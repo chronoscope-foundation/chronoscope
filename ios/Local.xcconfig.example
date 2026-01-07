@@ -1,0 +1,12 @@
+// Local development settings
+// Copy this file to Local.xcconfig and fill in your values
+
+// Your Apple Developer Team ID (find at https://developer.apple.com/account)
+DEVELOPMENT_TEAM = YOUR_TEAM_ID_HERE
+
+// API server domain (production default shown, dev script will override)
+// For local development, run `cargo run --bin dev` in api/ which will:
+//   1. Start an ngrok tunnel
+//   2. Automatically update this file with the tunnel URL
+//   3. Start the API server
+API_SERVER_DOMAIN = api.chronoscope.io

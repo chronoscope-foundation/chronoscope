@@ -1,0 +1,40 @@
+# Rust
+target/
+*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Environment files (secrets)
+.env
+.env.local
+.env.*.local
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+/data/
+
+# OpenAPI generated specs (regenerated on build)
+openapi.json
+
+# iOS / Xcode
+ios/Chronoscope.xcodeproj/
+ios/ChronoscopeAPI/.build/
+ios/.build/
+*.xcuserstate
+xcuserdata/
+DerivedData/
+
+# Swift Package Manager
+.swiftpm/
+Packages/
+Package.resolved

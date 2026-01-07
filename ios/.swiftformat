@@ -1,0 +1,26 @@
+# SwiftFormat configuration for Chronoscope
+
+# Format options
+--swiftversion 6.0
+--indent 4
+--indentcase false
+--trimwhitespace always
+--voidtype void
+--wrapcollections before-first
+--maxwidth 120
+--wraparguments before-first
+--wrapparameters before-first
+--closingparen balanced
+
+# Rules
+--enable isEmpty
+--enable redundantType
+--enable sortImports
+--enable wrapEnumCases
+--enable wrapSwitchCases
+
+--disable redundantSelf
+--disable trailingCommas
+
+# File options
+--exclude DerivedData,.build,Pods

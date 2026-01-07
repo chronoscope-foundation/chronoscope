@@ -1,0 +1,59 @@
+[package]
+name = "chronoscope-api"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Web framework
+dropshot = "0.16"
+http = "1.0"
+
+# WebAuthn/Passkeys
+# danger-allow-state-serialisation: enables Serialize/Deserialize on WebAuthn state
+# objects so we can sign them and send to client for stateless challenge flow
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs-proto = "0.5"
+
+# JWT for session tokens - using jwt-compact with pure Rust HMAC (no RSA dep)
+jwt-compact = { version = "0.8", features = ["clock"] }
+
+# Database - sqlx with SQLite for now, same API works for Postgres later
+# runtime-tokio: use tokio async runtime
+# sqlite: SQLite driver
+# Note: default-features=false to avoid pulling in mysql/postgres and their vulnerable deps
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive", "chrono"] }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Utilities
+base64.workspace = true
+uuid.workspace = true
+url.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+semver = "1"
+
+hickory-resolver = "0.25"
+async-trait = "0.1"
+
+# Logging (used by dropshot internally, we use it for warnings)
+slog = "2"
+
+# HTTP client (used by dev binary for ngrok API, and tests)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+# Testing framework
+tokio-test = "0.4"
+
+# WebAuthn authenticator simulator
+webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
