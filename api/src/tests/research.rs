@@ -254,7 +254,7 @@ async fn test_pagination_more_than_limit() -> TestResult {
     assert!(page1.next_page.is_some());
 
     // Second page: use page_token from first page
-    let page_token = page1.next_page.unwrap();
+    let page_token = page1.next_page.ok_or("expected next_page token")?;
     let page2 = ctx
         .list_following(&token, &format!("page_token={page_token}"))
         .await?;

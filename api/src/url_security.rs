@@ -279,6 +279,8 @@ fn check_ipv6_blocked(ip: &Ipv6Addr) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
     // ==================== URL Length Tests ====================
 
     #[test]
@@ -306,73 +308,84 @@ mod tests {
     // ==================== IPv4 Blocking Tests ====================
 
     #[test]
-    fn test_loopback_blocked() {
-        assert!(check_ipv4_blocked("127.0.0.1".parse().unwrap()).is_some());
-        assert!(check_ipv4_blocked("127.255.255.255".parse().unwrap()).is_some());
+    fn test_loopback_blocked() -> TestResult {
+        assert!(check_ipv4_blocked("127.0.0.1".parse()?).is_some());
+        assert!(check_ipv4_blocked("127.255.255.255".parse()?).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_private_10_blocked() {
-        assert!(check_ipv4_blocked("10.0.0.1".parse().unwrap()).is_some());
-        assert!(check_ipv4_blocked("10.255.255.255".parse().unwrap()).is_some());
+    fn test_private_10_blocked() -> TestResult {
+        assert!(check_ipv4_blocked("10.0.0.1".parse()?).is_some());
+        assert!(check_ipv4_blocked("10.255.255.255".parse()?).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_private_172_blocked() {
-        assert!(check_ipv4_blocked("172.16.0.1".parse().unwrap()).is_some());
-        assert!(check_ipv4_blocked("172.31.255.255".parse().unwrap()).is_some());
+    fn test_private_172_blocked() -> TestResult {
+        assert!(check_ipv4_blocked("172.16.0.1".parse()?).is_some());
+        assert!(check_ipv4_blocked("172.31.255.255".parse()?).is_some());
         // 172.15.x.x and 172.32.x.x are NOT private
-        assert!(check_ipv4_blocked("172.15.0.1".parse().unwrap()).is_none());
-        assert!(check_ipv4_blocked("172.32.0.1".parse().unwrap()).is_none());
+        assert!(check_ipv4_blocked("172.15.0.1".parse()?).is_none());
+        assert!(check_ipv4_blocked("172.32.0.1".parse()?).is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_private_192_168_blocked() {
-        assert!(check_ipv4_blocked("192.168.0.1".parse().unwrap()).is_some());
-        assert!(check_ipv4_blocked("192.168.255.255".parse().unwrap()).is_some());
+    fn test_private_192_168_blocked() -> TestResult {
+        assert!(check_ipv4_blocked("192.168.0.1".parse()?).is_some());
+        assert!(check_ipv4_blocked("192.168.255.255".parse()?).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_link_local_blocked() {
+    fn test_link_local_blocked() -> TestResult {
         // Includes AWS IMDS
-        assert!(check_ipv4_blocked("169.254.169.254".parse().unwrap()).is_some());
-        assert!(check_ipv4_blocked("169.254.0.1".parse().unwrap()).is_some());
+        assert!(check_ipv4_blocked("169.254.169.254".parse()?).is_some());
+        assert!(check_ipv4_blocked("169.254.0.1".parse()?).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_multicast_blocked() {
-        assert!(check_ipv4_blocked("224.0.0.1".parse().unwrap()).is_some());
-        assert!(check_ipv4_blocked("239.255.255.255".parse().unwrap()).is_some());
+    fn test_multicast_blocked() -> TestResult {
+        assert!(check_ipv4_blocked("224.0.0.1".parse()?).is_some());
+        assert!(check_ipv4_blocked("239.255.255.255".parse()?).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_public_ips_allowed() {
-        assert!(check_ipv4_blocked("8.8.8.8".parse().unwrap()).is_none());
-        assert!(check_ipv4_blocked("1.1.1.1".parse().unwrap()).is_none());
-        assert!(check_ipv4_blocked("93.184.216.34".parse().unwrap()).is_none()); // example.com
+    fn test_public_ips_allowed() -> TestResult {
+        assert!(check_ipv4_blocked("8.8.8.8".parse()?).is_none());
+        assert!(check_ipv4_blocked("1.1.1.1".parse()?).is_none());
+        assert!(check_ipv4_blocked("93.184.216.34".parse()?).is_none()); // example.com
+        Ok(())
     }
 
     // ==================== IPv6 Blocking Tests ====================
 
     #[test]
-    fn test_ipv6_loopback_blocked() {
-        assert!(check_ipv6_blocked(&"::1".parse().unwrap()).is_some());
+    fn test_ipv6_loopback_blocked() -> TestResult {
+        assert!(check_ipv6_blocked(&"::1".parse()?).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_ipv6_link_local_blocked() {
-        assert!(check_ipv6_blocked(&"fe80::1".parse().unwrap()).is_some());
+    fn test_ipv6_link_local_blocked() -> TestResult {
+        assert!(check_ipv6_blocked(&"fe80::1".parse()?).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_ipv6_unique_local_blocked() {
-        assert!(check_ipv6_blocked(&"fc00::1".parse().unwrap()).is_some());
-        assert!(check_ipv6_blocked(&"fd00::1".parse().unwrap()).is_some());
+    fn test_ipv6_unique_local_blocked() -> TestResult {
+        assert!(check_ipv6_blocked(&"fc00::1".parse()?).is_some());
+        assert!(check_ipv6_blocked(&"fd00::1".parse()?).is_some());
+        Ok(())
     }
 
     #[test]
-    fn test_ipv6_public_allowed() {
-        assert!(check_ipv6_blocked(&"2606:4700:4700::1111".parse().unwrap()).is_none()); // Cloudflare
+    fn test_ipv6_public_allowed() -> TestResult {
+        assert!(check_ipv6_blocked(&"2606:4700:4700::1111".parse()?).is_none()); // Cloudflare
+        Ok(())
     }
 
     // ==================== Scheme Tests ====================
@@ -407,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ssrf_blocked_ips_via_dns() {
+    async fn test_ssrf_blocked_ips_via_dns() -> TestResult {
         let cases: Vec<(&str, &str, &str)> = vec![
             ("127.0.0.1", "loopback", "loopback"),
             ("10.0.0.1", "private 10.x", "private"),
@@ -422,29 +435,28 @@ mod tests {
         for (ip, desc, expected_msg) in cases {
             let host = format!("{}.evil.test", ip.replace([':', '.'], "-"));
             let resolver = MockResolver(
-                [(host.clone(), vec![ip.parse().unwrap()])]
+                [(host.clone(), vec![ip.parse()?])]
                     .into_iter()
                     .collect(),
             );
 
             let result = validate_url(&format!("https://{host}/"), &resolver).await;
             assert!(result.is_err(), "{desc} ({ip}) should be blocked");
+            let err = result.err().ok_or("expected error")?;
             assert!(
-                result.unwrap_err().external_message.contains(expected_msg),
+                err.external_message.contains(expected_msg),
                 "{desc} error should mention '{expected_msg}'"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_public_ips_allowed_via_dns() {
+    async fn test_public_ips_allowed_via_dns() -> TestResult {
         let resolver = MockResolver(
             [
-                ("example.com".into(), vec!["93.184.216.34".parse().unwrap()]),
-                (
-                    "cloudflare.com".into(),
-                    vec!["104.16.132.229".parse().unwrap()],
-                ),
+                ("example.com".into(), vec!["93.184.216.34".parse()?]),
+                ("cloudflare.com".into(), vec!["104.16.132.229".parse()?]),
             ]
             .into_iter()
             .collect(),
@@ -460,17 +472,15 @@ mod tests {
                 .await
                 .is_ok()
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_mixed_ips_blocked_if_any_unsafe() {
+    async fn test_mixed_ips_blocked_if_any_unsafe() -> TestResult {
         let resolver = MockResolver(
             [(
                 "mixed.test".into(),
-                vec![
-                    "93.184.216.34".parse().unwrap(),
-                    "127.0.0.1".parse().unwrap(),
-                ],
+                vec!["93.184.216.34".parse()?, "127.0.0.1".parse()?],
             )]
             .into_iter()
             .collect(),
@@ -478,5 +488,6 @@ mod tests {
 
         let result = validate_url("https://mixed.test/", &resolver).await;
         assert!(result.is_err(), "should block if any IP is unsafe");
+        Ok(())
     }
 }

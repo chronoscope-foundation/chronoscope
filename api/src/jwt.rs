@@ -273,6 +273,7 @@ mod tests {
     use super::*;
 
     const TEST_SECRET: &str = "this-is-a-test-secret-with-enough-length";
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     #[test]
     fn test_jwt_error_to_http_error_server_errors() {
@@ -307,53 +308,54 @@ mod tests {
     }
 
     #[test]
-    fn test_session_token_roundtrip() {
+    fn test_session_token_roundtrip() -> TestResult {
         let config = JwtConfig::new(TEST_SECRET, 3600, 120, 60);
         let user_id = crate::types::UserId::new("test-user-123");
 
         // Create a token
-        let token_str = config.create_session_token(&user_id).unwrap();
+        let token_str = config.create_session_token(&user_id)?;
 
         // Validate it
-        let untrusted = UntrustedToken::new(&token_str).unwrap();
-        let validated_user_id = config.validate_session_token(&untrusted).unwrap();
+        let untrusted = UntrustedToken::new(&token_str)?;
+        let validated_user_id = config.validate_session_token(&untrusted)?;
 
         assert_eq!(validated_user_id.as_str(), "test-user-123");
+        Ok(())
     }
 
     #[test]
-    fn test_challenge_token_wrong_purpose() {
+    fn test_challenge_token_wrong_purpose() -> TestResult {
         let config = JwtConfig::new(TEST_SECRET, 3600, 120, 60);
         let user_id = crate::types::UserId::new("test-user");
 
         // Create a registration challenge token
-        let token_str = config
-            .create_challenge_token("state", &user_id, ChallengePurpose::Register)
-            .unwrap();
+        let token_str = config.create_challenge_token("state", &user_id, ChallengePurpose::Register)?;
 
         // Try to validate as login - should fail
-        let untrusted = UntrustedToken::new(&token_str).unwrap();
+        let untrusted = UntrustedToken::new(&token_str)?;
         let result = config.validate_challenge_token(&untrusted, &ChallengePurpose::Login);
         assert!(matches!(result, Err(JwtError::InvalidPurpose)));
+        Ok(())
     }
 
     #[test]
-    fn test_challenge_purpose_serialization() {
+    fn test_challenge_purpose_serialization() -> TestResult {
         // Test that purposes serialize/deserialize correctly
         let register = ChallengePurpose::Register;
         let login = ChallengePurpose::Login;
 
-        let reg_json = serde_json::to_string(&register).unwrap();
-        let login_json = serde_json::to_string(&login).unwrap();
+        let reg_json = serde_json::to_string(&register)?;
+        let login_json = serde_json::to_string(&login)?;
 
         assert_eq!(reg_json, "\"register\"");
         assert_eq!(login_json, "\"login\"");
 
-        let reg_back: ChallengePurpose = serde_json::from_str(&reg_json).unwrap();
-        let login_back: ChallengePurpose = serde_json::from_str(&login_json).unwrap();
+        let reg_back: ChallengePurpose = serde_json::from_str(&reg_json)?;
+        let login_back: ChallengePurpose = serde_json::from_str(&login_json)?;
 
         assert_eq!(reg_back, ChallengePurpose::Register);
         assert_eq!(login_back, ChallengePurpose::Login);
+        Ok(())
     }
 
     #[test]

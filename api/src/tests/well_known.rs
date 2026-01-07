@@ -15,7 +15,7 @@ async fn test_aasa_without_app_id() -> TestResult {
 
     // Should have webcredentials.apps as empty array when no app ID configured
     assert!(body["webcredentials"]["apps"].is_array());
-    assert_eq!(body["webcredentials"]["apps"].as_array().unwrap().len(), 0);
+    assert_eq!(body["webcredentials"]["apps"].as_array().ok_or("apps should be array")?.len(), 0);
     Ok(())
 }
 
@@ -30,7 +30,7 @@ async fn test_aasa_with_app_id() -> TestResult {
     let body: serde_json::Value = resp.json().await?;
 
     // Should have webcredentials.apps with our app ID
-    let apps = body["webcredentials"]["apps"].as_array().unwrap();
+    let apps = body["webcredentials"]["apps"].as_array().ok_or("apps should be array")?;
     assert_eq!(apps.len(), 1);
     assert_eq!(apps[0], "ABCD1234.com.example.chronoscope");
     Ok(())
@@ -44,7 +44,7 @@ async fn test_aasa_content_type() -> TestResult {
     assert_eq!(resp.status(), 200);
 
     // Dropshot returns application/json for HttpResponseOk
-    let content_type = resp.headers().get("content-type").unwrap();
-    assert!(content_type.to_str().unwrap().contains("application/json"));
+    let content_type = resp.headers().get("content-type").ok_or("missing content-type")?;
+    assert!(content_type.to_str()?.contains("application/json"));
     Ok(())
 }
