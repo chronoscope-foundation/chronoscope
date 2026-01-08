@@ -1,0 +1,12 @@
+# Ignored security advisories for cargo-audit
+#
+# These are vulnerabilities in transitive dependencies that we don't directly use
+# and cannot easily fix.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack timing sidechannel in rsa crate
+    # This comes through sqlx-mysql, but we only use SQLite. The vulnerable
+    # code path is never executed in our application.
+    "RUSTSEC-2023-0071",
+]
