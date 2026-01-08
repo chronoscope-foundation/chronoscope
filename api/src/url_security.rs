@@ -6,34 +6,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use async_trait::async_trait;
 use dropshot::HttpError;
-use hickory_resolver::name_server::TokioConnectionProvider;
 
-/// Type alias for the production DNS resolver using tokio.
-pub type TokioResolver = hickory_resolver::Resolver<TokioConnectionProvider>;
-
-/// Trait for DNS resolution, allowing mocking in tests.
-#[async_trait]
-pub trait DnsResolver: Send + Sync {
-    /// Resolve a hostname to IP addresses.
-    ///
-    /// # Errors
-    /// Returns `HttpError` if DNS resolution fails.
-    async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, HttpError>;
-}
-
-#[async_trait]
-impl DnsResolver for TokioResolver {
-    async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, HttpError> {
-        let response = hickory_resolver::Resolver::lookup_ip(self, host)
-            .await
-            .map_err(|e| {
-                HttpError::for_bad_request(None, format!("Failed to resolve host: {e}"))
-            })?;
-        Ok(response.iter().collect())
-    }
-}
+use crate::state::DnsResolver;
 
 /// Maximum allowed URL length in bytes.
 /// Generous limit to accommodate URLs with long query strings.
@@ -278,6 +253,7 @@ fn check_ipv6_blocked(ip: &Ipv6Addr) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 

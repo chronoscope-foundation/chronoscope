@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use dropshot::HttpError;
 
-use crate::url_security::DnsResolver;
+use crate::state::DnsResolver;
 
 use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,

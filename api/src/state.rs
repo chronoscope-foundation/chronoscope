@@ -1,11 +1,44 @@
+use std::net::IpAddr;
+
+use async_trait::async_trait;
+use dropshot::HttpError;
+use hickory_resolver::Resolver;
+use hickory_resolver::name_server::TokioConnectionProvider;
 use thiserror::Error;
 use url::Url;
 use webauthn_rs::prelude::*;
 
 use crate::db::Database;
 use crate::jwt::JwtConfig;
-use crate::url_security::DnsResolver;
-use hickory_resolver::Resolver;
+
+// ==================== DNS Resolution ====================
+
+/// Type alias for the production DNS resolver using tokio.
+pub type TokioResolver = hickory_resolver::Resolver<TokioConnectionProvider>;
+
+/// Trait for DNS resolution, allowing mocking in tests.
+#[async_trait]
+pub trait DnsResolver: Send + Sync {
+    /// Resolve a hostname to IP addresses.
+    ///
+    /// # Errors
+    /// Returns `HttpError` if DNS resolution fails.
+    async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, HttpError>;
+}
+
+#[async_trait]
+impl DnsResolver for TokioResolver {
+    async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, HttpError> {
+        let response = hickory_resolver::Resolver::lookup_ip(self, host)
+            .await
+            .map_err(|e| {
+                HttpError::for_bad_request(None, format!("Failed to resolve host: {e}"))
+            })?;
+        Ok(response.iter().collect())
+    }
+}
+
+// ==================== Configuration ====================
 
 /// Configuration for the application
 pub struct Config {
