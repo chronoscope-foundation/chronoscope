@@ -133,10 +133,13 @@ fn validate_ip(ip: &IpAddr) -> Result<(), HttpError> {
     };
 
     if let Some(reason) = blocked_reason {
-        return Err(HttpError::for_bad_request(
-            None,
-            format!("URL resolves to blocked IP address ({reason})"),
-        ));
+        return Err(HttpError {
+            status_code: dropshot::ErrorStatusCode::BAD_REQUEST,
+            error_code: None,
+            external_message: "URL not allowed".to_string(),
+            internal_message: format!("Blocked IP {ip}: {reason}"),
+            headers: None,
+        });
     }
 
     Ok(())
@@ -397,27 +400,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_ssrf_blocked_ips_via_dns() -> TestResult {
-        let cases: Vec<(&str, &str, &str)> = vec![
-            ("127.0.0.1", "loopback", "loopback"),
-            ("10.0.0.1", "private 10.x", "private"),
-            ("172.16.0.1", "private 172.16.x", "private"),
-            ("192.168.1.1", "private 192.168.x", "private"),
-            ("169.254.169.254", "AWS IMDS", "link-local"),
-            ("::1", "IPv6 loopback", "loopback"),
-            ("fe80::1", "IPv6 link-local", "link-local"),
-            ("fc00::1", "IPv6 unique local", "unique local"),
+        let cases: Vec<(&str, &str)> = vec![
+            ("127.0.0.1", "loopback"),
+            ("10.0.0.1", "private 10.x"),
+            ("172.16.0.1", "private 172.16.x"),
+            ("192.168.1.1", "private 192.168.x"),
+            ("169.254.169.254", "AWS IMDS"),
+            ("::1", "IPv6 loopback"),
+            ("fe80::1", "IPv6 link-local"),
+            ("fc00::1", "IPv6 unique local"),
         ];
 
-        for (ip, desc, expected_msg) in cases {
+        for (ip, desc) in cases {
             let host = format!("{}.evil.test", ip.replace([':', '.'], "-"));
             let resolver = MockResolver([(host.clone(), vec![ip.parse()?])].into_iter().collect());
 
             let result = validate_url(&format!("https://{host}/"), &resolver).await;
             assert!(result.is_err(), "{desc} ({ip}) should be blocked");
             let err = result.err().ok_or("expected error")?;
+            assert_eq!(err.external_message, "URL not allowed", "{desc} external message");
             assert!(
-                err.external_message.contains(expected_msg),
-                "{desc} error should mention '{expected_msg}'"
+                err.internal_message.contains(ip),
+                "{desc} internal message should contain IP, got: {}",
+                err.internal_message
             );
         }
         Ok(())
