@@ -8,8 +8,15 @@ mod research;
 mod user;
 mod well_known;
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+use async_trait::async_trait;
+use dropshot::HttpError;
+
+use crate::url_security::DnsResolver;
 
 use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,
@@ -30,6 +37,46 @@ use crate::research::{ResearchUrlResponse, SubmitResearchRequest, SubmitResearch
 use crate::state::{AppState, Config};
 use crate::types::{Email, ResearchUrlId, UserId};
 use crate::users::FollowedUrlResponse;
+
+// ==================== Test DNS Resolver ====================
+
+/// A mock DNS resolver for tests. Returns a safe public IP for any hostname
+/// unless explicitly configured with specific mappings.
+struct TestResolver(HashMap<String, Vec<IpAddr>>);
+
+impl TestResolver {
+    /// Create a resolver that returns a safe public IP for all lookups.
+    fn permissive() -> Self {
+        Self(HashMap::new())
+    }
+
+    /// Create a resolver with specific hostname -> IP mappings.
+    /// Hostnames not in the map will fail resolution.
+    #[allow(dead_code)]
+    fn with_mappings(mappings: HashMap<String, Vec<IpAddr>>) -> Self {
+        Self(mappings)
+    }
+}
+
+#[async_trait]
+impl DnsResolver for TestResolver {
+    async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, HttpError> {
+        if let Some(ips) = self.0.get(host) {
+            Ok(ips.clone())
+        } else if self.0.is_empty() {
+            // Permissive mode: return example.com's IP for any host
+            Ok(vec!["93.184.216.34".parse().expect("valid IP")])
+        } else {
+            // Strict mode: only configured hosts resolve
+            Err(HttpError::for_bad_request(
+                None,
+                format!("Host not found: {host}"),
+            ))
+        }
+    }
+}
+
+// ==================== Test Configuration ====================
 
 // Test defaults (secret must be at least 32 bytes)
 const TEST_SECRET: &str = "test-secret-key-for-testing-only-must-be-32-bytes";
@@ -56,24 +103,32 @@ struct TestContext {
 
 impl TestContext {
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::with_config(None, None).await
+        Self::with_options(None, None, None).await
     }
 
     async fn with_ios_app_id(
         app_id: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::with_config(Some(app_id.to_string()), None).await
+        Self::with_options(Some(app_id.to_string()), None, None).await
     }
 
     async fn with_jwt_config(
         jwt: JwtConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::with_config(None, Some(jwt)).await
+        Self::with_options(None, Some(jwt), None).await
     }
 
-    async fn with_config(
+    #[allow(dead_code)]
+    async fn with_dns_resolver(
+        resolver: TestResolver,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::with_options(None, None, Some(resolver)).await
+    }
+
+    async fn with_options(
         ios_app_id: Option<String>,
         jwt_config: Option<JwtConfig>,
+        dns_resolver: Option<TestResolver>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = jwt_config.unwrap_or_else(|| {
             JwtConfig::new(
@@ -83,6 +138,8 @@ impl TestContext {
                 TEST_LEEWAY,
             )
         });
+        let resolver = dns_resolver.unwrap_or_else(TestResolver::permissive);
+
         // Find an available port
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
@@ -96,7 +153,7 @@ impl TestContext {
             ios_app_id,
         };
 
-        let app_state = Arc::new(AppState::new_with_jwt(config, jwt).await?);
+        let app_state = Arc::new(AppState::new_with_resolver(config, jwt, Box::new(resolver)).await?);
 
         let config_dropshot = ConfigDropshot {
             bind_address: addr,

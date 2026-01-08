@@ -4,6 +4,7 @@ use webauthn_rs::prelude::*;
 
 use crate::db::Database;
 use crate::jwt::JwtConfig;
+use crate::url_security::DnsResolver;
 use hickory_resolver::Resolver;
 
 /// Configuration for the application
@@ -88,7 +89,7 @@ pub struct AppState {
     pub db: Database,
     pub jwt: JwtConfig,
     pub webauthn: Webauthn,
-    pub dns_resolver: crate::url_security::TokioResolver,
+    pub dns_resolver: Box<dyn DnsResolver>,
     pub config: Config,
 }
 
@@ -107,6 +108,22 @@ impl AppState {
     /// # Errors
     /// Returns `AppStateError` if database or `WebAuthn` initialization fails.
     pub async fn new_with_jwt(config: Config, jwt: JwtConfig) -> Result<Self, AppStateError> {
+        let dns_resolver = Resolver::builder_tokio()
+            .map_err(|e| AppStateError::DnsResolver(format!("{e}")))?
+            .build();
+        Self::new_with_resolver(config, jwt, Box::new(dns_resolver)).await
+    }
+
+    /// Create new application state with explicit JWT config and DNS resolver.
+    /// Primarily useful for testing with mock resolvers.
+    ///
+    /// # Errors
+    /// Returns `AppStateError` if database or `WebAuthn` initialization fails.
+    pub async fn new_with_resolver(
+        config: Config,
+        jwt: JwtConfig,
+        dns_resolver: Box<dyn DnsResolver>,
+    ) -> Result<Self, AppStateError> {
         // Initialize database
         let db = Database::new(&config.database_url).await?;
 
@@ -119,11 +136,6 @@ impl AppState {
             .rp_name("Chronoscope")
             .build()
             .map_err(|e| AppStateError::WebAuthn(format!("{e}")))?;
-
-        // Create async DNS resolver for SSRF protection
-        let dns_resolver = Resolver::builder_tokio()
-            .map_err(|e| AppStateError::DnsResolver(format!("{e}")))?
-            .build();
 
         Ok(Self {
             db,

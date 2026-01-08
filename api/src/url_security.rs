@@ -91,7 +91,7 @@ fn validate_url_format(url_str: &str) -> Result<url::Url, HttpError> {
 /// Returns `HttpError` if the URL fails any security check.
 pub async fn validate_url(
     url_str: &str,
-    resolver: &impl DnsResolver,
+    resolver: &(impl DnsResolver + ?Sized),
 ) -> Result<url::Url, HttpError> {
     let url = validate_url_format(url_str)?;
 
@@ -113,7 +113,7 @@ pub async fn validate_url(
 /// Returns `HttpError` if:
 /// - DNS resolution fails
 /// - Any resolved IP is in a blocked range
-async fn validate_host(host: &str, resolver: &impl DnsResolver) -> Result<(), HttpError> {
+async fn validate_host(host: &str, resolver: &(impl DnsResolver + ?Sized)) -> Result<(), HttpError> {
     // Try to parse as IP address first (no DNS needed)
     if let Ok(ip) = host.parse::<IpAddr>() {
         return validate_ip(&ip);
@@ -434,11 +434,7 @@ mod tests {
 
         for (ip, desc, expected_msg) in cases {
             let host = format!("{}.evil.test", ip.replace([':', '.'], "-"));
-            let resolver = MockResolver(
-                [(host.clone(), vec![ip.parse()?])]
-                    .into_iter()
-                    .collect(),
-            );
+            let resolver = MockResolver([(host.clone(), vec![ip.parse()?])].into_iter().collect());
 
             let result = validate_url(&format!("https://{host}/"), &resolver).await;
             assert!(result.is_err(), "{desc} ({ip}) should be blocked");

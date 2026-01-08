@@ -68,7 +68,7 @@ pub async fn submit_research(
     let req = body.into_inner();
 
     // Validate URL format, scheme, length, and check for SSRF (private IPs, etc.)
-    let _validated_url = validate_url(&req.url, &state.dns_resolver).await?;
+    let _validated_url = validate_url(&req.url, &*state.dns_resolver).await?;
 
     let (id, created) = state.db.submit_url(&user_id, &req.url).await?;
 
