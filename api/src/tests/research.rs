@@ -265,9 +265,18 @@ async fn test_pagination_exactly_limit_items() -> TestResult {
             .await?;
     }
 
-    let list = ctx.list_following(&token, "limit=5").await?;
-    assert_eq!(list.items.len(), 5);
-    assert!(list.next_page.is_none());
+    // First page returns all 5 items with a next_page token
+    let page1 = ctx.list_following(&token, "limit=5").await?;
+    assert_eq!(page1.items.len(), 5);
+    assert!(page1.next_page.is_some());
+
+    // Following the token returns an empty page (Dropshot's pagination pattern)
+    let page_token = page1.next_page.ok_or("expected next_page token")?;
+    let page2 = ctx
+        .list_following(&token, &format!("page_token={page_token}"))
+        .await?;
+    assert!(page2.items.is_empty());
+    assert!(page2.next_page.is_none());
     Ok(())
 }
 
@@ -286,13 +295,21 @@ async fn test_pagination_more_than_limit() -> TestResult {
     assert_eq!(page1.items.len(), 5);
     assert!(page1.next_page.is_some());
 
-    // Second page: use page_token from first page
+    // Second page: 2 remaining items
     let page_token = page1.next_page.ok_or("expected next_page token")?;
     let page2 = ctx
         .list_following(&token, &format!("page_token={page_token}"))
         .await?;
     assert_eq!(page2.items.len(), 2);
-    assert!(page2.next_page.is_none());
+    assert!(page2.next_page.is_some());
+
+    // Third page: empty (Dropshot's pagination pattern)
+    let page_token = page2.next_page.ok_or("expected next_page token")?;
+    let page3 = ctx
+        .list_following(&token, &format!("page_token={page_token}"))
+        .await?;
+    assert!(page3.items.is_empty());
+    assert!(page3.next_page.is_none());
     Ok(())
 }
 

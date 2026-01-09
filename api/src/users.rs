@@ -171,18 +171,14 @@ pub async fn list_following(
     };
 
     let limit_i64 = i64::from(limit);
-
-    // Fetch one extra to determine if there are more pages
     let cursor_ref = cursor.map(|s| (s.followed_at, &s.id));
     let urls = state
         .db
-        .list_followed_urls(&user_id, limit_i64 + 1, cursor_ref)
+        .list_followed_urls(&user_id, limit_i64, cursor_ref)
         .await?;
 
-    let has_more = urls.len() > limit as usize;
     let items: Vec<FollowedUrlResponse> = urls
         .into_iter()
-        .take(limit as usize)
         .map(|u| FollowedUrlResponse {
             id: u.id.clone(),
             url: u.url,
@@ -191,7 +187,6 @@ pub async fn list_following(
         })
         .collect();
 
-    // Build the next page token from the last item
     let page = ResultsPage::new(items, &pag_params, |item: &FollowedUrlResponse, _| {
         FollowingPageSelector {
             followed_at: item.followed_at,
@@ -199,16 +194,6 @@ pub async fn list_following(
         }
     })
     .map_err(|e| HttpError::for_internal_error(format!("Failed to build results page: {e}")))?;
-
-    // If there are no more items, clear the next_page token
-    let page = if has_more {
-        page
-    } else {
-        ResultsPage {
-            items: page.items,
-            next_page: None,
-        }
-    };
 
     Ok(HttpResponseOk(page))
 }

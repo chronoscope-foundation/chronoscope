@@ -111,15 +111,11 @@ pub async fn list_research(
     };
 
     let limit_i64 = i64::from(limit);
-
-    // Fetch one extra to determine if there are more pages
     let cursor_ref = cursor.map(|s| (s.created_at, &s.id));
-    let urls = state.db.list_all_urls(limit_i64 + 1, cursor_ref).await?;
+    let urls = state.db.list_all_urls(limit_i64, cursor_ref).await?;
 
-    let has_more = urls.len() > limit as usize;
     let items: Vec<ResearchUrlResponse> = urls
         .into_iter()
-        .take(limit as usize)
         .map(|u| ResearchUrlResponse {
             id: u.id.clone(),
             url: u.url,
@@ -127,7 +123,6 @@ pub async fn list_research(
         })
         .collect();
 
-    // Build the next page token from the last item
     let page = ResultsPage::new(items, &pag_params, |item: &ResearchUrlResponse, _| {
         ResearchPageSelector {
             created_at: item.created_at,
@@ -135,16 +130,6 @@ pub async fn list_research(
         }
     })
     .map_err(|e| HttpError::for_internal_error(format!("Failed to build results page: {e}")))?;
-
-    // If there are no more items, clear the next_page token
-    let page = if has_more {
-        page
-    } else {
-        ResultsPage {
-            items: page.items,
-            next_page: None,
-        }
-    };
 
     Ok(HttpResponseOk(page))
 }
