@@ -50,10 +50,9 @@ pub struct JwtConfig {
 impl JwtConfig {
     /// Create a new JWT configuration with explicit values.
     ///
-    /// # Panics
-    ///
-    /// Panics if the secret is shorter than `MIN_SECRET_LENGTH` bytes.
-    /// For non-panicking construction, use `try_new`.
+    /// Note: This does not validate secret length. For production use,
+    /// prefer `from_env()` which validates the secret meets minimum
+    /// security requirements.
     #[must_use]
     pub fn new(
         secret: &str,
@@ -61,37 +60,12 @@ impl JwtConfig {
         challenge_expiry_seconds: i64,
         leeway_seconds: i64,
     ) -> Self {
-        Self::try_new(
-            secret,
-            session_expiry_seconds,
-            challenge_expiry_seconds,
-            leeway_seconds,
-        )
-        .expect("JWT secret must be at least 32 bytes")
-    }
-
-    /// Create a new JWT configuration with explicit values, returning an error
-    /// if the secret is too short.
-    ///
-    /// # Errors
-    ///
-    /// Returns `JwtError::SecretTooShort` if the secret is shorter than
-    /// `MIN_SECRET_LENGTH` bytes.
-    pub fn try_new(
-        secret: &str,
-        session_expiry_seconds: i64,
-        challenge_expiry_seconds: i64,
-        leeway_seconds: i64,
-    ) -> Result<Self, JwtError> {
-        if secret.len() < MIN_SECRET_LENGTH {
-            return Err(JwtError::SecretTooShort);
-        }
-        Ok(Self {
+        Self {
             key: Hs256Key::new(secret.as_bytes()),
             session_expiry_seconds,
             challenge_expiry_seconds,
             leeway_seconds,
-        })
+        }
     }
 
     /// Load JWT configuration from environment variables
@@ -108,6 +82,10 @@ impl JwtConfig {
     pub fn from_env() -> Result<Self, JwtError> {
         let secret = std::env::var("JWT_SECRET").map_err(|_| JwtError::SecretNotConfigured)?;
 
+        if secret.len() < MIN_SECRET_LENGTH {
+            return Err(JwtError::SecretTooShort);
+        }
+
         let session_expiry_seconds = std::env::var("JWT_SESSION_EXPIRY_SECONDS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -123,12 +101,12 @@ impl JwtConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(60); // 60 seconds default for clock skew
 
-        Self::try_new(
+        Ok(Self::new(
             &secret,
             session_expiry_seconds,
             challenge_expiry_seconds,
             leeway_seconds,
-        )
+        ))
     }
 
     /// Create a session token for the given user.
@@ -360,16 +338,12 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_too_short_rejected() {
-        let short_secret = "too-short"; // 9 bytes, need 32
-        let result = JwtConfig::try_new(short_secret, 3600, 120, 60);
-        assert!(matches!(result, Err(JwtError::SecretTooShort)));
-    }
-
-    #[test]
-    fn test_secret_at_minimum_length_accepted() {
-        let min_secret = "a".repeat(super::MIN_SECRET_LENGTH); // exactly 32 bytes
-        let result = JwtConfig::try_new(&min_secret, 3600, 120, 60);
-        assert!(result.is_ok());
+    fn test_new_accepts_any_secret_length() {
+        // new() doesn't validate - that's from_env()'s job
+        let short_secret = "short";
+        let config = JwtConfig::new(short_secret, 3600, 120, 60);
+        let user_id = crate::types::UserId::new("test");
+        // Should still be able to create tokens (even if cryptographically weak)
+        assert!(config.create_session_token(&user_id).is_ok());
     }
 }

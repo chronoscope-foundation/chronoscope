@@ -1,4 +1,5 @@
 #![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
 
 use std::sync::Arc;
 
