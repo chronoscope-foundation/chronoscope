@@ -88,7 +88,10 @@ pub async fn validate_url(
 /// Returns `HttpError` if:
 /// - DNS resolution fails
 /// - Any resolved IP is in a blocked range
-async fn validate_host(host: &str, resolver: &(impl DnsResolver + ?Sized)) -> Result<(), HttpError> {
+async fn validate_host(
+    host: &str,
+    resolver: &(impl DnsResolver + ?Sized),
+) -> Result<(), HttpError> {
     // Try to parse as IP address first (no DNS needed)
     if let Ok(ip) = host.parse::<IpAddr>() {
         return validate_ip(&ip);
@@ -418,7 +421,10 @@ mod tests {
             let result = validate_url(&format!("https://{host}/"), &resolver).await;
             assert!(result.is_err(), "{desc} ({ip}) should be blocked");
             let err = result.err().ok_or("expected error")?;
-            assert_eq!(err.external_message, "URL not allowed", "{desc} external message");
+            assert_eq!(
+                err.external_message, "URL not allowed",
+                "{desc} external message"
+            );
             assert!(
                 err.internal_message.contains(ip),
                 "{desc} internal message should contain IP, got: {}",

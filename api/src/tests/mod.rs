@@ -153,7 +153,8 @@ impl TestContext {
             ios_app_id,
         };
 
-        let app_state = Arc::new(AppState::new_with_resolver(config, jwt, Box::new(resolver)).await?);
+        let app_state =
+            Arc::new(AppState::new_with_resolver(config, jwt, Box::new(resolver)).await?);
 
         let config_dropshot = ConfigDropshot {
             bind_address: addr,

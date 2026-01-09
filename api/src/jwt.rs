@@ -329,7 +329,8 @@ mod tests {
         let user_id = crate::types::UserId::new("test-user");
 
         // Create a registration challenge token
-        let token_str = config.create_challenge_token("state", &user_id, ChallengePurpose::Register)?;
+        let token_str =
+            config.create_challenge_token("state", &user_id, ChallengePurpose::Register)?;
 
         // Try to validate as login - should fail
         let untrusted = UntrustedToken::new(&token_str)?;
