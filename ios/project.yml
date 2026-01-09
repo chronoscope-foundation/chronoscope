@@ -39,21 +39,6 @@ targets:
       - package: ChronoscopeAPI
         product: ChronoscopeAPI
     preBuildScripts:
-      - name: Generate OpenAPI Spec
-        script: |
-          # Xcode doesn't inherit shell PATH; add rustup's default location (adjust if cargo is elsewhere)
-          export PATH="$HOME/.cargo/bin:$PATH"
-          OPENAPI_JSON="$SRCROOT/../api/target/openapi.json"
-          API_SRC="$SRCROOT/../api/src"
-
-          # Regenerate if openapi.json is missing or API source is newer
-          if [ ! -f "$OPENAPI_JSON" ] || [ -n "$(find "$API_SRC" -newer "$OPENAPI_JSON" 2>/dev/null)" ]; then
-            echo "Regenerating OpenAPI spec..."
-            cd "$SRCROOT/../api" && cargo run --bin openapi -- target/openapi.json
-          else
-            echo "OpenAPI spec is up to date"
-          fi
-        basedOnDependencyAnalysis: false
       - name: SwiftFormat
         script: |
           export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
@@ -109,6 +94,17 @@ schemes:
         Chronoscope: all
         ChronoscopeShareExtension: all
         ChronoscopeUITests: [test]
+      preActions:
+        - script: |
+            export PATH="$HOME/.cargo/bin:$PATH"
+            OPENAPI_JSON="${SRCROOT}/../api/target/openapi.json"
+            API_SRC="${SRCROOT}/../api/src"
+            if [ ! -f "$OPENAPI_JSON" ] || [ -n "$(find "$API_SRC" -newer "$OPENAPI_JSON" 2>/dev/null)" ]; then
+              echo "Regenerating OpenAPI spec..."
+              cd "${SRCROOT}/../api" && cargo run --bin openapi -- target/openapi.json
+            fi
+          name: Generate OpenAPI Spec
+          settingsTarget: Chronoscope
     run:
       config: Debug
     test:
