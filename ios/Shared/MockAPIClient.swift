@@ -7,12 +7,12 @@ import HTTPTypes
 actor MockAPIClient: APIProtocol {
     // MARK: - Mock Data
 
-    var researchItems: [Components.Schemas.ResearchUrlResponse] = []
+    var researchItems: [Components.Schemas.ResearchUrlSummary] = []
     var userInfo: Components.Schemas.UserResponse?
     var shouldFail: Bool
 
     init(
-        researchItems: [Components.Schemas.ResearchUrlResponse] = [],
+        researchItems: [Components.Schemas.ResearchUrlSummary] = [],
         userInfo: Components.Schemas.UserResponse? = nil,
         shouldFail: Bool = false
     ) {
@@ -39,11 +39,10 @@ actor MockAPIClient: APIProtocol {
         throw MockAPIError.notImplemented
     }
 
-    func getResearch(_ input: Operations.GetResearch.Input) async throws -> Operations.GetResearch.Output {
-        guard let item = researchItems.first(where: { $0.id == input.path.id }) else {
-            throw MockAPIError.notFound
-        }
-        return .ok(.init(body: .json(item)))
+    func getResearch(_: Operations.GetResearch.Input) async throws -> Operations.GetResearch.Output {
+        // This endpoint now returns ResearchUrlDossier, not ResearchUrlSummary.
+        // Since there's no detail view in the iOS UI yet, we stub this for now.
+        throw MockAPIError.notImplemented
     }
 
     // MARK: - User Operations
@@ -134,30 +133,55 @@ enum MockAPIError: LocalizedError {
 // MARK: - Sample Data for Previews
 
 extension MockAPIClient {
-    static let sampleResearchItems: [Components.Schemas.ResearchUrlResponse] = [
+    // Helper to create pending analysis state for sample data
+    private static func pendingAnalysis() -> Components.Schemas.ResearchUrlSummary.AnalysisPayload {
+        .init(value1: .init(
+            deepResearch: .init(value1: .pending(.init(status: .pending))),
+            media: .init(value1: .init(
+                embeddings: 0,
+                fetched: 0,
+                reverseImageSearch: 0,
+                segmentation: 0,
+                total: 0,
+                vlm: 0
+            ))
+        ))
+    }
+
+    static let sampleResearchItems: [Components.Schemas.ResearchUrlSummary] = [
         .init(
+            analysis: pendingAnalysis(),
             createdAt: "2024-01-15T10:30:00Z",
             id: "1",
+            status: .pending,
             url: "https://developer.apple.com/swift/"
         ),
         .init(
+            analysis: pendingAnalysis(),
             createdAt: "2024-01-14T15:45:00Z",
             id: "2",
+            status: .pending,
             url: "https://www.swift.org/documentation/"
         ),
         .init(
+            analysis: pendingAnalysis(),
             createdAt: "2024-01-13T09:20:00Z",
             id: "3",
+            status: .pending,
             url: "https://github.com/apple/swift"
         ),
         .init(
+            analysis: pendingAnalysis(),
             createdAt: "2024-01-12T14:00:00Z",
             id: "4",
+            status: .pending,
             url: "https://developer.apple.com/xcode/swiftui/"
         ),
         .init(
+            analysis: pendingAnalysis(),
             createdAt: "2024-01-11T11:30:00Z",
             id: "5",
+            status: .pending,
             url: "https://www.hackingwithswift.com/"
         )
     ]

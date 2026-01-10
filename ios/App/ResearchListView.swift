@@ -46,7 +46,7 @@ struct ResearchItem: Identifiable {
     let url: String
     let createdAt: Date?
 
-    init(_ response: Components.Schemas.ResearchUrlResponse) {
+    init(_ response: Components.Schemas.ResearchUrlSummary) {
         self.id = response.id
         self.url = response.url
         self.createdAt = ISO8601DateFormatter().date(from: response.createdAt)
