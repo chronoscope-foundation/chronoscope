@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
+use chronoscope_db::{Email, ResearchUrlId, UserId};
 use dropshot::{
     ClientErrorStatusCode, EmptyScanParams, HttpError, HttpResponseDeleted, HttpResponseOk,
     HttpResponseUpdatedNoContent, PaginationParams, Query, RequestContext, ResultsPage, TypedBody,
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::validate_session;
 use crate::research_types::FollowedUrlSummary;
 use crate::state::AppState;
-use crate::types::{Email, ResearchUrlId, UserId};
+use crate::validation::db_err;
 use crate::validation::{is_unique_violation, validate_email, validate_username};
 
 // ==================== Pagination Types ====================
@@ -68,7 +69,8 @@ pub async fn get_me(
     let user = state
         .db
         .get_user(&user_id)
-        .await?
+        .await
+        .map_err(db_err)?
         .ok_or_else(|| HttpError::for_internal_error("User not found".to_string()))?;
 
     Ok(HttpResponseOk(UserResponse {
@@ -103,7 +105,7 @@ pub async fn update_me(
                     "Username already taken".to_string(),
                 ));
             }
-            return Err(e.into());
+            return Err(db_err(e));
         }
     }
 
@@ -119,7 +121,7 @@ pub async fn update_me(
                     "Email already registered".to_string(),
                 ));
             }
-            return Err(e.into());
+            return Err(db_err(e));
         }
     }
 
@@ -127,7 +129,8 @@ pub async fn update_me(
     let user = state
         .db
         .get_user(&user_id)
-        .await?
+        .await
+        .map_err(db_err)?
         .ok_or_else(|| HttpError::for_internal_error("User not found".to_string()))?;
 
     Ok(HttpResponseOk(UserResponse {
@@ -166,7 +169,8 @@ pub async fn list_following(
     let urls = state
         .db
         .list_followed_urls(&user_id, limit_i64, cursor_ref)
-        .await?;
+        .await
+        .map_err(db_err)?;
 
     let items: Vec<FollowedUrlSummary> = urls.into_iter().map(FollowedUrlSummary::from).collect();
 
@@ -195,7 +199,7 @@ pub async fn follow_url(
     let id = &path.into_inner().id;
 
     // Check URL exists
-    if state.db.get_url_by_id(id).await?.is_none() {
+    if state.db.get_url_by_id(id).await.map_err(db_err)?.is_none() {
         return Err(HttpError::for_not_found(
             None,
             "Research URL not found".to_string(),
@@ -203,7 +207,7 @@ pub async fn follow_url(
     }
 
     // Follow it (idempotent - OK if already following)
-    state.db.follow_url(&user_id, id).await?;
+    state.db.follow_url(&user_id, id).await.map_err(db_err)?;
 
     Ok(HttpResponseUpdatedNoContent())
 }
@@ -221,7 +225,7 @@ pub async fn unfollow_url(
     let state = ctx.context();
     let id = &path.into_inner().id;
 
-    let unfollowed = state.db.unfollow_url(&user_id, id).await?;
+    let unfollowed = state.db.unfollow_url(&user_id, id).await.map_err(db_err)?;
 
     if !unfollowed {
         return Err(HttpError::for_not_found(

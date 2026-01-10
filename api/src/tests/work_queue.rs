@@ -160,7 +160,7 @@ async fn test_failed_url_increments_attempt_count() -> TestResult {
     // Check attempt count via raw query
     let row: (i32,) = sqlx::query_as("SELECT attempt_count FROM research_urls WHERE id = ?")
         .bind(&url_id)
-        .fetch_one(ctx.app_state.db.pool())
+        .fetch_one(ctx.app_state.db.pool_ref())
         .await?;
 
     assert_eq!(row.0, 3);

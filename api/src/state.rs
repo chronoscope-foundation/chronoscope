@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 
 use async_trait::async_trait;
+use chronoscope_db::Database;
 use dropshot::HttpError;
 use hickory_resolver::Resolver;
 use hickory_resolver::name_server::TokioConnectionProvider;
@@ -8,7 +9,6 @@ use thiserror::Error;
 use url::Url;
 use webauthn_rs::prelude::*;
 
-use crate::db::Database;
 use crate::jwt::JwtConfig;
 
 // ==================== DNS Resolution ====================
@@ -109,7 +109,7 @@ pub enum AppStateError {
     Config(#[from] ConfigError),
 
     #[error("Database error: {0}")]
-    Database(#[from] crate::db::DbError),
+    Database(#[from] chronoscope_db::DbError),
 
     #[error("JWT configuration error: {0}")]
     Jwt(#[from] crate::jwt::JwtError),

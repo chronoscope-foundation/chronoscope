@@ -1,11 +1,10 @@
+use chronoscope_db::UserId;
 use dropshot::HttpError;
 use jwt_compact::{
     AlgorithmExt, Claims, Header, TimeOptions, Token, UntrustedToken, alg::Hs256, alg::Hs256Key,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-use crate::types::UserId;
 
 #[derive(Error, Debug)]
 pub enum JwtError {
@@ -282,14 +281,14 @@ mod tests {
     fn test_jwt_config_new() {
         let config = JwtConfig::new(TEST_SECRET, 3600, 120, 60);
         // Should be able to create tokens
-        let user_id = crate::types::UserId::new("test-user");
+        let user_id = UserId::new("test-user");
         assert!(config.create_session_token(&user_id).is_ok());
     }
 
     #[test]
     fn test_session_token_roundtrip() -> TestResult {
         let config = JwtConfig::new(TEST_SECRET, 3600, 120, 60);
-        let user_id = crate::types::UserId::new("test-user-123");
+        let user_id = UserId::new("test-user-123");
 
         // Create a token
         let token_str = config.create_session_token(&user_id)?;
@@ -305,7 +304,7 @@ mod tests {
     #[test]
     fn test_challenge_token_wrong_purpose() -> TestResult {
         let config = JwtConfig::new(TEST_SECRET, 3600, 120, 60);
-        let user_id = crate::types::UserId::new("test-user");
+        let user_id = UserId::new("test-user");
 
         // Create a registration challenge token
         let token_str =
@@ -343,7 +342,7 @@ mod tests {
         // new() doesn't validate - that's from_env()'s job
         let short_secret = "short";
         let config = JwtConfig::new(short_secret, 3600, 120, 60);
-        let user_id = crate::types::UserId::new("test");
+        let user_id = UserId::new("test");
         // Should still be able to create tokens (even if cryptographically weak)
         assert!(config.create_session_token(&user_id).is_ok());
     }
@@ -407,7 +406,7 @@ mod tests {
 
         // Verify we can create tokens with the config
         if let Ok(config) = config {
-            let user_id = crate::types::UserId::new("test");
+            let user_id = UserId::new("test");
             assert!(config.create_session_token(&user_id).is_ok());
         }
     }

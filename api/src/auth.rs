@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use base64::prelude::*;
+use chronoscope_db::{Email, UserId};
 use dropshot::{
     ClientErrorStatusCode, HttpError, HttpResponseOk, RequestContext, TypedBody, endpoint,
 };
@@ -12,8 +13,7 @@ use webauthn_rs::prelude::*;
 
 use crate::jwt::ChallengePurpose;
 use crate::state::AppState;
-use crate::types::{Email, UserId};
-use crate::validation::{is_unique_violation, validate_email, validate_username};
+use crate::validation::{db_err, is_unique_violation, validate_email, validate_username};
 use crate::webauthn_types::{
     CredentialCreationOptions, CredentialRequestOptions, PublicKeyCredentialAssertion,
     PublicKeyCredentialAttestation,
@@ -145,7 +145,8 @@ pub async fn register_start(
     if state
         .db
         .find_user_by_identifier(&req.username)
-        .await?
+        .await
+        .map_err(db_err)?
         .is_some()
     {
         return Err(HttpError::for_bad_request(
@@ -156,7 +157,8 @@ pub async fn register_start(
     if state
         .db
         .find_user_by_identifier(req.email.as_str())
-        .await?
+        .await
+        .map_err(db_err)?
         .is_some()
     {
         return Err(HttpError::for_bad_request(
@@ -301,12 +303,14 @@ pub async fn register_finish(
             let username_taken = state
                 .db
                 .find_user_by_identifier(&req.username)
-                .await?
+                .await
+                .map_err(db_err)?
                 .is_some();
             let email_taken = state
                 .db
                 .find_user_by_identifier(req.email.as_str())
-                .await?
+                .await
+                .map_err(db_err)?
                 .is_some();
 
             let msg = match (username_taken, email_taken) {
@@ -322,10 +326,18 @@ pub async fn register_finish(
                 msg.to_string(),
             ));
         }
-        return Err(e.into());
+        return Err(db_err(e));
     }
 
-    state.db.add_credential(&claims.user_id, &passkey).await?;
+    // Store the passkey credential
+    let credential_id = BASE64_URL_SAFE_NO_PAD.encode(passkey.cred_id().as_ref());
+    let passkey_json = serde_json::to_string(&passkey)
+        .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize passkey: {e}")))?;
+    state
+        .db
+        .add_credential(&claims.user_id, &credential_id, &passkey_json)
+        .await
+        .map_err(db_err)?;
 
     // Create session token
     let token = state.jwt.create_session_token(&claims.user_id)?;
@@ -347,7 +359,12 @@ pub async fn login_start(
 
     // Find user by username or email
     // Note: We use a generic error message to prevent user enumeration
-    let Some(user_id) = state.db.find_user_by_identifier(&req.identifier).await? else {
+    let Some(user_id) = state
+        .db
+        .find_user_by_identifier(&req.identifier)
+        .await
+        .map_err(db_err)?
+    else {
         warn!(ctx.log, "login_attempt_unknown_user";
             "event" => "security",
             "action" => "login_start",
@@ -360,7 +377,12 @@ pub async fn login_start(
     };
 
     // Get credentials for this user only
-    let credentials = state.db.get_credentials(&user_id).await?;
+    let credential_jsons = state.db.get_credentials(&user_id).await.map_err(db_err)?;
+    let credentials: Vec<Passkey> = credential_jsons
+        .iter()
+        .map(|json| serde_json::from_str(json))
+        .collect::<Result<_, _>>()
+        .map_err(|e| HttpError::for_internal_error(format!("Invalid stored credential: {e}")))?;
 
     if credentials.is_empty() {
         // Same error message as above to prevent enumeration
@@ -487,13 +509,29 @@ pub async fn login_finish(
 
     // Update credential counter if needed
     if auth_result.needs_update() {
-        let credentials = state.db.get_credentials(user_id).await?;
+        let credential_jsons = state.db.get_credentials(user_id).await.map_err(db_err)?;
+        let credentials: Vec<Passkey> = credential_jsons
+            .iter()
+            .map(|json| serde_json::from_str(json))
+            .collect::<Result<_, _>>()
+            .map_err(|e| {
+                HttpError::for_internal_error(format!("Invalid stored credential: {e}"))
+            })?;
 
         for passkey in credentials {
             if passkey.cred_id() == auth_result.cred_id() {
                 let mut updated = passkey.clone();
                 updated.update_credential(&auth_result);
-                state.db.update_credential(user_id, &updated).await?;
+
+                let credential_id = BASE64_URL_SAFE_NO_PAD.encode(updated.cred_id().as_ref());
+                let passkey_json = serde_json::to_string(&updated).map_err(|e| {
+                    HttpError::for_internal_error(format!("Failed to serialize passkey: {e}"))
+                })?;
+                state
+                    .db
+                    .update_credential(user_id, &credential_id, &passkey_json)
+                    .await
+                    .map_err(db_err)?;
                 break;
             }
         }

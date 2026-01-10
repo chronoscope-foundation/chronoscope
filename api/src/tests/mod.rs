@@ -15,13 +15,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
-use dropshot::HttpError;
-
-use crate::state::DnsResolver;
-
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chronoscope_db::{
+    Database, Email, GpsLocation, MediaData, MediaId, MediaSlot, MediaType, PageData, PageId,
+    ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
+};
 use dropshot::{
-    ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,
-    ResultsPage,
+    ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpError,
+    HttpServerStarter, ResultsPage,
 };
 use reqwest::{Client, Response};
 use serde::Serialize;
@@ -33,15 +34,10 @@ use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-use crate::db::{GpsLocation, MediaData, MediaSlot, PageData};
 use crate::jwt::JwtConfig;
 use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
 use crate::research_types::{FollowedUrlSummary, ResearchUrlDossier, ResearchUrlSummary};
-use crate::state::{AppState, Config};
-use crate::types::{
-    Email, MediaId, MediaType, PageId, ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
-};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use crate::state::{AppState, Config, DnsResolver};
 
 // ==================== Test Utilities ====================
 
@@ -213,7 +209,7 @@ impl TestContext {
     }
 
     /// Direct access to the database for testing DB layer error paths.
-    fn db(&self) -> &crate::db::Database {
+    fn db(&self) -> &Database {
         &self.app_state.db
     }
 
@@ -428,7 +424,7 @@ impl TestContext {
         sqlx::query("UPDATE research_urls SET created_at = ? WHERE id = ?")
             .bind(timestamp)
             .bind(id.as_str())
-            .execute(self.app_state.db.pool())
+            .execute(self.app_state.db.pool_ref())
             .await?;
         Ok(())
     }

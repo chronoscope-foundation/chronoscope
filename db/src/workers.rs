@@ -6,9 +6,10 @@
 use chrono::NaiveDateTime;
 use serde::Serialize;
 
-use super::{Database, DbResult, GpsLocation, MediaData, MediaId, PageData, PageId, now};
-use crate::queries;
-use crate::types::ResearchUrlId;
+use crate::error::{DbError, DbResult};
+use crate::models::{GpsLocation, MediaData, PageData, ResearchUrl};
+use crate::types::{MediaId, PageId, ResearchUrlId};
+use crate::{Database, now, queries};
 
 /// Helper struct for batch URL insertion JSON payload.
 #[derive(Serialize)]
@@ -31,7 +32,7 @@ impl Database {
     /// or `DbError::Sqlx` if the database operation fails.
     pub async fn create_page(&self, data: &PageData) -> DbResult<PageId> {
         if !data.media.iter().all(|slot| slot.resolved.is_none()) {
-            return Err(super::DbError::InvalidArgument(
+            return Err(DbError::InvalidArgument(
                 "create_page received pre-resolved media - this is a logic error".to_string(),
             ));
         }
@@ -54,7 +55,6 @@ impl Database {
             .execute(&mut *tx)
             .await?;
 
-        // @cc can we just have the logic below be guarded by data.media not being empty to avoid the early return here?
         if data.media.is_empty() {
             tx.commit().await?;
             return Ok(page_id);
@@ -207,7 +207,7 @@ impl Database {
         worker_id: &str,
         batch_size: u32,
         stale_threshold: NaiveDateTime,
-    ) -> DbResult<Vec<super::ResearchUrl>> {
+    ) -> DbResult<Vec<ResearchUrl>> {
         let now = now();
 
         let urls = sqlx::query_as(queries::CLAIM_URLS.sql)

@@ -191,14 +191,8 @@ async fn test_pagination_limit_zero_rejected() -> TestResult {
         .await?;
 
     // limit=0 should be rejected by Dropshot's validation
-    let resp = ctx
-        .get_auth("/users/me/following?limit=0", &token)
-        .await?;
-    assert_eq!(
-        resp.status(),
-        400,
-        "limit=0 should be rejected as invalid"
-    );
+    let resp = ctx.get_auth("/users/me/following?limit=0", &token).await?;
+    assert_eq!(resp.status(), 400, "limit=0 should be rejected as invalid");
     Ok(())
 }
 
@@ -211,9 +205,7 @@ async fn test_pagination_negative_limit_rejected() -> TestResult {
         .await?;
 
     // Negative limit should be rejected
-    let resp = ctx
-        .get_auth("/users/me/following?limit=-1", &token)
-        .await?;
+    let resp = ctx.get_auth("/users/me/following?limit=-1", &token).await?;
     assert_eq!(
         resp.status(),
         400,

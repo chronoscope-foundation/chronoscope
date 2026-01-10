@@ -1,4 +1,4 @@
-//! Query definitions for the Chronoscope API.
+//! Query definitions for Chronoscope.
 //!
 //! All database queries are defined here to enable:
 //! - Centralized query management
@@ -200,7 +200,7 @@ define_queries! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Database;
+    use crate::Database;
 
     #[tokio::test]
     async fn test_all_queries_use_indexes() -> Result<(), Box<dyn std::error::Error + Send + Sync>>

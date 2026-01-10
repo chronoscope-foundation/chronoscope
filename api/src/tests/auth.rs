@@ -547,7 +547,7 @@ async fn test_clone_detection_rejects_stale_counter() -> TestResult {
     )
     .bind(inflated_counter)
     .bind(&username)
-    .execute(ctx.app_state.db.pool())
+    .execute(ctx.app_state.db.pool_ref())
     .await?;
 
     // Now try to login again. The authenticator's counter will be ~2,

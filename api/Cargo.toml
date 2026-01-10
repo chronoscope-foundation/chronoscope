@@ -20,11 +20,8 @@ webauthn-rs-proto = "0.5"
 # JWT for session tokens - using jwt-compact with pure Rust HMAC (no RSA dep)
 jwt-compact = { version = "0.8", features = ["clock"] }
 
-# Database - sqlx with SQLite for now, same API works for Postgres later
-# runtime-tokio: use tokio async runtime
-# sqlite: SQLite driver
-# Note: default-features=false to avoid pulling in mysql/postgres and their vulnerable deps
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive", "chrono"] }
+# Database layer
+chronoscope-db = { path = "../db" }
 
 # Serialization
 serde.workspace = true
@@ -60,3 +57,6 @@ serial_test = "3"
 
 # WebAuthn authenticator simulator
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }
+
+# Database access for test setup (raw queries)
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }

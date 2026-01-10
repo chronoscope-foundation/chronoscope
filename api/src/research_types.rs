@@ -4,11 +4,11 @@
 //! the resolved content (page or media), extracted metadata, and analysis results.
 
 use chrono::NaiveDateTime;
+use chronoscope_db::{
+    FollowedUrl, MediaId, MediaType, ResearchUrl, ResearchUrlId, ResearchUrlStatus, SourceType,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use crate::db::{FollowedUrl, ResearchUrl};
-use crate::types::{MediaId, MediaType, ResearchUrlId, ResearchUrlStatus, SourceType};
 
 // ==================== Analysis Outcome (Generic) ====================
 

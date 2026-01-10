@@ -183,3 +183,93 @@ impl AsRef<str> for Email {
         &self.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ID type tests (using UserId as representative)
+    #[test]
+    fn user_id_new_as_str_roundtrip() {
+        let id = UserId::new("test-123");
+        assert_eq!(id.as_str(), "test-123");
+    }
+
+    #[test]
+    fn user_id_generate_is_valid_uuid() {
+        let id = UserId::generate();
+        // UUIDv7 format: 8-4-4-4-12 hex chars with dashes = 36 chars
+        assert_eq!(id.as_str().len(), 36);
+        assert!(uuid::Uuid::parse_str(id.as_str()).is_ok());
+    }
+
+    #[test]
+    fn user_id_display() {
+        let id = UserId::new("abc-123");
+        assert_eq!(format!("{id}"), "abc-123");
+    }
+
+    #[test]
+    fn user_id_as_ref() {
+        let id = UserId::new("ref-test");
+        let s: &str = id.as_ref();
+        assert_eq!(s, "ref-test");
+    }
+
+    // Enum serialization tests
+    #[test]
+    fn research_url_status_json_roundtrip() -> Result<(), serde_json::Error> {
+        let status = ResearchUrlStatus::Analyzing;
+        let json = serde_json::to_string(&status)?;
+        assert_eq!(json, "\"analyzing\"");
+        let back: ResearchUrlStatus = serde_json::from_str(&json)?;
+        assert_eq!(back, status);
+        Ok(())
+    }
+
+    #[test]
+    fn research_url_status_as_str_matches_serde() -> Result<(), serde_json::Error> {
+        for status in [
+            ResearchUrlStatus::Pending,
+            ResearchUrlStatus::Analyzing,
+            ResearchUrlStatus::Complete,
+            ResearchUrlStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status)?;
+            assert_eq!(json, format!("\"{}\"", status.as_str()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_type_json_roundtrip() -> Result<(), serde_json::Error> {
+        let source = SourceType::Loc;
+        let json = serde_json::to_string(&source)?;
+        assert_eq!(json, "\"loc\"");
+        let back: SourceType = serde_json::from_str(&json)?;
+        assert_eq!(back, source);
+        Ok(())
+    }
+
+    #[test]
+    fn media_type_json_roundtrip() -> Result<(), serde_json::Error> {
+        let mt = MediaType::Video;
+        let json = serde_json::to_string(&mt)?;
+        assert_eq!(json, "\"video\"");
+        let back: MediaType = serde_json::from_str(&json)?;
+        assert_eq!(back, mt);
+        Ok(())
+    }
+
+    #[test]
+    fn email_new_as_str_roundtrip() {
+        let email = Email::new("test@example.com");
+        assert_eq!(email.as_str(), "test@example.com");
+    }
+
+    #[test]
+    fn email_display() {
+        let email = Email::new("display@example.com");
+        assert_eq!(format!("{email}"), "display@example.com");
+    }
+}

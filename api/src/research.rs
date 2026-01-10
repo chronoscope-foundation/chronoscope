@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
+use chronoscope_db::{Media, MediaSlot, Page, ResearchUrlId, ResearchUrlWithResolved};
 use dropshot::{
     Body, EmptyScanParams, HttpError, HttpResponseOk, PaginationParams, Query, RequestContext,
     ResultsPage, TypedBody, WhichPage, endpoint,
@@ -11,14 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::validate_session;
 use crate::cdn;
-use crate::db::{Media, MediaSlot, Page, ResearchUrlWithResolved};
 use crate::research_types::{
     GpsCoordinates, MediaAnalysis, MediaDossier, MediaReference, PageDossier, ResearchUrlDossier,
     ResearchUrlSummary, ResolvedContent, UrlAnalysis,
 };
 use crate::state::AppState;
-use crate::types::ResearchUrlId;
 use crate::url_security::validate_url;
+use crate::validation::db_err;
 
 // ==================== Pagination Types ====================
 
@@ -68,7 +68,11 @@ pub async fn submit_research(
     // Validate URL format, scheme, length, and check for SSRF (private IPs, etc.)
     let _validated_url = validate_url(&req.url, &*state.dns_resolver).await?;
 
-    let (id, created) = state.db.submit_url(&user_id, &req.url).await?;
+    let (id, created) = state
+        .db
+        .submit_url(&user_id, &req.url)
+        .await
+        .map_err(db_err)?;
 
     let response = SubmitResearchResponse { id };
     let body_bytes = serde_json::to_vec(&response)
@@ -110,7 +114,11 @@ pub async fn list_research(
 
     let limit_i64 = i64::from(limit);
     let cursor_ref = cursor.map(|s| (s.created_at, &s.id));
-    let urls = state.db.list_all_urls(limit_i64, cursor_ref).await?;
+    let urls = state
+        .db
+        .list_all_urls(limit_i64, cursor_ref)
+        .await
+        .map_err(db_err)?;
 
     let items: Vec<ResearchUrlSummary> = urls.into_iter().map(ResearchUrlSummary::from).collect();
 
@@ -140,7 +148,8 @@ pub async fn get_research(
     let dossier_data = state
         .db
         .get_research_dossier(id)
-        .await?
+        .await
+        .map_err(db_err)?
         .ok_or_else(|| HttpError::for_not_found(None, "Research URL not found".to_string()))?;
 
     let dossier = build_dossier(dossier_data, &state.config.cdn_base_url)?;
@@ -172,10 +181,10 @@ fn build_resolved_content(
     cdn_base_url: &str,
 ) -> Result<Option<ResolvedContent>, HttpError> {
     match &data.resolved {
-        Some(crate::db::ResolvedContent::Page(page)) => Ok(Some(ResolvedContent::Page(
+        Some(chronoscope_db::ResolvedContent::Page(page)) => Ok(Some(ResolvedContent::Page(
             convert_page(page, cdn_base_url)?,
         ))),
-        Some(crate::db::ResolvedContent::Media(media)) => Ok(Some(ResolvedContent::Media(
+        Some(chronoscope_db::ResolvedContent::Media(media)) => Ok(Some(ResolvedContent::Media(
             convert_media(media, cdn_base_url)?,
         ))),
         None => Ok(None),
@@ -272,9 +281,8 @@ fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, Http
 mod tests {
     use super::*;
     use crate::cdn::tests::TEST_CDN_BASE_URL;
-    use crate::db::{GpsLocation, Media, MediaData, MediaSlot};
-    use crate::types::{MediaId, MediaType};
     use chrono::{NaiveDate, NaiveDateTime};
+    use chronoscope_db::{GpsLocation, MediaData, MediaId, MediaType};
 
     #[allow(clippy::expect_used)]
     fn test_timestamp() -> NaiveDateTime {
@@ -433,9 +441,11 @@ mod tests {
         let mut media = minimal_media();
         media.data.width = -100; // Negative width (DB corruption)
 
-        let err = convert_media(&media, TEST_CDN_BASE_URL).err().ok_or_else(|| {
-            HttpError::for_bad_request(None, "Negative width should return error".to_string())
-        })?;
+        let err = convert_media(&media, TEST_CDN_BASE_URL)
+            .err()
+            .ok_or_else(|| {
+                HttpError::for_bad_request(None, "Negative width should return error".to_string())
+            })?;
 
         assert!(
             err.internal_message.contains("Invalid width"),
@@ -450,9 +460,11 @@ mod tests {
         let mut media = minimal_media();
         media.data.height = -50; // Negative height (DB corruption)
 
-        let err = convert_media(&media, TEST_CDN_BASE_URL).err().ok_or_else(|| {
-            HttpError::for_bad_request(None, "Negative height should return error".to_string())
-        })?;
+        let err = convert_media(&media, TEST_CDN_BASE_URL)
+            .err()
+            .ok_or_else(|| {
+                HttpError::for_bad_request(None, "Negative height should return error".to_string())
+            })?;
 
         assert!(
             err.internal_message.contains("Invalid height"),

@@ -239,6 +239,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "chronoscope-db",
  "dropshot",
  "hickory-resolver",
  "http",
@@ -259,6 +260,22 @@ dependencies = [
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "webauthn-rs-proto",
+]
+
+[[package]]
+name = "chronoscope-db"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.17",
+ "tokio",
+ "tokio-test",
+ "uuid",
 ]
 
 [[package]]

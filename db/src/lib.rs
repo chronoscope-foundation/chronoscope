@@ -1,318 +1,37 @@
+//! Chronoscope database layer.
+//!
+//! This crate provides database access for the Chronoscope platform.
+//! It is used by both the API server and background workers.
+
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+#![deny(unsafe_code)]
+
+pub mod error;
+pub mod models;
+pub mod queries;
+pub mod types;
 mod workers;
 
 use chrono::{NaiveDateTime, Utc};
-use dropshot::HttpError;
-use sqlx::FromRow;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
-use thiserror::Error;
-use webauthn_rs::prelude::Passkey;
 
-use crate::queries;
-use crate::types::{
+pub use error::{DbError, DbResult, is_unique_violation};
+pub use models::{
+    FollowedUrl, GpsLocation, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl,
+    ResearchUrlWithResolved, ResolvedContent, User,
+};
+pub use types::{
     Email, MediaId, MediaType, PageId, ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
 };
 
-#[derive(Error, Debug)]
-pub enum DbError {
-    #[error("Database error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+use models::{MediaDbRow, PageDbRow, PageMediaRow};
 
-    #[error("Migration error: {0}")]
-    Migrate(#[from] sqlx::migrate::MigrateError),
-
-    #[error("JSON serialization error: {0}")]
-    Json(#[from] serde_json::Error),
-
-    #[error("Query plan verification failed: {0}")]
-    QueryPlan(#[from] queries::QueryPlanError),
-
-    #[error("User not found")]
-    UserNotFound,
-
-    #[error("Credential not found")]
-    CredentialNotFound,
-
-    #[error("Invalid argument: {0}")]
-    InvalidArgument(String),
-}
-
-pub type DbResult<T> = Result<T, DbError>;
-
-// ==================== Data Types ====================
-
-/// GPS location with latitude, longitude, and optional altitude.
-/// Designed to match future PostGIS/Spatialite POINT type.
-#[derive(Debug, Clone)]
-pub struct GpsLocation {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub altitude: Option<f64>,
-}
-
-impl GpsLocation {
-    /// Reconstruct GPS location from separate lat/lon/alt columns.
-    /// Returns None if lat/lon are missing or only partially present.
-    pub(crate) fn from_columns(
-        lat: Option<f64>,
-        lon: Option<f64>,
-        alt: Option<f64>,
-    ) -> Option<Self> {
-        match (lat, lon) {
-            (Some(latitude), Some(longitude)) => Some(GpsLocation {
-                latitude,
-                longitude,
-                altitude: alt,
-            }),
-            _ => None,
-        }
-    }
-
-    /// Decompose an optional GPS location into separate column values for database storage.
-    pub(crate) fn to_columns(location: Option<&Self>) -> (Option<f64>, Option<f64>, Option<f64>) {
-        match location {
-            Some(loc) => (Some(loc.latitude), Some(loc.longitude), loc.altitude),
-            None => (None, None, None),
-        }
-    }
-}
-
-/// A user account
-#[derive(Debug, Clone, FromRow)]
-pub struct User {
-    pub id: UserId,
-    pub username: String,
-    pub email: Email,
-    pub created_at: NaiveDateTime,
-}
-
-/// A research URL (canonical, deduplicated)
-/// Note: page_id and media_id are mutually exclusive (enforced by DB constraint)
-#[derive(Debug, Clone, FromRow)]
-pub struct ResearchUrl {
-    pub id: ResearchUrlId,
-    pub url: String,
-    pub page_id: Option<PageId>,
-    pub media_id: Option<MediaId>,
-    pub status: ResearchUrlStatus,
-    pub created_at: NaiveDateTime,
-}
-
-/// A research URL that a user follows (includes follow timestamp)
-#[derive(Debug, Clone, FromRow)]
-pub struct FollowedUrl {
-    #[sqlx(flatten)]
-    pub research_url: ResearchUrl,
-    pub followed_at: NaiveDateTime,
-}
-
-/// A media slot - a URL reference that may or may not be resolved to Media yet
-#[derive(Debug, Clone)]
-pub struct MediaSlot {
-    pub url: String,
-    pub resolved: Option<Media>,
-}
-
-impl MediaSlot {
-    /// Create a slot for a URL that hasn't been fetched yet
-    pub fn pending(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            resolved: None,
-        }
-    }
-}
-
-/// Core page data (used for both creation and reading)
-#[derive(Debug, Clone)]
-pub struct PageData {
-    pub source_type: SourceType,
-    pub title: Option<String>,
-    pub author: Option<String>,
-    pub published_at: Option<NaiveDateTime>,
-    pub content: Option<String>,
-    pub fetched_at: NaiveDateTime,
-    /// Media referenced by this page (in source order)
-    pub media: Vec<MediaSlot>,
-}
-
-/// A page with database-generated fields
-#[derive(Debug, Clone)]
-pub struct Page {
-    pub id: PageId,
-    pub data: PageData,
-    pub created_at: NaiveDateTime,
-}
-
-/// Internal row type for reading pages from DB (no media, fetched separately)
-#[derive(Debug, FromRow)]
-struct PageDbRow {
-    id: PageId,
-    source_type: SourceType,
-    title: Option<String>,
-    author: Option<String>,
-    published_at: Option<NaiveDateTime>,
-    content: Option<String>,
-    fetched_at: NaiveDateTime,
-    created_at: NaiveDateTime,
-}
-
-/// Core media data (used for both creation and reading)
-#[derive(Debug, Clone)]
-pub struct MediaData {
-    pub exact_hash: Vec<u8>,
-    pub perceptual_hash: Option<Vec<u8>>,
-    pub storage_key: String,
-    pub media_type: MediaType,
-    pub width: i32,
-    pub height: i32,
-    pub duration_seconds: Option<f32>,
-    pub captured_at: Option<NaiveDateTime>,
-    pub location: Option<GpsLocation>,
-    pub source_metadata: Option<String>, // JSON stored as text
-    pub fetched_at: NaiveDateTime,
-}
-
-/// A media item with database-generated fields
-#[derive(Debug, Clone)]
-pub struct Media {
-    pub id: MediaId,
-    pub data: MediaData,
-    pub created_at: NaiveDateTime,
-}
-
-/// Internal row type for sqlx (maps to flat DB columns)
-#[derive(Debug, FromRow)]
-pub(crate) struct MediaDbRow {
-    id: MediaId,
-    exact_hash: Vec<u8>,
-    perceptual_hash: Option<Vec<u8>>,
-    storage_key: String,
-    media_type: MediaType,
-    width: i32,
-    height: i32,
-    duration_seconds: Option<f32>,
-    captured_at: Option<NaiveDateTime>,
-    gps_latitude: Option<f64>,
-    gps_longitude: Option<f64>,
-    gps_altitude: Option<f64>,
-    source_metadata: Option<String>,
-    fetched_at: NaiveDateTime,
-    created_at: NaiveDateTime,
-}
-
-impl MediaDbRow {
-    pub(crate) fn into_media(self) -> Media {
-        Media {
-            id: self.id,
-            data: MediaData {
-                exact_hash: self.exact_hash,
-                perceptual_hash: self.perceptual_hash,
-                storage_key: self.storage_key,
-                media_type: self.media_type,
-                width: self.width,
-                height: self.height,
-                duration_seconds: self.duration_seconds,
-                captured_at: self.captured_at,
-                location: GpsLocation::from_columns(
-                    self.gps_latitude,
-                    self.gps_longitude,
-                    self.gps_altitude,
-                ),
-                source_metadata: self.source_metadata,
-                fetched_at: self.fetched_at,
-            },
-            created_at: self.created_at,
-        }
-    }
-}
-
-/// Resolved content - either a page with embedded media, or direct media
-#[derive(Debug, Clone)]
-pub enum ResolvedContent {
-    Page(Page),
-    Media(Media),
-}
-
-/// Full dossier data for a research URL
-#[derive(Debug, Clone)]
-pub struct ResearchUrlWithResolved {
-    pub research_url: ResearchUrl,
-    pub resolved: Option<ResolvedContent>,
-}
-
-/// Raw row from the page media query (internal use only)
-#[derive(Debug, FromRow)]
-struct PageMediaRow {
-    source_url: String,
-    // Media fields (all optional since LEFT JOIN)
-    id: Option<MediaId>,
-    exact_hash: Option<Vec<u8>>,
-    perceptual_hash: Option<Vec<u8>>,
-    storage_key: Option<String>,
-    media_type: Option<MediaType>,
-    width: Option<i32>,
-    height: Option<i32>,
-    duration_seconds: Option<f32>,
-    captured_at: Option<NaiveDateTime>,
-    gps_latitude: Option<f64>,
-    gps_longitude: Option<f64>,
-    gps_altitude: Option<f64>,
-    source_metadata: Option<String>,
-    fetched_at: Option<NaiveDateTime>,
-    created_at: Option<NaiveDateTime>,
-}
-
-impl PageMediaRow {
-    fn into_media_slot(self) -> MediaSlot {
-        let resolved = match (
-            self.id,
-            self.exact_hash,
-            self.storage_key,
-            self.media_type,
-            self.width,
-            self.height,
-            self.fetched_at,
-            self.created_at,
-        ) {
-            (
-                Some(id),
-                Some(exact_hash),
-                Some(storage_key),
-                Some(media_type),
-                Some(width),
-                Some(height),
-                Some(fetched_at),
-                Some(created_at),
-            ) => Some(Media {
-                id,
-                data: MediaData {
-                    exact_hash,
-                    perceptual_hash: self.perceptual_hash,
-                    storage_key,
-                    media_type,
-                    width,
-                    height,
-                    duration_seconds: self.duration_seconds,
-                    captured_at: self.captured_at,
-                    location: GpsLocation::from_columns(
-                        self.gps_latitude,
-                        self.gps_longitude,
-                        self.gps_altitude,
-                    ),
-                    source_metadata: self.source_metadata,
-                    fetched_at,
-                },
-                created_at,
-            }),
-            _ => None,
-        };
-
-        MediaSlot {
-            url: self.source_url,
-            resolved,
-        }
-    }
+/// Get the current UTC timestamp as NaiveDateTime for database storage.
+pub(crate) fn now() -> NaiveDateTime {
+    Utc::now().naive_utc()
 }
 
 // ==================== Database ====================
@@ -322,15 +41,16 @@ pub struct Database {
     pool: SqlitePool,
 }
 
-/// Get the current UTC timestamp as NaiveDateTime for database storage.
-fn now() -> NaiveDateTime {
-    Utc::now().naive_utc()
-}
-
 impl Database {
     /// Get access to the underlying pool (for tests that need raw queries)
     #[cfg(test)]
     pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    /// Get access to the underlying pool (needed by API crate for its tests)
+    #[must_use]
+    pub fn pool_ref(&self) -> &SqlitePool {
         &self.pool
     }
 }
@@ -361,7 +81,6 @@ impl Database {
     /// Create a new database connection pool and run migrations, but skip query plan verification.
     ///
     /// This is used by tests that want to verify query plans themselves (to avoid circular dependency).
-    #[cfg(test)]
     pub async fn new_without_plan_verification(database_url: &str) -> DbResult<Self> {
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
@@ -465,22 +184,21 @@ impl Database {
 
     // ==================== Credentials ====================
 
-    /// Store a new passkey credential
+    /// Store a new passkey credential as JSON.
     ///
     /// # Errors
-    /// Returns `DbError::Sqlx` or `DbError::Json` if the operation fails.
-    pub async fn add_credential(&self, user_id: &UserId, passkey: &Passkey) -> DbResult<()> {
-        let credential_id = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            passkey.cred_id().as_ref(),
-        );
-        let passkey_json = serde_json::to_string(passkey)?;
-
+    /// Returns `DbError::Sqlx` if the operation fails.
+    pub async fn add_credential(
+        &self,
+        user_id: &UserId,
+        credential_id: &str,
+        passkey_json: &str,
+    ) -> DbResult<()> {
         queries::ADD_CREDENTIAL
             .query()
             .bind(user_id)
-            .bind(&credential_id)
-            .bind(&passkey_json)
+            .bind(credential_id)
+            .bind(passkey_json)
             .bind(now())
             .execute(&self.pool)
             .await?;
@@ -488,19 +206,17 @@ impl Database {
         Ok(())
     }
 
-    /// Get all credentials for a user
+    /// Get all credentials for a user as JSON strings.
     ///
     /// # Errors
-    /// Returns `DbError::Sqlx` or `DbError::Json` if the operation fails.
-    pub async fn get_credentials(&self, user_id: &UserId) -> DbResult<Vec<Passkey>> {
+    /// Returns `DbError::Sqlx` if the operation fails.
+    pub async fn get_credentials(&self, user_id: &UserId) -> DbResult<Vec<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(queries::GET_CREDENTIALS.sql)
             .bind(user_id)
             .fetch_all(&self.pool)
             .await?;
 
-        rows.into_iter()
-            .map(|(json,)| serde_json::from_str(&json).map_err(DbError::from))
-            .collect()
+        Ok(rows.into_iter().map(|(json,)| json).collect())
     }
 
     /// Update a credential after successful authentication.
@@ -508,19 +224,18 @@ impl Database {
     /// (webauthn-rs rejects authentication if the counter doesn't increase).
     ///
     /// # Errors
-    /// Returns `DbError::Sqlx`, `DbError::Json`, or `DbError::CredentialNotFound`.
-    pub async fn update_credential(&self, user_id: &UserId, passkey: &Passkey) -> DbResult<()> {
-        let passkey_json = serde_json::to_string(passkey)?;
-        let credential_id = base64::Engine::encode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            passkey.cred_id().as_ref(),
-        );
-
+    /// Returns `DbError::Sqlx` or `DbError::CredentialNotFound`.
+    pub async fn update_credential(
+        &self,
+        user_id: &UserId,
+        credential_id: &str,
+        passkey_json: &str,
+    ) -> DbResult<()> {
         let rows_affected = queries::UPDATE_CREDENTIAL
             .query()
-            .bind(&passkey_json)
+            .bind(passkey_json)
             .bind(user_id)
-            .bind(&credential_id)
+            .bind(credential_id)
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -778,45 +493,5 @@ impl Database {
             research_url,
             resolved,
         }))
-    }
-}
-
-impl From<DbError> for HttpError {
-    fn from(e: DbError) -> Self {
-        // Internal message logged by Dropshot; external message sent to client
-        HttpError::for_internal_error(e.to_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_db_error_to_http_error_hides_details_but_logs_them() {
-        // External message should be generic (sent to client)
-        // Internal message should contain details (logged by Dropshot)
-        let err = DbError::UserNotFound;
-        let http_err: HttpError = err.into();
-
-        assert!(http_err.status_code.is_server_error());
-        assert_eq!(http_err.external_message, "Internal Server Error");
-        assert_eq!(http_err.internal_message, "User not found");
-
-        let err = DbError::CredentialNotFound;
-        let http_err: HttpError = err.into();
-
-        assert!(http_err.status_code.is_server_error());
-        assert_eq!(http_err.external_message, "Internal Server Error");
-        assert_eq!(http_err.internal_message, "Credential not found");
-    }
-
-    #[test]
-    fn test_db_error_display() {
-        assert_eq!(DbError::UserNotFound.to_string(), "User not found");
-        assert_eq!(
-            DbError::CredentialNotFound.to_string(),
-            "Credential not found"
-        );
     }
 }

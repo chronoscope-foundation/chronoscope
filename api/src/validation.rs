@@ -1,8 +1,18 @@
 //! Shared validation utilities for request data.
 
+use chronoscope_db::DbError;
 use dropshot::HttpError;
 
-use crate::db::DbError;
+// Re-export from db crate for convenience
+pub use chronoscope_db::is_unique_violation;
+
+/// Convert a `DbError` to an `HttpError` for use in API handlers.
+///
+/// This logs the detailed error internally (visible in Dropshot logs) while
+/// returning a generic "Internal Server Error" to clients.
+pub fn db_err(e: DbError) -> HttpError {
+    HttpError::for_internal_error(e.to_string())
+}
 
 /// Validate username format.
 ///
@@ -54,15 +64,6 @@ pub fn validate_email(email: &str) -> Result<(), HttpError> {
         ));
     }
     Ok(())
-}
-
-/// Check if a database error is a uniqueness constraint violation.
-#[must_use]
-pub fn is_unique_violation(err: &DbError) -> bool {
-    let DbError::Sqlx(sqlx::Error::Database(db_err)) = err else {
-        return false;
-    };
-    db_err.kind() == sqlx::error::ErrorKind::UniqueViolation
 }
 
 #[cfg(test)]
@@ -133,5 +134,24 @@ mod tests {
         assert!(validate_email("@b").is_err()); // no local part
         assert!(validate_email("a@").is_err()); // no domain
         assert!(validate_email("a@@b").is_err()); // multiple @
+    }
+
+    // ==================== db_err Tests ====================
+
+    #[test]
+    fn test_db_error_to_http_error_hides_details_but_logs_them() {
+        // External message should be generic (sent to client)
+        // Internal message should contain details (logged by Dropshot)
+        let http_err = db_err(DbError::UserNotFound);
+
+        assert!(http_err.status_code.is_server_error());
+        assert_eq!(http_err.external_message, "Internal Server Error");
+        assert_eq!(http_err.internal_message, "User not found");
+
+        let http_err = db_err(DbError::CredentialNotFound);
+
+        assert!(http_err.status_code.is_server_error());
+        assert_eq!(http_err.external_message, "Internal Server Error");
+        assert_eq!(http_err.internal_message, "Credential not found");
     }
 }

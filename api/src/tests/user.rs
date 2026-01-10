@@ -1,7 +1,7 @@
 //! User management tests: username/email updates, conflicts, login by email
 
-use crate::db::DbError;
-use crate::types::Email;
+use chronoscope_db::{DbError, Email, UserId};
+
 use crate::users::{UpdateUserRequest, UserResponse};
 
 use super::*;
@@ -302,14 +302,23 @@ async fn test_db_update_credential_nonexistent_returns_error() -> TestResult {
     // Get the user's credentials
     let user: UserResponse = ctx.get_auth("/users/me", &token).await?.json().await?;
 
-    // Get credentials for this user
-    let credentials = ctx.db().get_credentials(&user.user_id).await?;
-    assert!(!credentials.is_empty(), "User should have credentials");
-    let passkey = &credentials[0];
+    // Get credentials for this user (as JSON strings)
+    let credential_jsons = ctx.db().get_credentials(&user.user_id).await?;
+    assert!(!credential_jsons.is_empty(), "User should have credentials");
+
+    // Parse the first credential to get its ID
+    let passkey: webauthn_rs::prelude::Passkey = serde_json::from_str(&credential_jsons[0])?;
+    let credential_id = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        passkey.cred_id().as_ref(),
+    );
 
     // Try to update this credential for a different (non-existent) user
     let fake_user_id = UserId::new("nonexistent-user-id");
-    let result = ctx.db().update_credential(&fake_user_id, passkey).await;
+    let result = ctx
+        .db()
+        .update_credential(&fake_user_id, &credential_id, &credential_jsons[0])
+        .await;
 
     assert!(
         matches!(result, Err(DbError::CredentialNotFound)),

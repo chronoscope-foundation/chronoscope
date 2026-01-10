@@ -9,13 +9,10 @@ use dropshot::ApiDescription;
 
 pub mod auth;
 pub mod cdn;
-pub mod db;
 pub mod jwt;
-pub mod queries;
 pub mod research;
 pub mod research_types;
 pub mod state;
-pub mod types;
 pub mod url_security;
 pub mod users;
 pub mod validation;
