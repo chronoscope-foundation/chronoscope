@@ -38,6 +38,8 @@ url.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 semver = "1"
+openapiv3 = "2.2"
+indexmap = "2"
 
 hickory-resolver = "0.25"
 async-trait = "0.1"
