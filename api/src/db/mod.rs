@@ -1,4 +1,6 @@
-use chrono::NaiveDateTime;
+mod workers;
+
+use chrono::{NaiveDateTime, Utc};
 use dropshot::HttpError;
 use sqlx::FromRow;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -7,7 +9,9 @@ use thiserror::Error;
 use webauthn_rs::prelude::Passkey;
 
 use crate::queries;
-use crate::types::{Email, ResearchUrlId, UserId};
+use crate::types::{
+    Email, MediaId, MediaType, PageId, ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
+};
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -28,11 +32,50 @@ pub enum DbError {
 
     #[error("Credential not found")]
     CredentialNotFound,
+
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
 
 // ==================== Data Types ====================
+
+/// GPS location with latitude, longitude, and optional altitude.
+/// Designed to match future PostGIS/Spatialite POINT type.
+#[derive(Debug, Clone)]
+pub struct GpsLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    pub altitude: Option<f64>,
+}
+
+impl GpsLocation {
+    /// Reconstruct GPS location from separate lat/lon/alt columns.
+    /// Returns None if lat/lon are missing or only partially present.
+    pub(crate) fn from_columns(
+        lat: Option<f64>,
+        lon: Option<f64>,
+        alt: Option<f64>,
+    ) -> Option<Self> {
+        match (lat, lon) {
+            (Some(latitude), Some(longitude)) => Some(GpsLocation {
+                latitude,
+                longitude,
+                altitude: alt,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Decompose an optional GPS location into separate column values for database storage.
+    pub(crate) fn to_columns(location: Option<&Self>) -> (Option<f64>, Option<f64>, Option<f64>) {
+        match location {
+            Some(loc) => (Some(loc.latitude), Some(loc.longitude), loc.altitude),
+            None => (None, None, None),
+        }
+    }
+}
 
 /// A user account
 #[derive(Debug, Clone, FromRow)]
@@ -44,20 +87,232 @@ pub struct User {
 }
 
 /// A research URL (canonical, deduplicated)
+/// Note: page_id and media_id are mutually exclusive (enforced by DB constraint)
 #[derive(Debug, Clone, FromRow)]
 pub struct ResearchUrl {
     pub id: ResearchUrlId,
     pub url: String,
+    pub page_id: Option<PageId>,
+    pub media_id: Option<MediaId>,
+    pub status: ResearchUrlStatus,
     pub created_at: NaiveDateTime,
 }
 
 /// A research URL that a user follows (includes follow timestamp)
 #[derive(Debug, Clone, FromRow)]
 pub struct FollowedUrl {
-    pub id: ResearchUrlId,
-    pub url: String,
-    pub created_at: NaiveDateTime,
+    #[sqlx(flatten)]
+    pub research_url: ResearchUrl,
     pub followed_at: NaiveDateTime,
+}
+
+/// A media slot - a URL reference that may or may not be resolved to Media yet
+#[derive(Debug, Clone)]
+pub struct MediaSlot {
+    pub url: String,
+    pub resolved: Option<Media>,
+}
+
+impl MediaSlot {
+    /// Create a slot for a URL that hasn't been fetched yet
+    pub fn pending(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            resolved: None,
+        }
+    }
+}
+
+/// Core page data (used for both creation and reading)
+#[derive(Debug, Clone)]
+pub struct PageData {
+    pub source_type: SourceType,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub published_at: Option<NaiveDateTime>,
+    pub content: Option<String>,
+    pub fetched_at: NaiveDateTime,
+    /// Media referenced by this page (in source order)
+    pub media: Vec<MediaSlot>,
+}
+
+/// A page with database-generated fields
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub id: PageId,
+    pub data: PageData,
+    pub created_at: NaiveDateTime,
+}
+
+/// Internal row type for reading pages from DB (no media, fetched separately)
+#[derive(Debug, FromRow)]
+struct PageDbRow {
+    id: PageId,
+    source_type: SourceType,
+    title: Option<String>,
+    author: Option<String>,
+    published_at: Option<NaiveDateTime>,
+    content: Option<String>,
+    fetched_at: NaiveDateTime,
+    created_at: NaiveDateTime,
+}
+
+/// Core media data (used for both creation and reading)
+#[derive(Debug, Clone)]
+pub struct MediaData {
+    pub exact_hash: Vec<u8>,
+    pub perceptual_hash: Option<Vec<u8>>,
+    pub storage_key: String,
+    pub media_type: MediaType,
+    pub width: i32,
+    pub height: i32,
+    pub duration_seconds: Option<f32>,
+    pub captured_at: Option<NaiveDateTime>,
+    pub location: Option<GpsLocation>,
+    pub source_metadata: Option<String>, // JSON stored as text
+    pub fetched_at: NaiveDateTime,
+}
+
+/// A media item with database-generated fields
+#[derive(Debug, Clone)]
+pub struct Media {
+    pub id: MediaId,
+    pub data: MediaData,
+    pub created_at: NaiveDateTime,
+}
+
+/// Internal row type for sqlx (maps to flat DB columns)
+#[derive(Debug, FromRow)]
+pub(crate) struct MediaDbRow {
+    id: MediaId,
+    exact_hash: Vec<u8>,
+    perceptual_hash: Option<Vec<u8>>,
+    storage_key: String,
+    media_type: MediaType,
+    width: i32,
+    height: i32,
+    duration_seconds: Option<f32>,
+    captured_at: Option<NaiveDateTime>,
+    gps_latitude: Option<f64>,
+    gps_longitude: Option<f64>,
+    gps_altitude: Option<f64>,
+    source_metadata: Option<String>,
+    fetched_at: NaiveDateTime,
+    created_at: NaiveDateTime,
+}
+
+impl MediaDbRow {
+    pub(crate) fn into_media(self) -> Media {
+        Media {
+            id: self.id,
+            data: MediaData {
+                exact_hash: self.exact_hash,
+                perceptual_hash: self.perceptual_hash,
+                storage_key: self.storage_key,
+                media_type: self.media_type,
+                width: self.width,
+                height: self.height,
+                duration_seconds: self.duration_seconds,
+                captured_at: self.captured_at,
+                location: GpsLocation::from_columns(
+                    self.gps_latitude,
+                    self.gps_longitude,
+                    self.gps_altitude,
+                ),
+                source_metadata: self.source_metadata,
+                fetched_at: self.fetched_at,
+            },
+            created_at: self.created_at,
+        }
+    }
+}
+
+/// Resolved content - either a page with embedded media, or direct media
+#[derive(Debug, Clone)]
+pub enum ResolvedContent {
+    Page(Page),
+    Media(Media),
+}
+
+/// Full dossier data for a research URL
+#[derive(Debug, Clone)]
+pub struct ResearchUrlWithResolved {
+    pub research_url: ResearchUrl,
+    pub resolved: Option<ResolvedContent>,
+}
+
+/// Raw row from the page media query (internal use only)
+#[derive(Debug, FromRow)]
+struct PageMediaRow {
+    source_url: String,
+    // Media fields (all optional since LEFT JOIN)
+    id: Option<MediaId>,
+    exact_hash: Option<Vec<u8>>,
+    perceptual_hash: Option<Vec<u8>>,
+    storage_key: Option<String>,
+    media_type: Option<MediaType>,
+    width: Option<i32>,
+    height: Option<i32>,
+    duration_seconds: Option<f32>,
+    captured_at: Option<NaiveDateTime>,
+    gps_latitude: Option<f64>,
+    gps_longitude: Option<f64>,
+    gps_altitude: Option<f64>,
+    source_metadata: Option<String>,
+    fetched_at: Option<NaiveDateTime>,
+    created_at: Option<NaiveDateTime>,
+}
+
+impl PageMediaRow {
+    fn into_media_slot(self) -> MediaSlot {
+        let resolved = match (
+            self.id,
+            self.exact_hash,
+            self.storage_key,
+            self.media_type,
+            self.width,
+            self.height,
+            self.fetched_at,
+            self.created_at,
+        ) {
+            (
+                Some(id),
+                Some(exact_hash),
+                Some(storage_key),
+                Some(media_type),
+                Some(width),
+                Some(height),
+                Some(fetched_at),
+                Some(created_at),
+            ) => Some(Media {
+                id,
+                data: MediaData {
+                    exact_hash,
+                    perceptual_hash: self.perceptual_hash,
+                    storage_key,
+                    media_type,
+                    width,
+                    height,
+                    duration_seconds: self.duration_seconds,
+                    captured_at: self.captured_at,
+                    location: GpsLocation::from_columns(
+                        self.gps_latitude,
+                        self.gps_longitude,
+                        self.gps_altitude,
+                    ),
+                    source_metadata: self.source_metadata,
+                    fetched_at,
+                },
+                created_at,
+            }),
+            _ => None,
+        };
+
+        MediaSlot {
+            url: self.source_url,
+            resolved,
+        }
+    }
 }
 
 // ==================== Database ====================
@@ -65,6 +320,11 @@ pub struct FollowedUrl {
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+}
+
+/// Get the current UTC timestamp as NaiveDateTime for database storage.
+fn now() -> NaiveDateTime {
+    Utc::now().naive_utc()
 }
 
 impl Database {
@@ -129,6 +389,7 @@ impl Database {
             .bind(id)
             .bind(username)
             .bind(email)
+            .bind(now())
             .execute(&self.pool)
             .await?;
 
@@ -220,6 +481,7 @@ impl Database {
             .bind(user_id)
             .bind(&credential_id)
             .bind(&passkey_json)
+            .bind(now())
             .execute(&self.pool)
             .await?;
 
@@ -278,23 +540,27 @@ impl Database {
     /// # Errors
     /// Returns `DbError::Sqlx` if the database operation fails.
     pub async fn submit_url(&self, user_id: &UserId, url: &str) -> DbResult<(ResearchUrlId, bool)> {
-        // Get or create the URL
-        let existing: Option<(ResearchUrlId,)> = sqlx::query_as(queries::GET_URL_BY_URL.sql)
+        // Try to insert the URL (ignored if already exists)
+        let new_id = ResearchUrlId::generate();
+        let result = queries::CREATE_URL_OR_IGNORE
+            .query()
+            .bind(&new_id)
             .bind(url)
-            .fetch_optional(&self.pool)
+            .bind(ResearchUrlStatus::Pending)
+            .bind(0_i32) // attempt_count
+            .bind(now())
+            .execute(&self.pool)
             .await?;
 
-        let (url_id, created) = if let Some((id,)) = existing {
-            (id, false)
+        // If we inserted, use our ID; otherwise fetch the existing one
+        let (url_id, created) = if result.rows_affected() > 0 {
+            (new_id, true)
         } else {
-            let id = ResearchUrlId::generate();
-            queries::CREATE_URL
-                .query()
-                .bind(&id)
+            let (id,): (ResearchUrlId,) = sqlx::query_as(queries::GET_URL_BY_URL.sql)
                 .bind(url)
-                .execute(&self.pool)
+                .fetch_one(&self.pool)
                 .await?;
-            (id, true)
+            (id, false)
         };
 
         // Follow the URL (ignore if already following)
@@ -302,6 +568,7 @@ impl Database {
             .query()
             .bind(user_id)
             .bind(&url_id)
+            .bind(now())
             .execute(&self.pool)
             .await?;
 
@@ -318,6 +585,7 @@ impl Database {
             .query()
             .bind(user_id)
             .bind(url_id)
+            .bind(now())
             .execute(&self.pool)
             .await?
             .rows_affected();
@@ -437,6 +705,79 @@ impl Database {
             .rows_affected();
 
         Ok(rows_affected > 0)
+    }
+
+    // ==================== Dossier ====================
+
+    /// Get a research URL with all resolved content (page or direct media).
+    ///
+    /// This fetches the research URL and, if resolved, the associated page or media.
+    /// For pages, also fetches all referenced media items.
+    ///
+    /// # Errors
+    /// Returns `DbError::Sqlx` if the database operation fails.
+    pub async fn get_research_dossier(
+        &self,
+        id: &ResearchUrlId,
+    ) -> DbResult<Option<ResearchUrlWithResolved>> {
+        // Get the research URL
+        let research_url: Option<ResearchUrl> = sqlx::query_as(queries::GET_URL_BY_ID.sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        let Some(research_url) = research_url else {
+            return Ok(None);
+        };
+
+        // Build resolved content based on what type of resolution we have
+        let resolved = if let Some(ref page_id) = research_url.page_id {
+            // Fetch page row
+            let page_row: Option<PageDbRow> = sqlx::query_as(queries::GET_PAGE_BY_ID.sql)
+                .bind(page_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+            // Fetch media slots for the page
+            let rows: Vec<PageMediaRow> = sqlx::query_as(queries::GET_PAGE_MEDIA.sql)
+                .bind(page_id)
+                .fetch_all(&self.pool)
+                .await?;
+            let media: Vec<MediaSlot> = rows
+                .into_iter()
+                .map(PageMediaRow::into_media_slot)
+                .collect();
+
+            page_row.map(|row| {
+                ResolvedContent::Page(Page {
+                    id: row.id,
+                    data: PageData {
+                        source_type: row.source_type,
+                        title: row.title,
+                        author: row.author,
+                        published_at: row.published_at,
+                        content: row.content,
+                        fetched_at: row.fetched_at,
+                        media,
+                    },
+                    created_at: row.created_at,
+                })
+            })
+        } else if let Some(ref media_id) = research_url.media_id {
+            // Fetch direct media
+            let row: Option<MediaDbRow> = sqlx::query_as(queries::GET_MEDIA_BY_ID.sql)
+                .bind(media_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            row.map(|r| ResolvedContent::Media(r.into_media()))
+        } else {
+            None
+        };
+
+        Ok(Some(ResearchUrlWithResolved {
+            research_url,
+            resolved,
+        }))
     }
 }
 

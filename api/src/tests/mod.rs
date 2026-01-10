@@ -7,6 +7,7 @@ mod auth;
 mod research;
 mod user;
 mod well_known;
+mod work_queue;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -32,11 +33,26 @@ use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
+use crate::db::{GpsLocation, MediaData, MediaSlot, PageData};
 use crate::jwt::JwtConfig;
-use crate::research::{ResearchUrlResponse, SubmitResearchRequest, SubmitResearchResponse};
+use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
+use crate::research_types::{FollowedUrlSummary, ResearchUrlDossier, ResearchUrlSummary};
 use crate::state::{AppState, Config};
-use crate::types::{Email, ResearchUrlId, UserId};
-use crate::users::FollowedUrlResponse;
+use crate::types::{
+    Email, MediaId, MediaType, PageId, ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
+};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+// ==================== Test Utilities ====================
+
+/// Build a path with optional query string for test requests.
+fn path_with_query(base: &str, query: &str) -> String {
+    if query.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{query}")
+    }
+}
 
 // ==================== Test DNS Resolver ====================
 
@@ -60,6 +76,7 @@ impl TestResolver {
 
 #[async_trait]
 impl DnsResolver for TestResolver {
+    #[allow(clippy::expect_used)] // Parsing constant IP address in test helper
     async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, HttpError> {
         if let Some(ips) = self.0.get(host) {
             Ok(ips.clone())
@@ -151,6 +168,7 @@ impl TestContext {
             rp_origin: format!("http://localhost:{}", addr.port()),
             bind_addr: addr,
             ios_app_id,
+            cdn_base_url: crate::cdn::tests::TEST_CDN_BASE_URL.to_string(),
         };
 
         let app_state =
@@ -192,6 +210,11 @@ impl TestContext {
 
     fn origin(&self) -> Result<Url, url::ParseError> {
         Url::parse(&self.base_url)
+    }
+
+    /// Direct access to the database for testing DB layer error paths.
+    fn db(&self) -> &crate::db::Database {
+        &self.app_state.db
     }
 
     // ==================== HTTP Helpers ====================
@@ -370,12 +393,8 @@ impl TestContext {
     async fn list_research(
         &self,
         query: &str,
-    ) -> Result<ResultsPage<ResearchUrlResponse>, Box<dyn std::error::Error + Send + Sync>> {
-        let path = if query.is_empty() {
-            "/research".to_string()
-        } else {
-            format!("/research?{query}")
-        };
+    ) -> Result<ResultsPage<ResearchUrlSummary>, Box<dyn std::error::Error + Send + Sync>> {
+        let path = path_with_query("/research", query);
         Ok(self.get(&path).await?.json().await?)
     }
 
@@ -384,12 +403,8 @@ impl TestContext {
         &self,
         token: &str,
         query: &str,
-    ) -> Result<ResultsPage<FollowedUrlResponse>, Box<dyn std::error::Error + Send + Sync>> {
-        let path = if query.is_empty() {
-            "/users/me/following".to_string()
-        } else {
-            format!("/users/me/following?{query}")
-        };
+    ) -> Result<ResultsPage<FollowedUrlSummary>, Box<dyn std::error::Error + Send + Sync>> {
+        let path = path_with_query("/users/me/following", query);
         Ok(self.get_auth(&path, token).await?.json().await?)
     }
 
@@ -417,6 +432,87 @@ impl TestContext {
             .await?;
         Ok(())
     }
+
+    // ==================== Content Creation Helpers (for testing dossier) ====================
+    //
+    // NOTE: These helpers call the database directly rather than through HTTP endpoints
+    // because the worker APIs don't exist yet. When worker endpoints are added, consider
+    // updating these tests to use the actual API flow.
+    // TODO: Revisit when implementing worker HTTP endpoints
+
+    /// Create a test page and link it to a research URL
+    async fn create_page_for_url(
+        &self,
+        url_id: &ResearchUrlId,
+        page_data: &PageData,
+    ) -> Result<PageId, Box<dyn std::error::Error + Send + Sync>> {
+        let page_id = self.app_state.db.create_page(page_data).await?;
+        self.app_state
+            .db
+            .mark_url_resolved_to_page(url_id, &page_id)
+            .await?;
+        Ok(page_id)
+    }
+
+    /// Create test media and link it to a research URL
+    async fn create_media_for_url(
+        &self,
+        url_id: &ResearchUrlId,
+        media_data: &MediaData,
+    ) -> Result<MediaId, Box<dyn std::error::Error + Send + Sync>> {
+        let media_id = self.app_state.db.get_or_create_media(media_data).await?;
+        self.app_state
+            .db
+            .mark_url_resolved_to_media(url_id, &media_id)
+            .await?;
+        Ok(media_id)
+    }
+
+    /// Mark a research URL as failed
+    async fn mark_url_failed(
+        &self,
+        url_id: &ResearchUrlId,
+        error_message: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.app_state
+            .db
+            .mark_url_failed(url_id, error_message, None)
+            .await?;
+        Ok(())
+    }
+
+    /// Helper to create a simple test page data
+    fn test_page_data(source_type: SourceType, media_urls: &[&str]) -> PageData {
+        PageData {
+            source_type,
+            title: Some("Test Post".to_string()),
+            author: Some("testuser".to_string()),
+            published_at: None,
+            content: Some("This is test content".to_string()),
+            fetched_at: chrono::Utc::now().naive_utc(),
+            media: media_urls
+                .iter()
+                .map(|url| MediaSlot::pending(*url))
+                .collect(),
+        }
+    }
+
+    /// Helper to create simple test media data
+    fn test_media_data(hash: &[u8]) -> MediaData {
+        MediaData {
+            exact_hash: hash.to_vec(),
+            perceptual_hash: None,
+            storage_key: format!("test/{}.jpg", URL_SAFE_NO_PAD.encode(hash)),
+            media_type: MediaType::Image,
+            width: 800,
+            height: 600,
+            duration_seconds: None,
+            captured_at: None,
+            location: None,
+            source_metadata: None,
+            fetched_at: chrono::Utc::now().naive_utc(),
+        }
+    }
 }
 
 /// An authenticated test client for a single user
@@ -440,7 +536,7 @@ impl TestClient<'_> {
     async fn list_following(
         &self,
         query: &str,
-    ) -> Result<ResultsPage<FollowedUrlResponse>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<ResultsPage<FollowedUrlSummary>, Box<dyn std::error::Error + Send + Sync>> {
         self.ctx.list_following(&self.token, query).await
     }
 

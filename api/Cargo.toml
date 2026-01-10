@@ -55,5 +55,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # Testing framework
 tokio-test = "0.4"
 
+# Serial test execution for tests that manipulate global state (env vars)
+serial_test = "3"
+
 # WebAuthn authenticator simulator
 webauthn-authenticator-rs = { version = "0.5", features = ["softpasskey"] }

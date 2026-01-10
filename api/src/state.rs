@@ -57,6 +57,9 @@ pub struct Config {
     /// iOS app identifier for AASA (e.g., "ABCD1234.com.example.app")
     /// Set via IOS_APP_ID env var, or constructed from APPLE_TEAM_ID + IOS_BUNDLE_ID
     pub ios_app_id: Option<String>,
+
+    /// CDN base URL for media assets (e.g., "https://cdn.chronoscope.io")
+    pub cdn_base_url: String,
 }
 
 impl Config {
@@ -80,12 +83,16 @@ impl Config {
 
         let ios_app_id = std::env::var("IOS_APP_ID").ok();
 
+        let cdn_base_url = std::env::var("CDN_BASE_URL")
+            .unwrap_or_else(|_| "https://cdn.chronoscope.io".to_string());
+
         Ok(Self {
             database_url,
             rp_id,
             rp_origin,
             bind_addr,
             ios_app_id,
+            cdn_base_url,
         })
     }
 }

@@ -72,9 +72,14 @@ async fn verify_query_plan(pool: &SqlitePool, query_def: &QueryDef) -> Result<()
         // SCAN without an index means full table scan
         // SCAN ... USING INDEX is fine (it's an index scan)
         // SEARCH is always fine (it's an index lookup)
-        let is_full_scan = detail.starts_with("SCAN") && !detail.contains("USING");
+        // SCAN (subquery-N) is fine (scanning materialized subquery result)
+        // SCAN ... VIRTUAL TABLE is fine (table-valued function like json_each)
+        let is_table_scan = detail.starts_with("SCAN ")
+            && !detail.contains("USING")
+            && !detail.contains("(subquery")
+            && !detail.contains("VIRTUAL TABLE");
 
-        if is_full_scan {
+        if is_table_scan {
             return Err(QueryPlanError::FullTableScan {
                 name: query_def.name,
                 sql: query_def.sql,
@@ -96,35 +101,100 @@ macro_rules! define_queries {
 }
 
 define_queries! {
-    // Users
-    CREATE_USER: "INSERT INTO users (id, username, email) VALUES (?, ?, ?)",
+    // Users (created_at must be provided - no defaults)
+    CREATE_USER: "INSERT INTO users (id, username, email, created_at) VALUES (?, ?, ?, ?)",
     FIND_USER_BY_IDENTIFIER: "SELECT id FROM users WHERE username = ? OR email = ?",
     UPDATE_USERNAME: "UPDATE users SET username = ? WHERE id = ?",
     UPDATE_EMAIL: "UPDATE users SET email = ? WHERE id = ?",
     GET_USER: "SELECT id, username, email, created_at FROM users WHERE id = ?",
 
-    // Credentials
-    ADD_CREDENTIAL: "INSERT INTO credentials (user_id, credential_id, passkey_json) VALUES (?, ?, ?)",
+    // Credentials (created_at must be provided - no defaults)
+    ADD_CREDENTIAL: "INSERT INTO credentials (user_id, credential_id, passkey_json, created_at) VALUES (?, ?, ?, ?)",
     GET_CREDENTIALS: "SELECT passkey_json FROM credentials WHERE user_id = ?",
     UPDATE_CREDENTIAL: "UPDATE credentials SET passkey_json = ? WHERE user_id = ? AND credential_id = ?",
 
-    // Research URLs
+    // Research URLs (all required fields must be provided - no defaults)
     GET_URL_BY_URL: "SELECT id FROM research_urls WHERE url = ?",
-    CREATE_URL: "INSERT INTO research_urls (id, url) VALUES (?, ?)",
-    GET_URL_BY_ID: "SELECT id, url, created_at FROM research_urls WHERE id = ?",
+    CREATE_URL: "INSERT INTO research_urls (id, url, status, attempt_count, created_at) VALUES (?, ?, ?, ?, ?)",
+    // Used when adding media URLs from a page - inserts new URL or ignores if exists
+    CREATE_URL_OR_IGNORE: "INSERT INTO research_urls (id, url, status, attempt_count, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(url) DO NOTHING",
+    // Batch insert URLs from JSON array of {id, url} objects. Params: ?1=created_at, ?2=JSON array
+    // Uses INSERT OR IGNORE because SQLite's upsert clause (ON CONFLICT...DO) only works with VALUES, not SELECT.
+    CREATE_URLS_BATCH: "
+        INSERT OR IGNORE INTO research_urls (id, url, status, attempt_count, created_at)
+        SELECT json_extract(value, '$.id'), json_extract(value, '$.url'), 'pending', 0, ?1
+        FROM json_each(?2)
+    ",
+    GET_URL_BY_ID: "SELECT id, url, page_id, media_id, status, claimed_at, claimed_by, attempt_count, retry_after, error_message, created_at FROM research_urls WHERE id = ?",
     // Keyset pagination: first page (no cursor)
-    LIST_ALL_URLS_FIRST: "SELECT id, url, created_at FROM research_urls ORDER BY created_at DESC, id DESC LIMIT ?",
+    LIST_ALL_URLS_FIRST: "SELECT id, url, page_id, media_id, status, created_at FROM research_urls ORDER BY created_at DESC, id DESC LIMIT ?",
     // Keyset pagination: subsequent pages (cursor = created_at, id of last item)
-    LIST_ALL_URLS_PAGE: "SELECT id, url, created_at FROM research_urls WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+    LIST_ALL_URLS_PAGE: "SELECT id, url, page_id, media_id, status, created_at FROM research_urls WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?",
 
-    // Follows
-    CREATE_FOLLOW: "INSERT INTO follows (user_id, url_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+    // Follows (created_at must be provided - no defaults)
+    CREATE_FOLLOW: "INSERT INTO follows (user_id, url_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
     // Keyset pagination: first page (no cursor)
-    LIST_FOLLOWED_URLS_FIRST: "SELECT r.id, r.url, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
+    LIST_FOLLOWED_URLS_FIRST: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
     // Keyset pagination: subsequent pages (cursor = followed_at, url_id of last item)
-    LIST_FOLLOWED_URLS_PAGE: "SELECT r.id, r.url, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? AND (f.created_at, r.id) < (?, ?) ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
+    LIST_FOLLOWED_URLS_PAGE: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? AND (f.created_at, r.id) < (?, ?) ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
     GET_FOLLOW_TIMESTAMP: "SELECT created_at FROM follows WHERE user_id = ? AND url_id = ?",
     DELETE_FOLLOW: "DELETE FROM follows WHERE user_id = ? AND url_id = ?",
+
+    // Pages
+    GET_PAGE_BY_ID: "SELECT id, source_type, title, author, published_at, content, fetched_at, created_at FROM pages WHERE id = ?",
+    CREATE_PAGE: "INSERT INTO pages (id, source_type, title, author, published_at, content, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+
+    // Media
+    GET_MEDIA_BY_ID: "SELECT id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at FROM media WHERE id = ?",
+    // Uses ON CONFLICT DO UPDATE SET id = id to make RETURNING work even on conflict.
+    // This is a no-op update that allows us to get the ID in a single atomic query.
+    CREATE_MEDIA: "INSERT INTO media (id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(exact_hash) DO UPDATE SET id = id RETURNING id",
+
+    // Page media items (ordered by source_order, with optional resolved media)
+    // Returns source_url from research_urls, plus media fields if resolved (NULL if pending)
+    GET_PAGE_MEDIA: "SELECT r.url as source_url, m.id, m.exact_hash, m.perceptual_hash, m.storage_key, m.media_type, m.width, m.height, m.duration_seconds, m.captured_at, m.gps_latitude, m.gps_longitude, m.gps_altitude, m.source_metadata, m.fetched_at, m.created_at FROM page_media pm JOIN research_urls r ON pm.url_id = r.id LEFT JOIN media m ON r.media_id = m.id WHERE pm.page_id = ? ORDER BY pm.source_order",
+    // Batch insert page_media from JSON array of URLs. Resolves URLs to IDs via join.
+    // Uses json_each key as source_order to preserve array ordering.
+    // Params: ?1=page_id, ?2=JSON array of URL strings
+    CREATE_PAGE_MEDIA_BATCH: "
+        INSERT INTO page_media (page_id, url_id, source_order)
+        SELECT ?1, ru.id, je.key
+        FROM json_each(?2) je
+        JOIN research_urls ru ON ru.url = je.value
+    ",
+
+    // Research URL status updates (for workers)
+    UPDATE_URL_RESOLVED_PAGE: "UPDATE research_urls SET page_id = ?, status = 'complete', claimed_at = NULL, claimed_by = NULL WHERE id = ?",
+    UPDATE_URL_RESOLVED_MEDIA: "UPDATE research_urls SET media_id = ?, status = 'complete', claimed_at = NULL, claimed_by = NULL WHERE id = ?",
+    UPDATE_URL_FAILED: "UPDATE research_urls SET status = 'failed', error_message = ?, attempt_count = attempt_count + 1, retry_after = ?, claimed_at = NULL, claimed_by = NULL WHERE id = ?",
+
+    // Batch claim: claims available URLs for processing
+    // A URL is claimable if:
+    //   - pending: not yet claimed, or claim is stale (worker died before starting)
+    //   - analyzing: claim is stale (worker died mid-processing)
+    //   - failed: retry_after time has passed
+    // Uses UPDATE...RETURNING (SQLite 3.35.0+) for atomic claim-and-fetch
+    // Uses UNION ALL to allow SQLite to use separate indexes for each case
+    // Params: ?1=now, ?2=worker_id, ?3=stale_threshold, ?4=now (for retry_after), ?5=batch_size
+    CLAIM_URLS: "
+        UPDATE research_urls
+        SET status = 'analyzing', claimed_at = ?1, claimed_by = ?2
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id, retry_after, created_at FROM research_urls
+                WHERE status = 'pending' AND (claimed_at IS NULL OR claimed_at < ?3)
+                UNION ALL
+                SELECT id, retry_after, created_at FROM research_urls
+                WHERE status = 'analyzing' AND claimed_at < ?3
+                UNION ALL
+                SELECT id, retry_after, created_at FROM research_urls
+                WHERE status = 'failed' AND retry_after IS NOT NULL AND retry_after <= ?4
+            )
+            ORDER BY retry_after NULLS FIRST, created_at
+            LIMIT ?5
+        )
+        RETURNING id, url, page_id, media_id, status, created_at
+    ",
 }
 
 #[cfg(test)]

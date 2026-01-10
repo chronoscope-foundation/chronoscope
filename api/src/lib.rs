@@ -1,15 +1,19 @@
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+#![deny(unsafe_code)]
 
 use std::sync::Arc;
 
 use dropshot::ApiDescription;
 
 pub mod auth;
+pub mod cdn;
 pub mod db;
 pub mod jwt;
 pub mod queries;
 pub mod research;
+pub mod research_types;
 pub mod state;
 pub mod types;
 pub mod url_security;

@@ -370,6 +370,34 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_ipv4_mapped_ipv6_blocked() -> TestResult {
+        // IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) should check the embedded IPv4
+        // These are a common SSRF bypass vector
+        assert!(
+            check_ipv6_blocked(&"::ffff:127.0.0.1".parse()?).is_some(),
+            "IPv4-mapped loopback should be blocked"
+        );
+        assert!(
+            check_ipv6_blocked(&"::ffff:10.0.0.1".parse()?).is_some(),
+            "IPv4-mapped private 10.x should be blocked"
+        );
+        assert!(
+            check_ipv6_blocked(&"::ffff:169.254.169.254".parse()?).is_some(),
+            "IPv4-mapped AWS IMDS should be blocked"
+        );
+        assert!(
+            check_ipv6_blocked(&"::ffff:192.168.1.1".parse()?).is_some(),
+            "IPv4-mapped private 192.168.x should be blocked"
+        );
+        // Public IPv4-mapped should be allowed
+        assert!(
+            check_ipv6_blocked(&"::ffff:93.184.216.34".parse()?).is_none(),
+            "IPv4-mapped public IP should be allowed"
+        );
+        Ok(())
+    }
+
     // ==================== Scheme Tests ====================
 
     #[test]

@@ -261,6 +261,7 @@ async fn run_with_ngrok(
         rp_origin: ngrok_url.clone(),
         bind_addr: format!("0.0.0.0:{port}").parse()?,
         ios_app_id,
+        cdn_base_url: "https://cdn.chronoscope.io".to_string(),
     };
 
     // Generate a random JWT secret for this dev session

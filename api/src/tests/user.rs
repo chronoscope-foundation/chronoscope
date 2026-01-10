@@ -1,5 +1,6 @@
 //! User management tests: username/email updates, conflicts, login by email
 
+use crate::db::DbError;
 use crate::types::Email;
 use crate::users::{UpdateUserRequest, UserResponse};
 
@@ -251,5 +252,68 @@ async fn test_update_empty_request() -> TestResult {
     let updated: UserResponse = resp.json().await?;
     assert_eq!(updated.username, original.username);
     assert_eq!(updated.email, original.email);
+    Ok(())
+}
+
+// ==================== Database Error Condition Tests ====================
+// These test the DB layer directly to verify error handling for edge cases
+// like user deleted mid-session or credential removed externally.
+
+#[tokio::test]
+async fn test_db_update_username_nonexistent_user_returns_error() -> TestResult {
+    let ctx = TestContext::new().await?;
+
+    // Try to update username for a user ID that doesn't exist
+    let fake_user_id = UserId::new("nonexistent-user-id");
+    let result = ctx.db().update_username(&fake_user_id, "newname").await;
+
+    assert!(
+        matches!(result, Err(DbError::UserNotFound)),
+        "Expected UserNotFound, got {result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_db_update_email_nonexistent_user_returns_error() -> TestResult {
+    let ctx = TestContext::new().await?;
+
+    // Try to update email for a user ID that doesn't exist
+    let fake_user_id = UserId::new("nonexistent-user-id");
+    let email = Email::new("test@example.com");
+    let result = ctx.db().update_email(&fake_user_id, &email).await;
+
+    assert!(
+        matches!(result, Err(DbError::UserNotFound)),
+        "Expected UserNotFound, got {result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_db_update_credential_nonexistent_returns_error() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let mut auth = TestContext::new_authenticator();
+    let username = TestContext::unique_username();
+
+    // Register a real user to get a valid passkey
+    let token = ctx.register_with_username(&mut auth, &username).await?;
+
+    // Get the user's credentials
+    let user: UserResponse = ctx.get_auth("/users/me", &token).await?.json().await?;
+
+    // Get credentials for this user
+    let credentials = ctx.db().get_credentials(&user.user_id).await?;
+    assert!(!credentials.is_empty(), "User should have credentials");
+    let passkey = &credentials[0];
+
+    // Try to update this credential for a different (non-existent) user
+    let fake_user_id = UserId::new("nonexistent-user-id");
+    let result = ctx.db().update_credential(&fake_user_id, passkey).await;
+
+    assert!(
+        matches!(result, Err(DbError::CredentialNotFound)),
+        "Expected CredentialNotFound, got {result:?}"
+    );
     Ok(())
 }

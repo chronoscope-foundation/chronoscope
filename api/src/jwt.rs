@@ -36,6 +36,7 @@ pub enum JwtError {
 pub const MIN_SECRET_LENGTH: usize = 32;
 
 /// JWT configuration for session and challenge tokens.
+#[derive(Debug)]
 pub struct JwtConfig {
     /// HMAC-SHA256 key used to sign and verify all JWTs.
     key: Hs256Key,
@@ -345,5 +346,69 @@ mod tests {
         let user_id = crate::types::UserId::new("test");
         // Should still be able to create tokens (even if cryptographically weak)
         assert!(config.create_session_token(&user_id).is_ok());
+    }
+
+    // ==================== from_env() Tests ====================
+    // These tests manipulate environment variables (global state) and use
+    // #[serial] to ensure they don't run concurrently with each other.
+
+    use serial_test::serial;
+
+    #[test]
+    #[serial(jwt_env)]
+    #[allow(unsafe_code)] // Required for env var manipulation in tests
+    fn test_from_env_secret_not_configured() {
+        // SAFETY: This test runs serially via #[serial(jwt_env)], so no concurrent
+        // access to these environment variables is possible.
+        unsafe {
+            std::env::remove_var("JWT_SECRET");
+        }
+
+        let result = JwtConfig::from_env();
+        assert!(
+            matches!(result, Err(JwtError::SecretNotConfigured)),
+            "Expected SecretNotConfigured, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[serial(jwt_env)]
+    #[allow(unsafe_code)] // Required for env var manipulation in tests
+    fn test_from_env_secret_too_short() {
+        // SAFETY: This test runs serially via #[serial(jwt_env)], so no concurrent
+        // access to these environment variables is possible.
+        unsafe {
+            std::env::set_var("JWT_SECRET", "short"); // Less than 32 bytes
+        }
+
+        let result = JwtConfig::from_env();
+        assert!(
+            matches!(result, Err(JwtError::SecretTooShort)),
+            "Expected SecretTooShort, got {result:?}"
+        );
+    }
+
+    #[test]
+    #[serial(jwt_env)]
+    #[allow(unsafe_code)] // Required for env var manipulation in tests
+    fn test_from_env_valid_secret_uses_defaults() {
+        // SAFETY: This test runs serially via #[serial(jwt_env)], so no concurrent
+        // access to these environment variables is possible.
+        unsafe {
+            // Set valid secret (32+ bytes), clear optional vars to test defaults
+            std::env::set_var("JWT_SECRET", "this-is-a-valid-secret-with-32-bytes!");
+            std::env::remove_var("JWT_SESSION_EXPIRY_SECONDS");
+            std::env::remove_var("JWT_CHALLENGE_EXPIRY_SECONDS");
+            std::env::remove_var("JWT_LEEWAY_SECONDS");
+        }
+
+        let config = JwtConfig::from_env();
+        assert!(config.is_ok(), "Expected Ok, got {config:?}");
+
+        // Verify we can create tokens with the config
+        if let Ok(config) = config {
+            let user_id = crate::types::UserId::new("test");
+            assert!(config.create_session_token(&user_id).is_ok());
+        }
     }
 }

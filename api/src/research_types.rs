@@ -1,0 +1,240 @@
+//! Dossier types for research URL summaries and detailed views.
+//!
+//! A "dossier" is the assembled information about a research URL, including
+//! the resolved content (page or media), extracted metadata, and analysis results.
+
+use chrono::NaiveDateTime;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::db::{FollowedUrl, ResearchUrl};
+use crate::types::{MediaId, MediaType, ResearchUrlId, ResearchUrlStatus, SourceType};
+
+// ==================== Analysis Outcome (Generic) ====================
+
+/// Outcome of an analysis stage.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AnalysisOutcome<T> {
+    /// Analysis not yet attempted
+    #[default]
+    Pending,
+    /// Analysis currently running
+    InProgress,
+    /// Analysis completed successfully
+    Success(T),
+    /// Analysis failed
+    Failed { error: String },
+}
+
+// ==================== Analysis Result Types ====================
+//
+// These are placeholder structs for future analysis pipeline results.
+// They are intentionally empty now and will be populated as we build
+// out each analysis stage.
+
+/// VLM (Vision-Language Model) analysis results.
+///
+/// Will contain: visual descriptions, detected objects, OCR text,
+/// date/location mentions extracted from image content.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VlmResults {}
+
+/// Image segmentation results.
+///
+/// Will contain: object masks, labeled regions, and bounding boxes
+/// for discrete elements within an image.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SegmentationResults {}
+
+/// Vector embedding results for similarity search.
+///
+/// Will contain: embedding vector reference, nearest neighbors,
+/// and similarity scores for finding visually similar images.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EmbeddingResults {}
+
+/// Reverse image search results.
+///
+/// Will contain: matching images found across the web, higher-resolution
+/// versions, and source attribution for provenance tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReverseImageSearchResults {}
+
+/// Deep research synthesis results.
+///
+/// Will contain: synthesized date estimates, location hypotheses,
+/// historical narrative, and confidence scores combining all analysis sources.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeepResearchResults {}
+
+// ==================== Analysis Progress ====================
+
+/// Per-media analysis stages.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct MediaAnalysis {
+    pub vlm: AnalysisOutcome<VlmResults>,
+    pub segmentation: AnalysisOutcome<SegmentationResults>,
+    pub embeddings: AnalysisOutcome<EmbeddingResults>,
+    pub reverse_image_search: AnalysisOutcome<ReverseImageSearchResults>,
+}
+
+/// Rollup counts across all media items for a URL.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct MediaAnalysisCounts {
+    /// Total media items referenced
+    pub total: u32,
+    /// Media items successfully fetched
+    pub fetched: u32,
+    pub vlm: u32,
+    pub segmentation: u32,
+    pub embeddings: u32,
+    pub reverse_image_search: u32,
+}
+
+/// URL-level analysis progress.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct UrlAnalysis {
+    /// Rollup of per-media analysis stages
+    pub media: MediaAnalysisCounts,
+    /// Deep research results
+    pub deep_research: AnalysisOutcome<DeepResearchResults>,
+}
+
+// ==================== Summary Types (for list endpoints) ====================
+
+/// Summary of a research URL for list views.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResearchUrlSummary {
+    pub id: ResearchUrlId,
+    pub url: String,
+    pub status: ResearchUrlStatus,
+    /// Thumbnail URL (CDN path), if available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    /// Primary date hint: "~1920s", "Mar 15, 1952", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_date: Option<String>,
+    /// Primary location hint: "Gary, IN", coordinates, etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_location: Option<String>,
+    /// Analysis progress
+    pub analysis: UrlAnalysis,
+    /// When this URL was submitted
+    pub created_at: NaiveDateTime,
+}
+
+/// Summary of a followed research URL (includes follow timestamp).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FollowedUrlSummary {
+    pub research_url: ResearchUrlSummary,
+    pub followed_at: NaiveDateTime,
+}
+
+// ==================== DB Conversion Traits ====================
+
+impl From<ResearchUrl> for ResearchUrlSummary {
+    fn from(u: ResearchUrl) -> Self {
+        ResearchUrlSummary {
+            id: u.id,
+            url: u.url,
+            status: u.status,
+            // TODO: Populate these from resolved content when available
+            thumbnail_url: None,
+            primary_date: None,
+            primary_location: None,
+            analysis: UrlAnalysis::default(),
+            created_at: u.created_at,
+        }
+    }
+}
+
+impl From<FollowedUrl> for FollowedUrlSummary {
+    fn from(u: FollowedUrl) -> Self {
+        FollowedUrlSummary {
+            research_url: u.research_url.into(),
+            followed_at: u.followed_at,
+        }
+    }
+}
+
+// ==================== Dossier Types (for detail view) ====================
+
+/// Full dossier for a research URL.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResearchUrlDossier {
+    pub id: ResearchUrlId,
+    pub url: String,
+    pub status: ResearchUrlStatus,
+    pub created_at: NaiveDateTime,
+    pub analysis: UrlAnalysis,
+    /// Resolved content (None while pending)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved: Option<ResolvedContent>,
+}
+
+/// Resolved content - either a page with embedded media, or direct media.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResolvedContent {
+    Page(PageDossier),
+    Media(MediaDossier),
+}
+
+/// Page content (Instagram post, Reddit thread, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PageDossier {
+    pub source_type: SourceType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<NaiveDateTime>,
+    /// Content as markdown (includes comments under heading)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// All media referenced by this page (in source order)
+    pub media: Vec<MediaReference>,
+    pub fetched_at: NaiveDateTime,
+}
+
+/// A media item referenced by a page - may or may not be fetched yet.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MediaReference {
+    /// Media is still being fetched
+    Pending { source_url: String },
+    /// Media has been fetched and processed
+    Fetched(Box<MediaDossier>),
+}
+
+/// A fetched media item with full details.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaDossier {
+    pub id: MediaId,
+    pub media_type: MediaType,
+    pub width: u32,
+    pub height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f32>,
+    pub thumbnail_url: String,
+    pub full_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<NaiveDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<GpsCoordinates>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_metadata: Option<serde_json::Value>,
+    pub fetched_at: NaiveDateTime,
+    pub analysis: MediaAnalysis,
+}
+
+/// GPS coordinates with optional altitude.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GpsCoordinates {
+    pub latitude: f64,
+    pub longitude: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub altitude: Option<f64>,
+}

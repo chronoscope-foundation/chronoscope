@@ -12,6 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::validate_session;
+use crate::research_types::FollowedUrlSummary;
 use crate::state::AppState;
 use crate::types::{Email, ResearchUrlId, UserId};
 use crate::validation::{is_unique_violation, validate_email, validate_username};
@@ -44,16 +45,6 @@ pub struct UpdateUserRequest {
     /// New email (if updating)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<Email>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct FollowedUrlResponse {
-    pub id: ResearchUrlId,
-    pub url: String,
-    /// When this URL was first submitted to the system
-    pub created_at: NaiveDateTime,
-    /// When you started following this URL
-    pub followed_at: NaiveDateTime,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -156,7 +147,7 @@ pub async fn update_me(
 pub async fn list_following(
     ctx: RequestContext<Arc<AppState>>,
     query: Query<PaginationParams<EmptyScanParams, FollowingPageSelector>>,
-) -> Result<HttpResponseOk<ResultsPage<FollowedUrlResponse>>, HttpError> {
+) -> Result<HttpResponseOk<ResultsPage<FollowedUrlSummary>>, HttpError> {
     let user_id = validate_session(&ctx)?;
     let state = ctx.context();
     let pag_params = query.into_inner();
@@ -177,20 +168,12 @@ pub async fn list_following(
         .list_followed_urls(&user_id, limit_i64, cursor_ref)
         .await?;
 
-    let items: Vec<FollowedUrlResponse> = urls
-        .into_iter()
-        .map(|u| FollowedUrlResponse {
-            id: u.id.clone(),
-            url: u.url,
-            created_at: u.created_at,
-            followed_at: u.followed_at,
-        })
-        .collect();
+    let items: Vec<FollowedUrlSummary> = urls.into_iter().map(FollowedUrlSummary::from).collect();
 
-    let page = ResultsPage::new(items, &pag_params, |item: &FollowedUrlResponse, _| {
+    let page = ResultsPage::new(items, &pag_params, |item: &FollowedUrlSummary, _| {
         FollowingPageSelector {
             followed_at: item.followed_at,
-            id: item.id.clone(),
+            id: item.research_url.id.clone(),
         }
     })
     .map_err(|e| HttpError::for_internal_error(format!("Failed to build results page: {e}")))?;

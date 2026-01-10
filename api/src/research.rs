@@ -10,6 +10,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::validate_session;
+use crate::cdn;
+use crate::db::{Media, MediaSlot, Page, ResearchUrlWithResolved};
+use crate::research_types::{
+    GpsCoordinates, MediaAnalysis, MediaDossier, MediaReference, PageDossier, ResearchUrlDossier,
+    ResearchUrlSummary, ResolvedContent, UrlAnalysis,
+};
 use crate::state::AppState;
 use crate::types::ResearchUrlId;
 use crate::url_security::validate_url;
@@ -30,14 +36,6 @@ pub struct ResearchPageSelector {
 pub struct SubmitResearchRequest {
     /// The URL to submit
     pub url: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ResearchUrlResponse {
-    pub id: ResearchUrlId,
-    pub url: String,
-    /// When this URL was first submitted to the system
-    pub created_at: NaiveDateTime,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -97,7 +95,7 @@ pub async fn submit_research(
 pub async fn list_research(
     ctx: RequestContext<Arc<AppState>>,
     query: Query<PaginationParams<EmptyScanParams, ResearchPageSelector>>,
-) -> Result<HttpResponseOk<ResultsPage<ResearchUrlResponse>>, HttpError> {
+) -> Result<HttpResponseOk<ResultsPage<ResearchUrlSummary>>, HttpError> {
     let state = ctx.context();
     let pag_params = query.into_inner();
 
@@ -114,16 +112,9 @@ pub async fn list_research(
     let cursor_ref = cursor.map(|s| (s.created_at, &s.id));
     let urls = state.db.list_all_urls(limit_i64, cursor_ref).await?;
 
-    let items: Vec<ResearchUrlResponse> = urls
-        .into_iter()
-        .map(|u| ResearchUrlResponse {
-            id: u.id.clone(),
-            url: u.url,
-            created_at: u.created_at,
-        })
-        .collect();
+    let items: Vec<ResearchUrlSummary> = urls.into_iter().map(ResearchUrlSummary::from).collect();
 
-    let page = ResultsPage::new(items, &pag_params, |item: &ResearchUrlResponse, _| {
+    let page = ResultsPage::new(items, &pag_params, |item: &ResearchUrlSummary, _| {
         ResearchPageSelector {
             created_at: item.created_at,
             id: item.id.clone(),
@@ -134,7 +125,7 @@ pub async fn list_research(
     Ok(HttpResponseOk(page))
 }
 
-/// Get a single research URL (public, no authentication required)
+/// Get a single research URL dossier (public, no authentication required)
 #[endpoint {
     method = GET,
     path = "/research/{id}",
@@ -142,19 +133,332 @@ pub async fn list_research(
 pub async fn get_research(
     ctx: RequestContext<Arc<AppState>>,
     path: dropshot::Path<IdPath>,
-) -> Result<HttpResponseOk<ResearchUrlResponse>, HttpError> {
+) -> Result<HttpResponseOk<ResearchUrlDossier>, HttpError> {
     let state = ctx.context();
     let id = &path.into_inner().id;
 
-    let url = state
+    let dossier_data = state
         .db
-        .get_url_by_id(id)
+        .get_research_dossier(id)
         .await?
         .ok_or_else(|| HttpError::for_not_found(None, "Research URL not found".to_string()))?;
 
-    Ok(HttpResponseOk(ResearchUrlResponse {
-        id: url.id,
-        url: url.url,
-        created_at: url.created_at,
-    }))
+    let dossier = build_dossier(dossier_data, &state.config.cdn_base_url)?;
+    Ok(HttpResponseOk(dossier))
+}
+
+// ==================== Conversion Helpers ====================
+
+/// Build a research URL dossier from DB data.
+fn build_dossier(
+    data: ResearchUrlWithResolved,
+    cdn_base_url: &str,
+) -> Result<ResearchUrlDossier, HttpError> {
+    let resolved = build_resolved_content(&data, cdn_base_url)?;
+
+    Ok(ResearchUrlDossier {
+        id: data.research_url.id,
+        url: data.research_url.url,
+        status: data.research_url.status,
+        created_at: data.research_url.created_at,
+        analysis: UrlAnalysis::default(), // TODO: populate from analysis tables
+        resolved,
+    })
+}
+
+/// Build resolved content from DB data.
+fn build_resolved_content(
+    data: &ResearchUrlWithResolved,
+    cdn_base_url: &str,
+) -> Result<Option<ResolvedContent>, HttpError> {
+    match &data.resolved {
+        Some(crate::db::ResolvedContent::Page(page)) => Ok(Some(ResolvedContent::Page(
+            convert_page(page, cdn_base_url)?,
+        ))),
+        Some(crate::db::ResolvedContent::Media(media)) => Ok(Some(ResolvedContent::Media(
+            convert_media(media, cdn_base_url)?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Convert a DB Page to API PageDossier.
+fn convert_page(page: &Page, cdn_base_url: &str) -> Result<PageDossier, HttpError> {
+    let media: Result<Vec<_>, _> = page
+        .data
+        .media
+        .iter()
+        .map(|slot| convert_media_reference(slot, cdn_base_url))
+        .collect();
+
+    Ok(PageDossier {
+        source_type: page.data.source_type,
+        title: page.data.title.clone(),
+        author: page.data.author.clone(),
+        published_at: page.data.published_at,
+        content: page.data.content.clone(),
+        media: media?,
+        fetched_at: page.data.fetched_at,
+    })
+}
+
+/// Convert a MediaSlot to API MediaReference.
+fn convert_media_reference(
+    slot: &MediaSlot,
+    cdn_base_url: &str,
+) -> Result<MediaReference, HttpError> {
+    match &slot.resolved {
+        Some(media) => Ok(MediaReference::Fetched(Box::new(convert_media(
+            media,
+            cdn_base_url,
+        )?))),
+        None => Ok(MediaReference::Pending {
+            source_url: slot.url.clone(),
+        }),
+    }
+}
+
+/// Convert a DB Media to API MediaDossier.
+fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, HttpError> {
+    // Convert DB GpsLocation to API GpsCoordinates
+    let location = media.data.location.as_ref().map(|loc| GpsCoordinates {
+        latitude: loc.latitude,
+        longitude: loc.longitude,
+        altitude: loc.altitude,
+    });
+
+    // Parse source_metadata JSON, propagating errors for corrupt data
+    let source_metadata = media
+        .data
+        .source_metadata
+        .as_ref()
+        .map(|s| serde_json::from_str(s))
+        .transpose()
+        .map_err(|e| {
+            HttpError::for_internal_error(format!("Corrupt JSON in media {}: {}", media.id, e))
+        })?;
+
+    // Convert dimensions, failing on invalid values (indicates DB corruption)
+    let width = u32::try_from(media.data.width).map_err(|_| {
+        HttpError::for_internal_error(format!(
+            "Invalid width {} for media {}",
+            media.data.width, media.id
+        ))
+    })?;
+    let height = u32::try_from(media.data.height).map_err(|_| {
+        HttpError::for_internal_error(format!(
+            "Invalid height {} for media {}",
+            media.data.height, media.id
+        ))
+    })?;
+
+    Ok(MediaDossier {
+        id: media.id.clone(),
+        media_type: media.data.media_type,
+        width,
+        height,
+        duration_seconds: media.data.duration_seconds,
+        thumbnail_url: cdn::thumbnail_url(cdn_base_url, &media.data.storage_key),
+        full_url: cdn::full_url(cdn_base_url, &media.data.storage_key),
+        captured_at: media.data.captured_at,
+        location,
+        source_metadata,
+        fetched_at: media.data.fetched_at,
+        analysis: MediaAnalysis::default(), // TODO: populate from analysis tables
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cdn::tests::TEST_CDN_BASE_URL;
+    use crate::db::{GpsLocation, Media, MediaData, MediaSlot};
+    use crate::types::{MediaId, MediaType};
+    use chrono::{NaiveDate, NaiveDateTime};
+
+    #[allow(clippy::expect_used)]
+    fn test_timestamp() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2024, 1, 15)
+            .and_then(|d| d.and_hms_opt(12, 0, 0))
+            .expect("valid constant")
+    }
+
+    fn minimal_media_data() -> MediaData {
+        MediaData {
+            exact_hash: vec![0x01, 0x02],
+            perceptual_hash: None,
+            storage_key: "test/image.jpg".to_string(),
+            media_type: MediaType::Image,
+            width: 800,
+            height: 600,
+            duration_seconds: None,
+            captured_at: None,
+            location: None,
+            source_metadata: None,
+            fetched_at: test_timestamp(),
+        }
+    }
+
+    fn minimal_media() -> Media {
+        Media {
+            id: MediaId::new("test-media-id"),
+            data: minimal_media_data(),
+            created_at: test_timestamp(),
+        }
+    }
+
+    type TestResult = Result<(), HttpError>;
+
+    // ==================== GPS Location ====================
+
+    #[test]
+    fn test_convert_media_no_gps_produces_none_location() -> TestResult {
+        let media = minimal_media();
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        assert!(dossier.location.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_media_with_location() -> TestResult {
+        let mut media = minimal_media();
+        media.data.location = Some(GpsLocation {
+            latitude: 41.5908,
+            longitude: -87.3467,
+            altitude: None,
+        });
+
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        let location = dossier
+            .location
+            .ok_or_else(|| HttpError::for_bad_request(None, "should have location".to_string()))?;
+        assert_eq!(location.latitude, 41.5908);
+        assert_eq!(location.longitude, -87.3467);
+        assert!(location.altitude.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_media_full_gps_with_altitude() -> TestResult {
+        let mut media = minimal_media();
+        media.data.location = Some(GpsLocation {
+            latitude: 41.5908,
+            longitude: -87.3467,
+            altitude: Some(180.5),
+        });
+
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        let location = dossier
+            .location
+            .ok_or_else(|| HttpError::for_bad_request(None, "should have location".to_string()))?;
+        assert_eq!(location.altitude, Some(180.5));
+        Ok(())
+    }
+
+    // ==================== Source Metadata JSON Parsing ====================
+
+    #[test]
+    fn test_convert_media_valid_json_metadata() -> TestResult {
+        let mut media = minimal_media();
+        media.data.source_metadata = Some(r#"{"camera": "iPhone 12", "iso": 100}"#.to_string());
+
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        let metadata = dossier
+            .source_metadata
+            .ok_or_else(|| HttpError::for_bad_request(None, "should have metadata".to_string()))?;
+        assert_eq!(metadata["camera"], "iPhone 12");
+        assert_eq!(metadata["iso"], 100);
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_media_invalid_json_returns_error() {
+        let mut media = minimal_media();
+        media.data.source_metadata = Some("not valid json {{{".to_string());
+
+        let result = convert_media(&media, TEST_CDN_BASE_URL);
+        assert!(result.is_err(), "Invalid JSON should return error");
+    }
+
+    #[test]
+    fn test_convert_media_null_metadata_produces_none() -> TestResult {
+        let media = minimal_media();
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        assert!(dossier.source_metadata.is_none());
+        Ok(())
+    }
+
+    // ==================== Media Reference Conversion ====================
+
+    #[test]
+    fn test_convert_media_reference_fetched() -> TestResult {
+        let slot = MediaSlot {
+            url: "https://example.com/image.jpg".to_string(),
+            resolved: Some(minimal_media()),
+        };
+
+        let reference = convert_media_reference(&slot, TEST_CDN_BASE_URL)?;
+
+        assert!(matches!(reference, MediaReference::Fetched(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_media_reference_pending() -> TestResult {
+        let slot = MediaSlot::pending("https://example.com/pending.jpg");
+
+        let reference = convert_media_reference(&slot, TEST_CDN_BASE_URL)?;
+
+        match reference {
+            MediaReference::Pending { source_url } => {
+                assert_eq!(source_url, "https://example.com/pending.jpg");
+            }
+            MediaReference::Fetched(_) => {
+                return Err(HttpError::for_bad_request(
+                    None,
+                    "Expected Pending, got Fetched".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // ==================== Dimension Validation (DB Corruption Detection) ====================
+
+    #[test]
+    fn test_convert_media_negative_width_returns_error() -> TestResult {
+        let mut media = minimal_media();
+        media.data.width = -100; // Negative width (DB corruption)
+
+        let err = convert_media(&media, TEST_CDN_BASE_URL).err().ok_or_else(|| {
+            HttpError::for_bad_request(None, "Negative width should return error".to_string())
+        })?;
+
+        assert!(
+            err.internal_message.contains("Invalid width"),
+            "Error should mention invalid width, got: {}",
+            err.internal_message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_media_negative_height_returns_error() -> TestResult {
+        let mut media = minimal_media();
+        media.data.height = -50; // Negative height (DB corruption)
+
+        let err = convert_media(&media, TEST_CDN_BASE_URL).err().ok_or_else(|| {
+            HttpError::for_bad_request(None, "Negative height should return error".to_string())
+        })?;
+
+        assert!(
+            err.internal_message.contains("Invalid height"),
+            "Error should mention invalid height, got: {}",
+            err.internal_message
+        );
+        Ok(())
+    }
 }
