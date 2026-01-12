@@ -23,13 +23,14 @@ struct ChronoscopeApp: App {
             }
             _authManager = StateObject(wrappedValue: AuthManager(keychainStorage: mockKeychain))
 
-            // Use MockAPIClient for views
+            // Use MockAPIClient for views (doesn't need real auth)
             client = MockAPIClient.withSampleData()
         } else {
-            _authManager = StateObject(wrappedValue: AuthManager())
+            let manager = AuthManager()
+            _authManager = StateObject(wrappedValue: manager)
 
-            // Use real API client (may be nil if server URL is misconfigured)
-            client = APIClientFactory.makeClient()
+            // Use real API client with explicit token dependency
+            client = APIClientFactory.makeClient(tokenProvider: manager.getToken)
         }
     }
 

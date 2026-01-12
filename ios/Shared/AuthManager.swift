@@ -18,7 +18,7 @@ class AuthManager: ObservableObject {
     private var _client: Client?
     private var client: Client? {
         if let existing = _client { return existing }
-        let newClient = APIClientFactory.makeClient()
+        let newClient = APIClientFactory.makeClient(tokenProvider: getToken)
         _client = newClient
         return newClient
     }
@@ -34,6 +34,11 @@ class AuthManager: ObservableObject {
             // Log but don't crash on init - user will need to sign in again
             Self.logger.error("Failed to load session token: \(error)")
         }
+    }
+
+    /// Returns the current session token, or nil if not authenticated.
+    func getToken() -> String? {
+        try? keychainStorage.load(key: Constants.sessionTokenKey)
     }
 
     func register(username: String, email: String) async throws {
@@ -94,7 +99,6 @@ class AuthManager: ObservableObject {
 
         // 4. Store session and update state
         try keychainStorage.save(key: Constants.sessionTokenKey, data: session.token)
-        TokenCache.refresh()
         isAuthenticated = true
     }
 
@@ -150,13 +154,11 @@ class AuthManager: ObservableObject {
 
         // 4. Store session and update state
         try keychainStorage.save(key: Constants.sessionTokenKey, data: session.token)
-        TokenCache.refresh()
         isAuthenticated = true
     }
 
     func signOut() throws {
         try keychainStorage.delete(key: Constants.sessionTokenKey)
-        TokenCache.clear()
         isAuthenticated = false
     }
 

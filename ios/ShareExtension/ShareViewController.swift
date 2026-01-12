@@ -23,11 +23,12 @@ class ShareViewController: UIViewController {
         super.viewDidLoad()
 
         let client: ShareClient = {
-            guard let apiClient = APIClientFactory.makeClient() else {
-                return .notConfigured
-            }
-            guard (try? KeychainHelper.load(key: Constants.sessionTokenKey)) != nil else {
+            let authManager = AuthManager()
+            guard authManager.isAuthenticated else {
                 return .notAuthenticated
+            }
+            guard let apiClient = APIClientFactory.makeClient(tokenProvider: authManager.getToken) else {
+                return .notConfigured
             }
             return .authenticated(apiClient)
         }()

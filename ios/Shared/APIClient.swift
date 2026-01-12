@@ -5,7 +5,7 @@ import Foundation
 /// Uses mock networking when running UI tests.
 @MainActor
 enum APIClientFactory {
-    static func makeClient() -> Client? {
+    static func makeClient(tokenProvider: @escaping @MainActor () -> String?) -> Client? {
         guard let serverURL = SharedConfig.apiServerURL,
               let url = URL(string: serverURL)
         else { return nil }
@@ -21,7 +21,7 @@ enum APIClientFactory {
         return Client(
             serverURL: url,
             transport: transport,
-            middlewares: [AuthenticatingMiddleware()]
+            middlewares: [AuthenticatingMiddleware(getToken: tokenProvider)]
         )
     }
 }
