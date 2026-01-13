@@ -3,10 +3,10 @@
 //! This binary:
 //! 1. Starts ngrok to create a public HTTPS tunnel (required for passkeys)
 //! 2. Updates ios/Local.xcconfig with the tunnel domain
-//! 3. Runs the API server with appropriate WebAuthn configuration
+//! 3. Runs the API server with appropriate `WebAuthn` configuration
 //!
 //! Usage:
-//!   cargo run --bin dev
+//!   cargo run -p chronoscope-dev
 //!
 //! Prerequisites:
 //!   - ngrok installed and authenticated (`ngrok config add-authtoken YOUR_TOKEN`)

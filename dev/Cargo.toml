@@ -1,0 +1,30 @@
+[package]
+name = "chronoscope-dev"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# API crate (provides AppState, Config, JwtConfig, register_api)
+chronoscope-api = { path = "../api" }
+
+# Web framework (for Dropshot server configuration)
+dropshot = "0.16"
+
+# HTTP client (for ngrok API)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization (for ngrok API responses)
+serde.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Utilities
+url.workspace = true
+uuid.workspace = true
+
+# Logging
+slog = "2"
