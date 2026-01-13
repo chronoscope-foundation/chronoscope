@@ -12,6 +12,7 @@ pub mod error;
 pub mod models;
 pub mod queries;
 pub mod types;
+pub mod url;
 mod workers;
 
 use chrono::{NaiveDateTime, Utc};
@@ -252,15 +253,30 @@ impl Database {
     /// Submit a URL: creates the URL if new, and follows it for the user.
     /// Returns the URL id and whether it was newly created.
     ///
+    /// The URL is normalized before storage to improve deduplication
+    /// (e.g., removing tracking parameters, canonicalizing domains).
+    ///
     /// # Errors
+    /// Returns `DbError::InvalidArgument` if the URL cannot be parsed or normalized.
     /// Returns `DbError::Sqlx` if the database operation fails.
-    pub async fn submit_url(&self, user_id: &UserId, url: &str) -> DbResult<(ResearchUrlId, bool)> {
+    pub async fn submit_url(
+        &self,
+        user_id: &UserId,
+        url_str: &str,
+    ) -> DbResult<(ResearchUrlId, bool)> {
+        // Parse and normalize URL for deduplication
+        let parsed_url = ::url::Url::parse(url_str)
+            .map_err(|e| DbError::InvalidArgument(format!("invalid URL: {e}")))?;
+        let normalized_url = url::normalize_url(&parsed_url)
+            .map_err(|e| DbError::InvalidArgument(format!("cannot normalize URL: {e}")))?;
+        let normalized_str = normalized_url.to_string();
+
         // Try to insert the URL (ignored if already exists)
         let new_id = ResearchUrlId::generate();
         let result = queries::CREATE_URL_OR_IGNORE
             .query()
             .bind(&new_id)
-            .bind(url)
+            .bind(&normalized_str)
             .bind(ResearchUrlStatus::Pending)
             .bind(0_i32) // attempt_count
             .bind(now())
@@ -272,7 +288,7 @@ impl Database {
             (new_id, true)
         } else {
             let (id,): (ResearchUrlId,) = sqlx::query_as(queries::GET_URL_BY_URL.sql)
-                .bind(url)
+                .bind(&normalized_str)
                 .fetch_one(&self.pool)
                 .await?;
             (id, false)
