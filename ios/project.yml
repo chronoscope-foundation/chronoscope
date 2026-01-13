@@ -36,6 +36,11 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: false
         CODE_SIGN_ENTITLEMENTS: App/Chronoscope.entitlements
+      configs:
+        Debug:
+          ASSOCIATED_DOMAIN_MODE: "?mode=developer"
+        Release:
+          ASSOCIATED_DOMAIN_MODE: ""
     dependencies:
       - target: ChronoscopeShareExtension
         embed: true

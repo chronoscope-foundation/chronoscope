@@ -4,8 +4,8 @@
 <dict>
 	<key>com.apple.developer.associated-domains</key>
 	<array>
-		<string>webcredentials:$(API_SERVER_DOMAIN)?mode=developer</string>
-		<string>applinks:$(API_SERVER_DOMAIN)?mode=developer</string>
+		<string>webcredentials:$(API_SERVER_DOMAIN)$(ASSOCIATED_DOMAIN_MODE)</string>
+		<string>applinks:$(API_SERVER_DOMAIN)$(ASSOCIATED_DOMAIN_MODE)</string>
 	</array>
 	<key>com.apple.security.application-groups</key>
 	<array>
