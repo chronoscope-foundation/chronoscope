@@ -45,8 +45,8 @@ struct SignInView: View {
 
     var body: some View {
         AuthLayoutView(error: error) {
-            VStack(spacing: 20) {
-                VStack(alignment: .leading, spacing: 6) {
+            VStack(spacing: Design.Spacing.large) {
+                VStack(alignment: .leading, spacing: Design.Spacing.labelField) {
                     Text("Username or Email")
                         .font(.caption)
                         .fontWeight(.medium)
@@ -107,8 +107,8 @@ struct SignUpView: View {
 
     var body: some View {
         AuthLayoutView(error: error) {
-            VStack(spacing: 20) {
-                VStack(alignment: .leading, spacing: 6) {
+            VStack(spacing: Design.Spacing.large) {
+                VStack(alignment: .leading, spacing: Design.Spacing.labelField) {
                     Text("Username")
                         .font(.caption)
                         .fontWeight(.medium)
@@ -118,7 +118,7 @@ struct SignUpView: View {
                         .usernameTextFieldStyle()
                 }
 
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: Design.Spacing.labelField) {
                     Text("Email")
                         .font(.caption)
                         .fontWeight(.medium)
@@ -235,7 +235,10 @@ struct AuthErrorView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(Design.Spacing.small)
-        .background(Color(.systemRed).opacity(0.1), in: RoundedRectangle(cornerRadius: Design.CornerRadius.small))
+        .background(
+            Color(.systemRed).opacity(Design.Opacity.light),
+            in: RoundedRectangle(cornerRadius: Design.CornerRadius.small)
+        )
     }
 }
 
@@ -265,12 +268,12 @@ struct AuthButtonLabel: View {
 
 #Preview("Sign In") {
     SignInView(switchToSignUp: {})
-        .environmentObject(AuthManager())
+        .environmentObject(AuthManager(authClient: MockAPIClient()))
 }
 
 #Preview("Sign Up") {
     SignUpView(switchToSignIn: {})
-        .environmentObject(AuthManager())
+        .environmentObject(AuthManager(authClient: MockAPIClient()))
 }
 
 #Preview("Sign In with Error") {

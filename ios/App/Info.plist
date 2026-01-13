@@ -46,5 +46,22 @@
 	</array>
 	<key>ApiServerDomain</key>
 	<string>$(API_SERVER_DOMAIN)</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<!-- Map apps (see ExternalApps.swift for sources) -->
+		<string>comgooglemaps</string>
+		<string>waze</string>
+		<string>om</string>
+		<!-- Browsers (see ExternalApps.swift for sources) -->
+		<string>googlechrome</string>
+		<string>googlechromes</string>
+		<string>firefox</string>
+		<string>microsoft-edge-http</string>
+		<string>microsoft-edge-https</string>
+		<string>brave</string>
+		<string>opera-http</string>
+		<string>opera-https</string>
+		<string>ddgQuickLink</string>
+	</array>
 </dict>
 </plist>

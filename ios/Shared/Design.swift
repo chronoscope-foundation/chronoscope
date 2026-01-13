@@ -9,6 +9,8 @@ enum Design {
     enum Spacing {
         /// 4pt - Tight spacing between related elements
         static let extraExtraSmall: CGFloat = 4
+        /// 6pt - Label-to-field spacing in forms
+        static let labelField: CGFloat = 6
         /// 8pt - Default inline spacing
         static let extraSmall: CGFloat = 8
         /// 12pt - Comfortable spacing
@@ -82,5 +84,77 @@ enum Design {
     enum TapTarget {
         /// 44pt - iOS minimum tap target
         static let minimum: CGFloat = 44
+    }
+
+    // MARK: - Opacity
+
+    /// Standard opacity values for visual states
+    enum Opacity {
+        /// 0.05 - Very subtle backgrounds (section backgrounds, cards)
+        static let subtle: Double = 0.05
+        /// 0.1 - Light backgrounds (badges, chips)
+        static let light: Double = 0.1
+        /// 0.15 - Subtle backgrounds for placeholders, unfetched content
+        static let placeholder: Double = 0.15
+        /// 0.4 - Disabled/non-interactive elements (industry standard: 0.3-0.5)
+        static let disabled: Double = 0.4
+        /// 0.3 - Ring track background
+        static let ringTrack: Double = 0.3
+        /// 0.5 - Medium visibility (secondary icons)
+        static let medium: Double = 0.5
+        /// 0.8 - Heavy/prominent (overlay badges)
+        static let heavy: Double = 0.8
+    }
+
+    // MARK: - Size
+
+    /// Standard sizes for specific UI elements
+    enum Size {
+        /// 56pt - List row thumbnails
+        static let thumbnail: CGFloat = 56
+        /// 150pt - Map preview height in detail views
+        static let mapPreview: CGFloat = 150
+        /// 200pt - Preview placeholder size
+        static let previewPlaceholder: CGFloat = 200
+        /// 300pt - Maximum preview image size
+        static let previewMax: CGFloat = 300
+        /// 300pt - Minimum height for empty/error state content
+        static let emptyStateMinHeight: CGFloat = 300
+        /// 100pt - Minimum grid item size
+        static let gridItemMin: CGFloat = 100
+        /// 150pt - Maximum grid item size
+        static let gridItemMax: CGFloat = 150
+    }
+
+    // MARK: - Badge Size
+
+    /// Standard badge sizes for status indicators
+    enum BadgeSize {
+        /// 10pt - Small spinner frame
+        static let spinner: CGFloat = 10
+        /// 18pt - Compact status indicator (checkmark circle)
+        static let compact: CGFloat = 18
+        /// 24pt - Standard badge size (analysis progress)
+        static let standard: CGFloat = 24
+    }
+
+    // MARK: - Date Formatters
+
+    /// Cached date formatters (expensive to create)
+    enum DateFormatters {
+        /// ISO8601 formatter for parsing API dates
+        /// Note: ISO8601DateFormatter is thread-safe for parsing operations
+        nonisolated(unsafe) static let iso8601: ISO8601DateFormatter = {
+            let formatter = ISO8601DateFormatter()
+            return formatter
+        }()
+    }
+
+    // MARK: - Analysis
+
+    /// Analysis pipeline constants
+    enum Analysis {
+        /// Number of analysis stages per media item (VLM, segmentation, embeddings, reverse image search)
+        static let stagesPerMedia = 4
     }
 }

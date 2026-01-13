@@ -23,7 +23,10 @@ class ShareViewController: UIViewController {
         super.viewDidLoad()
 
         let client: ShareClient = {
-            let authManager = AuthManager()
+            // Share extension only checks isAuthenticated and makes API calls.
+            // It doesn't perform auth operations (register/login), so authClient is unused.
+            // We pass a mock that throws if auth methods are accidentally called.
+            let authManager = AuthManager(authClient: MockAPIClient())
             guard authManager.isAuthenticated else {
                 return .notAuthenticated
             }

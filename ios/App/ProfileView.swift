@@ -276,7 +276,7 @@ struct EditFieldSheet: View {
 
 #Preview("Profile") {
     ProfileView(client: MockAPIClient.withSampleData())
-        .environmentObject(AuthManager())
+        .environmentObject(AuthManager(authClient: MockAPIClient()))
 }
 
 #Preview("Edit Username Sheet") {

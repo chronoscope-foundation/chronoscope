@@ -9,21 +9,12 @@ class AuthManager: ObservableObject {
 
     private static let logger = Logger(subsystem: "chronoscope", category: "auth")
 
-    // Dependency injection for testability
+    // Dependencies injected for testability
+    private let authClient: any APIProtocol
     private let keychainStorage: KeychainStorage
 
-    // Lazily created client - reused across requests.
-    // Can't use `lazy var` because: (1) it doesn't support optionals well,
-    // (2) it's not thread-safe, and (3) we need to support mock networking in UI tests.
-    private var _client: Client?
-    private var client: Client? {
-        if let existing = _client { return existing }
-        let newClient = APIClientFactory.makeClient(tokenProvider: getToken)
-        _client = newClient
-        return newClient
-    }
-
-    init(keychainStorage: KeychainStorage = SystemKeychainStorage()) {
+    init(authClient: any APIProtocol, keychainStorage: KeychainStorage = SystemKeychainStorage()) {
+        self.authClient = authClient
         self.keychainStorage = keychainStorage
         // Check for existing session
         do {
@@ -42,10 +33,8 @@ class AuthManager: ObservableObject {
     }
 
     func register(username: String, email: String) async throws {
-        guard let client else { throw AuthError.invalidServerURL }
-
         // 1. Start registration - get challenge from server
-        let startResponse = try await client.registerStart(body: .json(.init(email: email, username: username)))
+        let startResponse = try await authClient.registerStart(body: .json(.init(email: email, username: username)))
         guard case let .ok(okResponse) = startResponse,
               case let .json(data) = okResponse.body
         else {
@@ -74,7 +63,7 @@ class AuthManager: ObservableObject {
             throw AuthError.missingAttestationObject
         }
 
-        let finishResponse = try await client.registerFinish(
+        let finishResponse = try await authClient.registerFinish(
             body: .json(.init(
                 challengeToken: data.challengeToken,
                 credential: .init(
@@ -103,10 +92,8 @@ class AuthManager: ObservableObject {
     }
 
     func signIn(identifier: String) async throws {
-        guard let client else { throw AuthError.invalidServerURL }
-
         // 1. Start login - get challenge from server
-        let startResponse = try await client.loginStart(body: .json(.init(identifier: identifier)))
+        let startResponse = try await authClient.loginStart(body: .json(.init(identifier: identifier)))
         guard case let .ok(okResponse) = startResponse,
               case let .json(data) = okResponse.body
         else {
@@ -129,7 +116,7 @@ class AuthManager: ObservableObject {
         )
 
         // 3. Complete login with server
-        let finishResponse = try await client.loginFinish(
+        let finishResponse = try await authClient.loginFinish(
             body: .json(.init(
                 challengeToken: data.challengeToken,
                 credential: .init(
@@ -240,7 +227,6 @@ private class AuthorizationDelegate<T: ASAuthorizationCredential>: NSObject, ASA
 enum AuthError: LocalizedError {
     case unexpectedCredentialType
     case invalidResponse
-    case invalidServerURL
     case missingAttestationObject
     case invalidChallenge
     case invalidUserId
@@ -252,8 +238,6 @@ enum AuthError: LocalizedError {
             "Unexpected credential type received"
         case .invalidResponse:
             "Invalid response from server"
-        case .invalidServerURL:
-            "Invalid server URL"
         case .missingAttestationObject:
             "Missing attestation object from credential"
         case .invalidChallenge:

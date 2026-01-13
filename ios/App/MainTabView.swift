@@ -31,5 +31,5 @@ struct MainTabView: View {
 
 #Preview {
     MainTabView(client: MockAPIClient.withSampleData())
-        .environmentObject(AuthManager())
+        .environmentObject(AuthManager(authClient: MockAPIClient()))
 }

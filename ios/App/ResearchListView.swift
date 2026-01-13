@@ -16,9 +16,22 @@ struct ResearchListView: View {
                 ),
                 fetch: fetchPage
             ) { item in
-                ResearchRowView(item: item)
+                if item.status == .failed {
+                    // Failed items are not interactive - no detail to show
+                    ResearchRowView(item: item)
+                        .opacity(Design.Opacity.disabled)
+                        .accessibilityHint("Processing failed. This item cannot be opened.")
+                } else {
+                    NavigationLink(value: item) {
+                        ResearchRowView(item: item)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .navigationTitle("Research")
+            .navigationDestination(for: ResearchItem.self) { item in
+                ResearchDetailView(id: item.id, client: client)
+            }
         }
     }
 
@@ -41,15 +54,26 @@ struct ResearchListView: View {
 
 // MARK: - Research Item
 
-struct ResearchItem: Identifiable {
+struct ResearchItem: Identifiable, Hashable {
     let id: String
     let url: String
-    let createdAt: Date?
+    let status: Components.Schemas.ResearchUrlStatus
+    let summary: String
+    let thumbnailUrl: String?
+    let progress: AnalysisProgress
+    let sourceType: Components.Schemas.SourceType
 
     init(_ response: Components.Schemas.ResearchUrlSummary) {
         self.id = response.id
         self.url = response.url
-        self.createdAt = ISO8601DateFormatter().date(from: response.createdAt)
+        self.status = response.status
+        self.summary = response.summary
+        self.thumbnailUrl = response.thumbnailUrl
+        self.sourceType = .init(url: response.url)
+
+        self.progress = AnalysisProgress(
+            totalMedia: response.analysis.value1.media.value1.total
+        )
     }
 }
 
@@ -59,26 +83,75 @@ struct ResearchRowView: View {
     let item: ResearchItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Design.Spacing.extraExtraSmall) {
-            Text(item.url)
-                .font(.headline)
-                .lineLimit(1)
-
-            HStack {
-                Spacer()
-
-                Text(formattedDate)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+        HStack(alignment: .center, spacing: Design.Spacing.small) {
+            thumbnailView
+            contentView
         }
-        .padding(.vertical, Design.Spacing.extraExtraSmall)
+        .padding(.vertical, Design.Spacing.extraSmall)
         .accessibilityElement(children: .combine)
     }
 
-    private var formattedDate: String {
-        guard let date = item.createdAt else { return "" }
-        return date.formatted(.relative(presentation: .named))
+    private var thumbnailView: some View {
+        Group {
+            if let urlString = item.thumbnailUrl, let url = URL(string: urlString) {
+                AsyncImage(url: url) { phase in
+                    if case let .success(image) = phase {
+                        image.resizable().aspectRatio(contentMode: .fill)
+                    } else {
+                        placeholderContent
+                    }
+                }
+            } else {
+                placeholderContent
+            }
+        }
+        .frame(width: Design.Size.thumbnail, height: Design.Size.thumbnail)
+        .clipShape(RoundedRectangle(cornerRadius: Design.CornerRadius.small))
+    }
+
+    private var placeholderContent: some View {
+        let fillColor = item.status == .failed
+            ? Color.red.opacity(Design.Opacity.placeholder)
+            : Color.secondary.opacity(Design.Opacity.placeholder)
+        let iconColor = item.status == .failed
+            ? Color.red
+            : Color.secondary.opacity(Design.Opacity.medium)
+
+        return Rectangle()
+            .fill(fillColor)
+            .overlay {
+                Image(systemName: item.status == .failed ? "exclamationmark.triangle" : item.sourceType.icon)
+                    .foregroundStyle(iconColor)
+            }
+    }
+
+    private var contentView: some View {
+        VStack(alignment: .leading, spacing: Design.Spacing.extraExtraSmall) {
+            Text(item.summary)
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .lineLimit(2)
+                .foregroundStyle(.primary)
+
+            statusRow
+        }
+    }
+
+    private var statusRow: some View {
+        HStack(spacing: Design.Spacing.extraSmall) {
+            StatusBadge(status: item.status)
+
+            if item.progress.totalMedia > 0 {
+                Text(mediaCountText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var mediaCountText: String {
+        let count = item.progress.totalMedia
+        return count == 1 ? "1 item" : "\(count) items"
     }
 }
 

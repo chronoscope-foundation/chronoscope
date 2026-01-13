@@ -109,15 +109,13 @@ pub struct ResearchUrlSummary {
     pub id: ResearchUrlId,
     pub url: String,
     pub status: ResearchUrlStatus,
+    /// Best available summary for list display.
+    /// Initially derived from URL parsing, upgraded as analysis extracts
+    /// meaningful context (dates, locations, titles).
+    pub summary: String,
     /// Thumbnail URL (CDN path), if available
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
-    /// Primary date hint: "~1920s", "Mar 15, 1952", etc.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub primary_date: Option<String>,
-    /// Primary location hint: "Gary, IN", coordinates, etc.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub primary_location: Option<String>,
     /// Analysis progress
     pub analysis: UrlAnalysis,
     /// When this URL was submitted
@@ -135,14 +133,15 @@ pub struct FollowedUrlSummary {
 
 impl From<ResearchUrl> for ResearchUrlSummary {
     fn from(u: ResearchUrl) -> Self {
+        // TODO: Implement smart summary extraction from URL and resolved content
+        let summary = u.url.clone();
+
         ResearchUrlSummary {
             id: u.id,
+            summary,
             url: u.url,
             status: u.status,
-            // TODO: Populate these from resolved content when available
             thumbnail_url: None,
-            primary_date: None,
-            primary_location: None,
             analysis: UrlAnalysis::default(),
             created_at: u.created_at,
         }

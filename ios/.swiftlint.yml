@@ -29,8 +29,7 @@ opt_in_rules:
   - unowned_variable_capture
   - yoda_condition
 
-  # Style
-  - attributes
+  # Style (formatting rules handled by SwiftFormat)
   - closure_end_indentation
   - closure_spacing
   - collection_alignment

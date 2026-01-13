@@ -26,6 +26,9 @@ targets:
       - path: App
       - path: Shared
       - path: ShareExtension/ShareView.swift  # Included for SwiftUI preview support
+    resources:
+      - path: Shared/Resources
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: chronoscope.app

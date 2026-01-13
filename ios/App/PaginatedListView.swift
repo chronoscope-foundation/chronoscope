@@ -100,7 +100,7 @@ struct PaginatedListView<Item: Identifiable, ItemView: View>: View {
                     systemImage: empty.systemImage,
                     description: Text(empty.description)
                 )
-                .frame(maxWidth: .infinity, minHeight: 300)
+                .frame(maxWidth: .infinity, minHeight: Design.Size.emptyStateMinHeight)
             }
 
         case .loaded,
@@ -133,7 +133,7 @@ struct PaginatedListView<Item: Identifiable, ItemView: View>: View {
                     systemImage: "exclamationmark.triangle",
                     description: Text("Pull to refresh and try again")
                 )
-                .frame(maxWidth: .infinity, minHeight: 300)
+                .frame(maxWidth: .infinity, minHeight: Design.Size.emptyStateMinHeight)
             }
         }
     }

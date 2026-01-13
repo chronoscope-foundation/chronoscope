@@ -21,13 +21,13 @@ struct ContentView: View {
 #Preview("Authenticated") {
     ContentView(client: MockAPIClient.withSampleData())
         .environmentObject({
-            let manager = AuthManager(keychainStorage: InMemoryKeychainStorage())
-            manager.isAuthenticated = true
-            return manager
+            let mockKeychain = InMemoryKeychainStorage()
+            mockKeychain.setToken("preview-token")
+            return AuthManager(authClient: MockAPIClient(), keychainStorage: mockKeychain)
         }())
 }
 
 #Preview("Not Authenticated") {
     ContentView(client: MockAPIClient())
-        .environmentObject(AuthManager(keychainStorage: InMemoryKeychainStorage()))
+        .environmentObject(AuthManager(authClient: MockAPIClient(), keychainStorage: InMemoryKeychainStorage()))
 }

@@ -10,6 +10,9 @@
 --maxwidth 120
 --wraparguments before-first
 --wrapparameters before-first
+--func-attributes prev-line
+--type-attributes prev-line
+--complex-attributes prev-line
 --closingparen balanced
 
 # Rules
