@@ -1,0 +1,3 @@
+# Mark HTTP fixture files as generated (binary-like, don't diff)
+# These are VCR-style cassettes for HTTP test mocking
+workers/fixtures/*.json linguist-generated=true -diff

@@ -127,16 +127,16 @@ define_queries! {
     ",
     GET_URL_BY_ID: "SELECT id, url, page_id, media_id, status, claimed_at, claimed_by, attempt_count, retry_after, error_message, created_at FROM research_urls WHERE id = ?",
     // Keyset pagination: first page (no cursor)
-    LIST_ALL_URLS_FIRST: "SELECT id, url, page_id, media_id, status, created_at FROM research_urls ORDER BY created_at DESC, id DESC LIMIT ?",
+    LIST_ALL_URLS_FIRST: "SELECT id, url, page_id, media_id, status, attempt_count, created_at FROM research_urls ORDER BY created_at DESC, id DESC LIMIT ?",
     // Keyset pagination: subsequent pages (cursor = created_at, id of last item)
-    LIST_ALL_URLS_PAGE: "SELECT id, url, page_id, media_id, status, created_at FROM research_urls WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+    LIST_ALL_URLS_PAGE: "SELECT id, url, page_id, media_id, status, attempt_count, created_at FROM research_urls WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?",
 
     // Follows (created_at must be provided - no defaults)
     CREATE_FOLLOW: "INSERT INTO follows (user_id, url_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
     // Keyset pagination: first page (no cursor)
-    LIST_FOLLOWED_URLS_FIRST: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
+    LIST_FOLLOWED_URLS_FIRST: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.attempt_count, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
     // Keyset pagination: subsequent pages (cursor = followed_at, url_id of last item)
-    LIST_FOLLOWED_URLS_PAGE: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? AND (f.created_at, r.id) < (?, ?) ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
+    LIST_FOLLOWED_URLS_PAGE: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.attempt_count, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? AND (f.created_at, r.id) < (?, ?) ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
     GET_FOLLOW_TIMESTAMP: "SELECT created_at FROM follows WHERE user_id = ? AND url_id = ?",
     DELETE_FOLLOW: "DELETE FROM follows WHERE user_id = ? AND url_id = ?",
 
@@ -175,7 +175,7 @@ define_queries! {
     //   - failed: retry_after time has passed
     // Uses UPDATE...RETURNING (SQLite 3.35.0+) for atomic claim-and-fetch
     // Uses UNION ALL to allow SQLite to use separate indexes for each case
-    // Params: ?1=now, ?2=worker_id, ?3=stale_threshold, ?4=now (for retry_after), ?5=batch_size
+    // Params: ?1=now, ?2=worker_id, ?3=stale_cutoff, ?4=now (for retry_after), ?5=batch_size
     CLAIM_URLS: "
         UPDATE research_urls
         SET status = 'analyzing', claimed_at = ?1, claimed_by = ?2
@@ -193,7 +193,7 @@ define_queries! {
             ORDER BY retry_after NULLS FIRST, created_at
             LIMIT ?5
         )
-        RETURNING id, url, page_id, media_id, status, created_at
+        RETURNING id, url, page_id, media_id, status, attempt_count, created_at
     ",
 }
 

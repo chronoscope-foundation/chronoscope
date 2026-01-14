@@ -61,6 +61,7 @@ pub struct ResearchUrl {
     pub page_id: Option<PageId>,
     pub media_id: Option<MediaId>,
     pub status: ResearchUrlStatus,
+    pub attempt_count: i32,
     pub created_at: NaiveDateTime,
 }
 

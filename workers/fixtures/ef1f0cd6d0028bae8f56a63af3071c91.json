@@ -1,0 +1,20 @@
+{
+  "url": "https://example.com/",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "vary": "Accept-Encoding",
+    "connection": "keep-alive",
+    "server": "cloudflare",
+    "age": "9344",
+    "transfer-encoding": "chunked",
+    "cf-ray": "9bde68856e3efbea-SEA",
+    "allow": "GET, HEAD",
+    "cf-cache-status": "HIT",
+    "date": "Wed, 14 Jan 2026 16:11:16 GMT",
+    "content-type": "text/html",
+    "last-modified": "Tue, 13 Jan 2026 19:10:53 GMT"
+  },
+  "body": "PCFkb2N0eXBlIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjx0aXRsZT5FeGFtcGxlIERvbWFpbjwvdGl0bGU+PG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xIj48c3R5bGU+Ym9keXtiYWNrZ3JvdW5kOiNlZWU7d2lkdGg6NjB2dzttYXJnaW46MTV2aCBhdXRvO2ZvbnQtZmFtaWx5OnN5c3RlbS11aSxzYW5zLXNlcmlmfWgxe2ZvbnQtc2l6ZToxLjVlbX1kaXZ7b3BhY2l0eTowLjh9YTpsaW5rLGE6dmlzaXRlZHtjb2xvcjojMzQ4fTwvc3R5bGU+PGJvZHk+PGRpdj48aDE+RXhhbXBsZSBEb21haW48L2gxPjxwPlRoaXMgZG9tYWluIGlzIGZvciB1c2UgaW4gZG9jdW1lbnRhdGlvbiBleGFtcGxlcyB3aXRob3V0IG5lZWRpbmcgcGVybWlzc2lvbi4gQXZvaWQgdXNlIGluIG9wZXJhdGlvbnMuPHA+PGEgaHJlZj0iaHR0cHM6Ly9pYW5hLm9yZy9kb21haW5zL2V4YW1wbGUiPkxlYXJuIG1vcmU8L2E+PC9kaXY+PC9ib2R5PjwvaHRtbD4K",
+  "final_url": "https://example.com/"
+}

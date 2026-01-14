@@ -9,6 +9,7 @@
 #![deny(unsafe_code)]
 
 pub mod error;
+pub mod media_store;
 pub mod models;
 pub mod queries;
 pub mod types;

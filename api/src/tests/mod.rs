@@ -7,7 +7,6 @@ mod auth;
 mod research;
 mod user;
 mod well_known;
-mod work_queue;
 
 use std::collections::HashMap;
 use std::net::IpAddr;

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["api", "db", "dev"]
+members = ["api", "db", "dev", "workers"]
 
 [workspace.package]
 edition = "2024"
@@ -25,3 +25,4 @@ url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 base64 = "0.22"
 thiserror = "2"
+bytes = "1"

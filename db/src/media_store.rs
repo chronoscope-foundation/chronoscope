@@ -1,0 +1,298 @@
+//! Media storage abstraction for workers.
+//!
+//! This module provides a `MediaStore` trait for storing and retrieving media files,
+//! with an in-memory implementation for development and testing.
+
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::pin::Pin;
+use std::sync::RwLock;
+
+use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncReadExt};
+
+/// Error type for media store operations.
+#[derive(Debug, Clone)]
+pub struct MediaStoreError(String);
+
+impl std::fmt::Display for MediaStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "media store I/O error: {}", self.0)
+    }
+}
+
+impl std::error::Error for MediaStoreError {}
+
+impl From<std::io::Error> for MediaStoreError {
+    fn from(err: std::io::Error) -> Self {
+        Self(err.to_string())
+    }
+}
+
+/// Metadata about stored media.
+#[derive(Debug, Clone)]
+pub struct MediaMetadata {
+    pub content_type: String,
+    pub size: u64,
+}
+
+/// Trait for media storage, allowing different backends (memory, filesystem, S3).
+#[async_trait::async_trait]
+pub trait MediaStore: Send + Sync {
+    /// Store media from an async reader.
+    ///
+    /// Reads all data from the reader and stores it under the given key.
+    /// If a value already exists for the key, it is overwritten.
+    async fn put_stream<R: AsyncRead + Send + Unpin>(
+        &self,
+        key: &str,
+        reader: R,
+        content_type: &str,
+    ) -> Result<(), MediaStoreError>;
+
+    /// Retrieve media as an async reader.
+    ///
+    /// Returns `None` if the key does not exist.
+    async fn get_stream(
+        &self,
+        key: &str,
+    ) -> Result<Option<Pin<Box<dyn AsyncRead + Send>>>, MediaStoreError>;
+
+    /// Get metadata about stored media without retrieving the content.
+    ///
+    /// Returns `None` if the key does not exist.
+    async fn head(&self, key: &str) -> Result<Option<MediaMetadata>, MediaStoreError>;
+
+    // ==================== Convenience Methods ====================
+
+    /// Store media from bytes (convenience wrapper around `put_stream`).
+    async fn put(&self, key: &str, data: Bytes, content_type: &str) -> Result<(), MediaStoreError> {
+        self.put_stream(key, Cursor::new(data), content_type).await
+    }
+
+    /// Retrieve media as bytes (convenience wrapper around `get_stream`).
+    ///
+    /// Returns `None` if the key does not exist.
+    async fn get(&self, key: &str) -> Result<Option<Bytes>, MediaStoreError> {
+        match self.get_stream(key).await? {
+            Some(mut reader) => {
+                let mut buf = Vec::new();
+                reader.read_to_end(&mut buf).await?;
+                Ok(Some(Bytes::from(buf)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Check if a key exists.
+    async fn exists(&self, key: &str) -> Result<bool, MediaStoreError> {
+        Ok(self.head(key).await?.is_some())
+    }
+}
+
+// ==================== InMemoryMediaStore ====================
+
+/// In-memory media store for development and testing.
+///
+/// Uses a simple `RwLock<HashMap>` for storage. Not suitable for production
+/// but works well for dev servers and tests where simplicity trumps performance.
+pub struct InMemoryMediaStore {
+    storage: RwLock<HashMap<String, StoredMedia>>,
+}
+
+/// Media stored in memory.
+struct StoredMedia {
+    data: Bytes,
+    content_type: String,
+}
+
+impl InMemoryMediaStore {
+    /// Create a new empty in-memory store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            storage: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for InMemoryMediaStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl MediaStore for InMemoryMediaStore {
+    async fn put_stream<R: AsyncRead + Send + Unpin>(
+        &self,
+        key: &str,
+        mut reader: R,
+        content_type: &str,
+    ) -> Result<(), MediaStoreError> {
+        // Read all data from the stream
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await?;
+
+        // Store in memory
+        let stored = StoredMedia {
+            data: Bytes::from(buf),
+            content_type: content_type.to_string(),
+        };
+
+        self.storage
+            .write()
+            .map_err(|e| MediaStoreError(format!("lock poisoned: {e}")))?
+            .insert(key.to_string(), stored);
+
+        Ok(())
+    }
+
+    async fn get_stream(
+        &self,
+        key: &str,
+    ) -> Result<Option<Pin<Box<dyn AsyncRead + Send>>>, MediaStoreError> {
+        let guard = self
+            .storage
+            .read()
+            .map_err(|e| MediaStoreError(format!("lock poisoned: {e}")))?;
+
+        match guard.get(key) {
+            Some(stored) => {
+                // Cursor<T> implements AsyncRead when T: AsRef<[u8]> + Unpin
+                let cursor = Cursor::new(stored.data.clone());
+                Ok(Some(Box::pin(cursor)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<MediaMetadata>, MediaStoreError> {
+        let guard = self
+            .storage
+            .read()
+            .map_err(|e| MediaStoreError(format!("lock poisoned: {e}")))?;
+
+        Ok(guard.get(key).map(|stored| MediaMetadata {
+            content_type: stored.content_type.clone(),
+            size: stored.data.len() as u64,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_put_and_get_bytes() {
+        let store = InMemoryMediaStore::new();
+
+        store
+            .put("test.jpg", Bytes::from("image data"), "image/jpeg")
+            .await
+            .expect("put should succeed");
+
+        let retrieved = store.get("test.jpg").await.expect("get should succeed");
+        assert_eq!(retrieved, Some(Bytes::from("image data")));
+    }
+
+    #[tokio::test]
+    async fn test_get_nonexistent_returns_none() {
+        let store = InMemoryMediaStore::new();
+
+        let result = store.get("nonexistent").await.expect("get should succeed");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_head_returns_metadata() {
+        let store = InMemoryMediaStore::new();
+        let data = Bytes::from("test content here");
+
+        store
+            .put("test.txt", data.clone(), "text/plain")
+            .await
+            .expect("put should succeed");
+
+        let meta = store
+            .head("test.txt")
+            .await
+            .expect("head should succeed")
+            .expect("should exist");
+
+        assert_eq!(meta.content_type, "text/plain");
+        assert_eq!(meta.size, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_head_nonexistent_returns_none() {
+        let store = InMemoryMediaStore::new();
+
+        let result = store
+            .head("nonexistent")
+            .await
+            .expect("head should succeed");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_existing() {
+        let store = InMemoryMediaStore::new();
+
+        store
+            .put("test.jpg", Bytes::from("original"), "image/jpeg")
+            .await
+            .expect("put should succeed");
+
+        store
+            .put("test.jpg", Bytes::from("updated"), "image/png")
+            .await
+            .expect("put should succeed");
+
+        let data = store
+            .get("test.jpg")
+            .await
+            .expect("get should succeed")
+            .expect("should exist");
+        assert_eq!(data, Bytes::from("updated"));
+
+        let meta = store
+            .head("test.jpg")
+            .await
+            .expect("head should succeed")
+            .expect("should exist");
+        assert_eq!(meta.content_type, "image/png");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_read() {
+        let store = InMemoryMediaStore::new();
+        let data = Bytes::from("streaming test data");
+
+        store
+            .put("stream.bin", data.clone(), "application/octet-stream")
+            .await
+            .expect("put should succeed");
+
+        let mut reader = store
+            .get_stream("stream.bin")
+            .await
+            .expect("get_stream should succeed")
+            .expect("should exist");
+
+        // Read in small chunks to test streaming
+        let mut buf = [0u8; 4];
+        let mut result = Vec::new();
+
+        loop {
+            let n = reader.read(&mut buf).await.expect("read should succeed");
+            if n == 0 {
+                break;
+            }
+            result.extend_from_slice(&buf[..n]);
+        }
+
+        assert_eq!(result, data.as_ref());
+    }
+}

@@ -11,6 +11,9 @@ use crate::models::{GpsLocation, MediaData, PageData, ResearchUrl};
 use crate::types::{MediaId, PageId, ResearchUrlId};
 use crate::{Database, now, queries};
 
+#[cfg(test)]
+mod tests;
+
 /// Helper struct for batch URL insertion JSON payload.
 #[derive(Serialize)]
 struct UrlEntry {
@@ -20,6 +23,18 @@ struct UrlEntry {
 
 impl Database {
     /// Create a new page with its media slots.
+    ///
+    /// This always creates a new page - there's no deduplication. Each URL gets its
+    /// own page record, even if the content is identical to another page. This is
+    /// intentional: pages often have variable content (timestamps, ads, trackers)
+    /// that makes content-based deduplication unreliable, and preserving the 1:1
+    /// URL→page relationship maintains clear provenance.
+    ///
+    /// Compare with [`get_or_create_media`], which *does* deduplicate by content hash
+    /// since identical images/videos are truly identical regardless of source URL.
+    ///
+    /// After creating a page, call [`mark_url_resolved_to_page`] to link the
+    /// research URL to this page.
     ///
     /// This is transactional: either everything succeeds or nothing is committed.
     /// Uses batch queries to minimize round trips:
@@ -93,13 +108,21 @@ impl Database {
 
     /// Create new media or return existing if hash matches.
     ///
-    /// Media is deduplicated by exact_hash - if media with the same hash exists,
-    /// the existing media ID is returned instead of creating a duplicate.
+    /// Unlike [`create_page`], this *does* deduplicate: if media with the same
+    /// `exact_hash` already exists, the existing media ID is returned instead of
+    /// creating a duplicate. This makes sense for media because identical bytes
+    /// are truly identical regardless of which URL they came from - the same
+    /// photo syndicated across 10 sites should be stored once.
+    ///
+    /// This means multiple research URLs can resolve to the same media record
+    /// (N:1 relationship), whereas pages are always 1:1 with their source URL.
+    ///
+    /// After getting/creating media, call [`mark_url_resolved_to_media`] to link
+    /// the research URL to this media.
     ///
     /// Uses `ON CONFLICT DO UPDATE SET id = id RETURNING id` to atomically
     /// insert-or-get in a single query. The no-op update makes RETURNING fire
-    /// even on conflict. This is fine because if the hash matches exactly,
-    /// then (barring bugs or unlikely collisions) all metadata will match too.
+    /// even on conflict.
     ///
     /// # Errors
     /// Returns `DbError::Sqlx` if the database operation fails.
@@ -170,7 +193,7 @@ impl Database {
 
     /// Mark a research URL as failed.
     ///
-    /// Increments attempt_count and sets retry_after for backoff.
+    /// Increments `attempt_count` and sets `retry_after` for backoff.
     ///
     /// # Errors
     /// Returns `DbError::Sqlx` if the database operation fails.
@@ -195,10 +218,10 @@ impl Database {
     ///
     /// Claims up to `batch_size` URLs that are either:
     /// - Pending and not claimed (or with a stale claim)
-    /// - Failed but past their retry_after time
+    /// - Failed but past their `retry_after` time
     ///
     /// Returns the claimed URLs, already marked as 'analyzing'.
-    /// Uses optimistic locking - claims expire after `stale_threshold`.
+    /// Uses optimistic locking - claims older than `stale_cutoff` are considered abandoned.
     ///
     /// # Errors
     /// Returns `DbError::Sqlx` if the database operation fails.
@@ -206,14 +229,14 @@ impl Database {
         &self,
         worker_id: &str,
         batch_size: u32,
-        stale_threshold: NaiveDateTime,
+        stale_cutoff: NaiveDateTime,
     ) -> DbResult<Vec<ResearchUrl>> {
         let now = now();
 
         let urls = sqlx::query_as(queries::CLAIM_URLS.sql)
             .bind(now) // ?1 = now (for claimed_at)
             .bind(worker_id) // ?2 = worker_id
-            .bind(stale_threshold) // ?3 = stale_threshold
+            .bind(stale_cutoff) // ?3 = stale_cutoff
             .bind(now) // ?4 = now (for retry_after comparison)
             .bind(batch_size) // ?5 = batch_size
             .fetch_all(&self.pool)

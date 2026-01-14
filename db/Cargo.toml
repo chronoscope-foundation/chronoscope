@@ -27,5 +27,9 @@ url.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 
+# Async traits and bytes (for MediaStore)
+async-trait = "0.1"
+bytes.workspace = true
+
 [dev-dependencies]
 tokio-test = "0.4"
