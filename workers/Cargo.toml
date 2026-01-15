@@ -19,9 +19,10 @@ chronoscope-db = { path = "../db" }
 tokio.workspace = true
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
 async-trait = "0.1"
 bytes.workspace = true
+futures-util = "0.3"
 
 # Hashing (for HTTP cache keys)
 sha2 = "0.10"
@@ -36,6 +37,21 @@ serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
 tracing = "0.1"
+
+# Content extraction and processing
+readability-js = "0.1"
+html2md = "0.2"
+scraper = "0.22"
+infer = "0.19"
+
+# Image processing
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+kamadak-exif = "0.6"
+image_hasher = "3.0"
+
+# Video metadata
+mp4parse = "0.17"
+# matroska removed: requires file path, not in-memory buffer; WebM parsing not yet implemented
 
 [dev-dependencies]
 tempfile = "3"

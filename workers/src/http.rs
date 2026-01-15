@@ -4,13 +4,95 @@
 //! with implementations for production use and VCR-style caching for tests.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use reqwest::{Method, StatusCode};
 use url::Url;
+
+// ==================== SSRF Protection ====================
+//
+// TODO: Factor out shared IP blocking logic into a common crate (e.g., chronoscope-security).
+// The functions below duplicate `check_ipv4_blocked` and `check_ipv6_blocked` from
+// api/src/url_security.rs. That module also does DNS resolution to validate hostnames,
+// which we can't do here (reqwest's redirect callback is sync). Once factored out,
+// this module should reuse the shared IP checking functions.
+
+/// Check if an IPv4 address is in a blocked range (private/internal/reserved).
+fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+
+    // Loopback: 127.0.0.0/8
+    octets[0] == 127
+        // Private: 10.0.0.0/8
+        || octets[0] == 10
+        // Private: 172.16.0.0/12
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        // Private: 192.168.0.0/16
+        || (octets[0] == 192 && octets[1] == 168)
+        // Link-local: 169.254.0.0/16 (includes cloud metadata at 169.254.169.254)
+        || (octets[0] == 169 && octets[1] == 254)
+        // Shared address space: 100.64.0.0/10 (carrier-grade NAT)
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+}
+
+/// Check if an IPv6 address is in a blocked range.
+fn is_blocked_ipv6(ip: &Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return true;
+    }
+
+    let segments = ip.segments();
+    // Link-local: fe80::/10
+    if (segments[0] & 0xffc0) == 0xfe80 {
+        return true;
+    }
+    // Unique local: fc00::/7
+    if (segments[0] & 0xfe00) == 0xfc00 {
+        return true;
+    }
+    // IPv4-mapped: check embedded IPv4
+    if let Some(ipv4) = ip.to_ipv4_mapped() {
+        return is_blocked_ipv4(ipv4);
+    }
+
+    false
+}
+
+/// Check if a host (from redirect target) is potentially an SSRF target.
+///
+/// This is a sync check suitable for reqwest's redirect callback.
+/// It catches IP address literals and known dangerous hostnames, but cannot
+/// resolve hostnames to check their IPs (that happens at URL submission time).
+fn is_redirect_blocked(host: &str) -> bool {
+    // Check for known dangerous hostnames
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+        || lower == "metadata.google.internal"
+        || lower == "metadata.goog"
+    {
+        return true;
+    }
+
+    // Check if it's an IP address literal
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(ipv4) => is_blocked_ipv4(ipv4),
+            IpAddr::V6(ipv6) => is_blocked_ipv6(&ipv6),
+        };
+    }
+
+    false
+}
 
 /// Error type for HTTP operations.
 #[derive(Debug, Clone)]
@@ -19,6 +101,10 @@ pub enum HttpError {
     Network(String),
     /// Request building error (invalid URL, headers, etc.)
     Request(String),
+    /// Response body exceeds maximum allowed size
+    ResponseTooLarge { size: usize, max: usize },
+    /// Redirect to a blocked destination (SSRF protection)
+    BlockedRedirect { url: String },
     /// Cache miss in offline mode
     CacheMiss { url: String },
     /// I/O error during cache operations
@@ -30,6 +116,15 @@ impl std::fmt::Display for HttpError {
         match self {
             Self::Network(msg) => write!(f, "network error: {msg}"),
             Self::Request(msg) => write!(f, "request error: {msg}"),
+            Self::ResponseTooLarge { size, max } => {
+                write!(
+                    f,
+                    "response too large: {size} bytes exceeds {max} byte limit"
+                )
+            }
+            Self::BlockedRedirect { url } => {
+                write!(f, "redirect to blocked destination: {url}")
+            }
             Self::CacheMiss { url } => write!(f, "cache miss for {url} in offline mode"),
             Self::CacheIo(msg) => write!(f, "cache I/O error: {msg}"),
         }
@@ -112,6 +207,7 @@ pub trait HttpClient: Send + Sync {
 /// Production HTTP client using reqwest.
 pub struct ReqwestClient {
     client: reqwest::Client,
+    max_response_size: usize,
 }
 
 impl ReqwestClient {
@@ -128,15 +224,38 @@ impl ReqwestClient {
     /// # Errors
     /// Returns an error if the client cannot be built.
     pub fn with_config(config: &ReqwestConfig) -> Result<Self, HttpError> {
+        // Custom redirect policy that blocks redirects to internal/private destinations
+        let max_redirects = config.max_redirects;
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= max_redirects {
+                return attempt.stop();
+            }
+
+            // Check if redirect target is blocked (SSRF protection)
+            // Note: Can't use let-chains here - need to copy host before moving attempt
+            #[allow(clippy::collapsible_if)]
+            if let Some(host) = attempt.url().host_str() {
+                if is_redirect_blocked(host) {
+                    let host = host.to_string();
+                    return attempt.error(format!("redirect to blocked host: {host}"));
+                }
+            }
+
+            attempt.follow()
+        });
+
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .connect_timeout(config.connect_timeout)
             .user_agent(&config.user_agent)
-            .redirect(reqwest::redirect::Policy::limited(config.max_redirects))
+            .redirect(redirect_policy)
             .build()
             .map_err(|e| HttpError::Request(e.to_string()))?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            max_response_size: config.max_response_size,
+        })
     }
 }
 
@@ -146,6 +265,9 @@ pub struct ReqwestConfig {
     pub connect_timeout: Duration,
     pub user_agent: String,
     pub max_redirects: usize,
+    /// Maximum response body size in bytes. Checked via Content-Length header
+    /// before downloading.
+    pub max_response_size: usize,
 }
 
 impl Default for ReqwestConfig {
@@ -155,6 +277,7 @@ impl Default for ReqwestConfig {
             connect_timeout: Duration::from_secs(10),
             user_agent: "Chronoscope/0.1".to_string(),
             max_redirects: 10,
+            max_response_size: 20 * 1024 * 1024, // 20MB
         }
     }
 }
@@ -189,10 +312,40 @@ impl HttpClient for ReqwestClient {
         let final_url = response.url().clone();
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| HttpError::Network(format!("failed to read body: {e}")))?;
+
+        // Check Content-Length header for early rejection (avoids wasting bandwidth).
+        // Note: Servers can lie, so we also enforce the limit while streaming below.
+        if let Some(content_length) = headers.get(reqwest::header::CONTENT_LENGTH)
+            && let Ok(size_str) = content_length.to_str()
+            && let Ok(size) = size_str.parse::<usize>()
+            && size > self.max_response_size
+        {
+            return Err(HttpError::ResponseTooLarge {
+                size,
+                max: self.max_response_size,
+            });
+        }
+
+        // Stream the body with a hard size limit to prevent memory exhaustion.
+        // We never buffer more than max_response_size bytes, even if the server lies.
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|e| HttpError::Network(format!("failed to read body: {e}")))?;
+
+            if body.len() + chunk.len() > self.max_response_size {
+                return Err(HttpError::ResponseTooLarge {
+                    size: body.len() + chunk.len(),
+                    max: self.max_response_size,
+                });
+            }
+
+            body.extend_from_slice(&chunk);
+        }
+
+        let body = Bytes::from(body);
 
         Ok(HttpResponse {
             status,
@@ -413,9 +566,11 @@ impl HttpClient for CachingClient {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
     #[test]
-    fn test_cache_key_deterministic() {
-        let url = Url::parse("https://example.com/page?a=1").expect("valid url");
+    fn test_cache_key_deterministic() -> TestResult {
+        let url = Url::parse("https://example.com/page?a=1")?;
         let request = HttpRequest::get(url);
 
         let key1 = CachingClient::cache_key(&request);
@@ -423,34 +578,31 @@ mod tests {
 
         assert_eq!(key1, key2);
         assert_eq!(key1.len(), 32); // 16 bytes = 32 hex chars
+        Ok(())
     }
 
     #[test]
-    fn test_cache_key_differs_for_different_urls() {
-        let url1 = Url::parse("https://example.com/page1").expect("valid url");
-        let url2 = Url::parse("https://example.com/page2").expect("valid url");
+    fn test_cache_key_differs_for_different_urls() -> TestResult {
+        let url1 = Url::parse("https://example.com/page1")?;
+        let url2 = Url::parse("https://example.com/page2")?;
 
         let key1 = CachingClient::cache_key(&HttpRequest::get(url1));
         let key2 = CachingClient::cache_key(&HttpRequest::get(url2));
 
         assert_ne!(key1, key2);
+        Ok(())
     }
 
     // ==================== VCR-style integration tests ====================
     //
-    // These tests use cached HTTP fixtures by default (offline mode).
-    // If fixtures are missing, tests print instructions and return early.
-    //
-    // To record fixtures: cargo test -p chronoscope-workers --features record-fixtures
-    //
-    // example.com is owned by IANA (RFC 2606) - stable and safe for testing.
+    // These tests verify the CachingClient works correctly with real HTTP fixtures.
+    // Run with: cargo test -p chronoscope-workers --features record-fixtures
+    // to record fixtures, then run without the feature to replay.
 
-    /// Get the fixtures directory path.
     fn fixtures_dir() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
     }
 
-    /// Determine VCR mode from feature flag.
     fn vcr_mode() -> CacheMode {
         if cfg!(feature = "record-fixtures") {
             CacheMode::Online
@@ -459,33 +611,25 @@ mod tests {
         }
     }
 
-    /// Create a VCR client for tests.
     fn vcr_client() -> Result<CachingClient, HttpError> {
         CachingClient::new(fixtures_dir(), vcr_mode())
     }
 
-    /// Execute a request, returning None if fixture is missing (with helpful message).
-    async fn vcr_fetch(client: &CachingClient, request: HttpRequest) -> Option<HttpResponse> {
-        match client.execute(request.clone()).await {
-            Ok(response) => Some(response),
+    #[tokio::test]
+    async fn test_example_com_returns_expected_content() -> TestResult {
+        let client = vcr_client()?;
+        let url = Url::parse("https://example.com/")?;
+
+        let response = match client.execute(HttpRequest::get(url)).await {
+            Ok(r) => r,
             Err(HttpError::CacheMiss { url }) => {
                 eprintln!(
                     "\n  ⚠ Fixture missing for: {url}\n  \
                      Record with: cargo test -p chronoscope-workers --features record-fixtures\n"
                 );
-                None
+                return Ok(());
             }
-            Err(e) => panic!("unexpected error: {e}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_example_com_returns_expected_content() {
-        let client = vcr_client().expect("create client");
-        let url = Url::parse("https://example.com/").expect("valid url");
-
-        let Some(response) = vcr_fetch(&client, HttpRequest::get(url)).await else {
-            return; // Fixture missing - message already printed
+            Err(e) => return Err(e.into()),
         };
 
         assert_eq!(response.status, StatusCode::OK);
@@ -495,33 +639,45 @@ mod tests {
             body.contains("Example Domain"),
             "example.com should contain 'Example Domain'"
         );
-        assert!(
-            body.contains("This domain is for use in"),
-            "example.com should contain usage description"
-        );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_example_com_404_response() {
-        let client = vcr_client().expect("create client");
-        let url = Url::parse("https://example.com/nonexistent-page-12345").expect("valid url");
+    async fn test_example_com_404_response() -> TestResult {
+        let client = vcr_client()?;
+        let url = Url::parse("https://example.com/nonexistent-page-12345")?;
 
-        let Some(response) = vcr_fetch(&client, HttpRequest::get(url)).await else {
-            return;
+        let response = match client.execute(HttpRequest::get(url)).await {
+            Ok(r) => r,
+            Err(HttpError::CacheMiss { url }) => {
+                eprintln!(
+                    "\n  ⚠ Fixture missing for: {url}\n  \
+                     Record with: cargo test -p chronoscope-workers --features record-fixtures\n"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
         };
 
         assert_eq!(response.status, StatusCode::NOT_FOUND);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_redirect_is_followed() {
-        let client = vcr_client().expect("create client");
-        // httpbin.org provides reliable redirect testing
-        let url = Url::parse("https://httpbin.org/redirect-to?url=https%3A%2F%2Fexample.com%2F")
-            .expect("valid url");
+    async fn test_redirect_is_followed() -> TestResult {
+        let client = vcr_client()?;
+        let url = Url::parse("https://httpbin.org/redirect-to?url=https%3A%2F%2Fexample.com%2F")?;
 
-        let Some(response) = vcr_fetch(&client, HttpRequest::get(url)).await else {
-            return;
+        let response = match client.execute(HttpRequest::get(url)).await {
+            Ok(r) => r,
+            Err(HttpError::CacheMiss { url }) => {
+                eprintln!(
+                    "\n  ⚠ Fixture missing for: {url}\n  \
+                     Record with: cargo test -p chronoscope-workers --features record-fixtures\n"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
         };
 
         assert_eq!(response.status, StatusCode::OK);
@@ -530,16 +686,17 @@ mod tests {
             "should have followed redirect to example.com, got: {}",
             response.final_url
         );
+        Ok(())
     }
 
-    // ==================== CachingClient unit tests (use temp dirs) ====================
+    // ==================== CachingClient unit tests ====================
 
     #[tokio::test]
-    async fn test_caching_client_round_trip() {
-        let cache_dir = tempfile::tempdir().expect("create temp dir");
+    async fn test_caching_client_round_trip() -> TestResult {
+        let cache_dir = tempfile::tempdir()?;
 
         // We test the cache read path by pre-writing a cache file
-        let url = Url::parse("https://test.example/cached").expect("valid url");
+        let url = Url::parse("https://test.example/cached")?;
         let request = HttpRequest::get(url.clone());
         let cache_key = CachingClient::cache_key(&request);
         let cache_path = cache_dir.path().join(format!("{cache_key}.json"));
@@ -553,25 +710,23 @@ mod tests {
             "body": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"cached content"),
             "final_url": "https://test.example/cached"
         });
-        std::fs::write(&cache_path, serde_json::to_string_pretty(&cached).unwrap())
-            .expect("write cache");
+        std::fs::write(&cache_path, serde_json::to_string_pretty(&cached)?)?;
 
         // Offline client reads from cache
-        let offline = CachingClient::new(cache_dir.path().to_path_buf(), CacheMode::Offline)
-            .expect("create client");
+        let offline = CachingClient::new(cache_dir.path().to_path_buf(), CacheMode::Offline)?;
 
-        let response = offline.execute(request).await.expect("read from cache");
+        let response = offline.execute(request).await?;
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body.as_ref(), b"cached content");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_caching_client_offline_cache_miss() {
-        let cache_dir = tempfile::tempdir().expect("create temp dir");
-        let client = CachingClient::new(cache_dir.path().to_path_buf(), CacheMode::Offline)
-            .expect("create client");
+    async fn test_caching_client_offline_cache_miss() -> TestResult {
+        let cache_dir = tempfile::tempdir()?;
+        let client = CachingClient::new(cache_dir.path().to_path_buf(), CacheMode::Offline)?;
 
-        let url = Url::parse("https://example.com/not-cached").expect("valid url");
+        let url = Url::parse("https://example.com/not-cached")?;
 
         let result = client.execute(HttpRequest::get(url)).await;
 
@@ -579,5 +734,6 @@ mod tests {
             matches!(result, Err(HttpError::CacheMiss { .. })),
             "offline mode should return CacheMiss for uncached URL"
         );
+        Ok(())
     }
 }

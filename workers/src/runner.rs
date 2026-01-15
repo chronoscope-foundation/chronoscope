@@ -358,6 +358,8 @@ mod tests {
     use tokio::sync::mpsc;
     use url::Url;
 
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
     // ==================== RetryConfig Unit Tests ====================
 
     #[test]
@@ -465,10 +467,11 @@ mod tests {
         /// Configure a sequence of responses for a URL.
         /// First call returns first result, second call returns second, etc.
         fn on_url(self, url: &str, responses: Vec<ItemResult<Url>>) -> Self {
-            self.responses
-                .lock()
-                .expect("lock")
-                .insert(url.to_string(), VecDeque::from(responses));
+            // Mutex poisoning only occurs if another thread panicked while holding
+            // the lock. In single-threaded test setup code, this cannot happen.
+            if let Ok(mut guard) = self.responses.lock() {
+                guard.insert(url.to_string(), VecDeque::from(responses));
+            }
             self
         }
     }
@@ -492,9 +495,8 @@ mod tests {
                 let result = self
                     .responses
                     .lock()
-                    .expect("lock")
-                    .get_mut(&item.url)
-                    .and_then(|q| q.pop_front())
+                    .ok()
+                    .and_then(|mut guard| guard.get_mut(&item.url).and_then(|q| q.pop_front()))
                     .unwrap_or_else(|| ItemResult::PermanentFailure {
                         error: "no response configured".into(),
                     });
@@ -540,20 +542,16 @@ mod tests {
         }
     }
 
-    async fn setup_test_db() -> Arc<Database> {
-        Arc::new(
-            Database::new("sqlite::memory:")
-                .await
-                .expect("create test db"),
-        )
+    async fn setup_test_db() -> Result<Arc<Database>, chronoscope_db::DbError> {
+        Ok(Arc::new(Database::new("sqlite::memory:").await?))
     }
 
-    async fn create_test_url(db: &Database, url: &str) {
+    async fn create_test_url(db: &Database, url: &str) -> Result<(), chronoscope_db::DbError> {
         let user_id = UserId::generate();
         db.create_user(&user_id, "testuser", &Email::new("test@example.com"))
-            .await
-            .expect("create user");
-        db.submit_url(&user_id, url).await.expect("submit url");
+            .await?;
+        db.submit_url(&user_id, url).await?;
+        Ok(())
     }
 
     fn fast_retry_config() -> RetryConfig {
@@ -573,25 +571,48 @@ mod tests {
         }
     }
 
+    /// Error type for collect_n failures.
+    #[derive(Debug)]
+    struct CollectError(String);
+
+    impl std::fmt::Display for CollectError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl std::error::Error for CollectError {}
+
     /// Collect N items from a channel, with a timeout.
-    async fn collect_n<T>(rx: &mut mpsc::UnboundedReceiver<T>, n: usize) -> Vec<T> {
+    async fn collect_n<T>(
+        rx: &mut mpsc::UnboundedReceiver<T>,
+        n: usize,
+    ) -> Result<Vec<T>, CollectError> {
         let mut results = Vec::with_capacity(n);
         for _ in 0..n {
             match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
                 Ok(Some(item)) => results.push(item),
-                Ok(None) => panic!("channel closed unexpectedly"),
-                Err(_) => panic!("timeout waiting for item {}/{}", results.len() + 1, n),
+                Ok(None) => {
+                    return Err(CollectError("channel closed unexpectedly".to_string()));
+                }
+                Err(_) => {
+                    return Err(CollectError(format!(
+                        "timeout waiting for item {}/{}",
+                        results.len() + 1,
+                        n
+                    )));
+                }
             }
         }
-        results
+        Ok(results)
     }
 
     // ==================== Runner Integration Tests ====================
 
     #[tokio::test]
-    async fn test_runner_calls_worker_with_queued_item() {
-        let db = setup_test_db().await;
-        create_test_url(&db, "https://example.com/test").await;
+    async fn test_runner_calls_worker_with_queued_item() -> TestResult {
+        let db = setup_test_db().await?;
+        create_test_url(&db, "https://example.com/test").await?;
 
         let (call_tx, mut call_rx) = mpsc::unbounded_channel();
         let (enqueue_tx, _enqueue_rx) = mpsc::unbounded_channel();
@@ -619,16 +640,17 @@ mod tests {
         });
 
         // Wait for worker to be called once
-        let calls = collect_n(&mut call_rx, 1).await;
-        shutdown_tx.send(true).expect("shutdown");
+        let calls = collect_n(&mut call_rx, 1).await?;
+        let _ = shutdown_tx.send(true);
 
         assert_eq!(calls, vec!["https://example.com/test"]);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_runner_retries_on_retriable_error() {
-        let db = setup_test_db().await;
-        create_test_url(&db, "https://example.com/retry").await;
+    async fn test_runner_retries_on_retriable_error() -> TestResult {
+        let db = setup_test_db().await?;
+        create_test_url(&db, "https://example.com/retry").await?;
 
         let (call_tx, mut call_rx) = mpsc::unbounded_channel();
         let (enqueue_tx, _enqueue_rx) = mpsc::unbounded_channel();
@@ -665,8 +687,8 @@ mod tests {
         });
 
         // Should be called 3 times (2 retries + 1 success)
-        let calls = collect_n(&mut call_rx, 3).await;
-        shutdown_tx.send(true).expect("shutdown");
+        let calls = collect_n(&mut call_rx, 3).await?;
+        let _ = shutdown_tx.send(true);
 
         // All 3 calls should be for the same URL
         assert_eq!(
@@ -677,12 +699,13 @@ mod tests {
                 "https://example.com/retry",
             ]
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_runner_does_not_retry_permanent_failure() {
-        let db = setup_test_db().await;
-        create_test_url(&db, "https://example.com/permanent").await;
+    async fn test_runner_does_not_retry_permanent_failure() -> TestResult {
+        let db = setup_test_db().await?;
+        create_test_url(&db, "https://example.com/permanent").await?;
 
         let (call_tx, mut call_rx) = mpsc::unbounded_channel();
         let (enqueue_tx, _enqueue_rx) = mpsc::unbounded_channel();
@@ -716,32 +739,32 @@ mod tests {
         });
 
         // Should only be called once
-        let calls = collect_n(&mut call_rx, 1).await;
+        let calls = collect_n(&mut call_rx, 1).await?;
 
         // Give a brief moment to ensure no second call comes
         let extra = tokio::time::timeout(Duration::from_millis(50), call_rx.recv()).await;
-        shutdown_tx.send(true).expect("shutdown");
+        let _ = shutdown_tx.send(true);
 
         assert_eq!(calls, vec!["https://example.com/permanent"]);
         assert!(extra.is_err(), "should not have been called again");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_runner_processes_discovered_urls() {
-        let db = setup_test_db().await;
-        create_test_url(&db, "https://example.com/parent").await;
+    async fn test_runner_processes_discovered_urls() -> TestResult {
+        let db = setup_test_db().await?;
+        create_test_url(&db, "https://example.com/parent").await?;
 
         // Create system user for UrlEnqueuer
         let system_user = UserId::generate();
         db.create_user(&system_user, "system", &Email::new("system@test.io"))
-            .await
-            .expect("create system user");
+            .await?;
 
         let (call_tx, mut call_rx) = mpsc::unbounded_channel();
 
         let discovered = vec![
-            Url::parse("https://example.com/child1").expect("url"),
-            Url::parse("https://example.com/child2").expect("url"),
+            Url::parse("https://example.com/child1")?,
+            Url::parse("https://example.com/child2")?,
         ];
 
         // Configure worker for parent (returns discovered) and both children (return success)
@@ -776,8 +799,8 @@ mod tests {
         });
 
         // Wait for worker to be called 3 times (parent + 2 children)
-        let calls = collect_n(&mut call_rx, 3).await;
-        shutdown_tx.send(true).expect("shutdown");
+        let calls = collect_n(&mut call_rx, 3).await?;
+        let _ = shutdown_tx.send(true);
 
         // Verify all 3 URLs were processed
         assert!(
@@ -792,5 +815,6 @@ mod tests {
             calls.contains(&"https://example.com/child2".to_string()),
             "expected child2 in calls: {calls:?}"
         );
+        Ok(())
     }
 }

@@ -37,16 +37,18 @@ pub struct MediaMetadata {
 }
 
 /// Trait for media storage, allowing different backends (memory, filesystem, S3).
+///
+/// This trait is object-safe (dyn-compatible), so you can use `Arc<dyn MediaStore>`.
 #[async_trait::async_trait]
 pub trait MediaStore: Send + Sync {
     /// Store media from an async reader.
     ///
     /// Reads all data from the reader and stores it under the given key.
     /// If a value already exists for the key, it is overwritten.
-    async fn put_stream<R: AsyncRead + Send + Unpin>(
+    async fn put_stream(
         &self,
         key: &str,
-        reader: R,
+        reader: Pin<Box<dyn AsyncRead + Send>>,
         content_type: &str,
     ) -> Result<(), MediaStoreError>;
 
@@ -67,7 +69,8 @@ pub trait MediaStore: Send + Sync {
 
     /// Store media from bytes (convenience wrapper around `put_stream`).
     async fn put(&self, key: &str, data: Bytes, content_type: &str) -> Result<(), MediaStoreError> {
-        self.put_stream(key, Cursor::new(data), content_type).await
+        self.put_stream(key, Box::pin(Cursor::new(data)), content_type)
+            .await
     }
 
     /// Retrieve media as bytes (convenience wrapper around `get_stream`).
@@ -124,10 +127,10 @@ impl Default for InMemoryMediaStore {
 
 #[async_trait::async_trait]
 impl MediaStore for InMemoryMediaStore {
-    async fn put_stream<R: AsyncRead + Send + Unpin>(
+    async fn put_stream(
         &self,
         key: &str,
-        mut reader: R,
+        mut reader: Pin<Box<dyn AsyncRead + Send>>,
         content_type: &str,
     ) -> Result<(), MediaStoreError> {
         // Read all data from the stream

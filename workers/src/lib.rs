@@ -14,7 +14,7 @@
 //!
 //! # Available Workers
 //!
-//! - **URL Fetcher**: (coming soon) Fetches URLs, extracts content and media
+//! - **URL Fetcher**: Fetches URLs, extracts content (HTML/images/video), discovers embedded media
 
 #![deny(clippy::unwrap_used)]
 #![deny(clippy::expect_used)]
@@ -24,6 +24,7 @@
 pub mod config;
 pub mod http;
 pub mod runner;
+pub mod url_fetcher;
 pub mod worker;
 
 pub use config::WorkerConfig;
