@@ -5,7 +5,10 @@
 
 mod content;
 mod fetcher;
+mod fetchers;
 mod generic;
+#[cfg(test)]
+pub(crate) mod test_harness;
 
 use std::sync::Arc;
 
@@ -21,6 +24,7 @@ pub use content::{ContentType, ImageFormat, VideoFormat, content_hash, storage_k
 pub use fetcher::{
     FetchContext, FetchError, FetchOutcome, FetchResult, Fetcher, FetcherConfig, FetcherRegistry,
 };
+pub use fetchers::reddit::RedditFetcher;
 pub use generic::GenericFetcher;
 
 /// Worker that fetches URLs and extracts content.
@@ -41,10 +45,10 @@ impl UrlFetcherWorker {
         Self { registry, ctx }
     }
 
-    /// Create a new URL fetcher worker with default generic fetcher.
+    /// Create a new URL fetcher worker with default fetchers.
     ///
-    /// Sets up a generic fetcher for all URLs. Use `new()` to provide
-    /// domain-specific fetchers.
+    /// Sets up a generic fetcher for all URLs plus domain-specific fetchers
+    /// for Reddit, etc. Use `new()` for custom configuration.
     #[must_use]
     pub fn with_defaults(
         db: Arc<Database>,
@@ -52,7 +56,10 @@ impl UrlFetcherWorker {
         media_store: Arc<dyn MediaStore>,
     ) -> Self {
         let generic: Arc<dyn Fetcher> = Arc::new(GenericFetcher::new());
-        let registry = FetcherRegistry::new(generic);
+        let mut registry = FetcherRegistry::new(generic);
+
+        // Register domain-specific fetchers
+        registry.register(Arc::new(RedditFetcher::new()));
 
         let ctx = Arc::new(FetchContext {
             db,
@@ -69,11 +76,12 @@ impl UrlFetcherWorker {
 impl Worker for UrlFetcherWorker {
     type Item = ResearchUrl;
     type Discovered = Url;
+    type Error = FetchError;
 
     async fn process_batch(
         &self,
         items: Vec<Self::Item>,
-    ) -> Vec<(Self::Item, ItemResult<Self::Discovered>)> {
+    ) -> Vec<(Self::Item, ItemResult<Self::Discovered, Self::Error>)> {
         let mut results = Vec::with_capacity(items.len());
 
         for item in items {
@@ -84,7 +92,7 @@ impl Worker for UrlFetcherWorker {
                     results.push((
                         item,
                         ItemResult::PermanentFailure {
-                            error: format!("invalid URL: {e}"),
+                            error: FetchError::ParseError(format!("invalid URL: {e}")),
                         },
                     ));
                     continue;
@@ -101,12 +109,8 @@ impl Worker for UrlFetcherWorker {
                     Ok(fetch_result) => ItemResult::Success {
                         discovered: fetch_result.discovered_urls,
                     },
-                    Err(e) if e.is_retriable() => ItemResult::RetriableFailure {
-                        error: e.to_string(),
-                    },
-                    Err(e) => ItemResult::PermanentFailure {
-                        error: e.to_string(),
-                    },
+                    Err(e) if e.is_retriable() => ItemResult::RetriableFailure { error: e },
+                    Err(e) => ItemResult::PermanentFailure { error: e },
                 }
             }
             .instrument(span)

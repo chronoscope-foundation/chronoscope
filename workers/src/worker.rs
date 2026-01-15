@@ -4,9 +4,14 @@
 //! Workers process items from a queue and return results indicating
 //! success or failure, with the runner handling DB status updates.
 
+use std::fmt::Display;
+
 /// Result of processing a single work item.
+///
+/// The error type `E` defaults to `String` for simple cases, but workers
+/// can use a richer error type (e.g., `FetchError`) to preserve error details.
 #[derive(Debug, Clone)]
-pub enum ItemResult<D> {
+pub enum ItemResult<D, E = String> {
     /// Successfully processed. Worker has already marked the item as resolved.
     /// May include discovered items to enqueue.
     Success {
@@ -17,16 +22,28 @@ pub enum ItemResult<D> {
     /// Temporary failure - should retry later.
     /// Runner will mark as failed with `retry_after` based on attempt count.
     RetriableFailure {
-        /// Error message describing what went wrong
-        error: String,
+        /// Error describing what went wrong
+        error: E,
     },
 
     /// Permanent failure - don't retry.
     /// Runner will mark as failed without `retry_after`.
     PermanentFailure {
-        /// Error message describing what went wrong
-        error: String,
+        /// Error describing what went wrong
+        error: E,
     },
+}
+
+impl<D, E: Display> ItemResult<D, E> {
+    /// Get the error message as a string, if this is a failure.
+    pub fn error_message(&self) -> Option<String> {
+        match self {
+            Self::Success { .. } => None,
+            Self::RetriableFailure { error } | Self::PermanentFailure { error } => {
+                Some(error.to_string())
+            }
+        }
+    }
 }
 
 /// Trait for background workers that process items from a queue.
@@ -46,8 +63,11 @@ pub trait Worker: Send + Sync {
     /// The type of item this worker processes (e.g., `ResearchUrl`)
     type Item: Send;
 
-    /// The type of items discovered during processing (e.g., Url)
+    /// The type of items discovered during processing (e.g., `Url`)
     type Discovered: Send;
+
+    /// The error type for failures (e.g., `FetchError`)
+    type Error: Display + Send;
 
     /// Process a batch of items and return results.
     ///
@@ -56,5 +76,5 @@ pub trait Worker: Send + Sync {
     async fn process_batch(
         &self,
         items: Vec<Self::Item>,
-    ) -> Vec<(Self::Item, ItemResult<Self::Discovered>)>;
+    ) -> Vec<(Self::Item, ItemResult<Self::Discovered, Self::Error>)>;
 }

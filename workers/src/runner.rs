@@ -316,25 +316,27 @@ where
                         .compute_retry_delay(attempt_count)
                         .map(|d| Utc::now().naive_utc() + d);
 
+                    let error_msg = error.to_string();
                     item_span.in_scope(|| {
                         if retry_after.is_some() {
-                            debug!(attempt = attempt_count + 1, error = %error, "item failed (will retry)");
+                            debug!(attempt = attempt_count + 1, error = %error_msg, "item failed (will retry)");
                         } else {
-                            warn!(attempts = attempt_count + 1, error = %error, "item failed (max retries exceeded)");
+                            warn!(attempts = attempt_count + 1, error = %error_msg, "item failed (max retries exceeded)");
                         }
                     });
 
-                    if let Err(e) = queue.mark_failed(&item_id, &error, retry_after).await {
+                    if let Err(e) = queue.mark_failed(&item_id, &error_msg, retry_after).await {
                         error!(item_id = %item_id, error = %e, "failed to mark item as failed");
                     }
                 }
 
                 ItemResult::PermanentFailure { error } => {
+                    let error_msg = error.to_string();
                     item_span.in_scope(|| {
-                        warn!(error = %error, "item permanently failed");
+                        warn!(error = %error_msg, "item permanently failed");
                     });
 
-                    if let Err(e) = queue.mark_failed(&item_id, &error, None).await {
+                    if let Err(e) = queue.mark_failed(&item_id, &error_msg, None).await {
                         error!(item_id = %item_id, error = %e, "failed to mark item as failed");
                     }
                 }
@@ -480,11 +482,12 @@ mod tests {
     impl Worker for TestWorker {
         type Item = ResearchUrl;
         type Discovered = Url;
+        type Error = String;
 
         async fn process_batch(
             &self,
             items: Vec<Self::Item>,
-        ) -> Vec<(Self::Item, ItemResult<Self::Discovered>)> {
+        ) -> Vec<(Self::Item, ItemResult<Self::Discovered, Self::Error>)> {
             let mut results = Vec::with_capacity(items.len());
 
             for item in items {

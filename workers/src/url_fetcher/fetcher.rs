@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use chronoscope_db::media_store::{MediaStore, MediaStoreError};
 use chronoscope_db::{Database, MediaId, PageId, ResearchUrl};
+use reqwest::StatusCode;
 use url::Url;
 
 use crate::http::HttpClient;
@@ -105,6 +106,20 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    /// Convert an HTTP status code to a `FetchError`, returning `Ok(())` for success codes.
+    ///
+    /// This provides consistent error handling across all fetchers.
+    pub fn from_status(status: StatusCode) -> Result<(), Self> {
+        match status.as_u16() {
+            200..=299 => Ok(()),
+            404 => Err(Self::NotFound),
+            403 => Err(Self::Forbidden),
+            429 => Err(Self::RateLimited),
+            status @ 500..=599 => Err(Self::ServerError { status }),
+            status => Err(Self::Http(format!("unexpected status: {status}"))),
+        }
+    }
+
     /// Whether this error should be retried.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
