@@ -309,7 +309,9 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         }
     });
 
-    // Give the server a moment to start
+    // Give the server a moment to start listening before returning.
+    // This avoids races where callers try to connect before the socket is bound.
+    #[allow(clippy::disallowed_methods)]
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     info!(log, "Dev server ready"; "base_url" => &base_url);

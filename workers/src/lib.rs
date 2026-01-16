@@ -16,11 +16,6 @@
 //!
 //! - **URL Fetcher**: Fetches URLs, extracts content (HTML/images/video), discovers embedded media
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![deny(clippy::panic)]
-#![deny(unsafe_code)]
-
 pub mod config;
 pub mod http;
 pub mod runner;

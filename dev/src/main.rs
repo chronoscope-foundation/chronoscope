@@ -31,6 +31,8 @@ use tracing::Level;
 
 const NGROK_API_URL: &str = "http://localhost:4040/api/tunnels";
 
+// CARGO_MANIFEST_DIR is a compile-time constant that always has a parent directory.
+#[allow(clippy::expect_used)]
 fn ios_xcconfig_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -114,6 +116,8 @@ fn start_ngrok(
     Ok(child)
 }
 
+// Polling for ngrok tunnel to become available after spawning the process.
+#[allow(clippy::disallowed_methods)]
 async fn wait_for_ngrok_url(
     log: &slog::Logger,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {

@@ -240,6 +240,9 @@ impl WorkQueue for UrlQueue {
 /// # Errors
 ///
 /// Returns `RunnerError::Database` if queue operations fail.
+// Uses tokio::time::sleep for idle backoff when queue is empty. The sleep is
+// interruptible via the shutdown channel, so workers can shut down promptly.
+#[allow(clippy::disallowed_methods)]
 #[instrument(skip_all, fields(worker_id = %config.worker_id))]
 pub async fn run<Q, W, E>(
     queue: Q,

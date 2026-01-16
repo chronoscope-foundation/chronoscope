@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [features]
 ## Record HTTP fixtures for VCR-style tests (hits real network).
 ## Usage: cargo test -p chronoscope-workers --features record-fixtures

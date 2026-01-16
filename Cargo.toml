@@ -8,6 +8,16 @@ authors = ["Chronoscope Contributors"]
 license = "MIT"
 repository = "https://github.com/copumpkin/chronoscope"
 
+# Workspace-wide lint configuration
+# All crates inherit these via `[lints] workspace = true`
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

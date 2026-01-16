@@ -1,8 +1,3 @@
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![deny(clippy::panic)]
-#![deny(unsafe_code)]
-
 use std::sync::Arc;
 
 use dropshot::ApiDescription;

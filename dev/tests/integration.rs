@@ -26,6 +26,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Maximum polling attempts (100 * 100ms = 10 seconds).
 const MAX_POLL_ATTEMPTS: usize = 100;
 
+// CARGO_MANIFEST_DIR is a compile-time constant that always has a parent directory.
+#[allow(clippy::expect_used)]
 fn fixtures_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -137,6 +139,8 @@ impl TestServer {
     }
 
     /// Wait until the URL is no longer pending (resolved or failed).
+    // Polling is appropriate for integration tests waiting on async worker completion.
+    #[allow(clippy::disallowed_methods)]
     async fn wait_for_resolved(
         &self,
         url_id: &str,
@@ -152,6 +156,8 @@ impl TestServer {
     }
 
     /// Wait until at least one media item is fetched.
+    // Polling is appropriate for integration tests waiting on async worker completion.
+    #[allow(clippy::disallowed_methods)]
     async fn wait_for_fetched_media(
         &self,
         url_id: &str,

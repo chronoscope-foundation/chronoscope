@@ -3,11 +3,6 @@
 //! This crate provides database access for the Chronoscope platform.
 //! It is used by both the API server and background workers.
 
-#![deny(clippy::unwrap_used)]
-#![deny(clippy::expect_used)]
-#![deny(clippy::panic)]
-#![deny(unsafe_code)]
-
 pub mod error;
 pub mod media_store;
 pub mod models;
