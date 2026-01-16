@@ -12,7 +12,7 @@ use chronoscope_db::{Database, MediaId, PageId, ResearchUrl};
 use reqwest::StatusCode;
 use url::Url;
 
-use crate::http::HttpClient;
+use crate::http::{HttpClient, HttpError};
 
 /// Configuration for URL fetching.
 #[derive(Debug, Clone)]
@@ -77,8 +77,8 @@ pub enum FetchError {
     RateLimited,
 
     /// Server error (5xx) - retriable.
-    #[error("server error: {status}")]
-    ServerError { status: u16 },
+    #[error("server error: {}", status.as_u16())]
+    ServerError { status: StatusCode },
 
     /// Content not found (404) - permanent.
     #[error("not found")]
@@ -103,21 +103,39 @@ pub enum FetchError {
     /// Media storage error - retriable.
     #[error("media store error: {0}")]
     MediaStore(#[from] MediaStoreError),
+
+    /// VCR cache miss - permanent (only occurs in test mode).
+    #[error("cache miss: {0}")]
+    CacheMiss(String),
 }
 
 impl FetchError {
+    /// Convert an HTTP error to a `FetchError`.
+    ///
+    /// This handles `CacheMiss` specially as a permanent error (for VCR testing),
+    /// while other HTTP errors remain retriable.
+    #[must_use]
+    pub fn from_http_error(e: HttpError) -> Self {
+        match e {
+            HttpError::CacheMiss { url } => Self::CacheMiss(url),
+            other => Self::Http(other.to_string()),
+        }
+    }
+
     /// Convert an HTTP status code to a `FetchError`, returning `Ok(())` for success codes.
     ///
     /// This provides consistent error handling across all fetchers.
     pub fn from_status(status: StatusCode) -> Result<(), Self> {
-        match status.as_u16() {
-            200..=299 => Ok(()),
-            404 => Err(Self::NotFound),
-            403 => Err(Self::Forbidden),
-            429 => Err(Self::RateLimited),
-            status @ 500..=599 => Err(Self::ServerError { status }),
-            status => Err(Self::Http(format!("unexpected status: {status}"))),
+        if status.is_success() {
+            return Ok(());
         }
+        Err(match status.as_u16() {
+            404 => Self::NotFound,
+            403 => Self::Forbidden,
+            429 => Self::RateLimited,
+            500..=599 => Self::ServerError { status },
+            code => Self::Http(format!("unexpected status: {code}")),
+        })
     }
 
     /// Whether this error should be retried.
@@ -225,9 +243,24 @@ mod tests {
         assert!(FetchError::RateLimited.is_retriable());
 
         // Server errors (5xx) are retriable
-        assert!(FetchError::ServerError { status: 500 }.is_retriable());
-        assert!(FetchError::ServerError { status: 502 }.is_retriable());
-        assert!(FetchError::ServerError { status: 503 }.is_retriable());
+        assert!(
+            FetchError::ServerError {
+                status: StatusCode::INTERNAL_SERVER_ERROR
+            }
+            .is_retriable()
+        );
+        assert!(
+            FetchError::ServerError {
+                status: StatusCode::BAD_GATEWAY
+            }
+            .is_retriable()
+        );
+        assert!(
+            FetchError::ServerError {
+                status: StatusCode::SERVICE_UNAVAILABLE
+            }
+            .is_retriable()
+        );
 
         // Database errors are retriable (transient failures)
         assert!(FetchError::Database(chronoscope_db::DbError::UserNotFound).is_retriable());

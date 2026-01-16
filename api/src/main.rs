@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use chronoscope_api::state::{AppState, Config};
+use chronoscope_api::jwt::JwtConfig;
+use chronoscope_api::state::{AppState, Config, default_dns_resolver};
+use chronoscope_db::Database;
 use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,
 };
@@ -26,7 +28,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Initialize app state (includes database setup and migrations)
-    let app_state = Arc::new(AppState::new(config).await?);
+    let db = Database::new(&config.database_url).await?;
+    let jwt = JwtConfig::from_env()?;
+    let dns_resolver = default_dns_resolver()?;
+
+    // When embedded-media feature is enabled (e.g., dev builds), we need a media store.
+    // Production builds without the feature don't need one.
+    #[cfg(feature = "embedded-media")]
+    let app_state = {
+        use chronoscope_db::media_store::InMemoryMediaStore;
+        Arc::new(
+            AppState::new(
+                db,
+                config,
+                jwt,
+                dns_resolver,
+                std::sync::Arc::new(InMemoryMediaStore::new()),
+            )
+            .await?,
+        )
+    };
+    #[cfg(not(feature = "embedded-media"))]
+    let app_state = Arc::new(AppState::new(db, config, jwt, dns_resolver).await?);
 
     // Configure Dropshot
     let config_dropshot = ConfigDropshot {

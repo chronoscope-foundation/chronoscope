@@ -1,0 +1,316 @@
+//! Shared setup logic for the development server.
+//!
+//! This module provides `start_dev_server` which sets up all the shared
+//! infrastructure (database, media store, workers, API server) and returns
+//! a handle for interacting with the running server.
+//!
+//! Used by:
+//! - The dev binary (with real HTTP client and ngrok)
+//! - Integration tests (with VCR HTTP client and localhost)
+
+use std::net::TcpListener;
+use std::sync::Arc;
+use std::time::Duration;
+
+use chronoscope_api::jwt::JwtConfig;
+use chronoscope_api::state::{AppState, Config, default_dns_resolver};
+use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
+use chronoscope_db::{Database, Email, UserId};
+use chronoscope_workers::http::HttpClient;
+use chronoscope_workers::url_fetcher::UrlFetcherWorker;
+use chronoscope_workers::{RetryConfig, UrlEnqueuer, UrlQueue, WorkerConfig, run};
+use dropshot::{ApiDescription, ConfigDropshot, HttpServerStarter};
+use slog::info;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+
+/// Number of URL fetcher workers to spawn.
+const NUM_WORKERS: usize = 3;
+
+/// Error type for dev server setup.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct DevServerError(pub String);
+
+impl From<String> for DevServerError {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// Handle to a running development server.
+pub struct RunningDevServer {
+    /// Base URL of the server (e.g., "http://127.0.0.1:8080")
+    pub base_url: String,
+
+    /// Port the server is listening on
+    pub port: u16,
+
+    /// JWT auth token for a test user (for making authenticated API requests)
+    pub auth_token: String,
+
+    /// User ID of the test user
+    pub test_user_id: UserId,
+
+    /// Send `true` to trigger graceful shutdown of workers
+    shutdown_tx: watch::Sender<bool>,
+
+    /// Handles to spawned worker tasks for graceful shutdown
+    worker_handles: Vec<JoinHandle<()>>,
+}
+
+impl RunningDevServer {
+    /// Gracefully shut down the server and wait for all workers to stop.
+    pub async fn shutdown(self) {
+        // Signal workers to stop
+        let _ = self.shutdown_tx.send(true);
+
+        // Wait for all workers to finish
+        for handle in self.worker_handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Configuration for starting the dev server.
+pub struct DevServerConfig {
+    /// HTTP client for workers to use (real or VCR)
+    pub http_client: Arc<dyn HttpClient>,
+
+    /// How long workers wait when idle before polling again
+    pub worker_idle_backoff: Duration,
+
+    /// Retry configuration for workers
+    pub retry_config: RetryConfig,
+
+    /// Logger for the server
+    pub log: slog::Logger,
+
+    /// Port to bind to (use `find_available_port()` to get one)
+    pub port: u16,
+
+    /// Base URL for CDN/media assets (e.g., ngrok URL or localhost)
+    pub cdn_base_url: String,
+
+    /// Optional: RP ID for WebAuthn (defaults to "localhost")
+    pub rp_id: Option<String>,
+
+    /// Optional: RP Origin for WebAuthn (defaults to "http://localhost:{port}")
+    pub rp_origin: Option<String>,
+
+    /// Optional: iOS app ID for AASA
+    pub ios_app_id: Option<String>,
+}
+
+/// Find an available port by binding to port 0 and reading the assigned port.
+///
+/// # TOCTOU Note
+///
+/// There's a small race window between finding the port here and actually binding
+/// to it later. We accept this because:
+/// 1. This is only used for local development and testing
+/// 2. Port collisions are rare on a dev machine in practice
+/// 3. The alternative (binding to port 0 in Dropshot) would require knowing the
+///    ngrok URL before we know the port, creating a chicken-and-egg problem
+pub fn find_available_port() -> std::io::Result<u16> {
+    // TcpListener closes on drop, freeing the port for later use
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+}
+
+/// Spawn a URL fetcher worker in a background task, returning its handle.
+fn spawn_url_fetcher_worker(
+    index: usize,
+    db: Arc<Database>,
+    http_client: Arc<dyn HttpClient>,
+    media_store: Arc<dyn MediaStore>,
+    user_id: UserId,
+    idle_backoff: Duration,
+    retry_config: RetryConfig,
+    shutdown_rx: watch::Receiver<bool>,
+    log: slog::Logger,
+) -> JoinHandle<()> {
+    let worker_id = format!("url-fetcher-{index}");
+
+    let queue = UrlQueue::new(db.clone());
+    let worker = UrlFetcherWorker::with_defaults(db.clone(), http_client, media_store);
+    let enqueuer = UrlEnqueuer::new(db, user_id);
+    let worker_config = WorkerConfig {
+        worker_id: worker_id.clone(),
+        batch_size: 10,
+        stale_after: Duration::from_mins(5),
+        idle_backoff,
+    };
+
+    tokio::spawn(async move {
+        info!(log, "Starting worker"; "worker_id" => &worker_id);
+        if let Err(e) = run(
+            queue,
+            worker,
+            enqueuer,
+            worker_config,
+            retry_config,
+            shutdown_rx,
+        )
+        .await
+        {
+            slog::error!(log, "Worker error"; "worker_id" => &worker_id, "error" => %e);
+        }
+    })
+}
+
+/// Start the development server with the given configuration.
+///
+/// This sets up:
+/// - In-memory SQLite database
+/// - In-memory media store
+/// - System user for workers
+/// - Test user with JWT token (for API authentication)
+/// - URL fetcher workers
+/// - API server with embedded media serving
+///
+/// Returns a handle that can be used to interact with the server and shut it down.
+pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServer, DevServerError> {
+    let log = &config.log;
+    let port = config.port;
+    let base_url = format!("http://127.0.0.1:{port}");
+
+    info!(log, "Starting dev server"; "port" => port, "base_url" => &base_url);
+
+    // Create shutdown channel for graceful termination
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // ==================== Shared Infrastructure ====================
+
+    // Create shared database
+    let db = Arc::new(
+        Database::new("sqlite::memory:")
+            .await
+            .map_err(|e| format!("Failed to create database: {e}"))?,
+    );
+
+    // Create shared media store
+    let media_store: Arc<dyn MediaStore> = Arc::new(InMemoryMediaStore::new());
+
+    // Create test user (used for both API authentication and worker URL discoveries)
+    let test_user_id = UserId::generate();
+    db.create_user(
+        &test_user_id,
+        "test-user",
+        &Email::new("test@chronoscope.local"),
+    )
+    .await
+    .map_err(|e| format!("Failed to create test user: {e}"))?;
+    info!(log, "Created test user"; "user_id" => %test_user_id);
+
+    // ==================== Start URL Fetcher Workers ====================
+
+    let worker_handles: Vec<JoinHandle<()>> = (0..NUM_WORKERS)
+        .map(|i| {
+            spawn_url_fetcher_worker(
+                i,
+                db.clone(),
+                config.http_client.clone(),
+                media_store.clone(),
+                test_user_id.clone(),
+                config.worker_idle_backoff,
+                config.retry_config.clone(),
+                shutdown_rx.clone(),
+                log.clone(),
+            )
+        })
+        .collect();
+
+    info!(log, "Started {} URL fetcher workers", NUM_WORKERS);
+
+    // ==================== Start API Server ====================
+
+    let rp_id = config.rp_id.unwrap_or_else(|| "localhost".to_string());
+    let rp_origin = config
+        .rp_origin
+        .unwrap_or_else(|| format!("http://localhost:{port}"));
+
+    let api_config = Config {
+        database_url: "sqlite::memory:".to_string(), // Not used - we pass db directly
+        rp_id,
+        rp_origin,
+        bind_addr: format!("127.0.0.1:{port}")
+            .parse()
+            .map_err(|e| format!("Invalid bind address: {e}"))?,
+        ios_app_id: config.ios_app_id,
+        cdn_base_url: config.cdn_base_url,
+    };
+
+    // Generate a random JWT secret for this session
+    let jwt_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let jwt_config = JwtConfig::new(
+        &jwt_secret,
+        7 * 24 * 60 * 60, // 7 days session expiry
+        2 * 60,           // 2 min challenge expiry
+        60,               // 60s leeway
+    );
+
+    // Generate auth token for the test user
+    let auth_token = jwt_config
+        .create_session_token(&test_user_id)
+        .map_err(|e| format!("Failed to create auth token: {e}"))?;
+
+    info!(log, "Starting API server";
+        "rp_id" => &api_config.rp_id,
+        "rp_origin" => &api_config.rp_origin,
+        "bind_addr" => %api_config.bind_addr,
+        "cdn_base_url" => &api_config.cdn_base_url,
+    );
+
+    // Configure Dropshot (before api_config is moved)
+    let config_dropshot = ConfigDropshot {
+        bind_address: api_config.bind_addr,
+        default_request_body_max_bytes: 1024 * 1024,
+        default_handler_task_mode: dropshot::HandlerTaskMode::Detached,
+        ..Default::default()
+    };
+
+    // Create AppState with our shared database and media store
+    let dns_resolver =
+        default_dns_resolver().map_err(|e| format!("Failed to create DNS resolver: {e}"))?;
+    let app_state = AppState::new(
+        db.as_ref().clone(),
+        api_config,
+        jwt_config,
+        dns_resolver,
+        media_store,
+    )
+    .await
+    .map_err(|e| format!("Failed to create app state: {e}"))?;
+    let app_state = Arc::new(app_state);
+
+    // Build API
+    let mut api = ApiDescription::new();
+    chronoscope_api::register_api(&mut api).map_err(|e| format!("Failed to register API: {e}"))?;
+
+    // Start server (spawns in background)
+    let server = HttpServerStarter::new(&config_dropshot, api, app_state, log)
+        .map_err(|e| format!("Failed to start server: {e}"))?
+        .start();
+
+    // Spawn the server task to run in background
+    tokio::spawn(async move {
+        if let Err(e) = server.await {
+            eprintln!("Server error: {e}");
+        }
+    });
+
+    // Give the server a moment to start
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    info!(log, "Dev server ready"; "base_url" => &base_url);
+
+    Ok(RunningDevServer {
+        base_url,
+        port,
+        auth_token,
+        test_user_id,
+        shutdown_tx,
+        worker_handles,
+    })
+}

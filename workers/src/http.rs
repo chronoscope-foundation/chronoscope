@@ -275,7 +275,8 @@ impl Default for ReqwestConfig {
         Self {
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
-            user_agent: "Chronoscope/0.1".to_string(),
+            // Reddit blocks generic user agents; use a descriptive one
+            user_agent: "Chronoscope/0.1 (historical research tool)".to_string(),
             max_redirects: 10,
             max_response_size: 20 * 1024 * 1024, // 20MB
         }

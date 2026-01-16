@@ -30,10 +30,17 @@ impl From<std::io::Error> for MediaStoreError {
 }
 
 /// Metadata about stored media.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaMetadata {
     pub content_type: String,
     pub size: u64,
+}
+
+/// Media content with metadata, returned by `get`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaWithMetadata {
+    pub data: Bytes,
+    pub metadata: MediaMetadata,
 }
 
 /// Trait for media storage, allowing different backends (memory, filesystem, S3).
@@ -73,15 +80,21 @@ pub trait MediaStore: Send + Sync {
             .await
     }
 
-    /// Retrieve media as bytes (convenience wrapper around `get_stream`).
+    /// Retrieve media with metadata (convenience wrapper around `get_stream` + `head`).
     ///
     /// Returns `None` if the key does not exist.
-    async fn get(&self, key: &str) -> Result<Option<Bytes>, MediaStoreError> {
+    async fn get(&self, key: &str) -> Result<Option<MediaWithMetadata>, MediaStoreError> {
+        let Some(metadata) = self.head(key).await? else {
+            return Ok(None);
+        };
         match self.get_stream(key).await? {
             Some(mut reader) => {
                 let mut buf = Vec::new();
                 reader.read_to_end(&mut buf).await?;
-                Ok(Some(Bytes::from(buf)))
+                Ok(Some(MediaWithMetadata {
+                    data: Bytes::from(buf),
+                    metadata,
+                }))
             }
             None => Ok(None),
         }
@@ -181,6 +194,21 @@ impl MediaStore for InMemoryMediaStore {
             size: stored.data.len() as u64,
         }))
     }
+
+    async fn get(&self, key: &str) -> Result<Option<MediaWithMetadata>, MediaStoreError> {
+        let guard = self
+            .storage
+            .read()
+            .map_err(|e| MediaStoreError(format!("lock poisoned: {e}")))?;
+
+        Ok(guard.get(key).map(|stored| MediaWithMetadata {
+            data: stored.data.clone(),
+            metadata: MediaMetadata {
+                content_type: stored.content_type.clone(),
+                size: stored.data.len() as u64,
+            },
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -196,8 +224,13 @@ mod tests {
             .await
             .expect("put should succeed");
 
-        let retrieved = store.get("test.jpg").await.expect("get should succeed");
-        assert_eq!(retrieved, Some(Bytes::from("image data")));
+        let retrieved = store
+            .get("test.jpg")
+            .await
+            .expect("get should succeed")
+            .expect("should exist");
+        assert_eq!(retrieved.data, Bytes::from("image data"));
+        assert_eq!(retrieved.metadata.content_type, "image/jpeg");
     }
 
     #[tokio::test]
@@ -253,19 +286,13 @@ mod tests {
             .await
             .expect("put should succeed");
 
-        let data = store
+        let result = store
             .get("test.jpg")
             .await
             .expect("get should succeed")
             .expect("should exist");
-        assert_eq!(data, Bytes::from("updated"));
-
-        let meta = store
-            .head("test.jpg")
-            .await
-            .expect("head should succeed")
-            .expect("should exist");
-        assert_eq!(meta.content_type, "image/png");
+        assert_eq!(result.data, Bytes::from("updated"));
+        assert_eq!(result.metadata.content_type, "image/png");
     }
 
     #[tokio::test]

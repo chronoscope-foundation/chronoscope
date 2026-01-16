@@ -1,7 +1,11 @@
 use std::net::IpAddr;
+#[cfg(feature = "embedded-media")]
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chronoscope_db::Database;
+#[cfg(feature = "embedded-media")]
+use chronoscope_db::media_store::MediaStore;
 use dropshot::HttpError;
 use hickory_resolver::Resolver;
 use hickory_resolver::name_server::TokioConnectionProvider;
@@ -124,6 +128,17 @@ pub enum AppStateError {
     DnsResolver(String),
 }
 
+/// Create a default DNS resolver using tokio.
+///
+/// # Errors
+/// Returns `AppStateError::DnsResolver` if resolver creation fails.
+pub fn default_dns_resolver() -> Result<Box<dyn DnsResolver>, AppStateError> {
+    let resolver = Resolver::builder_tokio()
+        .map_err(|e| AppStateError::DnsResolver(format!("{e}")))?
+        .build();
+    Ok(Box::new(resolver))
+}
+
 /// Shared application state
 pub struct AppState {
     pub db: Database,
@@ -131,43 +146,23 @@ pub struct AppState {
     pub webauthn: Webauthn,
     pub dns_resolver: Box<dyn DnsResolver>,
     pub config: Config,
+    #[cfg(feature = "embedded-media")]
+    pub media_store: Arc<dyn MediaStore>,
 }
 
 impl AppState {
-    /// Create new application state (loads JWT config from environment)
+    /// Create application state with all components explicitly provided.
     ///
     /// # Errors
-    /// Returns `AppStateError` if JWT, database, or `WebAuthn` initialization fails.
-    pub async fn new(config: Config) -> Result<Self, AppStateError> {
-        let jwt = JwtConfig::from_env()?;
-        Self::new_with_jwt(config, jwt).await
-    }
-
-    /// Create new application state with explicit JWT config
-    ///
-    /// # Errors
-    /// Returns `AppStateError` if database or `WebAuthn` initialization fails.
-    pub async fn new_with_jwt(config: Config, jwt: JwtConfig) -> Result<Self, AppStateError> {
-        let dns_resolver = Resolver::builder_tokio()
-            .map_err(|e| AppStateError::DnsResolver(format!("{e}")))?
-            .build();
-        Self::new_with_resolver(config, jwt, Box::new(dns_resolver)).await
-    }
-
-    /// Create new application state with explicit JWT config and DNS resolver.
-    /// Primarily useful for testing with mock resolvers.
-    ///
-    /// # Errors
-    /// Returns `AppStateError` if database or `WebAuthn` initialization fails.
-    pub async fn new_with_resolver(
+    /// Returns `AppStateError` if `WebAuthn` initialization fails.
+    #[allow(clippy::unused_async)]
+    pub async fn new(
+        db: Database,
         config: Config,
         jwt: JwtConfig,
         dns_resolver: Box<dyn DnsResolver>,
+        #[cfg(feature = "embedded-media")] media_store: Arc<dyn MediaStore>,
     ) -> Result<Self, AppStateError> {
-        // Initialize database
-        let db = Database::new(&config.database_url).await?;
-
-        // Initialize WebAuthn
         let rp_origin = Url::parse(&config.rp_origin)
             .map_err(|e| AppStateError::InvalidOrigin(format!("{e}")))?;
 
@@ -183,6 +178,8 @@ impl AppState {
             webauthn,
             dns_resolver,
             config,
+            #[cfg(feature = "embedded-media")]
+            media_store,
         })
     }
 }

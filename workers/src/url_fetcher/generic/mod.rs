@@ -65,7 +65,7 @@ impl Fetcher for GenericFetcher {
             .http
             .execute(request)
             .await
-            .map_err(|e| FetchError::Http(e.to_string()))?;
+            .map_err(FetchError::from_http_error)?;
 
         // Check response status
         FetchError::from_status(response.status)?;

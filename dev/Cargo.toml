@@ -6,12 +6,28 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Enable to record VCR fixtures instead of reading from cache
+record-fixtures = []
+
 [dependencies]
 # API crate (provides AppState, Config, JwtConfig, register_api)
-chronoscope-api = { path = "../api" }
+# Enable embedded-media for dev to serve media at /media/{key}
+chronoscope-api = { path = "../api", features = ["embedded-media"] }
+
+# DB crate (for Database, InMemoryMediaStore, user management)
+chronoscope-db = { path = "../db" }
+
+# Workers crate (for URL fetcher worker)
+chronoscope-workers = { path = "../workers" }
 
 # Web framework (for Dropshot server configuration)
 dropshot = "0.16"
+
+# Tracing (for worker logging)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP client (for ngrok API)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -25,6 +41,16 @@ tokio.workspace = true
 # Utilities
 url.workspace = true
 uuid.workspace = true
+thiserror.workspace = true
 
 # Logging
 slog = "2"
+
+[dev-dependencies]
+# Testing
+tokio-test = "0.4"
+bytes = "1"
+chrono.workspace = true
+serde_json.workspace = true
+# Image validation
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }

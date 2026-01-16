@@ -4,6 +4,8 @@
 //! using the SoftPasskey authenticator.
 
 mod auth;
+#[cfg(feature = "embedded-media")]
+mod media;
 mod research;
 mod user;
 mod well_known;
@@ -15,6 +17,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+#[cfg(feature = "embedded-media")]
+use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{
     Database, Email, GpsLocation, MediaData, MediaId, MediaSlot, MediaType, PageData, PageId,
     ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
@@ -137,10 +141,31 @@ impl TestContext {
         Self::with_options(None, None, Some(resolver)).await
     }
 
+    /// Create a test context with an in-memory media store for testing /media endpoints.
+    #[cfg(feature = "embedded-media")]
+    async fn with_media_store()
+    -> Result<(Self, Arc<InMemoryMediaStore>), Box<dyn std::error::Error + Send + Sync>> {
+        let media_store = Arc::new(InMemoryMediaStore::new());
+        let ctx = Self::with_options_and_media(None, None, None, Some(media_store.clone())).await?;
+        Ok((ctx, media_store))
+    }
+
     async fn with_options(
         ios_app_id: Option<String>,
         jwt_config: Option<JwtConfig>,
         dns_resolver: Option<TestResolver>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        #[cfg(feature = "embedded-media")]
+        return Self::with_options_and_media(ios_app_id, jwt_config, dns_resolver, None).await;
+        #[cfg(not(feature = "embedded-media"))]
+        return Self::with_options_and_media(ios_app_id, jwt_config, dns_resolver).await;
+    }
+
+    async fn with_options_and_media(
+        ios_app_id: Option<String>,
+        jwt_config: Option<JwtConfig>,
+        dns_resolver: Option<TestResolver>,
+        #[cfg(feature = "embedded-media")] media_store: Option<Arc<InMemoryMediaStore>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = jwt_config.unwrap_or_else(|| {
             JwtConfig::new(
@@ -152,7 +177,6 @@ impl TestContext {
         });
         let resolver = dns_resolver.unwrap_or_else(TestResolver::permissive);
 
-        // Find an available port
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         drop(listener);
@@ -166,8 +190,17 @@ impl TestContext {
             cdn_base_url: crate::cdn::tests::TEST_CDN_BASE_URL.to_string(),
         };
 
-        let app_state =
-            Arc::new(AppState::new_with_resolver(config, jwt, Box::new(resolver)).await?);
+        let db = Database::new(&config.database_url).await?;
+
+        #[cfg(feature = "embedded-media")]
+        let app_state = {
+            let store = media_store.unwrap_or_else(|| Arc::new(InMemoryMediaStore::new()));
+            AppState::new(db, config, jwt, Box::new(resolver), store).await?
+        };
+        #[cfg(not(feature = "embedded-media"))]
+        let app_state = AppState::new(db, config, jwt, Box::new(resolver)).await?;
+
+        let app_state = Arc::new(app_state);
 
         let config_dropshot = ConfigDropshot {
             bind_address: addr,
@@ -187,7 +220,6 @@ impl TestContext {
         let server =
             HttpServerStarter::new(&config_dropshot, api, Arc::clone(&app_state), &log)?.start();
 
-        // Use localhost to match RP origin (not 127.0.0.1)
         let base_url = format!("http://localhost:{}", addr.port());
         let client = Client::new();
 

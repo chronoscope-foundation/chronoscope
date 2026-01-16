@@ -1,9 +1,10 @@
-//! Development server with ngrok tunnel.
+//! Development server with ngrok tunnel and background workers.
 //!
 //! This binary:
 //! 1. Starts ngrok to create a public HTTPS tunnel (required for passkeys)
 //! 2. Updates ios/Local.xcconfig with the tunnel domain
-//! 3. Runs the API server with appropriate `WebAuthn` configuration
+//! 3. Spawns URL fetcher workers to process submitted URLs
+//! 4. Runs the API server with embedded media serving at /media/{key}
 //!
 //! Usage:
 //!   cargo run -p chronoscope-dev
@@ -14,20 +15,19 @@
 //! Once running, open Xcode and build/run the iOS app normally.
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chronoscope_api::jwt::JwtConfig;
-use chronoscope_api::state::{AppState, Config};
-use dropshot::{
-    ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,
-};
+use chronoscope_dev::{DevServerConfig, start_dev_server};
+use chronoscope_workers::RetryConfig;
+use chronoscope_workers::http::ReqwestClient;
+use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::{error, info, warn};
 use tokio::signal;
 use tokio::time::sleep;
+use tracing::Level;
 
 const NGROK_API_URL: &str = "http://localhost:4040/api/tunnels";
 
@@ -54,14 +54,6 @@ fn read_xcconfig_value(path: &Path, key: &str) -> Option<String> {
     None
 }
 
-/// Find an available port by binding to port 0 and reading the assigned port.
-/// There's a small race window between dropping the listener and using the port,
-/// but this is a dev script so we accept that tradeoff over hardcoding a port.
-fn find_available_port() -> std::io::Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
-}
-
 #[derive(serde::Deserialize)]
 struct NgrokTunnels {
     tunnels: Vec<NgrokTunnel>,
@@ -74,35 +66,28 @@ struct NgrokTunnel {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Set up logging
+    // Set up tracing for workers (they use tracing, not slog)
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .with_target(false)
+        .init();
+
+    // Set up slog for API/ngrok logging
     let config_logging = ConfigLogging::StderrTerminal {
         level: ConfigLoggingLevel::Info,
     };
     let log = config_logging.to_logger("chronoscope-dev")?;
 
-    let port = find_available_port()?;
-    info!(log, "Starting development server with ngrok tunnel"; "port" => port);
+    info!(log, "Starting development server with ngrok tunnel");
 
-    let mut ngrok = start_ngrok(&log, port)?;
-
-    // Set up cleanup on Ctrl+C
-    let cleanup_log = log.clone();
-    let cleanup = async move {
-        signal::ctrl_c().await.ok();
-        info!(cleanup_log, "Shutting down...");
-    };
-
-    // Wait for ngrok and run server, with cleanup on interrupt
+    // Run the main logic with cleanup on Ctrl+C
     let result = tokio::select! {
-        result = run_with_ngrok(&log, &mut ngrok, port) => result,
-        () = cleanup => {
-            ngrok.kill().ok();
+        result = run_dev_server(&log) => result,
+        _ = signal::ctrl_c() => {
+            info!(log, "Shutting down...");
             Ok(())
         }
     };
-
-    // Ensure ngrok is killed on exit
-    ngrok.kill().ok();
 
     result
 }
@@ -111,7 +96,7 @@ fn start_ngrok(
     log: &slog::Logger,
     port: u16,
 ) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
-    info!(log, "Starting ngrok tunnel on port {}", port);
+    info!(log, "Starting ngrok tunnel"; "port" => port);
 
     let child = Command::new("ngrok")
         .args(["http", &port.to_string(), "--log=stdout"])
@@ -220,12 +205,18 @@ fn update_xcconfig(
     Ok(())
 }
 
-async fn run_with_ngrok(
+async fn run_dev_server(
     log: &slog::Logger,
-    ngrok: &mut Child,
-    port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Spawn a task to log ngrok output (helps debug issues)
+    // 1. Find an available port
+    let port =
+        chronoscope_dev::find_available_port().map_err(|e| format!("Failed to find port: {e}"))?;
+    info!(log, "Found available port"; "port" => port);
+
+    // 2. Start ngrok pointing to that port
+    let mut ngrok = start_ngrok(log, port)?;
+
+    // Spawn a task to log ngrok errors
     if let Some(stderr) = ngrok.stderr.take() {
         let log_clone = log.clone();
         std::thread::spawn(move || {
@@ -238,7 +229,7 @@ async fn run_with_ngrok(
         });
     }
 
-    // Wait for ngrok URL
+    // 3. Wait for ngrok URL
     let ngrok_url = wait_for_ngrok_url(log).await?;
     let ngrok_domain = extract_domain(&ngrok_url)?;
 
@@ -248,56 +239,41 @@ async fn run_with_ngrok(
     info!(log, "========================================");
     info!(log, "");
 
-    // Update iOS xcconfig
+    // 4. Update iOS xcconfig with ngrok domain
     update_xcconfig(log, &ngrok_domain)?;
 
-    // Read team ID from xcconfig to construct iOS app identifier
+    // 5. Read team ID for iOS app identifier
     let ios_app_id = read_xcconfig_value(&ios_xcconfig_path(), "DEVELOPMENT_TEAM")
         .map(|team_id| format!("{team_id}.chronoscope.app"));
 
-    let config = Config {
-        database_url: "sqlite::memory:".to_string(),
-        rp_id: ngrok_domain.clone(),
-        rp_origin: ngrok_url.clone(),
-        bind_addr: format!("0.0.0.0:{port}").parse()?,
+    // 6. Create HTTP client for workers
+    let http_client =
+        Arc::new(ReqwestClient::new().map_err(|e| format!("Failed to create HTTP client: {e}"))?);
+
+    // 7. Start the dev server with ngrok URL as CDN base
+    let server = start_dev_server(DevServerConfig {
+        http_client,
+        worker_idle_backoff: Duration::from_secs(5),
+        retry_config: RetryConfig::default(),
+        log: log.clone(),
+        port,
+        cdn_base_url: ngrok_url.clone(),
+        rp_id: Some(ngrok_domain.clone()),
+        rp_origin: Some(ngrok_url.clone()),
         ios_app_id,
-        cdn_base_url: "https://cdn.chronoscope.io".to_string(),
-    };
+    })
+    .await
+    .map_err(|e| format!("Failed to start dev server: {e}"))?;
 
-    // Generate a random JWT secret for this dev session
-    let jwt_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-    let jwt_config = JwtConfig::new(
-        &jwt_secret,
-        7 * 24 * 60 * 60, // 7 days session expiry
-        2 * 60,           // 2 min challenge expiry
-        60,               // 60s leeway
-    );
-
-    info!(log, "Starting API server";
-        "database" => &config.database_url,
-        "rp_id" => &config.rp_id,
-        "rp_origin" => &config.rp_origin,
-        "bind_addr" => %config.bind_addr,
-    );
-
-    let app_state = Arc::new(AppState::new_with_jwt(config, jwt_config).await?);
-
-    // Configure Dropshot
-    let config_dropshot = ConfigDropshot {
-        bind_address: app_state.config.bind_addr,
-        default_request_body_max_bytes: 1024 * 1024,
-        default_handler_task_mode: dropshot::HandlerTaskMode::Detached,
-        ..Default::default()
-    };
-
-    // Build API
-    let mut api = ApiDescription::new();
-    chronoscope_api::register_api(&mut api)?;
-
-    // Start server
+    // Print ready message
     info!(log, "");
     info!(log, "========================================");
     info!(log, "Development server ready!");
+    info!(log, "");
+    info!(log, "Running:");
+    info!(log, "  - API server: {}", ngrok_url);
+    info!(log, "  - Local: {}", server.base_url);
+    info!(log, "  - Media served at: {}/media/{{key}}", ngrok_url);
     info!(log, "");
     info!(log, "Next steps:");
     info!(log, "  1. Open ios/Chronoscope.xcodeproj in Xcode");
@@ -307,6 +283,15 @@ async fn run_with_ngrok(
     info!(log, "========================================");
     info!(log, "");
 
-    let server = HttpServerStarter::new(&config_dropshot, api, app_state, log)?.start();
-    server.await.map_err(Into::into)
+    // Wait for shutdown signal
+    signal::ctrl_c().await.ok();
+    info!(log, "Shutting down...");
+
+    // Gracefully shutdown server and wait for workers
+    server.shutdown().await;
+
+    // Kill ngrok
+    ngrok.kill().ok();
+
+    Ok(())
 }

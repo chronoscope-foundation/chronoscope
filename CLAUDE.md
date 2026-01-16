@@ -28,7 +28,8 @@ This repo contains a "thin end-to-end slice" to prove out the core flow:
 
 1. **Research URLs**: Users submit URLs (of historical images, documents, etc.) and can follow them
    - This is the minimal content type that will eventually feed into the full entity/evidence system
-   - URLs are validated (SSRF protection) but not yet retrieved
+   - URLs are validated (SSRF protection) and fetched by background workers
+   - Domain-specific fetchers (e.g., Reddit) extract structured content and media
 
 2. **Passkey Authentication**: WebAuthn-based passwordless auth
    - Stateless challenge flow (signed state sent to client)
@@ -84,11 +85,10 @@ This repo contains a "thin end-to-end slice" to prove out the core flow:
 For iOS passkey testing, you need a public HTTPS URL (passkeys require secure context):
 
 ```bash
-cd api
-cargo run --bin dev
+cargo run -p chronoscope-dev
 ```
 
-This starts ngrok, automatically updates `ios/Local.xcconfig` with the tunnel domain, and runs the API server. Then use Xcode normally to build/run the iOS app.
+This starts ngrok, automatically updates `ios/Local.xcconfig` with the tunnel domain, and runs the API server with background workers. Then use Xcode normally to build/run the iOS app.
 
 ### OpenAPI Flow
 

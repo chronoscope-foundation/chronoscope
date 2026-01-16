@@ -10,6 +10,8 @@ use dropshot::ApiDescription;
 pub mod auth;
 pub mod cdn;
 pub mod jwt;
+#[cfg(feature = "embedded-media")]
+pub mod media;
 pub mod research;
 pub mod research_types;
 pub mod state;
@@ -49,6 +51,10 @@ pub fn register_api(
 
     // Well-known endpoints
     api.register(well_known::apple_app_site_association)?;
+
+    // Media endpoint (embedded CDN for development)
+    #[cfg(feature = "embedded-media")]
+    api.register(media::get_media)?;
 
     Ok(())
 }
