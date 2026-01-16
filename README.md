@@ -1,13 +1,31 @@
 # Chronoscope
 
-A crowdsourced platform for exploring how places change over time. Users collect and share historical photos, maps, and documents to build a collaborative timeline of any location.
+A spatiotemporal knowledge platform - think "Wikipedia for places through time." Chronoscope transforms scattered historical photos, maps, and documents into an explorable timeline of any location, with humans and AI collaborating to resolve mysteries through photogrammetry and detective work.
 
-> **Status**: Early development - implementing a thin end-to-end slice with URL collection and passkey authentication.
+## Goals
 
-## What's Here
+Chronoscope is building a **knowledge graph, not a photo gallery**. Photos, maps, and documents are evidence for assertions about how places evolved - not the end product. The platform models uncertainty explicitly (vague dates like "sometime in the 1920s" are first-class), requires citations for all assertions, and uses AI to assist human researchers rather than replace them.
 
-- **API** (Rust): REST API with WebAuthn passkey authentication, URL submission/following, SQLite storage
-- **iOS App** (Swift): SwiftUI app with passkey login, research list, and share extension for easy URL capture
+The platform is **API-first**: the iOS app, eventual web frontend, browser extension, Android client, and command-line tools are all API clients. This makes it easy for organizations like historical societies to ingest their existing datasets.
+
+See [docs/design.md](docs/design.md) for detailed project tenets.
+
+## Current Status
+
+This repo contains a **thin end-to-end slice** proving out the core flow:
+
+- **Research URLs**: Submit URLs of historical content, which are fetched and analyzed by background workers
+- **Passkey Authentication**: WebAuthn-based passwordless auth with stateless challenge flow
+- **iOS App**: SwiftUI client with share extension for easy URL capture from Safari, social media, etc.
+
+## Roadmap
+
+The thin slice establishes the patterns for the full platform. Next steps include:
+
+- **Entity model**: Buildings, streets, and landmarks as abstract entities separate from evidence
+- **Transitions**: Track changes over time (constructed, modified, demolished) rather than static states
+- **Evidence chains**: Link assertions to sources with machine-checkable citations
+- **External integrations**: Wikidata, Library of Congress, OpenStreetMap, archive.org
 
 ## Getting Started
 
@@ -18,7 +36,7 @@ A crowdsourced platform for exploring how places change over time. Users collect
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 - ngrok (authenticated - `ngrok config add-authtoken YOUR_TOKEN`)
 
-### Development Workflow
+### Quick Start
 
 1. **Set up the iOS project** (one-time):
    ```bash
@@ -28,50 +46,49 @@ A crowdsourced platform for exploring how places change over time. Users collect
    xcodegen generate
    ```
 
-2. **Start the dev server** (in a terminal):
+2. **Start the dev server**:
    ```bash
-   cd api
-   cargo run --bin dev
+   cargo run -p chronoscope-dev
    ```
-   This starts ngrok, updates `ios/Local.xcconfig` with the tunnel URL, and runs the API server.
+   This starts ngrok, updates `ios/Local.xcconfig` with the tunnel URL, and runs the API with background workers.
 
-3. **Build and run in Xcode**:
-   Open `ios/Chronoscope.xcodeproj`, build and run normally (⌘R).
+3. **Build and run in Xcode**: Open `ios/Chronoscope.xcodeproj` and hit `Cmd+R`.
 
-The iOS app reads the API domain from `Local.xcconfig`, so each rebuild picks up the current ngrok URL automatically. The URL can't be dynamic since the iOS passkey implementation expects the specific domain to be built into the signed app entitlements.
+That's it - one terminal command and one Xcode shortcut for a fully functioning system on a real device.
 
-### Without ngrok
+See [docs/development.md](docs/development.md) for detailed development practices.
 
-For API-only development (passkeys won't work from iOS):
+### Running Tests
+
 ```bash
-cd api
-export JWT_SECRET="dev-secret"
-cargo run
+# API tests (includes auth flow with simulated passkeys)
+cargo test
+
+# iOS UI tests
+xcodebuild test -scheme Chronoscope -destination 'platform=iOS Simulator,name=iPhone 16'
 ```
-
-### OpenAPI
-
-The iOS client is generated from `api/target/openapi.json` (symlinked into the iOS project). The Xcode build phase regenerates it automatically when API source changes.
 
 ## Project Structure
 
 ```
 api/                 Rust API server (Dropshot framework)
+db/                  Database layer (sqlx + SQLite)
+workers/             Background workers (URL fetching, content extraction)
+dev/                 Development server with ngrok integration
 ios/
   App/               Main iOS app (SwiftUI)
   Shared/            Code shared between app and extension
   ShareExtension/    Share extension for URL capture
   ChronoscopeAPI/    Generated OpenAPI client package
-  UITests/           UI tests
 ```
+
+See [docs/architecture.md](docs/architecture.md) for technical details.
 
 ## AI Use
 
-This project was built with the help of AI - as a tool, not a shortcut. All code is reviewed, tested, and validated. What matters is whether the software works, solves real problems, and is maintainable and easily understood by both humans and AI.
+This project was built with the help of AI - as a tool, not a shortcut. All code is reviewed, tested, and validated. What matters is whether the software works, solves real problems, and is maintainable.
 
 AI-assisted contributions are welcome, but they need to pass human review, be well factored, and have other markers of quality code. Don't just tell your AI assistant to read an issue and fix it. Slop PRs will be closed.
-
-Disclosure format borrowed from [intercept](https://github.com/smittix/intercept/tree/ac0235312ca1e492caddbed2c5d2e7f4faccc4d9#ai-use).
 
 ## License
 

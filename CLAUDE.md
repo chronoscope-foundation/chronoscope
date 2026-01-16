@@ -1,45 +1,59 @@
 # Chronoscope
 
-## Vision
+## Development Tenets
 
-Chronoscope aims to be a spatiotemporal knowledge platform - think "Wikipedia for places through time." The goal is to transform scattered historical photos, maps, and documents into an explorable timeline of any location, with users and "tasteful AI" collaborating to resolve mysteries through photogrammetry and detective work.
+**Feedback mechanisms everywhere.** Strong types, strict lints, comprehensive tests, and fast local iteration catch errors early. These feedback loops help both LLM agents and human developers - it's not a tradeoff, it's just good engineering.
 
-### Core Principles
+**Predictable performance.** All SQL queries are factored out and verified with `EXPLAIN QUERY PLAN` at startup. No full table scans allowed. APIs should have predictable, verifiable performance characteristics.
 
-- **Knowledge graph, not photo gallery**: Photos are evidence for assertions about how places evolved, not the end product
-- **Wiki model**: Crowdsourced with self-correcting mechanisms, evidence-based assertions, transparent history
-- **Citations everywhere**: Knowledge doesn't exist in Chronoscope without attribution, with varying degrees of machine-checkable citations
-- **Uncertainty as feature**: First-class vague dates ("sometime in the 1920s") and locations ("near Main St") invite refinement
-- **Graceful degradation**: AI provides hints, humans make decisions; platform works even if automation fails
+**OpenAPI-first.** The API contract is the source of truth. iOS, web, and CLI clients are all generated from the same OpenAPI spec. Change the Rust endpoint, and the Swift client updates automatically.
 
-### Future Data Model (Not Yet Implemented)
+**Thin slice, then broaden.** Prove out the full stack end-to-end before building breadth. The current implementation is a thin slice (URLs → workers → iOS app) that establishes patterns for the larger system.
 
-The full vision includes:
-- **Entities**: Buildings, streets, landmarks exist abstractly separate from evidence
-- **Transitions**: Track changes (constructed, modified, demolished) not static states
-- **Evidence chains**: Every assertion requires sources
-- **Integrations**: Wikidata, Library of Congress, OpenStreetMap, archive.org
+**Tests for correctness, not coverage.** Every test should catch meaningful bugs. We don't write tests to hit coverage numbers - we think critically about what each test validates.
 
-## Current Implementation
+See [docs/development.md](docs/development.md) for detailed practices.
 
-This repo contains a "thin end-to-end slice" to prove out the core flow:
+## Project Tenets
 
-### What's Built
+See [docs/design.md](docs/design.md) for the full design philosophy. Key points:
 
-1. **Research URLs**: Users submit URLs (of historical images, documents, etc.) and can follow them
-   - This is the minimal content type that will eventually feed into the full entity/evidence system
-   - URLs are validated (SSRF protection) and fetched by background workers
-   - Domain-specific fetchers (e.g., Reddit) extract structured content and media
+- **Uncertainty is data** - vague dates and locations are first-class, not forced into false precision
+- **Citations are pervasive** - every assertion requires attribution, machine-checkable where possible
+- **Collaborative research** - AI assists humans, doesn't replace them; behavior must be interpretable
+- **API-first platform** - all clients are API consumers; easy ingestion for external datasets
 
-2. **Passkey Authentication**: WebAuthn-based passwordless auth
-   - Stateless challenge flow (signed state sent to client)
-   - JWT session tokens
+## Quick Reference
 
-3. **iOS App**: Native client with share extension
-   - Easy URL capture from Safari, social media, etc.
-   - Passkey registration and login
+```bash
+# Start dev server (ngrok + API + workers)
+cargo run -p chronoscope-dev
 
-### Architecture
+# Run tests
+cargo test
+
+# Generate OpenAPI spec
+cargo run --bin openapi
+```
+
+## Code Standards
+
+### Rust
+
+- `#![deny(clippy::unwrap_used)]` - handle errors properly, no unwraps
+- `#![deny(unsafe_code)]` - no unsafe code
+- OpenAPI-first: Dropshot macros define endpoints, schemars for schema
+- Tests use real database (in-memory SQLite) and simulated passkeys
+
+### Swift
+
+- SwiftFormat and SwiftLint enforced via Xcode build phases
+- `APIProtocol` abstraction for swapping real/mock implementations
+- Mock clients for previews and UI tests
+
+## Architecture Overview
+
+See [docs/architecture.md](docs/architecture.md) for details.
 
 ```
 ┌─────────────┐     OpenAPI      ┌─────────────┐
@@ -50,58 +64,10 @@ This repo contains a "thin end-to-end slice" to prove out the core flow:
        │ WebAuthn                       │ SQLite
        ▼                                ▼
    [Passkeys]                      [Database]
-```
-
-**API** (`api/`):
-- Dropshot framework (Oxide's REST framework with OpenAPI generation)
-- SQLite via sqlx (same API works for Postgres later)
-- WebAuthn via webauthn-rs
-- JWT sessions via jwt-compact
-
-**iOS** (`ios/`):
-- SwiftUI with Swift 6
-- Swift OpenAPI Generator for type-safe API client
-- XcodeGen for project generation
-- Share extension for URL ingestion
-
-## Code Conventions
-
-### Rust
-
-- `#![deny(clippy::unwrap_used)]` - no unwraps, handle errors properly
-- OpenAPI-first: endpoints defined with Dropshot macros, schema via schemars
-- Tests use real database with in-memory SQLite and webauthn-authenticator-rs for passkey simulation
-
-### Swift
-
-- SwiftFormat and SwiftLint enforced via build phases
-- Mock API clients for previews and UI tests
-- `APIProtocol` abstraction allows swapping real/mock implementations
-
-## Development
-
-### Running Locally
-
-For iOS passkey testing, you need a public HTTPS URL (passkeys require secure context):
-
-```bash
-cargo run -p chronoscope-dev
-```
-
-This starts ngrok, automatically updates `ios/Local.xcconfig` with the tunnel domain, and runs the API server with background workers. Then use Xcode normally to build/run the iOS app.
-
-### OpenAPI Flow
-
-1. Xcode build phase runs `cargo run --bin openapi` to generate `api/target/openapi.json`
-2. iOS project symlinks to this file (`ios/ChronoscopeAPI/Sources/ChronoscopeAPI/openapi.json`)
-3. Swift OpenAPI Generator plugin generates client code at build time
-
-### Testing
-
-```bash
-# API tests (includes auth flow with simulated passkeys)
-cd api && cargo test
-
-# iOS UI tests
-xcodebuild test -scheme Chronoscope -destination 'platform=iOS Simulator,name=iPhone 16'
+                                        │
+                                        ▼
+                                   [Workers]
+                                   (URL fetch,
+                                    content
+                                    extraction)
 ```
