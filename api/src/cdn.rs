@@ -13,14 +13,16 @@ pub fn full_url(base_url: &str, storage_key: &str) -> String {
 }
 
 /// Generate a thumbnail CDN URL for a media item.
+///
+/// Thumbnails are always JPEG regardless of original format.
 #[must_use]
 pub fn thumbnail_url(base_url: &str, storage_key: &str) -> String {
-    // Insert suffix before file extension, or append if no extension
+    // Strip original extension and always use .jpg
     if let Some(dot_pos) = storage_key.rfind('.') {
-        let (name, ext) = storage_key.split_at(dot_pos);
-        format!("{base_url}/{name}{THUMBNAIL_SUFFIX}{ext}")
+        let name = &storage_key[..dot_pos];
+        format!("{base_url}/{name}{THUMBNAIL_SUFFIX}.jpg")
     } else {
-        format!("{base_url}/{storage_key}{THUMBNAIL_SUFFIX}")
+        format!("{base_url}/{storage_key}{THUMBNAIL_SUFFIX}.jpg")
     }
 }
 
@@ -47,10 +49,18 @@ pub mod tests {
     }
 
     #[test]
+    fn test_thumbnail_url_png_becomes_jpg() {
+        assert_eq!(
+            thumbnail_url(TEST_CDN_BASE_URL, "abc123/image.png"),
+            format!("{TEST_CDN_BASE_URL}/abc123/image_thumb.jpg")
+        );
+    }
+
+    #[test]
     fn test_thumbnail_url_without_extension() {
         assert_eq!(
             thumbnail_url(TEST_CDN_BASE_URL, "abc123/image"),
-            format!("{TEST_CDN_BASE_URL}/abc123/image_thumb")
+            format!("{TEST_CDN_BASE_URL}/abc123/image_thumb.jpg")
         );
     }
 
@@ -58,7 +68,7 @@ pub mod tests {
     fn test_thumbnail_url_multiple_dots() {
         assert_eq!(
             thumbnail_url(TEST_CDN_BASE_URL, "2024/01/photo.2024.01.15.png"),
-            format!("{TEST_CDN_BASE_URL}/2024/01/photo.2024.01.15_thumb.png")
+            format!("{TEST_CDN_BASE_URL}/2024/01/photo.2024.01.15_thumb.jpg")
         );
     }
 }

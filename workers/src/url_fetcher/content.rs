@@ -20,6 +20,14 @@ pub fn storage_key(hash: &[u8], extension: &str) -> String {
     format!("media/{}.{}", hex::encode(hash), extension)
 }
 
+/// Generate a thumbnail storage key from the hash.
+///
+/// Thumbnails are always JPEG for consistent compression.
+#[must_use]
+pub fn thumbnail_key(hash: &[u8]) -> String {
+    format!("media/{}_thumb.jpg", hex::encode(hash))
+}
+
 /// Detected content type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentType {
@@ -195,5 +203,11 @@ mod tests {
         let random_bytes = Bytes::from_static(b"some random bytes that aren't anything");
         let result = detect_content_type(None, &random_bytes);
         assert!(matches!(result, ContentType::Unknown(_)));
+    }
+
+    #[test]
+    fn test_thumbnail_key() {
+        let hash = [0x01, 0x02, 0x03];
+        assert_eq!(thumbnail_key(&hash), "media/010203_thumb.jpg");
     }
 }

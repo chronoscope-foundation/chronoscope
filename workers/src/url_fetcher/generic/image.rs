@@ -8,13 +8,19 @@ use std::io::Cursor;
 use bytes::Bytes;
 use chrono::{NaiveDateTime, Utc};
 use chronoscope_db::{GpsLocation, MediaData, MediaType, ResearchUrl};
-use image::GenericImageView;
+use image::{GenericImageView, ImageEncoder};
 use image_hasher::{HashAlg, HasherConfig};
 use tracing::instrument;
 use url::Url;
 
-use crate::url_fetcher::content::{ImageFormat, content_hash, storage_key};
+use crate::url_fetcher::content::{ImageFormat, content_hash, storage_key, thumbnail_key};
 use crate::url_fetcher::fetcher::{FetchContext, FetchError, FetchOutcome, FetchResult};
+
+/// Maximum dimension (width or height) for thumbnails.
+const THUMBNAIL_SIZE: u32 = 512;
+
+/// JPEG quality for thumbnails (0-100).
+const THUMBNAIL_QUALITY: u8 = 80;
 
 /// Process image content: decode, extract EXIF, compute perceptual hash, store.
 #[instrument(skip_all, fields(media_id, width, height))]
@@ -51,6 +57,23 @@ pub async fn process(
     ctx.media_store
         .put(&storage_key, body.clone(), format.mime_type())
         .await?;
+
+    // Generate and store thumbnail (failures don't fail the fetch)
+    let thumb_key = thumbnail_key(&exact_hash);
+    match generate_thumbnail(&img) {
+        Ok(thumb_bytes) => {
+            if let Err(e) = ctx
+                .media_store
+                .put(&thumb_key, thumb_bytes, "image/jpeg")
+                .await
+            {
+                tracing::warn!(error = %e, "failed to store thumbnail");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to generate thumbnail");
+        }
+    }
 
     // Create media data
     let media_data = MediaData {
@@ -103,6 +126,29 @@ fn compute_perceptual_hash(img: &image::DynamicImage) -> Vec<u8> {
 
     let hash = hasher.hash_image(img);
     hash.as_bytes().to_vec()
+}
+
+/// Generate a thumbnail from an image.
+///
+/// Resizes the image so the longest edge is at most [`THUMBNAIL_SIZE`] pixels,
+/// then encodes as JPEG with quality [`THUMBNAIL_QUALITY`].
+fn generate_thumbnail(img: &image::DynamicImage) -> Result<Bytes, String> {
+    let thumb = img.thumbnail(THUMBNAIL_SIZE, THUMBNAIL_SIZE);
+    let rgb = thumb.to_rgb8();
+
+    let mut buffer = Vec::new();
+    let encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, THUMBNAIL_QUALITY);
+    encoder
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .map_err(|e| format!("failed to encode thumbnail: {e}"))?;
+
+    Ok(Bytes::from(buffer))
 }
 
 // ==================== EXIF Extraction ====================
