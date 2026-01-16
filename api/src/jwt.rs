@@ -230,6 +230,50 @@ pub enum ChallengePurpose {
     Login,
 }
 
+// ==================== Test Helpers ====================
+
+#[cfg(test)]
+impl JwtConfig {
+    /// Create an already-expired session token for testing.
+    ///
+    /// The token will have been "issued" an hour ago and "expired" 59 minutes ago.
+    pub fn create_expired_session_token(&self, user_id: &UserId) -> Result<String, JwtError> {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut claims = Claims::new(SessionClaims {
+            sub: user_id.to_string(),
+        });
+        claims.issued_at = Some(past);
+        claims.expiration = Some(past + chrono::Duration::seconds(1));
+
+        Hs256
+            .token(&Header::empty(), &claims, &self.key)
+            .map_err(JwtError::from)
+    }
+
+    /// Create an already-expired challenge token for testing.
+    ///
+    /// The token will have been "issued" an hour ago and "expired" 59 minutes ago.
+    pub fn create_expired_challenge_token(
+        &self,
+        state: &str,
+        user_id: &UserId,
+        purpose: ChallengePurpose,
+    ) -> Result<String, JwtError> {
+        let past = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut claims = Claims::new(ChallengeClaims {
+            state: state.to_string(),
+            user_id: user_id.clone(),
+            purpose,
+        });
+        claims.issued_at = Some(past);
+        claims.expiration = Some(past + chrono::Duration::seconds(1));
+
+        Hs256
+            .token(&Header::empty(), &claims, &self.key)
+            .map_err(JwtError::from)
+    }
+}
+
 impl From<JwtError> for HttpError {
     fn from(e: JwtError) -> Self {
         match e {

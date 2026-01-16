@@ -287,16 +287,13 @@ async fn test_auth_malformed_token() -> TestResult {
 
 #[tokio::test]
 async fn test_auth_expired_token() -> TestResult {
-    // Short expiry with no leeway for testing
-    let ctx =
-        TestContext::with_jwt_config(JwtConfig::new(TEST_SECRET, 1, TEST_CHALLENGE_EXPIRY, 0))
-            .await?;
+    let ctx = TestContext::new().await?;
 
+    // Create a token that's already expired (issued an hour ago, expired 59 mins ago)
     let token = ctx
         .app_state
         .jwt
-        .create_session_token(&UserId::new("test-user"))?;
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        .create_expired_session_token(&UserId::new("test-user"))?;
 
     assert_eq!(ctx.get_auth("/users/me", &token).await?.status(), 401);
     Ok(())
@@ -470,40 +467,33 @@ async fn test_challenge_token_tampering() -> TestResult {
 
 #[tokio::test]
 async fn test_challenge_token_expired() -> TestResult {
-    // Very short challenge expiry with no leeway
-    let ctx = TestContext::with_jwt_config(JwtConfig::new(TEST_SECRET, TEST_SESSION_EXPIRY, 1, 0))
-        .await?;
+    use crate::jwt::ChallengePurpose;
 
-    let mut authenticator = TestContext::new_authenticator();
+    let ctx = TestContext::new().await?;
 
-    // Start registration
-    let start_req = RegisterStartRequest {
-        username: TestContext::unique_username(),
-        email: Email::new(format!(
-            "{}@test.example.com",
-            TestContext::unique_username()
-        )),
-    };
-    let start_resp: RegisterStartResponse = ctx
-        .post_json("/auth/register/start", &start_req)
-        .await?
-        .json()
-        .await?;
-    let ccr: webauthn_rs::prelude::CreationChallengeResponse =
-        serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
-    let credential = authenticator
-        .do_registration(ctx.origin()?, ccr)
-        .map_err(|e| format!("Registration failed: {e:?}"))?;
+    // Create an already-expired challenge token. The server checks expiration
+    // before validating the webauthn state, so we can use dummy data.
+    let expired_token = ctx.app_state.jwt.create_expired_challenge_token(
+        "dummy-state",
+        &UserId::new("dummy-user"),
+        ChallengePurpose::Register,
+    )?;
 
-    // Wait for challenge token to expire
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    // Try to finish registration with the expired token.
+    // The credential/username/email don't matter - rejection happens at token validation.
+    // We just need data that deserializes; it won't actually be validated.
+    let dummy_credential = serde_json::from_value(serde_json::json!({
+        "id": "x",
+        "rawId": "eA",
+        "response": { "clientDataJSON": "e30", "attestationObject": "oA" },
+        "type": "public-key"
+    }))?;
 
-    // Try to finish with expired challenge token
     let finish_req = RegisterFinishRequest {
-        challenge_token: start_resp.challenge_token,
-        credential: serde_json::from_value(serde_json::to_value(&credential)?)?,
-        username: start_req.username.clone(),
-        email: start_req.email.clone(),
+        challenge_token: expired_token,
+        credential: dummy_credential,
+        username: "dummy-user".to_string(),
+        email: Email::new("dummy@test.example.com".to_string()),
     };
 
     assert_eq!(

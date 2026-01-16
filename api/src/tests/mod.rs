@@ -128,12 +128,6 @@ impl TestContext {
         Self::with_options(Some(app_id.to_string()), None, None).await
     }
 
-    async fn with_jwt_config(
-        jwt: JwtConfig,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::with_options(None, Some(jwt), None).await
-    }
-
     #[allow(dead_code)]
     async fn with_dns_resolver(
         resolver: TestResolver,
