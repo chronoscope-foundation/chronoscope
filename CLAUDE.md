@@ -23,14 +23,20 @@ See [docs/design.md](docs/design.md) for the full design philosophy. Key points:
 - **Collaborative research** - AI assists humans, doesn't replace them; behavior must be interpretable
 - **API-first platform** - all clients are API consumers; easy ingestion for external datasets
 
+## Commit Requirements
+
+Every commit must pass `just check`, which runs formatting, linting, tests, and coverage. Line coverage must stay above 75%.
+
+Run from the repo root for workspace-wide checks, or from a crate directory (e.g., `api/`) to check just that crate.
+
 ## Quick Reference
 
 ```bash
+# Run all checks (fmt, clippy, test, coverage)
+just check
+
 # Start dev server (ngrok + API + workers)
 cargo run -p chronoscope-dev
-
-# Run tests
-cargo test
 
 # Generate OpenAPI spec
 cargo run --bin openapi
