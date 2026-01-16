@@ -406,7 +406,7 @@ async fn test_dossier_video_with_duration() -> TestResult {
     Ok(())
 }
 
-/// Tests that create_page correctly handles a mix of pre-existing and new media URLs.
+/// Tests that `create_page` correctly handles a mix of pre-existing and new media URLs.
 /// This exercises the batch INSERT OR IGNORE + JOIN pattern.
 #[tokio::test]
 async fn test_create_page_with_mixed_existing_and_new_urls() -> TestResult {

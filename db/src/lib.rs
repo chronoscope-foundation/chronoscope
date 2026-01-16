@@ -26,7 +26,7 @@ pub use types::{
 
 use models::{MediaDbRow, PageDbRow, PageMediaRow};
 
-/// Get the current UTC timestamp as NaiveDateTime for database storage.
+/// Get the current UTC timestamp as `NaiveDateTime` for database storage.
 pub(crate) fn now() -> NaiveDateTime {
     Utc::now().naive_utc()
 }

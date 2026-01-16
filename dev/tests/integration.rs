@@ -210,7 +210,7 @@ impl TestServer {
 ///
 /// Note: The Reddit gallery contains 20 images, but we intentionally only recorded
 /// a VCR fixture for one of them. This tests that the failure path works correctly:
-/// images without fixtures fail with CacheMiss (treated as permanent failure in
+/// images without fixtures fail with `CacheMiss` (treated as permanent failure in
 /// offline VCR mode), while the one with a fixture succeeds and can be retrieved.
 #[tokio::test]
 async fn test_reddit_gallery_end_to_end() -> TestResult {

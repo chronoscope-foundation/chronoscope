@@ -59,10 +59,10 @@ pub struct Config {
     pub bind_addr: std::net::SocketAddr,
 
     /// iOS app identifier for AASA (e.g., "ABCD1234.com.example.app")
-    /// Set via IOS_APP_ID env var, or constructed from APPLE_TEAM_ID + IOS_BUNDLE_ID
+    /// Set via `IOS_APP_ID` env var, or constructed from `APPLE_TEAM_ID` + `IOS_BUNDLE_ID`
     pub ios_app_id: Option<String>,
 
-    /// CDN base URL for media assets (e.g., "https://cdn.chronoscope.io")
+    /// CDN base URL for media assets (e.g., `https://cdn.chronoscope.io`)
     pub cdn_base_url: String,
 }
 

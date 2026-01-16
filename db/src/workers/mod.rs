@@ -40,7 +40,7 @@ impl Database {
     /// Uses batch queries to minimize round trips:
     /// 1. Insert page row
     /// 2. Batch insert all media URLs (ON CONFLICT DO NOTHING)
-    /// 3. Batch insert page_media links (resolves URLs to IDs via join)
+    /// 3. Batch insert `page_media` links (resolves URLs to IDs via join)
     ///
     /// # Errors
     /// Returns `DbError::InvalidArgument` if any media slots have pre-resolved media,

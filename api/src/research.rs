@@ -191,7 +191,7 @@ fn build_resolved_content(
     }
 }
 
-/// Convert a DB Page to API PageDossier.
+/// Convert a DB Page to API `PageDossier`.
 fn convert_page(page: &Page, cdn_base_url: &str) -> Result<PageDossier, HttpError> {
     let media: Result<Vec<_>, _> = page
         .data
@@ -211,7 +211,7 @@ fn convert_page(page: &Page, cdn_base_url: &str) -> Result<PageDossier, HttpErro
     })
 }
 
-/// Convert a MediaSlot to API MediaReference.
+/// Convert a `MediaSlot` to API `MediaReference`.
 fn convert_media_reference(
     slot: &MediaSlot,
     cdn_base_url: &str,
@@ -227,7 +227,7 @@ fn convert_media_reference(
     }
 }
 
-/// Convert a DB Media to API MediaDossier.
+/// Convert a DB Media to API `MediaDossier`.
 fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, HttpError> {
     // Convert DB GpsLocation to API GpsCoordinates
     let location = media.data.location.as_ref().map(|loc| GpsCoordinates {

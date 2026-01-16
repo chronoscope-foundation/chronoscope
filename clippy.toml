@@ -1,7 +1,18 @@
 # Workspace-level clippy configuration
 
-# Allow these identifiers in documentation without triggering doc_markdown lint
-doc-valid-idents = ["WebAuthn", "AdGuard"]
+# Allow these identifiers in documentation without triggering doc_markdown lint.
+# These are product/protocol/format names, not code identifiers.
+doc-valid-idents = [
+    "AdGuard",
+    "EdDSA",
+    "IPv4",
+    "IPv6",
+    "OpenAPI",
+    "SQLite",
+    "UUIDv7",
+    "WebAuthn",
+    "WebP",
+]
 
 # Ban sleep functions to prevent accidental use in production code.
 # Use #[allow(clippy::disallowed_methods)] at specific call sites that need it.

@@ -117,10 +117,10 @@ async fn validate_host(
 /// Check if an IP address is in a blocked range.
 ///
 /// Blocked ranges include:
-/// - Loopback (127.0.0.0/8, ::1)
+/// - Loopback (127.0.0.0/8, `::1`)
 /// - Private networks (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16)
 /// - Link-local (169.254.0.0/16 - includes AWS IMDS at 169.254.169.254)
-/// - IPv6 link-local (fe80::/10)
+/// - IPv6 link-local (`fe80::/10`)
 /// - Multicast
 /// - Broadcast
 /// - Documentation ranges

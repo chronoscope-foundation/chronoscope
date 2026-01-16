@@ -17,6 +17,7 @@ unsafe_code = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+doc_markdown = "deny"
 
 [workspace.dependencies]
 # Async runtime

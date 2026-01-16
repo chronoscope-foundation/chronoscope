@@ -772,7 +772,7 @@ mod tests {
     /// Reddit CDN subdomains should NOT match the registered `redd.it` shortlink domain.
     ///
     /// This verifies that `preview.redd.it`, `i.redd.it`, and `v.redd.it` (CDN subdomains)
-    /// fall through to the generic fetcher rather than being routed to RedditFetcher.
+    /// fall through to the generic fetcher rather than being routed to `RedditFetcher`.
     #[test]
     fn test_reddit_cdn_does_not_match_shortlink_domain() -> TestResult {
         use crate::url_fetcher::{FetcherRegistry, GenericFetcher, RedditFetcher};

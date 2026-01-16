@@ -1,7 +1,7 @@
 //! Integration tests for the Chronoscope API
 //!
 //! These tests use an in-memory SQLite database and simulate WebAuthn flows
-//! using the SoftPasskey authenticator.
+//! using the `SoftPasskey` authenticator.
 
 mod auth;
 #[cfg(feature = "embedded-media")]
@@ -112,7 +112,7 @@ struct TestContext {
     client: Client,
     app_state: Arc<AppState>,
     /// Kept alive to maintain the server running for the duration of the test.
-    /// The server runs in a background task and is dropped when TestContext is dropped.
+    /// The server runs in a background task and is dropped when `TestContext` is dropped.
     #[allow(dead_code)]
     server: dropshot::HttpServer<Arc<AppState>>,
 }
@@ -440,7 +440,7 @@ impl TestContext {
         })
     }
 
-    /// Set the created_at timestamp for a research URL (for testing pagination ordering)
+    /// Set the `created_at` timestamp for a research URL (for testing pagination ordering)
     async fn set_research_timestamp(
         &self,
         id: &ResearchUrlId,

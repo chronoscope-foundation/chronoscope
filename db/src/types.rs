@@ -10,7 +10,7 @@ use std::fmt;
 /// - `new()` to create from any string-like value
 /// - `generate()` to create a new UUIDv7
 /// - `as_str()` to get the inner string reference
-/// - Display, AsRef<str>, and derives for serialization/database
+/// - Display, `AsRef<str>`, and derives for serialization/database
 macro_rules! define_id {
     ($name:ident) => {
         #[derive(
@@ -69,7 +69,7 @@ pub enum ResearchUrlStatus {
     Analyzing,
     /// All automated processing complete
     Complete,
-    /// Processing failed (see error_message)
+    /// Processing failed (see `error_message`)
     Failed,
 }
 

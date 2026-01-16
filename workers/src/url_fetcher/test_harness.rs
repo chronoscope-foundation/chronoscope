@@ -28,7 +28,7 @@ impl std::fmt::Display for TestError {
 
 impl std::error::Error for TestError {}
 
-/// Check if a FetchError indicates a cache miss (fixture not recorded).
+/// Check if a `FetchError` indicates a cache miss (fixture not recorded).
 fn is_cache_miss(error: &FetchError) -> bool {
     // Cache misses come through as Http errors from the CachingClient
     matches!(error, FetchError::Http(msg) if msg.to_lowercase().contains("cache miss"))

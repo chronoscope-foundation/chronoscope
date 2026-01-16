@@ -40,7 +40,7 @@ impl From<String> for DevServerError {
 
 /// Handle to a running development server.
 pub struct RunningDevServer {
-    /// Base URL of the server (e.g., "http://127.0.0.1:8080")
+    /// Base URL of the server (e.g., `http://127.0.0.1:8080`)
     pub base_url: String,
 
     /// Port the server is listening on

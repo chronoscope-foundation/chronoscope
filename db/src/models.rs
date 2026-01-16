@@ -53,7 +53,7 @@ pub struct User {
 }
 
 /// A research URL (canonical, deduplicated)
-/// Note: page_id and media_id are mutually exclusive (enforced by DB constraint)
+/// Note: `page_id` and `media_id` are mutually exclusive (enforced by DB constraint)
 #[derive(Debug, Clone, FromRow)]
 pub struct ResearchUrl {
     pub id: ResearchUrlId,

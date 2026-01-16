@@ -5,7 +5,7 @@
 //!
 //! # TODO: Streaming for large files (optimization)
 //!
-//! Currently loads entire response into memory before processing. The HttpClient
+//! Currently loads entire response into memory before processing. The `HttpClient`
 //! enforces a size limit while streaming, so this is safe but inefficient for large
 //! files. For better memory efficiency with video, we could stream directly to
 //! [`MediaStore`]:
@@ -240,7 +240,7 @@ mod tests {
         Ok(())
     }
 
-    /// 404 returns NotFound error
+    /// 404 returns `NotFound` error
     #[tokio::test]
     async fn test_process_404_returns_not_found() -> TestResult {
         let url = "https://example.com/nonexistent-page-12345";

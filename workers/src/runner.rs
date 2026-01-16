@@ -577,7 +577,7 @@ mod tests {
         }
     }
 
-    /// Error type for collect_n failures.
+    /// Error type for `collect_n` failures.
     #[derive(Debug)]
     struct CollectError(String);
 

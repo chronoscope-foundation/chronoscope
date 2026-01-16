@@ -21,7 +21,7 @@ use crate::validation::{is_unique_violation, validate_email, validate_username};
 // ==================== Pagination Types ====================
 
 /// Page selector for following list pagination (cursor-based).
-/// Contains the followed_at and id of the last item from the previous page.
+/// Contains the `followed_at` and id of the last item from the previous page.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct FollowingPageSelector {
     pub followed_at: NaiveDateTime,
