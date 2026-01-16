@@ -198,268 +198,292 @@ fn canonicalize_host(host: &str) -> String {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
     /// Helper to normalize a URL string, returning the result as a string.
-    fn normalize(input: &str) -> Result<String, NormalizeError> {
-        let url = Url::parse(input).expect("test URL should parse");
-        normalize_url(&url).map(|u| u.to_string())
+    fn normalize(input: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let url = Url::parse(input)?;
+        Ok(normalize_url(&url)?.to_string())
     }
 
     // ==================== Basic Normalization ====================
 
     #[test]
-    fn test_lowercase_host() {
+    fn test_lowercase_host() -> TestResult {
         assert_eq!(
-            normalize("https://EXAMPLE.COM/path").unwrap(),
+            normalize("https://EXAMPLE.COM/path")?,
             "https://example.com/path"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_fragment() {
+    fn test_remove_fragment() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/page#section").unwrap(),
+            normalize("https://example.com/page#section")?,
             "https://example.com/page"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_default_http_port() {
+    fn test_remove_default_http_port() -> TestResult {
         assert_eq!(
-            normalize("http://example.com:80/path").unwrap(),
+            normalize("http://example.com:80/path")?,
             "http://example.com/path"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_default_https_port() {
+    fn test_remove_default_https_port() -> TestResult {
         assert_eq!(
-            normalize("https://example.com:443/path").unwrap(),
+            normalize("https://example.com:443/path")?,
             "https://example.com/path"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_preserve_non_default_port() {
+    fn test_preserve_non_default_port() -> TestResult {
         assert_eq!(
-            normalize("https://example.com:8080/path").unwrap(),
+            normalize("https://example.com:8080/path")?,
             "https://example.com:8080/path"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_trailing_slash() {
+    fn test_remove_trailing_slash() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/path/").unwrap(),
+            normalize("https://example.com/path/")?,
             "https://example.com/path"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_preserve_root_path() {
-        assert_eq!(
-            normalize("https://example.com/").unwrap(),
-            "https://example.com/"
-        );
+    fn test_preserve_root_path() -> TestResult {
+        assert_eq!(normalize("https://example.com/")?, "https://example.com/");
+        Ok(())
     }
 
     #[test]
-    fn test_preserve_root_path_no_slash() {
+    fn test_preserve_root_path_no_slash() -> TestResult {
         // URL parser adds trailing slash to root
-        assert_eq!(
-            normalize("https://example.com").unwrap(),
-            "https://example.com/"
-        );
+        assert_eq!(normalize("https://example.com")?, "https://example.com/");
+        Ok(())
     }
 
     // ==================== Tracking Parameter Removal ====================
 
     #[test]
-    fn test_remove_utm_params() {
+    fn test_remove_utm_params() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/page?utm_source=twitter&utm_medium=social&id=123")
-                .unwrap(),
+            normalize("https://example.com/page?utm_source=twitter&utm_medium=social&id=123")?,
             "https://example.com/page?id=123"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_fbclid() {
+    fn test_remove_fbclid() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/page?fbclid=abc123&id=456").unwrap(),
+            normalize("https://example.com/page?fbclid=abc123&id=456")?,
             "https://example.com/page?id=456"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_all_tracking_leaves_no_query() {
+    fn test_remove_all_tracking_leaves_no_query() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/page?utm_source=x&fbclid=y").unwrap(),
+            normalize("https://example.com/page?utm_source=x&fbclid=y")?,
             "https://example.com/page"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_preserve_non_tracking_params() {
+    fn test_preserve_non_tracking_params() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/search?q=test&page=2").unwrap(),
+            normalize("https://example.com/search?q=test&page=2")?,
             "https://example.com/search?q=test&page=2"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_remove_utm_prefix_variants() {
+    fn test_remove_utm_prefix_variants() -> TestResult {
         // Should catch any utm_* even if not in our explicit list
         assert_eq!(
-            normalize("https://example.com/?utm_custom=foo&id=1").unwrap(),
+            normalize("https://example.com/?utm_custom=foo&id=1")?,
             "https://example.com/?id=1"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_tracking_params_case_insensitive() {
+    fn test_tracking_params_case_insensitive() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/page?UTM_SOURCE=x&FBCLID=y&id=1").unwrap(),
+            normalize("https://example.com/page?UTM_SOURCE=x&FBCLID=y&id=1")?,
             "https://example.com/page?id=1"
         );
+        Ok(())
     }
 
     // ==================== Domain Aliasing ====================
 
     #[test]
-    fn test_reddit_www_to_canonical() {
+    fn test_reddit_www_to_canonical() -> TestResult {
         assert_eq!(
-            normalize("https://www.reddit.com/r/test").unwrap(),
+            normalize("https://www.reddit.com/r/test")?,
             "https://reddit.com/r/test"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_reddit_old_to_canonical() {
+    fn test_reddit_old_to_canonical() -> TestResult {
         assert_eq!(
-            normalize("https://old.reddit.com/r/test").unwrap(),
+            normalize("https://old.reddit.com/r/test")?,
             "https://reddit.com/r/test"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_reddit_mobile_to_canonical() {
+    fn test_reddit_mobile_to_canonical() -> TestResult {
         assert_eq!(
-            normalize("https://m.reddit.com/r/test").unwrap(),
+            normalize("https://m.reddit.com/r/test")?,
             "https://reddit.com/r/test"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_twitter_www_to_canonical() {
+    fn test_twitter_www_to_canonical() -> TestResult {
         assert_eq!(
-            normalize("https://www.twitter.com/user/status/123").unwrap(),
+            normalize("https://www.twitter.com/user/status/123")?,
             "https://twitter.com/user/status/123"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_x_to_twitter() {
+    fn test_x_to_twitter() -> TestResult {
         assert_eq!(
-            normalize("https://x.com/user/status/123").unwrap(),
+            normalize("https://x.com/user/status/123")?,
             "https://twitter.com/user/status/123"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_www_x_to_twitter() {
+    fn test_www_x_to_twitter() -> TestResult {
         assert_eq!(
-            normalize("https://www.x.com/user/status/123").unwrap(),
+            normalize("https://www.x.com/user/status/123")?,
             "https://twitter.com/user/status/123"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_youtube_mobile_to_canonical() {
+    fn test_youtube_mobile_to_canonical() -> TestResult {
         assert_eq!(
-            normalize("https://m.youtube.com/watch?v=abc123").unwrap(),
+            normalize("https://m.youtube.com/watch?v=abc123")?,
             "https://youtube.com/watch?v=abc123"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_wikipedia_mobile_to_canonical() {
+    fn test_wikipedia_mobile_to_canonical() -> TestResult {
         assert_eq!(
-            normalize("https://en.m.wikipedia.org/wiki/Test").unwrap(),
+            normalize("https://en.m.wikipedia.org/wiki/Test")?,
             "https://en.wikipedia.org/wiki/Test"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_unknown_domain_unchanged() {
+    fn test_unknown_domain_unchanged() -> TestResult {
         // Domains not in our alias list are left as-is (including www)
         assert_eq!(
-            normalize("https://www.somesite.com/page").unwrap(),
+            normalize("https://www.somesite.com/page")?,
             "https://www.somesite.com/page"
         );
+        Ok(())
     }
 
     // ==================== Error Cases ====================
 
     #[test]
-    fn test_non_http_scheme_returns_error() {
-        let url = Url::parse("ftp://files.example.com/file.txt").unwrap();
+    fn test_non_http_scheme_returns_error() -> TestResult {
+        let url = Url::parse("ftp://files.example.com/file.txt")?;
         assert_eq!(normalize_url(&url), Err(NormalizeError::UnsupportedScheme));
+        Ok(())
     }
 
     #[test]
-    fn test_mailto_returns_error() {
-        let url = Url::parse("mailto:user@example.com").unwrap();
+    fn test_mailto_returns_error() -> TestResult {
+        let url = Url::parse("mailto:user@example.com")?;
         assert_eq!(normalize_url(&url), Err(NormalizeError::UnsupportedScheme));
+        Ok(())
     }
 
     // ==================== Edge Cases ====================
 
     #[test]
-    fn test_combined_normalizations() {
+    fn test_combined_normalizations() -> TestResult {
         // Test multiple normalizations at once
         assert_eq!(
             normalize(
                 "https://OLD.REDDIT.COM:443/r/HistoryPorn/comments/abc123/?utm_source=share&utm_medium=web#comments"
-            ).unwrap(),
+            )?,
             "https://reddit.com/r/HistoryPorn/comments/abc123"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_empty_query_value() {
+    fn test_empty_query_value() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/page?flag=&id=123").unwrap(),
+            normalize("https://example.com/page?flag=&id=123")?,
             "https://example.com/page?flag=&id=123"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_encoded_characters_preserved() {
+    fn test_encoded_characters_preserved() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/path%20with%20spaces").unwrap(),
+            normalize("https://example.com/path%20with%20spaces")?,
             "https://example.com/path%20with%20spaces"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_reddit_share_params_removed() {
+    fn test_reddit_share_params_removed() -> TestResult {
         assert_eq!(
-            normalize("https://reddit.com/r/pics/comments/abc?share_id=xyz&ref_source=link")
-                .unwrap(),
+            normalize("https://reddit.com/r/pics/comments/abc?share_id=xyz&ref_source=link")?,
             "https://reddit.com/r/pics/comments/abc"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_instagram_tracking_removed() {
+    fn test_instagram_tracking_removed() -> TestResult {
         assert_eq!(
-            normalize("https://instagram.com/p/abc123?igsh=xyz").unwrap(),
+            normalize("https://instagram.com/p/abc123?igsh=xyz")?,
             "https://instagram.com/p/abc123"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_normalization_is_idempotent() {
+    fn test_normalization_is_idempotent() -> TestResult {
         let urls = [
             "https://EXAMPLE.COM/path?utm_source=x#frag",
             "https://old.reddit.com/r/test/?share_id=abc",
@@ -467,18 +491,20 @@ mod tests {
             "https://example.com/search?q=test&page=2",
         ];
         for url_str in urls {
-            let url = Url::parse(url_str).unwrap();
-            let once = normalize_url(&url).unwrap();
-            let twice = normalize_url(&once).unwrap();
+            let url = Url::parse(url_str)?;
+            let once = normalize_url(&url)?;
+            let twice = normalize_url(&once)?;
             assert_eq!(once, twice, "Normalization not idempotent for: {url_str}");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_trailing_slash_with_query_string() {
+    fn test_trailing_slash_with_query_string() -> TestResult {
         assert_eq!(
-            normalize("https://example.com/path/?q=test").unwrap(),
+            normalize("https://example.com/path/?q=test")?,
             "https://example.com/path?q=test"
         );
+        Ok(())
     }
 }

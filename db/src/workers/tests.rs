@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::DbError;
 use crate::models::MediaSlot;
 use crate::types::{Email, MediaType, ResearchUrlStatus, SourceType, UserId};
 use chrono::{Duration, Utc};
@@ -390,8 +391,8 @@ async fn test_get_or_create_media_creates_new() -> DbResult<()> {
             .fetch_optional(&db.pool)
             .await?;
 
-    assert!(row.is_some());
-    let (width, height, key) = row.as_ref().map(|(w, h, k)| (*w, *h, k.as_str())).unwrap();
+    let (width, height, key) =
+        row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
     assert_eq!(width, 1920);
     assert_eq!(height, 1080);
     assert_eq!(key, "test/hash12345.jpg");
@@ -516,8 +517,8 @@ async fn test_get_or_create_media_with_video() -> DbResult<()> {
             .fetch_optional(&db.pool)
             .await?;
 
-    assert!(row.is_some());
-    let (media_type, duration) = row.unwrap();
+    let (media_type, duration) =
+        row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
     assert_eq!(media_type, "video");
     assert!((duration - 120.5).abs() < 0.01);
 
@@ -554,8 +555,8 @@ async fn test_get_or_create_media_with_gps() -> DbResult<()> {
             .fetch_optional(&db.pool)
             .await?;
 
-    assert!(row.is_some());
-    let (lat, lon, alt) = row.unwrap();
+    let (lat, lon, alt) =
+        row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
     assert!((lat - 37.7749).abs() < 0.0001);
     assert!((lon - (-122.4194)).abs() < 0.0001);
     assert!((alt.unwrap_or(0.0) - 10.5).abs() < 0.01);

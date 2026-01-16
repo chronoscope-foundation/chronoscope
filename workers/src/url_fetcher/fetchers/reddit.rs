@@ -363,10 +363,12 @@ fn build_content(post: &RedditPost, comments: &[RedditComment]) -> Option<String
     let mut parts = Vec::new();
 
     // Add selftext (if not deleted/removed)
-    if let Some(ref text) = post.selftext {
-        if !text.is_empty() && text != REMOVED && text != DELETED {
-            parts.push(text.clone());
-        }
+    if let Some(ref text) = post.selftext
+        && !text.is_empty()
+        && text != REMOVED
+        && text != DELETED
+    {
+        parts.push(text.clone());
     }
 
     // Add external link if present (not Reddit, not image)

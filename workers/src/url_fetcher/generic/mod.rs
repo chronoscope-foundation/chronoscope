@@ -141,14 +141,14 @@ mod tests {
             .media
             .data
             .captured_at
-            .expect("should have capture time");
+            .ok_or("should have capture time")?;
         assert_eq!(captured.and_utc().year(), 2008);
 
         let location = fetched
             .media
             .data
             .location
-            .expect("should have GPS location");
+            .ok_or("should have GPS location")?;
         assert!(
             (location.latitude - 43.467).abs() < 0.01,
             "lat: {}",
@@ -184,7 +184,7 @@ mod tests {
             .data
             .content
             .as_deref()
-            .expect("should have content");
+            .ok_or("should have content")?;
         assert!(content.contains("The mansion was built for"));
         assert!(content.contains("from 1878 to 1882"));
         assert!(content.contains("William Kissam Vanderbilt"));
@@ -227,7 +227,7 @@ mod tests {
             .media
             .data
             .duration_seconds
-            .expect("should have duration");
+            .ok_or("should have duration")?;
         assert!((0.03..0.05).contains(&duration), "duration: {duration}");
 
         // Stored in media store

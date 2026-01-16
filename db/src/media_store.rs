@@ -215,108 +215,92 @@ impl MediaStore for InMemoryMediaStore {
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
     #[tokio::test]
-    async fn test_put_and_get_bytes() {
+    async fn test_put_and_get_bytes() -> TestResult {
         let store = InMemoryMediaStore::new();
 
         store
             .put("test.jpg", Bytes::from("image data"), "image/jpeg")
-            .await
-            .expect("put should succeed");
+            .await?;
 
-        let retrieved = store
-            .get("test.jpg")
-            .await
-            .expect("get should succeed")
-            .expect("should exist");
+        let retrieved = store.get("test.jpg").await?.ok_or("should exist")?;
         assert_eq!(retrieved.data, Bytes::from("image data"));
         assert_eq!(retrieved.metadata.content_type, "image/jpeg");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_get_nonexistent_returns_none() {
+    async fn test_get_nonexistent_returns_none() -> TestResult {
         let store = InMemoryMediaStore::new();
 
-        let result = store.get("nonexistent").await.expect("get should succeed");
+        let result = store.get("nonexistent").await?;
         assert!(result.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_head_returns_metadata() {
+    async fn test_head_returns_metadata() -> TestResult {
         let store = InMemoryMediaStore::new();
         let data = Bytes::from("test content here");
 
-        store
-            .put("test.txt", data.clone(), "text/plain")
-            .await
-            .expect("put should succeed");
+        store.put("test.txt", data.clone(), "text/plain").await?;
 
-        let meta = store
-            .head("test.txt")
-            .await
-            .expect("head should succeed")
-            .expect("should exist");
+        let meta = store.head("test.txt").await?.ok_or("should exist")?;
 
         assert_eq!(meta.content_type, "text/plain");
         assert_eq!(meta.size, data.len() as u64);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_head_nonexistent_returns_none() {
+    async fn test_head_nonexistent_returns_none() -> TestResult {
         let store = InMemoryMediaStore::new();
 
-        let result = store
-            .head("nonexistent")
-            .await
-            .expect("head should succeed");
+        let result = store.head("nonexistent").await?;
         assert!(result.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_overwrite_existing() {
+    async fn test_overwrite_existing() -> TestResult {
         let store = InMemoryMediaStore::new();
 
         store
             .put("test.jpg", Bytes::from("original"), "image/jpeg")
-            .await
-            .expect("put should succeed");
+            .await?;
 
         store
             .put("test.jpg", Bytes::from("updated"), "image/png")
-            .await
-            .expect("put should succeed");
+            .await?;
 
-        let result = store
-            .get("test.jpg")
-            .await
-            .expect("get should succeed")
-            .expect("should exist");
+        let result = store.get("test.jpg").await?.ok_or("should exist")?;
         assert_eq!(result.data, Bytes::from("updated"));
         assert_eq!(result.metadata.content_type, "image/png");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_streaming_read() {
+    async fn test_streaming_read() -> TestResult {
         let store = InMemoryMediaStore::new();
         let data = Bytes::from("streaming test data");
 
         store
             .put("stream.bin", data.clone(), "application/octet-stream")
-            .await
-            .expect("put should succeed");
+            .await?;
 
         let mut reader = store
             .get_stream("stream.bin")
-            .await
-            .expect("get_stream should succeed")
-            .expect("should exist");
+            .await?
+            .ok_or("should exist")?;
 
         // Read in small chunks to test streaming
         let mut buf = [0u8; 4];
         let mut result = Vec::new();
 
         loop {
-            let n = reader.read(&mut buf).await.expect("read should succeed");
+            let n = reader.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
@@ -324,5 +308,6 @@ mod tests {
         }
 
         assert_eq!(result, data.as_ref());
+        Ok(())
     }
 }

@@ -118,9 +118,8 @@ pub fn find_available_port() -> std::io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// Spawn a URL fetcher worker in a background task, returning its handle.
-fn spawn_url_fetcher_worker(
-    index: usize,
+/// Shared context for spawning URL fetcher workers.
+struct WorkerContext {
     db: Arc<Database>,
     http_client: Arc<dyn HttpClient>,
     media_store: Arc<dyn MediaStore>,
@@ -129,18 +128,29 @@ fn spawn_url_fetcher_worker(
     retry_config: RetryConfig,
     shutdown_rx: watch::Receiver<bool>,
     log: slog::Logger,
-) -> JoinHandle<()> {
+}
+
+/// Spawn a URL fetcher worker in a background task, returning its handle.
+fn spawn_url_fetcher_worker(index: usize, ctx: &WorkerContext) -> JoinHandle<()> {
     let worker_id = format!("url-fetcher-{index}");
 
-    let queue = UrlQueue::new(db.clone());
-    let worker = UrlFetcherWorker::with_defaults(db.clone(), http_client, media_store);
-    let enqueuer = UrlEnqueuer::new(db, user_id);
+    let queue = UrlQueue::new(ctx.db.clone());
+    let worker = UrlFetcherWorker::with_defaults(
+        ctx.db.clone(),
+        ctx.http_client.clone(),
+        ctx.media_store.clone(),
+    );
+    let enqueuer = UrlEnqueuer::new(ctx.db.clone(), ctx.user_id.clone());
     let worker_config = WorkerConfig {
         worker_id: worker_id.clone(),
         batch_size: 10,
         stale_after: Duration::from_mins(5),
-        idle_backoff,
+        idle_backoff: ctx.idle_backoff,
     };
+
+    let retry_config = ctx.retry_config.clone();
+    let shutdown_rx = ctx.shutdown_rx.clone();
+    let log = ctx.log.clone();
 
     tokio::spawn(async move {
         info!(log, "Starting worker"; "worker_id" => &worker_id);
@@ -205,20 +215,19 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
 
     // ==================== Start URL Fetcher Workers ====================
 
+    let worker_ctx = WorkerContext {
+        db: db.clone(),
+        http_client: config.http_client.clone(),
+        media_store: media_store.clone(),
+        user_id: test_user_id.clone(),
+        idle_backoff: config.worker_idle_backoff,
+        retry_config: config.retry_config.clone(),
+        shutdown_rx: shutdown_rx.clone(),
+        log: log.clone(),
+    };
+
     let worker_handles: Vec<JoinHandle<()>> = (0..NUM_WORKERS)
-        .map(|i| {
-            spawn_url_fetcher_worker(
-                i,
-                db.clone(),
-                config.http_client.clone(),
-                media_store.clone(),
-                test_user_id.clone(),
-                config.worker_idle_backoff,
-                config.retry_config.clone(),
-                shutdown_rx.clone(),
-                log.clone(),
-            )
-        })
+        .map(|i| spawn_url_fetcher_worker(i, &worker_ctx))
         .collect();
 
     info!(log, "Started {} URL fetcher workers", NUM_WORKERS);
