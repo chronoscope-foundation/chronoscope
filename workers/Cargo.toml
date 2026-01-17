@@ -17,17 +17,17 @@ record-fixtures = []
 [dependencies]
 # Internal crates
 chronoscope-db = { path = "../db" }
+chronoscope-integrations = { path = "../integrations" }
 
 # Async runtime
 tokio.workspace = true
 
-# HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
+# HTTP (types re-exported from integrations, need reqwest for StatusCode in tests)
 async-trait = "0.1"
 bytes.workspace = true
-futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false }
 
-# Hashing (for HTTP cache keys)
+# Hashing (for content storage keys)
 sha2 = "0.10"
 hex = "0.4"
 
@@ -38,7 +38,6 @@ uuid.workspace = true
 url.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-base64.workspace = true
 tracing = "0.1"
 
 # Content extraction and processing

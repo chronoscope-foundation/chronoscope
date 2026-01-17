@@ -185,15 +185,32 @@ pub trait WorkQueue: Send + Sync {
 }
 
 /// Work queue for research URLs.
+///
+/// Claims URLs based on worker affinity:
+/// - `affinity = None`: claims generic URLs only (`worker_affinity` IS NULL)
+/// - `affinity = Some(name)`: claims URLs with matching `worker_affinity`
 pub struct UrlQueue {
     db: Arc<Database>,
+    affinity: Option<chronoscope_integrations::IntegrationName>,
 }
 
 impl UrlQueue {
-    /// Create a new URL queue.
+    /// Create a queue for generic URLs (no affinity).
     #[must_use]
     pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+        Self { db, affinity: None }
+    }
+
+    /// Create a queue for URLs with a specific integration affinity.
+    #[must_use]
+    pub fn with_affinity(
+        db: Arc<Database>,
+        affinity: chronoscope_integrations::IntegrationName,
+    ) -> Self {
+        Self {
+            db,
+            affinity: Some(affinity),
+        }
     }
 }
 
@@ -216,10 +233,19 @@ impl WorkQueue for UrlQueue {
         batch_size: u32,
         stale_cutoff: chrono::NaiveDateTime,
     ) -> Result<Vec<Self::Item>, RunnerError> {
-        Ok(self
-            .db
-            .claim_urls(worker_id, batch_size, stale_cutoff)
-            .await?)
+        let urls = match self.affinity {
+            None => {
+                self.db
+                    .claim_urls(worker_id, batch_size, stale_cutoff)
+                    .await?
+            }
+            Some(affinity) => {
+                self.db
+                    .claim_urls_with_affinity(worker_id, batch_size, stale_cutoff, affinity)
+                    .await?
+            }
+        };
+        Ok(urls)
     }
 
     async fn mark_failed(

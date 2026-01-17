@@ -30,9 +30,7 @@ CREATE INDEX idx_credentials_user_id ON credentials(user_id);
 CREATE TABLE pages (
     id TEXT PRIMARY KEY,
 
-    source_type TEXT NOT NULL CHECK (source_type IN (
-        'instagram', 'reddit', 'twitter', 'flickr', 'loc', 'generic'
-    )),
+    source_type TEXT NOT NULL CHECK (source_type IN ('reddit', 'instagram', 'generic')),
     title TEXT,
     author TEXT,
     published_at TIMESTAMP,
@@ -88,6 +86,10 @@ CREATE TABLE research_urls (
     retry_after TIMESTAMP,
     error_message TEXT,
 
+    -- Worker affinity: which specialized worker should process this URL.
+    -- NULL means generic worker, 'reddit'/'instagram'/etc for specialized workers.
+    worker_affinity TEXT,
+
     created_at TIMESTAMP NOT NULL,
 
     -- At most one of page_id or media_id can be set
@@ -95,12 +97,23 @@ CREATE TABLE research_urls (
 );
 
 -- Work queue indexes: support claiming pending/stale URLs and retrying failed URLs
-CREATE INDEX idx_urls_pending ON research_urls(claimed_at, created_at)
-    WHERE status = 'pending';
-CREATE INDEX idx_urls_analyzing ON research_urls(claimed_at, created_at)
-    WHERE status = 'analyzing';
-CREATE INDEX idx_urls_failed_retry ON research_urls(retry_after, created_at)
-    WHERE status = 'failed' AND retry_after IS NOT NULL;
+-- Generic workers (affinity IS NULL)
+CREATE INDEX idx_urls_pending_generic ON research_urls(claimed_at, created_at)
+    WHERE status = 'pending' AND worker_affinity IS NULL;
+CREATE INDEX idx_urls_analyzing_generic ON research_urls(claimed_at)
+    WHERE status = 'analyzing' AND worker_affinity IS NULL;
+CREATE INDEX idx_urls_failed_retry_generic ON research_urls(retry_after, created_at)
+    WHERE status = 'failed' AND retry_after IS NOT NULL AND worker_affinity IS NULL;
+
+-- Specialized workers (affinity-filtered) - affinity first for equality match
+CREATE INDEX idx_urls_pending_affinity ON research_urls(worker_affinity, claimed_at, created_at)
+    WHERE status = 'pending' AND worker_affinity IS NOT NULL;
+CREATE INDEX idx_urls_analyzing_affinity ON research_urls(worker_affinity, claimed_at)
+    WHERE status = 'analyzing' AND worker_affinity IS NOT NULL;
+CREATE INDEX idx_urls_failed_retry_affinity ON research_urls(worker_affinity, retry_after, created_at)
+    WHERE status = 'failed' AND retry_after IS NOT NULL AND worker_affinity IS NOT NULL;
+
+-- Resolution indexes
 CREATE INDEX idx_urls_page ON research_urls(page_id)
     WHERE page_id IS NOT NULL;
 CREATE INDEX idx_urls_media ON research_urls(media_id)

@@ -1,0 +1,50 @@
+[package]
+name = "chronoscope-integrations"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+## Record HTTP fixtures for VCR-style tests (hits real network).
+## Usage: cargo test -p chronoscope-integrations --features record-fixtures
+record-fixtures = []
+
+[dependencies]
+# Async runtime and traits
+tokio = { workspace = true, features = ["fs"] }
+async-trait = "0.1"
+
+# URL handling
+url.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Time handling
+chrono.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# HTTP client (full implementation)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
+bytes.workspace = true
+futures-util = "0.3"
+
+# Hashing (for HTTP cache keys)
+sha2 = "0.10"
+hex = "0.4"
+base64.workspace = true
+
+# Tracing for instrumentation
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = "3"

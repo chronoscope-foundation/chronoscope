@@ -17,10 +17,15 @@
 //! - **URL Fetcher**: Fetches URLs, extracts content (HTML/images/video), discovers embedded media
 
 pub mod config;
-pub mod http;
 pub mod runner;
 pub mod url_fetcher;
 pub mod worker;
+
+// Re-export types from integrations for convenience
+pub use chronoscope_integrations::{
+    CacheMode, CachingClient, HttpClient, HttpError, HttpRequest, HttpResponse, IntegrationName,
+    ReqwestClient, ReqwestConfig,
+};
 
 pub use config::WorkerConfig;
 pub use runner::{

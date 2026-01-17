@@ -25,10 +25,10 @@ pub struct ExtractedArticle {
 /// Separated into sync function to avoid Send issues with `QuickJS` runtime.
 pub fn extract_article(html: &str, base_url: &str) -> Result<ExtractedArticle, FetchError> {
     let readability = readability_js::Readability::new()
-        .map_err(|e| FetchError::ParseError(format!("failed to create readability: {e}")))?;
+        .map_err(|e| FetchError::ContentProcessing(format!("failed to create readability: {e}")))?;
     let article = readability
         .parse_with_url(html, base_url)
-        .map_err(|e| FetchError::ParseError(format!("readability failed: {e}")))?;
+        .map_err(|e| FetchError::ContentProcessing(format!("readability failed: {e}")))?;
 
     Ok(ExtractedArticle {
         title: article.title,

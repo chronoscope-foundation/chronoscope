@@ -10,6 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# Internal crates
+chronoscope-integrations = { path = "../integrations" }
+
 # Database - sqlx with SQLite for now, same API works for Postgres later
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive", "chrono"] }
 

@@ -36,7 +36,7 @@ pub async fn process(
 
     // Decode image to get dimensions
     let img = image::load_from_memory(body)
-        .map_err(|e| FetchError::ParseError(format!("failed to decode image: {e}")))?;
+        .map_err(|e| FetchError::ContentProcessing(format!("failed to decode image: {e}")))?;
     let (width, height) = img.dimensions();
 
     // Record dimensions in current span

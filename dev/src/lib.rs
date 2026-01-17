@@ -16,16 +16,14 @@ use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config, default_dns_resolver};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, UserId};
-use chronoscope_workers::http::HttpClient;
+use chronoscope_workers::HttpClient;
+use chronoscope_workers::IntegrationName;
 use chronoscope_workers::url_fetcher::UrlFetcherWorker;
 use chronoscope_workers::{RetryConfig, UrlEnqueuer, UrlQueue, WorkerConfig, run};
 use dropshot::{ApiDescription, ConfigDropshot, HttpServerStarter};
 use slog::info;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-
-/// Number of URL fetcher workers to spawn.
-const NUM_WORKERS: usize = 3;
 
 /// Error type for dev server setup.
 #[derive(Debug, thiserror::Error)]
@@ -131,15 +129,26 @@ struct WorkerContext {
 }
 
 /// Spawn a URL fetcher worker in a background task, returning its handle.
-fn spawn_url_fetcher_worker(index: usize, ctx: &WorkerContext) -> JoinHandle<()> {
-    let worker_id = format!("url-fetcher-{index}");
+///
+/// If `affinity` is `None`, spawns a generic worker that claims URLs with no affinity.
+/// If `affinity` is `Some(name)`, spawns a specialized worker for that integration.
+fn spawn_url_fetcher_worker(
+    name: &str,
+    affinity: Option<IntegrationName>,
+    ctx: &WorkerContext,
+) -> Result<JoinHandle<()>, DevServerError> {
+    let worker_id = name.to_string();
 
-    let queue = UrlQueue::new(ctx.db.clone());
+    let queue = match affinity {
+        None => UrlQueue::new(ctx.db.clone()),
+        Some(aff) => UrlQueue::with_affinity(ctx.db.clone(), aff),
+    };
     let worker = UrlFetcherWorker::with_defaults(
         ctx.db.clone(),
         ctx.http_client.clone(),
         ctx.media_store.clone(),
-    );
+    )
+    .map_err(|e| DevServerError(format!("Failed to create worker: {e}")))?;
     let enqueuer = UrlEnqueuer::new(ctx.db.clone(), ctx.user_id.clone());
     let worker_config = WorkerConfig {
         worker_id: worker_id.clone(),
@@ -152,7 +161,7 @@ fn spawn_url_fetcher_worker(index: usize, ctx: &WorkerContext) -> JoinHandle<()>
     let shutdown_rx = ctx.shutdown_rx.clone();
     let log = ctx.log.clone();
 
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         info!(log, "Starting worker"; "worker_id" => &worker_id);
         if let Err(e) = run(
             queue,
@@ -166,7 +175,7 @@ fn spawn_url_fetcher_worker(index: usize, ctx: &WorkerContext) -> JoinHandle<()>
         {
             slog::error!(log, "Worker error"; "worker_id" => &worker_id, "error" => %e);
         }
-    })
+    }))
 }
 
 /// Start the development server with the given configuration.
@@ -192,7 +201,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
 
     // ==================== Shared Infrastructure ====================
 
-    // Create shared database
+    // Create shared database (includes default integration registry)
     let db = Arc::new(
         Database::new("sqlite::memory:")
             .await
@@ -226,11 +235,15 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         log: log.clone(),
     };
 
-    let worker_handles: Vec<JoinHandle<()>> = (0..NUM_WORKERS)
-        .map(|i| spawn_url_fetcher_worker(i, &worker_ctx))
-        .collect();
+    // Spawn workers per affinity: one for each integration + one generic
+    let worker_handles = vec![
+        // Reddit worker
+        spawn_url_fetcher_worker("reddit-worker", Some(IntegrationName::Reddit), &worker_ctx)?,
+        // Generic worker (handles URLs with no specialized integration)
+        spawn_url_fetcher_worker("generic-worker", None, &worker_ctx)?,
+    ];
 
-    info!(log, "Started {} URL fetcher workers", NUM_WORKERS);
+    info!(log, "Started {} URL fetcher workers", worker_handles.len());
 
     // ==================== Start API Server ====================
 

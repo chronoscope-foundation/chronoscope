@@ -4,6 +4,7 @@
 //! pages, media, and research URL status.
 
 use chrono::NaiveDateTime;
+use chronoscope_integrations::IntegrationName;
 use serde::Serialize;
 
 use crate::error::{DbError, DbResult};
@@ -19,6 +20,8 @@ mod tests;
 struct UrlEntry {
     id: ResearchUrlId,
     url: String,
+    /// Worker affinity (null for generic URLs).
+    affinity: Option<String>,
 }
 
 impl Database {
@@ -76,12 +79,14 @@ impl Database {
         }
 
         // 2. Batch insert all media URLs (generates IDs, ignores existing)
+        // Media URLs discovered from pages get NULL affinity (generic worker)
         let url_entries: Vec<UrlEntry> = data
             .media
             .iter()
             .map(|slot| UrlEntry {
                 id: ResearchUrlId::generate(),
                 url: slot.url.clone(),
+                affinity: None,
             })
             .collect();
         let urls_json = serde_json::to_string(&url_entries)?;
@@ -214,14 +219,16 @@ impl Database {
         Ok(())
     }
 
-    /// Claim a batch of URLs for processing.
+    /// Claim a batch of URLs for processing by a generic worker.
     ///
-    /// Claims up to `batch_size` URLs that are either:
+    /// Claims up to `batch_size` URLs with `worker_affinity IS NULL` that are either:
     /// - Pending and not claimed (or with a stale claim)
     /// - Failed but past their `retry_after` time
     ///
     /// Returns the claimed URLs, already marked as 'analyzing'.
     /// Uses optimistic locking - claims older than `stale_cutoff` are considered abandoned.
+    ///
+    /// For specialized workers (Reddit, Instagram, etc.), use [`claim_urls_with_affinity`].
     ///
     /// # Errors
     /// Returns `DbError::Sqlx` if the database operation fails.
@@ -233,12 +240,45 @@ impl Database {
     ) -> DbResult<Vec<ResearchUrl>> {
         let now = now();
 
-        let urls = sqlx::query_as(queries::CLAIM_URLS.sql)
+        let urls = sqlx::query_as(queries::CLAIM_URLS_GENERIC.sql)
             .bind(now) // ?1 = now (for claimed_at)
             .bind(worker_id) // ?2 = worker_id
             .bind(stale_cutoff) // ?3 = stale_cutoff
             .bind(now) // ?4 = now (for retry_after comparison)
             .bind(batch_size) // ?5 = batch_size
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(urls)
+    }
+
+    /// Claim a batch of URLs for processing by a specialized worker.
+    ///
+    /// Claims up to `batch_size` URLs with matching `worker_affinity` that are either:
+    /// - Pending and not claimed (or with a stale claim)
+    /// - Failed but past their `retry_after` time
+    ///
+    /// Returns the claimed URLs, already marked as 'analyzing'.
+    /// Uses optimistic locking - claims older than `stale_cutoff` are considered abandoned.
+    ///
+    /// # Errors
+    /// Returns `DbError::Sqlx` if the database operation fails.
+    pub async fn claim_urls_with_affinity(
+        &self,
+        worker_id: &str,
+        batch_size: u32,
+        stale_cutoff: NaiveDateTime,
+        affinity: IntegrationName,
+    ) -> DbResult<Vec<ResearchUrl>> {
+        let now = now();
+
+        let urls = sqlx::query_as(queries::CLAIM_URLS_WITH_AFFINITY.sql)
+            .bind(now) // ?1 = now (for claimed_at)
+            .bind(worker_id) // ?2 = worker_id
+            .bind(stale_cutoff) // ?3 = stale_cutoff
+            .bind(now) // ?4 = now (for retry_after comparison)
+            .bind(batch_size) // ?5 = batch_size
+            .bind(affinity.as_str()) // ?6 = affinity
             .fetch_all(&self.pool)
             .await?;
 

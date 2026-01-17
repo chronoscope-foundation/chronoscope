@@ -242,7 +242,7 @@ async fn test_create_page_with_media_slots() -> DbResult<()> {
     ];
 
     let page_data = PageData {
-        source_type: SourceType::Instagram,
+        source_type: SourceType::Reddit,
         title: Some("Post with Images".to_string()),
         author: None,
         published_at: None,
@@ -648,6 +648,99 @@ async fn test_mark_url_resolved_to_media() -> DbResult<()> {
     assert_eq!(row.1, "complete");
     assert!(row.2.is_none(), "claimed_at should be cleared");
     assert!(row.3.is_none(), "claimed_by should be cleared");
+
+    Ok(())
+}
+
+// ==================== Affinity-Based Claiming Tests ====================
+
+use chronoscope_integrations::IntegrationName;
+
+#[tokio::test]
+async fn test_claim_urls_with_affinity_only_claims_matching() -> DbResult<()> {
+    let (db, user_id) = setup().await?;
+
+    // Submit a Reddit URL (gets affinity "reddit" from built-in registry)
+    let (reddit_id, _) = db
+        .submit_url(&user_id, "https://reddit.com/r/rust/comments/abc123")
+        .await?;
+
+    let stale = Utc::now().naive_utc() - Duration::hours(1);
+
+    // Claim with Instagram affinity - should get nothing
+    let claimed = db
+        .claim_urls_with_affinity("worker-1", 1, stale, IntegrationName::Instagram)
+        .await?;
+    assert_eq!(
+        claimed.len(),
+        0,
+        "Instagram worker should not claim Reddit URL"
+    );
+
+    // Generic claim_urls should also not get it (has affinity)
+    let claimed = db.claim_urls("worker-generic", 10, stale).await?;
+    assert_eq!(
+        claimed.len(),
+        0,
+        "Generic worker should not claim Reddit URL"
+    );
+
+    // Claim with Reddit affinity - should get the URL
+    let claimed = db
+        .claim_urls_with_affinity("worker-2", 1, stale, IntegrationName::Reddit)
+        .await?;
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, reddit_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_claim_urls_generic_ignores_affinity_urls() -> DbResult<()> {
+    let (db, user_id) = setup().await?;
+
+    // Submit a Reddit URL (gets affinity "reddit" from built-in registry)
+    db.submit_url(&user_id, "https://reddit.com/r/rust/comments/abc123")
+        .await?;
+
+    // Submit a generic URL (no affinity - domain not in registry)
+    let (generic_id, _) = db
+        .submit_url(&user_id, "https://example.com/article")
+        .await?;
+
+    let stale = Utc::now().naive_utc() - Duration::hours(1);
+
+    // Generic claim_urls should only get the generic URL, not the Reddit one
+    let claimed = db.claim_urls("worker-1", 10, stale).await?;
+    assert_eq!(
+        claimed.len(),
+        1,
+        "Generic worker should only claim generic URLs"
+    );
+    assert_eq!(claimed[0].id, generic_id);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_claim_urls_affinity_ignores_generic_urls() -> DbResult<()> {
+    let (db, user_id) = setup().await?;
+
+    // Submit a generic URL (no affinity)
+    db.submit_url(&user_id, "https://example.com/article")
+        .await?;
+
+    let stale = Utc::now().naive_utc() - Duration::hours(1);
+
+    // Reddit worker should not claim generic URLs
+    let claimed = db
+        .claim_urls_with_affinity("worker-1", 10, stale, IntegrationName::Reddit)
+        .await?;
+    assert_eq!(
+        claimed.len(),
+        0,
+        "Reddit worker should not claim generic URLs"
+    );
 
     Ok(())
 }

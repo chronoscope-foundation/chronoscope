@@ -15,6 +15,8 @@ use chrono::{NaiveDateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
 
+use chronoscope_integrations::IntegrationRegistry;
+
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
     FollowedUrl, GpsLocation, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl,
@@ -36,6 +38,7 @@ pub(crate) fn now() -> NaiveDateTime {
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+    registry: IntegrationRegistry,
 }
 
 impl Database {
@@ -50,15 +53,26 @@ impl Database {
     pub fn pool_ref(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Get the integration registry for URL routing.
+    #[must_use]
+    pub fn registry(&self) -> &IntegrationRegistry {
+        &self.registry
+    }
 }
 
 impl Database {
     /// Create a new database connection pool, run migrations, and verify query plans.
     ///
+    /// Internally creates the default integration registry for URL normalization
+    /// and worker affinity computation.
+    ///
     /// # Errors
     /// Returns `DbError::Sqlx` if connection fails, `DbError::Migrate` if migrations fail,
     /// or `DbError::QueryPlan` if any query would cause a full table scan.
     pub async fn new(database_url: &str) -> DbResult<Self> {
+        let registry = chronoscope_integrations::create_default_registry()?;
+
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
             .foreign_keys(true);
@@ -72,13 +86,15 @@ impl Database {
 
         queries::verify_all_query_plans(&pool).await?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, registry })
     }
 
     /// Create a new database connection pool and run migrations, but skip query plan verification.
     ///
     /// This is used by tests that want to verify query plans themselves (to avoid circular dependency).
     pub async fn new_without_plan_verification(database_url: &str) -> DbResult<Self> {
+        let registry = chronoscope_integrations::create_default_registry()?;
+
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
             .foreign_keys(true);
@@ -90,7 +106,7 @@ impl Database {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, registry })
     }
 
     // ==================== Users ====================
@@ -252,6 +268,10 @@ impl Database {
     /// The URL is normalized before storage to improve deduplication
     /// (e.g., removing tracking parameters, canonicalizing domains).
     ///
+    /// The URL's domain is checked against the integration registry (provided at
+    /// database construction) to compute `worker_affinity`. This determines which
+    /// specialized worker should process the URL.
+    ///
     /// # Errors
     /// Returns `DbError::InvalidArgument` if the URL cannot be parsed or normalized.
     /// Returns `DbError::Sqlx` if the database operation fails.
@@ -263,9 +283,18 @@ impl Database {
         // Parse and normalize URL for deduplication
         let parsed_url = ::url::Url::parse(url_str)
             .map_err(|e| DbError::InvalidArgument(format!("invalid URL: {e}")))?;
-        let normalized_url = url::normalize_url(&parsed_url)
+
+        // Apply integration-specific normalization, then generic
+        let integration_normalized = self.registry.normalize_url(&parsed_url);
+        let normalized_url = url::normalize_url(&integration_normalized)
             .map_err(|e| DbError::InvalidArgument(format!("cannot normalize URL: {e}")))?;
         let normalized_str = normalized_url.to_string();
+
+        // Compute worker affinity from the domain
+        let worker_affinity: Option<String> = normalized_url
+            .host_str()
+            .and_then(|domain| self.registry.integration_name_for_domain(domain))
+            .map(|name| name.as_str().to_string());
 
         // Try to insert the URL (ignored if already exists)
         let new_id = ResearchUrlId::generate();
@@ -275,6 +304,7 @@ impl Database {
             .bind(&normalized_str)
             .bind(ResearchUrlStatus::Pending)
             .bind(0_i32) // attempt_count
+            .bind(&worker_affinity)
             .bind(now())
             .execute(&self.pool)
             .await?;

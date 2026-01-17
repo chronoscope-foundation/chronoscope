@@ -16,7 +16,7 @@ use chronoscope_api::research_types::{MediaReference, ResearchUrlDossier, Resolv
 use chronoscope_db::ResearchUrlStatus;
 use chronoscope_dev::{DevServerConfig, RunningDevServer, start_dev_server};
 use chronoscope_workers::RetryConfig;
-use chronoscope_workers::http::{CacheMode, CachingClient, HttpClient};
+use chronoscope_workers::{CacheMode, CachingClient, HttpClient};
 use dropshot::ConfigLogging;
 use reqwest::Client;
 
@@ -30,10 +30,11 @@ const MAX_POLL_ATTEMPTS: usize = 100;
 // CARGO_MANIFEST_DIR is a compile-time constant that always has a parent directory.
 #[allow(clippy::expect_used)]
 fn fixtures_dir() -> std::path::PathBuf {
+    // Fixtures are in the integrations crate
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("dev crate should have parent")
-        .join("workers/fixtures")
+        .join("integrations/fixtures")
 }
 
 fn vcr_mode() -> CacheMode {

@@ -91,15 +91,18 @@ impl fmt::Display for ResearchUrlStatus {
     }
 }
 
-/// Source type for a page (where it was scraped from).
+/// Source type for a page (which integration processed it).
+///
+/// This indicates which specialized integration fetched and processed the content.
+/// `Generic` means the generic fetcher was used (no specialized integration).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type,
 )]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
-    Instagram,
     Reddit,
+    Instagram,
     Twitter,
     Flickr,
     /// Library of Congress
@@ -111,8 +114,8 @@ impl SourceType {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Instagram => "instagram",
             Self::Reddit => "reddit",
+            Self::Instagram => "instagram",
             Self::Twitter => "twitter",
             Self::Flickr => "flickr",
             Self::Loc => "loc",
@@ -124,6 +127,16 @@ impl SourceType {
 impl fmt::Display for SourceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+impl From<Option<chronoscope_integrations::IntegrationName>> for SourceType {
+    fn from(name: Option<chronoscope_integrations::IntegrationName>) -> Self {
+        match name {
+            Some(chronoscope_integrations::IntegrationName::Reddit) => Self::Reddit,
+            Some(chronoscope_integrations::IntegrationName::Instagram) => Self::Instagram,
+            None => Self::Generic,
+        }
     }
 }
 
@@ -243,9 +256,9 @@ mod tests {
 
     #[test]
     fn source_type_json_roundtrip() -> Result<(), serde_json::Error> {
-        let source = SourceType::Loc;
+        let source = SourceType::Reddit;
         let json = serde_json::to_string(&source)?;
-        assert_eq!(json, "\"loc\"");
+        assert_eq!(json, "\"reddit\"");
         let back: SourceType = serde_json::from_str(&json)?;
         assert_eq!(back, source);
         Ok(())
@@ -271,5 +284,20 @@ mod tests {
     fn email_display() {
         let email = Email::new("display@example.com");
         assert_eq!(format!("{email}"), "display@example.com");
+    }
+
+    #[test]
+    fn source_type_from_integration_name() {
+        use chronoscope_integrations::IntegrationName;
+
+        assert_eq!(
+            SourceType::from(Some(IntegrationName::Reddit)),
+            SourceType::Reddit
+        );
+        assert_eq!(
+            SourceType::from(Some(IntegrationName::Instagram)),
+            SourceType::Instagram
+        );
+        assert_eq!(SourceType::from(None), SourceType::Generic);
     }
 }

@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_dev::{DevServerConfig, start_dev_server};
+use chronoscope_workers::ReqwestClient;
 use chronoscope_workers::RetryConfig;
-use chronoscope_workers::http::ReqwestClient;
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::{error, info, warn};
 use tokio::signal;

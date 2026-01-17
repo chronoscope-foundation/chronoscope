@@ -107,7 +107,10 @@ schemes:
             export PATH="$HOME/.cargo/bin:$PATH"
             OPENAPI_JSON="${SRCROOT}/../api/target/openapi.json"
             API_SRC="${SRCROOT}/../api/src"
-            if [ ! -f "$OPENAPI_JSON" ] || [ -n "$(find "$API_SRC" -newer "$OPENAPI_JSON" 2>/dev/null)" ]; then
+            DB_SRC="${SRCROOT}/../db/src"
+            if [ ! -f "$OPENAPI_JSON" ] || \
+               [ -n "$(find "$API_SRC" -newer "$OPENAPI_JSON" 2>/dev/null)" ] || \
+               [ -n "$(find "$DB_SRC" -newer "$OPENAPI_JSON" 2>/dev/null)" ]; then
               echo "Regenerating OpenAPI spec..."
               cd "${SRCROOT}/../api" && cargo run --bin openapi -- target/openapi.json
             fi

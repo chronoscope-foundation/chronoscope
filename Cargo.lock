@@ -351,6 +351,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "chronoscope-integrations",
  "schemars",
  "serde",
  "serde_json",
@@ -387,15 +388,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "chronoscope-workers"
+name = "chronoscope-integrations"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
- "chronoscope-db",
  "futures-util",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "chronoscope-workers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "chronoscope-db",
+ "chronoscope-integrations",
  "hex",
  "html2md",
  "image",

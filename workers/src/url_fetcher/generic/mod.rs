@@ -22,16 +22,17 @@ pub mod image;
 pub mod video;
 
 use chronoscope_db::ResearchUrl;
+use chronoscope_integrations::HttpRequest;
 use tracing::{instrument, warn};
 use url::Url;
 
 use super::content::{ContentType, detect_content_type};
-use super::fetcher::{FetchContext, FetchError, FetchResult, Fetcher};
-use crate::http::HttpRequest;
+use super::fetcher::{FetchContext, FetchError, FetchResult};
 
 /// Generic fetcher that handles HTML, images, and video.
 ///
 /// Routes content to specialized processors based on detected content type.
+/// Used for URLs that don't have a specialized integration (Reddit, Instagram, etc.).
 #[derive(Default)]
 pub struct GenericFetcher;
 
@@ -41,23 +42,19 @@ impl GenericFetcher {
     pub fn new() -> Self {
         Self
     }
-}
 
-#[async_trait::async_trait]
-impl Fetcher for GenericFetcher {
-    fn domains(&self) -> &'static [&'static str] {
-        // Empty = fallback fetcher for all unrecognized domains
-        &[]
-    }
-
+    /// Process a URL and return the result.
+    ///
+    /// Detects content type and dispatches to the appropriate processor
+    /// (HTML, image, or video).
     #[instrument(skip(self, ctx, research_url), fields(url = %research_url.url))]
-    async fn process(
+    pub async fn process(
         &self,
         ctx: &FetchContext,
         research_url: &ResearchUrl,
     ) -> Result<FetchResult, FetchError> {
         let url = Url::parse(&research_url.url)
-            .map_err(|e| FetchError::ParseError(format!("invalid URL: {e}")))?;
+            .map_err(|e| FetchError::ContentProcessing(format!("invalid URL: {e}")))?;
 
         // Fetch the content (HttpClient handles size limits internally via streaming)
         let request = HttpRequest::get(url.clone());
@@ -247,7 +244,13 @@ mod tests {
 
         let error = TestHarness::new().await?.fetch_error(url).await?;
 
-        assert!(matches!(error, FetchError::NotFound), "error: {error:?}");
+        assert!(
+            matches!(
+                error,
+                FetchError::Integration(chronoscope_integrations::FetchError::NotFound)
+            ),
+            "error: {error:?}"
+        );
         Ok(())
     }
 }

@@ -22,7 +22,7 @@ chronoscope-api = { path = "../api", features = ["embedded-media"] }
 # DB crate (for Database, InMemoryMediaStore, user management)
 chronoscope-db = { path = "../db" }
 
-# Workers crate (for URL fetcher worker)
+# Workers crate (for URL fetcher worker, IntegrationName)
 chronoscope-workers = { path = "../workers" }
 
 # Web framework (for Dropshot server configuration)

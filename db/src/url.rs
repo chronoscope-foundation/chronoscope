@@ -19,24 +19,15 @@ use url::Url;
 /// Note that the utm_* prefixed keys are removed further down in code, since there are so many of them.
 static TRACKING_PARAMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     HashSet::from([
-        // Facebook/Meta
-        "fbclid",
-        // Google Ads
-        "gclid",
-        "gclsrc",
-        "dclid",
-        // Microsoft Ads
-        "msclkid",
-        // Mailchimp
-        "mc_cid",
-        "mc_eid",
-        // Instagram
-        "igsh",
-        // YouTube
-        "si",
-        // Reddit
-        "share_id",
-        "ref_source",
+        "fbclid",  // Facebook/Meta
+        "gclid",   // Google Ads
+        "gclsrc",  // Google Ads
+        "dclid",   // Google Ads (DoubleClick)
+        "msclkid", // Microsoft Ads
+        "mc_cid",  // Mailchimp
+        "mc_eid",  // Mailchimp
+        "igsh",    // Instagram
+        "si",      // YouTube
     ])
 });
 
@@ -48,14 +39,6 @@ static TRACKING_PARAMS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// - Regional/preference variants (www., np.)
 static DOMAIN_ALIASES: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     HashMap::from([
-        // Reddit - all serve same content
-        ("www.reddit.com", "reddit.com"),
-        ("old.reddit.com", "reddit.com"),
-        ("new.reddit.com", "reddit.com"),
-        ("m.reddit.com", "reddit.com"),
-        ("i.reddit.com", "reddit.com"),
-        ("np.reddit.com", "reddit.com"),
-        ("amp.reddit.com", "reddit.com"),
         // Twitter/X - x.com is the new domain
         ("www.twitter.com", "twitter.com"),
         ("mobile.twitter.com", "twitter.com"),
@@ -335,33 +318,6 @@ mod tests {
     // ==================== Domain Aliasing ====================
 
     #[test]
-    fn test_reddit_www_to_canonical() -> TestResult {
-        assert_eq!(
-            normalize("https://www.reddit.com/r/test")?,
-            "https://reddit.com/r/test"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_reddit_old_to_canonical() -> TestResult {
-        assert_eq!(
-            normalize("https://old.reddit.com/r/test")?,
-            "https://reddit.com/r/test"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_reddit_mobile_to_canonical() -> TestResult {
-        assert_eq!(
-            normalize("https://m.reddit.com/r/test")?,
-            "https://reddit.com/r/test"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn test_twitter_www_to_canonical() -> TestResult {
         assert_eq!(
             normalize("https://www.twitter.com/user/status/123")?,
@@ -436,12 +392,12 @@ mod tests {
 
     #[test]
     fn test_combined_normalizations() -> TestResult {
-        // Test multiple normalizations at once
+        // Test multiple normalizations at once (lowercase, port, trailing slash, utm, fragment)
         assert_eq!(
             normalize(
-                "https://OLD.REDDIT.COM:443/r/HistoryPorn/comments/abc123/?utm_source=share&utm_medium=web#comments"
+                "https://WWW.TWITTER.COM:443/user/status/123/?utm_source=share&utm_medium=web#comments"
             )?,
-            "https://reddit.com/r/HistoryPorn/comments/abc123"
+            "https://twitter.com/user/status/123"
         );
         Ok(())
     }
@@ -465,15 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reddit_share_params_removed() -> TestResult {
-        assert_eq!(
-            normalize("https://reddit.com/r/pics/comments/abc?share_id=xyz&ref_source=link")?,
-            "https://reddit.com/r/pics/comments/abc"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn test_instagram_tracking_removed() -> TestResult {
         assert_eq!(
             normalize("https://instagram.com/p/abc123?igsh=xyz")?,
@@ -486,7 +433,7 @@ mod tests {
     fn test_normalization_is_idempotent() -> TestResult {
         let urls = [
             "https://EXAMPLE.COM/path?utm_source=x#frag",
-            "https://old.reddit.com/r/test/?share_id=abc",
+            "https://m.youtube.com/watch?v=abc&utm_source=share",
             "https://www.x.com/user/status/123",
             "https://example.com/search?q=test&page=2",
         ];

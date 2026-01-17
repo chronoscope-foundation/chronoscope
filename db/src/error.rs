@@ -18,6 +18,9 @@ pub enum DbError {
     #[error("Query plan verification failed: {0}")]
     QueryPlan(#[from] queries::QueryPlanError),
 
+    #[error("Integration registry error: {0}")]
+    Registry(#[from] chronoscope_integrations::RegistrationError),
+
     #[error("User not found")]
     UserNotFound,
 

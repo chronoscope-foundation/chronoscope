@@ -115,28 +115,28 @@ define_queries! {
 
     // Research URLs (all required fields must be provided - no defaults)
     GET_URL_BY_URL: "SELECT id FROM research_urls WHERE url = ?",
-    CREATE_URL: "INSERT INTO research_urls (id, url, status, attempt_count, created_at) VALUES (?, ?, ?, ?, ?)",
+    CREATE_URL: "INSERT INTO research_urls (id, url, status, attempt_count, worker_affinity, created_at) VALUES (?, ?, ?, ?, ?, ?)",
     // Used when adding media URLs from a page - inserts new URL or ignores if exists
-    CREATE_URL_OR_IGNORE: "INSERT INTO research_urls (id, url, status, attempt_count, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(url) DO NOTHING",
-    // Batch insert URLs from JSON array of {id, url} objects. Params: ?1=created_at, ?2=JSON array
+    CREATE_URL_OR_IGNORE: "INSERT INTO research_urls (id, url, status, attempt_count, worker_affinity, created_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(url) DO NOTHING",
+    // Batch insert URLs from JSON array of {id, url, affinity} objects. Params: ?1=created_at, ?2=JSON array
     // Uses INSERT OR IGNORE because SQLite's upsert clause (ON CONFLICT...DO) only works with VALUES, not SELECT.
     CREATE_URLS_BATCH: "
-        INSERT OR IGNORE INTO research_urls (id, url, status, attempt_count, created_at)
-        SELECT json_extract(value, '$.id'), json_extract(value, '$.url'), 'pending', 0, ?1
+        INSERT OR IGNORE INTO research_urls (id, url, status, attempt_count, worker_affinity, created_at)
+        SELECT json_extract(value, '$.id'), json_extract(value, '$.url'), 'pending', 0, json_extract(value, '$.affinity'), ?1
         FROM json_each(?2)
     ",
-    GET_URL_BY_ID: "SELECT id, url, page_id, media_id, status, claimed_at, claimed_by, attempt_count, retry_after, error_message, created_at FROM research_urls WHERE id = ?",
+    GET_URL_BY_ID: "SELECT id, url, page_id, media_id, status, claimed_at, claimed_by, attempt_count, retry_after, error_message, worker_affinity, created_at FROM research_urls WHERE id = ?",
     // Keyset pagination: first page (no cursor)
-    LIST_ALL_URLS_FIRST: "SELECT id, url, page_id, media_id, status, attempt_count, created_at FROM research_urls ORDER BY created_at DESC, id DESC LIMIT ?",
+    LIST_ALL_URLS_FIRST: "SELECT id, url, page_id, media_id, status, attempt_count, worker_affinity, created_at FROM research_urls ORDER BY created_at DESC, id DESC LIMIT ?",
     // Keyset pagination: subsequent pages (cursor = created_at, id of last item)
-    LIST_ALL_URLS_PAGE: "SELECT id, url, page_id, media_id, status, attempt_count, created_at FROM research_urls WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+    LIST_ALL_URLS_PAGE: "SELECT id, url, page_id, media_id, status, attempt_count, worker_affinity, created_at FROM research_urls WHERE (created_at, id) < (?, ?) ORDER BY created_at DESC, id DESC LIMIT ?",
 
     // Follows (created_at must be provided - no defaults)
     CREATE_FOLLOW: "INSERT INTO follows (user_id, url_id, created_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
     // Keyset pagination: first page (no cursor)
-    LIST_FOLLOWED_URLS_FIRST: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.attempt_count, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
+    LIST_FOLLOWED_URLS_FIRST: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.attempt_count, r.worker_affinity, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
     // Keyset pagination: subsequent pages (cursor = followed_at, url_id of last item)
-    LIST_FOLLOWED_URLS_PAGE: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.attempt_count, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? AND (f.created_at, r.id) < (?, ?) ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
+    LIST_FOLLOWED_URLS_PAGE: "SELECT r.id, r.url, r.page_id, r.media_id, r.status, r.attempt_count, r.worker_affinity, r.created_at, f.created_at as followed_at FROM research_urls r JOIN follows f ON f.url_id = r.id WHERE f.user_id = ? AND (f.created_at, r.id) < (?, ?) ORDER BY f.created_at DESC, r.id DESC LIMIT ?",
     GET_FOLLOW_TIMESTAMP: "SELECT created_at FROM follows WHERE user_id = ? AND url_id = ?",
     DELETE_FOLLOW: "DELETE FROM follows WHERE user_id = ? AND url_id = ?",
 
@@ -168,7 +168,10 @@ define_queries! {
     UPDATE_URL_RESOLVED_MEDIA: "UPDATE research_urls SET media_id = ?, status = 'complete', claimed_at = NULL, claimed_by = NULL WHERE id = ?",
     UPDATE_URL_FAILED: "UPDATE research_urls SET status = 'failed', error_message = ?, attempt_count = attempt_count + 1, retry_after = ?, claimed_at = NULL, claimed_by = NULL WHERE id = ?",
 
-    // Batch claim: claims available URLs for processing
+    // Batch claim: claims available URLs for generic workers (affinity IS NULL)
+    // Note: We need separate queries for NULL vs non-NULL affinity because SQL's
+    // NULL = NULL returns NULL (not true). You can't parameterize `WHERE col = ?`
+    // to match NULL rows - you must use `IS NULL`. No clean way around this.
     // A URL is claimable if:
     //   - pending: not yet claimed, or claim is stale (worker died before starting)
     //   - analyzing: claim is stale (worker died mid-processing)
@@ -176,25 +179,48 @@ define_queries! {
     // Uses UPDATE...RETURNING (SQLite 3.35.0+) for atomic claim-and-fetch
     // Uses UNION ALL to allow SQLite to use separate indexes for each case
     // Params: ?1=now, ?2=worker_id, ?3=stale_cutoff, ?4=now (for retry_after), ?5=batch_size
-    CLAIM_URLS: "
+    CLAIM_URLS_GENERIC: "
         UPDATE research_urls
         SET status = 'analyzing', claimed_at = ?1, claimed_by = ?2
         WHERE id IN (
             SELECT id FROM (
                 SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'pending' AND (claimed_at IS NULL OR claimed_at < ?3)
+                WHERE status = 'pending' AND worker_affinity IS NULL AND (claimed_at IS NULL OR claimed_at < ?3)
                 UNION ALL
                 SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'analyzing' AND claimed_at < ?3
+                WHERE status = 'analyzing' AND worker_affinity IS NULL AND claimed_at < ?3
                 UNION ALL
                 SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'failed' AND retry_after IS NOT NULL AND retry_after <= ?4
+                WHERE status = 'failed' AND worker_affinity IS NULL AND retry_after IS NOT NULL AND retry_after <= ?4
             )
             ORDER BY retry_after NULLS FIRST, created_at
             LIMIT ?5
         )
-        RETURNING id, url, page_id, media_id, status, attempt_count, created_at
+        RETURNING id, url, page_id, media_id, status, attempt_count, worker_affinity, created_at
     ",
+
+    // Batch claim: claims available URLs for specialized workers (affinity = ?6)
+    // Params: ?1=now, ?2=worker_id, ?3=stale_cutoff, ?4=now (for retry_after), ?5=batch_size, ?6=affinity
+    CLAIM_URLS_WITH_AFFINITY: "
+        UPDATE research_urls
+        SET status = 'analyzing', claimed_at = ?1, claimed_by = ?2
+        WHERE id IN (
+            SELECT id FROM (
+                SELECT id, retry_after, created_at FROM research_urls
+                WHERE status = 'pending' AND worker_affinity = ?6 AND (claimed_at IS NULL OR claimed_at < ?3)
+                UNION ALL
+                SELECT id, retry_after, created_at FROM research_urls
+                WHERE status = 'analyzing' AND worker_affinity = ?6 AND claimed_at < ?3
+                UNION ALL
+                SELECT id, retry_after, created_at FROM research_urls
+                WHERE status = 'failed' AND worker_affinity = ?6 AND retry_after IS NOT NULL AND retry_after <= ?4
+            )
+            ORDER BY retry_after NULLS FIRST, created_at
+            LIMIT ?5
+        )
+        RETURNING id, url, page_id, media_id, status, attempt_count, worker_affinity, created_at
+    ",
+
 }
 
 #[cfg(test)]

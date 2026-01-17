@@ -1,7 +1,10 @@
-//! HTTP client abstraction for workers.
+//! HTTP client abstraction with SSRF protection and VCR-style caching.
 //!
-//! This module provides an `HttpClient` trait that abstracts HTTP operations,
-//! with implementations for production use and VCR-style caching for tests.
+//! This module provides:
+//! - [`HttpClient`] trait: abstraction for HTTP operations
+//! - [`ReqwestClient`]: production implementation with SSRF protection
+//! - [`CachingClient`]: VCR-style caching for reproducible integration tests
+//! - [`FetchError`]: error type for fetch operations
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -94,6 +97,8 @@ fn is_redirect_blocked(host: &str) -> bool {
     false
 }
 
+// ==================== Error Types ====================
+
 /// Error type for HTTP operations.
 #[derive(Debug, Clone)]
 pub enum HttpError {
@@ -101,13 +106,13 @@ pub enum HttpError {
     Network(String),
     /// Request building error (invalid URL, headers, etc.)
     Request(String),
-    /// Response body exceeds maximum allowed size
+    /// Response body exceeds maximum allowed size.
     ResponseTooLarge { size: usize, max: usize },
-    /// Redirect to a blocked destination (SSRF protection)
+    /// Redirect to a blocked destination (SSRF protection).
     BlockedRedirect { url: String },
-    /// Cache miss in offline mode
+    /// Cache miss in offline mode.
     CacheMiss { url: String },
-    /// I/O error during cache operations
+    /// I/O error during cache operations.
     CacheIo(String),
 }
 
@@ -133,14 +138,94 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+/// Errors that can occur during fetching.
+///
+/// This is the main error type for integration fetch operations. It wraps
+/// HTTP-level errors and adds semantic errors like "not found" and "rate limited".
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    /// HTTP request failed (may be retriable).
+    #[error("HTTP error: {0}")]
+    Http(String),
+
+    /// Rate limited - should retry after delay.
+    #[error("rate limited")]
+    RateLimited,
+
+    /// Server error (5xx) - retriable.
+    #[error("server error: {status}")]
+    ServerError { status: u16 },
+
+    /// Content not found (404) - permanent.
+    #[error("not found")]
+    NotFound,
+
+    /// Access forbidden (403) - permanent.
+    #[error("forbidden")]
+    Forbidden,
+
+    /// Failed to parse content - permanent.
+    #[error("parse error: {0}")]
+    ParseError(String),
+
+    /// VCR cache miss - permanent (only occurs in test mode).
+    #[error("cache miss: {0}")]
+    CacheMiss(String),
+}
+
+impl FetchError {
+    /// Convert an HTTP error to a [`FetchError`].
+    ///
+    /// Handles `CacheMiss` specially as a permanent error (for VCR testing),
+    /// while other HTTP errors remain retriable.
+    #[must_use]
+    pub fn from_http_error(e: HttpError) -> Self {
+        match e {
+            HttpError::CacheMiss { url } => Self::CacheMiss(url),
+            other => Self::Http(other.to_string()),
+        }
+    }
+
+    /// Convert an HTTP status code to a [`FetchError`], returning `Ok(())` for success codes.
+    ///
+    /// Provides consistent error handling across all integrations.
+    pub fn from_status(status: StatusCode) -> Result<(), Self> {
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(match status.as_u16() {
+            404 => Self::NotFound,
+            403 => Self::Forbidden,
+            429 => Self::RateLimited,
+            code @ 500..=599 => Self::ServerError { status: code },
+            code => Self::Http(format!("unexpected status: {code}")),
+        })
+    }
+
+    /// Whether this error should be retried.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self,
+            Self::Http(_) | Self::RateLimited | Self::ServerError { .. }
+        )
+    }
+}
+
+// ==================== Request/Response Types ====================
+
 /// HTTP request to execute.
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
+    /// HTTP method.
     pub method: Method,
+    /// Request URL.
     pub url: Url,
+    /// Request headers.
     pub headers: HeaderMap,
+    /// Request body (optional).
     pub body: Option<Bytes>,
-    /// Request timeout (overrides client default if set)
+    /// Request timeout (overrides client default if set).
     pub timeout: Option<Duration>,
 }
 
@@ -179,10 +264,13 @@ impl HttpRequest {
 /// HTTP response from a request.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
+    /// Response status code.
     pub status: StatusCode,
+    /// Response headers.
     pub headers: HeaderMap,
+    /// Response body.
     pub body: Bytes,
-    /// Final URL after following redirects
+    /// Final URL after following redirects.
     pub final_url: Url,
 }
 
@@ -204,14 +292,14 @@ pub trait HttpClient: Send + Sync {
 
 // ==================== ReqwestClient (Production) ====================
 
-/// Production HTTP client using reqwest.
+/// Production HTTP client using reqwest with SSRF protection.
 pub struct ReqwestClient {
     client: reqwest::Client,
     max_response_size: usize,
 }
 
 impl ReqwestClient {
-    /// Create a new reqwest-based HTTP client.
+    /// Create a new reqwest-based HTTP client with default configuration.
     ///
     /// # Errors
     /// Returns an error if the client cannot be built (unlikely).
@@ -259,14 +347,18 @@ impl ReqwestClient {
     }
 }
 
-/// Configuration for `ReqwestClient`.
+/// Configuration for [`ReqwestClient`].
 pub struct ReqwestConfig {
+    /// Overall request timeout.
     pub timeout: Duration,
+    /// TCP connection timeout.
     pub connect_timeout: Duration,
+    /// User-Agent header value.
     pub user_agent: String,
+    /// Maximum number of redirects to follow.
     pub max_redirects: usize,
     /// Maximum response body size in bytes. Checked via Content-Length header
-    /// before downloading.
+    /// before downloading, and enforced while streaming.
     pub max_response_size: usize,
 }
 
@@ -362,11 +454,11 @@ impl HttpClient for ReqwestClient {
 /// Cache mode for VCR-style HTTP caching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheMode {
-    /// Online: fetch from network, cache responses
+    /// Online: fetch from network, cache responses.
     Online,
-    /// Offline: only read from cache, error on miss
+    /// Offline: only read from cache, error on miss.
     Offline,
-    /// Passthrough: always fetch from network, never cache
+    /// Passthrough: always fetch from network, never cache.
     Passthrough,
 }
 
@@ -396,7 +488,8 @@ impl CachingClient {
     }
 
     /// Generate a cache key from a request.
-    fn cache_key(request: &HttpRequest) -> String {
+    #[must_use]
+    pub fn cache_key(request: &HttpRequest) -> String {
         use sha2::{Digest, Sha256};
 
         let mut hasher = Sha256::new();
@@ -563,11 +656,52 @@ impl HttpClient for CachingClient {
     }
 }
 
+// ==================== Tests ====================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    // ==================== FetchError tests ====================
+
+    #[test]
+    fn test_fetch_error_is_retriable() {
+        assert!(FetchError::Http("timeout".into()).is_retriable());
+        assert!(FetchError::RateLimited.is_retriable());
+        assert!(FetchError::ServerError { status: 500 }.is_retriable());
+
+        assert!(!FetchError::NotFound.is_retriable());
+        assert!(!FetchError::Forbidden.is_retriable());
+        assert!(!FetchError::ParseError("bad json".into()).is_retriable());
+        assert!(!FetchError::CacheMiss("url".into()).is_retriable());
+    }
+
+    #[test]
+    fn test_fetch_error_from_status() {
+        assert!(FetchError::from_status(StatusCode::OK).is_ok());
+        assert!(FetchError::from_status(StatusCode::CREATED).is_ok());
+
+        assert!(matches!(
+            FetchError::from_status(StatusCode::NOT_FOUND),
+            Err(FetchError::NotFound)
+        ));
+        assert!(matches!(
+            FetchError::from_status(StatusCode::FORBIDDEN),
+            Err(FetchError::Forbidden)
+        ));
+        assert!(matches!(
+            FetchError::from_status(StatusCode::TOO_MANY_REQUESTS),
+            Err(FetchError::RateLimited)
+        ));
+        assert!(matches!(
+            FetchError::from_status(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(FetchError::ServerError { status: 500 })
+        ));
+    }
+
+    // ==================== CachingClient tests ====================
 
     #[test]
     fn test_cache_key_deterministic() -> TestResult {
@@ -597,7 +731,7 @@ mod tests {
     // ==================== VCR-style integration tests ====================
     //
     // These tests verify the CachingClient works correctly with real HTTP fixtures.
-    // Run with: cargo test -p chronoscope-workers --features record-fixtures
+    // Run with: cargo test -p chronoscope-integrations --features record-fixtures
     // to record fixtures, then run without the feature to replay.
 
     fn fixtures_dir() -> std::path::PathBuf {
@@ -621,17 +755,7 @@ mod tests {
         let client = vcr_client()?;
         let url = Url::parse("https://example.com/")?;
 
-        let response = match client.execute(HttpRequest::get(url)).await {
-            Ok(r) => r,
-            Err(HttpError::CacheMiss { url }) => {
-                eprintln!(
-                    "\n  ⚠ Fixture missing for: {url}\n  \
-                     Record with: cargo test -p chronoscope-workers --features record-fixtures\n"
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let response = client.execute(HttpRequest::get(url)).await?;
 
         assert_eq!(response.status, StatusCode::OK);
 
@@ -648,17 +772,7 @@ mod tests {
         let client = vcr_client()?;
         let url = Url::parse("https://example.com/nonexistent-page-12345")?;
 
-        let response = match client.execute(HttpRequest::get(url)).await {
-            Ok(r) => r,
-            Err(HttpError::CacheMiss { url }) => {
-                eprintln!(
-                    "\n  ⚠ Fixture missing for: {url}\n  \
-                     Record with: cargo test -p chronoscope-workers --features record-fixtures\n"
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let response = client.execute(HttpRequest::get(url)).await?;
 
         assert_eq!(response.status, StatusCode::NOT_FOUND);
         Ok(())
@@ -669,17 +783,7 @@ mod tests {
         let client = vcr_client()?;
         let url = Url::parse("https://httpbin.org/redirect-to?url=https%3A%2F%2Fexample.com%2F")?;
 
-        let response = match client.execute(HttpRequest::get(url)).await {
-            Ok(r) => r,
-            Err(HttpError::CacheMiss { url }) => {
-                eprintln!(
-                    "\n  ⚠ Fixture missing for: {url}\n  \
-                     Record with: cargo test -p chronoscope-workers --features record-fixtures\n"
-                );
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let response = client.execute(HttpRequest::get(url)).await?;
 
         assert_eq!(response.status, StatusCode::OK);
         assert!(

@@ -108,7 +108,7 @@ fn parse_mp4_metadata(body: &Bytes) -> Result<VideoMetadata, FetchError> {
     let cursor = Cursor::new(body.as_ref());
 
     let context = mp4parse::read_mp4(&mut std::io::BufReader::new(cursor))
-        .map_err(|e| FetchError::ParseError(format!("failed to parse MP4: {e:?}")))?;
+        .map_err(|e| FetchError::ContentProcessing(format!("failed to parse MP4: {e}")))?;
 
     // Find video track
     let video_track = context
@@ -117,7 +117,9 @@ fn parse_mp4_metadata(body: &Bytes) -> Result<VideoMetadata, FetchError> {
         .find(|t| matches!(t.track_type, mp4parse::TrackType::Video));
 
     let Some(track) = video_track else {
-        return Err(FetchError::ParseError("no video track found".to_string()));
+        return Err(FetchError::ContentProcessing(
+            "no video track found".to_string(),
+        ));
     };
 
     // Get dimensions from track header.

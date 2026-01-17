@@ -62,6 +62,9 @@ pub struct ResearchUrl {
     pub media_id: Option<MediaId>,
     pub status: ResearchUrlStatus,
     pub attempt_count: i32,
+    /// Worker affinity: which specialized worker should process this URL.
+    /// `None` means generic worker, `Some("reddit")`, etc. for specialized workers.
+    pub worker_affinity: Option<String>,
     pub created_at: NaiveDateTime,
 }
 

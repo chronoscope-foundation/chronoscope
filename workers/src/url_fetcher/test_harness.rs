@@ -7,9 +7,9 @@ use std::sync::Arc;
 use chrono::Utc;
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{Database, Email, Media, Page, ResearchUrlStatus, ResolvedContent, UserId};
+use chronoscope_integrations::{CacheMode, CachingClient, HttpClient};
 use url::Url;
 
-use crate::http::{CacheMode, CachingClient, HttpClient};
 use crate::url_fetcher::{FetchError, UrlFetcherWorker};
 use crate::worker::{ItemResult, Worker};
 
@@ -30,12 +30,20 @@ impl std::error::Error for TestError {}
 
 /// Check if a `FetchError` indicates a cache miss (fixture not recorded).
 fn is_cache_miss(error: &FetchError) -> bool {
-    // Cache misses come through as Http errors from the CachingClient
-    matches!(error, FetchError::Http(msg) if msg.to_lowercase().contains("cache miss"))
+    // Cache misses come through wrapped as Integration errors
+    matches!(
+        error,
+        FetchError::Integration(chronoscope_integrations::FetchError::CacheMiss(_))
+    )
 }
 
 fn fixtures_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+    // Fixtures are in the integrations crate
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workers crate should have parent directory")
+        .join("integrations")
+        .join("fixtures")
 }
 
 fn vcr_mode() -> CacheMode {
@@ -120,8 +128,11 @@ impl TestHarness {
 
         let http_client: Arc<dyn HttpClient> =
             Arc::new(CachingClient::new(fixtures_dir(), vcr_mode())?);
-        let worker =
-            UrlFetcherWorker::with_defaults(self.db.clone(), http_client, self.media_store.clone());
+        let worker = UrlFetcherWorker::with_defaults(
+            self.db.clone(),
+            http_client,
+            self.media_store.clone(),
+        )?;
 
         let results = worker.process_batch(vec![research_url]).await;
         let (_research_url, item_result) = results
