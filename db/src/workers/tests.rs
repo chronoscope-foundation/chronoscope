@@ -695,6 +695,65 @@ async fn test_claim_urls_with_affinity_only_claims_matching() -> DbResult<()> {
     Ok(())
 }
 
+// ==================== submit_url worker affinity tests ====================
+
+/// Helper to assert the affinity of a submitted URL.
+async fn assert_affinity(
+    db: &Database,
+    url_id: &crate::types::ResearchUrlId,
+    expected: Option<&str>,
+) -> DbResult<()> {
+    let affinity: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT worker_affinity FROM research_urls WHERE id = ?")
+            .bind(url_id.as_str())
+            .fetch_optional(&db.pool)
+            .await?;
+    assert_eq!(
+        affinity.map(|(a,)| a),
+        Some(expected.map(String::from)),
+        "URL {} should have affinity {:?}",
+        url_id.as_str(),
+        expected
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_submit_url_sets_reddit_affinity() -> DbResult<()> {
+    let (db, user_id) = setup().await?;
+    let (url_id, _) = db
+        .submit_url(&user_id, "https://reddit.com/r/rust/comments/abc123")
+        .await?;
+    assert_affinity(&db, &url_id, Some("reddit")).await
+}
+
+#[tokio::test]
+async fn test_submit_url_sets_instagram_affinity() -> DbResult<()> {
+    let (db, user_id) = setup().await?;
+    let (url_id, _) = db
+        .submit_url(&user_id, "https://instagram.com/p/ABC123xyz")
+        .await?;
+    assert_affinity(&db, &url_id, Some("instagram")).await
+}
+
+#[tokio::test]
+async fn test_submit_url_sets_no_affinity_for_generic_url() -> DbResult<()> {
+    let (db, user_id) = setup().await?;
+    let (url_id, _) = db
+        .submit_url(&user_id, "https://example.com/article")
+        .await?;
+    assert_affinity(&db, &url_id, None).await
+}
+
+#[tokio::test]
+async fn test_submit_url_www_subdomain_gets_affinity() -> DbResult<()> {
+    let (db, user_id) = setup().await?;
+    let (url_id, _) = db
+        .submit_url(&user_id, "https://www.reddit.com/r/rust")
+        .await?;
+    assert_affinity(&db, &url_id, Some("reddit")).await
+}
+
 #[tokio::test]
 async fn test_claim_urls_generic_ignores_affinity_urls() -> DbResult<()> {
     let (db, user_id) = setup().await?;

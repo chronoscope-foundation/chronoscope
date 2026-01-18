@@ -1,0 +1,9 @@
+{
+  "url": "https://preview.redd.it/skyz5m6tjddg1.jpg?width=3405&format=pjpg&auto=webp&s=fa4e64d03555ba2bbce1e3fa2cb581be67808e94",
+  "method": "GET",
+  "status": 404,
+  "headers": {},
+  "body": "",
+  "final_url": "https://preview.redd.it/skyz5m6tjddg1.jpg?width=3405&format=pjpg&auto=webp&s=fa4e64d03555ba2bbce1e3fa2cb581be67808e94",
+  "pinned": "Intentional 404 for testing - only first gallery image is tested"
+}

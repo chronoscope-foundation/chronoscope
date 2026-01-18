@@ -38,10 +38,10 @@ impl IntegrationRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`RegistrationError`] if any domain is already registered to another integration.
-    /// This is a programming error - domains should not overlap.
+    /// Returns [`RegistrationError`] if any domain is already registered.
+    /// This is a programming error - domains should not overlap between integrations.
     pub fn register(&mut self, integration: Integration) -> Result<(), RegistrationError> {
-        // Check for overlaps first
+        // Check for overlaps
         for domain in integration.domains() {
             if let Some(existing) = self.by_domain.get(domain) {
                 return Err(RegistrationError {
@@ -52,7 +52,7 @@ impl IntegrationRegistry {
             }
         }
 
-        // No overlaps, insert all domains
+        // No conflicts, insert all domains
         for domain in integration.domains() {
             self.by_domain.insert(domain, integration.clone());
         }
@@ -92,8 +92,7 @@ impl IntegrationRegistry {
     #[must_use]
     pub fn normalize_url(&self, url: &Url) -> Url {
         self.get(url)
-            .map(|i| i.normalize_url(url))
-            .unwrap_or_else(|| url.clone())
+            .map_or_else(|| url.clone(), |i| i.normalize_url(url))
     }
 }
 
@@ -141,17 +140,17 @@ mod tests {
         }
     }
 
-    fn test_integration(domains: &'static [&'static str]) -> Integration {
-        Integration::Single(Arc::new(TestIntegration {
-            name: IntegrationName::Reddit,
-            domains,
-        }))
+    fn test_integration(name: IntegrationName, domains: &'static [&'static str]) -> Integration {
+        Integration::Single(Arc::new(TestIntegration { name, domains }))
     }
 
     #[test]
     fn test_registry_exact_domain_match() -> TestResult {
         let mut registry = IntegrationRegistry::new();
-        registry.register(test_integration(&["reddit.com", "redd.it"]))?;
+        registry.register(test_integration(
+            IntegrationName::Reddit,
+            &["reddit.com", "redd.it"],
+        ))?;
 
         let url = Url::parse("https://reddit.com/r/rust")?;
         assert!(registry.get(&url).is_some());
@@ -164,7 +163,7 @@ mod tests {
     #[test]
     fn test_registry_strips_www_prefix() -> TestResult {
         let mut registry = IntegrationRegistry::new();
-        registry.register(test_integration(&["example.com"]))?;
+        registry.register(test_integration(IntegrationName::Reddit, &["example.com"]))?;
 
         let url = Url::parse("https://www.example.com/page")?;
         assert!(registry.get(&url).is_some());
@@ -177,7 +176,7 @@ mod tests {
     #[test]
     fn test_registry_returns_none_for_unknown_domain() -> TestResult {
         let mut registry = IntegrationRegistry::new();
-        registry.register(test_integration(&["reddit.com"]))?;
+        registry.register(test_integration(IntegrationName::Reddit, &["reddit.com"]))?;
 
         let url = Url::parse("https://unknown-site.com/page")?;
         assert!(registry.get(&url).is_none());
@@ -197,7 +196,10 @@ mod tests {
     #[test]
     fn test_integration_name_for_domain() -> TestResult {
         let mut registry = IntegrationRegistry::new();
-        registry.register(test_integration(&["reddit.com", "redd.it"]))?;
+        registry.register(test_integration(
+            IntegrationName::Reddit,
+            &["reddit.com", "redd.it"],
+        ))?;
 
         assert_eq!(
             registry.integration_name_for_domain("reddit.com"),
@@ -218,14 +220,20 @@ mod tests {
     #[test]
     fn test_registry_errors_on_domain_overlap() -> TestResult {
         let mut registry = IntegrationRegistry::new();
-        registry.register(test_integration(&["reddit.com"]))?;
+        registry.register(test_integration(IntegrationName::Reddit, &["reddit.com"]))?;
 
-        let result = registry.register(test_integration(&["reddit.com"]));
+        // Any integration trying to claim an already-registered domain should fail
+        let result = registry.register(test_integration(
+            IntegrationName::Instagram,
+            &["reddit.com"],
+        ));
         let err = match result {
             Ok(()) => return Err("expected registration to fail".into()),
             Err(e) => e,
         };
         assert_eq!(err.domain, "reddit.com");
+        assert_eq!(err.existing, IntegrationName::Reddit);
+        assert_eq!(err.new, IntegrationName::Instagram);
         Ok(())
     }
 }

@@ -15,6 +15,7 @@
 
 pub mod content;
 pub mod http;
+pub mod instagram;
 pub mod reddit;
 mod registry;
 
@@ -23,33 +24,38 @@ pub use http::{
     CacheMode, CachingClient, FetchError, HttpClient, HttpError, HttpRequest, HttpResponse,
     ReqwestClient, ReqwestConfig,
 };
+pub use instagram::{ApifyConfig, InstagramIntegration};
 pub use reddit::RedditIntegration;
 pub use registry::{IntegrationRegistry, RegistrationError};
-
-/// Create a registry with all default integrations registered.
-///
-/// This sets up Reddit, Instagram (when implemented), and any other
-/// platform-specific integrations. Use this for production setups.
-///
-/// # Errors
-///
-/// Returns `RegistrationError` if integration domains conflict (should never
-/// happen with default integrations, but the error is propagated for safety).
-pub fn create_default_registry() -> Result<IntegrationRegistry, RegistrationError> {
-    let mut registry = IntegrationRegistry::new();
-
-    // Register domain-specific integrations
-    registry.register(Integration::Single(Arc::new(RedditIntegration::new())))?;
-
-    // Future: registry.register(Integration::Batch(Arc::new(InstagramIntegration::new(config))))?;
-
-    Ok(registry)
-}
 
 use std::fmt;
 use std::sync::Arc;
 
 use url::Url;
+
+/// Create an integration registry with all supported integrations.
+///
+/// If `instagram_config` is provided, Instagram fetching will use those credentials.
+/// Otherwise, Instagram URLs will still be detected and normalized, but actual
+/// fetching will fail without real credentials.
+///
+/// # Errors
+///
+/// Returns `RegistrationError` if integration domains conflict (should never
+/// happen with default integrations, but the error is propagated for safety).
+pub fn create_registry(
+    instagram_config: Option<ApifyConfig>,
+) -> Result<IntegrationRegistry, RegistrationError> {
+    let mut registry = IntegrationRegistry::new();
+
+    // Register domain-specific integrations
+    registry.register(Integration::Single(Arc::new(RedditIntegration::new())))?;
+    registry.register(Integration::Batch(Arc::new(InstagramIntegration::new(
+        instagram_config,
+    ))))?;
+
+    Ok(registry)
+}
 
 /// Typed integration names - avoids stringly-typed APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

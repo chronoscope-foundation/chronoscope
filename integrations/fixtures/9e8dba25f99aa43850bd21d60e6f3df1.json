@@ -1,0 +1,9 @@
+{
+  "url": "https://preview.redd.it/okrofzlojddg1.jpg?width=3504&format=pjpg&auto=webp&s=f6d94d8ae0dd3060bebab65eded07e643f8f87e8",
+  "method": "GET",
+  "status": 404,
+  "headers": {},
+  "body": "",
+  "final_url": "https://preview.redd.it/okrofzlojddg1.jpg?width=3504&format=pjpg&auto=webp&s=f6d94d8ae0dd3060bebab65eded07e643f8f87e8",
+  "pinned": "Intentional 404 for testing - only first gallery image is tested"
+}

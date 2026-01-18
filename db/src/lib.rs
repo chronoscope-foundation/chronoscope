@@ -71,7 +71,7 @@ impl Database {
     /// Returns `DbError::Sqlx` if connection fails, `DbError::Migrate` if migrations fail,
     /// or `DbError::QueryPlan` if any query would cause a full table scan.
     pub async fn new(database_url: &str) -> DbResult<Self> {
-        let registry = chronoscope_integrations::create_default_registry()?;
+        let registry = chronoscope_integrations::create_registry(None)?;
 
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
@@ -93,7 +93,7 @@ impl Database {
     ///
     /// This is used by tests that want to verify query plans themselves (to avoid circular dependency).
     pub async fn new_without_plan_verification(database_url: &str) -> DbResult<Self> {
-        let registry = chronoscope_integrations::create_default_registry()?;
+        let registry = chronoscope_integrations::create_registry(None)?;
 
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)

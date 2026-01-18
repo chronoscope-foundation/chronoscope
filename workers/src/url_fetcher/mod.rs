@@ -24,7 +24,8 @@ use std::sync::Arc;
 use chronoscope_db::media_store::MediaStore;
 use chronoscope_db::{Database, MediaSlot, PageData, ResearchUrl};
 use chronoscope_integrations::{
-    FetchedContent, HttpClient, Integration, IntegrationName, IntegrationRegistry, SingleFetcher,
+    BatchFetcher, FetchedContent, HttpClient, Integration, IntegrationName, IntegrationRegistry,
+    SingleFetcher,
 };
 use tracing::{Instrument, error, info_span};
 use url::Url;
@@ -109,7 +110,9 @@ impl UrlFetcherWorker {
         }
     }
 
-    /// Process a URL using a specialized integration.
+    /// Process a single URL using a specialized integration.
+    ///
+    /// For batch integrations, prefer using `process_batch_integration` which is more efficient.
     async fn process_with_integration(
         &self,
         research_url: &ResearchUrl,
@@ -122,11 +125,81 @@ impl UrlFetcherWorker {
                     .await
             }
             Integration::Batch(fetcher) => {
-                // Batch integrations require different coordination (accumulating URLs before
-                // calling the external API). This will be implemented in Commit 2 (Instagram).
-                Err(FetchError::BatchNotImplemented(fetcher.name().to_string()))
+                // Process as a single-item batch
+                self.process_batch_integration(
+                    &[(research_url.clone(), url.clone())],
+                    fetcher.as_ref(),
+                )
+                .await
+                .pop()
+                .map(|(_, result)| result)
+                .unwrap_or_else(|| {
+                    Err(FetchError::ContentProcessing(
+                        "batch returned no results".into(),
+                    ))
+                })
             }
         }
+    }
+
+    /// Process multiple URLs using a batch integration (e.g., Instagram via Apify).
+    async fn process_batch_integration(
+        &self,
+        items: &[(ResearchUrl, Url)],
+        fetcher: &dyn BatchFetcher,
+    ) -> Vec<(ResearchUrl, Result<FetchResult, FetchError>)> {
+        if items.is_empty() {
+            return Vec::new();
+        }
+
+        // Extract just the URLs for the batch fetcher
+        let urls: Vec<Url> = items.iter().map(|(_, url)| url.clone()).collect();
+
+        // Call the batch fetcher
+        let fetch_results = fetcher.fetch_batch(self.ctx.http.as_ref(), &urls).await;
+
+        // Build a map from URL to (research_url, result) for matching
+        let research_url_map: std::collections::HashMap<String, &ResearchUrl> = items
+            .iter()
+            .map(|(ru, url)| (url.to_string(), ru))
+            .collect();
+
+        // Match results back to research URLs and persist
+        let mut results = Vec::with_capacity(items.len());
+
+        for (url, fetch_result) in fetch_results {
+            let url_str = url.to_string();
+            let Some(research_url) = research_url_map.get(&url_str) else {
+                // This shouldn't happen, but log and skip if it does
+                error!(url = %url_str, "batch result URL not found in input");
+                continue;
+            };
+            let research_url = (*research_url).clone();
+
+            let result = match fetch_result {
+                Ok(content) => {
+                    self.persist_fetched_content(&research_url, content, Some(fetcher.name()))
+                        .await
+                }
+                Err(e) => Err(FetchError::Integration(e)),
+            };
+
+            results.push((research_url, result));
+        }
+
+        // Check for any items that didn't get results (e.g., batch fetcher missed them)
+        for (research_url, _url) in items {
+            if !results.iter().any(|(ru, _)| ru.id == research_url.id) {
+                results.push((
+                    research_url.clone(),
+                    Err(FetchError::Integration(
+                        chronoscope_integrations::FetchError::NotFound,
+                    )),
+                ));
+            }
+        }
+
+        results
     }
 
     /// Process a URL using a single-URL integration (e.g., Reddit).

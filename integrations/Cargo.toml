@@ -21,6 +21,7 @@ async-trait = "0.1"
 
 # URL handling
 url.workspace = true
+urlencoding = "2"
 
 # Serialization
 serde.workspace = true

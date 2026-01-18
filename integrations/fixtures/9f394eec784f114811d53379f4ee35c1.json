@@ -1,0 +1,9 @@
+{
+  "url": "https://preview.redd.it/h8ouwe9njddg1.jpg?width=3504&format=pjpg&auto=webp&s=521995a790ea08595bebe2252660628d3600d111",
+  "method": "GET",
+  "status": 404,
+  "headers": {},
+  "body": "",
+  "final_url": "https://preview.redd.it/h8ouwe9njddg1.jpg?width=3504&format=pjpg&auto=webp&s=521995a790ea08595bebe2252660628d3600d111",
+  "pinned": "Intentional 404 for testing - only first gallery image is tested"
+}

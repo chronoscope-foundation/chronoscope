@@ -195,22 +195,16 @@ pub struct UrlQueue {
 }
 
 impl UrlQueue {
-    /// Create a queue for generic URLs (no affinity).
+    /// Create a queue with optional integration affinity.
+    ///
+    /// - `affinity = None`: claims generic URLs only (`worker_affinity` IS NULL)
+    /// - `affinity = Some(name)`: claims URLs with matching `worker_affinity`
     #[must_use]
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db, affinity: None }
-    }
-
-    /// Create a queue for URLs with a specific integration affinity.
-    #[must_use]
-    pub fn with_affinity(
+    pub fn new(
         db: Arc<Database>,
-        affinity: chronoscope_integrations::IntegrationName,
+        affinity: Option<chronoscope_integrations::IntegrationName>,
     ) -> Self {
-        Self {
-            db,
-            affinity: Some(affinity),
-        }
+        Self { db, affinity }
     }
 }
 
@@ -655,7 +649,7 @@ mod tests {
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let queue = UrlQueue::new(db.clone());
+        let queue = UrlQueue::new(db.clone(), None);
 
         tokio::spawn(async move {
             let _ = run(
@@ -702,7 +696,7 @@ mod tests {
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let queue = UrlQueue::new(db.clone());
+        let queue = UrlQueue::new(db.clone(), None);
 
         tokio::spawn(async move {
             let _ = run(
@@ -754,7 +748,7 @@ mod tests {
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let queue = UrlQueue::new(db.clone());
+        let queue = UrlQueue::new(db.clone(), None);
 
         tokio::spawn(async move {
             let _ = run(
@@ -815,7 +809,7 @@ mod tests {
             );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let queue = UrlQueue::new(db.clone());
+        let queue = UrlQueue::new(db.clone(), None);
         let enqueuer = UrlEnqueuer::new(db.clone(), system_user);
 
         tokio::spawn(async move {

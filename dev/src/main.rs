@@ -21,8 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_dev::{DevServerConfig, start_dev_server};
-use chronoscope_workers::ReqwestClient;
-use chronoscope_workers::RetryConfig;
+use chronoscope_workers::{ApifyConfig, ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::{error, info, warn};
 use tokio::signal;
@@ -254,7 +253,16 @@ async fn run_dev_server(
     let http_client =
         Arc::new(ReqwestClient::new().map_err(|e| format!("Failed to create HTTP client: {e}"))?);
 
-    // 7. Start the dev server with ngrok URL as CDN base
+    // 7. Check for Apify credentials for Instagram integration
+    let apify_config = std::env::var("APIFY_API_TOKEN").ok().map(|api_token| {
+        info!(
+            log,
+            "Apify credentials found - Instagram integration enabled"
+        );
+        ApifyConfig::new(api_token)
+    });
+
+    // 8. Start the dev server with ngrok URL as CDN base
     let server = start_dev_server(DevServerConfig {
         http_client,
         worker_idle_backoff: Duration::from_secs(5),
@@ -265,6 +273,7 @@ async fn run_dev_server(
         rp_id: Some(ngrok_domain.clone()),
         rp_origin: Some(ngrok_url.clone()),
         ios_app_id,
+        apify_config,
     })
     .await
     .map_err(|e| format!("Failed to start dev server: {e}"))?;

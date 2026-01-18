@@ -1,0 +1,25 @@
+{
+  "url": "https://api.apify.com/v2/acts/apify%2Finstagram-scraper/runs",
+  "method": "POST",
+  "status": 201,
+  "headers": {
+    "access-control-allow-origin": "*",
+    "content-type": "application/json; charset=utf-8",
+    "transfer-encoding": "chunked",
+    "vary": "Accept-Encoding",
+    "access-control-allow-headers": "User-Agent, Content-Type, Authorization, X-Apify-Request-Origin, openai-conversation-id, openai-ephemeral-user-id, x-apify-integration-platform, x-apify-integration-app-id, x-apify-integration-ai-tool",
+    "cache-control": "no-cache, no-store, must-revalidate",
+    "location": "https://api.apify.com/v2/actor-runs/7ISxhM9t2OAWa2wkt",
+    "access-control-expose-headers": "X-Apify-Pagination-Total, X-Apify-Pagination-Offset, X-Apify-Pagination-Desc, X-Apify-Pagination-Count, X-Apify-Pagination-Limit",
+    "pragma": "no-cache",
+    "connection": "keep-alive",
+    "date": "Sun, 18 Jan 2026 08:24:54 GMT",
+    "expires": "0",
+    "access-control-allow-methods": "GET, POST",
+    "referrer-policy": "no-referrer",
+    "x-robots-tag": "none",
+    "x-ratelimit-limit": "400"
+  },
+  "body": "ewogICJkYXRhIjogewogICAgImlkIjogIjdJU3hoTTl0Mk9BV2Eyd2t0IiwKICAgICJhY3RJZCI6ICJzaHU4aHZyWGJKYlkzRWI5VyIsCiAgICAidXNlcklkIjogImloYkpiNkFhRVZGYVdUcTRmIiwKICAgICJzdGFydGVkQXQiOiAiMjAyNi0wMS0xOFQwODoyNDo1NC40MDVaIiwKICAgICJmaW5pc2hlZEF0IjogbnVsbCwKICAgICJzdGF0dXMiOiAiUkVBRFkiLAogICAgIm1ldGEiOiB7CiAgICAgICJvcmlnaW4iOiAiQVBJIiwKICAgICAgInVzZXJBZ2VudCI6ICJDaHJvbm9zY29wZS8wLjEgKGhpc3RvcmljYWwgcmVzZWFyY2ggdG9vbCkiCiAgICB9LAogICAgInN0YXRzIjogewogICAgICAiaW5wdXRCb2R5TGVuIjogMTM4LAogICAgICAibWlncmF0aW9uQ291bnQiOiAwLAogICAgICAicmVib290Q291bnQiOiAwLAogICAgICAicmVzdGFydENvdW50IjogMCwKICAgICAgInJlc3VycmVjdENvdW50IjogMCwKICAgICAgImNvbXB1dGVVbml0cyI6IDAKICAgIH0sCiAgICAib3B0aW9ucyI6IHsKICAgICAgImJ1aWxkIjogImxhdGVzdCIsCiAgICAgICJ0aW1lb3V0U2VjcyI6IDYwNDgwMCwKICAgICAgIm1lbW9yeU1ieXRlcyI6IDEwMjQsCiAgICAgICJtYXhUb3RhbENoYXJnZVVzZCI6IDQuOTI5ODM4LAogICAgICAiZGlza01ieXRlcyI6IDIwNDgKICAgIH0sCiAgICAiYnVpbGRJZCI6ICJsM2RiVVJFRXVGZ1E0MEZqSyIsCiAgICAiZGVmYXVsdEtleVZhbHVlU3RvcmVJZCI6ICJYZmFJMmZUUVBudjdnUlVFbCIsCiAgICAiZGVmYXVsdERhdGFzZXRJZCI6ICJxZjM2ZEdwNUFLUDRrbmRKSCIsCiAgICAiZGVmYXVsdFJlcXVlc3RRdWV1ZUlkIjogInFwODZ1MktObDVxTGkxbzVQIiwKICAgICJwcmljaW5nSW5mbyI6IHsKICAgICAgIm1pbmltYWxNYXhUb3RhbENoYXJnZVVzZCI6IDAuMDAyNywKICAgICAgInByaWNpbmdNb2RlbCI6ICJQQVlfUEVSX0VWRU5UIiwKICAgICAgImlzUHJpY2VDaGFuZ2VOb3RpZmljYXRpb25TdXBwcmVzc2VkIjogdHJ1ZSwKICAgICAgImNyZWF0ZWRBdCI6ICIyMDI1LTEyLTEyVDE2OjEwOjQzLjUzNFoiLAogICAgICAic3RhcnRlZEF0IjogIjIwMjUtMTItMTJUMTY6MTA6NDMuNTM0WiIsCiAgICAgICJhcGlmeU1hcmdpblBlcmNlbnRhZ2UiOiAwLjIsCiAgICAgICJwcmljaW5nUGVyRXZlbnQiOiB7CiAgICAgICAgImFjdG9yQ2hhcmdlRXZlbnRzIjogewogICAgICAgICAgInJlc3VsdCI6IHsKICAgICAgICAgICAgImV2ZW50VGl0bGUiOiAiUmVzdWx0IiwKICAgICAgICAgICAgImV2ZW50RGVzY3JpcHRpb24iOiAiRWFjaCByZXN1bHQgd3JpdHRlbiB0byB0aGUgZGF0YXNldCIsCiAgICAgICAgICAgICJpc09uZVRpbWVFdmVudCI6IGZhbHNlLAogICAgICAgICAgICAiZXZlbnRQcmljZVVzZCI6IDAuMDAyNwogICAgICAgICAgfQogICAgICAgIH0KICAgICAgfQogICAgfSwKICAgICJjaGFyZ2VkRXZlbnRDb3VudHMiOiB7CiAgICAgICJyZXN1bHQiOiAwCiAgICB9LAogICAgInBsYXRmb3JtVXNhZ2VCaWxsaW5nTW9kZWwiOiAiREVWRUxPUEVSIiwKICAgICJhY2NvdW50ZWRDaGFyZ2VkRXZlbnRDb3VudHMiOiB7CiAgICAgICJyZXN1bHQiOiAwCiAgICB9LAogICAgImdlbmVyYWxBY2Nlc3MiOiAiRk9MTE9XX1VTRVJfU0VUVElORyIsCiAgICAiYnVpbGROdW1iZXIiOiAiMC4wLjU0MyIsCiAgICAiY29udGFpbmVyVXJsIjogImh0dHBzOi8vc25vYWhja2x0Z3FkLnJ1bnMuYXBpZnkubmV0IiwKICAgICJ1c2FnZVRvdGFsVXNkIjogMAogIH0KfQ==",
+  "final_url": "https://api.apify.com/v2/acts/apify%2Finstagram-scraper/runs"
+}

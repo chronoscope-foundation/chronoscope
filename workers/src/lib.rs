@@ -23,8 +23,9 @@ pub mod worker;
 
 // Re-export types from integrations for convenience
 pub use chronoscope_integrations::{
-    CacheMode, CachingClient, HttpClient, HttpError, HttpRequest, HttpResponse, IntegrationName,
-    ReqwestClient, ReqwestConfig,
+    ApifyConfig, CacheMode, CachingClient, HttpClient, HttpError, HttpRequest, HttpResponse,
+    InstagramIntegration, Integration, IntegrationName, IntegrationRegistry, RedditIntegration,
+    ReqwestClient, ReqwestConfig, create_registry,
 };
 
 pub use config::WorkerConfig;

@@ -16,10 +16,11 @@ use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config, default_dns_resolver};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, UserId};
-use chronoscope_workers::HttpClient;
-use chronoscope_workers::IntegrationName;
-use chronoscope_workers::url_fetcher::UrlFetcherWorker;
-use chronoscope_workers::{RetryConfig, UrlEnqueuer, UrlQueue, WorkerConfig, run};
+use chronoscope_workers::url_fetcher::{FetcherConfig, UrlFetcherWorker};
+use chronoscope_workers::{
+    ApifyConfig, HttpClient, IntegrationName, IntegrationRegistry, RetryConfig, UrlEnqueuer,
+    UrlQueue, WorkerConfig, create_registry, run,
+};
 use dropshot::{ApiDescription, ConfigDropshot, HttpServerStarter};
 use slog::info;
 use tokio::sync::watch;
@@ -59,14 +60,25 @@ pub struct RunningDevServer {
 
 impl RunningDevServer {
     /// Gracefully shut down the server and wait for all workers to stop.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         // Signal workers to stop
         let _ = self.shutdown_tx.send(true);
 
-        // Wait for all workers to finish
-        for handle in self.worker_handles {
+        // Take ownership of handles (leaving empty vec) so we can await them
+        // despite implementing Drop
+        let handles = std::mem::take(&mut self.worker_handles);
+        for handle in handles {
             let _ = handle.await;
         }
+    }
+}
+
+impl Drop for RunningDevServer {
+    fn drop(&mut self) {
+        // Signal workers to stop. We can't await here, but signaling is enough
+        // to prevent workers from picking up new tasks. The handles will be
+        // dropped, which is fine since workers are detached tasks.
+        let _ = self.shutdown_tx.send(true);
     }
 }
 
@@ -98,6 +110,10 @@ pub struct DevServerConfig {
 
     /// Optional: iOS app ID for AASA
     pub ios_app_id: Option<String>,
+
+    /// Optional: Apify configuration for Instagram integration.
+    /// If provided, an Instagram worker will be spawned.
+    pub apify_config: Option<ApifyConfig>,
 }
 
 /// Find an available port by binding to port 0 and reading the assigned port.
@@ -110,6 +126,10 @@ pub struct DevServerConfig {
 /// 2. Port collisions are rare on a dev machine in practice
 /// 3. The alternative (binding to port 0 in Dropshot) would require knowing the
 ///    ngrok URL before we know the port, creating a chicken-and-egg problem
+///
+/// # Errors
+///
+/// Returns an I/O error if unable to bind to any available port.
 pub fn find_available_port() -> std::io::Result<u16> {
     // TcpListener closes on drop, freeing the port for later use
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -126,6 +146,8 @@ struct WorkerContext {
     retry_config: RetryConfig,
     shutdown_rx: watch::Receiver<bool>,
     log: slog::Logger,
+    /// Pre-configured integration registry (cloned per worker).
+    registry: IntegrationRegistry,
 }
 
 /// Spawn a URL fetcher worker in a background task, returning its handle.
@@ -136,19 +158,21 @@ fn spawn_url_fetcher_worker(
     name: &str,
     affinity: Option<IntegrationName>,
     ctx: &WorkerContext,
-) -> Result<JoinHandle<()>, DevServerError> {
+) -> JoinHandle<()> {
+    use chronoscope_workers::url_fetcher::FetchContext;
+
     let worker_id = name.to_string();
 
-    let queue = match affinity {
-        None => UrlQueue::new(ctx.db.clone()),
-        Some(aff) => UrlQueue::with_affinity(ctx.db.clone(), aff),
-    };
-    let worker = UrlFetcherWorker::with_defaults(
-        ctx.db.clone(),
-        ctx.http_client.clone(),
-        ctx.media_store.clone(),
-    )
-    .map_err(|e| DevServerError(format!("Failed to create worker: {e}")))?;
+    let queue = UrlQueue::new(ctx.db.clone(), affinity);
+
+    let fetch_ctx = Arc::new(FetchContext {
+        db: ctx.db.clone(),
+        http: ctx.http_client.clone(),
+        media_store: ctx.media_store.clone(),
+        config: FetcherConfig::default(),
+    });
+
+    let worker = UrlFetcherWorker::new(ctx.registry.clone(), fetch_ctx);
     let enqueuer = UrlEnqueuer::new(ctx.db.clone(), ctx.user_id.clone());
     let worker_config = WorkerConfig {
         worker_id: worker_id.clone(),
@@ -161,7 +185,7 @@ fn spawn_url_fetcher_worker(
     let shutdown_rx = ctx.shutdown_rx.clone();
     let log = ctx.log.clone();
 
-    Ok(tokio::spawn(async move {
+    tokio::spawn(async move {
         info!(log, "Starting worker"; "worker_id" => &worker_id);
         if let Err(e) = run(
             queue,
@@ -175,7 +199,7 @@ fn spawn_url_fetcher_worker(
         {
             slog::error!(log, "Worker error"; "worker_id" => &worker_id, "error" => %e);
         }
-    }))
+    })
 }
 
 /// Start the development server with the given configuration.
@@ -189,6 +213,11 @@ fn spawn_url_fetcher_worker(
 /// - API server with embedded media serving
 ///
 /// Returns a handle that can be used to interact with the server and shut it down.
+///
+/// # Errors
+///
+/// Returns [`DevServerError`] if server initialization fails (database setup,
+/// user creation, API server startup, etc.).
 pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServer, DevServerError> {
     let log = &config.log;
     let port = config.port;
@@ -224,6 +253,10 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
 
     // ==================== Start URL Fetcher Workers ====================
 
+    // Create integration registry once, cloned per worker
+    let registry = create_registry(config.apify_config.clone())
+        .map_err(|e| DevServerError(format!("Failed to create integration registry: {e}")))?;
+
     let worker_ctx = WorkerContext {
         db: db.clone(),
         http_client: config.http_client.clone(),
@@ -233,17 +266,28 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         retry_config: config.retry_config.clone(),
         shutdown_rx: shutdown_rx.clone(),
         log: log.clone(),
+        registry,
     };
 
     // Spawn workers per affinity: one for each integration + one generic
-    let worker_handles = vec![
+    let mut worker_handles = vec![
         // Reddit worker
-        spawn_url_fetcher_worker("reddit-worker", Some(IntegrationName::Reddit), &worker_ctx)?,
+        spawn_url_fetcher_worker("reddit-worker", Some(IntegrationName::Reddit), &worker_ctx),
         // Generic worker (handles URLs with no specialized integration)
-        spawn_url_fetcher_worker("generic-worker", None, &worker_ctx)?,
+        spawn_url_fetcher_worker("generic-worker", None, &worker_ctx),
     ];
 
-    info!(log, "Started {} URL fetcher workers", worker_handles.len());
+    // Spawn Instagram worker if Apify credentials are provided
+    if config.apify_config.is_some() {
+        worker_handles.push(spawn_url_fetcher_worker(
+            "instagram-worker",
+            Some(IntegrationName::Instagram),
+            &worker_ctx,
+        ));
+        info!(log, "Instagram worker enabled with Apify integration");
+    }
+
+    info!(log, "Started URL fetcher workers"; "count" => worker_handles.len());
 
     // ==================== Start API Server ====================
 

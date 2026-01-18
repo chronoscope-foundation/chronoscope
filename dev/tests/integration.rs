@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_api::research_types::{MediaReference, ResearchUrlDossier, ResolvedContent};
-use chronoscope_db::ResearchUrlStatus;
+use chronoscope_db::{MediaType, ResearchUrlStatus};
 use chronoscope_dev::{DevServerConfig, RunningDevServer, start_dev_server};
 use chronoscope_workers::RetryConfig;
-use chronoscope_workers::{CacheMode, CachingClient, HttpClient};
+use chronoscope_workers::{ApifyConfig, CacheMode, CachingClient, HttpClient};
 use dropshot::ConfigLogging;
 use reqwest::Client;
 
@@ -24,8 +24,10 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 /// Polling interval for async operations in tests.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Maximum polling attempts (100 * 100ms = 10 seconds).
-const MAX_POLL_ATTEMPTS: usize = 100;
+/// Default timeout for most operations (10 seconds).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Extended timeout for external API calls (30 seconds).
+const EXTERNAL_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 // CARGO_MANIFEST_DIR is a compile-time constant that always has a parent directory.
 #[allow(clippy::expect_used)]
@@ -48,41 +50,25 @@ fn vcr_mode() -> CacheMode {
 // ==================== Test Harness ====================
 
 /// Test server wrapper with helper methods for making authenticated requests.
+///
+/// Workers are automatically signaled to stop when this is dropped (via
+/// `RunningDevServer`'s `Drop` impl). For clean shutdown in passing tests,
+/// call `shutdown().await` explicitly to wait for workers to finish.
 struct TestServer {
     server: RunningDevServer,
     client: Client,
 }
 
-/// RAII guard that ensures the test server is shut down when dropped.
-///
-/// This prevents worker threads from continuing to run if a test fails
-/// before reaching the explicit shutdown call.
-struct TestServerGuard {
-    server: TestServer,
-}
-
-impl TestServerGuard {
-    fn new(server: TestServer) -> Self {
-        Self { server }
-    }
-
-    /// Gracefully shut down the server.
-    async fn shutdown(self) {
-        self.server.shutdown().await;
-    }
-}
-
-impl std::ops::Deref for TestServerGuard {
-    type Target = TestServer;
-
-    fn deref(&self) -> &Self::Target {
-        &self.server
-    }
-}
-
 impl TestServer {
     /// Start a test server with VCR fixtures.
     async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::start_with_config(None).await
+    }
+
+    /// Start a test server with VCR fixtures and optional Apify config.
+    async fn start_with_config(
+        apify_config: Option<ApifyConfig>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let http_client: Arc<dyn HttpClient> =
             Arc::new(CachingClient::new(fixtures_dir(), vcr_mode())?);
 
@@ -107,6 +93,7 @@ impl TestServer {
             rp_id: None,
             rp_origin: None,
             ios_app_id: None,
+            apify_config,
         })
         .await?;
 
@@ -167,21 +154,26 @@ impl TestServer {
         Ok(resp.json().await?)
     }
 
-    /// Wait until the URL is no longer pending (resolved or failed).
+    /// Wait until the URL is resolved or failed, with configurable timeout.
     // Polling is appropriate for integration tests waiting on async worker completion.
     #[allow(clippy::disallowed_methods)]
     async fn wait_for_resolved(
         &self,
         url_id: &str,
+        timeout: Duration,
     ) -> Result<ResearchUrlDossier, Box<dyn std::error::Error + Send + Sync>> {
-        for _ in 0..MAX_POLL_ATTEMPTS {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
             tokio::time::sleep(POLL_INTERVAL).await;
             let dossier = self.get_dossier(url_id).await?;
             if dossier.resolved.is_some() {
                 return Ok(dossier);
             }
+            if dossier.status == ResearchUrlStatus::Failed {
+                return Err(format!("URL failed: {:?}", dossier).into());
+            }
         }
-        Err("timeout waiting for URL to resolve".into())
+        Err(format!("timeout waiting for URL to resolve after {timeout:?}").into())
     }
 
     /// Wait until at least one media item is fetched.
@@ -191,7 +183,8 @@ impl TestServer {
         &self,
         url_id: &str,
     ) -> Result<ResearchUrlDossier, Box<dyn std::error::Error + Send + Sync>> {
-        for _ in 0..MAX_POLL_ATTEMPTS {
+        let start = std::time::Instant::now();
+        while start.elapsed() < DEFAULT_TIMEOUT {
             tokio::time::sleep(POLL_INTERVAL).await;
             let dossier = self.get_dossier(url_id).await?;
 
@@ -243,21 +236,40 @@ impl TestServer {
 /// offline VCR mode), while the one with a fixture succeeds and can be retrieved.
 #[tokio::test]
 async fn test_reddit_gallery_end_to_end() -> TestResult {
-    let guard = TestServerGuard::new(TestServer::start().await?);
+    let server = TestServer::start().await?;
 
     // Submit the Reddit gallery URL.
     // Reddit is a good test source because URLs are nearly permanent (content is hard
     // to delete), posts are append-only, and this gallery is relevant to our domain
     // (historical/abandoned places).
-    let url_id = guard
+    let url_id = server
         .submit_url("https://www.reddit.com/r/abandoned/comments/1qcyfyj/bolshoye_selo/")
         .await?;
 
     // Wait for the page to be resolved
-    guard.wait_for_resolved(&url_id).await?;
+    server.wait_for_resolved(&url_id, DEFAULT_TIMEOUT).await?;
 
-    // Wait for at least one media item to be fetched
-    let dossier = guard.wait_for_fetched_media(&url_id).await?;
+    // Wait for at least one media item to be fetched, then poll until all are done
+    let mut dossier = server.wait_for_fetched_media(&url_id).await?;
+
+    // Keep polling until all media items are fetched
+    for _ in 0..30 {
+        let page = match &dossier.resolved {
+            Some(ResolvedContent::Page(p)) => p,
+            _ => break,
+        };
+        let pending_count = page
+            .media
+            .iter()
+            .filter(|m| matches!(m, MediaReference::Pending { .. }))
+            .count();
+        if pending_count == 0 {
+            break;
+        }
+        #[allow(clippy::disallowed_methods)]
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        dossier = server.get_dossier(&url_id).await?;
+    }
 
     // Verify we got a page with media
     let page = match dossier.resolved {
@@ -276,30 +288,40 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
         })
         .collect();
 
+    // Only one fixture is kept (first gallery image); others have pinned 404 failures
     assert_eq!(
         fetched.len(),
         1,
-        "exactly one media should be fetched (only one fixture recorded)"
+        "exactly one media should be fetched (others have pinned 404 fixtures)"
     );
 
-    // Verify the fetched media has dimensions
+    // Verify metadata dimensions (from fixture: 3504x2336)
     let media = fetched[0];
-    assert!(media.width > 0, "fetched media should have width");
-    assert!(media.height > 0, "fetched media should have height");
+    assert_eq!(media.width, 3504, "media width should be 3504");
+    assert_eq!(media.height, 2336, "media height should be 2336");
 
     // Fetch the full image and verify it's valid
-    let image_bytes = guard.fetch_bytes(&media.full_url).await?;
+    let image_bytes = server.fetch_bytes(&media.full_url).await?;
 
     // Parse with the image crate to verify it's a valid image
     let img = image::ImageReader::new(Cursor::new(&image_bytes))
         .with_guessed_format()?
         .decode()?;
 
-    assert!(img.width() > 0, "decoded image should have width");
-    assert!(img.height() > 0, "decoded image should have height");
+    // Verify decoded dimensions match metadata
+    assert_eq!(
+        img.width(),
+        media.width,
+        "decoded width should match metadata"
+    );
+    assert_eq!(
+        img.height(),
+        media.height,
+        "decoded height should match metadata"
+    );
 
     // Fetch the thumbnail and verify it's valid
-    let thumb_bytes = guard.fetch_bytes(&media.thumbnail_url).await?;
+    let thumb_bytes = server.fetch_bytes(&media.thumbnail_url).await?;
 
     let thumb = image::ImageReader::new(Cursor::new(&thumb_bytes))
         .with_guessed_format()?
@@ -319,7 +341,7 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
         "thumbnail should not be larger than original"
     );
 
-    guard.shutdown().await;
+    server.shutdown().await;
     Ok(())
 }
 
@@ -331,23 +353,25 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
 #[allow(clippy::disallowed_methods)]
 #[tokio::test]
 async fn test_url_with_no_fixtures_fails_gracefully() -> TestResult {
-    let guard = TestServerGuard::new(TestServer::start().await?);
+    let server = TestServer::start().await?;
 
     // Submit a URL that has no VCR fixtures recorded at all.
     // In offline VCR mode, this will fail to fetch the page itself.
-    let url_id = guard
+    let url_id = server
         .submit_url("https://example.com/no-fixture-exists")
         .await?;
 
     // Wait for resolution attempt (will fail due to missing fixture)
-    for _ in 0..MAX_POLL_ATTEMPTS {
+    let start = std::time::Instant::now();
+    #[allow(clippy::disallowed_methods)]
+    while start.elapsed() < DEFAULT_TIMEOUT {
         tokio::time::sleep(POLL_INTERVAL).await;
-        let dossier = guard.get_dossier(&url_id).await?;
+        let dossier = server.get_dossier(&url_id).await?;
 
         // The URL should eventually be marked as failed
         if dossier.status == ResearchUrlStatus::Failed {
             // Success: the system handled the failure gracefully
-            guard.shutdown().await;
+            server.shutdown().await;
             return Ok(());
         }
 
@@ -363,14 +387,283 @@ async fn test_url_with_no_fixtures_fails_gracefully() -> TestResult {
 /// Test that invalid URLs are rejected at submission time.
 #[tokio::test]
 async fn test_invalid_url_rejected() -> TestResult {
-    let guard = TestServerGuard::new(TestServer::start().await?);
+    let server = TestServer::start().await?;
 
     // Try to submit an invalid URL
-    let result = guard.submit_url("not-a-valid-url").await;
+    let result = server.submit_url("not-a-valid-url").await;
 
     // Should fail at submission time, not during processing
     assert!(result.is_err(), "invalid URL should be rejected");
 
-    guard.shutdown().await;
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Helper to get Apify config for Instagram tests.
+///
+/// In recording mode (with `record-fixtures` feature), uses the real API token
+/// from the environment. In playback mode (default), uses a dummy token since
+/// the token isn't part of the cache key (it's in the Authorization header).
+fn apify_config_for_test() -> Option<ApifyConfig> {
+    if cfg!(feature = "record-fixtures") {
+        // Recording mode: need real token from environment
+        // The test_with attribute ensures this env var exists
+        std::env::var("APIFY_API_TOKEN").ok().map(ApifyConfig::new)
+    } else {
+        // Playback mode: use obvious dummy token
+        // Cache keys don't include the Authorization header, so this works
+        Some(ApifyConfig::new("EXAMPLE_KEY".to_string()))
+    }
+}
+
+/// Test the complete end-to-end flow for an Instagram post via Apify.
+///
+/// This test verifies:
+/// 1. URL submission via HTTP API
+/// 2. Worker processes the Instagram post via Apify batch fetcher
+/// 3. Post content is extracted correctly
+///
+/// # Running
+///
+/// In playback mode (default), this test uses cached VCR fixtures:
+/// ```bash
+/// cargo test -p chronoscope-dev -- test_instagram
+/// ```
+///
+/// To record/update fixtures, set `APIFY_API_TOKEN` and enable the feature:
+/// ```bash
+/// APIFY_API_TOKEN=xxx cargo test -p chronoscope-dev --features record-fixtures -- test_instagram
+/// ```
+///
+/// Without the token in recording mode, the test is skipped (not failed).
+#[cfg_attr(feature = "record-fixtures", test_with::env(APIFY_API_TOKEN))]
+#[tokio::test]
+async fn test_instagram_post_end_to_end() -> TestResult {
+    let apify_config = apify_config_for_test().expect("playback mode always returns Some");
+
+    let server = TestServer::start_with_config(Some(apify_config)).await?;
+
+    // Submit the Instagram post URL
+    let url_id = server
+        .submit_url("https://www.instagram.com/p/DP1Y0KYDCHh")
+        .await?;
+
+    // Wait for the page to be resolved
+    server
+        .wait_for_resolved(&url_id, EXTERNAL_API_TIMEOUT)
+        .await?;
+
+    // Wait for at least one media item to be fetched, then poll until all are done
+    let mut dossier = server.wait_for_fetched_media(&url_id).await?;
+
+    // Keep polling until all media items are fetched (carousel has 7 images)
+    for _ in 0..60 {
+        let page = match &dossier.resolved {
+            Some(ResolvedContent::Page(p)) => p,
+            _ => break,
+        };
+        let pending_count = page
+            .media
+            .iter()
+            .filter(|m| matches!(m, MediaReference::Pending { .. }))
+            .count();
+        if pending_count == 0 {
+            break;
+        }
+        #[allow(clippy::disallowed_methods)]
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        dossier = server.get_dossier(&url_id).await?;
+    }
+
+    // Verify we got a page
+    let page = match dossier.resolved {
+        Some(ResolvedContent::Page(page)) => page,
+        _ => return Err("expected resolved page".into()),
+    };
+
+    // Check for expected content from the post caption
+    // Note: Using "elegant Italian villa" to avoid apostrophe encoding issues
+    let content = page.content.as_deref().unwrap_or("");
+    assert!(
+        content.contains("elegant Italian villa"),
+        "post caption should contain expected text, got: {content}"
+    );
+
+    // Check that comments are included
+    assert!(
+        content.contains("@oganiangallery: Amazing shots"),
+        "content should include comments, got: {content}"
+    );
+
+    // Only one fixture is kept (smallest carousel image); others have pinned 404 failures
+    let fetched: Vec<_> = page
+        .media
+        .iter()
+        .filter_map(|m| match m {
+            MediaReference::Fetched(media) => Some(media.as_ref()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        fetched.len(),
+        1,
+        "exactly one carousel image should be fetched (others have pinned 404 fixtures)"
+    );
+
+    // Verify the one fetched image
+    let media = fetched[0];
+    assert_eq!(media.media_type, MediaType::Image, "should be an image");
+    assert_eq!(media.width, 1080, "image width should be 1080");
+    assert_eq!(media.height, 1440, "image height should be 1440");
+
+    // Fetch the image from CDN and verify it's valid
+    let image_bytes = server.fetch_bytes(&media.full_url).await?;
+    let img = image::ImageReader::new(Cursor::new(&image_bytes))
+        .with_guessed_format()?
+        .decode()?;
+
+    // Verify decoded dimensions match the metadata
+    assert_eq!(img.width(), media.width, "decoded width should match");
+    assert_eq!(img.height(), media.height, "decoded height should match");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Test the complete end-to-end flow for an Instagram reel (video content) via Apify.
+///
+/// This test verifies:
+/// 1. URL submission via HTTP API
+/// 2. Worker processes the Instagram reel via Apify batch fetcher
+/// 3. Reel content is extracted correctly (display URL thumbnail + video URL)
+///
+/// # Reel structure
+///
+/// Instagram reels have:
+/// - `display_url`: A static thumbnail image (the video's cover frame)
+/// - `video_url`: The actual video content
+///
+/// Both are fetched and stored. The thumbnail can be used for previews while the
+/// full video is available for playback.
+///
+/// # Running
+///
+/// In playback mode (default), this test uses cached VCR fixtures:
+/// ```bash
+/// cargo test -p chronoscope-dev -- test_instagram_reel
+/// ```
+///
+/// To record/update fixtures, set `APIFY_API_TOKEN` and enable the feature:
+/// ```bash
+/// APIFY_API_TOKEN=xxx cargo test -p chronoscope-dev --features record-fixtures -- test_instagram_reel
+/// ```
+///
+/// Without the token in recording mode, the test is skipped (not failed).
+#[cfg_attr(feature = "record-fixtures", test_with::env(APIFY_API_TOKEN))]
+#[tokio::test]
+async fn test_instagram_reel_end_to_end() -> TestResult {
+    let apify_config = apify_config_for_test().expect("playback mode always returns Some");
+
+    let server = TestServer::start_with_config(Some(apify_config)).await?;
+
+    // Submit the Instagram reel URL
+    let url_id = server
+        .submit_url("https://www.instagram.com/reel/DTnX730ETHG/")
+        .await?;
+
+    // Wait for the page to be resolved
+    server
+        .wait_for_resolved(&url_id, EXTERNAL_API_TIMEOUT)
+        .await?;
+
+    // Wait for both media items to be fetched (thumbnail + video)
+    // The video is ~22MB so this may take a moment
+    let mut dossier = server.wait_for_fetched_media(&url_id).await?;
+
+    // Keep polling until both media items are fetched (video takes longer)
+    for _ in 0..30 {
+        let page = match &dossier.resolved {
+            Some(ResolvedContent::Page(p)) => p,
+            _ => break,
+        };
+        let fetched_count = page
+            .media
+            .iter()
+            .filter(|m| matches!(m, MediaReference::Fetched(_)))
+            .count();
+        if fetched_count >= 2 {
+            break;
+        }
+        #[allow(clippy::disallowed_methods)]
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        dossier = server.get_dossier(&url_id).await?;
+    }
+
+    // Verify we got a page
+    let page = match dossier.resolved {
+        Some(ResolvedContent::Page(page)) => page,
+        _ => return Err("expected resolved page".into()),
+    };
+
+    // Reels should have 2 media items: thumbnail (display_url) + video (video_url)
+    let fetched: Vec<_> = page
+        .media
+        .iter()
+        .filter_map(|m| match m {
+            MediaReference::Fetched(media) => Some(media.as_ref()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        fetched.len(),
+        2,
+        "both thumbnail and video should be fetched"
+    );
+
+    // Find the image (thumbnail) and video by media type
+    let thumbnail = fetched
+        .iter()
+        .find(|m| m.media_type == MediaType::Image)
+        .ok_or("expected thumbnail image")?;
+    let video = fetched
+        .iter()
+        .find(|m| m.media_type == MediaType::Video)
+        .ok_or("expected video")?;
+
+    // Verify thumbnail dimensions (from fixture)
+    assert_eq!(thumbnail.width, 640, "thumbnail width should be 640");
+    assert_eq!(thumbnail.height, 1136, "thumbnail height should be 1136");
+
+    // Verify video metadata (from fixture)
+    assert_eq!(video.width, 720, "video width should be 720");
+    assert_eq!(video.height, 1280, "video height should be 1280");
+    let duration = video.duration_seconds.expect("video should have duration");
+    // Duration is ~56.6 seconds; check within a small tolerance
+    assert!(
+        (56.0..57.0).contains(&duration),
+        "video duration should be ~56.6s, got {duration}"
+    );
+
+    // Fetch the thumbnail from CDN and verify it's a valid image
+    let image_bytes = server.fetch_bytes(&thumbnail.full_url).await?;
+    let img = image::ImageReader::new(Cursor::new(&image_bytes))
+        .with_guessed_format()?
+        .decode()?;
+
+    // Verify decoded dimensions match the metadata
+    assert_eq!(
+        img.width(),
+        thumbnail.width,
+        "decoded thumbnail width should match metadata"
+    );
+    assert_eq!(
+        img.height(),
+        thumbnail.height,
+        "decoded thumbnail height should match metadata"
+    );
+
+    server.shutdown().await;
     Ok(())
 }

@@ -189,13 +189,22 @@ impl FetchError {
     /// Convert an HTTP status code to a [`FetchError`], returning `Ok(())` for success codes.
     ///
     /// Provides consistent error handling across all integrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-success status codes:
+    /// - [`FetchError::NotFound`] for 404
+    /// - [`FetchError::Forbidden`] for 401 and 403
+    /// - [`FetchError::RateLimited`] for 429
+    /// - [`FetchError::ServerError`] for 5xx codes
+    /// - [`FetchError::Http`] for other non-success codes
     pub fn from_status(status: StatusCode) -> Result<(), Self> {
         if status.is_success() {
             return Ok(());
         }
         Err(match status.as_u16() {
             404 => Self::NotFound,
-            403 => Self::Forbidden,
+            401 | 403 => Self::Forbidden,
             429 => Self::RateLimited,
             code @ 500..=599 => Self::ServerError { status: code },
             code => Self::Http(format!("unexpected status: {code}")),
@@ -242,6 +251,18 @@ impl HttpRequest {
         }
     }
 
+    /// Create a POST request.
+    #[must_use]
+    pub fn post(url: Url) -> Self {
+        Self {
+            method: Method::POST,
+            url,
+            headers: HeaderMap::new(),
+            body: None,
+            timeout: None,
+        }
+    }
+
     /// Add a header to the request.
     #[must_use]
     pub fn header(
@@ -250,6 +271,17 @@ impl HttpRequest {
         value: impl Into<reqwest::header::HeaderValue>,
     ) -> Self {
         self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    /// Set a JSON body, automatically adding the Content-Type header.
+    #[must_use]
+    pub fn json_body(mut self, body: impl Into<Bytes>) -> Self {
+        self.headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        self.body = Some(body.into());
         self
     }
 
@@ -370,7 +402,9 @@ impl Default for ReqwestConfig {
             // Reddit blocks generic user agents; use a descriptive one
             user_agent: "Chronoscope/0.1 (historical research tool)".to_string(),
             max_redirects: 10,
-            max_response_size: 20 * 1024 * 1024, // 20MB
+            // TODO: Split into separate limits for images (conservative, ~10MB) and video
+            // (larger, ~100MB+). Currently using a single limit that accommodates video.
+            max_response_size: 50 * 1024 * 1024, // 50MB
         }
     }
 }
@@ -488,16 +522,69 @@ impl CachingClient {
     }
 
     /// Generate a cache key from a request.
+    ///
+    /// Includes method, URL, and body hash to distinguish requests to the same
+    /// endpoint with different payloads (e.g., Apify POST requests for different URLs).
+    ///
+    /// CDN hostnames are normalized to avoid cache misses when the same content
+    /// is served from different edge servers (e.g., `scontent-lax7-1.cdninstagram.com`
+    /// and `scontent-dfw5-2.cdninstagram.com` both normalize to `cdninstagram.com`).
     #[must_use]
     pub fn cache_key(request: &HttpRequest) -> String {
         use sha2::{Digest, Sha256};
 
+        // Normalize URL for cache key
+        let normalized_url = Self::normalize_url_for_cache(&request.url);
+
         let mut hasher = Sha256::new();
         hasher.update(request.method.as_str().as_bytes());
         hasher.update(b"|");
-        hasher.update(request.url.as_str().as_bytes());
+        hasher.update(normalized_url.as_bytes());
+        if let Some(ref body) = request.body {
+            hasher.update(b"|");
+            hasher.update(body.as_ref());
+        }
         let hash = hasher.finalize();
         hex::encode(&hash[..16]) // Use first 16 bytes (32 hex chars)
+    }
+
+    /// Normalize a URL for cache key computation.
+    ///
+    /// Strips CDN-specific variations that change per-request but serve the same content:
+    /// - Instagram CDN subdomains (scontent-xxx-N.cdninstagram.com → cdninstagram.com)
+    /// - Reddit preview signature parameter (s=...) which changes but serves same image
+    fn normalize_url_for_cache(url: &Url) -> String {
+        let mut normalized = url.clone();
+
+        if let Some(host) = url.host_str() {
+            // Normalize *.cdninstagram.com → cdninstagram.com
+            if host.ends_with(".cdninstagram.com") || host == "cdninstagram.com" {
+                let _ = normalized.set_host(Some("cdninstagram.com"));
+            }
+
+            // Strip signature parameter from Reddit preview URLs
+            // The 's' param is a time-sensitive signature, but the image content is the same
+            if host == "preview.redd.it" {
+                let filtered_pairs: Vec<(String, String)> = normalized
+                    .query_pairs()
+                    .filter(|(k, _)| k != "s")
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+
+                if filtered_pairs.is_empty() {
+                    normalized.set_query(None);
+                } else {
+                    let query = filtered_pairs
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    normalized.set_query(Some(&query));
+                }
+            }
+        }
+
+        normalized.to_string()
     }
 
     /// Get the cache file path for a request.
@@ -521,11 +608,28 @@ impl CachingClient {
     }
 
     /// Write a response to the cache.
+    ///
+    /// If the existing cache file is pinned (manually modified), this skips writing
+    /// and logs an info message instead.
     async fn write_cache(
         &self,
         request: &HttpRequest,
         response: &HttpResponse,
     ) -> Result<(), HttpError> {
+        let path = self.cache_path(request);
+
+        // Check if existing fixture is pinned
+        if let Ok(existing_data) = tokio::fs::read(&path).await
+            && let Ok(existing) = serde_json::from_slice::<CachedResponse>(&existing_data)
+            && let Some(reason) = &existing.pinned
+        {
+            eprintln!(
+                "[VCR] Skipping write-through on pinned fixture: {} (reason: {reason})",
+                request.url
+            );
+            return Ok(());
+        }
+
         // Ensure cache directory exists
         tokio::fs::create_dir_all(&self.cache_dir)
             .await
@@ -535,7 +639,6 @@ impl CachingClient {
         let data = serde_json::to_vec_pretty(&cached)
             .map_err(|e| HttpError::CacheIo(format!("failed to serialize: {e}")))?;
 
-        let path = self.cache_path(request);
         tokio::fs::write(&path, data)
             .await
             .map_err(|e| HttpError::CacheIo(e.to_string()))?;
@@ -554,6 +657,10 @@ struct CachedResponse {
     #[serde(with = "base64_bytes")]
     body: Vec<u8>,
     final_url: String,
+    /// If set, this fixture has been manually modified and should not be overwritten.
+    /// The value describes why/how it was modified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pinned: Option<String>,
 }
 
 impl CachedResponse {
@@ -574,6 +681,7 @@ impl CachedResponse {
             headers,
             body: response.body.to_vec(),
             final_url: response.final_url.to_string(),
+            pinned: None,
         }
     }
 }
@@ -639,17 +747,22 @@ impl HttpClient for CachingClient {
             }
 
             CacheMode::Online => {
-                // Check cache first
-                if let Some(cached) = self.read_cache(&request).await? {
+                // Recording mode: fetch from network and cache the response.
+                //
+                // Exception: pinned fixtures are returned directly without network
+                // requests. This ensures pinned fixtures behave identically in both
+                // online and offline modes.
+                if let Some(cached) = self.read_cache(&request).await?
+                    && cached.pinned.is_some()
+                {
                     return cached.try_into();
                 }
 
-                // Fetch from network
+                // Write-through caching: we overwrite any existing entry.
+                // For polling APIs, this means the cache ends up with the final
+                // response (e.g., "SUCCEEDED"), which is what we want for playback.
                 let response = self.inner.execute(request.clone()).await?;
-
-                // Cache the response
                 self.write_cache(&request, &response).await?;
-
                 Ok(response)
             }
         }

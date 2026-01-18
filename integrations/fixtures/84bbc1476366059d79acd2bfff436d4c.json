@@ -1,18 +1,18 @@
 {
-  "url": "https://example.com/nonexistent-page-12345",
+  "url": "https://example.com/no-fixture-exists",
   "method": "GET",
   "status": 404,
   "headers": {
-    "cf-cache-status": "HIT",
-    "transfer-encoding": "chunked",
-    "connection": "keep-alive",
-    "server": "cloudflare",
-    "date": "Sun, 18 Jan 2026 08:41:22 GMT",
-    "cf-ray": "9bfccafd4b56eef3-YVR",
+    "date": "Sun, 18 Jan 2026 08:44:41 GMT",
     "vary": "Accept-Encoding",
+    "transfer-encoding": "chunked",
+    "cf-ray": "9bfccfd6ec1deb3c-SEA",
+    "connection": "keep-alive",
+    "cf-cache-status": "HIT",
+    "age": "173",
     "content-type": "text/html",
-    "age": "205"
+    "server": "cloudflare"
   },
   "body": "PCFkb2N0eXBlIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjx0aXRsZT5FeGFtcGxlIERvbWFpbjwvdGl0bGU+PG1ldGEgbmFtZT0idmlld3BvcnQiIGNvbnRlbnQ9IndpZHRoPWRldmljZS13aWR0aCwgaW5pdGlhbC1zY2FsZT0xIj48c3R5bGU+Ym9keXtiYWNrZ3JvdW5kOiNlZWU7d2lkdGg6NjB2dzttYXJnaW46MTV2aCBhdXRvO2ZvbnQtZmFtaWx5OnN5c3RlbS11aSxzYW5zLXNlcmlmfWgxe2ZvbnQtc2l6ZToxLjVlbX1kaXZ7b3BhY2l0eTowLjh9YTpsaW5rLGE6dmlzaXRlZHtjb2xvcjojMzQ4fTwvc3R5bGU+PGJvZHk+PGRpdj48aDE+RXhhbXBsZSBEb21haW48L2gxPjxwPlRoaXMgZG9tYWluIGlzIGZvciB1c2UgaW4gZG9jdW1lbnRhdGlvbiBleGFtcGxlcyB3aXRob3V0IG5lZWRpbmcgcGVybWlzc2lvbi4gQXZvaWQgdXNlIGluIG9wZXJhdGlvbnMuPHA+PGEgaHJlZj0iaHR0cHM6Ly9pYW5hLm9yZy9kb21haW5zL2V4YW1wbGUiPkxlYXJuIG1vcmU8L2E+PC9kaXY+PC9ib2R5PjwvaHRtbD4K",
-  "final_url": "https://example.com/nonexistent-page-12345"
+  "final_url": "https://example.com/no-fixture-exists"
 }
