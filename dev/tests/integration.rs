@@ -29,14 +29,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Extended timeout for external API calls (30 seconds).
 const EXTERNAL_API_TIMEOUT: Duration = Duration::from_secs(30);
 
-// CARGO_MANIFEST_DIR is a compile-time constant that always has a parent directory.
-#[allow(clippy::expect_used)]
-fn fixtures_dir() -> std::path::PathBuf {
+fn fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
     // Fixtures are in the integrations crate
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    Ok(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("dev crate should have parent")
-        .join("integrations/fixtures")
+        .ok_or("dev crate should have parent")?
+        .join("integrations/fixtures"))
 }
 
 fn vcr_mode() -> CacheMode {
@@ -70,7 +68,7 @@ impl TestServer {
         apify_config: Option<ApifyConfig>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let http_client: Arc<dyn HttpClient> =
-            Arc::new(CachingClient::new(fixtures_dir(), vcr_mode())?);
+            Arc::new(CachingClient::new(fixtures_dir()?, vcr_mode())?);
 
         let log = ConfigLogging::StderrTerminal {
             level: dropshot::ConfigLoggingLevel::Warn,
@@ -154,51 +152,30 @@ impl TestServer {
         Ok(resp.json().await?)
     }
 
-    /// Wait until the URL is resolved or failed, with configurable timeout.
+    /// Wait until a condition on the page's media is satisfied.
+    ///
+    /// Polls until the dossier has a resolved page and the condition returns true
+    /// for that page's media items.
     // Polling is appropriate for integration tests waiting on async worker completion.
     #[allow(clippy::disallowed_methods)]
-    async fn wait_for_resolved(
+    async fn wait_for_media_condition(
         &self,
         url_id: &str,
+        condition: impl Fn(&[MediaReference]) -> bool,
         timeout: Duration,
     ) -> Result<ResearchUrlDossier, Box<dyn std::error::Error + Send + Sync>> {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
             tokio::time::sleep(POLL_INTERVAL).await;
             let dossier = self.get_dossier(url_id).await?;
-            if dossier.resolved.is_some() {
+
+            if let Some(ResolvedContent::Page(page)) = &dossier.resolved
+                && condition(&page.media)
+            {
                 return Ok(dossier);
             }
-            if dossier.status == ResearchUrlStatus::Failed {
-                return Err(format!("URL failed: {:?}", dossier).into());
-            }
         }
-        Err(format!("timeout waiting for URL to resolve after {timeout:?}").into())
-    }
-
-    /// Wait until at least one media item is fetched.
-    // Polling is appropriate for integration tests waiting on async worker completion.
-    #[allow(clippy::disallowed_methods)]
-    async fn wait_for_fetched_media(
-        &self,
-        url_id: &str,
-    ) -> Result<ResearchUrlDossier, Box<dyn std::error::Error + Send + Sync>> {
-        let start = std::time::Instant::now();
-        while start.elapsed() < DEFAULT_TIMEOUT {
-            tokio::time::sleep(POLL_INTERVAL).await;
-            let dossier = self.get_dossier(url_id).await?;
-
-            if let Some(ResolvedContent::Page(page)) = &dossier.resolved {
-                let has_fetched = page
-                    .media
-                    .iter()
-                    .any(|m| matches!(m, MediaReference::Fetched(_)));
-                if has_fetched {
-                    return Ok(dossier);
-                }
-            }
-        }
-        Err("timeout waiting for media to be fetched".into())
+        Err(format!("timeout waiting for media condition after {timeout:?}").into())
     }
 
     /// Fetch raw bytes from a URL (for media verification).
@@ -246,35 +223,22 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
         .submit_url("https://www.reddit.com/r/abandoned/comments/1qcyfyj/bolshoye_selo/")
         .await?;
 
-    // Wait for the page to be resolved
-    server.wait_for_resolved(&url_id, DEFAULT_TIMEOUT).await?;
-
-    // Wait for at least one media item to be fetched, then poll until all are done
-    let mut dossier = server.wait_for_fetched_media(&url_id).await?;
-
-    // Keep polling until all media items are fetched
-    for _ in 0..30 {
-        let page = match &dossier.resolved {
-            Some(ResolvedContent::Page(p)) => p,
-            _ => break,
-        };
-        let pending_count = page
-            .media
-            .iter()
-            .filter(|m| matches!(m, MediaReference::Pending { .. }))
-            .count();
-        if pending_count == 0 {
-            break;
-        }
-        #[allow(clippy::disallowed_methods)]
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        dossier = server.get_dossier(&url_id).await?;
-    }
+    // Wait for the expected media to be fetched (1 image has a fixture, rest have pinned 404s)
+    let dossier = server
+        .wait_for_media_condition(
+            &url_id,
+            |media| {
+                media
+                    .iter()
+                    .any(|m| matches!(m, MediaReference::Fetched(_)))
+            },
+            DEFAULT_TIMEOUT,
+        )
+        .await?;
 
     // Verify we got a page with media
-    let page = match dossier.resolved {
-        Some(ResolvedContent::Page(page)) => page,
-        _ => return Err("expected resolved page".into()),
+    let Some(ResolvedContent::Page(page)) = dossier.resolved else {
+        return Err("expected resolved page".into());
     };
     assert!(!page.media.is_empty(), "should have media items");
 
@@ -284,7 +248,7 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
         .iter()
         .filter_map(|m| match m {
             MediaReference::Fetched(media) => Some(media.as_ref()),
-            _ => None,
+            MediaReference::Pending { .. } => None,
         })
         .collect();
 
@@ -439,7 +403,8 @@ fn apify_config_for_test() -> Option<ApifyConfig> {
 #[cfg_attr(feature = "record-fixtures", test_with::env(APIFY_API_TOKEN))]
 #[tokio::test]
 async fn test_instagram_post_end_to_end() -> TestResult {
-    let apify_config = apify_config_for_test().expect("playback mode always returns Some");
+    let apify_config =
+        apify_config_for_test().ok_or("apify config should be available in playback mode")?;
 
     let server = TestServer::start_with_config(Some(apify_config)).await?;
 
@@ -448,37 +413,22 @@ async fn test_instagram_post_end_to_end() -> TestResult {
         .submit_url("https://www.instagram.com/p/DP1Y0KYDCHh")
         .await?;
 
-    // Wait for the page to be resolved
-    server
-        .wait_for_resolved(&url_id, EXTERNAL_API_TIMEOUT)
+    // Wait for the expected media to be fetched (1 image has a fixture, rest have pinned 404s)
+    let dossier = server
+        .wait_for_media_condition(
+            &url_id,
+            |media| {
+                media
+                    .iter()
+                    .any(|m| matches!(m, MediaReference::Fetched(_)))
+            },
+            EXTERNAL_API_TIMEOUT,
+        )
         .await?;
 
-    // Wait for at least one media item to be fetched, then poll until all are done
-    let mut dossier = server.wait_for_fetched_media(&url_id).await?;
-
-    // Keep polling until all media items are fetched (carousel has 7 images)
-    for _ in 0..60 {
-        let page = match &dossier.resolved {
-            Some(ResolvedContent::Page(p)) => p,
-            _ => break,
-        };
-        let pending_count = page
-            .media
-            .iter()
-            .filter(|m| matches!(m, MediaReference::Pending { .. }))
-            .count();
-        if pending_count == 0 {
-            break;
-        }
-        #[allow(clippy::disallowed_methods)]
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        dossier = server.get_dossier(&url_id).await?;
-    }
-
     // Verify we got a page
-    let page = match dossier.resolved {
-        Some(ResolvedContent::Page(page)) => page,
-        _ => return Err("expected resolved page".into()),
+    let Some(ResolvedContent::Page(page)) = &dossier.resolved else {
+        return Err("expected resolved page".into());
     };
 
     // Check for expected content from the post caption
@@ -501,7 +451,7 @@ async fn test_instagram_post_end_to_end() -> TestResult {
         .iter()
         .filter_map(|m| match m {
             MediaReference::Fetched(media) => Some(media.as_ref()),
-            _ => None,
+            MediaReference::Pending { .. } => None,
         })
         .collect();
 
@@ -563,7 +513,8 @@ async fn test_instagram_post_end_to_end() -> TestResult {
 #[cfg_attr(feature = "record-fixtures", test_with::env(APIFY_API_TOKEN))]
 #[tokio::test]
 async fn test_instagram_reel_end_to_end() -> TestResult {
-    let apify_config = apify_config_for_test().expect("playback mode always returns Some");
+    let apify_config =
+        apify_config_for_test().ok_or("apify config should be available in playback mode")?;
 
     let server = TestServer::start_with_config(Some(apify_config)).await?;
 
@@ -572,38 +523,25 @@ async fn test_instagram_reel_end_to_end() -> TestResult {
         .submit_url("https://www.instagram.com/reel/DTnX730ETHG/")
         .await?;
 
-    // Wait for the page to be resolved
-    server
-        .wait_for_resolved(&url_id, EXTERNAL_API_TIMEOUT)
-        .await?;
-
     // Wait for both media items to be fetched (thumbnail + video)
     // The video is ~22MB so this may take a moment
-    let mut dossier = server.wait_for_fetched_media(&url_id).await?;
-
-    // Keep polling until both media items are fetched (video takes longer)
-    for _ in 0..30 {
-        let page = match &dossier.resolved {
-            Some(ResolvedContent::Page(p)) => p,
-            _ => break,
-        };
-        let fetched_count = page
-            .media
-            .iter()
-            .filter(|m| matches!(m, MediaReference::Fetched(_)))
-            .count();
-        if fetched_count >= 2 {
-            break;
-        }
-        #[allow(clippy::disallowed_methods)]
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        dossier = server.get_dossier(&url_id).await?;
-    }
+    let dossier = server
+        .wait_for_media_condition(
+            &url_id,
+            |media| {
+                media
+                    .iter()
+                    .filter(|m| matches!(m, MediaReference::Fetched(_)))
+                    .count()
+                    >= 2
+            },
+            EXTERNAL_API_TIMEOUT,
+        )
+        .await?;
 
     // Verify we got a page
-    let page = match dossier.resolved {
-        Some(ResolvedContent::Page(page)) => page,
-        _ => return Err("expected resolved page".into()),
+    let Some(ResolvedContent::Page(page)) = &dossier.resolved else {
+        return Err("expected resolved page".into());
     };
 
     // Reels should have 2 media items: thumbnail (display_url) + video (video_url)
@@ -612,7 +550,7 @@ async fn test_instagram_reel_end_to_end() -> TestResult {
         .iter()
         .filter_map(|m| match m {
             MediaReference::Fetched(media) => Some(media.as_ref()),
-            _ => None,
+            MediaReference::Pending { .. } => None,
         })
         .collect();
 
@@ -639,7 +577,7 @@ async fn test_instagram_reel_end_to_end() -> TestResult {
     // Verify video metadata (from fixture)
     assert_eq!(video.width, 720, "video width should be 720");
     assert_eq!(video.height, 1280, "video height should be 1280");
-    let duration = video.duration_seconds.expect("video should have duration");
+    let duration = video.duration_seconds.ok_or("video should have duration")?;
     // Duration is ~56.6 seconds; check within a small tolerance
     assert!(
         (56.0..57.0).contains(&duration),
