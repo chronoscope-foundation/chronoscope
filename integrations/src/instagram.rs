@@ -122,7 +122,7 @@ impl BatchFetcher for InstagramIntegration {
                 let error_msg = e.to_string();
                 warn!(error = %error_msg, "Apify pipeline failed");
                 urls.iter()
-                    .map(|url| (url.clone(), Err(FetchError::Http(error_msg.clone()))))
+                    .map(|url| (url.clone(), Err(FetchError::service(error_msg.clone()))))
                     .collect()
             }
         }
@@ -208,7 +208,7 @@ impl InstagramIntegration {
 
         loop {
             if start.elapsed() > config.max_wait {
-                return Err(FetchError::Http(format!(
+                return Err(FetchError::service(format!(
                     "Apify run timed out after {:?}",
                     config.max_wait
                 )));
@@ -233,7 +233,7 @@ impl InstagramIntegration {
                     return Ok(run_status.data.default_dataset_id);
                 }
                 "FAILED" | "ABORTED" | "TIMED-OUT" => {
-                    return Err(FetchError::Http(format!(
+                    return Err(FetchError::service(format!(
                         "Apify run failed with status: {}",
                         run_status.data.status
                     )));

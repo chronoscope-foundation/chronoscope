@@ -130,10 +130,9 @@ mod tests {
 
     #[test]
     fn test_retriable_errors() {
-        // HTTP errors are retriable (network issues, etc.)
+        // Service errors are retriable (integration-level issues)
         assert!(
-            FetchError::Integration(IntegrationError::Http("connection reset".into()))
-                .is_retriable()
+            FetchError::Integration(IntegrationError::service("connection reset")).is_retriable()
         );
 
         // Rate limiting should be retried after delay

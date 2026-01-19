@@ -33,7 +33,7 @@ fn is_cache_miss(error: &FetchError) -> bool {
     // Cache misses come through wrapped as Integration errors
     matches!(
         error,
-        FetchError::Integration(chronoscope_integrations::FetchError::CacheMiss(_))
+        FetchError::Integration(chronoscope_integrations::FetchError::CacheMiss { .. })
     )
 }
 

@@ -12,21 +12,15 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 /// Error type for media store operations.
-#[derive(Debug, Clone)]
-pub struct MediaStoreError(String);
+#[derive(Debug, thiserror::Error)]
+pub enum MediaStoreError {
+    /// I/O error during media operations.
+    #[error("media store I/O error: {0}")]
+    Io(#[from] std::io::Error),
 
-impl std::fmt::Display for MediaStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "media store I/O error: {}", self.0)
-    }
-}
-
-impl std::error::Error for MediaStoreError {}
-
-impl From<std::io::Error> for MediaStoreError {
-    fn from(err: std::io::Error) -> Self {
-        Self(err.to_string())
-    }
+    /// Lock was poisoned (a thread panicked while holding it).
+    #[error("lock poisoned: {0}")]
+    LockPoisoned(String),
 }
 
 /// Metadata about stored media.
@@ -158,7 +152,7 @@ impl MediaStore for InMemoryMediaStore {
 
         self.storage
             .write()
-            .map_err(|e| MediaStoreError(format!("lock poisoned: {e}")))?
+            .map_err(|e| MediaStoreError::LockPoisoned(e.to_string()))?
             .insert(key.to_string(), stored);
 
         Ok(())
@@ -171,7 +165,7 @@ impl MediaStore for InMemoryMediaStore {
         let guard = self
             .storage
             .read()
-            .map_err(|e| MediaStoreError(format!("lock poisoned: {e}")))?;
+            .map_err(|e| MediaStoreError::LockPoisoned(e.to_string()))?;
 
         match guard.get(key) {
             Some(stored) => {
@@ -187,7 +181,7 @@ impl MediaStore for InMemoryMediaStore {
         let guard = self
             .storage
             .read()
-            .map_err(|e| MediaStoreError(format!("lock poisoned: {e}")))?;
+            .map_err(|e| MediaStoreError::LockPoisoned(e.to_string()))?;
 
         Ok(guard.get(key).map(|stored| MediaMetadata {
             content_type: stored.content_type.clone(),
@@ -199,7 +193,7 @@ impl MediaStore for InMemoryMediaStore {
         let guard = self
             .storage
             .read()
-            .map_err(|e| MediaStoreError(format!("lock poisoned: {e}")))?;
+            .map_err(|e| MediaStoreError::LockPoisoned(e.to_string()))?;
 
         Ok(guard.get(key).map(|stored| MediaWithMetadata {
             data: stored.data.clone(),

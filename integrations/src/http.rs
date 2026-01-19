@@ -100,43 +100,36 @@ fn is_redirect_blocked(host: &str) -> bool {
 // ==================== Error Types ====================
 
 /// Error type for HTTP operations.
-#[derive(Debug, Clone)]
+#[derive(Debug, thiserror::Error)]
 pub enum HttpError {
-    /// Network-level error (timeout, connection refused, etc.)
-    Network(String),
-    /// Request building error (invalid URL, headers, etc.)
-    Request(String),
+    /// Request failed (timeout, connection, build error, etc.)
+    #[error("request error: {0}")]
+    Reqwest(#[from] reqwest::Error),
+
     /// Response body exceeds maximum allowed size.
+    #[error("response too large: {size} bytes exceeds {max} byte limit")]
     ResponseTooLarge { size: usize, max: usize },
+
     /// Redirect to a blocked destination (SSRF protection).
+    #[error("redirect to blocked destination: {url}")]
     BlockedRedirect { url: String },
+
     /// Cache miss in offline mode.
+    #[error("cache miss for {url} in offline mode")]
     CacheMiss { url: String },
+
     /// I/O error during cache operations.
-    CacheIo(String),
-}
+    #[error("cache I/O error: {0}")]
+    CacheIo(#[from] std::io::Error),
 
-impl std::fmt::Display for HttpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Network(msg) => write!(f, "network error: {msg}"),
-            Self::Request(msg) => write!(f, "request error: {msg}"),
-            Self::ResponseTooLarge { size, max } => {
-                write!(
-                    f,
-                    "response too large: {size} bytes exceeds {max} byte limit"
-                )
-            }
-            Self::BlockedRedirect { url } => {
-                write!(f, "redirect to blocked destination: {url}")
-            }
-            Self::CacheMiss { url } => write!(f, "cache miss for {url} in offline mode"),
-            Self::CacheIo(msg) => write!(f, "cache I/O error: {msg}"),
-        }
-    }
-}
+    /// Cache file has invalid JSON format.
+    #[error("cache format error: {0}")]
+    CacheFormat(#[source] serde_json::Error),
 
-impl std::error::Error for HttpError {}
+    /// Cache data is invalid (e.g., corrupt status code or URL).
+    #[error("invalid cache data: {0}")]
+    CacheInvalid(String),
+}
 
 /// Errors that can occur during fetching.
 ///
@@ -144,9 +137,13 @@ impl std::error::Error for HttpError {}
 /// HTTP-level errors and adds semantic errors like "not found" and "rate limited".
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
-    /// HTTP request failed (may be retriable).
+    /// HTTP transport error (may be retriable).
     #[error("HTTP error: {0}")]
-    Http(String),
+    Http(#[source] HttpError),
+
+    /// Integration service error (e.g., Apify run failed).
+    #[error("service error: {0}")]
+    Service(String),
 
     /// Rate limited - should retry after delay.
     #[error("rate limited")]
@@ -155,6 +152,10 @@ pub enum FetchError {
     /// Server error (5xx) - retriable.
     #[error("server error: {status}")]
     ServerError { status: u16 },
+
+    /// Unexpected HTTP status code - retriable.
+    #[error("unexpected status: {status}")]
+    UnexpectedStatus { status: u16 },
 
     /// Content not found (404) - permanent.
     #[error("not found")]
@@ -169,8 +170,8 @@ pub enum FetchError {
     ParseError(String),
 
     /// VCR cache miss - permanent (only occurs in test mode).
-    #[error("cache miss: {0}")]
-    CacheMiss(String),
+    #[error("cache miss: {url}")]
+    CacheMiss { url: String },
 }
 
 impl FetchError {
@@ -181,9 +182,15 @@ impl FetchError {
     #[must_use]
     pub fn from_http_error(e: HttpError) -> Self {
         match e {
-            HttpError::CacheMiss { url } => Self::CacheMiss(url),
-            other => Self::Http(other.to_string()),
+            HttpError::CacheMiss { url } => Self::CacheMiss { url },
+            other => Self::Http(other),
         }
+    }
+
+    /// Create a service error for integration-level failures.
+    #[must_use]
+    pub fn service(message: impl Into<String>) -> Self {
+        Self::Service(message.into())
     }
 
     /// Convert an HTTP status code to a [`FetchError`], returning `Ok(())` for success codes.
@@ -197,7 +204,7 @@ impl FetchError {
     /// - [`FetchError::Forbidden`] for 401 and 403
     /// - [`FetchError::RateLimited`] for 429
     /// - [`FetchError::ServerError`] for 5xx codes
-    /// - [`FetchError::Http`] for other non-success codes
+    /// - [`FetchError::UnexpectedStatus`] for other non-success codes
     pub fn from_status(status: StatusCode) -> Result<(), Self> {
         if status.is_success() {
             return Ok(());
@@ -207,7 +214,7 @@ impl FetchError {
             401 | 403 => Self::Forbidden,
             429 => Self::RateLimited,
             code @ 500..=599 => Self::ServerError { status: code },
-            code => Self::Http(format!("unexpected status: {code}")),
+            status => Self::UnexpectedStatus { status },
         })
     }
 
@@ -216,7 +223,11 @@ impl FetchError {
     pub fn is_retriable(&self) -> bool {
         matches!(
             self,
-            Self::Http(_) | Self::RateLimited | Self::ServerError { .. }
+            Self::Http(_)
+                | Self::Service(_)
+                | Self::RateLimited
+                | Self::ServerError { .. }
+                | Self::UnexpectedStatus { .. }
         )
     }
 }
@@ -369,8 +380,7 @@ impl ReqwestClient {
             .connect_timeout(config.connect_timeout)
             .user_agent(&config.user_agent)
             .redirect(redirect_policy)
-            .build()
-            .map_err(|e| HttpError::Request(e.to_string()))?;
+            .build()?;
 
         Ok(Self {
             client,
@@ -425,15 +435,7 @@ impl HttpClient for ReqwestClient {
             builder = builder.timeout(timeout);
         }
 
-        let response = builder.send().await.map_err(|e| {
-            if e.is_timeout() {
-                HttpError::Network(format!("request timed out: {e}"))
-            } else if e.is_connect() {
-                HttpError::Network(format!("connection failed: {e}"))
-            } else {
-                HttpError::Network(e.to_string())
-            }
-        })?;
+        let response = builder.send().await?;
 
         // Extract fields before .bytes() which consumes the response
         let final_url = response.url().clone();
@@ -459,8 +461,7 @@ impl HttpClient for ReqwestClient {
         let mut body = Vec::new();
 
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| HttpError::Network(format!("failed to read body: {e}")))?;
+            let chunk = chunk?;
 
             if body.len() + chunk.len() > self.max_response_size {
                 return Err(HttpError::ResponseTooLarge {
@@ -598,12 +599,12 @@ impl CachingClient {
         let path = self.cache_path(request);
         match tokio::fs::read(&path).await {
             Ok(data) => {
-                let cached: CachedResponse = serde_json::from_slice(&data)
-                    .map_err(|e| HttpError::CacheIo(format!("invalid cache file: {e}")))?;
+                let cached: CachedResponse =
+                    serde_json::from_slice(&data).map_err(HttpError::CacheFormat)?;
                 Ok(Some(cached))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(HttpError::CacheIo(e.to_string())),
+            Err(e) => Err(HttpError::CacheIo(e)),
         }
     }
 
@@ -631,17 +632,12 @@ impl CachingClient {
         }
 
         // Ensure cache directory exists
-        tokio::fs::create_dir_all(&self.cache_dir)
-            .await
-            .map_err(|e| HttpError::CacheIo(e.to_string()))?;
+        tokio::fs::create_dir_all(&self.cache_dir).await?;
 
         let cached = CachedResponse::from_response(request, response);
-        let data = serde_json::to_vec_pretty(&cached)
-            .map_err(|e| HttpError::CacheIo(format!("failed to serialize: {e}")))?;
+        let data = serde_json::to_vec_pretty(&cached).map_err(HttpError::CacheFormat)?;
 
-        tokio::fs::write(&path, data)
-            .await
-            .map_err(|e| HttpError::CacheIo(e.to_string()))?;
+        tokio::fs::write(&path, data).await?;
 
         Ok(())
     }
@@ -690,8 +686,9 @@ impl TryFrom<CachedResponse> for HttpResponse {
     type Error = HttpError;
 
     fn try_from(cached: CachedResponse) -> Result<Self, Self::Error> {
-        let status = StatusCode::from_u16(cached.status)
-            .map_err(|_| HttpError::CacheIo(format!("invalid status code: {}", cached.status)))?;
+        let status = StatusCode::from_u16(cached.status).map_err(|_| {
+            HttpError::CacheInvalid(format!("invalid status code: {}", cached.status))
+        })?;
 
         let mut headers = HeaderMap::new();
         for (k, v) in cached.headers {
@@ -704,7 +701,7 @@ impl TryFrom<CachedResponse> for HttpResponse {
         }
 
         let final_url = Url::parse(&cached.final_url)
-            .map_err(|e| HttpError::CacheIo(format!("invalid cached URL: {e}")))?;
+            .map_err(|e| HttpError::CacheInvalid(format!("invalid cached URL: {e}")))?;
 
         Ok(HttpResponse {
             status,
@@ -781,14 +778,15 @@ mod tests {
 
     #[test]
     fn test_fetch_error_is_retriable() {
-        assert!(FetchError::Http("timeout".into()).is_retriable());
+        assert!(FetchError::service("timeout").is_retriable());
         assert!(FetchError::RateLimited.is_retriable());
         assert!(FetchError::ServerError { status: 500 }.is_retriable());
+        assert!(FetchError::UnexpectedStatus { status: 418 }.is_retriable());
 
         assert!(!FetchError::NotFound.is_retriable());
         assert!(!FetchError::Forbidden.is_retriable());
         assert!(!FetchError::ParseError("bad json".into()).is_retriable());
-        assert!(!FetchError::CacheMiss("url".into()).is_retriable());
+        assert!(!FetchError::CacheMiss { url: "url".into() }.is_retriable());
     }
 
     #[test]
