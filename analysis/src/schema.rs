@@ -22,15 +22,15 @@ use serde::{Deserialize, Serialize};
 /// Run-length encoding alternates between background and foreground run lengths,
 /// compressed into a compact ASCII string using modified LEB128 encoding.
 /// This is the same format used by pycocotools.
+///
+/// Note: Mask dimensions are not stored per-mask. All masks in an `AnalysisResult`
+/// share the same dimensions, stored in `AnalysisResult::image_size`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RleMask {
     /// Compressed run lengths as COCO string (modified LEB128, +48 ASCII offset).
     /// Alternates background/foreground; first run is always background.
     pub counts: String,
-
-    /// Mask dimensions as [height, width].
-    pub size: (u32, u32),
 }
 
 /// A detected region from SAM3 segmentation.
@@ -316,6 +316,10 @@ pub struct VlmAnalysis {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AnalysisResult {
+    /// Source image dimensions as (height, width).
+    /// All region masks share these dimensions.
+    pub image_size: (u32, u32),
+
     /// Detected regions from SAM3 segmentation.
     /// Empty if no regions passed confidence threshold.
     pub segmentation: Vec<DetectedRegion>,

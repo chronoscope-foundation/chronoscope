@@ -4,7 +4,6 @@ BAML syntax is more concise and LLM-friendly than JSON Schema.
 This produces a compact representation that preserves field descriptions.
 """
 
-import json
 from typing import Any
 
 

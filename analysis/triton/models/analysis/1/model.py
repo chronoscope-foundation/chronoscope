@@ -66,12 +66,15 @@ def get_string_from_tensor(tensor: Any) -> str:
     return result
 
 
-def decode_rle(rle: dict[str, Any]) -> np.ndarray:
-    """Decode RLE mask back to binary array."""
-    h, w = rle["size"]
-    counts = rle["counts"]
+def decode_rle(counts: list[int], height: int, width: int) -> np.ndarray:
+    """Decode RLE mask back to binary array.
 
-    mask = np.zeros(h * w, dtype=np.uint8)
+    Args:
+        counts: List of run lengths (alternating background/foreground).
+        height: Mask height.
+        width: Mask width.
+    """
+    mask = np.zeros(height * width, dtype=np.uint8)
     pos = 0
     is_fg = False  # First run is background
 
@@ -81,17 +84,15 @@ def decode_rle(rle: dict[str, Any]) -> np.ndarray:
         pos += run_length
         is_fg = not is_fg
 
-    return mask.reshape((h, w), order="F")
+    return mask.reshape((height, width), order="F")
 
 
-def compress_rle(rle: dict[str, Any]) -> dict[str, Any]:
+def compress_rle(counts: list[int]) -> str:
     """Compress RLE integer array to COCO compressed string format.
 
     Uses modified LEB128 encoding: 5 bits per chunk, +48 for ASCII, bit 5 = continuation.
     This is the same format used by pycocotools for compact wire transfer.
     """
-    counts = rle["counts"]
-
     encoded = []
     for x in counts:
         if x == 0:
@@ -103,7 +104,7 @@ def compress_rle(rle: dict[str, Any]) -> dict[str, Any]:
                 if x > 0:
                     chunk |= 0x20  # Set continuation bit
                 encoded.append(chunk + 48)
-    return {"counts": bytes(encoded).decode("ascii"), "size": rle["size"]}
+    return bytes(encoded).decode("ascii")
 
 
 def annotate_image(image: Image.Image, regions: list[dict[str, Any]]) -> Image.Image:
@@ -136,10 +137,9 @@ def annotate_image(image: Image.Image, regions: list[dict[str, Any]]) -> Image.I
     for region in regions:
         region_id = region["region_id"]
         color = REGION_COLORS[(region_id - 1) % len(REGION_COLORS)]
-        mask_rle = region["mask"]
 
-        # Decode mask
-        mask = decode_rle(mask_rle)
+        # Decode mask from RLE counts
+        mask = decode_rle(region["mask"], image.height, image.width)
 
         # Create colored mask overlay
         mask_rgba = np.zeros((*mask.shape, 4), dtype=np.uint8)
@@ -239,13 +239,18 @@ class TritonPythonModel:
             if estimated_size > MAX_IMAGE_BYTES:
                 size_mb = estimated_size // (1024 * 1024)
                 limit_mb = MAX_IMAGE_BYTES // (1024 * 1024)
+                # Can't safely decode oversized images, use (0, 0) as placeholder
                 result = self._error_result(
-                    f"Image too large: {size_mb}MB exceeds {limit_mb}MB limit"
+                    f"Image too large: {size_mb}MB exceeds {limit_mb}MB limit", 0, 0
                 )
                 result_json = json.dumps(result)
                 output_tensor = pb_utils.Tensor("result", np.array([result_json.encode("utf-8")]))
                 responses.append(pb_utils.InferenceResponse([output_tensor]))
                 continue
+
+            # Decode image early to get dimensions for all code paths
+            image_bytes = base64.b64decode(image_b64)
+            original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
             # 1. Call SAM3 for segmentation
             sam_request = pb_utils.InferenceRequest(
@@ -257,15 +262,15 @@ class TritonPythonModel:
 
             if sam_response.has_error():
                 error_msg = sam_response.error().message()
-                result = self._error_result(f"SAM3 error: {error_msg}")
+                result = self._error_result(
+                    f"SAM3 error: {error_msg}", original.height, original.width
+                )
             else:
                 regions_tensor = pb_utils.get_output_tensor_by_name(sam_response, "regions")
                 regions_json = get_string_from_tensor(regions_tensor)
                 regions = json.loads(regions_json)
 
                 # 2. Annotate image
-                image_bytes = base64.b64decode(image_b64)
-                original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
                 annotated = annotate_image(original, regions)
 
                 # Encode images for VLM
@@ -281,8 +286,11 @@ class TritonPythonModel:
                 )
 
                 # 5. Combine results (compress masks for wire transfer)
-                compressed_regions = [{**r, "mask": compress_rle(r["mask"])} for r in regions]
+                compressed_regions = [
+                    {**r, "mask": {"counts": compress_rle(r["mask"])}} for r in regions
+                ]
                 result = {
+                    "image_size": [original.height, original.width],
                     "segmentation": compressed_regions,
                     "annotated_image": annotated_b64,
                     "vlm": vlm_result,
@@ -396,7 +404,8 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
         if len(responses_list) == 0:
             return {"error": "VLM returned no response"}
         if len(responses_list) > 1:
-            return {"error": f"VLM returned {len(responses_list)} responses, expected 1 (streaming not supported)"}
+            n = len(responses_list)
+            return {"error": f"VLM returned {n} responses, expected 1 (streaming not supported)"}
 
         vlm_response = responses_list[0]
         if vlm_response.has_error():
@@ -426,9 +435,10 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
             pb_utils.Logger.log_error(f"JSON parse error: {e}")
             return {"error": f"JSON parse error: {e}", "raw_output": output_text}
 
-    def _error_result(self, error_msg: str) -> dict[str, Any]:
+    def _error_result(self, error_msg: str, height: int, width: int) -> dict[str, Any]:
         """Create an error result."""
         return {
+            "image_size": [height, width],
             "segmentation": [],
             "annotated_image": None,
             "vlm": {"error": error_msg},

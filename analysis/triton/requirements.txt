@@ -5,6 +5,7 @@ pillow>=10.0.0
 # Testing framework
 pytest>=8.0.0
 hypothesis>=6.100.0
+jsonschema>=4.20.0
 
 # Code quality
 ruff>=0.4.0

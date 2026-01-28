@@ -35,20 +35,19 @@ MIN_CONFIDENCE = 0.5
 MAX_REGIONS = 20
 
 
-def encode_rle(mask: np.ndarray) -> dict[str, Any]:
+def encode_rle(mask: np.ndarray) -> list[int]:
     """Encode a binary mask as RLE (COCO-style, column-major order).
 
     Args:
         mask: Binary mask of shape (H, W) with values 0 or 1.
 
     Returns:
-        Dict with 'counts' (list of run lengths) and 'size' [height, width].
+        List of run lengths (alternating background/foreground, starting with background).
     """
-    h, w = mask.shape
     # Flatten in column-major (Fortran) order for COCO compatibility
     flat = mask.flatten(order="F")
 
-    counts = []
+    counts: list[int] = []
     current_val = 0  # Start counting background
     run_length = 0
 
@@ -62,7 +61,7 @@ def encode_rle(mask: np.ndarray) -> dict[str, Any]:
 
     counts.append(run_length)
 
-    return {"counts": counts, "size": [h, w]}
+    return counts
 
 
 def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:

@@ -74,8 +74,9 @@ class TestRleEncoding:
         )
         @settings(max_examples=50, deadline=None)
         def check_roundtrip(mask):
-            rle = sam3_module.encode_rle(mask)
-            decoded = analysis_model.decode_rle(rle)
+            counts = sam3_module.encode_rle(mask)
+            h, w = mask.shape
+            decoded = analysis_model.decode_rle(counts, h, w)
             assert np.array_equal(decoded, mask)
 
         check_roundtrip()
@@ -93,14 +94,13 @@ class TestRleEncoding:
         ]
 
         for counts in test_cases:
-            rle = {"counts": counts, "size": [100, 100]}
-            compressed = analysis_model.compress_rle(rle)
+            compressed = analysis_model.compress_rle(counts)
 
             # Manually decode the compressed string
             decoded_counts = []
             x = 0
             shift = 0
-            for c in compressed["counts"]:
+            for c in compressed:
                 val = ord(c) - 48
                 x |= (val & 0x1F) << shift
                 if val & 0x20:
@@ -738,3 +738,92 @@ class TestAnalysisOrchestration:
 
         assert "error" in result["vlm"], "Should report JSON parse error"
         assert "JSON" in result["vlm"]["error"] or "json" in result["vlm"]["error"].lower()
+
+
+# =============================================================================
+# Schema compatibility tests
+# =============================================================================
+
+
+class TestSchemaCompatibility:
+    """Tests to ensure Python output matches Rust schema expectations.
+
+    These tests validate that the JSON produced by the Python models can be
+    deserialized by the Rust types, catching schema drift early.
+    """
+
+    def test_analysis_result_matches_rust_schema(self, analysis_model, sam3_module):
+        """Full pipeline output validates against Rust AnalysisResult schema."""
+        import jsonschema
+
+        # Get the Rust-generated schema
+        result = subprocess.run(
+            ["cargo", "run", "--bin", "print_schema", "result"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent.parent,
+        )
+        if result.returncode != 0:
+            pytest.skip(f"cargo not available: {result.stderr[:100]}")
+
+        rust_schema = json.loads(result.stdout)
+
+        # Run the full pipeline to get actual output
+        def sam3_handler(inputs):
+            img_b64 = inputs["image"].as_numpy().flatten()[0].decode("utf-8")
+            img_bytes = base64.b64decode(img_b64)
+            img = Image.open(io.BytesIO(img_bytes))
+
+            mask = np.zeros((img.height, img.width), dtype=np.uint8)
+            mask[10:50, 10:50] = 1
+            regions = [{"region_id": 1, "confidence": 0.85, "mask": sam3_module.encode_rle(mask)}]
+            return mock_triton.InferenceResponse(
+                [mock_triton.Tensor("regions", np.array([json.dumps(regions).encode("utf-8")]))]
+            )
+
+        def vlm_handler(inputs):
+            result = {
+                "is_relevant": True,
+                "rejection_reason": None,
+                "media_type": "photo",
+                "content_summary": "A building",
+                "scene_type": "outdoor",
+                "temporal_cues": ["black and white"],
+                "composite": {"rows": 1, "columns": 1},
+                "regions": {
+                    "1": {
+                        "entity_type": "building",
+                        "description": "A brick building",
+                        "identifiable_features": ["red brick", "arched windows"],
+                        "visible_text": [],
+                        "damage_signs": [],
+                    }
+                },
+                "region_relationships": [],
+                "extracted_text": [{"text": "1923", "location": "cornerstone"}],
+            }
+            return mock_triton.InferenceResponse(
+                [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
+            )
+
+        mock_triton.register_model("sam3", sam3_handler)
+        mock_triton.register_model("vlm", vlm_handler)
+
+        model = analysis_model.TritonPythonModel()
+        model.initialize({"model_config": json.dumps({})})
+
+        request = mock_triton.InferenceRequest(
+            model_name="analysis",
+            requested_output_names=["result"],
+            inputs=[
+                mock_triton.Tensor("image", np.array([make_test_image().encode("utf-8")])),
+                mock_triton.Tensor("schema", np.array([make_test_schema().encode("utf-8")])),
+            ],
+        )
+
+        responses = model.execute([request])
+        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
+        python_output = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+
+        # Validate against Rust schema
+        jsonschema.validate(instance=python_output, schema=rust_schema)
