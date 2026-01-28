@@ -1,0 +1,11 @@
+{
+  "model": "Qwen/Qwen3-VL-32B-Instruct",
+  "trust_remote_code": true,
+  "gpu_memory_utilization": 0.8,
+  "max_model_len": 131072,
+  "tensor_parallel_size": 2,
+  "distributed_executor_backend": "ray",
+  "limit_mm_per_prompt": {
+    "image": 2
+  }
+}

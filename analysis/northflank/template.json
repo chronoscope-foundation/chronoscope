@@ -1,0 +1,140 @@
+{
+  "name": "triton-analysis",
+  "description": "Triton Inference Server with SAM3 and VLM for image analysis",
+  "apiVersion": "v1",
+  "arguments": {
+    "gpuPlan": "nf-gpu-a100-80-2g",
+    "gpuType": "a100-80",
+    "imageTag": "latest",
+    "vlmModel": "",
+    "cacheVolumeSize": 153600
+  },
+  "spec": {
+    "kind": "Workflow",
+    "spec": {
+      "type": "sequential",
+      "steps": [
+        {
+          "kind": "Volume",
+          "ref": "cache",
+          "spec": {
+            "name": "triton-cache",
+            "projectId": "chronoscope",
+            "mounts": [
+              {
+                "volumeMountPath": "",
+                "containerMountPath": "/root/.cache/huggingface"
+              }
+            ],
+            "tags": [],
+            "spec": {
+              "accessMode": "ReadWriteMany",
+              "storageSize": "${args.cacheVolumeSize}",
+              "storageClassName": "nf-multi-rw"
+            },
+            "attachedObjects": [
+              {
+                "id": "triton",
+                "type": "service"
+              }
+            ]
+          }
+        },
+        {
+          "kind": "DeploymentService",
+          "ref": "triton",
+          "spec": {
+            "name": "triton",
+            "projectId": "chronoscope",
+            "infrastructure": {
+              "architecture": "x86"
+            },
+            "billing": {
+              "deploymentPlan": "${args.gpuPlan}"
+            },
+            "deployment": {
+              "type": "deployment",
+              "instances": 1,
+              "storage": {
+                "ephemeralStorage": {
+                  "storageSize": 512000
+                },
+                "shmSize": 174080
+              },
+              "external": {
+                "imagePath": "ghcr.io/copumpkin/chronoscope-triton:${args.imageTag}"
+              },
+              "gpu": {
+                "enabled": true,
+                "configuration": {
+                  "gpuType": "${args.gpuType}",
+                  "gpuCount": 2
+                }
+              }
+            },
+            "ports": [
+              {
+                "name": "http",
+                "internalPort": 8000,
+                "public": false,
+                "protocol": "HTTP2"
+              },
+              {
+                "name": "grpc",
+                "internalPort": 8001,
+                "public": false,
+                "protocol": "HTTP2"
+              },
+              {
+                "name": "metrics",
+                "internalPort": 8002,
+                "public": false,
+                "protocol": "HTTP"
+              }
+            ],
+            "runtimeEnvironment": {
+              "VLM_MODEL": "${args.vlmModel}"
+            },
+            "healthChecks": [
+              {
+                "type": "readinessProbe",
+                "protocol": "HTTP",
+                "path": "/v2/health/ready",
+                "port": 8000,
+                "initialDelaySeconds": 300,
+                "periodSeconds": 30,
+                "timeoutSeconds": 5,
+                "failureThreshold": 50,
+                "successThreshold": 1
+              },
+              {
+                "type": "livenessProbe",
+                "protocol": "HTTP",
+                "path": "/v2/health/live",
+                "port": 8000,
+                "initialDelaySeconds": 1800,
+                "periodSeconds": 30,
+                "timeoutSeconds": 5,
+                "failureThreshold": 3
+              }
+            ]
+          }
+        },
+        {
+          "kind": "Action",
+          "ref": "restart",
+          "spec": {
+            "kind": "Service",
+            "spec": {
+              "type": "restart",
+              "data": {
+                "projectId": "chronoscope",
+                "serviceId": "${refs.triton.id}"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

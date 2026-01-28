@@ -1,0 +1,31 @@
+name: "analysis"
+backend: "python"
+max_batch_size: 1
+
+input [
+  {
+    name: "image"
+    data_type: TYPE_STRING
+    dims: [1]
+  },
+  {
+    name: "schema"
+    data_type: TYPE_STRING
+    dims: [1]
+  }
+]
+
+output [
+  {
+    name: "result"
+    data_type: TYPE_STRING
+    dims: [1]
+  }
+]
+
+instance_group [
+  {
+    count: 1
+    kind: KIND_CPU
+  }
+]

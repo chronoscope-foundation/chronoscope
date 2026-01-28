@@ -38,3 +38,8 @@ DerivedData/
 .swiftpm/
 Packages/
 Package.resolved
+
+# Python
+.venv/
+__pycache__/
+.hypothesis/
