@@ -62,7 +62,8 @@
                 "shmSize": 174080
               },
               "external": {
-                "imagePath": "ghcr.io/copumpkin/chronoscope-triton:${args.imageTag}"
+                "imagePath": "ghcr.io/copumpkin/chronoscope-triton:${args.imageTag}",
+                "credentials": "copumpkin-github"
               },
               "gpu": {
                 "enabled": true,
@@ -77,13 +78,13 @@
                 "name": "http",
                 "internalPort": 8000,
                 "public": false,
-                "protocol": "HTTP2"
+                "protocol": "HTTP/2"
               },
               {
                 "name": "grpc",
                 "internalPort": 8001,
                 "public": false,
-                "protocol": "HTTP2"
+                "protocol": "HTTP/2"
               },
               {
                 "name": "metrics",
