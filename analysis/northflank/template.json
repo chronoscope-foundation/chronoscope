@@ -3,6 +3,7 @@
   "description": "Triton Inference Server with SAM3 and VLM for image analysis",
   "apiVersion": "v1",
   "arguments": {
+    "projectId": "chronoscope",
     "gpuPlan": "nf-gpu-a100-80-2g",
     "gpuType": "a100-80",
     "imageTag": "latest",
@@ -15,37 +16,11 @@
       "type": "sequential",
       "steps": [
         {
-          "kind": "Volume",
-          "ref": "cache",
-          "spec": {
-            "name": "triton-cache",
-            "projectId": "chronoscope",
-            "mounts": [
-              {
-                "volumeMountPath": "",
-                "containerMountPath": "/root/.cache/huggingface"
-              }
-            ],
-            "tags": [],
-            "spec": {
-              "accessMode": "ReadWriteMany",
-              "storageSize": "${args.cacheVolumeSize}",
-              "storageClassName": "nf-multi-rw"
-            },
-            "attachedObjects": [
-              {
-                "id": "triton",
-                "type": "service"
-              }
-            ]
-          }
-        },
-        {
           "kind": "DeploymentService",
           "ref": "triton",
           "spec": {
             "name": "triton",
-            "projectId": "chronoscope",
+            "projectId": "${args.projectId}",
             "infrastructure": {
               "architecture": "x86"
             },
@@ -122,6 +97,32 @@
           }
         },
         {
+          "kind": "Volume",
+          "ref": "cache",
+          "spec": {
+            "name": "triton-cache",
+            "projectId": "${args.projectId}",
+            "mounts": [
+              {
+                "volumeMountPath": "",
+                "containerMountPath": "/root/.cache/huggingface"
+              }
+            ],
+            "tags": [],
+            "spec": {
+              "accessMode": "ReadWriteMany",
+              "storageSize": "${args.cacheVolumeSize}",
+              "storageClassName": "nf-multi-rw"
+            },
+            "attachedObjects": [
+              {
+                "id": "${refs.triton.id}",
+                "type": "service"
+              }
+            ]
+          }
+        },
+        {
           "kind": "Action",
           "ref": "restart",
           "spec": {
@@ -129,7 +130,7 @@
             "spec": {
               "type": "restart",
               "data": {
-                "projectId": "chronoscope",
+                "projectId": "${args.projectId}",
                 "serviceId": "${refs.triton.id}"
               }
             }

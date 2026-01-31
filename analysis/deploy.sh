@@ -9,6 +9,7 @@
 # Usage:
 #   ./deploy.sh                                              # Full build and deploy
 #   ./deploy.sh --skip-build                                 # Template-only deploy (no container build)
+#   NF_PROJECT=chronoscope-us-east ./deploy.sh --skip-build  # Deploy to different project
 #   NF_GPU_PLAN=nf-gpu-h100-80-1g VLM_MODEL=Qwen/Qwen3-VL-32B-Instruct ./deploy.sh
 #   NF_GPU_PLAN=nf-gpu-l4-24-1g ./deploy.sh                  # Budget L4 for testing
 
@@ -26,7 +27,6 @@ done
 
 # Configuration
 PROJECT="${NF_PROJECT:-chronoscope}"
-SERVICE="${NF_SERVICE:-triton}"
 REGISTRY="ghcr.io"
 GHCR_REPO="${GHCR_REPO:-copumpkin/chronoscope-triton}"
 GPU_PLAN="${NF_GPU_PLAN:-nf-gpu-a100-80-1g}"
@@ -38,7 +38,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "=== Chronoscope Analysis Deployment ==="
 echo "Project:   $PROJECT"
-echo "Service:   $SERVICE"
 echo "GPU Plan:  $GPU_PLAN"
 echo "VLM Model: ${VLM_MODEL:-<default: Qwen/Qwen3-VL-32B-Instruct>}"
 echo "Image Tag: $IMAGE_TAG"
@@ -64,18 +63,20 @@ echo ""
 echo "Deploying to Northflank..."
 
 # Upsert template (update if exists, create if not)
-northflank update template --templateId triton-analysis --file "$SCRIPT_DIR/northflank/template.json" 2>/dev/null \
+echo "Updating template (or creating if it doesn't exist)..."
+northflank update template --templateId triton-analysis --file "$SCRIPT_DIR/northflank/template.json" \
     || northflank create template --file "$SCRIPT_DIR/northflank/template.json"
 
-# Run the template (idempotent - creates or updates the service)
+# Run the template with project-specific arguments
 echo "Running template..."
-northflank run template --templateId triton-analysis --skipValidation
+northflank run template --templateId triton-analysis --quiet \
+    -i "{\"arguments\":{\"projectId\":\"$PROJECT\"}}"
 
 echo ""
 echo "=== Deployment Complete ==="
 echo ""
 echo "To connect to the service:"
-echo "  northflank forward service --projectId $PROJECT --serviceId $SERVICE --localPort 8000 --port 8000"
+echo "  northflank forward service --projectId $PROJECT --serviceId triton --localPort 8000 --port 8000"
 echo ""
 echo "Then run analysis:"
 echo "  cargo run -p chronoscope-analysis --bin analyze -- <image>"
