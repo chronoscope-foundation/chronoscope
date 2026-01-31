@@ -62,6 +62,13 @@ northflank run template --templateId ID --quiet
 - Secrets: `${secrets.API_KEY}`
 - Functions: `${fn.randomSecret(32)}`, `${fn.if(args.dev, 'a', 'b')}`
 
+**Template Scoping**: Templates are stored at the team level, not per-project. The project UI filters to show templates that reference that project in their default arguments. A single template can deploy to any project by parameterizing `projectId` and overriding it at runtime:
+```bash
+northflank run template --templateId my-template --quiet \
+    -i '{"arguments":{"projectId":"other-project"}}'
+```
+Note: Use `arguments` (not `argumentOverrides`) when passing runtime values via `-i`.
+
 ## Volumes
 
 ```bash
