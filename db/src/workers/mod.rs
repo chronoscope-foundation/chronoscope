@@ -3,14 +3,24 @@
 //! These functions are used by background workers to create and update
 //! pages, media, and research URL status.
 
-use chrono::NaiveDateTime;
-use chronoscope_integrations::IntegrationName;
 use serde::Serialize;
+use sqlx::FromRow;
 
 use crate::error::{DbError, DbResult};
-use crate::models::{GpsLocation, MediaData, PageData, ResearchUrl};
+use crate::models::{GpsLocation, MediaData, PageData};
 use crate::types::{MediaId, PageId, ResearchUrlId};
 use crate::{Database, now, queries};
+
+/// Media item claimed for analysis.
+#[derive(Debug, Clone, FromRow)]
+pub struct MediaForAnalysis {
+    /// Media ID
+    pub id: MediaId,
+    /// Storage key for retrieving the media bytes
+    pub storage_key: String,
+    /// Number of previous analysis attempts
+    pub analysis_attempt_count: i32,
+}
 
 #[cfg(test)]
 mod tests;
@@ -196,92 +206,24 @@ impl Database {
         Ok(())
     }
 
-    /// Mark a research URL as failed.
-    ///
-    /// Increments `attempt_count` and sets `retry_after` for backoff.
+    /// Mark a media item's analysis as complete with results.
     ///
     /// # Errors
     /// Returns `DbError::Sqlx` if the database operation fails.
-    pub async fn mark_url_failed(
+    pub async fn mark_analysis_complete(
         &self,
-        url_id: &ResearchUrlId,
-        error_message: &str,
-        retry_after: Option<NaiveDateTime>,
+        media_id: &MediaId,
+        vlm_result: &str,
+        segmentation_result: &str,
     ) -> DbResult<()> {
-        queries::UPDATE_URL_FAILED
+        queries::UPDATE_ANALYSIS_COMPLETE
             .query()
-            .bind(error_message)
-            .bind(retry_after)
-            .bind(url_id)
+            .bind(media_id)
+            .bind(vlm_result)
+            .bind(segmentation_result)
             .execute(&self.pool)
             .await?;
 
         Ok(())
-    }
-
-    /// Claim a batch of URLs for processing by a generic worker.
-    ///
-    /// Claims up to `batch_size` URLs with `worker_affinity IS NULL` that are either:
-    /// - Pending and not claimed (or with a stale claim)
-    /// - Failed but past their `retry_after` time
-    ///
-    /// Returns the claimed URLs, already marked as 'analyzing'.
-    /// Uses optimistic locking - claims older than `stale_cutoff` are considered abandoned.
-    ///
-    /// For specialized workers (Reddit, Instagram, etc.), use [`claim_urls_with_affinity`].
-    ///
-    /// # Errors
-    /// Returns `DbError::Sqlx` if the database operation fails.
-    pub async fn claim_urls(
-        &self,
-        worker_id: &str,
-        batch_size: u32,
-        stale_cutoff: NaiveDateTime,
-    ) -> DbResult<Vec<ResearchUrl>> {
-        let now = now();
-
-        let urls = sqlx::query_as(queries::CLAIM_URLS_GENERIC.sql)
-            .bind(now) // ?1 = now (for claimed_at)
-            .bind(worker_id) // ?2 = worker_id
-            .bind(stale_cutoff) // ?3 = stale_cutoff
-            .bind(now) // ?4 = now (for retry_after comparison)
-            .bind(batch_size) // ?5 = batch_size
-            .fetch_all(&self.pool)
-            .await?;
-
-        Ok(urls)
-    }
-
-    /// Claim a batch of URLs for processing by a specialized worker.
-    ///
-    /// Claims up to `batch_size` URLs with matching `worker_affinity` that are either:
-    /// - Pending and not claimed (or with a stale claim)
-    /// - Failed but past their `retry_after` time
-    ///
-    /// Returns the claimed URLs, already marked as 'analyzing'.
-    /// Uses optimistic locking - claims older than `stale_cutoff` are considered abandoned.
-    ///
-    /// # Errors
-    /// Returns `DbError::Sqlx` if the database operation fails.
-    pub async fn claim_urls_with_affinity(
-        &self,
-        worker_id: &str,
-        batch_size: u32,
-        stale_cutoff: NaiveDateTime,
-        affinity: IntegrationName,
-    ) -> DbResult<Vec<ResearchUrl>> {
-        let now = now();
-
-        let urls = sqlx::query_as(queries::CLAIM_URLS_WITH_AFFINITY.sql)
-            .bind(now) // ?1 = now (for claimed_at)
-            .bind(worker_id) // ?2 = worker_id
-            .bind(stale_cutoff) // ?3 = stale_cutoff
-            .bind(now) // ?4 = now (for retry_after comparison)
-            .bind(batch_size) // ?5 = batch_size
-            .bind(affinity.as_str()) // ?6 = affinity
-            .fetch_all(&self.pool)
-            .await?;
-
-        Ok(urls)
     }
 }

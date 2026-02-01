@@ -13,6 +13,8 @@ workspace = true
 ## Record HTTP fixtures for VCR-style tests (hits real network).
 ## Usage: cargo test -p chronoscope-integrations --features record-fixtures
 record-fixtures = []
+## Enable MockHttpClient for unit testing in dependent crates.
+testing = []
 
 [dependencies]
 # Async runtime and traits

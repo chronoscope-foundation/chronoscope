@@ -497,7 +497,8 @@ impl TestContext {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.app_state
             .db
-            .mark_url_failed(url_id, error_message, None)
+            .url_queue_generic
+            .mark_failed(url_id, error_message, None)
             .await?;
         Ok(())
     }

@@ -16,6 +16,7 @@ record-fixtures = []
 
 [dependencies]
 # Internal crates
+chronoscope-analysis = { path = "../analysis" }
 chronoscope-db = { path = "../db" }
 chronoscope-integrations = { path = "../integrations" }
 
@@ -57,3 +58,5 @@ mp4parse = "0.17"
 
 [dev-dependencies]
 tempfile = "3"
+# Enable testing utilities (MockHttpClient) for unit tests
+chronoscope-integrations = { path = "../integrations", features = ["testing"] }

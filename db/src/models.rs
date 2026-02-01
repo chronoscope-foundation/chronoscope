@@ -4,8 +4,34 @@ use chrono::NaiveDateTime;
 use sqlx::FromRow;
 
 use crate::types::{
-    Email, MediaId, MediaType, PageId, ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
+    AnalysisStatus, Email, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
+    ResearchUrlStatus, SourceType, UserId,
 };
+
+/// Construct analysis state from raw DB fields, enforcing invariants.
+/// Invalid combinations (e.g., Complete without results) fall back to safe states.
+fn build_analysis_state(
+    status: AnalysisStatus,
+    vlm_result: Option<String>,
+    segmentation_result: Option<String>,
+    analysis_error: Option<String>,
+) -> MediaAnalysisState {
+    match status {
+        AnalysisStatus::Pending => MediaAnalysisState::Pending,
+        AnalysisStatus::Processing => MediaAnalysisState::Processing,
+        AnalysisStatus::Complete => match (vlm_result, segmentation_result) {
+            (Some(vlm), Some(seg)) => MediaAnalysisState::Complete {
+                vlm_result: vlm,
+                segmentation_result: seg,
+            },
+            // DB corruption: Complete without results. Treat as pending.
+            _ => MediaAnalysisState::Pending,
+        },
+        AnalysisStatus::Failed => MediaAnalysisState::Failed {
+            error: analysis_error.unwrap_or_else(|| "Unknown error".to_string()),
+        },
+    }
+}
 
 // ==================== Data Types ====================
 
@@ -149,6 +175,8 @@ pub struct Media {
     pub id: MediaId,
     pub data: MediaData,
     pub created_at: NaiveDateTime,
+    /// Analysis state with associated data (enforces valid state combinations)
+    pub analysis: MediaAnalysisState,
 }
 
 /// Internal row type for sqlx (maps to flat DB columns)
@@ -169,10 +197,21 @@ pub(crate) struct MediaDbRow {
     pub(crate) source_metadata: Option<String>,
     pub(crate) fetched_at: NaiveDateTime,
     pub(crate) created_at: NaiveDateTime,
+    pub(crate) analysis_status: AnalysisStatus,
+    pub(crate) vlm_result: Option<String>,
+    pub(crate) segmentation_result: Option<String>,
+    pub(crate) analysis_error: Option<String>,
 }
 
 impl MediaDbRow {
     pub(crate) fn into_media(self) -> Media {
+        let analysis = build_analysis_state(
+            self.analysis_status,
+            self.vlm_result,
+            self.segmentation_result,
+            self.analysis_error,
+        );
+
         Media {
             id: self.id,
             data: MediaData {
@@ -193,6 +232,7 @@ impl MediaDbRow {
                 fetched_at: self.fetched_at,
             },
             created_at: self.created_at,
+            analysis,
         }
     }
 }
@@ -231,57 +271,56 @@ pub(crate) struct PageMediaRow {
     pub(crate) source_metadata: Option<String>,
     pub(crate) fetched_at: Option<NaiveDateTime>,
     pub(crate) created_at: Option<NaiveDateTime>,
+    pub(crate) analysis_status: Option<AnalysisStatus>,
+    pub(crate) vlm_result: Option<String>,
+    pub(crate) segmentation_result: Option<String>,
+    pub(crate) analysis_error: Option<String>,
 }
 
 impl PageMediaRow {
-    pub(crate) fn into_media_slot(self) -> MediaSlot {
-        let resolved = match (
-            self.id,
-            self.exact_hash,
-            self.storage_key,
-            self.media_type,
-            self.width,
-            self.height,
-            self.fetched_at,
-            self.created_at,
-        ) {
-            (
-                Some(id),
-                Some(exact_hash),
-                Some(storage_key),
-                Some(media_type),
-                Some(width),
-                Some(height),
-                Some(fetched_at),
-                Some(created_at),
-            ) => Some(Media {
-                id,
-                data: MediaData {
-                    exact_hash,
-                    perceptual_hash: self.perceptual_hash,
-                    storage_key,
-                    media_type,
-                    width,
-                    height,
-                    duration_seconds: self.duration_seconds,
-                    captured_at: self.captured_at,
-                    location: GpsLocation::from_columns(
-                        self.gps_latitude,
-                        self.gps_longitude,
-                        self.gps_altitude,
-                    ),
-                    source_metadata: self.source_metadata,
-                    fetched_at,
-                },
-                created_at,
-            }),
-            _ => None,
-        };
-
+    pub(crate) fn into_media_slot(mut self) -> MediaSlot {
+        let url = std::mem::take(&mut self.source_url);
         MediaSlot {
-            url: self.source_url,
-            resolved,
+            url,
+            resolved: self.try_into_media(),
         }
+    }
+
+    /// Try to construct a Media from the LEFT JOIN fields.
+    ///
+    /// Returns None if the LEFT JOIN didn't match a media row (id is None).
+    /// Uses `?` on required fields - if id exists, all NOT NULL columns must exist.
+    fn try_into_media(self) -> Option<Media> {
+        let id = self.id?;
+        let analysis = build_analysis_state(
+            self.analysis_status?,
+            self.vlm_result,
+            self.segmentation_result,
+            self.analysis_error,
+        );
+
+        Some(Media {
+            id,
+            data: MediaData {
+                exact_hash: self.exact_hash?,
+                perceptual_hash: self.perceptual_hash,
+                storage_key: self.storage_key?,
+                media_type: self.media_type?,
+                width: self.width?,
+                height: self.height?,
+                duration_seconds: self.duration_seconds,
+                captured_at: self.captured_at,
+                location: GpsLocation::from_columns(
+                    self.gps_latitude,
+                    self.gps_longitude,
+                    self.gps_altitude,
+                ),
+                source_metadata: self.source_metadata,
+                fetched_at: self.fetched_at?,
+            },
+            created_at: self.created_at?,
+            analysis,
+        })
     }
 }
 

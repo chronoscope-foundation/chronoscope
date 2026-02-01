@@ -24,6 +24,8 @@ pub use http::{
     CacheMode, CachingClient, FetchError, HttpClient, HttpError, HttpRequest, HttpResponse,
     ReqwestClient, ReqwestConfig,
 };
+#[cfg(feature = "testing")]
+pub use http::{MockHttpClient, MockHttpError};
 pub use instagram::{ApifyConfig, InstagramIntegration};
 pub use reddit::RedditIntegration;
 pub use registry::{IntegrationRegistry, RegistrationError};

@@ -10,6 +10,9 @@ use chronoscope_db::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+// Re-export analysis types for API consumers
+pub use chronoscope_analysis::{DetectedRegion, VlmAnalysis, VlmOutput};
+
 // ==================== Analysis Outcome (Generic) ====================
 
 /// Outcome of an analysis stage.
@@ -28,24 +31,21 @@ pub enum AnalysisOutcome<T> {
 }
 
 // ==================== Analysis Result Types ====================
-//
-// These are placeholder structs for future analysis pipeline results.
-// They are intentionally empty now and will be populated as we build
-// out each analysis stage.
 
 /// VLM (Vision-Language Model) analysis results.
 ///
-/// Will contain: visual descriptions, detected objects, OCR text,
-/// date/location mentions extracted from image content.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct VlmResults {}
+/// Contains: visual descriptions, region analysis, detected text,
+/// temporal cues, and structured scene understanding.
+pub type VlmResults = VlmAnalysis;
 
 /// Image segmentation results.
 ///
-/// Will contain: object masks, labeled regions, and bounding boxes
-/// for discrete elements within an image.
+/// Contains: detected regions with RLE-encoded masks and confidence scores.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SegmentationResults {}
+pub struct SegmentationResults {
+    /// Detected regions from SAM3 segmentation.
+    pub regions: Vec<DetectedRegion>,
+}
 
 /// Vector embedding results for similarity search.
 ///
@@ -177,7 +177,7 @@ pub struct ResearchUrlDossier {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResolvedContent {
     Page(PageDossier),
-    Media(MediaDossier),
+    Media(Box<MediaDossier>),
 }
 
 /// Page content (Instagram post, Reddit thread, etc.).

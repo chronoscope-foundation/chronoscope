@@ -185,7 +185,7 @@ fn build_resolved_content(
             convert_page(page, cdn_base_url)?,
         ))),
         Some(chronoscope_db::ResolvedContent::Media(media)) => Ok(Some(ResolvedContent::Media(
-            convert_media(media, cdn_base_url)?,
+            Box::new(convert_media(media, cdn_base_url)?),
         ))),
         None => Ok(None),
     }
@@ -248,18 +248,17 @@ fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, Http
         })?;
 
     // Convert dimensions, failing on invalid values (indicates DB corruption)
-    let width = u32::try_from(media.data.width).map_err(|_| {
-        HttpError::for_internal_error(format!(
-            "Invalid width {} for media {}",
-            media.data.width, media.id
-        ))
-    })?;
-    let height = u32::try_from(media.data.height).map_err(|_| {
-        HttpError::for_internal_error(format!(
-            "Invalid height {} for media {}",
-            media.data.height, media.id
-        ))
-    })?;
+    let (width, height) = u32::try_from(media.data.width)
+        .and_then(|w| u32::try_from(media.data.height).map(|h| (w, h)))
+        .map_err(|_| {
+            HttpError::for_internal_error(format!(
+                "Invalid dimensions {}x{} for media {}",
+                media.data.width, media.data.height, media.id
+            ))
+        })?;
+
+    // Convert analysis results based on status
+    let analysis = convert_analysis(media)?;
 
     Ok(MediaDossier {
         id: media.id.clone(),
@@ -273,7 +272,64 @@ fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, Http
         location,
         source_metadata,
         fetched_at: media.data.fetched_at,
-        analysis: MediaAnalysis::default(), // TODO: populate from analysis tables
+        analysis,
+    })
+}
+
+/// Convert DB analysis state to API `MediaAnalysis`.
+fn convert_analysis(media: &Media) -> Result<MediaAnalysis, HttpError> {
+    use crate::research_types::{AnalysisOutcome, SegmentationResults, VlmOutput};
+    use chronoscope_db::MediaAnalysisState;
+
+    let (vlm, segmentation) = match &media.analysis {
+        MediaAnalysisState::Pending => (AnalysisOutcome::Pending, AnalysisOutcome::Pending),
+        MediaAnalysisState::Processing => {
+            (AnalysisOutcome::InProgress, AnalysisOutcome::InProgress)
+        }
+        MediaAnalysisState::Failed { error } => (
+            AnalysisOutcome::Failed {
+                error: error.clone(),
+            },
+            AnalysisOutcome::Failed {
+                error: error.clone(),
+            },
+        ),
+        MediaAnalysisState::Complete {
+            vlm_result,
+            segmentation_result,
+        } => {
+            // Parse VLM result JSON
+            let vlm_output: VlmOutput = serde_json::from_str(vlm_result).map_err(|e| {
+                HttpError::for_internal_error(format!(
+                    "Corrupt vlm_result JSON in media {}: {}",
+                    media.id, e
+                ))
+            })?;
+            let vlm = match vlm_output {
+                VlmOutput::Success(analysis) => AnalysisOutcome::Success(analysis),
+                VlmOutput::Error { error, .. } => AnalysisOutcome::Failed { error },
+            };
+
+            // Parse segmentation result JSON
+            let regions: Vec<chronoscope_analysis::DetectedRegion> =
+                serde_json::from_str(segmentation_result).map_err(|e| {
+                    HttpError::for_internal_error(format!(
+                        "Corrupt segmentation_result JSON in media {}: {}",
+                        media.id, e
+                    ))
+                })?;
+            let segmentation = AnalysisOutcome::Success(SegmentationResults { regions });
+
+            (vlm, segmentation)
+        }
+    };
+
+    Ok(MediaAnalysis {
+        vlm,
+        segmentation,
+        // These stages aren't implemented yet
+        embeddings: AnalysisOutcome::Pending,
+        reverse_image_search: AnalysisOutcome::Pending,
     })
 }
 
@@ -281,6 +337,7 @@ fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, Http
 mod tests {
     use super::*;
     use crate::cdn::tests::TEST_CDN_BASE_URL;
+    use crate::research_types::AnalysisOutcome;
     use chrono::{NaiveDate, NaiveDateTime};
     use chronoscope_db::{GpsLocation, MediaData, MediaId, MediaType};
 
@@ -312,6 +369,7 @@ mod tests {
             id: MediaId::new("test-media-id"),
             data: minimal_media_data(),
             created_at: test_timestamp(),
+            analysis: chronoscope_db::MediaAnalysisState::Pending,
         }
     }
 
@@ -448,8 +506,8 @@ mod tests {
             })?;
 
         assert!(
-            err.internal_message.contains("Invalid width"),
-            "Error should mention invalid width, got: {}",
+            err.internal_message.contains("Invalid dimensions"),
+            "Error should mention invalid dimensions, got: {}",
             err.internal_message
         );
         Ok(())
@@ -467,10 +525,180 @@ mod tests {
             })?;
 
         assert!(
-            err.internal_message.contains("Invalid height"),
-            "Error should mention invalid height, got: {}",
+            err.internal_message.contains("Invalid dimensions"),
+            "Error should mention invalid dimensions, got: {}",
             err.internal_message
         );
         Ok(())
+    }
+
+    // ==================== Analysis Conversion ====================
+
+    #[test]
+    fn test_convert_analysis_pending_status() -> TestResult {
+        let media = minimal_media(); // analysis_status = "pending"
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        assert!(
+            matches!(dossier.analysis.vlm, AnalysisOutcome::Pending),
+            "VLM should be Pending"
+        );
+        assert!(
+            matches!(dossier.analysis.segmentation, AnalysisOutcome::Pending),
+            "Segmentation should be Pending"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_analysis_processing_status() -> TestResult {
+        let mut media = minimal_media();
+        media.analysis = chronoscope_db::MediaAnalysisState::Processing;
+
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        assert!(
+            matches!(dossier.analysis.vlm, AnalysisOutcome::InProgress),
+            "VLM should be InProgress"
+        );
+        assert!(
+            matches!(dossier.analysis.segmentation, AnalysisOutcome::InProgress),
+            "Segmentation should be InProgress"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_analysis_failed_status() -> TestResult {
+        let mut media = minimal_media();
+        media.analysis = chronoscope_db::MediaAnalysisState::Failed {
+            error: "Triton server unavailable".to_string(),
+        };
+
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        match &dossier.analysis.vlm {
+            AnalysisOutcome::Failed { error } => {
+                assert_eq!(error, "Triton server unavailable");
+            }
+            other => panic!("Expected Failed, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_analysis_complete_with_results() -> TestResult {
+        use chronoscope_analysis::{
+            AnalyzedMediaType, CompositeInfo, SceneType, VlmAnalysis, VlmOutput,
+        };
+        use std::collections::HashMap;
+
+        // Create realistic VLM output
+        let vlm_analysis = VlmAnalysis {
+            is_relevant: true,
+            rejection_reason: None,
+            media_type: AnalyzedMediaType::Photo,
+            content_summary: "A historic building on a street corner".to_string(),
+            scene_type: SceneType::Outdoor,
+            temporal_cues: vec!["black and white".to_string()],
+            composite: CompositeInfo {
+                rows: 1,
+                columns: 1,
+            },
+            regions: HashMap::new(),
+            region_relationships: vec![],
+            extracted_text: vec![],
+            thinking: None,
+        };
+        let vlm_output = VlmOutput::Success(vlm_analysis);
+        let vlm_result = serde_json::to_string(&vlm_output).expect("serialize");
+
+        // Create segmentation results (empty regions for simplicity)
+        let segmentation: Vec<chronoscope_analysis::DetectedRegion> = vec![];
+        let segmentation_result = serde_json::to_string(&segmentation).expect("serialize");
+
+        let mut media = minimal_media();
+        media.analysis = chronoscope_db::MediaAnalysisState::Complete {
+            vlm_result,
+            segmentation_result,
+        };
+
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        // Verify VLM analysis was parsed correctly
+        match &dossier.analysis.vlm {
+            AnalysisOutcome::Success(analysis) => {
+                assert!(analysis.is_relevant);
+                assert_eq!(
+                    analysis.content_summary,
+                    "A historic building on a street corner"
+                );
+                assert_eq!(analysis.temporal_cues, vec!["black and white"]);
+            }
+            other => panic!("Expected VLM Success, got {other:?}"),
+        }
+
+        // Verify segmentation was parsed correctly
+        match &dossier.analysis.segmentation {
+            AnalysisOutcome::Success(seg) => {
+                assert!(seg.regions.is_empty());
+            }
+            other => panic!("Expected Segmentation Success, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_analysis_complete_with_vlm_error() -> TestResult {
+        use chronoscope_analysis::VlmOutput;
+
+        // VLM returned an error (e.g., token limit exceeded)
+        let vlm_output = VlmOutput::Error {
+            error: "Token limit exceeded".to_string(),
+            raw_output: Some("truncated output...".to_string()),
+        };
+        let vlm_result = serde_json::to_string(&vlm_output).expect("serialize");
+
+        // Segmentation still succeeded
+        let segmentation: Vec<chronoscope_analysis::DetectedRegion> = vec![];
+        let segmentation_result = serde_json::to_string(&segmentation).expect("serialize");
+
+        let mut media = minimal_media();
+        media.analysis = chronoscope_db::MediaAnalysisState::Complete {
+            vlm_result,
+            segmentation_result,
+        };
+
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        // VLM should be Failed (from VlmOutput::Error)
+        match &dossier.analysis.vlm {
+            AnalysisOutcome::Failed { error } => {
+                assert_eq!(error, "Token limit exceeded");
+            }
+            other => panic!("Expected VLM Failed, got {other:?}"),
+        }
+
+        // Segmentation should still be Success
+        assert!(
+            matches!(dossier.analysis.segmentation, AnalysisOutcome::Success(_)),
+            "Segmentation should be Success"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_convert_analysis_corrupt_vlm_json_returns_error() {
+        let mut media = minimal_media();
+        media.analysis = chronoscope_db::MediaAnalysisState::Complete {
+            vlm_result: "not valid json {{{".to_string(),
+            segmentation_result: "[]".to_string(),
+        };
+
+        let result = convert_media(&media, TEST_CDN_BASE_URL);
+        assert!(
+            result.is_err(),
+            "Corrupt VLM JSON should return internal error"
+        );
     }
 }

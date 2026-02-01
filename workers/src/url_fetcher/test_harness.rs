@@ -119,7 +119,11 @@ impl TestHarness {
         self.db.submit_url(&self.user_id, url).await?;
 
         let stale_cutoff = Utc::now().naive_utc() - chrono::Duration::hours(1);
-        let claimed = self.db.claim_urls("test-worker", 1, stale_cutoff).await?;
+        let claimed = self
+            .db
+            .url_queue_generic
+            .claim("test-worker", 1, stale_cutoff)
+            .await?;
         let research_url = claimed
             .into_iter()
             .next()

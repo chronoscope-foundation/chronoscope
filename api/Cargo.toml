@@ -32,6 +32,9 @@ jwt-compact = { version = "0.8", features = ["clock"] }
 # Database layer
 chronoscope-db = { path = "../db" }
 
+# Analysis types
+chronoscope-analysis = { path = "../analysis" }
+
 # Serialization
 serde.workspace = true
 serde_json.workspace = true

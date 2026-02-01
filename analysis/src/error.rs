@@ -1,5 +1,6 @@
 //! Error types for analysis operations.
 
+use reqwest::StatusCode;
 use thiserror::Error;
 
 /// Errors that can occur during analysis.
@@ -10,8 +11,13 @@ pub enum AnalysisError {
     Connection(String),
 
     /// Triton returned an error response
-    #[error("triton error: {0}")]
-    Triton(String),
+    #[error("triton error ({status}): {message}")]
+    Triton {
+        /// HTTP status code from Triton
+        status: StatusCode,
+        /// Error message from response body
+        message: String,
+    },
 
     /// Failed to parse response
     #[error("response parsing error: {0}")]
@@ -21,7 +27,25 @@ pub enum AnalysisError {
     #[error("invalid image: {0}")]
     InvalidImage(String),
 
-    /// HTTP error
+    /// Transport-level HTTP error (connection refused, timeout, TLS failure).
+    /// Distinct from `Triton` which represents an error response from Triton.
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] chronoscope_integrations::HttpError),
+}
+
+impl AnalysisError {
+    /// Whether this error should be retried.
+    ///
+    /// Retriable: connection errors, transport failures, server errors (5xx), rate limits.
+    /// Permanent: client errors (4xx), parsing errors, invalid images.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::Connection(_) | Self::Http(_) => true,
+            Self::Triton { status, .. } => {
+                status.is_server_error() || *status == StatusCode::TOO_MANY_REQUESTS
+            }
+            Self::ResponseParsing(_) | Self::InvalidImage(_) => false,
+        }
+    }
 }

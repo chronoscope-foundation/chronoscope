@@ -1,7 +1,8 @@
 use super::*;
 use crate::error::DbError;
 use crate::models::MediaSlot;
-use crate::types::{Email, MediaType, ResearchUrlStatus, SourceType, UserId};
+use crate::queue::{Queue, url_queue_config};
+use crate::types::{Email, MediaAnalysisState, MediaType, ResearchUrlStatus, SourceType, UserId};
 use chrono::{Duration, Utc};
 
 /// Helper to create a database and test user.
@@ -14,16 +15,16 @@ async fn setup() -> DbResult<(Database, UserId)> {
 }
 
 #[tokio::test]
-async fn test_claim_urls_marks_as_analyzing() -> DbResult<()> {
+async fn test_claim_urls_marks_as_processing() -> DbResult<()> {
     let (db, user_id) = setup().await?;
     let (url_id, _) = db.submit_url(&user_id, "https://example.com/test").await?;
 
     let stale = Utc::now().naive_utc() - Duration::hours(1);
-    let claimed = db.claim_urls("worker-1", 1, stale).await?;
+    let claimed = db.url_queue_generic.claim("worker-1", 1, stale).await?;
 
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].id, url_id);
-    assert_eq!(claimed[0].status, ResearchUrlStatus::Analyzing);
+    assert_eq!(claimed[0].status, ResearchUrlStatus::Processing);
 
     Ok(())
 }
@@ -36,11 +37,11 @@ async fn test_claimed_url_not_reclaimable() -> DbResult<()> {
     let stale = Utc::now().naive_utc() - Duration::hours(1);
 
     // First worker claims
-    let claimed1 = db.claim_urls("worker-1", 1, stale).await?;
+    let claimed1 = db.url_queue_generic.claim("worker-1", 1, stale).await?;
     assert_eq!(claimed1.len(), 1);
 
     // Second worker tries to claim - should get nothing
-    let claimed2 = db.claim_urls("worker-2", 1, stale).await?;
+    let claimed2 = db.url_queue_generic.claim("worker-2", 1, stale).await?;
     assert_eq!(claimed2.len(), 0);
 
     Ok(())
@@ -53,14 +54,14 @@ async fn test_stale_claim_can_be_reclaimed() -> DbResult<()> {
 
     // First worker claims
     let old_stale = Utc::now().naive_utc() - Duration::hours(1);
-    let claimed1 = db.claim_urls("worker-1", 1, old_stale).await?;
+    let claimed1 = db.url_queue_generic.claim("worker-1", 1, old_stale).await?;
     assert_eq!(claimed1.len(), 1);
 
     // Simulate time passing - stale cutoff is now AFTER the claim time
     let new_stale = Utc::now().naive_utc() + Duration::hours(1);
 
     // Second worker can now reclaim
-    let claimed2 = db.claim_urls("worker-2", 1, new_stale).await?;
+    let claimed2 = db.url_queue_generic.claim("worker-2", 1, new_stale).await?;
     assert_eq!(claimed2.len(), 1);
     assert_eq!(claimed2[0].id, url_id);
 
@@ -74,12 +75,13 @@ async fn test_retry_after_in_future_not_claimable() -> DbResult<()> {
 
     // Mark as failed with retry_after in the future
     let retry_after = Utc::now().naive_utc() + Duration::hours(1);
-    db.mark_url_failed(&url_id, "temporary error", Some(retry_after))
+    db.url_queue_generic
+        .mark_failed(&url_id, "temporary error", Some(retry_after))
         .await?;
 
     // Try to claim - should get nothing (retry_after not reached)
     let stale = Utc::now().naive_utc() - Duration::hours(1);
-    let claimed = db.claim_urls("worker-1", 1, stale).await?;
+    let claimed = db.url_queue_generic.claim("worker-1", 1, stale).await?;
     assert_eq!(claimed.len(), 0);
 
     Ok(())
@@ -92,12 +94,13 @@ async fn test_retry_after_in_past_is_claimable() -> DbResult<()> {
 
     // Mark as failed with retry_after in the past
     let retry_after = Utc::now().naive_utc() - Duration::hours(1);
-    db.mark_url_failed(&url_id, "temporary error", Some(retry_after))
+    db.url_queue_generic
+        .mark_failed(&url_id, "temporary error", Some(retry_after))
         .await?;
 
     // Try to claim - should succeed (retry_after has passed)
     let stale = Utc::now().naive_utc() - Duration::hours(2);
-    let claimed = db.claim_urls("worker-1", 1, stale).await?;
+    let claimed = db.url_queue_generic.claim("worker-1", 1, stale).await?;
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].id, url_id);
 
@@ -110,11 +113,13 @@ async fn test_failed_without_retry_after_not_claimable() -> DbResult<()> {
     let (url_id, _) = db.submit_url(&user_id, "https://example.com/test").await?;
 
     // Mark as failed with NO retry_after (permanent failure)
-    db.mark_url_failed(&url_id, "permanent error", None).await?;
+    db.url_queue_generic
+        .mark_failed(&url_id, "permanent error", None)
+        .await?;
 
     // Try to claim - should get nothing (no retry_after means don't retry)
     let stale = Utc::now().naive_utc() - Duration::hours(1);
-    let claimed = db.claim_urls("worker-1", 1, stale).await?;
+    let claimed = db.url_queue_generic.claim("worker-1", 1, stale).await?;
     assert_eq!(claimed.len(), 0);
 
     Ok(())
@@ -126,9 +131,15 @@ async fn test_failed_url_increments_attempt_count() -> DbResult<()> {
     let (url_id, _) = db.submit_url(&user_id, "https://example.com/test").await?;
 
     // Fail multiple times
-    db.mark_url_failed(&url_id, "error 1", None).await?;
-    db.mark_url_failed(&url_id, "error 2", None).await?;
-    db.mark_url_failed(&url_id, "error 3", None).await?;
+    db.url_queue_generic
+        .mark_failed(&url_id, "error 1", None)
+        .await?;
+    db.url_queue_generic
+        .mark_failed(&url_id, "error 2", None)
+        .await?;
+    db.url_queue_generic
+        .mark_failed(&url_id, "error 3", None)
+        .await?;
 
     // Check attempt count via raw query
     let row: (i32,) = sqlx::query_as("SELECT attempt_count FROM research_urls WHERE id = ?")
@@ -154,11 +165,11 @@ async fn test_claim_batch_respects_limit() -> DbResult<()> {
     let stale = Utc::now().naive_utc() - Duration::hours(1);
 
     // Claim batch of 3
-    let claimed = db.claim_urls("worker-1", 3, stale).await?;
+    let claimed = db.url_queue_generic.claim("worker-1", 3, stale).await?;
     assert_eq!(claimed.len(), 3);
 
     // Claim another batch - should get remaining 2
-    let claimed2 = db.claim_urls("worker-2", 3, stale).await?;
+    let claimed2 = db.url_queue_generic.claim("worker-2", 3, stale).await?;
     assert_eq!(claimed2.len(), 2);
 
     Ok(())
@@ -177,15 +188,16 @@ async fn test_claim_prioritizes_retry_after_nulls_first() -> DbResult<()> {
 
     // Set url2 with a retry_after in the past (so it should come last in priority)
     let retry_after = Utc::now().naive_utc() - Duration::minutes(5);
-    db.mark_url_failed(&url2, "temporary", Some(retry_after))
+    db.url_queue_generic
+        .mark_failed(&url2, "temporary", Some(retry_after))
         .await?;
 
     let stale = Utc::now().naive_utc() - Duration::hours(1);
 
     // Claim one at a time to check order
-    let claimed1 = db.claim_urls("worker-1", 1, stale).await?;
-    let claimed2 = db.claim_urls("worker-1", 1, stale).await?;
-    let claimed3 = db.claim_urls("worker-1", 1, stale).await?;
+    let claimed1 = db.url_queue_generic.claim("worker-1", 1, stale).await?;
+    let claimed2 = db.url_queue_generic.claim("worker-1", 1, stale).await?;
+    let claimed3 = db.url_queue_generic.claim("worker-1", 1, stale).await?;
 
     // Pending URLs (url1, url3) should come before failed URL (url2)
     // because ORDER BY retry_after NULLS FIRST
@@ -301,6 +313,7 @@ async fn test_create_page_rejects_pre_resolved_media() -> DbResult<()> {
             fetched_at: Utc::now().naive_utc(),
         },
         created_at: Utc::now().naive_utc(),
+        analysis: MediaAnalysisState::Pending,
     });
 
     let page_data = PageData {
@@ -575,7 +588,7 @@ async fn test_mark_url_resolved_to_page() -> DbResult<()> {
 
     // Claim the URL first (simulating worker flow)
     let stale = Utc::now().naive_utc() - Duration::hours(1);
-    let claimed = db.claim_urls("worker-1", 1, stale).await?;
+    let claimed = db.url_queue_generic.claim("worker-1", 1, stale).await?;
     assert_eq!(claimed.len(), 1);
 
     // Create a page and mark resolved
@@ -616,7 +629,7 @@ async fn test_mark_url_resolved_to_media() -> DbResult<()> {
 
     // Claim the URL first
     let stale = Utc::now().naive_utc() - Duration::hours(1);
-    let claimed = db.claim_urls("worker-1", 1, stale).await?;
+    let claimed = db.url_queue_generic.claim("worker-1", 1, stale).await?;
     assert_eq!(claimed.len(), 1);
 
     // Create media and mark resolved
@@ -654,6 +667,7 @@ async fn test_mark_url_resolved_to_media() -> DbResult<()> {
 
 // ==================== Affinity-Based Claiming Tests ====================
 
+use crate::models::ResearchUrl;
 use chronoscope_integrations::IntegrationName;
 
 #[tokio::test]
@@ -667,10 +681,18 @@ async fn test_claim_urls_with_affinity_only_claims_matching() -> DbResult<()> {
 
     let stale = Utc::now().naive_utc() - Duration::hours(1);
 
+    // Create affinity-specific queues for testing
+    let instagram_queue: Queue<ResearchUrl> = Queue::new(
+        db.pool.clone(),
+        url_queue_config(Some(IntegrationName::Instagram)),
+    );
+    let reddit_queue: Queue<ResearchUrl> = Queue::new(
+        db.pool.clone(),
+        url_queue_config(Some(IntegrationName::Reddit)),
+    );
+
     // Claim with Instagram affinity - should get nothing
-    let claimed = db
-        .claim_urls_with_affinity("worker-1", 1, stale, IntegrationName::Instagram)
-        .await?;
+    let claimed = instagram_queue.claim("worker-1", 1, stale).await?;
     assert_eq!(
         claimed.len(),
         0,
@@ -678,7 +700,10 @@ async fn test_claim_urls_with_affinity_only_claims_matching() -> DbResult<()> {
     );
 
     // Generic claim_urls should also not get it (has affinity)
-    let claimed = db.claim_urls("worker-generic", 10, stale).await?;
+    let claimed = db
+        .url_queue_generic
+        .claim("worker-generic", 10, stale)
+        .await?;
     assert_eq!(
         claimed.len(),
         0,
@@ -686,9 +711,7 @@ async fn test_claim_urls_with_affinity_only_claims_matching() -> DbResult<()> {
     );
 
     // Claim with Reddit affinity - should get the URL
-    let claimed = db
-        .claim_urls_with_affinity("worker-2", 1, stale, IntegrationName::Reddit)
-        .await?;
+    let claimed = reddit_queue.claim("worker-2", 1, stale).await?;
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].id, reddit_id);
 
@@ -770,7 +793,7 @@ async fn test_claim_urls_generic_ignores_affinity_urls() -> DbResult<()> {
     let stale = Utc::now().naive_utc() - Duration::hours(1);
 
     // Generic claim_urls should only get the generic URL, not the Reddit one
-    let claimed = db.claim_urls("worker-1", 10, stale).await?;
+    let claimed = db.url_queue_generic.claim("worker-1", 10, stale).await?;
     assert_eq!(
         claimed.len(),
         1,
@@ -791,10 +814,14 @@ async fn test_claim_urls_affinity_ignores_generic_urls() -> DbResult<()> {
 
     let stale = Utc::now().naive_utc() - Duration::hours(1);
 
+    // Create Reddit queue
+    let reddit_queue: Queue<ResearchUrl> = Queue::new(
+        db.pool.clone(),
+        url_queue_config(Some(IntegrationName::Reddit)),
+    );
+
     // Reddit worker should not claim generic URLs
-    let claimed = db
-        .claim_urls_with_affinity("worker-1", 10, stale, IntegrationName::Reddit)
-        .await?;
+    let claimed = reddit_queue.claim("worker-1", 10, stale).await?;
     assert_eq!(
         claimed.len(),
         0,

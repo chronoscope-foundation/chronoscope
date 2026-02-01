@@ -12,7 +12,9 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chronoscope_api::research_types::{MediaReference, ResearchUrlDossier, ResolvedContent};
+use chronoscope_api::research_types::{
+    AnalysisOutcome, MediaReference, ResearchUrlDossier, ResolvedContent,
+};
 use chronoscope_db::{MediaType, ResearchUrlStatus};
 use chronoscope_dev::{DevServerConfig, RunningDevServer, start_dev_server};
 use chronoscope_workers::RetryConfig;
@@ -28,6 +30,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Extended timeout for external API calls (30 seconds).
 const EXTERNAL_API_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for analysis operations. Triton inference can be slow
+const ANALYSIS_TIMEOUT: Duration = Duration::from_mins(5);
 
 fn fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
     // Fixtures are in the integrations crate
@@ -58,15 +62,22 @@ struct TestServer {
 }
 
 impl TestServer {
-    /// Start a test server with VCR fixtures.
+    /// Start a test server with VCR fixtures and default Triton endpoint.
     async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::start_with_config(None).await
     }
 
-    /// Start a test server with VCR fixtures and optional Apify config.
+    /// Start a test server with VCR fixtures, optional Apify config, and default Triton endpoint.
     async fn start_with_config(
         apify_config: Option<ApifyConfig>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // Use TRITON_ENDPOINT from environment, or the default endpoint fixtures were recorded with.
+        // The VCR cache key includes the URL, so we need consistent URLs between recording and playback.
+        let triton_endpoint: Option<url::Url> = Some(
+            std::env::var("TRITON_ENDPOINT")
+                .unwrap_or_else(|_| "http://38.80.122.36:12880".to_string())
+                .parse()?,
+        );
         let http_client: Arc<dyn HttpClient> =
             Arc::new(CachingClient::new(fixtures_dir()?, vcr_mode())?);
 
@@ -92,6 +103,7 @@ impl TestServer {
             rp_origin: None,
             ios_app_id: None,
             apify_config,
+            triton_endpoint,
         })
         .await?;
 
@@ -190,10 +202,49 @@ impl TestServer {
         Ok(resp.bytes().await?)
     }
 
+    /// Wait until analysis is complete on at least one media item.
+    ///
+    /// Polls until the dossier has a resolved page with at least one media item
+    /// that has completed analysis (both VLM and segmentation).
+    async fn wait_for_analysis_complete(
+        &self,
+        url_id: &str,
+        timeout: Duration,
+    ) -> Result<ResearchUrlDossier, Box<dyn std::error::Error + Send + Sync>> {
+        self.wait_for_media_condition(
+            url_id,
+            |media| {
+                media.iter().any(|m| {
+                    if let MediaReference::Fetched(fetched) = m {
+                        matches!(fetched.analysis.vlm, AnalysisOutcome::Success(_))
+                            && matches!(fetched.analysis.segmentation, AnalysisOutcome::Success(_))
+                    } else {
+                        false
+                    }
+                })
+            },
+            timeout,
+        )
+        .await
+    }
+
     /// Gracefully shut down the server and wait for workers to stop.
     async fn shutdown(self) {
         self.server.shutdown().await;
     }
+}
+
+// ==================== Helpers ====================
+
+/// Extract fetched media from a slice of MediaReferences.
+fn fetched_media(media: &[MediaReference]) -> Vec<&chronoscope_api::research_types::MediaDossier> {
+    media
+        .iter()
+        .filter_map(|m| match m {
+            MediaReference::Fetched(media) => Some(media.as_ref()),
+            MediaReference::Pending { .. } => None,
+        })
+        .collect()
 }
 
 // ==================== Tests ====================
@@ -206,11 +257,24 @@ impl TestServer {
 /// 3. Workers attempt to fetch each media item (1 succeeds via fixture, rest fail)
 /// 4. Dossier shows correct media states (fetched vs pending/failed)
 /// 5. Successful media can be retrieved via CDN URL and is a valid image
+/// 6. Analysis worker processes the image through Triton (SAM3 + VLM)
+/// 7. Analysis results appear in the API response with valid structure
 ///
 /// Note: The Reddit gallery contains 20 images, but we intentionally only recorded
 /// a VCR fixture for one of them. This tests that the failure path works correctly:
 /// images without fixtures fail with `CacheMiss` (treated as permanent failure in
 /// offline VCR mode), while the one with a fixture succeeds and can be retrieved.
+///
+/// # Recording fixtures
+///
+/// To record/update fixtures (including Triton), ensure Triton is running and:
+/// ```bash
+/// cargo test -p chronoscope-dev --features record-fixtures -- test_reddit_gallery
+/// ```
+///
+/// The test uses `TRITON_ENDPOINT` env var if set, otherwise defaults to the
+/// endpoint fixtures were recorded with. To use a different Triton server,
+/// set the env var and re-record fixtures.
 #[tokio::test]
 async fn test_reddit_gallery_end_to_end() -> TestResult {
     let server = TestServer::start().await?;
@@ -243,14 +307,7 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
     assert!(!page.media.is_empty(), "should have media items");
 
     // Find the fetched media items
-    let fetched: Vec<_> = page
-        .media
-        .iter()
-        .filter_map(|m| match m {
-            MediaReference::Fetched(media) => Some(media.as_ref()),
-            MediaReference::Pending { .. } => None,
-        })
-        .collect();
+    let fetched = fetched_media(&page.media);
 
     // Only one fixture is kept (first gallery image); others have pinned 404 failures
     assert_eq!(
@@ -304,6 +361,75 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
         thumb.width() <= img.width() && thumb.height() <= img.height(),
         "thumbnail should not be larger than original"
     );
+
+    // ==================== Analysis Verification ====================
+    // Wait for analysis to complete (may take longer due to Triton inference)
+    let dossier = server
+        .wait_for_analysis_complete(&url_id, ANALYSIS_TIMEOUT)
+        .await?;
+
+    // Re-extract the analyzed media
+    let Some(ResolvedContent::Page(page)) = dossier.resolved else {
+        return Err("expected resolved page after analysis".into());
+    };
+
+    let analyzed: Vec<_> = fetched_media(&page.media)
+        .into_iter()
+        .filter(|m| matches!(m.analysis.vlm, AnalysisOutcome::Success(_)))
+        .collect();
+
+    assert!(
+        !analyzed.is_empty(),
+        "at least one media item should have completed analysis"
+    );
+
+    let media = analyzed[0];
+
+    // Verify VLM analysis results
+    let AnalysisOutcome::Success(vlm) = &media.analysis.vlm else {
+        return Err("expected successful VLM analysis".into());
+    };
+
+    assert!(
+        !vlm.content_summary.is_empty(),
+        "VLM should produce a content summary"
+    );
+
+    // For this abandoned buildings image, it should be marked as relevant
+    assert!(
+        vlm.is_relevant,
+        "abandoned building image should be marked as relevant"
+    );
+
+    // Verify segmentation results
+    let AnalysisOutcome::Success(segmentation) = &media.analysis.segmentation else {
+        return Err("expected successful segmentation".into());
+    };
+
+    // Recorded fixture should return exactly 2 regions with specific properties
+    assert_eq!(
+        segmentation.regions.len(),
+        2,
+        "recorded fixture should detect exactly 2 regions"
+    );
+
+    // Verify region IDs and confidence scores from the recorded fixture
+    let region_ids: Vec<_> = segmentation.regions.iter().map(|r| r.region_id).collect();
+    assert_eq!(region_ids, vec![1, 2], "region IDs should be 1 and 2");
+
+    // Both regions should have confidence ~0.66-0.69 (from recorded fixture)
+    for region in &segmentation.regions {
+        assert!(
+            !region.mask.counts.is_empty(),
+            "region mask should have RLE counts"
+        );
+        assert!(
+            region.confidence > 0.65 && region.confidence < 0.70,
+            "region {} confidence should be ~0.66-0.69, got {}",
+            region.region_id,
+            region.confidence
+        );
+    }
 
     server.shutdown().await;
     Ok(())
@@ -446,14 +572,7 @@ async fn test_instagram_post_end_to_end() -> TestResult {
     );
 
     // Only one fixture is kept (smallest carousel image); others have pinned 404 failures
-    let fetched: Vec<_> = page
-        .media
-        .iter()
-        .filter_map(|m| match m {
-            MediaReference::Fetched(media) => Some(media.as_ref()),
-            MediaReference::Pending { .. } => None,
-        })
-        .collect();
+    let fetched = fetched_media(&page.media);
 
     assert_eq!(
         fetched.len(),
@@ -545,14 +664,7 @@ async fn test_instagram_reel_end_to_end() -> TestResult {
     };
 
     // Reels should have 2 media items: thumbnail (display_url) + video (video_url)
-    let fetched: Vec<_> = page
-        .media
-        .iter()
-        .filter_map(|m| match m {
-            MediaReference::Fetched(media) => Some(media.as_ref()),
-            MediaReference::Pending { .. } => None,
-        })
-        .collect();
+    let fetched = fetched_media(&page.media);
 
     assert_eq!(
         fetched.len(),

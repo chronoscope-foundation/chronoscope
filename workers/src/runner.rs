@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use chronoscope_db::Database;
+use chronoscope_db::{Database, Queue, QueueItem};
 use tokio::sync::watch;
 use tracing::{debug, debug_span, error, info, instrument, warn};
 
@@ -127,17 +127,14 @@ impl Enqueuer<()> for NoOpEnqueuer {
     }
 }
 
-// ==================== Work Queue Abstraction ====================
-
-/// A work queue that provides items for processing.
+/// Run the worker loop.
 ///
-/// This trait abstracts queue operations (claim, `mark_failed`) from the
-/// runner, allowing different queue backends (DB tables, SQS, etc.)
-/// and different item types (URLs, media items, etc.).
+/// Claims items from the queue, processes them with the worker, and handles
+/// status updates based on results. Runs until the shutdown signal is received.
 ///
 /// # Design Note: Success Handling
 ///
-/// TODO: Currently there's an asymmetry in who handles success vs failure:
+/// There's an intentional asymmetry in who handles success vs failure:
 /// - **Failure**: Runner calls `queue.mark_failed()` (queue manages retry state)
 /// - **Success**: Worker writes to DB directly (creates page/media, marks URL resolved)
 ///
@@ -148,115 +145,6 @@ impl Enqueuer<()> for NoOpEnqueuer {
 /// Workers must write to the DB anyway to store content (pages/media), so having
 /// them also mark resolution (`page_id`/`media_id`) isn't additional coupling.
 ///
-/// Revisit this when we have more worker implementations to see if a cleaner
-/// pattern emerges (e.g., `WorkQueue::mark_success()` that takes a "resolved to"
-/// payload from the worker).
-#[async_trait::async_trait]
-pub trait WorkQueue: Send + Sync {
-    /// The type of items in this queue.
-    type Item: Send;
-
-    /// The type of item identifiers (for logging and status updates).
-    type ItemId: std::fmt::Display + Send + Sync + Clone;
-
-    /// Extract the identifier from an item.
-    #[must_use]
-    fn item_id(item: &Self::Item) -> Self::ItemId;
-
-    /// Get the attempt count for retry logic.
-    #[must_use]
-    fn attempt_count(item: &Self::Item) -> i32;
-
-    /// Claim a batch of items for processing.
-    async fn claim(
-        &self,
-        worker_id: &str,
-        batch_size: u32,
-        stale_cutoff: chrono::NaiveDateTime,
-    ) -> Result<Vec<Self::Item>, RunnerError>;
-
-    /// Mark an item as failed with optional retry.
-    async fn mark_failed(
-        &self,
-        item_id: &Self::ItemId,
-        error: &str,
-        retry_after: Option<chrono::NaiveDateTime>,
-    ) -> Result<(), RunnerError>;
-}
-
-/// Work queue for research URLs.
-///
-/// Claims URLs based on worker affinity:
-/// - `affinity = None`: claims generic URLs only (`worker_affinity` IS NULL)
-/// - `affinity = Some(name)`: claims URLs with matching `worker_affinity`
-pub struct UrlQueue {
-    db: Arc<Database>,
-    affinity: Option<chronoscope_integrations::IntegrationName>,
-}
-
-impl UrlQueue {
-    /// Create a queue with optional integration affinity.
-    ///
-    /// - `affinity = None`: claims generic URLs only (`worker_affinity` IS NULL)
-    /// - `affinity = Some(name)`: claims URLs with matching `worker_affinity`
-    #[must_use]
-    pub fn new(
-        db: Arc<Database>,
-        affinity: Option<chronoscope_integrations::IntegrationName>,
-    ) -> Self {
-        Self { db, affinity }
-    }
-}
-
-#[async_trait::async_trait]
-impl WorkQueue for UrlQueue {
-    type Item = chronoscope_db::ResearchUrl;
-    type ItemId = chronoscope_db::ResearchUrlId;
-
-    fn item_id(item: &Self::Item) -> Self::ItemId {
-        item.id.clone()
-    }
-
-    fn attempt_count(item: &Self::Item) -> i32 {
-        item.attempt_count
-    }
-
-    async fn claim(
-        &self,
-        worker_id: &str,
-        batch_size: u32,
-        stale_cutoff: chrono::NaiveDateTime,
-    ) -> Result<Vec<Self::Item>, RunnerError> {
-        let urls = match self.affinity {
-            None => {
-                self.db
-                    .claim_urls(worker_id, batch_size, stale_cutoff)
-                    .await?
-            }
-            Some(affinity) => {
-                self.db
-                    .claim_urls_with_affinity(worker_id, batch_size, stale_cutoff, affinity)
-                    .await?
-            }
-        };
-        Ok(urls)
-    }
-
-    async fn mark_failed(
-        &self,
-        item_id: &Self::ItemId,
-        error: &str,
-        retry_after: Option<chrono::NaiveDateTime>,
-    ) -> Result<(), RunnerError> {
-        Ok(self.db.mark_url_failed(item_id, error, retry_after).await?)
-    }
-}
-
-/// Run the worker loop.
-///
-/// Claims items from the queue, processes them with the worker, and handles
-/// status updates based on results. Runs until the shutdown signal is received.
-///
 /// # Errors
 ///
 /// Returns `RunnerError::Database` if queue operations fail.
@@ -264,8 +152,8 @@ impl WorkQueue for UrlQueue {
 // interruptible via the shutdown channel, so workers can shut down promptly.
 #[allow(clippy::disallowed_methods)]
 #[instrument(skip_all, fields(worker_id = %config.worker_id))]
-pub async fn run<Q, W, E>(
-    queue: Q,
+pub async fn run<T, W, E>(
+    queue: Arc<Queue<T>>,
     worker: W,
     enqueuer: E,
     config: WorkerConfig,
@@ -273,11 +161,15 @@ pub async fn run<Q, W, E>(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), RunnerError>
 where
-    Q: WorkQueue,
-    W: Worker<Item = Q::Item>,
+    T: QueueItem,
+    W: Worker<Item = T>,
     E: Enqueuer<W::Discovered>,
 {
-    info!(batch_size = config.batch_size, "worker starting");
+    info!(
+        batch_size = config.batch_size,
+        queue = queue.name(),
+        "worker starting"
+    );
 
     loop {
         // Check for shutdown
@@ -317,8 +209,8 @@ where
 
         // Handle results
         for (item, result) in results {
-            let attempt_count = Q::attempt_count(&item);
-            let item_id = Q::item_id(&item);
+            let attempt_count = item.attempt_count();
+            let item_id = item.id();
             let item_span = debug_span!("item", item_id = %item_id);
 
             match result {
@@ -377,7 +269,7 @@ where
 mod tests {
     use super::*;
     use crate::worker::Worker;
-    use chronoscope_db::{Database, Email, ResearchUrl, UserId};
+    use chronoscope_db::{Database, Email, ResearchUrl, ResearchUrlId, UserId};
     use std::collections::{HashMap, VecDeque};
     use std::sync::Mutex;
     use tokio::sync::mpsc;
@@ -572,12 +464,15 @@ mod tests {
         Ok(Arc::new(Database::new("sqlite::memory:").await?))
     }
 
-    async fn create_test_url(db: &Database, url: &str) -> Result<(), chronoscope_db::DbError> {
+    async fn create_test_url(
+        db: &Database,
+        url: &str,
+    ) -> Result<ResearchUrlId, chronoscope_db::DbError> {
         let user_id = UserId::generate();
         db.create_user(&user_id, "testuser", &Email::new("test@example.com"))
             .await?;
-        db.submit_url(&user_id, url).await?;
-        Ok(())
+        let (url_id, _) = db.submit_url(&user_id, url).await?;
+        Ok(url_id)
     }
 
     fn fast_retry_config() -> RetryConfig {
@@ -649,7 +544,7 @@ mod tests {
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let queue = UrlQueue::new(db.clone(), None);
+        let queue = db.url_queue_generic.clone();
 
         tokio::spawn(async move {
             let _ = run(
@@ -696,7 +591,7 @@ mod tests {
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let queue = UrlQueue::new(db.clone(), None);
+        let queue = db.url_queue_generic.clone();
 
         tokio::spawn(async move {
             let _ = run(
@@ -731,24 +626,21 @@ mod tests {
     #[tokio::test]
     async fn test_runner_does_not_retry_permanent_failure() -> TestResult {
         let db = setup_test_db().await?;
-        create_test_url(&db, "https://example.com/permanent").await?;
+        let url_id = create_test_url(&db, "https://example.com/permanent").await?;
 
         let (call_tx, mut call_rx) = mpsc::unbounded_channel();
         let (enqueue_tx, _enqueue_rx) = mpsc::unbounded_channel();
 
-        // Configure permanent failure, then success (should never reach success)
+        // Configure permanent failure
         let worker = TestWorker::new(db.clone(), call_tx).on_url(
             "https://example.com/permanent",
-            vec![
-                ItemResult::PermanentFailure {
-                    error: "gone".into(),
-                },
-                ItemResult::Success { discovered: vec![] }, // Should never be reached
-            ],
+            vec![ItemResult::PermanentFailure {
+                error: "gone".into(),
+            }],
         );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let queue = UrlQueue::new(db.clone(), None);
+        let queue = db.url_queue_generic.clone();
 
         tokio::spawn(async move {
             let _ = run(
@@ -764,15 +656,30 @@ mod tests {
             .await;
         });
 
-        // Should only be called once
+        // Wait for the single call
         let calls = collect_n(&mut call_rx, 1).await?;
+        assert_eq!(calls, vec!["https://example.com/permanent"]);
 
-        // Give a brief moment to ensure no second call comes
-        let extra = tokio::time::timeout(Duration::from_millis(50), call_rx.recv()).await;
+        // Shutdown the runner
         let _ = shutdown_tx.send(true);
 
-        assert_eq!(calls, vec!["https://example.com/permanent"]);
-        assert!(extra.is_err(), "should not have been called again");
+        // Verify the URL status is now failed (via get_url_by_id)
+        let url_record = db.get_url_by_id(&url_id).await?.expect("URL should exist");
+        assert_eq!(
+            url_record.status,
+            chronoscope_db::ResearchUrlStatus::Failed,
+            "status should be 'failed'"
+        );
+
+        // Verify the item cannot be claimed (permanent failure means retry_after is NULL)
+        // Using a very future stale cutoff to ensure we'd catch any claimable items
+        let stale = chrono::Utc::now().naive_utc() + chrono::Duration::hours(1);
+        let claimed = db.url_queue_generic.claim("worker-2", 10, stale).await?;
+        assert!(
+            claimed.is_empty(),
+            "permanently failed item should not be claimable"
+        );
+
         Ok(())
     }
 
@@ -809,7 +716,7 @@ mod tests {
             );
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let queue = UrlQueue::new(db.clone(), None);
+        let queue = db.url_queue_generic.clone();
         let enqueuer = UrlEnqueuer::new(db.clone(), system_user);
 
         tokio::spawn(async move {

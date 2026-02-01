@@ -7,13 +7,16 @@ pub mod error;
 pub mod media_store;
 pub mod models;
 pub mod queries;
+pub mod queue;
 pub mod types;
 pub mod url;
-mod workers;
+pub mod workers;
+
+use std::str::FromStr;
+use std::sync::Arc;
 
 use chrono::{NaiveDateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use std::str::FromStr;
 
 use chronoscope_integrations::IntegrationRegistry;
 
@@ -22,9 +25,13 @@ pub use models::{
     FollowedUrl, GpsLocation, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl,
     ResearchUrlWithResolved, ResolvedContent, User,
 };
+pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use types::{
-    Email, MediaId, MediaType, PageId, ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
+    AnalysisStatus, Email, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
+    ResearchUrlStatus, SourceType, UserId,
 };
+
+pub use workers::MediaForAnalysis;
 
 use models::{MediaDbRow, PageDbRow, PageMediaRow};
 
@@ -39,6 +46,15 @@ pub(crate) fn now() -> NaiveDateTime {
 pub struct Database {
     pool: SqlitePool,
     registry: IntegrationRegistry,
+
+    // Type-erased for verification iteration
+    all_queues: Vec<Arc<dyn QueueQueries>>,
+
+    // Typed queue access for workers
+    /// Queue for generic URLs (`worker_affinity IS NULL`).
+    pub url_queue_generic: Arc<Queue<ResearchUrl>>,
+    /// Queue for image analysis.
+    pub analysis_queue: Arc<Queue<MediaForAnalysis>>,
 }
 
 impl Database {
@@ -84,9 +100,26 @@ impl Database {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        queries::verify_all_query_plans(&pool).await?;
+        // Create queues
+        let url_queue_generic = Arc::new(Queue::new(pool.clone(), url_queue_config(None)));
+        let analysis_queue = Arc::new(Queue::new(pool.clone(), &ANALYSIS_QUEUE));
 
-        Ok(Self { pool, registry })
+        // Collect for verification (same Arc, different view)
+        let all_queues: Vec<Arc<dyn QueueQueries>> =
+            vec![url_queue_generic.clone(), analysis_queue.clone()];
+
+        let db = Self {
+            pool,
+            registry,
+            all_queues,
+            url_queue_generic,
+            analysis_queue,
+        };
+
+        // Verify all query plans (static + queue-generated)
+        db.verify_all_query_plans().await?;
+
+        Ok(db)
     }
 
     /// Create a new database connection pool and run migrations, but skip query plan verification.
@@ -106,7 +139,36 @@ impl Database {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        Ok(Self { pool, registry })
+        // Create queues
+        let url_queue_generic = Arc::new(Queue::new(pool.clone(), url_queue_config(None)));
+        let analysis_queue = Arc::new(Queue::new(pool.clone(), &ANALYSIS_QUEUE));
+
+        // Collect for verification
+        let all_queues: Vec<Arc<dyn QueueQueries>> =
+            vec![url_queue_generic.clone(), analysis_queue.clone()];
+
+        Ok(Self {
+            pool,
+            registry,
+            all_queues,
+            url_queue_generic,
+            analysis_queue,
+        })
+    }
+
+    /// Verify all query plans (static queries + queue-generated queries).
+    async fn verify_all_query_plans(&self) -> DbResult<()> {
+        // Verify static queries
+        queries::verify_all_query_plans(&self.pool).await?;
+
+        // Verify queue-generated queries
+        for queue in &self.all_queues {
+            for (name, sql) in queue.queries() {
+                queries::verify_query_plan_sql(&self.pool, name, sql).await?;
+            }
+        }
+
+        Ok(())
     }
 
     // ==================== Users ====================

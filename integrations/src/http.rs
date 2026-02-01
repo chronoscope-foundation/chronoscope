@@ -766,6 +766,104 @@ impl HttpClient for CachingClient {
     }
 }
 
+// ==================== Mock Client (Test Support) ====================
+
+/// Mock HTTP client for unit testing.
+///
+/// Returns pre-configured responses regardless of the request. Use this for
+/// testing specific scenarios like error status codes, malformed responses, etc.
+///
+/// For integration tests with realistic request/response matching, use
+/// [`CachingClient`] in offline mode with recorded fixtures instead.
+///
+/// Requires the `testing` feature to be enabled.
+#[cfg(feature = "testing")]
+pub struct MockHttpClient {
+    responses: tokio::sync::Mutex<Vec<Result<HttpResponse, HttpError>>>,
+}
+
+#[cfg(feature = "testing")]
+impl MockHttpClient {
+    /// Create a mock client that returns the given response.
+    #[must_use]
+    pub fn with_response(response: Result<HttpResponse, HttpError>) -> Self {
+        Self {
+            responses: tokio::sync::Mutex::new(vec![response]),
+        }
+    }
+
+    /// Create a mock client that returns a successful response with the given body.
+    ///
+    /// # Errors
+    /// Returns error if the mock URL cannot be parsed (should not happen).
+    pub fn success(body: &[u8]) -> Result<Self, MockHttpError> {
+        let url = mock_url()?;
+        Ok(Self::with_response(Ok(HttpResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::copy_from_slice(body),
+            final_url: url,
+        })))
+    }
+
+    /// Create a mock client that returns the given status code with a body.
+    ///
+    /// # Errors
+    /// Returns error if the mock URL cannot be parsed (should not happen).
+    pub fn with_status(status: StatusCode, body: &str) -> Result<Self, MockHttpError> {
+        let url = mock_url()?;
+        Ok(Self::with_response(Ok(HttpResponse {
+            status,
+            headers: HeaderMap::new(),
+            body: Bytes::copy_from_slice(body.as_bytes()),
+            final_url: url,
+        })))
+    }
+
+    /// Alias for `with_status` - returns an error status with body.
+    ///
+    /// # Errors
+    /// Returns error if the mock URL cannot be parsed (should not happen).
+    pub fn error_status(status: StatusCode, body: &str) -> Result<Self, MockHttpError> {
+        Self::with_status(status, body)
+    }
+
+    /// Create a mock client that returns the given status code with empty body.
+    ///
+    /// # Errors
+    /// Returns error if the mock URL cannot be parsed (should not happen).
+    pub fn status(status: StatusCode) -> Result<Self, MockHttpError> {
+        Self::with_status(status, "")
+    }
+}
+
+/// Error constructing a mock HTTP client.
+#[cfg(feature = "testing")]
+#[derive(Debug, thiserror::Error)]
+#[error("failed to construct mock: {0}")]
+pub struct MockHttpError(String);
+
+#[cfg(feature = "testing")]
+fn mock_url() -> Result<Url, MockHttpError> {
+    "http://mock.test/"
+        .parse()
+        .map_err(|e| MockHttpError(format!("invalid mock URL: {e}")))
+}
+
+#[cfg(feature = "testing")]
+#[async_trait::async_trait]
+impl HttpClient for MockHttpClient {
+    async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let mut responses = self.responses.lock().await;
+        match responses.pop() {
+            Some(response) => response,
+            None => Err(HttpError::CacheMiss {
+                url: "mock: no more responses configured".to_string(),
+            }),
+        }
+    }
+}
+
 // ==================== Tests ====================
 
 #[cfg(test)]

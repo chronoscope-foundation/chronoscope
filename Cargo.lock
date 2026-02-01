@@ -450,7 +450,10 @@ dependencies = [
 name = "chronoscope-analysis"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
+ "bytes",
+ "chronoscope-integrations",
  "clap",
  "reqwest",
  "schemars 0.8.22",
@@ -471,6 +474,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "chronoscope-analysis",
  "chronoscope-db",
  "dropshot",
  "hickory-resolver",
@@ -522,6 +526,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
+ "chronoscope-analysis",
  "chronoscope-api",
  "chronoscope-db",
  "chronoscope-workers",
@@ -570,6 +575,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "chronoscope-analysis",
  "chronoscope-db",
  "chronoscope-integrations",
  "hex",

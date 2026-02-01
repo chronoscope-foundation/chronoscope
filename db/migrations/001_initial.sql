@@ -62,11 +62,32 @@ CREATE TABLE media (
     source_metadata JSON,  -- Source-specific extras (photographer, format, etc.)
 
     fetched_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP NOT NULL
+    created_at TIMESTAMP NOT NULL,
+
+    -- Analysis work queue fields (for image analysis worker)
+    analysis_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (analysis_status IN ('pending', 'processing', 'complete', 'failed')),
+    analysis_claimed_at TIMESTAMP,
+    analysis_claimed_by TEXT,
+    analysis_attempt_count INT NOT NULL DEFAULT 0,
+    analysis_retry_after TIMESTAMP,
+    analysis_error TEXT,
+
+    -- Analysis results (JSON)
+    vlm_result JSON,
+    segmentation_result JSON
 );
 
 CREATE INDEX idx_media_perceptual ON media(perceptual_hash)
     WHERE perceptual_hash IS NOT NULL;
+
+-- Analysis queue indexes for images only
+CREATE INDEX idx_media_analysis_pending ON media(analysis_claimed_at, created_at)
+    WHERE analysis_status = 'pending' AND media_type = 'image';
+CREATE INDEX idx_media_analysis_processing ON media(analysis_claimed_at)
+    WHERE analysis_status = 'processing' AND media_type = 'image';
+CREATE INDEX idx_media_analysis_failed ON media(analysis_retry_after, created_at)
+    WHERE analysis_status = 'failed' AND analysis_retry_after IS NOT NULL AND media_type = 'image';
 
 -- Research URLs: the work queue
 -- Each URL resolves to either a page (complex content) or media (direct image/video)
@@ -78,13 +99,13 @@ CREATE TABLE research_urls (
     page_id TEXT REFERENCES pages(id) ON DELETE SET NULL,
     media_id TEXT REFERENCES media(id) ON DELETE SET NULL,
 
-    -- Work queue fields
-    status TEXT NOT NULL CHECK (status IN ('pending', 'analyzing', 'complete', 'failed')),
+    -- Work queue fields (uses 'processing' to match analysis queue)
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'complete', 'failed')),
     claimed_at TIMESTAMP,
     claimed_by TEXT,
     attempt_count INT NOT NULL,
     retry_after TIMESTAMP,
-    error_message TEXT,
+    error TEXT,
 
     -- Worker affinity: which specialized worker should process this URL.
     -- NULL means generic worker, 'reddit'/'instagram'/etc for specialized workers.
@@ -100,16 +121,16 @@ CREATE TABLE research_urls (
 -- Generic workers (affinity IS NULL)
 CREATE INDEX idx_urls_pending_generic ON research_urls(claimed_at, created_at)
     WHERE status = 'pending' AND worker_affinity IS NULL;
-CREATE INDEX idx_urls_analyzing_generic ON research_urls(claimed_at)
-    WHERE status = 'analyzing' AND worker_affinity IS NULL;
+CREATE INDEX idx_urls_processing_generic ON research_urls(claimed_at)
+    WHERE status = 'processing' AND worker_affinity IS NULL;
 CREATE INDEX idx_urls_failed_retry_generic ON research_urls(retry_after, created_at)
     WHERE status = 'failed' AND retry_after IS NOT NULL AND worker_affinity IS NULL;
 
 -- Specialized workers (affinity-filtered) - affinity first for equality match
 CREATE INDEX idx_urls_pending_affinity ON research_urls(worker_affinity, claimed_at, created_at)
     WHERE status = 'pending' AND worker_affinity IS NOT NULL;
-CREATE INDEX idx_urls_analyzing_affinity ON research_urls(worker_affinity, claimed_at)
-    WHERE status = 'analyzing' AND worker_affinity IS NOT NULL;
+CREATE INDEX idx_urls_processing_affinity ON research_urls(worker_affinity, claimed_at)
+    WHERE status = 'processing' AND worker_affinity IS NOT NULL;
 CREATE INDEX idx_urls_failed_retry_affinity ON research_urls(worker_affinity, retry_after, created_at)
     WHERE status = 'failed' AND retry_after IS NOT NULL AND worker_affinity IS NOT NULL;
 

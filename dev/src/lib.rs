@@ -15,11 +15,12 @@ use std::time::Duration;
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config, default_dns_resolver};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
-use chronoscope_db::{Database, Email, UserId};
+use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId, url_queue_config};
+use chronoscope_workers::analysis::AnalysisWorker;
 use chronoscope_workers::url_fetcher::{FetcherConfig, UrlFetcherWorker};
 use chronoscope_workers::{
-    ApifyConfig, HttpClient, IntegrationName, IntegrationRegistry, RetryConfig, UrlEnqueuer,
-    UrlQueue, WorkerConfig, create_registry, run,
+    ApifyConfig, HttpClient, IntegrationName, IntegrationRegistry, NoOpEnqueuer, RetryConfig,
+    UrlEnqueuer, WorkerConfig, create_registry, run,
 };
 use dropshot::{ApiDescription, ConfigDropshot, HttpServerStarter};
 use slog::info;
@@ -114,6 +115,10 @@ pub struct DevServerConfig {
     /// Optional: Apify configuration for Instagram integration.
     /// If provided, an Instagram worker will be spawned.
     pub apify_config: Option<ApifyConfig>,
+
+    /// Optional: Triton endpoint for image analysis.
+    /// If provided, an analysis worker will be spawned.
+    pub triton_endpoint: Option<url::Url>,
 }
 
 /// Find an available port by binding to port 0 and reading the assigned port.
@@ -163,7 +168,15 @@ fn spawn_url_fetcher_worker(
 
     let worker_id = name.to_string();
 
-    let queue = UrlQueue::new(ctx.db.clone(), affinity);
+    // Create queue based on affinity
+    let queue: Arc<Queue<ResearchUrl>> = match affinity {
+        None => ctx.db.url_queue_generic.clone(),
+        Some(integration) => {
+            // Create a queue for this specific integration
+            let config = url_queue_config(Some(integration));
+            Arc::new(Queue::new(ctx.db.pool_ref().clone(), config))
+        }
+    };
 
     let fetch_ctx = Arc::new(FetchContext {
         db: ctx.db.clone(),
@@ -198,6 +211,48 @@ fn spawn_url_fetcher_worker(
         .await
         {
             slog::error!(log, "Worker error"; "worker_id" => &worker_id, "error" => %e);
+        }
+    })
+}
+
+/// Spawn an analysis worker in a background task.
+fn spawn_analysis_worker(
+    worker_id: &str,
+    triton_endpoint: url::Url,
+    ctx: &WorkerContext,
+) -> JoinHandle<()> {
+    use chronoscope_analysis::TritonClient;
+
+    let worker_id = worker_id.to_string();
+    let queue = ctx.db.analysis_queue.clone();
+    let triton = TritonClient::new(triton_endpoint, ctx.http_client.clone());
+    let worker = AnalysisWorker::new(triton, ctx.db.clone(), ctx.media_store.clone());
+    let enqueuer = NoOpEnqueuer;
+
+    let worker_config = WorkerConfig {
+        worker_id: worker_id.clone(),
+        batch_size: 1, // Process one at a time (scale via multiple workers)
+        stale_after: Duration::from_mins(10), // Analysis can take longer
+        idle_backoff: ctx.idle_backoff,
+    };
+
+    let retry_config = ctx.retry_config.clone();
+    let shutdown_rx = ctx.shutdown_rx.clone();
+    let log = ctx.log.clone();
+
+    tokio::spawn(async move {
+        info!(log, "Starting analysis worker"; "worker_id" => &worker_id);
+        if let Err(e) = run(
+            queue,
+            worker,
+            enqueuer,
+            worker_config,
+            retry_config,
+            shutdown_rx,
+        )
+        .await
+        {
+            slog::error!(log, "Analysis worker error"; "worker_id" => &worker_id, "error" => %e);
         }
     })
 }
@@ -287,7 +342,20 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         info!(log, "Instagram worker enabled with Apify integration");
     }
 
-    info!(log, "Started URL fetcher workers"; "count" => worker_handles.len());
+    // Spawn analysis worker if Triton endpoint is provided
+    if let Some(triton_endpoint) = config.triton_endpoint.clone() {
+        worker_handles.push(spawn_analysis_worker(
+            "analysis-worker",
+            triton_endpoint.clone(),
+            &worker_ctx,
+        ));
+        info!(
+            log,
+            "Analysis worker enabled with Triton at {:?}", triton_endpoint
+        );
+    }
+
+    info!(log, "Started workers"; "count" => worker_handles.len());
 
     // ==================== Start API Server ====================
 

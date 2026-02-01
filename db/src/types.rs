@@ -65,8 +65,8 @@ define_id!(MediaId);
 pub enum ResearchUrlStatus {
     /// Submitted, waiting to be fetched
     Pending,
-    /// Fetched successfully, analysis in progress
-    Analyzing,
+    /// Currently being processed by a worker
+    Processing,
     /// All automated processing complete
     Complete,
     /// Processing failed (see `error_message`)
@@ -78,7 +78,7 @@ impl ResearchUrlStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
-            Self::Analyzing => "analyzing",
+            Self::Processing => "processing",
             Self::Complete => "complete",
             Self::Failed => "failed",
         }
@@ -88,6 +88,78 @@ impl ResearchUrlStatus {
 impl fmt::Display for ResearchUrlStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
+    }
+}
+
+/// Status of media analysis in the processing pipeline.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type,
+)]
+#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
+pub enum AnalysisStatus {
+    /// Waiting to be analyzed
+    Pending,
+    /// Analysis in progress
+    Processing,
+    /// Analysis completed successfully
+    Complete,
+    /// Analysis failed (see `analysis_error`)
+    Failed,
+}
+
+impl AnalysisStatus {
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Processing => "processing",
+            Self::Complete => "complete",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl fmt::Display for AnalysisStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Analysis state with associated data - enforces valid state combinations.
+///
+/// Unlike the flat DB representation (status + optional fields), this enum
+/// guarantees that Complete always has results and Failed always has an error.
+#[derive(Debug, Clone)]
+pub enum MediaAnalysisState {
+    /// Waiting to be analyzed
+    Pending,
+    /// Analysis in progress
+    Processing,
+    /// Analysis completed successfully with results
+    Complete {
+        /// VLM analysis result (JSON)
+        vlm_result: String,
+        /// Segmentation result (JSON)
+        segmentation_result: String,
+    },
+    /// Analysis failed with an error message
+    Failed {
+        /// Error description
+        error: String,
+    },
+}
+
+impl MediaAnalysisState {
+    /// Get the status enum value (for display/logging).
+    #[must_use]
+    pub fn status(&self) -> AnalysisStatus {
+        match self {
+            Self::Pending => AnalysisStatus::Pending,
+            Self::Processing => AnalysisStatus::Processing,
+            Self::Complete { .. } => AnalysisStatus::Complete,
+            Self::Failed { .. } => AnalysisStatus::Failed,
+        }
     }
 }
 
@@ -232,9 +304,9 @@ mod tests {
     // Enum serialization tests
     #[test]
     fn research_url_status_json_roundtrip() -> Result<(), serde_json::Error> {
-        let status = ResearchUrlStatus::Analyzing;
+        let status = ResearchUrlStatus::Processing;
         let json = serde_json::to_string(&status)?;
-        assert_eq!(json, "\"analyzing\"");
+        assert_eq!(json, "\"processing\"");
         let back: ResearchUrlStatus = serde_json::from_str(&json)?;
         assert_eq!(back, status);
         Ok(())
@@ -244,7 +316,7 @@ mod tests {
     fn research_url_status_as_str_matches_serde() -> Result<(), serde_json::Error> {
         for status in [
             ResearchUrlStatus::Pending,
-            ResearchUrlStatus::Analyzing,
+            ResearchUrlStatus::Processing,
             ResearchUrlStatus::Complete,
             ResearchUrlStatus::Failed,
         ] {

@@ -24,8 +24,8 @@ schemars.workspace = true
 # Async runtime
 tokio.workspace = true
 
-# HTTP client for Triton
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# HTTP client abstraction from integrations crate
+chronoscope-integrations = { path = "../integrations" }
 
 # URL handling
 url.workspace = true
@@ -42,3 +42,16 @@ clap = { version = "4", features = ["derive"] }
 
 # Base64 for image encoding
 base64.workspace = true
+
+# Byte handling
+bytes.workspace = true
+
+# Async trait for mock implementations
+async-trait.workspace = true
+
+# HTTP types needed for mock responses in tests (reqwest types exposed via integrations)
+reqwest = { version = "0.12", default-features = false }
+
+[dev-dependencies]
+# Enable testing utilities (MockHttpClient) for unit tests
+chronoscope-integrations = { path = "../integrations", features = ["testing"] }

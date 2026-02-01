@@ -14,14 +14,14 @@ use thiserror::Error;
 pub enum QueryPlanError {
     #[error("Query '{name}' has full table scan: {detail}\nSQL: {sql}")]
     FullTableScan {
-        name: &'static str,
-        sql: &'static str,
+        name: String,
+        sql: String,
         detail: String,
     },
 
     #[error("Failed to explain query '{name}': {source}")]
     ExplainFailed {
-        name: &'static str,
+        name: String,
         #[source]
         source: sqlx::Error,
     },
@@ -40,7 +40,7 @@ impl QueryDef {
     }
 }
 
-/// Verify that all queries use indexes (no full table scans).
+/// Verify that all static queries use indexes (no full table scans).
 ///
 /// This should be called on startup to catch missing indexes early.
 /// SQLite and Postgres have different indexes, so this check must run
@@ -52,19 +52,29 @@ pub async fn verify_all_query_plans(pool: &SqlitePool) -> Result<(), QueryPlanEr
     // TODO: When we add Postgres support, this will need to branch on DB type.
     // Postgres uses `EXPLAIN` with different output format.
     for query_def in ALL {
-        verify_query_plan(pool, query_def).await?;
+        verify_query_plan_sql(pool, query_def.name, query_def.sql).await?;
     }
     Ok(())
 }
 
-async fn verify_query_plan(pool: &SqlitePool, query_def: &QueryDef) -> Result<(), QueryPlanError> {
-    let explain_sql = format!("EXPLAIN QUERY PLAN {}", query_def.sql);
+/// Verify a SQL query uses indexes (no full table scans).
+///
+/// Used both for static `QueryDef`s and dynamically-generated queue SQL.
+///
+/// # Errors
+/// Returns `QueryPlanError` if the query would cause a full table scan.
+pub async fn verify_query_plan_sql(
+    pool: &SqlitePool,
+    name: &str,
+    sql: &str,
+) -> Result<(), QueryPlanError> {
+    let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
 
     let plan: Vec<(i32, i32, i32, String)> = sqlx::query_as(&explain_sql)
         .fetch_all(pool)
         .await
         .map_err(|e| QueryPlanError::ExplainFailed {
-            name: query_def.name,
+            name: name.to_string(),
             source: e,
         })?;
 
@@ -74,21 +84,24 @@ async fn verify_query_plan(pool: &SqlitePool, query_def: &QueryDef) -> Result<()
         // SEARCH is always fine (it's an index lookup)
         // SCAN (subquery-N) is fine (scanning materialized subquery result)
         // SCAN ... VIRTUAL TABLE is fine (table-valued function like json_each)
-        let is_table_scan = detail.starts_with("SCAN ")
-            && !detail.contains("USING")
-            && !detail.contains("(subquery")
-            && !detail.contains("VIRTUAL TABLE");
-
-        if is_table_scan {
+        if is_full_table_scan(&detail) {
             return Err(QueryPlanError::FullTableScan {
-                name: query_def.name,
-                sql: query_def.sql,
+                name: name.to_string(),
+                sql: sql.to_string(),
                 detail,
             });
         }
     }
 
     Ok(())
+}
+
+/// Check if an EXPLAIN QUERY PLAN detail line indicates a full table scan.
+fn is_full_table_scan(detail: &str) -> bool {
+    detail.starts_with("SCAN ")
+        && !detail.contains("USING")
+        && !detail.contains("(subquery")
+        && !detail.contains("VIRTUAL TABLE")
 }
 
 macro_rules! define_queries {
@@ -125,7 +138,7 @@ define_queries! {
         SELECT json_extract(value, '$.id'), json_extract(value, '$.url'), 'pending', 0, json_extract(value, '$.affinity'), ?1
         FROM json_each(?2)
     ",
-    GET_URL_BY_ID: "SELECT id, url, page_id, media_id, status, claimed_at, claimed_by, attempt_count, retry_after, error_message, worker_affinity, created_at FROM research_urls WHERE id = ?",
+    GET_URL_BY_ID: "SELECT id, url, page_id, media_id, status, attempt_count, worker_affinity, created_at FROM research_urls WHERE id = ?",
     // Keyset pagination: first page (no cursor)
     LIST_ALL_URLS_FIRST: "SELECT id, url, page_id, media_id, status, attempt_count, worker_affinity, created_at FROM research_urls ORDER BY created_at DESC, id DESC LIMIT ?",
     // Keyset pagination: subsequent pages (cursor = created_at, id of last item)
@@ -145,14 +158,14 @@ define_queries! {
     CREATE_PAGE: "INSERT INTO pages (id, source_type, title, author, published_at, content, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 
     // Media
-    GET_MEDIA_BY_ID: "SELECT id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at FROM media WHERE id = ?",
+    GET_MEDIA_BY_ID: "SELECT id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at, analysis_status, vlm_result, segmentation_result, analysis_error FROM media WHERE id = ?",
     // Uses ON CONFLICT DO UPDATE SET id = id to make RETURNING work even on conflict.
     // This is a no-op update that allows us to get the ID in a single atomic query.
     CREATE_MEDIA: "INSERT INTO media (id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(exact_hash) DO UPDATE SET id = id RETURNING id",
 
     // Page media items (ordered by source_order, with optional resolved media)
     // Returns source_url from research_urls, plus media fields if resolved (NULL if pending)
-    GET_PAGE_MEDIA: "SELECT r.url as source_url, m.id, m.exact_hash, m.perceptual_hash, m.storage_key, m.media_type, m.width, m.height, m.duration_seconds, m.captured_at, m.gps_latitude, m.gps_longitude, m.gps_altitude, m.source_metadata, m.fetched_at, m.created_at FROM page_media pm JOIN research_urls r ON pm.url_id = r.id LEFT JOIN media m ON r.media_id = m.id WHERE pm.page_id = ? ORDER BY pm.source_order",
+    GET_PAGE_MEDIA: "SELECT r.url as source_url, m.id, m.exact_hash, m.perceptual_hash, m.storage_key, m.media_type, m.width, m.height, m.duration_seconds, m.captured_at, m.gps_latitude, m.gps_longitude, m.gps_altitude, m.source_metadata, m.fetched_at, m.created_at, m.analysis_status, m.vlm_result, m.segmentation_result, m.analysis_error FROM page_media pm JOIN research_urls r ON pm.url_id = r.id LEFT JOIN media m ON r.media_id = m.id WHERE pm.page_id = ? ORDER BY pm.source_order",
     // Batch insert page_media from JSON array of URLs. Resolves URLs to IDs via join.
     // Uses json_each key as source_order to preserve array ordering.
     // Params: ?1=page_id, ?2=JSON array of URL strings
@@ -164,61 +177,20 @@ define_queries! {
     ",
 
     // Research URL status updates (for workers)
+    // Note: Queue claim and mark_failed queries are now dynamically generated
+    // by the Queue<T> abstraction in db/src/queue.rs
     UPDATE_URL_RESOLVED_PAGE: "UPDATE research_urls SET page_id = ?, status = 'complete', claimed_at = NULL, claimed_by = NULL WHERE id = ?",
     UPDATE_URL_RESOLVED_MEDIA: "UPDATE research_urls SET media_id = ?, status = 'complete', claimed_at = NULL, claimed_by = NULL WHERE id = ?",
-    UPDATE_URL_FAILED: "UPDATE research_urls SET status = 'failed', error_message = ?, attempt_count = attempt_count + 1, retry_after = ?, claimed_at = NULL, claimed_by = NULL WHERE id = ?",
 
-    // Batch claim: claims available URLs for generic workers (affinity IS NULL)
-    // Note: We need separate queries for NULL vs non-NULL affinity because SQL's
-    // NULL = NULL returns NULL (not true). You can't parameterize `WHERE col = ?`
-    // to match NULL rows - you must use `IS NULL`. No clean way around this.
-    // A URL is claimable if:
-    //   - pending: not yet claimed, or claim is stale (worker died before starting)
-    //   - analyzing: claim is stale (worker died mid-processing)
-    //   - failed: retry_after time has passed
-    // Uses UPDATE...RETURNING (SQLite 3.35.0+) for atomic claim-and-fetch
-    // Uses UNION ALL to allow SQLite to use separate indexes for each case
-    // Params: ?1=now, ?2=worker_id, ?3=stale_cutoff, ?4=now (for retry_after), ?5=batch_size
-    CLAIM_URLS_GENERIC: "
-        UPDATE research_urls
-        SET status = 'analyzing', claimed_at = ?1, claimed_by = ?2
-        WHERE id IN (
-            SELECT id FROM (
-                SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'pending' AND worker_affinity IS NULL AND (claimed_at IS NULL OR claimed_at < ?3)
-                UNION ALL
-                SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'analyzing' AND worker_affinity IS NULL AND claimed_at < ?3
-                UNION ALL
-                SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'failed' AND worker_affinity IS NULL AND retry_after IS NOT NULL AND retry_after <= ?4
-            )
-            ORDER BY retry_after NULLS FIRST, created_at
-            LIMIT ?5
-        )
-        RETURNING id, url, page_id, media_id, status, attempt_count, worker_affinity, created_at
-    ",
-
-    // Batch claim: claims available URLs for specialized workers (affinity = ?6)
-    // Params: ?1=now, ?2=worker_id, ?3=stale_cutoff, ?4=now (for retry_after), ?5=batch_size, ?6=affinity
-    CLAIM_URLS_WITH_AFFINITY: "
-        UPDATE research_urls
-        SET status = 'analyzing', claimed_at = ?1, claimed_by = ?2
-        WHERE id IN (
-            SELECT id FROM (
-                SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'pending' AND worker_affinity = ?6 AND (claimed_at IS NULL OR claimed_at < ?3)
-                UNION ALL
-                SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'analyzing' AND worker_affinity = ?6 AND claimed_at < ?3
-                UNION ALL
-                SELECT id, retry_after, created_at FROM research_urls
-                WHERE status = 'failed' AND worker_affinity = ?6 AND retry_after IS NOT NULL AND retry_after <= ?4
-            )
-            ORDER BY retry_after NULLS FIRST, created_at
-            LIMIT ?5
-        )
-        RETURNING id, url, page_id, media_id, status, attempt_count, worker_affinity, created_at
+    // Mark analysis complete with results
+    UPDATE_ANALYSIS_COMPLETE: "
+        UPDATE media
+        SET analysis_status = 'complete',
+            analysis_claimed_at = NULL,
+            analysis_claimed_by = NULL,
+            vlm_result = ?2,
+            segmentation_result = ?3
+        WHERE id = ?1
     ",
 
 }

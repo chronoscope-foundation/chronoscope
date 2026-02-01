@@ -12,7 +12,9 @@
 //!   # Terminal 2: analyze photo.jpg
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use chronoscope_integrations::ReqwestClient;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 use url::Url;
@@ -44,21 +46,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // Parse endpoint URL
+    // Parse endpoint URL and create HTTP client
     let endpoint = Url::parse(&args.endpoint)?;
-    let client = TritonClient::new(endpoint)?;
+    let http_client = Arc::new(ReqwestClient::new()?);
+    let client = TritonClient::new(endpoint, http_client);
 
     // Check server health
     tracing::info!("Checking Triton server at {}...", args.endpoint);
-    match client.is_server_ready().await {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(AnalysisError::Connection("Triton server not ready".to_string()).into());
-        }
-        Err(e) => {
-            return Err(AnalysisError::Connection(format!("Health check failed: {e}")).into());
-        }
-    }
+    client
+        .is_server_ready()
+        .await
+        .map_err(|e| AnalysisError::Connection(format!("Health check failed: {e}")))?;
     tracing::info!("Server ready");
 
     // Read image
@@ -77,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let annotated_bytes = base64::engine::general_purpose::STANDARD
                 .decode(annotated_b64)
                 .map_err(|e| {
-                    AnalysisError::Connection(format!("Failed to decode annotated image: {e}"))
+                    AnalysisError::ResponseParsing(format!("Failed to decode annotated image: {e}"))
                 })?;
             std::fs::write(path, &annotated_bytes)?;
             tracing::info!("Saved annotated image to {}", path.display());

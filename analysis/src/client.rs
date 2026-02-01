@@ -1,8 +1,11 @@
 //! Triton Inference Server HTTP client.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
+use bytes::Bytes;
+use chronoscope_integrations::{HttpClient, HttpRequest};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -12,7 +15,7 @@ use crate::schema::{AnalysisResult, VlmAnalysis};
 /// Client for communicating with Triton Inference Server.
 pub struct TritonClient {
     endpoint: Url,
-    http: reqwest::Client,
+    http: Arc<dyn HttpClient>,
 }
 
 /// Default timeout for inference request.
@@ -23,29 +26,44 @@ impl TritonClient {
     ///
     /// # Arguments
     /// * `endpoint` - Base URL of the Triton server (e.g., `http://localhost:8080`)
-    ///
-    /// # Errors
-    /// Returns an error if the HTTP client cannot be initialized (e.g., TLS backend failure).
-    pub fn new(endpoint: Url) -> Result<Self, AnalysisError> {
-        let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
-            .build()
-            .map_err(|e| AnalysisError::Connection(e.to_string()))?;
-        Ok(Self { endpoint, http })
+    /// * `http` - HTTP client implementation (real or mock)
+    #[must_use]
+    pub fn new(endpoint: Url, http: Arc<dyn HttpClient>) -> Self {
+        Self { endpoint, http }
+    }
+
+    /// Join a path to the endpoint URL.
+    fn url(&self, path: &str) -> Result<Url, AnalysisError> {
+        self.endpoint
+            .join(path)
+            .map_err(|e| AnalysisError::Connection(e.to_string()))
     }
 
     /// Check if the Triton server is ready.
     ///
+    /// Returns `Ok(())` if ready, or an error describing why it's not ready.
+    ///
     /// # Errors
-    /// Returns an error if the health check request fails.
-    pub async fn is_server_ready(&self) -> Result<bool, AnalysisError> {
-        let url = self
-            .endpoint
-            .join("/v2/health/ready")
+    /// Returns `AnalysisError::Triton` if the server responds with a non-success status,
+    /// or `AnalysisError::Connection` if the request fails entirely.
+    pub async fn is_server_ready(&self) -> Result<(), AnalysisError> {
+        let url = self.url("/v2/health/ready")?;
+
+        let request = HttpRequest::get(url);
+        let response = self
+            .http
+            .execute(request)
+            .await
             .map_err(|e| AnalysisError::Connection(e.to_string()))?;
 
-        let response = self.http.get(url).send().await?;
-        Ok(response.status().is_success())
+        if response.is_success() {
+            Ok(())
+        } else {
+            Err(AnalysisError::Triton {
+                status: response.status,
+                message: String::from_utf8_lossy(&response.body).into_owned(),
+            })
+        }
     }
 
     /// Check if a specific model is ready.
@@ -53,13 +71,16 @@ impl TritonClient {
     /// # Errors
     /// Returns an error if the model health check request fails.
     pub async fn is_model_ready(&self, model_name: &str) -> Result<bool, AnalysisError> {
-        let url = self
-            .endpoint
-            .join(&format!("/v2/models/{model_name}/ready"))
+        let url = self.url(&format!("/v2/models/{model_name}/ready"))?;
+
+        let request = HttpRequest::get(url);
+        let response = self
+            .http
+            .execute(request)
+            .await
             .map_err(|e| AnalysisError::Connection(e.to_string()))?;
 
-        let response = self.http.get(url).send().await?;
-        Ok(response.status().is_success())
+        Ok(response.is_success())
     }
 
     /// Analyze an image using the analysis pipeline.
@@ -71,10 +92,7 @@ impl TritonClient {
     /// Returns an error if the inference request fails, Triton returns an error,
     /// or the response cannot be parsed.
     pub async fn analyze(&self, image: &[u8]) -> Result<AnalysisResult, AnalysisError> {
-        let url = self
-            .endpoint
-            .join("/v2/models/analysis/infer")
-            .map_err(|e| AnalysisError::Connection(e.to_string()))?;
+        let url = self.url("/v2/models/analysis/infer")?;
 
         // Build the inference request
         let schema = schemars::schema_for!(VlmAnalysis);
@@ -82,7 +100,7 @@ impl TritonClient {
             .map_err(|e| AnalysisError::ResponseParsing(e.to_string()))?;
 
         // Note: shapes are [batch_size, dim] because model has max_batch_size=1
-        let request = TritonInferRequest {
+        let triton_request = TritonInferRequest {
             inputs: vec![
                 TritonInputTensor {
                     name: "image".to_string(),
@@ -103,20 +121,27 @@ impl TritonClient {
             }],
         };
 
-        let response = self.http.post(url).json(&request).send().await?;
+        let body_json = serde_json::to_vec(&triton_request)
+            .map_err(|e| AnalysisError::ResponseParsing(e.to_string()))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown error".to_string());
-            return Err(AnalysisError::Triton(format!("{status}: {body}")));
+        let request = HttpRequest::post(url)
+            .json_body(Bytes::from(body_json))
+            .timeout(DEFAULT_TIMEOUT);
+
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|e| AnalysisError::Connection(e.to_string()))?;
+
+        if !response.is_success() {
+            return Err(AnalysisError::Triton {
+                status: response.status,
+                message: String::from_utf8_lossy(&response.body).into_owned(),
+            });
         }
 
-        let infer_response: TritonInferResponse = response
-            .json()
-            .await
+        let infer_response: TritonInferResponse = serde_json::from_slice(&response.body)
             .map_err(|e| AnalysisError::ResponseParsing(e.to_string()))?;
 
         // Extract the result from the response
@@ -171,11 +196,13 @@ struct TritonOutputTensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chronoscope_integrations::MockHttpClient;
 
     #[test]
     fn test_client_creation() -> Result<(), Box<dyn std::error::Error>> {
         let url = Url::parse("http://localhost:8080")?;
-        let client = TritonClient::new(url.clone())?;
+        let http = Arc::new(MockHttpClient::success(b"")?);
+        let client = TritonClient::new(url.clone(), http);
         assert_eq!(client.endpoint, url);
         Ok(())
     }
@@ -184,13 +211,40 @@ mod tests {
     fn test_client_with_different_endpoints() -> Result<(), Box<dyn std::error::Error>> {
         // Test with path
         let url = Url::parse("http://localhost:8080/v2")?;
-        let client = TritonClient::new(url.clone())?;
+        let http = Arc::new(MockHttpClient::success(b"")?);
+        let client = TritonClient::new(url.clone(), http);
         assert_eq!(client.endpoint, url);
 
         // Test with https
         let url = Url::parse("https://triton.example.com")?;
-        let client = TritonClient::new(url.clone())?;
+        let http = Arc::new(MockHttpClient::success(b"")?);
+        let client = TritonClient::new(url.clone(), http);
         assert_eq!(client.endpoint, url);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_is_server_ready_success() -> Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse("http://localhost:8080")?;
+        let http = Arc::new(MockHttpClient::success(b"")?);
+        let client = TritonClient::new(url, http);
+
+        // Should succeed without error
+        client.is_server_ready().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_is_server_ready_not_ready() -> Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse("http://localhost:8080")?;
+        let http = Arc::new(MockHttpClient::status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        )?);
+        let client = TritonClient::new(url, http);
+
+        // 503 should return an error, not Ok(false)
+        let result = client.is_server_ready().await;
+        assert!(result.is_err(), "expected error for 503, got Ok");
         Ok(())
     }
 }
