@@ -23,7 +23,7 @@
     "url": "https://www.reddit.com/r/TheWayWeWere/comments/abc123/",
     "summary": "r/TheWayWeWere",
     "created_at": "2024-01-14T15:45:00Z",
-    "status": "analyzing",
+    "status": "processing",
     "analysis": {
       "deep_research": { "status": "in_progress" },
       "media": {
@@ -41,7 +41,7 @@
     "url": "https://twitter.com/historicalpics/status/123456",
     "summary": "@historicalpics",
     "created_at": "2024-01-13T18:00:00Z",
-    "status": "analyzing",
+    "status": "processing",
     "analysis": {
       "deep_research": { "status": "in_progress" },
       "media": {
@@ -113,7 +113,7 @@
     "url": "https://www.instagram.com/p/historic_chicago/",
     "summary": "1935 · Chicago, IL",
     "created_at": "2024-01-10T09:00:00Z",
-    "status": "analyzing",
+    "status": "processing",
     "thumbnail_url": "https://picsum.photos/200?random=7",
     "analysis": {
       "deep_research": { "status": "in_progress" },

@@ -10,6 +10,7 @@ disabled_rules:
   - todo          # Allow TODO comments during development
   - file_name     # Allow Models.swift with multiple types
   - opening_brace # Conflicts with SwiftFormat's multiline wrapping
+  - multiline_arguments # Conflicts with SwiftFormat's wrapping style
 
 opt_in_rules:
   # Code quality

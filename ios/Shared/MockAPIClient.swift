@@ -15,6 +15,8 @@ enum MockScenario: String {
     case error
     /// Single item that resolves to direct media (not a page)
     case directMedia
+    /// Alias for directMedia (kept for backward compatibility)
+    case withRegions
 }
 
 /// A mock API client for SwiftUI previews and testing.
@@ -43,8 +45,8 @@ actor MockAPIClient: APIProtocol {
 
         // Simple mock pagination - ignore page_token and just return all items
         let limit = input.query.limit ?? 20
-        let pageItems = Array(researchItems.prefix(Int(limit)))
-        let nextPage: String? = researchItems.count > Int(limit) ? "next" : nil
+        let pageItems = Array(researchItems.prefix(limit))
+        let nextPage: String? = researchItems.count > limit ? "next" : nil
 
         return .ok(.init(body: .json(.init(items: pageItems, nextPage: nextPage))))
     }
@@ -65,7 +67,7 @@ actor MockAPIClient: APIProtocol {
         // Pending/failed items have no resolved content yet
         let resolved: Components.Schemas.ResearchUrlDossier.ResolvedPayload? =
             switch summary.status {
-            case .analyzing,
+            case .processing,
                  .complete:
                 Self.mockResolvedContent(for: summary)
             case .pending,
@@ -217,11 +219,13 @@ extension MockAPIClient {
     private static func mockDirectMediaContent(
         for summary: Components.Schemas.ResearchUrlSummary
     ) -> Components.Schemas.ResearchUrlDossier.ResolvedPayload {
+        let width = 400
+        let height = 300
         let analysis = Components.Schemas.MediaAnalysis(
             embeddings: .success(.init(status: .success)),
             reverseImageSearch: .success(.init(status: .success)),
-            segmentation: .success(.init(status: .success)),
-            vlm: .success(.init(status: .success))
+            segmentation: .success(MockRegionData.sampleSegmentationSuccess),
+            vlm: .success(MockRegionData.sampleVlmAnalysis)
         )
 
         let media = Components.Schemas.ResolvedContentMedia(
@@ -229,15 +233,15 @@ extension MockAPIClient {
             capturedAt: "1920-06-15T12:00:00Z",
             durationSeconds: nil,
             fetchedAt: "2024-01-15T10:30:00Z",
-            fullUrl: "https://picsum.photos/800/600?random=\(summary.id)",
-            height: 600,
+            fullUrl: "https://picsum.photos/\(width)/\(height)?random=\(summary.id)",
+            height: height,
             id: "media-\(summary.id)",
             location: .init(value1: .init(altitude: 152.4, latitude: 41.5934, longitude: -87.3464)),
             mediaType: .image,
             sourceMetadata: nil,
             thumbnailUrl: "https://picsum.photos/200/150?random=\(summary.id)",
             _type: .media,
-            width: 800
+            width: width
         )
 
         return .init(value1: .media(media))
@@ -276,15 +280,15 @@ extension MockAPIClient {
                     capturedAt: "1920-06-15T12:00:00Z",
                     durationSeconds: nil,
                     fetchedAt: "2024-01-15T10:30:00Z",
-                    fullUrl: "https://picsum.photos/800/600?random=\(summary.id)-\(index)",
-                    height: 600,
+                    fullUrl: "https://picsum.photos/400/300?random=\(summary.id)-\(index)",
+                    height: 300,
                     id: "media-\(summary.id)-\(index)",
                     location: location.map { .init(value1: $0) },
                     mediaType: .image,
                     sourceMetadata: nil,
                     state: .fetched,
                     thumbnailUrl: "https://picsum.photos/200/150?random=\(summary.id)-\(index)",
-                    width: 800
+                    width: 400
                 )))
             } else {
                 // This media is still pending
@@ -325,9 +329,11 @@ extension MockAPIClient {
                 .inProgress(.init(status: .inProgress)),
             reverseImageSearch: index < risComplete ? .success(.init(status: .success)) :
                 .pending(.init(status: .pending)),
-            segmentation: index < segComplete ? .success(.init(status: .success)) :
-                .inProgress(.init(status: .inProgress)),
-            vlm: index < vlmComplete ? .success(.init(status: .success)) : .pending(.init(status: .pending))
+            segmentation: index < segComplete
+                ? .success(MockRegionData.sampleSegmentationSuccess)
+                : .inProgress(.init(status: .inProgress)),
+            vlm: index < vlmComplete ? .success(MockRegionData.sampleVlmAnalysis) :
+                .pending(.init(status: .pending))
         )
     }
 
@@ -358,7 +364,8 @@ extension MockAPIClient {
             return MockAPIClient(userInfo: sampleUserInfo)
         case .error:
             return MockAPIClient(shouldFail: true)
-        case .directMedia:
+        case .directMedia,
+             .withRegions:
             // Filter to only items with direct image URLs
             let directMediaItems = sampleResearchItems.filter { isDirectMediaUrl($0.url) }
             return MockAPIClient(
@@ -385,9 +392,10 @@ extension MockAPIClient {
             reverseImageSearch: analysisComplete >= 4
                 ? .success(.init(status: .success)) : .pending(.init(status: .pending)),
             segmentation: analysisComplete >= 2
-                ? .success(.init(status: .success)) : .pending(.init(status: .pending)),
+                ? .success(MockRegionData.sampleSegmentationSuccess)
+                : .pending(.init(status: .pending)),
             vlm: analysisComplete >= 1
-                ? .success(.init(status: .success)) : .pending(.init(status: .pending))
+                ? .success(MockRegionData.sampleVlmAnalysis) : .pending(.init(status: .pending))
         )
 
         let location: Components.Schemas.MediaReferenceFetched.LocationPayload? = withLocation
@@ -399,15 +407,15 @@ extension MockAPIClient {
             capturedAt: "1920-06-15T12:00:00Z",
             durationSeconds: nil,
             fetchedAt: "2024-01-15T10:30:00Z",
-            fullUrl: "https://picsum.photos/800/600?random=\(seed)",
-            height: 600,
+            fullUrl: "https://picsum.photos/400/300?random=\(seed)",
+            height: 300,
             id: id,
             location: location,
             mediaType: .image,
             sourceMetadata: nil,
             state: .fetched,
             thumbnailUrl: "https://picsum.photos/200/150?random=\(seed)",
-            width: 800
+            width: 400
         )
     }
 
@@ -450,7 +458,7 @@ extension MockAPIClient {
             createdAt: "2024-01-15T10:00:00Z",
             id: "preview-all-states",
             resolved: .init(value1: .page(page)),
-            status: .analyzing,
+            status: .processing,
             url: "https://www.reddit.com/r/TheWayWeWere/comments/example/"
         )
     }()
@@ -468,7 +476,7 @@ extension MockAPIClient {
         let failedAnalysis = Components.Schemas.MediaAnalysis(
             embeddings: .failed(.init(error: "Embedding service unavailable", status: .failed)),
             reverseImageSearch: .failed(.init(error: "Rate limited", status: .failed)),
-            segmentation: .success(.init(status: .success)),
+            segmentation: .success(.init(regions: [], status: .success)),
             vlm: .failed(.init(error: "Model timeout", status: .failed))
         )
 

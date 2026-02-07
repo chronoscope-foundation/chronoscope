@@ -8,7 +8,7 @@ extension Components.Schemas.ResearchUrlStatus {
     var color: Color {
         switch self {
         case .pending: .secondary
-        case .analyzing: .blue
+        case .processing: .blue
         case .complete: .green
         case .failed: .red
         }
@@ -52,18 +52,17 @@ extension Components.Schemas.SourceType {
             domains.contains { host == $0 || host.hasSuffix(".\($0)") }
         }
 
-        switch true {
-        case isFrom("instagram.com"):
+        if isFrom("instagram.com") {
             self = .instagram
-        case isFrom("reddit.com", "redd.it"):
+        } else if isFrom("reddit.com", "redd.it") {
             self = .reddit
-        case isFrom("twitter.com", "x.com"):
+        } else if isFrom("twitter.com", "x.com") {
             self = .twitter
-        case isFrom("flickr.com", "staticflickr.com"):
+        } else if isFrom("flickr.com", "staticflickr.com") {
             self = .flickr
-        case isFrom("loc.gov"):
+        } else if isFrom("loc.gov") {
             self = .loc
-        default:
+        } else {
             self = .generic
         }
     }

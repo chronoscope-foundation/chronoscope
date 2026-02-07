@@ -9,6 +9,8 @@ enum Design {
     enum Spacing {
         /// 4pt - Tight spacing between related elements
         static let extraExtraSmall: CGFloat = 4
+        /// 5pt - Vertical alignment for bullet points with text
+        static let bulletAlignment: CGFloat = 5
         /// 6pt - Label-to-field spacing in forms
         static let labelField: CGFloat = 6
         /// 8pt - Default inline spacing

@@ -569,6 +569,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronoscope-solver"
+version = "0.1.0"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "chronoscope-workers"
 version = "0.1.0"
 dependencies = [

@@ -83,6 +83,18 @@ targets:
       - package: ChronoscopeAPI
         product: ChronoscopeAPI
 
+  ChronoscopeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: chronoscope.app.tests
+        GENERATE_INFOPLIST_FILE: true
+    dependencies:
+      - target: Chronoscope
+
   ChronoscopeUITests:
     type: bundle.ui-testing
     platform: iOS
@@ -101,6 +113,7 @@ schemes:
       targets:
         Chronoscope: all
         ChronoscopeShareExtension: all
+        ChronoscopeTests: [test]
         ChronoscopeUITests: [test]
       preActions:
         - script: |
@@ -121,6 +134,7 @@ schemes:
     test:
       config: Debug
       targets:
+        - ChronoscopeTests
         - ChronoscopeUITests
     archive:
       config: Release

@@ -14,6 +14,7 @@
 --type-attributes prev-line
 --complex-attributes prev-line
 --closingparen balanced
+--trailingcommas never
 
 # Rules
 --enable isEmpty
@@ -23,7 +24,6 @@
 --enable wrapSwitchCases
 
 --disable redundantSelf
---disable trailingCommas
 
 # File options
 --exclude DerivedData,.build,Pods

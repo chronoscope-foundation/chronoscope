@@ -135,7 +135,7 @@ private struct PendingContentView: View {
     private var statusTitle: String {
         switch dossier.status {
         case .pending: "Waiting to Process"
-        case .analyzing: "Fetching Content"
+        case .processing: "Fetching Content"
         case .complete: "Complete" // Shouldn't reach here if resolved is nil
         case .failed: "Processing Failed"
         }
@@ -144,7 +144,7 @@ private struct PendingContentView: View {
     private var statusIcon: String {
         switch dossier.status {
         case .pending: "clock"
-        case .analyzing: "arrow.down.circle"
+        case .processing: "arrow.down.circle"
         case .complete: "checkmark.circle"
         case .failed: "exclamationmark.triangle"
         }

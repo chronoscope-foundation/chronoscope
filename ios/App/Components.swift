@@ -56,7 +56,7 @@ struct StatusBadge: View {
             } else {
                 // Standard pill badge
                 HStack(spacing: Design.Spacing.extraExtraSmall) {
-                    if status == .analyzing {
+                    if status == .processing {
                         ProgressView()
                             .scaleEffect(0.5)
                             .frame(width: Design.BadgeSize.spinner, height: Design.BadgeSize.spinner)
@@ -78,7 +78,7 @@ struct StatusBadge: View {
     private var statusText: String {
         switch status {
         case .pending: "Pending"
-        case .analyzing: "Analyzing"
+        case .processing: "Analyzing"
         case .complete: "" // Not shown, uses checkmark
         case .failed: "Failed"
         }
@@ -87,7 +87,7 @@ struct StatusBadge: View {
     private var accessibilityText: String {
         switch status {
         case .pending: "Pending"
-        case .analyzing: "Analyzing"
+        case .processing: "Analyzing"
         case .complete: "Complete"
         case .failed: "Failed"
         }
@@ -109,6 +109,7 @@ struct SectionHeader: View {
             .font(.subheadline)
             .fontWeight(.semibold)
             .foregroundStyle(.secondary)
+            .accessibilityAddTraits(.isHeader)
     }
 }
 
@@ -128,6 +129,7 @@ struct DetailRow: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -147,6 +149,7 @@ struct SourceBadge: View {
         .padding(.vertical, Design.Spacing.extraExtraSmall)
         .background(Color.secondary.opacity(Design.Opacity.light))
         .clipShape(Capsule())
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -167,42 +170,45 @@ struct SourceLink: View {
     }
 
     var body: some View {
-        linkLabel
-            .contentShape(Capsule())
-            .onTapGesture {
-                guard let linkUrl = URL(string: url) else { return }
+        Button {
+            guard let linkUrl = URL(string: url) else { return }
 
-                // If only Safari available, open directly
-                if availableBrowsers.count <= 1 {
-                    openURL(linkUrl)
-                } else {
-                    showingBrowserOptions = true
+            // If only Safari available, open directly
+            if availableBrowsers.count <= 1 {
+                openURL(linkUrl)
+            } else {
+                showingBrowserOptions = true
+            }
+        } label: {
+            linkLabel
+        }
+        .buttonStyle(.plain)
+        .contentShape(Capsule())
+        .accessibilityAddTraits(.isLink)
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = url
+            } label: {
+                Label("Copy URL", systemImage: "doc.on.doc")
+            }
+
+            if let linkUrl = URL(string: url) {
+                ShareLink(item: linkUrl) {
+                    Label("Share", systemImage: "square.and.arrow.up")
                 }
             }
-            .contextMenu {
-                Button {
-                    UIPasteboard.general.string = url
-                } label: {
-                    Label("Copy URL", systemImage: "doc.on.doc")
-                }
-
-                if let linkUrl = URL(string: url) {
-                    ShareLink(item: linkUrl) {
-                        Label("Share", systemImage: "square.and.arrow.up")
-                    }
-                }
-            }
-            .confirmationDialog("Open in Browser", isPresented: $showingBrowserOptions) {
-                if let linkUrl = URL(string: url) {
-                    ForEach(availableBrowsers, id: \.self) { browser in
-                        Button(browser.name) {
-                            if let browserUrl = browser.url(for: linkUrl) {
-                                openURL(browserUrl)
-                            }
+        }
+        .confirmationDialog("Open in Browser", isPresented: $showingBrowserOptions) {
+            if let linkUrl = URL(string: url) {
+                ForEach(availableBrowsers, id: \.self) { browser in
+                    Button(browser.name) {
+                        if let browserUrl = browser.url(for: linkUrl) {
+                            openURL(browserUrl)
                         }
                     }
                 }
             }
+        }
     }
 
     private var linkLabel: some View {
@@ -302,7 +308,7 @@ struct AnalysisStatusCounts {
         count(analysis.reverseImageSearch)
     }
 
-    private mutating func count(_ outcome: Components.Schemas.AnalysisOutcomeForVlmResults) {
+    private mutating func count(_ outcome: Components.Schemas.AnalysisOutcomeForVlmAnalysis) {
         switch outcome {
         case .pending: pending += 1
         case .inProgress: inProgress += 1
@@ -344,7 +350,7 @@ struct AnalysisStatusCounts {
 #Preview("Status Badges") {
     VStack(spacing: Design.Spacing.small) {
         StatusBadge(status: .pending)
-        StatusBadge(status: .analyzing)
+        StatusBadge(status: .processing)
         StatusBadge(status: .complete)
         StatusBadge(status: .failed)
     }

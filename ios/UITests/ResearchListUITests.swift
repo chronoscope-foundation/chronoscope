@@ -138,12 +138,11 @@ final class ResearchListUITests: XCTestCase {
         // Wait for detail view
         XCTAssertTrue(app.navigationBars["Details"].waitForExistence(timeout: Timeout.standard))
 
-        // Media content shows analysis stages directly (not inside a Media gallery section)
-        // Look for analysis stage rows
-        let analysisHeader = app.staticTexts["Analysis"]
+        // Media detail should show the image and metadata
+        let mediaImage = app.otherElements["mediaImage"]
         XCTAssertTrue(
-            analysisHeader.waitForExistence(timeout: Timeout.standard),
-            "Media detail should show Analysis section"
+            mediaImage.waitForExistence(timeout: Timeout.standard),
+            "Media detail should show the media image"
         )
     }
 
@@ -228,31 +227,5 @@ final class ResearchListUITests: XCTestCase {
             failedStatusLabel.frame.width > 0 && failedStatusLabel.frame.height > 0,
             "Failed status badge should be visible on screen"
         )
-    }
-
-    // MARK: - Helpers
-
-    /// Finds a cell containing the specified text in its label or descendant labels
-    private func findCellContaining(text: String) -> XCUIElement? {
-        let cells = app.cells
-
-        // First try direct text match
-        for index in 0 ..< cells.count {
-            let cell = cells.element(boundBy: index)
-            // Check if cell label contains the text
-            if cell.label.contains(text) {
-                return cell
-            }
-            // Check descendant static texts
-            if cell.staticTexts[text].exists {
-                return cell
-            }
-            // Check using predicate for partial match
-            let predicate = NSPredicate(format: "label CONTAINS %@", text)
-            if cell.staticTexts.matching(predicate).firstMatch.exists {
-                return cell
-            }
-        }
-        return nil
     }
 }
