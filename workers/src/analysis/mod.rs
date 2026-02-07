@@ -68,10 +68,11 @@ impl AnalysisWorker {
         // 3. Serialize results to JSON
         let vlm_json = serde_json::to_string(&result.vlm)?;
         let segmentation_json = serde_json::to_string(&result.segmentation)?;
+        let embedding_json = serde_json::to_string(&result.embeddings)?;
 
         // 4. Store results in database
         self.db
-            .mark_analysis_complete(&media.id, &vlm_json, &segmentation_json)
+            .mark_analysis_complete(&media.id, &vlm_json, &segmentation_json, &embedding_json)
             .await?;
 
         Ok(())

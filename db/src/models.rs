@@ -14,6 +14,7 @@ fn build_analysis_state(
     status: AnalysisStatus,
     vlm_result: Option<String>,
     segmentation_result: Option<String>,
+    embedding_result: Option<String>,
     analysis_error: Option<String>,
 ) -> MediaAnalysisState {
     match status {
@@ -23,6 +24,10 @@ fn build_analysis_state(
             (Some(vlm), Some(seg)) => MediaAnalysisState::Complete {
                 vlm_result: vlm,
                 segmentation_result: seg,
+                // Default to empty embeddings if column is NULL (pre-migration data).
+                // Must match `Embeddings::EMPTY_JSON` in chronoscope-analysis.
+                embedding_result: embedding_result
+                    .unwrap_or_else(|| r#"{"image":[],"regions":{}}"#.to_string()),
             },
             // DB corruption: Complete without results. Treat as pending.
             _ => MediaAnalysisState::Pending,
@@ -200,6 +205,7 @@ pub(crate) struct MediaDbRow {
     pub(crate) analysis_status: AnalysisStatus,
     pub(crate) vlm_result: Option<String>,
     pub(crate) segmentation_result: Option<String>,
+    pub(crate) embedding_result: Option<String>,
     pub(crate) analysis_error: Option<String>,
 }
 
@@ -209,6 +215,7 @@ impl MediaDbRow {
             self.analysis_status,
             self.vlm_result,
             self.segmentation_result,
+            self.embedding_result,
             self.analysis_error,
         );
 
@@ -274,6 +281,7 @@ pub(crate) struct PageMediaRow {
     pub(crate) analysis_status: Option<AnalysisStatus>,
     pub(crate) vlm_result: Option<String>,
     pub(crate) segmentation_result: Option<String>,
+    pub(crate) embedding_result: Option<String>,
     pub(crate) analysis_error: Option<String>,
 }
 
@@ -296,6 +304,7 @@ impl PageMediaRow {
             self.analysis_status?,
             self.vlm_result,
             self.segmentation_result,
+            self.embedding_result,
             self.analysis_error,
         );
 

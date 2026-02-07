@@ -297,6 +297,7 @@ fn convert_analysis(media: &Media) -> Result<MediaAnalysis, HttpError> {
         MediaAnalysisState::Complete {
             vlm_result,
             segmentation_result,
+            ..
         } => {
             // Parse VLM result JSON
             let vlm_output: VlmOutput = serde_json::from_str(vlm_result).map_err(|e| {
@@ -621,6 +622,7 @@ mod tests {
         media.analysis = chronoscope_db::MediaAnalysisState::Complete {
             vlm_result,
             segmentation_result,
+            embedding_result: r#"{"image":[],"regions":{}}"#.to_string(),
         };
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
@@ -667,6 +669,7 @@ mod tests {
         media.analysis = chronoscope_db::MediaAnalysisState::Complete {
             vlm_result,
             segmentation_result,
+            embedding_result: r#"{"image":[],"regions":{}}"#.to_string(),
         };
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
@@ -693,6 +696,7 @@ mod tests {
         media.analysis = chronoscope_db::MediaAnalysisState::Complete {
             vlm_result: "not valid json {{{".to_string(),
             segmentation_result: "[]".to_string(),
+            embedding_result: r#"{"image":[],"regions":{}}"#.to_string(),
         };
 
         let result = convert_media(&media, TEST_CDN_BASE_URL);

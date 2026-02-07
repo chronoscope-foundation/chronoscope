@@ -158,14 +158,14 @@ define_queries! {
     CREATE_PAGE: "INSERT INTO pages (id, source_type, title, author, published_at, content, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 
     // Media
-    GET_MEDIA_BY_ID: "SELECT id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at, analysis_status, vlm_result, segmentation_result, analysis_error FROM media WHERE id = ?",
+    GET_MEDIA_BY_ID: "SELECT id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at, analysis_status, vlm_result, segmentation_result, embedding_result, analysis_error FROM media WHERE id = ?",
     // Uses ON CONFLICT DO UPDATE SET id = id to make RETURNING work even on conflict.
     // This is a no-op update that allows us to get the ID in a single atomic query.
     CREATE_MEDIA: "INSERT INTO media (id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(exact_hash) DO UPDATE SET id = id RETURNING id",
 
     // Page media items (ordered by source_order, with optional resolved media)
     // Returns source_url from research_urls, plus media fields if resolved (NULL if pending)
-    GET_PAGE_MEDIA: "SELECT r.url as source_url, m.id, m.exact_hash, m.perceptual_hash, m.storage_key, m.media_type, m.width, m.height, m.duration_seconds, m.captured_at, m.gps_latitude, m.gps_longitude, m.gps_altitude, m.source_metadata, m.fetched_at, m.created_at, m.analysis_status, m.vlm_result, m.segmentation_result, m.analysis_error FROM page_media pm JOIN research_urls r ON pm.url_id = r.id LEFT JOIN media m ON r.media_id = m.id WHERE pm.page_id = ? ORDER BY pm.source_order",
+    GET_PAGE_MEDIA: "SELECT r.url as source_url, m.id, m.exact_hash, m.perceptual_hash, m.storage_key, m.media_type, m.width, m.height, m.duration_seconds, m.captured_at, m.gps_latitude, m.gps_longitude, m.gps_altitude, m.source_metadata, m.fetched_at, m.created_at, m.analysis_status, m.vlm_result, m.segmentation_result, m.embedding_result, m.analysis_error FROM page_media pm JOIN research_urls r ON pm.url_id = r.id LEFT JOIN media m ON r.media_id = m.id WHERE pm.page_id = ? ORDER BY pm.source_order",
     // Batch insert page_media from JSON array of URLs. Resolves URLs to IDs via join.
     // Uses json_each key as source_order to preserve array ordering.
     // Params: ?1=page_id, ?2=JSON array of URL strings
@@ -189,7 +189,8 @@ define_queries! {
             analysis_claimed_at = NULL,
             analysis_claimed_by = NULL,
             vlm_result = ?2,
-            segmentation_result = ?3
+            segmentation_result = ?3,
+            embedding_result = ?4
         WHERE id = ?1
     ",
 

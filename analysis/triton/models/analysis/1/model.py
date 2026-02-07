@@ -1,6 +1,6 @@
 """BLS orchestration model for the full analysis pipeline.
 
-Orchestrates: SAM3 segmentation → image annotation → VLM analysis.
+Orchestrates: SAM3 segmentation → image annotation → VLM analysis → DINOv3 embeddings.
 """
 
 import base64
@@ -51,6 +51,10 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5MB limit to prevent OOM
 # Qwen3-VL: 28x28 pixels = 1 token, max 16384 tokens/image.
 # 2048x2048 = ~5.4K tokens × 2 images = ~11K tokens, well within 128K context.
 VLM_MAX_IMAGE_DIM = 2048
+
+# Max region crops to embed via DINOv3 (caps GPU memory usage).
+# SAM3 outputs regions in left-to-right spatial order, not confidence order.
+MAX_REGION_CROPS = 16
 
 
 def get_string_from_tensor(tensor: Any) -> str:
@@ -262,9 +266,18 @@ class TritonPythonModel:
 
             if sam_response.has_error():
                 error_msg = sam_response.error().message()
-                result = self._error_result(
-                    f"SAM3 error: {error_msg}", original.height, original.width
-                )
+
+                # Still compute whole-image embedding even if SAM3 failed
+                embeddings = self._call_dinov3([original])
+                embedding_result = {"image": embeddings[0], "regions": {}}
+
+                result = {
+                    "image_size": [original.height, original.width],
+                    "segmentation": [],
+                    "annotated_image": None,
+                    "vlm": {"error": f"SAM3 error: {error_msg}"},
+                    "embeddings": embedding_result,
+                }
             else:
                 regions_tensor = pb_utils.get_output_tensor_by_name(sam_response, "regions")
                 regions_json = get_string_from_tensor(regions_tensor)
@@ -285,15 +298,34 @@ class TritonPythonModel:
                     prompt, original_b64, annotated_b64, schema_json, len(regions)
                 )
 
-                # 5. Combine results (compress masks for wire transfer)
+                # 5. Compress masks for wire transfer
                 compressed_regions = [
                     {**r, "mask": {"counts": compress_rle(r["mask"])}} for r in regions
                 ]
+
+                # 6. Compute DINOv3 embeddings
+                dino_images = [original]
+
+                # Add region bbox crops for relevant images with regions
+                if regions and vlm_result.get("is_relevant", False):
+                    for region in compressed_regions[:MAX_REGION_CROPS]:
+                        crop = self._crop_region_bbox(original, region["mask"], padding=0.05)
+                        dino_images.append(crop)
+
+                embeddings = self._call_dinov3(dino_images)
+
+                embedding_result = {"image": embeddings[0], "regions": {}}
+                if len(embeddings) > 1:
+                    for i, region in enumerate(compressed_regions[:MAX_REGION_CROPS]):
+                        region_id = str(region["region_id"])
+                        embedding_result["regions"][region_id] = embeddings[i + 1]
+
                 result = {
                     "image_size": [original.height, original.width],
                     "segmentation": compressed_regions,
                     "annotated_image": annotated_b64,
                     "vlm": vlm_result,
+                    "embeddings": embedding_result,
                 }
 
             result_json = json.dumps(result)
@@ -435,6 +467,84 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
             pb_utils.Logger.log_error(f"JSON parse error: {e}")
             return {"error": f"JSON parse error: {e}", "raw_output": output_text}
 
+    def _crop_region_bbox(
+        self, image: Image.Image, rle_mask: dict[str, str], padding: float = 0.05
+    ) -> Image.Image:
+        """Crop image to bounding box of an RLE mask with padding.
+
+        Args:
+            image: Source image.
+            rle_mask: RLE mask dict with "counts" key (compressed string).
+            padding: Fraction of bbox size to add as padding margin.
+        """
+        # Decompress RLE to get integer counts, then decode to binary mask
+        counts_str = rle_mask["counts"]
+        counts = []
+        x = 0
+        shift = 0
+        for c in counts_str:
+            val = ord(c) - 48
+            x |= (val & 0x1F) << shift
+            if val & 0x20:
+                shift += 5
+            else:
+                counts.append(x)
+                x = 0
+                shift = 0
+
+        mask = decode_rle(counts, image.height, image.width)
+
+        # Find bounding box
+        ys, xs = np.where(mask == 1)
+        if len(xs) == 0:
+            return image  # Empty mask, return whole image
+
+        x_min, x_max = int(xs.min()), int(xs.max())
+        y_min, y_max = int(ys.min()), int(ys.max())
+
+        # Add padding
+        w = x_max - x_min
+        h = y_max - y_min
+        pad_x = int(w * padding)
+        pad_y = int(h * padding)
+
+        x_min = max(0, x_min - pad_x)
+        y_min = max(0, y_min - pad_y)
+        x_max = min(image.width, x_max + pad_x)
+        y_max = min(image.height, y_max + pad_y)
+
+        return image.crop((x_min, y_min, x_max, y_max))
+
+    def _call_dinov3(self, images: list[Image.Image]) -> list[list[float]]:
+        """Call DINOv3 model with a list of PIL images.
+
+        Returns list of 1024-dim L2-normalized embeddings.
+        """
+        # Encode images to base64 for the DINOv3 model
+        b64_images = []
+        for img in images:
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=90)
+            b64_images.append(base64.b64encode(buffer.getvalue()).decode("utf-8"))
+
+        image_array = np.array([b.encode("utf-8") for b in b64_images]).reshape(1, -1)
+
+        dino_request = pb_utils.InferenceRequest(
+            model_name="dinov3",
+            requested_output_names=["embeddings"],
+            inputs=[pb_utils.Tensor("images", image_array)],
+        )
+        dino_response = dino_request.exec()
+
+        if dino_response.has_error():
+            error_msg = dino_response.error().message()
+            raise RuntimeError(f"DINOv3 error: {error_msg}")
+
+        embeddings_tensor = pb_utils.get_output_tensor_by_name(dino_response, "embeddings")
+        embeddings_json = get_string_from_tensor(embeddings_tensor)
+        result: list[list[float]] = json.loads(embeddings_json)
+        return result
+
     def _error_result(self, error_msg: str, height: int, width: int) -> dict[str, Any]:
         """Create an error result."""
         return {
@@ -442,6 +552,7 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
             "segmentation": [],
             "annotated_image": None,
             "vlm": {"error": error_msg},
+            "embeddings": {"image": [], "regions": {}},
         }
 
     def finalize(self):

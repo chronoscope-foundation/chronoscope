@@ -47,7 +47,7 @@ pub mod schema;
 pub use client::TritonClient;
 pub use error::AnalysisError;
 pub use schema::{
-    AnalysisRequest, AnalysisResult, AnalyzedMediaType, CompositeInfo, DetectedRegion, EntityType,
-    ExtractedText, RegionAnalysis, RegionEntry, RegionRelationship, RelationType, RleMask,
-    SceneType, VlmAnalysis, VlmOutput,
+    AnalysisRequest, AnalysisResult, AnalyzedMediaType, CompositeInfo, DetectedRegion, Embeddings,
+    EntityType, ExtractedText, RegionAnalysis, RegionEntry, RegionRelationship, RelationType,
+    RleMask, SceneType, VlmAnalysis, VlmOutput,
 };

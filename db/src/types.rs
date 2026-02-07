@@ -142,6 +142,8 @@ pub enum MediaAnalysisState {
         vlm_result: String,
         /// Segmentation result (JSON)
         segmentation_result: String,
+        /// Embedding result (JSON)
+        embedding_result: String,
     },
     /// Analysis failed with an error message
     Failed {

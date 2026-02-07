@@ -1,14 +1,15 @@
 # Triton Inference Server with vLLM backend
 FROM nvcr.io/nvidia/tritonserver:25.12-vllm-python-py3
 
-# Install dependencies for SAM3 and image processing
+# Install dependencies for SAM3, image processing, and DINOv3
 RUN pip install --no-cache-dir \
     pillow \
     numpy \
     opencv-python-headless \
     qwen-vl-utils \
     decord \
-    pycocotools
+    pycocotools \
+    transformers
 
 # Install iopath from GitHub (the PyPI tarball has issues)
 RUN pip install --no-cache-dir git+https://github.com/facebookresearch/iopath.git

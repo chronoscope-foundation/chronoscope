@@ -41,6 +41,12 @@ def sam3_module():
 
 
 @pytest.fixture(scope="module")
+def dinov3_module():
+    """Load the DINOv3 embedding model."""
+    return _load_model_module(_models_dir / "dinov3" / "1", "dinov3_model")
+
+
+@pytest.fixture(scope="module")
 def baml_converter():
     """Load the BAML converter from the analysis model directory."""
     # Load directly without going through the analysis model to avoid import conflicts

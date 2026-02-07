@@ -451,6 +451,25 @@ class TestBamlConverter:
 
 
 # =============================================================================
+# DINOv3 model tests
+# =============================================================================
+
+
+class TestDinov3:
+    """Tests for DINOv3 embedding model preprocessing and output format."""
+
+    def test_model_loads(self, dinov3_module):
+        """DINOv3 model module loads without errors."""
+        assert hasattr(dinov3_module, "TritonPythonModel")
+
+    def test_get_string_from_tensor(self, dinov3_module):
+        """String extraction works for the DINOv3 module's copy."""
+        tensor = mock_triton.Tensor("test", np.array([b"hello"]))
+        result = dinov3_module.get_string_from_tensor(tensor)
+        assert result == "hello"
+
+
+# =============================================================================
 # Integration tests
 # =============================================================================
 
@@ -544,10 +563,37 @@ class TestAnalysisOrchestration:
 
         return handler
 
+    def _make_dinov3_handler(self):
+        """Create a mock DINOv3 handler that returns fake embeddings."""
+
+        def handler(inputs):
+            images_tensor = inputs.get("images")
+            assert images_tensor is not None, "DINOv3 should receive images input"
+
+            num_images = len(images_tensor.as_numpy().flatten())
+
+            # Return fake 1024-dim L2-normalized embeddings
+            embeddings = []
+            for i in range(num_images):
+                emb = [0.0] * 1024
+                emb[i % 1024] = 1.0  # Unit vector for easy verification
+                embeddings.append(emb)
+
+            return mock_triton.InferenceResponse(
+                [
+                    mock_triton.Tensor(
+                        "embeddings", np.array([json.dumps(embeddings).encode("utf-8")])
+                    )
+                ]
+            )
+
+        return handler
+
     def test_full_pipeline_success(self, analysis_model, sam3_module):
-        """Full pipeline: SAM3 segmentation -> annotation -> VLM analysis."""
+        """Full pipeline: SAM3 segmentation -> annotation -> VLM analysis -> DINOv3."""
         mock_triton.register_model("sam3", self._make_sam3_handler(sam3_module))
         mock_triton.register_model("vlm", self._make_vlm_handler())
+        mock_triton.register_model("dinov3", self._make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -577,8 +623,15 @@ class TestAnalysisOrchestration:
         assert len(result["segmentation"]) == 1
         assert result["vlm"]["is_relevant"] is True
 
+        # Verify embeddings
+        assert "embeddings" in result
+        emb = result["embeddings"]
+        assert len(emb["image"]) == 1024, "Should have 1024-dim whole-image embedding"
+        assert "1" in emb["regions"], "Should have region 1 embedding (relevant image)"
+        assert len(emb["regions"]["1"]) == 1024, "Region embedding should be 1024-dim"
+
     def test_handles_sam3_error_gracefully(self, analysis_model):
-        """Pipeline handles SAM3 errors without crashing."""
+        """Pipeline handles SAM3 errors without crashing, still computes embeddings."""
 
         def failing_sam3(inputs):
             return mock_triton.InferenceResponse(
@@ -586,6 +639,7 @@ class TestAnalysisOrchestration:
             )
 
         mock_triton.register_model("sam3", failing_sam3)
+        mock_triton.register_model("dinov3", self._make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -606,9 +660,15 @@ class TestAnalysisOrchestration:
         assert "error" in result["vlm"]
         assert "SAM3" in result["vlm"]["error"]
 
+        # Embeddings should still be computed for whole image
+        assert "embeddings" in result
+        assert len(result["embeddings"]["image"]) == 1024
+        assert result["embeddings"]["regions"] == {}
+
     def test_handles_vlm_error_gracefully(self, analysis_model, sam3_module):
         """Pipeline handles VLM errors without crashing."""
         mock_triton.register_model("sam3", self._make_sam3_handler(sam3_module))
+        mock_triton.register_model("dinov3", self._make_dinov3_handler())
 
         def failing_vlm(inputs):
             return mock_triton.InferenceResponse(error=mock_triton.TritonError("VLM out of memory"))
@@ -633,6 +693,11 @@ class TestAnalysisOrchestration:
 
         assert "error" in result["vlm"]
         assert "VLM" in result["vlm"]["error"]
+
+        # DINOv3 still produces whole-image embedding (no regions since VLM failed)
+        assert "embeddings" in result
+        assert len(result["embeddings"]["image"]) == 1024
+        assert result["embeddings"]["regions"] == {}
 
     def test_rejects_oversized_images(self, analysis_model):
         """Pipeline rejects images exceeding size limit (5MB)."""
@@ -687,6 +752,7 @@ class TestAnalysisOrchestration:
 
         mock_triton.register_model("sam3", empty_sam3)
         mock_triton.register_model("vlm", vlm_for_empty)
+        mock_triton.register_model("dinov3", self._make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -708,9 +774,14 @@ class TestAnalysisOrchestration:
         assert "error" not in result["vlm"], "Should not be an error"
         assert result["vlm"]["is_relevant"] is False
 
+        # Whole-image embedding still computed, no region embeddings
+        assert len(result["embeddings"]["image"]) == 1024
+        assert result["embeddings"]["regions"] == {}
+
     def test_handles_vlm_malformed_json(self, analysis_model, sam3_module):
         """Pipeline handles VLM returning invalid JSON."""
         mock_triton.register_model("sam3", self._make_sam3_handler(sam3_module))
+        mock_triton.register_model("dinov3", self._make_dinov3_handler())
 
         def bad_json_vlm(inputs):
             # Return something that's not valid JSON
@@ -738,6 +809,38 @@ class TestAnalysisOrchestration:
 
         assert "error" in result["vlm"], "Should report JSON parse error"
         assert "JSON" in result["vlm"]["error"] or "json" in result["vlm"]["error"].lower()
+
+        # Embeddings still computed despite VLM JSON failure
+        assert "embeddings" in result
+        assert len(result["embeddings"]["image"]) == 1024
+
+    def test_dinov3_error_fails_pipeline(self, analysis_model, sam3_module):
+        """DINOv3 errors propagate — no silent fallback to empty embeddings."""
+        mock_triton.register_model("sam3", self._make_sam3_handler(sam3_module))
+        mock_triton.register_model("vlm", self._make_vlm_handler())
+
+        def failing_dinov3(inputs):
+            return mock_triton.InferenceResponse(
+                error=mock_triton.TritonError("DINOv3 out of memory")
+            )
+
+        mock_triton.register_model("dinov3", failing_dinov3)
+
+        model = analysis_model.TritonPythonModel()
+        model.initialize({"model_config": json.dumps({})})
+
+        request = mock_triton.InferenceRequest(
+            model_name="analysis",
+            requested_output_names=["result"],
+            inputs=[
+                mock_triton.Tensor("image", np.array([make_test_image().encode("utf-8")])),
+                mock_triton.Tensor("schema", np.array([make_test_schema().encode("utf-8")])),
+            ],
+        )
+
+        # DINOv3 failure raises RuntimeError (Triton wraps this into error response)
+        with pytest.raises(RuntimeError, match="DINOv3"):
+            model.execute([request])
 
 
 # =============================================================================
@@ -806,8 +909,21 @@ class TestSchemaCompatibility:
                 [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
             )
 
+        def dinov3_handler(inputs):
+            images = inputs["images"].as_numpy().flatten()
+            num = len(images)
+            embeddings = [[0.0] * 1024 for _ in range(num)]
+            return mock_triton.InferenceResponse(
+                [
+                    mock_triton.Tensor(
+                        "embeddings", np.array([json.dumps(embeddings).encode("utf-8")])
+                    )
+                ]
+            )
+
         mock_triton.register_model("sam3", sam3_handler)
         mock_triton.register_model("vlm", vlm_handler)
+        mock_triton.register_model("dinov3", dinov3_handler)
 
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -827,3 +943,8 @@ class TestSchemaCompatibility:
 
         # Validate against Rust schema
         jsonschema.validate(instance=python_output, schema=rust_schema)
+
+        # Verify embeddings are present and structured correctly
+        assert "embeddings" in python_output
+        assert "image" in python_output["embeddings"]
+        assert "regions" in python_output["embeddings"]

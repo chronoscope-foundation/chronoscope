@@ -312,6 +312,19 @@ pub struct VlmAnalysis {
     pub thinking: Option<String>,
 }
 
+/// `DINOv3` embedding results.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Embeddings {
+    /// Whole-image CLS embedding (1024 dims, L2-normalized).
+    pub image: Vec<f32>,
+
+    /// Per-region CLS embeddings, keyed by `region_id` string.
+    /// Empty for irrelevant images or if SAM3 found no regions.
+    #[serde(default)]
+    pub regions: HashMap<String, Vec<f32>>,
+}
+
 /// Full analysis result combining segmentation and VLM stages.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -331,6 +344,9 @@ pub struct AnalysisResult {
 
     /// VLM analysis output (success or error).
     pub vlm: VlmOutput,
+
+    /// `DINOv3` embeddings (whole image + per-region).
+    pub embeddings: Embeddings,
 }
 
 /// Request to analyze an image.

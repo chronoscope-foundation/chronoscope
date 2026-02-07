@@ -65,7 +65,8 @@ pub fn triton_success_response(analysis_result: &chronoscope_analysis::AnalysisR
 /// Create a minimal valid `AnalysisResult` for testing.
 pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
     use chronoscope_analysis::{
-        AnalysisResult, AnalyzedMediaType, CompositeInfo, SceneType, VlmAnalysis, VlmOutput,
+        AnalysisResult, AnalyzedMediaType, CompositeInfo, Embeddings, SceneType, VlmAnalysis,
+        VlmOutput,
     };
 
     AnalysisResult {
@@ -88,6 +89,10 @@ pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
             extracted_text: vec![],
             thinking: None,
         }),
+        embeddings: Embeddings {
+            image: vec![],
+            regions: HashMap::new(),
+        },
     }
 }
 
