@@ -236,7 +236,7 @@ impl TestServer {
 
 // ==================== Helpers ====================
 
-/// Extract fetched media from a slice of MediaReferences.
+/// Extract fetched media from a slice of `MediaReferences`.
 fn fetched_media(media: &[MediaReference]) -> Vec<&chronoscope_api::research_types::MediaDossier> {
     media
         .iter()

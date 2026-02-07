@@ -49,8 +49,10 @@ fn sha2_hash(data: &[u8]) -> Vec<u8> {
 /// Build a valid Triton inference response body.
 ///
 /// The response wraps an `AnalysisResult` in Triton's output format.
-pub fn triton_success_response(analysis_result: &chronoscope_analysis::AnalysisResult) -> Vec<u8> {
-    let result_json = serde_json::to_string(analysis_result).expect("serialize analysis result");
+pub fn triton_success_response(
+    analysis_result: &chronoscope_analysis::AnalysisResult,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let result_json = serde_json::to_string(analysis_result)?;
 
     let response = serde_json::json!({
         "outputs": [{
@@ -59,7 +61,7 @@ pub fn triton_success_response(analysis_result: &chronoscope_analysis::AnalysisR
         }]
     });
 
-    serde_json::to_vec(&response).expect("serialize triton response")
+    serde_json::to_vec(&response)
 }
 
 /// Create a minimal valid `AnalysisResult` for testing.
@@ -228,7 +230,7 @@ mod tests {
         harness.create_media_for_analysis().await?;
 
         // Mock a successful Triton response
-        let response_body = triton_success_response(&minimal_analysis_result());
+        let response_body = triton_success_response(&minimal_analysis_result())?;
         let http = Arc::new(MockHttpClient::success(&response_body)?);
 
         let (_media, result) = harness.process_with_mock(http).await?;
@@ -404,7 +406,7 @@ mod tests {
         harness.db.get_or_create_media(&media_data).await?;
 
         // The HTTP client won't even be called - storage lookup fails first
-        let response_body = triton_success_response(&minimal_analysis_result());
+        let response_body = triton_success_response(&minimal_analysis_result())?;
         let http = Arc::new(MockHttpClient::success(&response_body)?);
 
         let (_media, result) = harness.process_with_mock(http).await?;

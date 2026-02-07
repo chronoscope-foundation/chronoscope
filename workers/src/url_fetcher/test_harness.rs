@@ -38,12 +38,12 @@ fn is_cache_miss(error: &FetchError) -> bool {
 }
 
 fn fixtures_dir() -> std::path::PathBuf {
-    // Fixtures are in the integrations crate
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("workers crate should have parent directory")
-        .join("integrations")
-        .join("fixtures")
+    // Fixtures are in the integrations crate — relative to the workers crate root
+    let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.pop(); // up from workers/ to repo root
+    path.push("integrations");
+    path.push("fixtures");
+    path
 }
 
 fn vcr_mode() -> CacheMode {

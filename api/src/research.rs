@@ -578,13 +578,20 @@ mod tests {
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
 
-        match &dossier.analysis.vlm {
-            AnalysisOutcome::Failed { error } => {
-                assert_eq!(error, "Triton server unavailable");
-            }
-            other => panic!("Expected Failed, got {other:?}"),
-        }
+        let AnalysisOutcome::Failed { error } = &dossier.analysis.vlm else {
+            return Err(test_err("Expected Failed VLM outcome"));
+        };
+        assert_eq!(error, "Triton server unavailable");
         Ok(())
+    }
+
+    fn serialize(value: &impl serde::Serialize) -> Result<String, HttpError> {
+        serde_json::to_string(value)
+            .map_err(|e| HttpError::for_internal_error(format!("serialize: {e}")))
+    }
+
+    fn test_err(msg: &str) -> HttpError {
+        HttpError::for_internal_error(msg.to_string())
     }
 
     #[test]
@@ -612,11 +619,11 @@ mod tests {
             thinking: None,
         };
         let vlm_output = VlmOutput::Success(vlm_analysis);
-        let vlm_result = serde_json::to_string(&vlm_output).expect("serialize");
+        let vlm_result = serialize(&vlm_output)?;
 
         // Create segmentation results (empty regions for simplicity)
         let segmentation: Vec<chronoscope_analysis::DetectedRegion> = vec![];
-        let segmentation_result = serde_json::to_string(&segmentation).expect("serialize");
+        let segmentation_result = serialize(&segmentation)?;
 
         let mut media = minimal_media();
         media.analysis = chronoscope_db::MediaAnalysisState::Complete {
@@ -628,25 +635,21 @@ mod tests {
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
 
         // Verify VLM analysis was parsed correctly
-        match &dossier.analysis.vlm {
-            AnalysisOutcome::Success(analysis) => {
-                assert!(analysis.is_relevant);
-                assert_eq!(
-                    analysis.content_summary,
-                    "A historic building on a street corner"
-                );
-                assert_eq!(analysis.temporal_cues, vec!["black and white"]);
-            }
-            other => panic!("Expected VLM Success, got {other:?}"),
-        }
+        let AnalysisOutcome::Success(analysis) = &dossier.analysis.vlm else {
+            return Err(test_err("Expected VLM Success"));
+        };
+        assert!(analysis.is_relevant);
+        assert_eq!(
+            analysis.content_summary,
+            "A historic building on a street corner"
+        );
+        assert_eq!(analysis.temporal_cues, vec!["black and white"]);
 
         // Verify segmentation was parsed correctly
-        match &dossier.analysis.segmentation {
-            AnalysisOutcome::Success(seg) => {
-                assert!(seg.regions.is_empty());
-            }
-            other => panic!("Expected Segmentation Success, got {other:?}"),
-        }
+        let AnalysisOutcome::Success(seg) = &dossier.analysis.segmentation else {
+            return Err(test_err("Expected Segmentation Success"));
+        };
+        assert!(seg.regions.is_empty());
         Ok(())
     }
 
@@ -659,11 +662,11 @@ mod tests {
             error: "Token limit exceeded".to_string(),
             raw_output: Some("truncated output...".to_string()),
         };
-        let vlm_result = serde_json::to_string(&vlm_output).expect("serialize");
+        let vlm_result = serialize(&vlm_output)?;
 
         // Segmentation still succeeded
         let segmentation: Vec<chronoscope_analysis::DetectedRegion> = vec![];
-        let segmentation_result = serde_json::to_string(&segmentation).expect("serialize");
+        let segmentation_result = serialize(&segmentation)?;
 
         let mut media = minimal_media();
         media.analysis = chronoscope_db::MediaAnalysisState::Complete {
@@ -675,12 +678,10 @@ mod tests {
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
 
         // VLM should be Failed (from VlmOutput::Error)
-        match &dossier.analysis.vlm {
-            AnalysisOutcome::Failed { error } => {
-                assert_eq!(error, "Token limit exceeded");
-            }
-            other => panic!("Expected VLM Failed, got {other:?}"),
-        }
+        let AnalysisOutcome::Failed { error } = &dossier.analysis.vlm else {
+            return Err(test_err("Expected VLM Failed"));
+        };
+        assert_eq!(error, "Token limit exceeded");
 
         // Segmentation should still be Success
         assert!(
