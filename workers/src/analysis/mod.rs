@@ -5,11 +5,14 @@
 //!
 //! # Architecture
 //!
-//! The analysis worker processes images through a two-stage pipeline:
-//! - **Segmentation** (SAM3): Identifies and segments regions of interest
-//! - **VLM Analysis**: Analyzes the annotated image to describe structures
+//! The analysis worker sends images to the Triton BLS orchestrator, which runs
+//! a multi-stage pipeline:
+//! 1. **Subimage detection** (SAM3): Splits composite images into panels
+//! 2. **Region segmentation** (SAM3): Segments structures within each subimage
+//! 3. **VLM analysis**: Describes content, temporal cues, and region semantics
+//! 4. **Embeddings** (DINOv3): Computes visual embeddings for similarity search
 //!
-//! Results are stored in the `media` table as JSON fields.
+//! Results are stored in the `media` table as a single JSON column.
 
 mod error;
 #[cfg(test)]
@@ -31,7 +34,7 @@ pub use error::AnalysisError;
 ///
 /// For each claimed media item:
 /// 1. Fetches image bytes from media store
-/// 2. Sends to Triton for SAM3 segmentation + VLM analysis
+/// 2. Sends to the Triton BLS pipeline (subimage detection, SAM3, VLM, DINOv3)
 /// 3. Stores results as JSON in the media table
 pub struct AnalysisWorker {
     triton: TritonClient,
@@ -65,14 +68,10 @@ impl AnalysisWorker {
         // 2. Analyze with Triton
         let result = self.triton.analyze(&media_with_meta.data).await?;
 
-        // 3. Serialize results to JSON
-        let vlm_json = serde_json::to_string(&result.vlm)?;
-        let segmentation_json = serde_json::to_string(&result.segmentation)?;
-        let embedding_json = serde_json::to_string(&result.embeddings)?;
-
-        // 4. Store results in database
+        // 3. Store results in database
+        let analysis_json = serde_json::to_string(&result)?;
         self.db
-            .mark_analysis_complete(&media.id, &vlm_json, &segmentation_json, &embedding_json)
+            .mark_analysis_complete(&media.id, &analysis_json)
             .await?;
 
         Ok(())

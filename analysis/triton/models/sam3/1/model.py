@@ -64,6 +64,9 @@ def encode_rle(mask: np.ndarray) -> list[int]:
     return counts
 
 
+# NOTE: Duplicated in analysis/1/model.py. Triton's Python backend loads
+# each model in isolation, so there's no clean way to share code between
+# models without complicating the deployment structure.
 def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
     """Compute Intersection over Union between two masks."""
     intersection = np.logical_and(mask1, mask2).sum()
@@ -183,12 +186,18 @@ class TritonPythonModel:
             image_tensor = pb_utils.get_input_tensor_by_name(request, "image")
             image_b64 = get_string_from_tensor(image_tensor)
 
+            # Check for optional prompts
+            prompts_tensor = pb_utils.get_input_tensor_by_name(request, "prompts")
+            prompts = None
+            if prompts_tensor is not None:
+                prompts = [p.decode("utf-8") for p in prompts_tensor.as_numpy().flatten()]
+
             # Decode image
             image_bytes = base64.b64decode(image_b64)
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
             # Run segmentation
-            regions = self._segment_with_sam3(image)
+            regions = self._segment_with_sam3(image, prompts=prompts)
 
             # Encode result
             result_json = json.dumps(regions)
@@ -197,7 +206,9 @@ class TritonPythonModel:
 
         return responses
 
-    def _segment_with_sam3(self, image: Image.Image) -> list[dict]:
+    def _segment_with_sam3(
+        self, image: Image.Image, prompts: list[str] | None = None
+    ) -> list[dict]:
         """Run SAM3 segmentation with text prompts."""
         # Set the image once
         inference_state = self.processor.set_image(image)
@@ -206,7 +217,7 @@ class TritonPythonModel:
         all_scores = []
 
         # Run with each entity prompt
-        for prompt in ENTITY_PROMPTS:
+        for prompt in prompts or ENTITY_PROMPTS:
             try:
                 output = self.processor.set_text_prompt(state=inference_state, prompt=prompt)
                 masks = output["masks"]
@@ -233,15 +244,10 @@ class TritonPythonModel:
         filtered = sort_regions_left_to_right(filtered)
 
         # Convert to output format
-        regions = []
-        for i, (mask, score) in enumerate(filtered, start=1):
-            regions.append(
-                {
-                    "region_id": i,
-                    "confidence": score,
-                    "mask": encode_rle(mask.astype(np.uint8)),
-                }
-            )
+        regions = [
+            {"confidence": score, "mask": encode_rle(mask.astype(np.uint8))}
+            for mask, score in filtered
+        ]
 
         return regions
 

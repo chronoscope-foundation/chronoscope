@@ -1,7 +1,8 @@
 //! Database models.
 
 use chrono::NaiveDateTime;
-use sqlx::FromRow;
+use sqlx::sqlite::SqliteRow;
+use sqlx::{FromRow, Row};
 
 use crate::types::{
     AnalysisStatus, Email, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
@@ -10,27 +11,21 @@ use crate::types::{
 
 /// Construct analysis state from raw DB fields, enforcing invariants.
 /// Invalid combinations (e.g., Complete without results) fall back to safe states.
+///
 fn build_analysis_state(
     status: AnalysisStatus,
-    vlm_result: Option<String>,
-    segmentation_result: Option<String>,
-    embedding_result: Option<String>,
+    analysis_result: Option<String>,
     analysis_error: Option<String>,
 ) -> MediaAnalysisState {
     match status {
         AnalysisStatus::Pending => MediaAnalysisState::Pending,
         AnalysisStatus::Processing => MediaAnalysisState::Processing,
-        AnalysisStatus::Complete => match (vlm_result, segmentation_result) {
-            (Some(vlm), Some(seg)) => MediaAnalysisState::Complete {
-                vlm_result: vlm,
-                segmentation_result: seg,
-                // Default to empty embeddings if column is NULL (pre-migration data).
-                // Must match `Embeddings::EMPTY_JSON` in chronoscope-analysis.
-                embedding_result: embedding_result
-                    .unwrap_or_else(|| r#"{"image":[],"regions":{}}"#.to_string()),
+        AnalysisStatus::Complete => match analysis_result {
+            Some(result) => MediaAnalysisState::Complete {
+                analysis_result: result,
             },
             // DB corruption: Complete without results. Treat as pending.
-            _ => MediaAnalysisState::Pending,
+            None => MediaAnalysisState::Pending,
         },
         AnalysisStatus::Failed => MediaAnalysisState::Failed {
             error: analysis_error.unwrap_or_else(|| "Unknown error".to_string()),
@@ -83,20 +78,65 @@ pub struct User {
     pub created_at: NaiveDateTime,
 }
 
+/// What a research URL has resolved to after processing.
+///
+/// A URL starts as `Unresolved`, then a worker resolves it to either a page
+/// (HTML content with embedded media references) or direct media (image/video).
+/// The DB enforces mutual exclusion between `page_id` and `media_id` via a CHECK constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTarget {
+    /// URL has not been resolved yet (both `page_id` and `media_id` are NULL).
+    Unresolved,
+    /// URL resolved to a page (HTML content).
+    Page(PageId),
+    /// URL resolved to direct media (image or video).
+    Media(MediaId),
+}
+
 /// A research URL (canonical, deduplicated)
-/// Note: `page_id` and `media_id` are mutually exclusive (enforced by DB constraint)
-#[derive(Debug, Clone, FromRow)]
+#[derive(Debug, Clone)]
 pub struct ResearchUrl {
     pub id: ResearchUrlId,
     pub url: String,
-    pub page_id: Option<PageId>,
-    pub media_id: Option<MediaId>,
+    pub target: ResolvedTarget,
     pub status: ResearchUrlStatus,
     pub attempt_count: i32,
     /// Worker affinity: which specialized worker should process this URL.
     /// `None` means generic worker, `Some("reddit")`, etc. for specialized workers.
     pub worker_affinity: Option<String>,
     pub created_at: NaiveDateTime,
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for ResearchUrl {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+        let page_id: Option<PageId> = row.try_get("page_id")?;
+        let media_id: Option<MediaId> = row.try_get("media_id")?;
+
+        let target = match (page_id, media_id) {
+            (None, None) => ResolvedTarget::Unresolved,
+            (Some(pid), None) => ResolvedTarget::Page(pid),
+            (None, Some(mid)) => ResolvedTarget::Media(mid),
+            (Some(_), Some(_)) => {
+                return Err(sqlx::Error::ColumnDecode {
+                    index: "page_id/media_id".to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "page_id and media_id are mutually exclusive",
+                    )),
+                });
+            }
+        };
+
+        Ok(Self {
+            id: row.try_get("id")?,
+            url: row.try_get("url")?,
+            target,
+            status: row.try_get("status")?,
+            attempt_count: row.try_get("attempt_count")?,
+            worker_affinity: row.try_get("worker_affinity")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
 }
 
 /// A research URL that a user follows (includes follow timestamp)
@@ -203,9 +243,7 @@ pub(crate) struct MediaDbRow {
     pub(crate) fetched_at: NaiveDateTime,
     pub(crate) created_at: NaiveDateTime,
     pub(crate) analysis_status: AnalysisStatus,
-    pub(crate) vlm_result: Option<String>,
-    pub(crate) segmentation_result: Option<String>,
-    pub(crate) embedding_result: Option<String>,
+    pub(crate) analysis_result: Option<String>,
     pub(crate) analysis_error: Option<String>,
 }
 
@@ -213,9 +251,7 @@ impl MediaDbRow {
     pub(crate) fn into_media(self) -> Media {
         let analysis = build_analysis_state(
             self.analysis_status,
-            self.vlm_result,
-            self.segmentation_result,
-            self.embedding_result,
+            self.analysis_result,
             self.analysis_error,
         );
 
@@ -279,9 +315,7 @@ pub(crate) struct PageMediaRow {
     pub(crate) fetched_at: Option<NaiveDateTime>,
     pub(crate) created_at: Option<NaiveDateTime>,
     pub(crate) analysis_status: Option<AnalysisStatus>,
-    pub(crate) vlm_result: Option<String>,
-    pub(crate) segmentation_result: Option<String>,
-    pub(crate) embedding_result: Option<String>,
+    pub(crate) analysis_result: Option<String>,
     pub(crate) analysis_error: Option<String>,
 }
 
@@ -302,9 +336,7 @@ impl PageMediaRow {
         let id = self.id?;
         let analysis = build_analysis_state(
             self.analysis_status?,
-            self.vlm_result,
-            self.segmentation_result,
-            self.embedding_result,
+            self.analysis_result,
             self.analysis_error,
         );
 

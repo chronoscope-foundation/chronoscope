@@ -31,10 +31,6 @@ struct Args {
 
     /// Image file to analyze
     image: PathBuf,
-
-    /// Save annotated image to this path (optional)
-    #[arg(long)]
-    save_annotated: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -68,26 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Analyzing...");
     let result = client.analyze(&image_bytes).await?;
 
-    // Save annotated image if requested
-    if let Some(ref path) = args.save_annotated {
-        if let Some(ref annotated_b64) = result.annotated_image {
-            use base64::Engine;
-            let annotated_bytes = base64::engine::general_purpose::STANDARD
-                .decode(annotated_b64)
-                .map_err(|e| {
-                    AnalysisError::ResponseParsing(format!("Failed to decode annotated image: {e}"))
-                })?;
-            std::fs::write(path, &annotated_bytes)?;
-            tracing::info!("Saved annotated image to {}", path.display());
-        } else {
-            tracing::warn!("No annotated image in response");
-        }
-    }
-
-    // Output result as JSON (without the bulky base64 image)
-    let mut output = result;
-    output.annotated_image = None;
-    let json = serde_json::to_string_pretty(&output)?;
+    // Output result as JSON
+    let json = serde_json::to_string_pretty(&result)?;
     println!("{json}");
 
     Ok(())

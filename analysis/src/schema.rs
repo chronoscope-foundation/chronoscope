@@ -1,16 +1,14 @@
 //! Schema types for analysis results.
 //!
-//! Region-keyed output: SAM3 assigns each mask a `region_id` (1, 2, 3...),
-//! painted on the annotated image. The VLM references regions by ID in its output,
-//! enabling correlation between masks and descriptions.
+//! The pipeline outputs subimage-centric results: each source image is split into
+//! one or more subimages (panels), and each subimage gets independent SAM3 segmentation,
+//! VLM analysis, and DINOv3 embeddings.
 //!
 //! Region relationships form a constraint graph: when external knowledge identifies
 //! one entity, constraints propagate along relationship edges to narrow down unknowns.
 //! For example, if region 2 is identified as a building demolished in 1927, and region 1
 //! is marked as "adjacent" to region 2, we learn that region 1 was near that location
 //! and existed before 1927.
-
-use std::collections::HashMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -22,10 +20,7 @@ use serde::{Deserialize, Serialize};
 /// Run-length encoding alternates between background and foreground run lengths,
 /// compressed into a compact ASCII string using modified LEB128 encoding.
 /// This is the same format used by pycocotools.
-///
-/// Note: Mask dimensions are not stored per-mask. All masks in an `AnalysisResult`
-/// share the same dimensions, stored in `AnalysisResult::image_size`.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RleMask {
     /// Compressed run lengths as COCO string (modified LEB128, +48 ASCII offset).
@@ -34,6 +29,9 @@ pub struct RleMask {
 }
 
 /// A detected region from SAM3 segmentation.
+///
+/// Used by legacy pipeline output. New pipeline uses [`Region`] which merges
+/// segmentation, VLM analysis, and embeddings.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DetectedRegion {
@@ -47,7 +45,7 @@ pub struct DetectedRegion {
     pub mask: RleMask,
 }
 
-// ==================== VLM Analysis Types ====================
+// ==================== Shared Analysis Types ====================
 //
 // NOTE: The schemars descriptions below are written as instructions for the model
 // producing this output. They use imperative/neutral language rather than describing
@@ -67,26 +65,6 @@ pub enum AnalyzedMediaType {
     PhotoOfModel,
     /// A map, site plan, or floor plan
     Map,
-}
-
-/// Composite image layout.
-///
-/// Some images are composites of multiple panels, often showing the same scene
-/// at different times or from different angles. For single images, rows=1 and columns=1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CompositeInfo {
-    /// Number of rows in the grid
-    #[schemars(
-        description = "Number of rows of panels. 1 for a single image or side-by-side panels."
-    )]
-    pub rows: u8,
-
-    /// Number of columns in the grid
-    #[schemars(
-        description = "Number of columns of panels. 1 for a single image or stacked panels."
-    )]
-    pub columns: u8,
 }
 
 /// Scene type classification.
@@ -109,7 +87,7 @@ pub enum SceneType {
 }
 
 /// Text extracted from the image.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractedText {
     /// The text content
@@ -146,21 +124,21 @@ pub enum RelationType {
     /// Both regions depict the same physical structure across different panels.
     /// Symmetric: establishes identity between regions in composite images.
     #[schemars(
-        description = "Both regions show the same physical structure in different panels of a composite image (e.g., before/after views). For segmentation splits within a single view, use same_as in the region entry instead."
+        description = "Both regions show the same physical structure in different panels of a composite image (e.g., before/after views)"
     )]
     SameStructure,
 }
 
 /// A relationship between two regions.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RegionRelationship {
-    /// The subject region ID (1-indexed, matching annotation labels).
-    #[schemars(description = "Subject region number, e.g. 1")]
+    /// The subject region index (0-based, matching annotation labels).
+    #[schemars(description = "Subject region index (0-based), e.g. 0")]
     pub subject: u32,
 
-    /// The object region ID (1-indexed, matching annotation labels).
-    #[schemars(description = "Object region number, e.g. 2")]
+    /// The object region index (0-based, matching annotation labels).
+    #[schemars(description = "Object region index (0-based), e.g. 1")]
     pub object: u32,
 
     /// Type of relationship between subject and object.
@@ -182,10 +160,14 @@ pub enum EntityType {
     Monument,
     /// Other infrastructure - walls, piers, dams, etc.
     Infrastructure,
+    /// Not a built structure (trees, sky, streets, vehicles).
+    /// Produced when the VLM determines a segmented region doesn't contain
+    /// a built structure.
+    NonStructure,
 }
 
-/// Analysis of a single numbered region.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Analysis of a single numbered region (VLM output only — no mask/embedding).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RegionAnalysis {
     /// Type of built structure in this region.
@@ -212,61 +194,191 @@ pub struct RegionAnalysis {
     pub damage_signs: Vec<String>,
 }
 
-/// Entry for a numbered region - either full analysis or a reference to another region.
-///
-/// When segmentation incorrectly splits one structure into multiple regions, provide
-/// full analysis for the lowest-numbered region and use `SameAs` for the others.
-///
-/// TODO: Handle the inverse case where the VLM identifies multiple distinct structures
-/// within a single segmentation region. This might require a way to sub-divide regions
-/// or report that a region contains multiple entities.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub enum RegionEntry {
-    /// Full analysis of this region
-    Analysis(RegionAnalysis),
-    /// This region depicts the same structure as another (lower-numbered) region.
-    /// Use when segmentation incorrectly split one structure into multiple regions.
-    SameAs {
-        #[schemars(
-            description = "Region number this is the same structure as (must be lower than this region's number)"
-        )]
-        same_as: u32,
-    },
+// ==================== Analysis Pipeline Types ====================
+
+/// Axis-aligned bounding box in pixel coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BoundingBox {
+    /// X offset from left edge of the source image.
+    pub x: u32,
+    /// Y offset from top edge of the source image.
+    pub y: u32,
+    /// Width of the bounding box in pixels.
+    pub width: u32,
+    /// Height of the bounding box in pixels.
+    pub height: u32,
 }
 
-/// VLM output - either successful analysis or an error.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(untagged)]
-pub enum VlmOutput {
-    /// Successful analysis
-    Success(VlmAnalysis),
-    /// Error during analysis (e.g., token limit exceeded, JSON parse failure)
-    Error {
-        /// Error message
-        error: String,
-        /// Raw VLM output if available (for debugging truncation issues)
+/// Bounds of a subimage within the source image.
+///
+/// The `bbox` defines the coordinate rectangle in the source image.
+/// The `mask` is in the **crop coordinate space** — its dimensions are
+/// `(bbox.height, bbox.width)`. For rectangular crops the mask is all-ones
+/// (RLE: `[0, H*W]`). For non-rectangular crops (e.g. diagonal panel borders)
+/// the mask indicates which pixels within the bbox belong to this subimage.
+///
+/// All [`Region`] masks within a [`Subimage`] share these same dimensions.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SubimageBounds {
+    /// Bounding box in source image coordinates.
+    pub bbox: BoundingBox,
+    /// Which pixels within the bbox belong to this subimage.
+    /// Dimensions: `(bbox.height, bbox.width)`.
+    pub mask: RleMask,
+}
+
+/// A unified region combining SAM3 segmentation, VLM analysis, and DINOv3 embedding.
+///
+/// Regions are ordered left-to-right by centroid; position in the array IS identity
+/// (0-based index matches annotation labels).
+///
+/// Masks are in the subimage crop coordinate space — same dimensions as
+/// the parent [`Subimage`]'s `bounds.bbox` (height x width).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Region {
+    /// SAM3 segmentation confidence for this region.
+    pub segmentation_confidence: f64,
+
+    /// Region mask, RLE-encoded in subimage crop coordinates.
+    pub mask: RleMask,
+
+    /// DINOv3 CLS embedding for this region crop (1024 dims, L2-normalized).
+    /// Empty if embedding failed or was skipped.
+    pub embedding: Vec<f32>,
+
+    /// Type of built structure in this region.
+    pub entity_type: EntityType,
+
+    /// Brief factual description of what's visible in this region.
+    pub description: String,
+
+    /// Distinguishing features that would help identify this specific structure.
+    pub identifiable_features: Vec<String>,
+
+    /// Legible text visible in this region (signs, nameplates, cornerstone dates).
+    pub visible_text: Vec<ExtractedText>,
+
+    /// Observable signs of damage or deterioration, if any.
+    pub damage_signs: Vec<String>,
+}
+
+/// Analysis result for a single subimage.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubimageAnalysis {
+    /// Subimage was analyzed successfully.
+    Analyzed {
+        /// Type of media.
+        media_type: AnalyzedMediaType,
+        /// 1-2 sentence factual description of what the subimage shows.
+        content_summary: String,
+        /// Indoor, outdoor, or mixed/ambiguous scene.
+        scene_type: SceneType,
+        /// Visual evidence suggesting time period.
+        temporal_cues: Vec<String>,
+        /// Legible text not in any marked region.
+        extracted_text: Vec<ExtractedText>,
+        /// Chain-of-thought reasoning from the VLM (not part of VLM schema).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        raw_output: Option<String>,
+        thinking: Option<String>,
+        /// DINOv3 CLS embedding for the whole subimage crop (1024 dims, L2-normalized).
+        /// Empty if embedding failed.
+        embedding: Vec<f32>,
+        /// Detected and analyzed regions within this subimage.
+        regions: Vec<Region>,
+        /// Spatial and structural relationships between regions.
+        region_relationships: Vec<RegionRelationship>,
+    },
+    /// Subimage was rejected (not relevant for historical building research).
+    Rejected {
+        /// Brief reason for rejection.
+        reason: String,
+    },
+    /// An error occurred during analysis of this subimage.
+    /// Distinct from Rejected: Rejected means the VLM intentionally
+    /// determined the content isn't relevant. Error means something
+    /// went wrong during processing.
+    Error {
+        /// Error message describing what went wrong.
+        message: String,
     },
 }
 
-/// Full analysis output.
+/// A subimage (panel) detected within the source image.
+///
+/// All masks within a subimage — both the bounds mask and per-region masks — share
+/// dimensions `(bounds.bbox.height, bounds.bbox.width)`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Subimage {
+    /// Bounds of this subimage within the source image.
+    pub bounds: SubimageBounds,
+    /// Analysis result (analyzed or rejected).
+    pub analysis: SubimageAnalysis,
+}
+
+/// Model versions used to produce an analysis result.
+/// Enables reproducibility tracking: given the same image and these versions,
+/// the same result should be produced.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelVersions {
+    /// VLM model identifier (e.g., `"Qwen/Qwen3-VL-32B-Instruct"`).
+    pub vlm: String,
+    /// SAM3 model identifier.
+    pub sam3: String,
+    /// DINOv3 model identifier.
+    pub dinov3: String,
+    /// Git commit SHA of the analysis pipeline code, for reproducibility.
+    pub git_sha: String,
+}
+
+/// Full analysis result — subimage-centric output from the analysis pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AnalysisResult {
+    /// Detected subimages (panels) with their analysis results.
+    /// For single-image inputs, this contains exactly one entry covering the full image.
+    pub subimages: Vec<Subimage>,
+    /// Model versions used for this analysis run.
+    pub versions: ModelVersions,
+}
+
+// ==================== VLM Schema Types ====================
+//
+// Separate types for JSON Schema generation. The VLM doesn't produce masks or
+// embeddings — those are merged in by the BLS orchestrator.
+
+/// VLM output for a single subimage — either analyzed or rejected.
+///
+/// Used to generate the JSON schema passed to the VLM for constrained output.
+/// The BLS orchestrator merges this with SAM3 and DINOv3 results to produce
+/// [`SubimageAnalysis`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum VlmSubimageOutput {
+    /// Subimage contains relevant built structures.
+    Analyzed(VlmAnalyzedOutput),
+    /// Subimage is not relevant for historical building research.
+    Rejected {
+        /// Brief reason for rejection.
+        #[schemars(
+            description = "Brief reason if rejected: e.g., 'portrait photo', 'natural landscape', 'vehicle photo', 'meme', 'food photo', 'animal photo'"
+        )]
+        reason: String,
+    },
+}
+
+/// VLM analysis output for an analyzed subimage.
+///
+/// This is the schema the VLM fills in. It does not include masks or embeddings —
+/// those are added by the BLS orchestrator.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct VlmAnalysis {
-    /// Is this image relevant for historical building research?
-    #[schemars(
-        description = "True if image shows human-built structures: buildings, bridges, tunnels, railways, dams, monuments, infrastructure. False for: people without structures, nature, vehicles as subject, memes, food, animals, abstract art, porn, etc."
-    )]
-    pub is_relevant: bool,
-
-    /// If not relevant, why?
-    #[schemars(
-        description = "Brief reason if rejected: e.g., 'portrait photo', 'natural landscape', 'vehicle photo', 'meme', 'food photo', 'animal photo'"
-    )]
-    pub rejection_reason: Option<String>,
-
+pub struct VlmAnalyzedOutput {
     /// Type of media
     #[schemars(description = "What type of visual media is this?")]
     pub media_type: AnalyzedMediaType,
@@ -285,15 +397,12 @@ pub struct VlmAnalysis {
     )]
     pub temporal_cues: Vec<String>,
 
-    /// Composite image detection
-    #[schemars(description = "Whether this is a multi-panel composite and how it's arranged")]
-    pub composite: CompositeInfo,
-
-    /// Analysis for each numbered region.
+    /// Analysis for each detected region, in the same order as the annotated labels (0-indexed).
+    /// Every region must have an entry; use `non_structure` `entity_type` for non-structures.
     #[schemars(
-        description = "Entry for each numbered region visible in the annotated image. Key is region number as string. Every numbered region must have an entry. For regions that aren't built structures, omit them. If segmentation split one structure into multiple regions, provide full analysis for the lowest-numbered region and use same_as for the others."
+        description = "Array of analyses, one per SAM3 region in order. Index = region number (0-based). Every region must have an entry; use non_structure entity_type for non-structures."
     )]
-    pub regions: HashMap<String, RegionEntry>,
+    pub regions: Vec<RegionAnalysis>,
 
     /// Relationships between regions.
     #[schemars(description = "Spatial and structural relationships between numbered regions.")]
@@ -304,49 +413,6 @@ pub struct VlmAnalysis {
         description = "Legible text not in marked regions: street signs, captions, watermarks, date stamps, photographer credits"
     )]
     pub extracted_text: Vec<ExtractedText>,
-
-    /// Chain-of-thought reasoning from Qwen3-VL-Thinking model.
-    /// Added by BLS model after VLM generation, not part of VLM's output schema.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(skip)]
-    pub thinking: Option<String>,
-}
-
-/// `DINOv3` embedding results.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Embeddings {
-    /// Whole-image CLS embedding (1024 dims, L2-normalized).
-    pub image: Vec<f32>,
-
-    /// Per-region CLS embeddings, keyed by `region_id` string.
-    /// Empty for irrelevant images or if SAM3 found no regions.
-    #[serde(default)]
-    pub regions: HashMap<String, Vec<f32>>,
-}
-
-/// Full analysis result combining segmentation and VLM stages.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AnalysisResult {
-    /// Source image dimensions as (height, width).
-    /// All region masks share these dimensions.
-    pub image_size: (u32, u32),
-
-    /// Detected regions from SAM3 segmentation.
-    /// Empty if no regions passed confidence threshold.
-    pub segmentation: Vec<DetectedRegion>,
-
-    /// Annotated image with region overlays (base64 JPEG).
-    /// Useful for debugging to see what SAM3 segmented.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub annotated_image: Option<String>,
-
-    /// VLM analysis output (success or error).
-    pub vlm: VlmOutput,
-
-    /// `DINOv3` embeddings (whole image + per-region).
-    pub embeddings: Embeddings,
 }
 
 /// Request to analyze an image.

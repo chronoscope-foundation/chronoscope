@@ -205,7 +205,7 @@ impl TestServer {
     /// Wait until analysis is complete on at least one media item.
     ///
     /// Polls until the dossier has a resolved page with at least one media item
-    /// that has completed analysis (both VLM and segmentation).
+    /// that has completed analysis.
     async fn wait_for_analysis_complete(
         &self,
         url_id: &str,
@@ -216,8 +216,7 @@ impl TestServer {
             |media| {
                 media.iter().any(|m| {
                     if let MediaReference::Fetched(fetched) = m {
-                        matches!(fetched.analysis.vlm, AnalysisOutcome::Success(_))
-                            && matches!(fetched.analysis.segmentation, AnalysisOutcome::Success(_))
+                        matches!(fetched.analysis.analysis, AnalysisOutcome::Success(_))
                     } else {
                         false
                     }
@@ -375,7 +374,7 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
 
     let analyzed: Vec<_> = fetched_media(&page.media)
         .into_iter()
-        .filter(|m| matches!(m.analysis.vlm, AnalysisOutcome::Success(_)))
+        .filter(|m| matches!(m.analysis.analysis, AnalysisOutcome::Success(_)))
         .collect();
 
     assert!(
@@ -385,49 +384,51 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
 
     let media = analyzed[0];
 
-    // Verify VLM analysis results
-    let AnalysisOutcome::Success(vlm) = &media.analysis.vlm else {
-        return Err("expected successful VLM analysis".into());
+    // Verify analysis results
+    let AnalysisOutcome::Success(result) = &media.analysis.analysis else {
+        return Err("expected successful analysis".into());
     };
 
     assert!(
-        !vlm.content_summary.is_empty(),
-        "VLM should produce a content summary"
+        !result.subimages.is_empty(),
+        "analysis should have at least one subimage"
     );
 
-    // For this abandoned buildings image, it should be marked as relevant
-    assert!(
-        vlm.is_relevant,
-        "abandoned building image should be marked as relevant"
-    );
+    // Get the primary subimage's analysis
+    let chronoscope_api::research_types::AnalysisResult { subimages, .. } = result;
+    let subimage = &subimages[0];
 
-    // Verify segmentation results
-    let AnalysisOutcome::Success(segmentation) = &media.analysis.segmentation else {
-        return Err("expected successful segmentation".into());
+    let chronoscope_analysis::SubimageAnalysis::Analyzed {
+        content_summary,
+        regions,
+        ..
+    } = &subimage.analysis
+    else {
+        return Err("expected analyzed subimage".into());
     };
+
+    assert!(
+        !content_summary.is_empty(),
+        "analysis should produce a content summary"
+    );
 
     // Recorded fixture should return exactly 2 regions with specific properties
     assert_eq!(
-        segmentation.regions.len(),
+        regions.len(),
         2,
         "recorded fixture should detect exactly 2 regions"
     );
 
-    // Verify region IDs and confidence scores from the recorded fixture
-    let region_ids: Vec<_> = segmentation.regions.iter().map(|r| r.region_id).collect();
-    assert_eq!(region_ids, vec![1, 2], "region IDs should be 1 and 2");
-
-    // Both regions should have confidence ~0.66-0.69 (from recorded fixture)
-    for region in &segmentation.regions {
+    // Both regions should have segmentation_confidence ~0.66-0.69 (from recorded fixture)
+    for (i, region) in regions.iter().enumerate() {
         assert!(
             !region.mask.counts.is_empty(),
-            "region mask should have RLE counts"
+            "region {i} mask should have RLE counts"
         );
         assert!(
-            region.confidence > 0.65 && region.confidence < 0.70,
-            "region {} confidence should be ~0.66-0.69, got {}",
-            region.region_id,
-            region.confidence
+            region.segmentation_confidence > 0.65 && region.segmentation_confidence < 0.70,
+            "region {i} confidence should be ~0.66-0.69, got {}",
+            region.segmentation_confidence
         );
     }
 

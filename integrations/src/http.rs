@@ -737,9 +737,13 @@ impl HttpClient for CachingClient {
                 // Only read from cache
                 match self.read_cache(&request).await? {
                     Some(cached) => cached.try_into(),
-                    None => Err(HttpError::CacheMiss {
-                        url: request.url.to_string(),
-                    }),
+                    None => {
+                        let key = Self::cache_key(&request);
+                        tracing::debug!(key, url = %request.url, "VCR cache miss");
+                        Err(HttpError::CacheMiss {
+                            url: request.url.to_string(),
+                        })
+                    }
                 }
             }
 

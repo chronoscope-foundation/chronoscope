@@ -11,7 +11,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 // Re-export analysis types for API consumers
-pub use chronoscope_analysis::{DetectedRegion, VlmAnalysis, VlmOutput};
+pub use chronoscope_analysis::AnalysisResult;
 
 // ==================== Analysis Outcome (Generic) ====================
 
@@ -32,28 +32,6 @@ pub enum AnalysisOutcome<T> {
 
 // ==================== Analysis Result Types ====================
 
-/// VLM (Vision-Language Model) analysis results.
-///
-/// Contains: visual descriptions, region analysis, detected text,
-/// temporal cues, and structured scene understanding.
-pub type VlmResults = VlmAnalysis;
-
-/// Image segmentation results.
-///
-/// Contains: detected regions with RLE-encoded masks and confidence scores.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SegmentationResults {
-    /// Detected regions from SAM3 segmentation.
-    pub regions: Vec<DetectedRegion>,
-}
-
-/// Vector embedding results for similarity search.
-///
-/// Will contain: embedding vector reference, nearest neighbors,
-/// and similarity scores for finding visually similar images.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct EmbeddingResults {}
-
 /// Reverse image search results.
 ///
 /// Will contain: matching images found across the web, higher-resolution
@@ -73,9 +51,8 @@ pub struct DeepResearchResults {}
 /// Per-media analysis stages.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct MediaAnalysis {
-    pub vlm: AnalysisOutcome<VlmResults>,
-    pub segmentation: AnalysisOutcome<SegmentationResults>,
-    pub embeddings: AnalysisOutcome<EmbeddingResults>,
+    /// Image analysis (segmentation + VLM + embeddings).
+    pub analysis: AnalysisOutcome<AnalysisResult>,
     pub reverse_image_search: AnalysisOutcome<ReverseImageSearchResults>,
 }
 
@@ -86,9 +63,8 @@ pub struct MediaAnalysisCounts {
     pub total: u32,
     /// Media items successfully fetched
     pub fetched: u32,
-    pub vlm: u32,
-    pub segmentation: u32,
-    pub embeddings: u32,
+    /// Media items with completed analysis
+    pub analyzed: u32,
     pub reverse_image_search: u32,
 }
 

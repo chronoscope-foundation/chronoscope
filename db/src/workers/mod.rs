@@ -213,16 +213,12 @@ impl Database {
     pub async fn mark_analysis_complete(
         &self,
         media_id: &MediaId,
-        vlm_result: &str,
-        segmentation_result: &str,
-        embedding_result: &str,
+        analysis_result: &str,
     ) -> DbResult<()> {
         queries::UPDATE_ANALYSIS_COMPLETE
             .query()
             .bind(media_id)
-            .bind(vlm_result)
-            .bind(segmentation_result)
-            .bind(embedding_result)
+            .bind(analysis_result)
             .execute(&self.pool)
             .await?;
 

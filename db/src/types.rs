@@ -138,12 +138,8 @@ pub enum MediaAnalysisState {
     Processing,
     /// Analysis completed successfully with results
     Complete {
-        /// VLM analysis result (JSON)
-        vlm_result: String,
-        /// Segmentation result (JSON)
-        segmentation_result: String,
-        /// Embedding result (JSON)
-        embedding_result: String,
+        /// Full analysis result (JSON-serialized `AnalysisResult`).
+        analysis_result: String,
     },
     /// Analysis failed with an error message
     Failed {

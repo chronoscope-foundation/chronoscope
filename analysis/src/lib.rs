@@ -32,7 +32,7 @@
 //! if client.is_server_ready().await? {
 //!     let image_bytes = std::fs::read("image.jpg")?;
 //!     let result: AnalysisResult = client.analyze(&image_bytes).await?;
-//!     println!("Relevant: {}", result.vlm.is_relevant);
+//!     println!("Subimages: {}", result.subimages.len());
 //! }
 //! ```
 
@@ -47,7 +47,7 @@ pub mod schema;
 pub use client::TritonClient;
 pub use error::AnalysisError;
 pub use schema::{
-    AnalysisRequest, AnalysisResult, AnalyzedMediaType, CompositeInfo, DetectedRegion, Embeddings,
-    EntityType, ExtractedText, RegionAnalysis, RegionEntry, RegionRelationship, RelationType,
-    RleMask, SceneType, VlmAnalysis, VlmOutput,
+    AnalysisRequest, AnalysisResult, AnalyzedMediaType, BoundingBox, EntityType, ExtractedText,
+    ModelVersions, Region, RegionAnalysis, RegionRelationship, RelationType, RleMask, SceneType,
+    Subimage, SubimageAnalysis, SubimageBounds, VlmAnalyzedOutput, VlmSubimageOutput,
 };

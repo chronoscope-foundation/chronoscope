@@ -4,12 +4,11 @@
 
 #![allow(dead_code)] // Test infrastructure - used by tests in this module
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::Utc;
-use chronoscope_analysis::TritonClient;
+use chronoscope_analysis::{ModelVersions, TritonClient};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::workers::MediaForAnalysis;
 use chronoscope_db::{Database, Email, MediaData, MediaId, MediaType, UserId};
@@ -67,33 +66,40 @@ pub fn triton_success_response(
 /// Create a minimal valid `AnalysisResult` for testing.
 pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
     use chronoscope_analysis::{
-        AnalysisResult, AnalyzedMediaType, CompositeInfo, Embeddings, SceneType, VlmAnalysis,
-        VlmOutput,
+        AnalysisResult, AnalyzedMediaType, BoundingBox, RleMask, SceneType, Subimage,
+        SubimageAnalysis, SubimageBounds,
     };
 
     AnalysisResult {
-        image_size: (100, 100),
-        segmentation: vec![],
-        annotated_image: None,
-        vlm: VlmOutput::Success(VlmAnalysis {
-            is_relevant: true,
-            rejection_reason: None,
-            media_type: AnalyzedMediaType::Photo,
-            content_summary: "A test image".to_string(),
-            scene_type: SceneType::Outdoor,
-            temporal_cues: vec![],
-            composite: CompositeInfo {
-                rows: 1,
-                columns: 1,
+        subimages: vec![Subimage {
+            bounds: SubimageBounds {
+                bbox: BoundingBox {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                mask: RleMask {
+                    counts: "01".to_string(),
+                },
             },
-            regions: HashMap::new(),
-            region_relationships: vec![],
-            extracted_text: vec![],
-            thinking: None,
-        }),
-        embeddings: Embeddings {
-            image: vec![],
-            regions: HashMap::new(),
+            analysis: SubimageAnalysis::Analyzed {
+                media_type: AnalyzedMediaType::Photo,
+                content_summary: "A test image".to_string(),
+                scene_type: SceneType::Outdoor,
+                temporal_cues: vec![],
+                extracted_text: vec![],
+                thinking: None,
+                embedding: vec![],
+                regions: vec![],
+                region_relationships: vec![],
+            },
+        }],
+        versions: ModelVersions {
+            vlm: "test-vlm".to_string(),
+            sam3: "test-sam3".to_string(),
+            dinov3: "test-dinov3".to_string(),
+            git_sha: "test-sha".to_string(),
         },
     }
 }

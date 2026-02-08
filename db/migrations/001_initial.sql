@@ -73,10 +73,8 @@ CREATE TABLE media (
     analysis_retry_after TIMESTAMP,
     analysis_error TEXT,
 
-    -- Analysis results (JSON)
-    vlm_result JSON,
-    segmentation_result JSON,
-    embedding_result JSON
+    -- Analysis result (JSON-serialized AnalysisResult)
+    analysis_result JSON
 );
 
 CREATE INDEX idx_media_perceptual ON media(perceptual_hash)

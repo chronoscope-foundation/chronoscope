@@ -36,6 +36,17 @@ class TritonError(Exception):
         return self._message
 
 
+class InferenceFuture:
+    """Mock future for async BLS execution."""
+
+    def __init__(self, response: "InferenceResponse"):
+        self._response = response
+
+    def get(self) -> "InferenceResponse":
+        """Get the result of the async execution."""
+        return self._response
+
+
 class InferenceResponse:
     """Mock inference response."""
 
@@ -106,9 +117,32 @@ class InferenceRequest:
         self.model_name = model_name
         self.requested_output_names = requested_output_names
         self._inputs = {t.name: t for t in inputs}
+        self._timeout_ms: int | None = None
 
     def inputs(self) -> list[Tensor]:
         return list(self._inputs.values())
+
+    def set_timeout_ms(self, timeout_ms: int) -> None:
+        """Set timeout in milliseconds for this request."""
+        self._timeout_ms = timeout_ms
+
+    def async_exec(self) -> InferenceFuture:
+        """Execute BLS call asynchronously.
+
+        Returns a Future that can be resolved with .get().
+        In mock mode, execution happens immediately.
+        """
+        handler = _model_handlers.get(self.model_name)
+        if handler is None:
+            response = InferenceResponse(
+                error=TritonError(f"No handler registered for model '{self.model_name}'")
+            )
+        else:
+            try:
+                response = handler(self._inputs)
+            except Exception as e:
+                response = InferenceResponse(error=TritonError(str(e)))
+        return InferenceFuture(response)
 
     def exec(self, decoupled: bool = False) -> InferenceResponse | Iterator[InferenceResponse]:
         """Execute BLS call by looking up registered handler.

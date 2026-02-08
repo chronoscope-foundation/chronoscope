@@ -1,6 +1,8 @@
-"""BLS orchestration model for the full analysis pipeline.
+"""BLS orchestration model for the subimage-centric analysis pipeline.
 
-Orchestrates: SAM3 segmentation → image annotation → VLM analysis → DINOv3 embeddings.
+Orchestrates per-subimage: SAM3 segmentation → image annotation → VLM analysis → DINOv3 embeddings.
+
+Output shape: AnalysisResult { subimages: [{ bounds, analysis }] }
 """
 
 import base64
@@ -8,7 +10,8 @@ import io
 import json
 import os
 import sys
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, NamedTuple
 
 import numpy as np
 import triton_python_backend_utils as pb_utils
@@ -55,6 +58,34 @@ VLM_MAX_IMAGE_DIM = 2048
 # Max region crops to embed via DINOv3 (caps GPU memory usage).
 # SAM3 outputs regions in left-to-right spatial order, not confidence order.
 MAX_REGION_CROPS = 16
+
+# Timeouts are generous placeholder values — no production latency data yet.
+# VLM with 32K max_tokens on a 72B model can take minutes for complex images.
+SAM3_TIMEOUT_MS = 120_000  # 2 min
+VLM_TIMEOUT_MS = 300_000  # 5 min
+DINOV3_TIMEOUT_MS = 60_000  # 1 min
+
+# Subimage detection thresholds
+SUBIMAGE_MIN_AREA_FRAC = 0.05  # Reject subimages <5% of image area
+SUBIMAGE_MAX_AREA_FRAC = 0.95  # Reject subimages >95% of image area
+SUBIMAGE_MIN_BBOX_FILL = 0.7  # Reject if mask/bbox area ratio < 0.7
+SUBIMAGE_MAX_OVERLAP_IOU = 0.3  # Fallback to single if IoU > 0.3 between any pair
+
+# Text prompts for composite image panel detection. These target distinct image
+# regions within collages, side-by-side comparisons, or multi-panel layouts.
+SUBIMAGE_PROMPTS = [
+    "distinct image panel in a composite layout",
+    "separate photograph in a collage",
+]
+
+
+class DinoBatchEntry(NamedTuple):
+    """Entry in the DINOv3 embedding batch."""
+
+    subimage_idx: int
+    entry_type: str  # "subimage" or "region"
+    region_idx: int | None
+    crop: Image.Image
 
 
 def get_string_from_tensor(tensor: Any) -> str:
@@ -111,6 +142,48 @@ def compress_rle(counts: list[int]) -> str:
     return bytes(encoded).decode("ascii")
 
 
+def decompress_rle(counts_str: str) -> list[int]:
+    """Decompress COCO compressed RLE string to integer counts."""
+    counts = []
+    x = 0
+    shift = 0
+    for c in counts_str:
+        val = ord(c) - 48
+        x |= (val & 0x1F) << shift
+        if val & 0x20:
+            shift += 5
+        else:
+            counts.append(x)
+            x = 0
+            shift = 0
+    return counts
+
+
+def make_full_image_mask(height: int, width: int) -> str:
+    """Create an all-ones compressed RLE mask (full image, no masking)."""
+    return compress_rle([0, height * width])
+
+
+def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Compute bounding box of a binary mask. Returns (x, y, w, h) or None if empty."""
+    ys, xs = np.where(mask == 1)
+    if len(xs) == 0:
+        return None
+    x_min, x_max = int(xs.min()), int(xs.max())
+    y_min, y_max = int(ys.min()), int(ys.max())
+    return (x_min, y_min, x_max - x_min + 1, y_max - y_min + 1)
+
+
+# NOTE: Duplicated in sam3/1/model.py. Triton's Python backend loads each
+# model in isolation, so there's no clean way to share code between models
+# without complicating the deployment structure.
+def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
+    """Compute Intersection over Union between two masks."""
+    intersection = np.logical_and(mask1, mask2).sum()
+    union = np.logical_or(mask1, mask2).sum()
+    return float(intersection / union) if union > 0 else 0.0
+
+
 def annotate_image(image: Image.Image, regions: list[dict[str, Any]]) -> Image.Image:
     """Create Set-of-Mark (SoM) annotated image.
 
@@ -138,9 +211,8 @@ def annotate_image(image: Image.Image, regions: list[dict[str, Any]]) -> Image.I
         except OSError:
             continue
 
-    for region in regions:
-        region_id = region["region_id"]
-        color = REGION_COLORS[(region_id - 1) % len(REGION_COLORS)]
+    for idx, region in enumerate(regions):
+        color = REGION_COLORS[idx % len(REGION_COLORS)]
 
         # Decode mask from RLE counts
         mask = decode_rle(region["mask"], image.height, image.width)
@@ -157,7 +229,7 @@ def annotate_image(image: Image.Image, regions: list[dict[str, Any]]) -> Image.I
             cx, cy = int(xs.mean()), int(ys.mean())
 
             # Draw label background and text
-            label = str(region_id)
+            label = str(idx)
             bbox = font.getbbox(label)
             text_left, text_top, text_right, text_bottom = bbox
             tw = text_right - text_left
@@ -187,7 +259,7 @@ def annotate_image(image: Image.Image, regions: list[dict[str, Any]]) -> Image.I
 
 
 def build_vlm_prompt(schema_json: str) -> str:
-    """Build the VLM prompt for analysis.
+    """Build the VLM prompt for subimage analysis.
 
     Uses BAML-style type definitions for concise, LLM-friendly schema representation.
     The actual JSON Schema is still used for constrained decoding.
@@ -205,12 +277,16 @@ Your response must be valid JSON matching this schema:
 
 {baml_schema}
 
-You will see two images showing exactly the same scene:
-1. The original photograph - use this to see fine details clearly
-2. The annotated photograph - same image with colored overlays marking detected
-   regions, each labeled with a circled number
+DECISION: If the image shows built structures (buildings, bridges, towers, monuments,
+infrastructure), respond with status "analyzed". If not relevant (portraits, animals,
+food, memes, pure landscapes with no structures), respond with status "rejected" and
+a brief reason.
 
-HOW TO USE THE TWO IMAGES:
+For "analyzed" responses:
+- You will see two images showing exactly the same scene:
+  1. The original photograph - use this to see fine details clearly
+  2. The annotated photograph - same image with colored overlays marking detected
+     regions, each labeled with a circled number
 - Find region numbers and boundaries in the ANNOTATED image
   (look for numbers like 1, 2, 3 inside colored circles)
 - Examine the corresponding area in the ORIGINAL image for architectural
@@ -220,15 +296,44 @@ HOW TO USE THE TWO IMAGES:
 
 
 class TritonPythonModel:
-    """BLS orchestration model for the full analysis pipeline."""
+    """BLS orchestration model for the subimage-centric analysis pipeline."""
 
     def initialize(self, args):
         """Initialize the orchestrator."""
         self.model_config = json.loads(args["model_config"])
+
+        # Model IDs for provenance tracking
+        self.vlm_model_name = "unknown"
+        vlm_model_json = os.path.join(
+            args.get("model_repository", "/models"),
+            "vlm",
+            "1",
+            "model.json",
+        )
+        if os.path.exists(vlm_model_json):
+            with open(vlm_model_json) as f:
+                vlm_config = json.load(f)
+            self.vlm_model_name = vlm_config.get("model", "unknown")
+
+        self.sam3_model_name = "facebook/sam2.1-hiera-large"
+        self.dinov3_model_name = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+        self.git_revision = os.environ.get("ANALYSIS_GIT_SHA", "unknown")
+
+        self.versions = {
+            "vlm": self.vlm_model_name,
+            "sam3": self.sam3_model_name,
+            "dinov3": self.dinov3_model_name,
+            "git_sha": self.git_revision,
+        }
+
         pb_utils.Logger.log_info("Analysis BLS model initialized")
 
     def execute(self, requests):
-        """Process analysis requests by orchestrating SAM3 and VLM."""
+        """Process analysis requests through the subimage pipeline.
+
+        Pipeline: detect subimages → per-subimage (SAM3 → annotate → VLM)
+        → batched DINOv3 → assemble.
+        """
         responses = []
 
         for request in requests:
@@ -239,106 +344,241 @@ class TritonPythonModel:
             schema_json = get_string_from_tensor(schema_tensor)
 
             # Validate image size to prevent OOM
-            estimated_size = len(image_b64) * 3 // 4  # base64 decode estimate
+            estimated_size = len(image_b64) * 3 // 4
             if estimated_size > MAX_IMAGE_BYTES:
                 size_mb = estimated_size // (1024 * 1024)
                 limit_mb = MAX_IMAGE_BYTES // (1024 * 1024)
-                # Can't safely decode oversized images, use (0, 0) as placeholder
-                result = self._error_result(
-                    f"Image too large: {size_mb}MB exceeds {limit_mb}MB limit", 0, 0
-                )
-                result_json = json.dumps(result)
-                output_tensor = pb_utils.Tensor("result", np.array([result_json.encode("utf-8")]))
-                responses.append(pb_utils.InferenceResponse([output_tensor]))
+                result = {
+                    "subimages": [
+                        {
+                            "bounds": _full_image_bounds(1, 1),
+                            "analysis": {
+                                "status": "rejected",
+                                "reason": f"Image too large: {size_mb}MB exceeds {limit_mb}MB limit",
+                            },
+                        }
+                    ],
+                    "versions": self.versions,
+                }
+                responses.append(_make_response(result))
                 continue
 
-            # Decode image early to get dimensions for all code paths
+            # Decode image
             image_bytes = base64.b64decode(image_b64)
             original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-            # 1. Call SAM3 for segmentation
-            sam_request = pb_utils.InferenceRequest(
-                model_name="sam3",
-                requested_output_names=["regions"],
-                inputs=[pb_utils.Tensor("image", np.array([[image_b64.encode("utf-8")]]))],
-            )
-            sam_response = sam_request.exec()
+            # Step 1: Detect subimages (panels) in the source image
+            subimage_bounds = self._detect_subimages(image_b64, original)
 
-            if sam_response.has_error():
-                error_msg = sam_response.error().message()
+            # Step 2: Per-subimage analysis
+            subimage_results = []
+            dino_batch: list[DinoBatchEntry] = []
 
-                # Still compute whole-image embedding even if SAM3 failed
-                embeddings = self._call_dinov3([original])
-                embedding_result = {"image": embeddings[0], "regions": {}}
+            # Pre-compute prompt once
+            vlm_prompt = build_vlm_prompt(schema_json)
 
-                result = {
-                    "image_size": [original.height, original.width],
-                    "segmentation": [],
-                    "annotated_image": None,
-                    "vlm": {"error": f"SAM3 error: {error_msg}"},
-                    "embeddings": embedding_result,
-                }
-            else:
+            # Phase 1: Fire all SAM3 requests concurrently
+            sam_futures = []
+            for si_idx, bounds in enumerate(subimage_bounds):
+                bbox = bounds["bbox"]
+                crop = original.crop(
+                    (
+                        bbox["x"],
+                        bbox["y"],
+                        bbox["x"] + bbox["width"],
+                        bbox["y"] + bbox["height"],
+                    )
+                )
+                crop_b64 = self._encode_image(crop, max_dim=None)
+                sam_request = pb_utils.InferenceRequest(
+                    model_name="sam3",
+                    requested_output_names=["regions"],
+                    inputs=[pb_utils.Tensor("image", np.array([[crop_b64.encode("utf-8")]]))],
+                )
+                sam_request.set_timeout_ms(SAM3_TIMEOUT_MS)
+                sam_futures.append((si_idx, bounds, crop, sam_request.async_exec()))
+
+            # Phase 2: Collect SAM3 results, prepare VLM inputs
+            vlm_inputs = []
+            for si_idx, bounds, crop, sam_future in sam_futures:
+                sam_response = sam_future.get()
+                if sam_response.has_error():
+                    raise RuntimeError(
+                        f"SAM3 error on subimage {si_idx}: {sam_response.error().message()}"
+                    )
+
                 regions_tensor = pb_utils.get_output_tensor_by_name(sam_response, "regions")
                 regions_json = get_string_from_tensor(regions_tensor)
                 regions = json.loads(regions_json)
 
-                # 2. Annotate image
-                annotated = annotate_image(original, regions)
-
-                # Encode images for VLM
-                original_b64 = self._encode_image(original)
+                annotated = annotate_image(crop, regions)
+                original_b64 = self._encode_image(crop)
                 annotated_b64 = self._encode_image(annotated)
 
-                # 3. Build VLM prompt with schema for context
-                prompt = build_vlm_prompt(schema_json)
-
-                # 4. Call VLM with both images and structured output constraint
-                vlm_result = self._call_vlm(
-                    prompt, original_b64, annotated_b64, schema_json, len(regions)
-                )
-
-                # 5. Compress masks for wire transfer
                 compressed_regions = [
                     {**r, "mask": {"counts": compress_rle(r["mask"])}} for r in regions
                 ]
 
-                # 6. Compute DINOv3 embeddings
-                dino_images = [original]
+                vlm_inputs.append(
+                    (si_idx, bounds, crop, compressed_regions,
+                     original_b64, annotated_b64, len(regions))
+                )
 
-                # Add region bbox crops for relevant images with regions
-                if regions and vlm_result.get("is_relevant", False):
-                    for region in compressed_regions[:MAX_REGION_CROPS]:
-                        crop = self._crop_region_bbox(original, region["mask"], padding=0.05)
-                        dino_images.append(crop)
-
-                embeddings = self._call_dinov3(dino_images)
-
-                embedding_result = {"image": embeddings[0], "regions": {}}
-                if len(embeddings) > 1:
-                    for i, region in enumerate(compressed_regions[:MAX_REGION_CROPS]):
-                        region_id = str(region["region_id"])
-                        embedding_result["regions"][region_id] = embeddings[i + 1]
-
-                result = {
-                    "image_size": [original.height, original.width],
-                    "segmentation": compressed_regions,
-                    "annotated_image": annotated_b64,
-                    "vlm": vlm_result,
-                    "embeddings": embedding_result,
+            # Phase 3: Run VLM concurrently across subimages, then queue DINOv3
+            vlm_results: dict[int, dict[str, Any]] = {}
+            with ThreadPoolExecutor(max_workers=len(vlm_inputs) or 1) as pool:
+                future_to_idx = {
+                    pool.submit(
+                        self._call_vlm,
+                        vlm_prompt, orig_b64, ann_b64, schema_json, n_regions,
+                    ): si_idx
+                    for si_idx, _, _, _, orig_b64, ann_b64, n_regions in vlm_inputs
                 }
+                for future in as_completed(future_to_idx):
+                    vlm_results[future_to_idx[future]] = future.result()
 
-            result_json = json.dumps(result)
-            output_tensor = pb_utils.Tensor("result", np.array([result_json.encode("utf-8")]))
-            responses.append(pb_utils.InferenceResponse([output_tensor]))
+            for si_idx, bounds, crop, compressed_regions, _, _, _ in vlm_inputs:
+                vlm_result = vlm_results[si_idx]
+
+                subimage_results.append(
+                    {
+                        "bounds": bounds,
+                        "vlm": vlm_result,
+                        "compressed_regions": compressed_regions,
+                    }
+                )
+
+                # Queue DINOv3 crops for analyzed subimages
+                if vlm_result.get("status") == "analyzed":
+                    dino_batch.append(DinoBatchEntry(si_idx, "subimage", None, crop))
+                    for ri, region in enumerate(compressed_regions[:MAX_REGION_CROPS]):
+                        region_crop = self._crop_region_bbox(crop, region["mask"], padding=0.05)
+                        dino_batch.append(DinoBatchEntry(si_idx, "region", ri, region_crop))
+
+            # Step 3: Batched DINOv3 embeddings
+            embeddings_map: dict[tuple[int, str, int | None], list[float]] = {}
+            if dino_batch:
+                dino_images = [entry.crop for entry in dino_batch]
+                embeddings = self._call_dinov3(dino_images)
+                for i, entry in enumerate(dino_batch):
+                    key = (entry.subimage_idx, entry.entry_type, entry.region_idx)
+                    embeddings_map[key] = embeddings[i]
+
+            # Step 4: Assemble final AnalysisResult
+            subimages = []
+            for si_idx, si_data in enumerate(subimage_results):
+                vlm = si_data["vlm"]
+                bounds = si_data["bounds"]
+                compressed_regions = si_data["compressed_regions"]
+
+                if vlm.get("status") == "analyzed":
+                    subimage_embedding = embeddings_map.get((si_idx, "subimage", None), [])
+                    analysis = self._assemble_analyzed(
+                        vlm, compressed_regions, si_idx, embeddings_map, subimage_embedding
+                    )
+                elif vlm.get("status") == "rejected":
+                    analysis = {"status": "rejected", "reason": vlm.get("reason", "Unknown")}
+                elif "error" in vlm:
+                    analysis = {"status": "error", "message": vlm["error"]}
+                else:
+                    analysis = {"status": "error", "message": "Unexpected VLM output format"}
+
+                subimages.append({"bounds": bounds, "analysis": analysis})
+
+            result = {
+                "subimages": subimages,
+                "versions": self.versions,
+            }
+            responses.append(_make_response(result))
 
         return responses
 
-    def _encode_image(self, image: Image.Image) -> str:
-        """Resize and encode PIL image to base64 JPEG."""
-        # Resize if needed to stay within VLM token limits
-        if max(image.size) > VLM_MAX_IMAGE_DIM:
-            ratio = VLM_MAX_IMAGE_DIM / max(image.size)
+    def _detect_subimages(self, image_b64: str, image: Image.Image) -> list[dict[str, Any]]:
+        """Detect subimage panels using SAM3 with image-level prompts.
+
+        Returns list of SubimageBounds dicts. Falls back to a single full-image
+        bounds if detection finds 0-1 panels, fails, or panels overlap too much.
+        """
+        full_bounds = _full_image_bounds(image.width, image.height)
+
+        # Call SAM3 with subimage detection prompts
+        prompts_array = np.array([p.encode("utf-8") for p in SUBIMAGE_PROMPTS])
+        sam_request = pb_utils.InferenceRequest(
+            model_name="sam3",
+            requested_output_names=["regions"],
+            inputs=[
+                pb_utils.Tensor("image", np.array([[image_b64.encode("utf-8")]])),
+                pb_utils.Tensor("prompts", prompts_array),
+            ],
+        )
+        sam_request.set_timeout_ms(SAM3_TIMEOUT_MS)
+        sam_response = sam_request.exec()
+
+        if sam_response.has_error():
+            raise RuntimeError(f"Subimage SAM3 error: {sam_response.error().message()}")
+
+        regions_tensor = pb_utils.get_output_tensor_by_name(sam_response, "regions")
+        regions_json = get_string_from_tensor(regions_tensor)
+        raw_regions = json.loads(regions_json)
+
+        if not raw_regions:
+            return [full_bounds]
+
+        # Filter by area and bbox fill ratio
+        image_area = image.width * image.height
+        usable = []
+        for region in raw_regions:
+            mask = decode_rle(region["mask"], image.height, image.width)
+            area = int(mask.sum())
+            area_frac = area / image_area
+
+            if area_frac < SUBIMAGE_MIN_AREA_FRAC or area_frac > SUBIMAGE_MAX_AREA_FRAC:
+                continue
+
+            bbox = mask_bbox(mask)
+            if bbox is None:
+                continue
+            bx, by, bw, bh = bbox
+            bbox_area = bw * bh
+            if bbox_area > 0 and area / bbox_area < SUBIMAGE_MIN_BBOX_FILL:
+                continue
+
+            usable.append((mask, bbox, region["confidence"]))
+
+        # Fallback if 0 or 1 usable regions
+        if len(usable) <= 1:
+            return [full_bounds]
+
+        # Check pairwise overlap — if any pair has IoU > threshold, fallback
+        for i in range(len(usable)):
+            for j in range(i + 1, len(usable)):
+                if compute_iou(usable[i][0], usable[j][0]) > SUBIMAGE_MAX_OVERLAP_IOU:
+                    return [full_bounds]
+
+        # Convert to SubimageBounds
+        result = []
+        for mask, (bx, by, bw, bh), _ in usable:
+            # Crop mask to bbox coordinate space and encode as RLE
+            crop_mask = mask[by : by + bh, bx : bx + bw]
+            crop_counts = _encode_rle_mask(crop_mask)
+            result.append(
+                {
+                    "bbox": {"x": bx, "y": by, "width": bw, "height": bh},
+                    "mask": {"counts": compress_rle(crop_counts)},
+                }
+            )
+
+        return result
+
+    def _encode_image(self, image: Image.Image, *, max_dim: int | None = VLM_MAX_IMAGE_DIM) -> str:
+        """Encode PIL image to base64 JPEG, optionally resizing first.
+
+        Args:
+            image: PIL image to encode.
+            max_dim: Maximum dimension (width or height). Pass None to skip resizing.
+        """
+        if max_dim is not None and max(image.size) > max_dim:
+            ratio = max_dim / max(image.size)
             new_size = (int(image.size[0] * ratio), int(image.size[1] * ratio))
             image = image.resize(new_size, Image.Resampling.LANCZOS)
 
@@ -359,63 +599,38 @@ class TritonPythonModel:
         Uses Qwen3-VL ChatML format with separate image inputs.
         Uses structured_outputs for guaranteed JSON conformance.
         """
-        # Build ChatML prompt with constant prefix for KV cache efficiency.
-        # Text instructions come first (cacheable), then variable images.
-        #
-        # TODO: The original image comes before the annotated image intentionally.
-        # This means the VLM's dependency on SAM3 is only for the second image.
-        # In principle, we could start VLM prefill on (text + original) while SAM3
-        # is still running, then append the annotated image when ready. This would
-        # reduce end-to-end latency by overlapping SAM3 and partial VLM processing.
-        #
-        # The region count hint is placed right before the annotated image to
-        # minimize the prefix that depends on SAM3 output.
         region_hint = f"""
-The annotated image contains {num_regions} labeled regions (1 through {num_regions}).
-Each region has a circled number label. Provide an entry for each numbered region
-that contains a built structure. Omit regions that aren't built structures (trees,
-sky, streets, vehicles).
+The annotated image contains {num_regions} labeled regions (0 through {num_regions - 1}).
+Each region has a circled number label. Provide an entry for EVERY numbered region
+in the regions array. For regions that aren't built structures (trees, sky, streets,
+vehicles), use "non_structure" as the entity_type with an empty description.
 
-RELATIONSHIPS (all symmetric - always use lower region number as subject):
+RELATIONSHIPS (all symmetric - always use lower region index as subject):
 - "adjacent": structures next to each other on the SAME side of a street
 - "across_from": structures facing each other on OPPOSITE sides of a street
   or open space
-- same_as is rare: only use when segmentation incorrectly split one structure
-  into multiple regions
+- "same_structure": both regions show the same structure split by segmentation
 """
         text_prompt = (
             "<|im_start|>user\n"
             f"{prompt}\n"
             "<|vision_start|><|image_pad|><|vision_end|>"  # Original image
-            "<|vision_start|><|image_pad|><|vision_end|>"  # Annotated image (from SAM3)
+            "<|vision_start|><|image_pad|><|vision_end|>"  # Annotated image
             f"{region_hint}"
             "<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
 
-        # Build sampling parameters with structured_outputs
-        # Note: structured_outputs requires double-encoding:
-        # - Inner json.dumps for the {"json": schema} wrapper
-        # - Outer json.dumps for the full sampling_params dict
-        # See https://github.com/triton-inference-server/server/issues/7897 for more info
         schema = json.loads(schema_json)
         sampling_params = json.dumps(
             {
                 "max_tokens": 32768,
                 "temperature": 0.1,
-                # TODO: thinking_token_budget isn't supported by Triton vLLM backend yet
                 "structured_outputs": json.dumps({"json": schema}),
             }
         )
 
-        # Pass images as separate tensor elements (not JSON array).
-        # vLLM backend iterates over elements: for img in images.as_numpy()
-        image_array = np.array(
-            [
-                original_b64.encode("utf-8"),
-                annotated_b64.encode("utf-8"),
-            ]
-        )
+        image_array = np.array([original_b64.encode("utf-8"), annotated_b64.encode("utf-8")])
 
         vlm_request = pb_utils.InferenceRequest(
             model_name="vlm",
@@ -427,11 +642,9 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
                 pb_utils.Tensor("exclude_input_in_output", np.array([True])),
             ],
         )
-        # vLLM backend uses decoupled mode for streaming support
+        vlm_request.set_timeout_ms(VLM_TIMEOUT_MS)
         vlm_responses = vlm_request.exec(decoupled=True)
 
-        # We expect exactly one response (streaming disabled). Fail loudly if vLLM
-        # starts streaming so we notice and handle it properly.
         responses_list = list(vlm_responses)
         if len(responses_list) == 0:
             return {"error": "VLM returned no response"}
@@ -447,8 +660,6 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
         output_text = get_string_from_tensor(output_tensor)
 
         # Parse thinking content from Qwen3-VL-Thinking output.
-        # Format: <think>...reasoning...</think>{"json": ...}
-        # Note: The opening <think> may be implicit (added by chat template).
         thinking_content = None
         json_text = output_text
 
@@ -457,54 +668,72 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
             thinking_content = parts[0].replace("<think>", "").strip()
             json_text = parts[1].strip() if len(parts) > 1 else ""
 
-        try:
-            result: dict[str, Any] = json.loads(json_text)
-            if thinking_content:
-                result["thinking"] = thinking_content
-            return result
-        except json.JSONDecodeError as e:
-            # If structured_outputs worked, this shouldn't happen
-            pb_utils.Logger.log_error(f"JSON parse error: {e}")
-            return {"error": f"JSON parse error: {e}", "raw_output": output_text}
+        result: dict[str, Any] = json.loads(json_text)
+        if thinking_content:
+            result["thinking"] = thinking_content
+        return result
+
+    def _assemble_analyzed(
+        self,
+        vlm: dict[str, Any],
+        compressed_regions: list[dict],
+        si_idx: int,
+        embeddings_map: dict[tuple[int, str, int | None], list[float]],
+        subimage_embedding: list[float],
+    ) -> dict[str, Any]:
+        """Assemble an analyzed SubimageAnalysis from VLM + SAM3 + DINOv3 results."""
+        vlm_regions = vlm["regions"]  # Now a list, not a dict
+
+        # Merge SAM3 regions with VLM analysis and DINOv3 embeddings
+        unified_regions = []
+        for ri, sam_region in enumerate(compressed_regions):
+            # VLM analysis for this region (positional indexing)
+            vlm_analysis = vlm_regions[ri] if ri < len(vlm_regions) else {}
+
+            # DINOv3 embedding
+            region_embedding = embeddings_map.get((si_idx, "region", ri), [])
+
+            unified_regions.append(
+                {
+                    "segmentation_confidence": sam_region["confidence"],
+                    "mask": sam_region["mask"],
+                    "embedding": region_embedding,
+                    "entity_type": vlm_analysis["entity_type"],
+                    "description": vlm_analysis["description"],
+                    "identifiable_features": vlm_analysis["identifiable_features"],
+                    "visible_text": vlm_analysis["visible_text"],
+                    "damage_signs": vlm_analysis["damage_signs"],
+                }
+            )
+
+        return {
+            "status": "analyzed",
+            "media_type": vlm["media_type"],
+            "content_summary": vlm["content_summary"],
+            "scene_type": vlm["scene_type"],
+            "temporal_cues": vlm["temporal_cues"],
+            "extracted_text": vlm["extracted_text"],
+            "thinking": vlm.get("thinking"),
+            "embedding": subimage_embedding,
+            "regions": unified_regions,
+            "region_relationships": vlm["region_relationships"],
+        }
 
     def _crop_region_bbox(
         self, image: Image.Image, rle_mask: dict[str, str], padding: float = 0.05
     ) -> Image.Image:
-        """Crop image to bounding box of an RLE mask with padding.
-
-        Args:
-            image: Source image.
-            rle_mask: RLE mask dict with "counts" key (compressed string).
-            padding: Fraction of bbox size to add as padding margin.
-        """
-        # Decompress RLE to get integer counts, then decode to binary mask
-        counts_str = rle_mask["counts"]
-        counts = []
-        x = 0
-        shift = 0
-        for c in counts_str:
-            val = ord(c) - 48
-            x |= (val & 0x1F) << shift
-            if val & 0x20:
-                shift += 5
-            else:
-                counts.append(x)
-                x = 0
-                shift = 0
-
+        """Crop image to bounding box of an RLE mask with padding."""
+        counts = decompress_rle(rle_mask["counts"])
         mask = decode_rle(counts, image.height, image.width)
 
-        # Find bounding box
-        ys, xs = np.where(mask == 1)
-        if len(xs) == 0:
-            return image  # Empty mask, return whole image
+        bbox = mask_bbox(mask)
+        if bbox is None:
+            return image
 
-        x_min, x_max = int(xs.min()), int(xs.max())
-        y_min, y_max = int(ys.min()), int(ys.max())
+        x_min, y_min, w, h = bbox
+        x_max = x_min + w - 1
+        y_max = y_min + h - 1
 
-        # Add padding
-        w = x_max - x_min
-        h = y_max - y_min
         pad_x = int(w * padding)
         pad_y = int(h * padding)
 
@@ -520,7 +749,6 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
 
         Returns list of 1024-dim L2-normalized embeddings.
         """
-        # Encode images to base64 for the DINOv3 model
         b64_images = []
         for img in images:
             buffer = io.BytesIO()
@@ -534,6 +762,7 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
             requested_output_names=["embeddings"],
             inputs=[pb_utils.Tensor("images", image_array)],
         )
+        dino_request.set_timeout_ms(DINOV3_TIMEOUT_MS)
         dino_response = dino_request.exec()
 
         if dino_response.has_error():
@@ -545,16 +774,46 @@ RELATIONSHIPS (all symmetric - always use lower region number as subject):
         result: list[list[float]] = json.loads(embeddings_json)
         return result
 
-    def _error_result(self, error_msg: str, height: int, width: int) -> dict[str, Any]:
-        """Create an error result."""
-        return {
-            "image_size": [height, width],
-            "segmentation": [],
-            "annotated_image": None,
-            "vlm": {"error": error_msg},
-            "embeddings": {"image": [], "regions": {}},
-        }
-
     def finalize(self):
         """Clean up."""
         pass
+
+
+# ==================== Module-level helpers ====================
+
+
+# NOTE: Duplicated as encode_rle() in sam3/1/model.py. See compute_iou
+# above for rationale.
+def _encode_rle_mask(mask: np.ndarray) -> list[int]:
+    """Encode a binary mask as RLE (COCO-style, column-major order)."""
+    flat = mask.flatten(order="F")
+    counts: list[int] = []
+    current_val = 0
+    run_length = 0
+
+    for val in flat:
+        if val == current_val:
+            run_length += 1
+        else:
+            counts.append(run_length)
+            current_val = val
+            run_length = 1
+
+    counts.append(run_length)
+    return counts
+
+
+def _full_image_bounds(width: int, height: int) -> dict[str, Any]:
+    """Create SubimageBounds covering the full image."""
+    return {
+        "bbox": {"x": 0, "y": 0, "width": width, "height": height},
+        "mask": {"counts": make_full_image_mask(height, width)},
+    }
+
+
+
+def _make_response(result: dict[str, Any]) -> Any:
+    """Wrap a result dict into a Triton InferenceResponse."""
+    result_json = json.dumps(result)
+    output_tensor = pb_utils.Tensor("result", np.array([result_json.encode("utf-8")]))
+    return pb_utils.InferenceResponse([output_tensor])

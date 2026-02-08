@@ -127,6 +127,39 @@ def jsonschema_to_baml(schema: dict[str, Any]) -> str:
 
         return "\n".join(result)
 
+    def is_tagged_union(spec: dict[str, Any]) -> bool:
+        """Check if a oneOf spec is a tagged union.
+
+        Each variant must be an object with a shared discriminant field.
+        """
+        return find_tag_field(spec) is not None
+
+    def find_tag_field(spec: dict[str, Any]) -> str | None:
+        """Find the discriminant field name in a tagged union."""
+        variants = spec.get("oneOf", [])
+        if not variants:
+            return None
+
+        common_props = set(variants[0].get("properties", {}).keys())
+        for v in variants[1:]:
+            common_props &= set(v.get("properties", {}).keys())
+
+        for prop in common_props:
+            is_tag = True
+            for v in variants:
+                prop_spec = v["properties"].get(prop, {})
+                if not (
+                    prop_spec.get("type") == "string"
+                    and "enum" in prop_spec
+                    and len(prop_spec["enum"]) == 1
+                ):
+                    is_tag = False
+                    break
+            if is_tag:
+                return str(prop)
+
+        return None
+
     def convert_class(name: str, spec: dict[str, Any]) -> str:
         """Convert a JSON Schema object to BAML class."""
         result = []
@@ -155,9 +188,67 @@ def jsonschema_to_baml(schema: dict[str, Any]) -> str:
         result.append("}")
         return "\n".join(result)
 
+    def convert_tagged_union(name: str, spec: dict[str, Any]) -> str:
+        """Convert a tagged union (internally-tagged enum) to BAML-style representation.
+
+        Outputs each variant as a separate class-like block showing which fields
+        apply for each tag value.
+        """
+        result = []
+        desc = spec.get("description")
+        if desc:
+            escaped = desc.replace('"', '\\"').replace("\n", " ")
+            result.append(f'@description("{escaped}")')
+
+        tag_field = find_tag_field(spec)
+        if not tag_field:
+            return f"// {name}: unknown tagged union"
+
+        result.append(
+            f'// {name}: output ONE of the following (distinguished by "{tag_field}" field):'
+        )
+        result.append("")
+
+        for variant in spec.get("oneOf", []):
+            tag_value = variant["properties"][tag_field]["enum"][0]
+            variant_desc = variant.get("description", "")
+
+            if variant_desc:
+                escaped = variant_desc.replace('"', '\\"').replace("\n", " ")
+                result.append(f'// When {tag_field} = "{tag_value}": {escaped}')
+            else:
+                result.append(f'// When {tag_field} = "{tag_value}":')
+
+            result.append(f"class {name}_{tag_value} {{")
+
+            properties = variant.get("properties", {})
+            required = set(variant.get("required", []))
+
+            for prop_name, prop_spec in properties.items():
+                if prop_name == tag_field:
+                    # Show the tag field with its fixed value
+                    result.append(f'  {prop_name} "{tag_value}" @description("discriminant")')
+                    continue
+
+                prop_type = resolve_type(prop_spec)
+                if prop_name not in required and not prop_type.endswith("?"):
+                    prop_type = f"{prop_type}?"
+
+                prop_desc = prop_spec.get("description")
+                if prop_desc:
+                    escaped = prop_desc.replace('"', '\\"').replace("\n", " ")
+                    result.append(f'  {prop_name} {prop_type} @description("{escaped}")')
+                else:
+                    result.append(f"  {prop_name} {prop_type}")
+
+            result.append("}")
+            result.append("")
+
+        return "\n".join(result)
+
     # Convert all definitions
     for def_name, def_spec in definitions.items():
-        # Detect if it's an enum (has oneOf with enum variants)
+        # Detect if it's an enum (has oneOf with all single enum string values)
         if "oneOf" in def_spec:
             variants = def_spec["oneOf"]
             if all("enum" in v and len(v["enum"]) == 1 for v in variants):
@@ -165,6 +256,13 @@ def jsonschema_to_baml(schema: dict[str, Any]) -> str:
                 lines.append("")
                 continue
 
+            # Detect tagged union (oneOf with object variants sharing a discriminant)
+            if is_tagged_union(def_spec):
+                lines.append(convert_tagged_union(def_name, def_spec))
+                lines.append("")
+                continue
+
+        # Do we really need convert_union distinct from convert_tagged_union and this seemingly duplicative anyOf/oneOf stuff? They're all coming from rust types (where we only have tagged unions) but I guess the schemars code might generate the two flavors in different cases?
         # Detect if it's a union type (anyOf)
         if "anyOf" in def_spec:
             lines.append(convert_union(def_name, def_spec))
@@ -176,9 +274,19 @@ def jsonschema_to_baml(schema: dict[str, Any]) -> str:
             lines.append(convert_class(def_name, def_spec))
             lines.append("")
 
-    # Convert the root type (usually the main output type)
+    # Convert the root type
     if "properties" in schema:
         root_name = schema.get("title", "Output")
         lines.append(convert_class(root_name, schema))
+    elif "oneOf" in schema:
+        root_name = schema.get("title", "Output")
+        if is_tagged_union(schema):
+            lines.append(convert_tagged_union(root_name, schema))
+        else:
+            variants = schema["oneOf"]
+            if all("enum" in v and len(v["enum"]) == 1 for v in variants):
+                lines.append(convert_enum(root_name, schema))
+            else:
+                lines.append(convert_union(root_name, schema))
 
     return "\n".join(lines)

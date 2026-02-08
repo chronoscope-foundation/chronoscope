@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::error::AnalysisError;
-use crate::schema::{AnalysisResult, VlmAnalysis};
+use crate::schema::{AnalysisResult, VlmSubimageOutput};
 
 /// Client for communicating with Triton Inference Server.
 pub struct TritonClient {
@@ -83,43 +83,14 @@ impl TritonClient {
         Ok(response.is_success())
     }
 
-    /// Analyze an image using the analysis pipeline.
-    ///
-    /// # Arguments
-    /// * `image` - Raw image bytes (JPEG, PNG, etc.)
-    ///
-    /// # Errors
-    /// Returns an error if the inference request fails, Triton returns an error,
-    /// or the response cannot be parsed.
-    pub async fn analyze(&self, image: &[u8]) -> Result<AnalysisResult, AnalysisError> {
-        let url = self.url("/v2/models/analysis/infer")?;
-
-        // Build the inference request
-        let schema = schemars::schema_for!(VlmAnalysis);
-        let schema_json = serde_json::to_string(&schema)
-            .map_err(|e| AnalysisError::ResponseParsing(e.to_string()))?;
-
-        // Note: shapes are [batch_size, dim] because model has max_batch_size=1
-        let triton_request = TritonInferRequest {
-            inputs: vec![
-                TritonInputTensor {
-                    name: "image".to_string(),
-                    datatype: "BYTES".to_string(),
-                    shape: vec![1, 1],
-                    // Image bytes are base64-encoded for JSON transport
-                    data: vec![base64::engine::general_purpose::STANDARD.encode(image)],
-                },
-                TritonInputTensor {
-                    name: "schema".to_string(),
-                    datatype: "BYTES".to_string(),
-                    shape: vec![1, 1],
-                    data: vec![schema_json],
-                },
-            ],
-            outputs: vec![TritonOutputRequest {
-                name: "result".to_string(),
-            }],
-        };
+    /// Send an inference request to a Triton model and extract a named output string.
+    async fn infer(
+        &self,
+        model_name: &str,
+        triton_request: TritonInferRequest,
+        output_name: &str,
+    ) -> Result<String, AnalysisError> {
+        let url = self.url(&format!("/v2/models/{model_name}/infer"))?;
 
         let body_json = serde_json::to_vec(&triton_request)
             .map_err(|e| AnalysisError::ResponseParsing(e.to_string()))?;
@@ -144,19 +115,88 @@ impl TritonClient {
         let infer_response: TritonInferResponse = serde_json::from_slice(&response.body)
             .map_err(|e| AnalysisError::ResponseParsing(e.to_string()))?;
 
-        // Extract the result from the response
-        let result_output = infer_response
+        let output = infer_response
             .outputs
             .into_iter()
-            .find(|o| o.name == "result")
-            .ok_or_else(|| AnalysisError::ResponseParsing("missing 'result' output".to_string()))?;
+            .find(|o| o.name == output_name)
+            .ok_or_else(|| {
+                AnalysisError::ResponseParsing(format!("missing '{output_name}' output"))
+            })?;
 
-        let result_str = result_output
+        output
             .data
             .first()
-            .ok_or_else(|| AnalysisError::ResponseParsing("empty result data".to_string()))?;
+            .cloned()
+            .ok_or_else(|| AnalysisError::ResponseParsing(format!("empty {output_name} data")))
+    }
 
-        serde_json::from_str(result_str)
+    /// Compute a DINOv3 embedding for an image.
+    ///
+    /// Calls the DINOv3 model directly (not through the BLS pipeline).
+    /// Returns a 1024-dimensional L2-normalized CLS embedding.
+    ///
+    /// # Arguments
+    /// * `image` - Raw image bytes (JPEG, PNG, etc.)
+    ///
+    /// # Errors
+    /// Returns an error if the inference request fails or the response cannot be parsed.
+    pub async fn embed(&self, image: &[u8]) -> Result<Vec<f32>, AnalysisError> {
+        let triton_request = TritonInferRequest {
+            inputs: vec![TritonInputTensor {
+                name: "image".to_string(),
+                datatype: "BYTES".to_string(),
+                shape: vec![1, 1],
+                data: vec![base64::engine::general_purpose::STANDARD.encode(image)],
+            }],
+            outputs: vec![TritonOutputRequest {
+                name: "embedding".to_string(),
+            }],
+        };
+
+        let result_str = self.infer("dinov3", triton_request, "embedding").await?;
+
+        serde_json::from_str(&result_str)
+            .map_err(|e| AnalysisError::ResponseParsing(format!("invalid embedding JSON: {e}")))
+    }
+
+    /// Analyze an image using the analysis pipeline.
+    ///
+    /// # Arguments
+    /// * `image` - Raw image bytes (JPEG, PNG, etc.)
+    ///
+    /// # Errors
+    /// Returns an error if the inference request fails, Triton returns an error,
+    /// or the response cannot be parsed.
+    pub async fn analyze(&self, image: &[u8]) -> Result<AnalysisResult, AnalysisError> {
+        let schema = schemars::schema_for!(VlmSubimageOutput);
+        let schema_json = serde_json::to_string(&schema)
+            .map_err(|e| AnalysisError::ResponseParsing(format!("schema serialization: {e}")))?;
+
+        // Note: shapes are [batch_size, dim] because model has max_batch_size=1
+        let triton_request = TritonInferRequest {
+            inputs: vec![
+                TritonInputTensor {
+                    name: "image".to_string(),
+                    datatype: "BYTES".to_string(),
+                    shape: vec![1, 1],
+                    // Image bytes are base64-encoded for JSON transport
+                    data: vec![base64::engine::general_purpose::STANDARD.encode(image)],
+                },
+                TritonInputTensor {
+                    name: "schema".to_string(),
+                    datatype: "BYTES".to_string(),
+                    shape: vec![1, 1],
+                    data: vec![schema_json],
+                },
+            ],
+            outputs: vec![TritonOutputRequest {
+                name: "result".to_string(),
+            }],
+        };
+
+        let result_str = self.infer("analysis", triton_request, "result").await?;
+
+        serde_json::from_str(&result_str)
             .map_err(|e| AnalysisError::ResponseParsing(format!("invalid result JSON: {e}")))
     }
 }
@@ -245,6 +285,57 @@ mod tests {
         // 503 should return an error, not Ok(false)
         let result = client.is_server_ready().await;
         assert!(result.is_err(), "expected error for 503, got Ok");
+        Ok(())
+    }
+
+    /// Build a mock Triton response wrapping a single named output.
+    fn mock_triton_response(name: &str, data: &str) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&serde_json::json!({
+            "outputs": [{ "name": name, "data": [data] }]
+        }))
+    }
+
+    #[tokio::test]
+    async fn test_embed_success() -> Result<(), Box<dyn std::error::Error>> {
+        let embedding = vec![0.1_f32, 0.2, 0.3];
+        let embedding_json = serde_json::to_string(&embedding)?;
+        let response_body = mock_triton_response("embedding", &embedding_json)?;
+
+        let url = Url::parse("http://localhost:8080")?;
+        let http = Arc::new(MockHttpClient::success(&response_body)?);
+        let client = TritonClient::new(url, http);
+
+        let result = client.embed(b"fake image bytes").await?;
+        assert_eq!(result, embedding);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embed_triton_error() -> Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse("http://localhost:8080")?;
+        let http = Arc::new(MockHttpClient::status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        )?);
+        let client = TritonClient::new(url, http);
+
+        let result = client.embed(b"fake image bytes").await;
+        assert!(result.is_err(), "expected error for 500");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_embed_missing_output() -> Result<(), Box<dyn std::error::Error>> {
+        let response_body = mock_triton_response("wrong_name", "[1.0]")?;
+
+        let url = Url::parse("http://localhost:8080")?;
+        let http = Arc::new(MockHttpClient::success(&response_body)?);
+        let client = TritonClient::new(url, http);
+
+        let result = client.embed(b"fake image bytes").await;
+        assert!(
+            result.is_err(),
+            "expected error for missing 'embedding' output"
+        );
         Ok(())
     }
 }

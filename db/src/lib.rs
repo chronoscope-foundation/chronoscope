@@ -23,7 +23,7 @@ use chronoscope_integrations::IntegrationRegistry;
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
     FollowedUrl, GpsLocation, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl,
-    ResearchUrlWithResolved, ResolvedContent, User,
+    ResearchUrlWithResolved, ResolvedContent, ResolvedTarget, User,
 };
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use types::{
@@ -550,47 +550,49 @@ impl Database {
         };
 
         // Build resolved content based on what type of resolution we have
-        let resolved = if let Some(ref page_id) = research_url.page_id {
-            // Fetch page row
-            let page_row: Option<PageDbRow> = sqlx::query_as(queries::GET_PAGE_BY_ID.sql)
-                .bind(page_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let resolved = match &research_url.target {
+            ResolvedTarget::Unresolved => None,
+            ResolvedTarget::Page(page_id) => {
+                // Fetch page row
+                let page_row: Option<PageDbRow> = sqlx::query_as(queries::GET_PAGE_BY_ID.sql)
+                    .bind(page_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
 
-            // Fetch media slots for the page
-            let rows: Vec<PageMediaRow> = sqlx::query_as(queries::GET_PAGE_MEDIA.sql)
-                .bind(page_id)
-                .fetch_all(&self.pool)
-                .await?;
-            let media: Vec<MediaSlot> = rows
-                .into_iter()
-                .map(PageMediaRow::into_media_slot)
-                .collect();
+                // Fetch media slots for the page
+                let rows: Vec<PageMediaRow> = sqlx::query_as(queries::GET_PAGE_MEDIA.sql)
+                    .bind(page_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+                let media: Vec<MediaSlot> = rows
+                    .into_iter()
+                    .map(PageMediaRow::into_media_slot)
+                    .collect();
 
-            page_row.map(|row| {
-                ResolvedContent::Page(Page {
-                    id: row.id,
-                    data: PageData {
-                        source_type: row.source_type,
-                        title: row.title,
-                        author: row.author,
-                        published_at: row.published_at,
-                        content: row.content,
-                        fetched_at: row.fetched_at,
-                        media,
-                    },
-                    created_at: row.created_at,
+                page_row.map(|row| {
+                    ResolvedContent::Page(Page {
+                        id: row.id,
+                        data: PageData {
+                            source_type: row.source_type,
+                            title: row.title,
+                            author: row.author,
+                            published_at: row.published_at,
+                            content: row.content,
+                            fetched_at: row.fetched_at,
+                            media,
+                        },
+                        created_at: row.created_at,
+                    })
                 })
-            })
-        } else if let Some(ref media_id) = research_url.media_id {
-            // Fetch direct media
-            let row: Option<MediaDbRow> = sqlx::query_as(queries::GET_MEDIA_BY_ID.sql)
-                .bind(media_id)
-                .fetch_optional(&self.pool)
-                .await?;
-            row.map(|r| ResolvedContent::Media(r.into_media()))
-        } else {
-            None
+            }
+            ResolvedTarget::Media(media_id) => {
+                // Fetch direct media
+                let row: Option<MediaDbRow> = sqlx::query_as(queries::GET_MEDIA_BY_ID.sql)
+                    .bind(media_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                row.map(|r| ResolvedContent::Media(r.into_media()))
+            }
         };
 
         Ok(Some(ResearchUrlWithResolved {

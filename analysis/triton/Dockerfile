@@ -25,6 +25,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy model repository
 COPY models /models
 
+# Git SHA for provenance tracking (pass via --build-arg GIT_SHA=$(git rev-parse --short HEAD))
+ARG GIT_SHA=unknown
+ENV ANALYSIS_GIT_SHA=$GIT_SHA
+
 # Environment variables
 # HuggingFace token for gated models (required for SAM3 and Qwen)
 ENV HF_TOKEN=""

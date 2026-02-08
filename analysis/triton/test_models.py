@@ -35,14 +35,51 @@ def make_test_image(width: int = 200, height: int = 150) -> str:
 
 
 def make_test_schema() -> str:
-    """Create a minimal test schema."""
+    """Get the actual VlmSubimageOutput schema from Rust."""
+    result = subprocess.run(
+        ["cargo", "run", "--bin", "print_schema"],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).parent.parent,  # analysis/ directory
+    )
+    if result.returncode == 0:
+        return result.stdout
+    # Fallback to a minimal schema if cargo isn't available
     return json.dumps(
         {
-            "type": "object",
-            "properties": {
-                "is_relevant": {"type": "boolean"},
-                "content_summary": {"type": "string"},
-            },
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": [
+                        "status",
+                        "media_type",
+                        "content_summary",
+                        "scene_type",
+                        "temporal_cues",
+                        "regions",
+                        "region_relationships",
+                        "extracted_text",
+                    ],
+                    "properties": {
+                        "status": {"type": "string", "enum": ["analyzed"]},
+                        "media_type": {"type": "string"},
+                        "content_summary": {"type": "string"},
+                        "scene_type": {"type": "string"},
+                        "temporal_cues": {"type": "array", "items": {"type": "string"}},
+                        "regions": {"type": "array", "items": {"type": "object"}},
+                        "region_relationships": {"type": "array"},
+                        "extracted_text": {"type": "array"},
+                    },
+                },
+                {
+                    "type": "object",
+                    "required": ["status", "reason"],
+                    "properties": {
+                        "status": {"type": "string", "enum": ["rejected"]},
+                        "reason": {"type": "string"},
+                    },
+                },
+            ],
         }
     )
 
@@ -95,21 +132,7 @@ class TestRleEncoding:
 
         for counts in test_cases:
             compressed = analysis_model.compress_rle(counts)
-
-            # Manually decode the compressed string
-            decoded_counts = []
-            x = 0
-            shift = 0
-            for c in compressed:
-                val = ord(c) - 48
-                x |= (val & 0x1F) << shift
-                if val & 0x20:
-                    shift += 5
-                else:
-                    decoded_counts.append(x)
-                    x = 0
-                    shift = 0
-
+            decoded_counts = analysis_model.decompress_rle(compressed)
             assert decoded_counts == counts, f"Failed for {counts}: got {decoded_counts}"
 
 
@@ -289,20 +312,21 @@ class TestVlmPrompt:
         assert p1 == p2, "Prompt should be deterministic"
 
     def test_prompt_contains_required_elements(self, analysis_model):
-        """Prompt includes instructions for region analysis."""
+        """Prompt includes instructions for region analysis and status decision."""
         schema = make_test_schema()
         prompt = analysis_model.build_vlm_prompt(schema)
 
         assert "circled number" in prompt, "Should reference numbered regions"
         assert "original" in prompt.lower(), "Should reference original image"
+        assert "analyzed" in prompt, "Should mention analyzed status"
+        assert "rejected" in prompt, "Should mention rejected status"
 
     def test_prompt_includes_baml_schema(self, analysis_model):
         """Prompt includes BAML-converted schema for clarity."""
         schema = make_test_schema()
         prompt = analysis_model.build_vlm_prompt(schema)
 
-        assert "is_relevant bool" in prompt, "BAML should have 'is_relevant bool'"
-        assert "content_summary string" in prompt, "BAML should have 'content_summary string'"
+        assert "status" in prompt, "BAML should include status field"
 
 
 # =============================================================================
@@ -420,6 +444,36 @@ class TestBamlConverter:
         assert "class Outer" in baml
         assert "nested Inner" in baml
 
+    def test_converts_tagged_union(self, baml_converter):
+        """Converter handles tagged unions (internally-tagged serde enums)."""
+        schema = {
+            "title": "TestUnion",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "required": ["status", "value"],
+                    "properties": {
+                        "status": {"type": "string", "enum": ["ok"]},
+                        "value": {"type": "integer"},
+                    },
+                },
+                {
+                    "type": "object",
+                    "required": ["status", "error"],
+                    "properties": {
+                        "status": {"type": "string", "enum": ["error"]},
+                        "error": {"type": "string"},
+                    },
+                },
+            ],
+        }
+        baml = baml_converter.jsonschema_to_baml(schema)
+
+        assert "TestUnion" in baml
+        assert "status" in baml
+        assert "ok" in baml
+        assert "error" in baml
+
     def test_converts_rust_generated_schema(self, baml_converter):
         """Converter works with the actual Rust-generated schema.
 
@@ -437,16 +491,17 @@ class TestBamlConverter:
         schema = json.loads(result.stdout)
         baml = baml_converter.jsonschema_to_baml(schema)
 
-        # Check key types from our schema are present
+        # Check key types from new schema
         assert "enum AnalyzedMediaType" in baml
         assert "enum RelationType" in baml
-        assert "class VlmAnalysis" in baml
         assert "class RegionAnalysis" in baml
         assert "class RegionRelationship" in baml
 
-        # Check specific fields
-        assert "is_relevant bool" in baml
-        assert "regions map<string, RegionEntry>" in baml
+        # Check tagged union structure
+        assert "VlmSubimageOutput" in baml
+        assert "analyzed" in baml
+        assert "rejected" in baml
+        assert "regions RegionAnalysis[]" in baml
         assert "region_relationships RegionRelationship[]" in baml
 
 
@@ -474,126 +529,155 @@ class TestDinov3:
 # =============================================================================
 
 
+def _make_sam3_handler(sam3_module):
+    """Create a mock SAM3 handler that returns valid regions.
+
+    Args:
+        sam3_module: The loaded SAM3 module (for encode_rle).
+    """
+
+    def handler(inputs):
+        image_tensor = inputs.get("image")
+        assert image_tensor is not None, "SAM3 should receive image input"
+
+        # SAM3 has max_batch_size=1, so expects 2D input [batch, data]
+        shape = image_tensor.as_numpy().shape
+        assert len(shape) == 2, f"SAM3 expects 2D input, got shape {shape}"
+
+        img_b64 = image_tensor.as_numpy().flatten()[0].decode("utf-8")
+        img_bytes = base64.b64decode(img_b64)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        # Create a mock region (0-indexed, no region_id)
+        mask = np.zeros((img.height, img.width), dtype=np.uint8)
+        mask[10:50, 10:50] = 1
+        regions = [{"confidence": 0.85, "mask": sam3_module.encode_rle(mask)}]
+
+        return mock_triton.InferenceResponse(
+            [mock_triton.Tensor("regions", np.array([json.dumps(regions).encode("utf-8")]))]
+        )
+
+    return handler
+
+
+def _make_subimage_fallback_sam3(sam3_module):
+    """Create a SAM3 handler: empty for subimage, valid for entity.
+
+    Subimage detection finds nothing (falls back to single full image),
+    but entity segmentation returns regions.
+    """
+    entity_handler = _make_sam3_handler(sam3_module)
+
+    def handler(inputs):
+        prompts = inputs.get("prompts")
+        if prompts is not None:
+            # Subimage detection — return empty to trigger full-image fallback
+            return mock_triton.InferenceResponse(
+                [mock_triton.Tensor("regions", np.array([json.dumps([]).encode("utf-8")]))]
+            )
+        # Entity segmentation
+        return entity_handler(inputs)
+
+    return handler
+
+
+def _make_vlm_handler():
+    """Create a mock VLM handler that returns analyzed VlmSubimageOutput."""
+
+    def handler(inputs):
+        text_input = inputs.get("text_input")
+        image_input = inputs.get("image")
+        sampling_params = inputs.get("sampling_parameters")
+
+        assert text_input is not None, "VLM should receive text_input"
+        assert image_input is not None, "VLM should receive image"
+        assert sampling_params is not None, "VLM should receive sampling_parameters"
+
+        # VLM has max_batch_size=0, so expects 1D input [data]
+        assert text_input.as_numpy().ndim == 1, "VLM expects 1D text input"
+        assert sampling_params.as_numpy().ndim == 1, "VLM expects 1D sampling params"
+
+        # Verify ChatML prompt structure
+        prompt = text_input.as_numpy().flatten()[0].decode("utf-8")
+        assert "<|im_start|>user" in prompt, "Should use ChatML format"
+        assert "<|vision_start|>" in prompt, "Should have vision placeholders"
+
+        # Verify images are provided as separate array elements
+        images = image_input.as_numpy()
+        assert len(images) == 2, f"Should have 2 images, got {len(images)}"
+
+        # Verify structured_outputs is set
+        params = json.loads(sampling_params.as_numpy().flatten()[0].decode("utf-8"))
+        assert "structured_outputs" in params
+
+        result = {
+            "status": "analyzed",
+            "media_type": "photo",
+            "content_summary": "Test building",
+            "scene_type": "outdoor",
+            "temporal_cues": [],
+            "regions": [
+                {
+                    "entity_type": "building",
+                    "description": "A test building",
+                    "identifiable_features": [],
+                    "visible_text": [],
+                    "damage_signs": [],
+                }
+            ],
+            "region_relationships": [],
+            "extracted_text": [],
+        }
+        return mock_triton.InferenceResponse(
+            [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
+        )
+
+    return handler
+
+
+def _make_rejected_vlm_handler(reason: str = "No structures detected"):
+    """Create a mock VLM handler that returns rejected VlmSubimageOutput."""
+
+    def handler(inputs):
+        result = {"status": "rejected", "reason": reason}
+        return mock_triton.InferenceResponse(
+            [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
+        )
+
+    return handler
+
+
+def _make_dinov3_handler():
+    """Create a mock DINOv3 handler that returns fake embeddings."""
+
+    def handler(inputs):
+        images_tensor = inputs.get("images")
+        assert images_tensor is not None, "DINOv3 should receive images input"
+
+        num_images = len(images_tensor.as_numpy().flatten())
+
+        # Return fake 1024-dim L2-normalized embeddings
+        embeddings = []
+        for i in range(num_images):
+            emb = [0.0] * 1024
+            emb[i % 1024] = 1.0  # Unit vector for easy verification
+            embeddings.append(emb)
+
+        return mock_triton.InferenceResponse(
+            [mock_triton.Tensor("embeddings", np.array([json.dumps(embeddings).encode("utf-8")]))]
+        )
+
+    return handler
+
+
 class TestAnalysisOrchestration:
-    """Integration tests for the full analysis pipeline."""
+    """Integration tests for the subimage-centric analysis pipeline."""
 
-    def _make_sam3_handler(self, sam3_module):
-        """Create a mock SAM3 handler that returns valid regions."""
-
-        def handler(inputs):
-            image_tensor = inputs.get("image")
-            assert image_tensor is not None, "SAM3 should receive image input"
-
-            # SAM3 has max_batch_size=1, so expects 2D input [batch, data]
-            shape = image_tensor.as_numpy().shape
-            assert len(shape) == 2, f"SAM3 expects 2D input, got shape {shape}"
-
-            # Decode to verify it's valid
-            img_b64 = image_tensor.as_numpy().flatten()[0].decode("utf-8")
-            img_bytes = base64.b64decode(img_b64)
-            img = Image.open(io.BytesIO(img_bytes))
-
-            # Create a mock region
-            mask = np.zeros((img.height, img.width), dtype=np.uint8)
-            mask[10:50, 10:50] = 1
-            regions = [{"region_id": 1, "confidence": 0.85, "mask": sam3_module.encode_rle(mask)}]
-
-            return mock_triton.InferenceResponse(
-                [mock_triton.Tensor("regions", np.array([json.dumps(regions).encode("utf-8")]))]
-            )
-
-        return handler
-
-    def _make_vlm_handler(self):
-        """Create a mock VLM handler that returns valid analysis."""
-
-        def handler(inputs):
-            text_input = inputs.get("text_input")
-            image_input = inputs.get("image")
-            sampling_params = inputs.get("sampling_parameters")
-
-            assert text_input is not None, "VLM should receive text_input"
-            assert image_input is not None, "VLM should receive image"
-            assert sampling_params is not None, "VLM should receive sampling_parameters"
-
-            # VLM has max_batch_size=0, so expects 1D input [data]
-            assert text_input.as_numpy().ndim == 1, "VLM expects 1D text input"
-            assert sampling_params.as_numpy().ndim == 1, "VLM expects 1D sampling params"
-
-            # Verify ChatML prompt structure
-            prompt = text_input.as_numpy().flatten()[0].decode("utf-8")
-            assert "<|im_start|>user" in prompt, "Should use ChatML format"
-            assert "<|vision_start|>" in prompt, "Should have vision placeholders"
-
-            # Check text comes before images (KV cache optimization)
-            text_end = prompt.find("<|vision_start|>")
-            assert "historical built environment" in prompt[:text_end]
-
-            # Verify images are provided as separate array elements
-            images = image_input.as_numpy()
-            assert len(images) == 2, f"Should have 2 images, got {len(images)}"
-
-            # Verify structured_outputs is set
-            params = json.loads(sampling_params.as_numpy().flatten()[0].decode("utf-8"))
-            assert "structured_outputs" in params
-
-            result = {
-                "is_relevant": True,
-                "rejection_reason": None,
-                "media_type": "photo",
-                "content_summary": "Test building",
-                "scene_type": "outdoor",
-                "temporal_cues": [],
-                "composite": {"rows": 1, "columns": 1},
-                "regions": {
-                    "1": {
-                        "entity_type": "building",
-                        "description": "A test building",
-                        "identifiable_features": [],
-                        "visible_text": [],
-                        "damage_signs": [],
-                    }
-                },
-                "region_relationships": [],
-                "extracted_text": [],
-            }
-            return mock_triton.InferenceResponse(
-                [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
-            )
-
-        return handler
-
-    def _make_dinov3_handler(self):
-        """Create a mock DINOv3 handler that returns fake embeddings."""
-
-        def handler(inputs):
-            images_tensor = inputs.get("images")
-            assert images_tensor is not None, "DINOv3 should receive images input"
-
-            num_images = len(images_tensor.as_numpy().flatten())
-
-            # Return fake 1024-dim L2-normalized embeddings
-            embeddings = []
-            for i in range(num_images):
-                emb = [0.0] * 1024
-                emb[i % 1024] = 1.0  # Unit vector for easy verification
-                embeddings.append(emb)
-
-            return mock_triton.InferenceResponse(
-                [
-                    mock_triton.Tensor(
-                        "embeddings", np.array([json.dumps(embeddings).encode("utf-8")])
-                    )
-                ]
-            )
-
-        return handler
-
-    def test_full_pipeline_success(self, analysis_model, sam3_module):
-        """Full pipeline: SAM3 segmentation -> annotation -> VLM analysis -> DINOv3."""
-        mock_triton.register_model("sam3", self._make_sam3_handler(sam3_module))
-        mock_triton.register_model("vlm", self._make_vlm_handler())
-        mock_triton.register_model("dinov3", self._make_dinov3_handler())
+    def test_single_image_pipeline(self, analysis_model, sam3_module):
+        """Full pipeline with single image: SAM3 subimage detection finds nothing -> full image."""
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("vlm", _make_vlm_handler())
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -611,35 +695,54 @@ class TestAnalysisOrchestration:
 
         assert len(responses) == 1
         response = responses[0]
-        assert not response.has_error(), (
-            f"Got error: {response.error().message() if response.has_error() else ''}"
-        )
+        assert not response.has_error()
 
         result_tensor = mock_triton.get_output_tensor_by_name(response, "result")
         result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
 
-        assert "segmentation" in result
-        assert "vlm" in result
-        assert len(result["segmentation"]) == 1
-        assert result["vlm"]["is_relevant"] is True
+        # Verify subimage-centric output
+        assert "subimages" in result
+        assert len(result["subimages"]) == 1
 
-        # Verify embeddings
-        assert "embeddings" in result
-        emb = result["embeddings"]
-        assert len(emb["image"]) == 1024, "Should have 1024-dim whole-image embedding"
-        assert "1" in emb["regions"], "Should have region 1 embedding (relevant image)"
-        assert len(emb["regions"]["1"]) == 1024, "Region embedding should be 1024-dim"
+        subimage = result["subimages"][0]
+        assert "bounds" in subimage
+        assert "analysis" in subimage
 
-    def test_handles_sam3_error_gracefully(self, analysis_model):
-        """Pipeline handles SAM3 errors without crashing, still computes embeddings."""
+        # Bounds should cover the full image
+        bounds = subimage["bounds"]
+        assert bounds["bbox"]["x"] == 0
+        assert bounds["bbox"]["y"] == 0
+        assert bounds["bbox"]["width"] == 200
+        assert bounds["bbox"]["height"] == 150
 
-        def failing_sam3(inputs):
-            return mock_triton.InferenceResponse(
-                error=mock_triton.TritonError("SAM3 out of memory")
-            )
+        # Analysis should be "analyzed"
+        analysis = subimage["analysis"]
+        assert analysis["status"] == "analyzed"
+        assert analysis["content_summary"] == "Test building"
 
-        mock_triton.register_model("sam3", failing_sam3)
-        mock_triton.register_model("dinov3", self._make_dinov3_handler())
+        # Should have regions from entity SAM3 (0-indexed, no region_id)
+        assert len(analysis["regions"]) == 1
+        region = analysis["regions"][0]
+        assert region["entity_type"] == "building"
+        assert region["mask"]["counts"] != ""  # Should have RLE mask
+        assert "region_id" not in region
+
+        # Should have embeddings
+        assert len(analysis["embedding"]) == 1024
+        assert len(region["embedding"]) == 1024
+
+        # Should have versions
+        assert "versions" in result
+        assert "vlm" in result["versions"]
+        assert "sam3" in result["versions"]
+        assert "dinov3" in result["versions"]
+        assert "git_sha" in result["versions"]
+
+    def test_rejected_subimage(self, analysis_model, sam3_module):
+        """VLM rejects a subimage as not relevant."""
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("vlm", _make_rejected_vlm_handler("portrait photo"))
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -657,18 +760,42 @@ class TestAnalysisOrchestration:
         result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
         result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
 
-        assert "error" in result["vlm"]
-        assert "SAM3" in result["vlm"]["error"]
+        assert len(result["subimages"]) == 1
+        analysis = result["subimages"][0]["analysis"]
+        assert analysis["status"] == "rejected"
+        assert analysis["reason"] == "portrait photo"
 
-        # Embeddings should still be computed for whole image
-        assert "embeddings" in result
-        assert len(result["embeddings"]["image"]) == 1024
-        assert result["embeddings"]["regions"] == {}
+    def test_sam3_error_fails_pipeline(self, analysis_model):
+        """SAM3 errors propagate — no silent fallback."""
+
+        def failing_sam3(inputs):
+            return mock_triton.InferenceResponse(
+                error=mock_triton.TritonError("SAM3 out of memory")
+            )
+
+        mock_triton.register_model("sam3", failing_sam3)
+        mock_triton.register_model("vlm", _make_vlm_handler())
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
+
+        model = analysis_model.TritonPythonModel()
+        model.initialize({"model_config": json.dumps({})})
+
+        request = mock_triton.InferenceRequest(
+            model_name="analysis",
+            requested_output_names=["result"],
+            inputs=[
+                mock_triton.Tensor("image", np.array([make_test_image().encode("utf-8")])),
+                mock_triton.Tensor("schema", np.array([make_test_schema().encode("utf-8")])),
+            ],
+        )
+
+        with pytest.raises(RuntimeError, match="SAM3"):
+            model.execute([request])
 
     def test_handles_vlm_error_gracefully(self, analysis_model, sam3_module):
-        """Pipeline handles VLM errors without crashing."""
-        mock_triton.register_model("sam3", self._make_sam3_handler(sam3_module))
-        mock_triton.register_model("dinov3", self._make_dinov3_handler())
+        """Pipeline handles VLM errors — result is error status."""
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         def failing_vlm(inputs):
             return mock_triton.InferenceResponse(error=mock_triton.TritonError("VLM out of memory"))
@@ -691,13 +818,9 @@ class TestAnalysisOrchestration:
         result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
         result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
 
-        assert "error" in result["vlm"]
-        assert "VLM" in result["vlm"]["error"]
-
-        # DINOv3 still produces whole-image embedding (no regions since VLM failed)
-        assert "embeddings" in result
-        assert len(result["embeddings"]["image"]) == 1024
-        assert result["embeddings"]["regions"] == {}
+        analysis = result["subimages"][0]["analysis"]
+        assert analysis["status"] == "error"
+        assert "VLM" in analysis["message"]
 
     def test_rejects_oversized_images(self, analysis_model):
         """Pipeline rejects images exceeding size limit (5MB)."""
@@ -705,8 +828,7 @@ class TestAnalysisOrchestration:
         model.initialize({"model_config": json.dumps({})})
 
         # Create a "large" image by making a long base64 string
-        # 5MB limit means ~6.67MB base64 (base64 is ~4/3 of original)
-        fake_large_b64 = "A" * (7 * 1024 * 1024)  # 7MB of base64
+        fake_large_b64 = "A" * (7 * 1024 * 1024)
 
         request = mock_triton.InferenceRequest(
             model_name="analysis",
@@ -721,38 +843,24 @@ class TestAnalysisOrchestration:
         result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
         result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
 
-        assert "error" in result["vlm"]
-        assert "too large" in result["vlm"]["error"]
+        assert len(result["subimages"]) == 1
+        analysis = result["subimages"][0]["analysis"]
+        assert analysis["status"] == "rejected"
+        assert "too large" in analysis["reason"]
+        assert "versions" in result, "rejected result must include versions"
 
     def test_handles_zero_regions_from_sam3(self, analysis_model):
-        """Pipeline works when SAM3 finds no regions (empty scene)."""
+        """Pipeline works when entity SAM3 finds no regions."""
 
-        def empty_sam3(inputs):
+        def subimage_sam3(inputs):
+            # Both subimage detection and entity segmentation return empty
             return mock_triton.InferenceResponse(
                 [mock_triton.Tensor("regions", np.array([json.dumps([]).encode("utf-8")]))]
             )
 
-        def vlm_for_empty(inputs):
-            # VLM should still be called even with no regions
-            result = {
-                "is_relevant": False,
-                "rejection_reason": "No structures detected",
-                "media_type": "photo",
-                "content_summary": "Empty field",
-                "scene_type": "outdoor",
-                "temporal_cues": [],
-                "composite": {"rows": 1, "columns": 1},
-                "regions": {},
-                "region_relationships": [],
-                "extracted_text": [],
-            }
-            return mock_triton.InferenceResponse(
-                [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
-            )
-
-        mock_triton.register_model("sam3", empty_sam3)
-        mock_triton.register_model("vlm", vlm_for_empty)
-        mock_triton.register_model("dinov3", self._make_dinov3_handler())
+        mock_triton.register_model("sam3", subimage_sam3)
+        mock_triton.register_model("vlm", _make_vlm_handler())
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -770,21 +878,17 @@ class TestAnalysisOrchestration:
         result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
         result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
 
-        assert result["segmentation"] == [], "Should have empty segmentation"
-        assert "error" not in result["vlm"], "Should not be an error"
-        assert result["vlm"]["is_relevant"] is False
-
-        # Whole-image embedding still computed, no region embeddings
-        assert len(result["embeddings"]["image"]) == 1024
-        assert result["embeddings"]["regions"] == {}
+        assert len(result["subimages"]) == 1
+        analysis = result["subimages"][0]["analysis"]
+        assert analysis["status"] == "analyzed"
+        assert analysis["regions"] == []
 
     def test_handles_vlm_malformed_json(self, analysis_model, sam3_module):
-        """Pipeline handles VLM returning invalid JSON."""
-        mock_triton.register_model("sam3", self._make_sam3_handler(sam3_module))
-        mock_triton.register_model("dinov3", self._make_dinov3_handler())
+        """Pipeline raises on VLM returning invalid JSON."""
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         def bad_json_vlm(inputs):
-            # Return something that's not valid JSON
             return mock_triton.InferenceResponse(
                 [mock_triton.Tensor("text_output", np.array([b"not valid json {{{"]))]
             )
@@ -803,21 +907,13 @@ class TestAnalysisOrchestration:
             ],
         )
 
-        responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
-
-        assert "error" in result["vlm"], "Should report JSON parse error"
-        assert "JSON" in result["vlm"]["error"] or "json" in result["vlm"]["error"].lower()
-
-        # Embeddings still computed despite VLM JSON failure
-        assert "embeddings" in result
-        assert len(result["embeddings"]["image"]) == 1024
+        with pytest.raises(json.JSONDecodeError):
+            model.execute([request])
 
     def test_dinov3_error_fails_pipeline(self, analysis_model, sam3_module):
         """DINOv3 errors propagate — no silent fallback to empty embeddings."""
-        mock_triton.register_model("sam3", self._make_sam3_handler(sam3_module))
-        mock_triton.register_model("vlm", self._make_vlm_handler())
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("vlm", _make_vlm_handler())
 
         def failing_dinov3(inputs):
             return mock_triton.InferenceResponse(
@@ -841,6 +937,43 @@ class TestAnalysisOrchestration:
         # DINOv3 failure raises RuntimeError (Triton wraps this into error response)
         with pytest.raises(RuntimeError, match="DINOv3"):
             model.execute([request])
+
+    def test_subimage_detection_uses_prompts(self, analysis_model, sam3_module):
+        """Subimage detection calls SAM3 with panel detection prompts."""
+        received_prompts = []
+        entity_handler = _make_sam3_handler(sam3_module)
+
+        def tracking_sam3(inputs):
+            prompts = inputs.get("prompts")
+            if prompts is not None:
+                received_prompts.extend([p.decode("utf-8") for p in prompts.as_numpy().flatten()])
+                # Return empty to trigger fallback
+                return mock_triton.InferenceResponse(
+                    [mock_triton.Tensor("regions", np.array([json.dumps([]).encode("utf-8")]))]
+                )
+            return entity_handler(inputs)
+
+        mock_triton.register_model("sam3", tracking_sam3)
+        mock_triton.register_model("vlm", _make_vlm_handler())
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
+
+        model = analysis_model.TritonPythonModel()
+        model.initialize({"model_config": json.dumps({})})
+
+        request = mock_triton.InferenceRequest(
+            model_name="analysis",
+            requested_output_names=["result"],
+            inputs=[
+                mock_triton.Tensor("image", np.array([make_test_image().encode("utf-8")])),
+                mock_triton.Tensor("schema", np.array([make_test_schema().encode("utf-8")])),
+            ],
+        )
+
+        model.execute([request])
+
+        # Should have received subimage detection prompts for composite/collage detection
+        assert len(received_prompts) > 0
+        assert any("composite" in p or "collage" in p for p in received_prompts)
 
 
 # =============================================================================
@@ -871,37 +1004,25 @@ class TestSchemaCompatibility:
 
         rust_schema = json.loads(result.stdout)
 
-        # Run the full pipeline to get actual output
-        def sam3_handler(inputs):
-            img_b64 = inputs["image"].as_numpy().flatten()[0].decode("utf-8")
-            img_bytes = base64.b64decode(img_b64)
-            img = Image.open(io.BytesIO(img_bytes))
-
-            mask = np.zeros((img.height, img.width), dtype=np.uint8)
-            mask[10:50, 10:50] = 1
-            regions = [{"region_id": 1, "confidence": 0.85, "mask": sam3_module.encode_rle(mask)}]
-            return mock_triton.InferenceResponse(
-                [mock_triton.Tensor("regions", np.array([json.dumps(regions).encode("utf-8")]))]
-            )
+        # Set up pipeline with subimage detection fallback
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
 
         def vlm_handler(inputs):
             result = {
-                "is_relevant": True,
-                "rejection_reason": None,
+                "status": "analyzed",
                 "media_type": "photo",
                 "content_summary": "A building",
                 "scene_type": "outdoor",
                 "temporal_cues": ["black and white"],
-                "composite": {"rows": 1, "columns": 1},
-                "regions": {
-                    "1": {
+                "regions": [
+                    {
                         "entity_type": "building",
                         "description": "A brick building",
                         "identifiable_features": ["red brick", "arched windows"],
                         "visible_text": [],
                         "damage_signs": [],
                     }
-                },
+                ],
                 "region_relationships": [],
                 "extracted_text": [{"text": "1923", "location": "cornerstone"}],
             }
@@ -909,21 +1030,8 @@ class TestSchemaCompatibility:
                 [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
             )
 
-        def dinov3_handler(inputs):
-            images = inputs["images"].as_numpy().flatten()
-            num = len(images)
-            embeddings = [[0.0] * 1024 for _ in range(num)]
-            return mock_triton.InferenceResponse(
-                [
-                    mock_triton.Tensor(
-                        "embeddings", np.array([json.dumps(embeddings).encode("utf-8")])
-                    )
-                ]
-            )
-
-        mock_triton.register_model("sam3", sam3_handler)
         mock_triton.register_model("vlm", vlm_handler)
-        mock_triton.register_model("dinov3", dinov3_handler)
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -944,7 +1052,12 @@ class TestSchemaCompatibility:
         # Validate against Rust schema
         jsonschema.validate(instance=python_output, schema=rust_schema)
 
-        # Verify embeddings are present and structured correctly
-        assert "embeddings" in python_output
-        assert "image" in python_output["embeddings"]
-        assert "regions" in python_output["embeddings"]
+        # Verify subimage structure
+        assert "subimages" in python_output
+        assert len(python_output["subimages"]) == 1
+        subimage = python_output["subimages"][0]
+        assert "bounds" in subimage
+        assert "analysis" in subimage
+        assert subimage["analysis"]["status"] == "analyzed"
+        assert len(subimage["analysis"]["regions"]) == 1
+        assert len(subimage["analysis"]["embedding"]) == 1024
