@@ -664,10 +664,7 @@ mod tests {
         let _ = shutdown_tx.send(true);
 
         // Verify the URL status is now failed (via get_url_by_id)
-        let url_record = db
-            .get_url_by_id(&url_id)
-            .await?
-            .ok_or("URL should exist")?;
+        let url_record = db.get_url_by_id(&url_id).await?.ok_or("URL should exist")?;
         assert_eq!(
             url_record.status,
             chronoscope_db::ResearchUrlStatus::Failed,
