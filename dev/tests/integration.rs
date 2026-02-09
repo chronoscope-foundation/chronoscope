@@ -24,6 +24,19 @@ use reqwest::Client;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+/// Initialize tracing for integration tests. Respects `RUST_LOG` env var
+/// (e.g. `RUST_LOG=debug`). Safe to call from multiple tests — only the
+/// first call installs the subscriber.
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
 /// Polling interval for async operations in tests.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Default timeout for most operations (10 seconds).
@@ -71,6 +84,8 @@ impl TestServer {
     async fn start_with_config(
         apify_config: Option<ApifyConfig>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        init_tracing();
+
         // Use TRITON_ENDPOINT from environment, or the default endpoint fixtures were recorded with.
         // The VCR cache key includes the URL, so we need consistent URLs between recording and playback.
         let triton_endpoint: Option<url::Url> = Some(
@@ -398,17 +413,14 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
     let chronoscope_api::research_types::AnalysisResult { subimages, .. } = result;
     let subimage = &subimages[0];
 
-    let chronoscope_analysis::SubimageAnalysis::Analyzed {
-        content_summary,
-        regions,
-        ..
-    } = &subimage.analysis
+    let chronoscope_analysis::SubimageAnalysis::Analyzed { scene, regions, .. } =
+        &subimage.analysis
     else {
         return Err("expected analyzed subimage".into());
     };
 
     assert!(
-        !content_summary.is_empty(),
+        !scene.content_summary.is_empty(),
         "analysis should produce a content summary"
     );
 

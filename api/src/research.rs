@@ -560,8 +560,8 @@ mod tests {
     #[test]
     fn test_convert_analysis_complete_with_results() -> TestResult {
         use chronoscope_analysis::{
-            AnalysisResult, AnalyzedMediaType, BoundingBox, ModelVersions, RleMask, SceneType,
-            Subimage, SubimageAnalysis, SubimageBounds,
+            AnalysisResult, AnalyzedMediaType, BoundingBox, ModelVersions, PhotoColor, RleMask,
+            SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds,
         };
 
         let analysis_result = AnalysisResult {
@@ -578,15 +578,18 @@ mod tests {
                     },
                 },
                 analysis: SubimageAnalysis::Analyzed {
-                    media_type: AnalyzedMediaType::Photo,
-                    content_summary: "A historic building on a street corner".to_string(),
-                    scene_type: SceneType::Outdoor,
-                    temporal_cues: vec!["black and white".to_string()],
-                    extracted_text: vec![],
+                    scene: SceneAnalysis {
+                        media_type: AnalyzedMediaType::Photo {
+                            color: PhotoColor::Monochrome,
+                        },
+                        content_summary: "A historic building on a street corner".to_string(),
+                        scene_type: SceneType::Outdoor,
+                        scene_observations: Default::default(),
+                        extracted_text: vec![],
+                    },
                     thinking: None,
-                    embedding: vec![],
+                    embedding: None,
                     regions: vec![],
-                    region_relationships: vec![],
                 },
             }],
             versions: ModelVersions {
@@ -609,16 +612,13 @@ mod tests {
         };
         assert_eq!(result.subimages.len(), 1);
 
-        let SubimageAnalysis::Analyzed {
-            content_summary,
-            temporal_cues,
-            ..
-        } = &result.subimages[0].analysis
-        else {
+        let SubimageAnalysis::Analyzed { scene, .. } = &result.subimages[0].analysis else {
             return Err(test_err("Expected Analyzed subimage"));
         };
-        assert_eq!(content_summary, "A historic building on a street corner");
-        assert_eq!(temporal_cues, &vec!["black and white".to_string()]);
+        assert_eq!(
+            scene.content_summary,
+            "A historic building on a street corner"
+        );
         Ok(())
     }
 

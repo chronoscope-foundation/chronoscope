@@ -7,6 +7,7 @@ Uses pytest fixtures from conftest.py for test isolation and module loading.
 """
 
 import base64
+import copy
 import io
 import json
 import subprocess
@@ -35,53 +36,16 @@ def make_test_image(width: int = 200, height: int = 150) -> str:
 
 
 def make_test_schema() -> str:
-    """Get the actual VlmSubimageOutput schema from Rust."""
+    """Get the actual vlm_schema::SubimageOutput schema from Rust."""
     result = subprocess.run(
         ["cargo", "run", "--bin", "print_schema"],
         capture_output=True,
         text=True,
         cwd=Path(__file__).parent.parent,  # analysis/ directory
     )
-    if result.returncode == 0:
-        return result.stdout
-    # Fallback to a minimal schema if cargo isn't available
-    return json.dumps(
-        {
-            "oneOf": [
-                {
-                    "type": "object",
-                    "required": [
-                        "status",
-                        "media_type",
-                        "content_summary",
-                        "scene_type",
-                        "temporal_cues",
-                        "regions",
-                        "region_relationships",
-                        "extracted_text",
-                    ],
-                    "properties": {
-                        "status": {"type": "string", "enum": ["analyzed"]},
-                        "media_type": {"type": "string"},
-                        "content_summary": {"type": "string"},
-                        "scene_type": {"type": "string"},
-                        "temporal_cues": {"type": "array", "items": {"type": "string"}},
-                        "regions": {"type": "array", "items": {"type": "object"}},
-                        "region_relationships": {"type": "array"},
-                        "extracted_text": {"type": "array"},
-                    },
-                },
-                {
-                    "type": "object",
-                    "required": ["status", "reason"],
-                    "properties": {
-                        "status": {"type": "string", "enum": ["rejected"]},
-                        "reason": {"type": "string"},
-                    },
-                },
-            ],
-        }
-    )
+    if result.returncode != 0:
+        pytest.skip("cargo required for schema generation (run from repo with Rust toolchain)")
+    return result.stdout
 
 
 # =============================================================================
@@ -492,17 +456,18 @@ class TestBamlConverter:
         baml = baml_converter.jsonschema_to_baml(schema)
 
         # Check key types from new schema
-        assert "enum AnalyzedMediaType" in baml
         assert "enum RelationType" in baml
         assert "class RegionAnalysis" in baml
-        assert "class RegionRelationship" in baml
+        assert "class SceneObservations" in baml
+        assert "class RegionObservations" in baml
+        assert "class Surroundings" in baml
 
         # Check tagged union structure
-        assert "VlmSubimageOutput" in baml
+        assert "SubimageOutput" in baml
         assert "analyzed" in baml
         assert "rejected" in baml
         assert "regions RegionAnalysis[]" in baml
-        assert "region_relationships RegionRelationship[]" in baml
+        assert "scene_observations SceneObservations" in baml
 
 
 # =============================================================================
@@ -581,8 +546,60 @@ def _make_subimage_fallback_sam3(sam3_module):
     return handler
 
 
-def _make_vlm_handler():
-    """Create a mock VLM handler that returns analyzed VlmSubimageOutput."""
+def _make_vlm_response(**overrides: object) -> dict:
+    """Build a valid VLM analyzed response with optional field overrides.
+
+    Returns a canonical vlm_schema::SubimageOutput (analyzed variant).
+    Callers override specific fields via keyword args for deep merge.
+    """
+    base = {
+        "status": "analyzed",
+        "scene": {
+            "media_type": {"type": "photo", "color": "color"},
+            "content_summary": "Test building",
+            "scene_type": "outdoor",
+            "scene_observations": {
+                "vehicles": [],
+                "street_infrastructure": [],
+                "road_surface": [],
+                "other_observations": [],
+            },
+            "extracted_text": [],
+        },
+        "regions": [
+            {
+                "entity_type": "building",
+                "description": "A test building",
+                "observations": {
+                    "roof_types": [],
+                    "facade_materials": [],
+                    "structural_elements": [],
+                    "window_shapes": [],
+                    "stories_visible": None,
+                    "other_features": [],
+                },
+                "condition": [],
+                "other_condition": [],
+                "visible_text": [],
+                "surroundings": {
+                    "non_entity": [],
+                    "other_non_entity": [],
+                    "related_regions": [],
+                },
+            }
+        ],
+    }
+    result: dict = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key].update(value)
+        else:
+            result[key] = value
+    return result
+
+
+def _make_vlm_handler(**overrides: object):
+    """Create a mock VLM handler that returns analyzed vlm_schema::SubimageOutput."""
 
     def handler(inputs):
         text_input = inputs.get("text_input")
@@ -610,24 +627,7 @@ def _make_vlm_handler():
         params = json.loads(sampling_params.as_numpy().flatten()[0].decode("utf-8"))
         assert "structured_outputs" in params
 
-        result = {
-            "status": "analyzed",
-            "media_type": "photo",
-            "content_summary": "Test building",
-            "scene_type": "outdoor",
-            "temporal_cues": [],
-            "regions": [
-                {
-                    "entity_type": "building",
-                    "description": "A test building",
-                    "identifiable_features": [],
-                    "visible_text": [],
-                    "damage_signs": [],
-                }
-            ],
-            "region_relationships": [],
-            "extracted_text": [],
-        }
+        result = _make_vlm_response(**overrides)
         return mock_triton.InferenceResponse(
             [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
         )
@@ -636,7 +636,7 @@ def _make_vlm_handler():
 
 
 def _make_rejected_vlm_handler(reason: str = "No structures detected"):
-    """Create a mock VLM handler that returns rejected VlmSubimageOutput."""
+    """Create a mock VLM handler that returns rejected vlm_schema::SubimageOutput."""
 
     def handler(inputs):
         result = {"status": "rejected", "reason": reason}
@@ -718,12 +718,12 @@ class TestAnalysisOrchestration:
         # Analysis should be "analyzed"
         analysis = subimage["analysis"]
         assert analysis["status"] == "analyzed"
-        assert analysis["content_summary"] == "Test building"
+        assert analysis["scene"]["content_summary"] == "Test building"
 
         # Should have regions from entity SAM3 (0-indexed, no region_id)
         assert len(analysis["regions"]) == 1
         region = analysis["regions"][0]
-        assert region["entity_type"] == "building"
+        assert region["analysis"]["entity_type"] == "building"
         assert region["mask"]["counts"] != ""  # Should have RLE mask
         assert "region_id" not in region
 
@@ -859,7 +859,7 @@ class TestAnalysisOrchestration:
             )
 
         mock_triton.register_model("sam3", subimage_sam3)
-        mock_triton.register_model("vlm", _make_vlm_handler())
+        mock_triton.register_model("vlm", _make_vlm_handler(regions=[]))
         mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
@@ -884,7 +884,7 @@ class TestAnalysisOrchestration:
         assert analysis["regions"] == []
 
     def test_handles_vlm_malformed_json(self, analysis_model, sam3_module):
-        """Pipeline raises on VLM returning invalid JSON."""
+        """Malformed VLM JSON surfaces as per-subimage error, not pipeline crash."""
         mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
         mock_triton.register_model("dinov3", _make_dinov3_handler())
 
@@ -907,11 +907,15 @@ class TestAnalysisOrchestration:
             ],
         )
 
-        with pytest.raises(json.JSONDecodeError):
-            model.execute([request])
+        responses = model.execute([request])
+        result = json.loads(responses[0].output_tensors()[0].as_numpy().item().decode("utf-8"))
+        # VLM error should produce per-subimage error, not crash the pipeline
+        analysis = result["subimages"][0]["analysis"]
+        assert analysis["status"] == "error"
+        assert "VLM call failed" in analysis["message"]
 
-    def test_dinov3_error_fails_pipeline(self, analysis_model, sam3_module):
-        """DINOv3 errors propagate — no silent fallback to empty embeddings."""
+    def test_dinov3_error_preserves_vlm_results(self, analysis_model, sam3_module):
+        """DINOv3 errors are non-fatal — VLM results are preserved without embeddings."""
         mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
         mock_triton.register_model("vlm", _make_vlm_handler())
 
@@ -934,11 +938,17 @@ class TestAnalysisOrchestration:
             ],
         )
 
-        # DINOv3 failure raises RuntimeError (Triton wraps this into error response)
-        with pytest.raises(RuntimeError, match="DINOv3"):
-            model.execute([request])
+        # DINOv3 failure is non-fatal — results come back without embeddings
+        responses = model.execute([request])
+        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
+        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
 
-    def test_subimage_detection_uses_prompts(self, analysis_model, sam3_module):
+        analysis = result["subimages"][0]["analysis"]
+        assert analysis["status"] == "analyzed", "VLM results should be preserved"
+        assert "embedding" not in analysis, "subimage embedding should be absent"
+        assert "embedding" not in analysis["regions"][0], "region embedding should be absent"
+
+    def test_subimage_detection_uses_prompt(self, analysis_model, sam3_module):
         """Subimage detection calls SAM3 with panel detection prompts."""
         received_prompts = []
         entity_handler = _make_sam3_handler(sam3_module)
@@ -971,9 +981,9 @@ class TestAnalysisOrchestration:
 
         model.execute([request])
 
-        # Should have received subimage detection prompts for composite/collage detection
-        assert len(received_prompts) > 0
-        assert any("composite" in p or "collage" in p for p in received_prompts)
+        # Should have received subimage detection prompt for collage detection
+        assert len(received_prompts) == 1
+        assert "collage" in received_prompts[0]
 
 
 # =============================================================================
@@ -1007,30 +1017,45 @@ class TestSchemaCompatibility:
         # Set up pipeline with subimage detection fallback
         mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
 
-        def vlm_handler(inputs):
-            result = {
-                "status": "analyzed",
-                "media_type": "photo",
-                "content_summary": "A building",
-                "scene_type": "outdoor",
-                "temporal_cues": ["black and white"],
-                "regions": [
+        mock_triton.register_model(
+            "vlm",
+            _make_vlm_handler(
+                scene={
+                    "media_type": {"type": "photo", "color": "monochrome"},
+                    "content_summary": "A building",
+                    "scene_type": "outdoor",
+                    "scene_observations": {
+                        "vehicles": [],
+                        "street_infrastructure": [],
+                        "road_surface": [],
+                        "other_observations": [],
+                    },
+                    "extracted_text": [{"text": "1923", "location": "cornerstone"}],
+                },
+                regions=[
                     {
                         "entity_type": "building",
                         "description": "A brick building",
-                        "identifiable_features": ["red brick", "arched windows"],
+                        "observations": {
+                            "roof_types": [],
+                            "facade_materials": ["brick"],
+                            "structural_elements": [],
+                            "window_shapes": ["arched"],
+                            "stories_visible": None,
+                            "other_features": [],
+                        },
+                        "condition": [],
+                        "other_condition": [],
                         "visible_text": [],
-                        "damage_signs": [],
+                        "surroundings": {
+                            "non_entity": [],
+                            "other_non_entity": [],
+                            "related_regions": [],
+                        },
                     }
                 ],
-                "region_relationships": [],
-                "extracted_text": [{"text": "1923", "location": "cornerstone"}],
-            }
-            return mock_triton.InferenceResponse(
-                [mock_triton.Tensor("text_output", np.array([json.dumps(result).encode("utf-8")]))]
-            )
-
-        mock_triton.register_model("vlm", vlm_handler)
+            ),
+        )
         mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         model = analysis_model.TritonPythonModel()
@@ -1051,6 +1076,16 @@ class TestSchemaCompatibility:
 
         # Validate against Rust schema
         jsonschema.validate(instance=python_output, schema=rust_schema)
+
+        # Validate via serde deserialization (catches deny_unknown_fields, tagging, etc.)
+        validate_result = subprocess.run(
+            ["cargo", "run", "--bin", "print_schema", "--", "validate"],
+            input=json.dumps(python_output),
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent.parent,
+        )
+        assert validate_result.returncode == 0, f"serde validation failed: {validate_result.stderr}"
 
         # Verify subimage structure
         assert "subimages" in python_output

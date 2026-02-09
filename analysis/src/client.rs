@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::error::AnalysisError;
-use crate::schema::{AnalysisResult, VlmSubimageOutput};
+use crate::schema::AnalysisResult;
+use crate::schema::vlm_schema::SubimageOutput;
 
 /// Client for communicating with Triton Inference Server.
 pub struct TritonClient {
@@ -143,17 +144,17 @@ impl TritonClient {
     pub async fn embed(&self, image: &[u8]) -> Result<Vec<f32>, AnalysisError> {
         let triton_request = TritonInferRequest {
             inputs: vec![TritonInputTensor {
-                name: "image".to_string(),
+                name: "images".to_string(),
                 datatype: "BYTES".to_string(),
                 shape: vec![1, 1],
                 data: vec![base64::engine::general_purpose::STANDARD.encode(image)],
             }],
             outputs: vec![TritonOutputRequest {
-                name: "embedding".to_string(),
+                name: "embeddings".to_string(),
             }],
         };
 
-        let result_str = self.infer("dinov3", triton_request, "embedding").await?;
+        let result_str = self.infer("dinov3", triton_request, "embeddings").await?;
 
         serde_json::from_str(&result_str)
             .map_err(|e| AnalysisError::ResponseParsing(format!("invalid embedding JSON: {e}")))
@@ -168,7 +169,7 @@ impl TritonClient {
     /// Returns an error if the inference request fails, Triton returns an error,
     /// or the response cannot be parsed.
     pub async fn analyze(&self, image: &[u8]) -> Result<AnalysisResult, AnalysisError> {
-        let schema = schemars::schema_for!(VlmSubimageOutput);
+        let schema = schemars::schema_for!(SubimageOutput);
         let schema_json = serde_json::to_string(&schema)
             .map_err(|e| AnalysisError::ResponseParsing(format!("schema serialization: {e}")))?;
 
@@ -299,7 +300,7 @@ mod tests {
     async fn test_embed_success() -> Result<(), Box<dyn std::error::Error>> {
         let embedding = vec![0.1_f32, 0.2, 0.3];
         let embedding_json = serde_json::to_string(&embedding)?;
-        let response_body = mock_triton_response("embedding", &embedding_json)?;
+        let response_body = mock_triton_response("embeddings", &embedding_json)?;
 
         let url = Url::parse("http://localhost:8080")?;
         let http = Arc::new(MockHttpClient::success(&response_body)?);
@@ -334,7 +335,7 @@ mod tests {
         let result = client.embed(b"fake image bytes").await;
         assert!(
             result.is_err(),
-            "expected error for missing 'embedding' output"
+            "expected error for missing 'embeddings' output"
         );
         Ok(())
     }

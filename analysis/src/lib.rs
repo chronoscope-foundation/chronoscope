@@ -47,7 +47,9 @@ pub mod schema;
 pub use client::TritonClient;
 pub use error::AnalysisError;
 pub use schema::{
-    AnalysisRequest, AnalysisResult, AnalyzedMediaType, BoundingBox, EntityType, ExtractedText,
-    ModelVersions, Region, RegionAnalysis, RegionRelationship, RelationType, RleMask, SceneType,
-    Subimage, SubimageAnalysis, SubimageBounds, VlmAnalyzedOutput, VlmSubimageOutput,
+    AnalysisRequest, AnalysisResult, AnalyzedMediaType, BoundingBox, ConditionIndicator,
+    EntityType, ExtractedText, FacadeMaterial, ModelVersions, PhotoColor, Region, RegionAnalysis,
+    RegionIndex, RegionObservations, RegionRelation, RelationType, RleMask, RoadSurface, RoofType,
+    SceneAnalysis, SceneObservations, SceneType, StreetInfrastructure, StructuralElement, Subimage,
+    SubimageAnalysis, SubimageBounds, SurroundingType, Surroundings, VehicleType, WindowShape,
 };

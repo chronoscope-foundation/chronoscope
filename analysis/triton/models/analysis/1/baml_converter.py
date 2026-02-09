@@ -89,44 +89,6 @@ def jsonschema_to_baml(schema: dict[str, Any]) -> str:
         result.append("}")
         return "\n".join(result)
 
-    def convert_union(name: str, spec: dict[str, Any]) -> str:
-        """Convert an anyOf (untagged union) to BAML-style documentation.
-
-        Since BAML doesn't have native union syntax, we document the variants.
-        """
-        result = []
-        desc = spec.get("description")
-        if desc:
-            # Extract first sentence for the main description
-            first_sentence = desc.split(".")[0] + "."
-            escaped = first_sentence.replace('"', '\\"').replace("\n", " ")
-            result.append(f'@description("{escaped}")')
-
-        result.append(f"// {name} is ONE OF the following:")
-
-        for i, variant in enumerate(spec.get("anyOf", []), 1):
-            variant_desc = variant.get("description", "")
-
-            # Check if it's a $ref or allOf with $ref
-            if "$ref" in variant:
-                ref_name = variant["$ref"].split("/")[-1]
-                result.append(f"//   {i}. A {ref_name} object")
-            elif "allOf" in variant and len(variant["allOf"]) == 1:
-                ref_name = resolve_type(variant["allOf"][0])
-                if variant_desc:
-                    result.append(f"//   {i}. A {ref_name} object - {variant_desc}")
-                else:
-                    result.append(f"//   {i}. A {ref_name} object")
-            elif "properties" in variant:
-                # Inline object - describe its structure
-                props = list(variant.get("properties", {}).keys())
-                if variant_desc:
-                    result.append(f"//   {i}. An object with: {', '.join(props)} - {variant_desc}")
-                else:
-                    result.append(f"//   {i}. An object with: {', '.join(props)}")
-
-        return "\n".join(result)
-
     def is_tagged_union(spec: dict[str, Any]) -> bool:
         """Check if a oneOf spec is a tagged union.
 
@@ -262,12 +224,11 @@ def jsonschema_to_baml(schema: dict[str, Any]) -> str:
                 lines.append("")
                 continue
 
-        # Do we really need convert_union distinct from convert_tagged_union and this seemingly duplicative anyOf/oneOf stuff? They're all coming from rust types (where we only have tagged unions) but I guess the schemars code might generate the two flavors in different cases?
-        # Detect if it's a union type (anyOf)
         if "anyOf" in def_spec:
-            lines.append(convert_union(def_name, def_spec))
-            lines.append("")
-            continue
+            raise ValueError(
+                f"Unsupported: definition '{def_name}' uses anyOf "
+                f"(untagged union). All Rust enums should be tagged."
+            )
 
         # Otherwise it's a class/object
         if def_spec.get("type") == "object" or "properties" in def_spec:
@@ -287,6 +248,9 @@ def jsonschema_to_baml(schema: dict[str, Any]) -> str:
             if all("enum" in v and len(v["enum"]) == 1 for v in variants):
                 lines.append(convert_enum(root_name, schema))
             else:
-                lines.append(convert_union(root_name, schema))
+                raise ValueError(
+                    f"Unsupported: root type '{root_name}' has oneOf "
+                    f"that is neither a simple enum nor a tagged union."
+                )
 
     return "\n".join(lines)

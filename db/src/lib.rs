@@ -14,6 +14,7 @@ pub mod workers;
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{NaiveDateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -91,7 +92,9 @@ impl Database {
 
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -130,7 +133,9 @@ impl Database {
 
         let options = SqliteConnectOptions::from_str(database_url)?
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)

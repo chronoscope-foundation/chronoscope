@@ -624,10 +624,7 @@ impl CachingClient {
             && let Ok(existing) = serde_json::from_slice::<CachedResponse>(&existing_data)
             && let Some(reason) = &existing.pinned
         {
-            eprintln!(
-                "[VCR] Skipping write-through on pinned fixture: {} (reason: {reason})",
-                request.url
-            );
+            tracing::debug!(url = %request.url, reason, "VCR skipping write-through on pinned fixture");
             return Ok(());
         }
 
@@ -741,7 +738,7 @@ impl HttpClient for CachingClient {
                         let key = Self::cache_key(&request);
                         tracing::debug!(key, url = %request.url, "VCR cache miss");
                         Err(HttpError::CacheMiss {
-                            url: request.url.to_string(),
+                            url: format!("{} (fixture: {key}.json)", request.url),
                         })
                     }
                 }

@@ -66,8 +66,8 @@ pub fn triton_success_response(
 /// Create a minimal valid `AnalysisResult` for testing.
 pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
     use chronoscope_analysis::{
-        AnalysisResult, AnalyzedMediaType, BoundingBox, RleMask, SceneType, Subimage,
-        SubimageAnalysis, SubimageBounds,
+        AnalysisResult, AnalyzedMediaType, BoundingBox, PhotoColor, RleMask, SceneAnalysis,
+        SceneType, Subimage, SubimageAnalysis, SubimageBounds,
     };
 
     AnalysisResult {
@@ -84,15 +84,18 @@ pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
                 },
             },
             analysis: SubimageAnalysis::Analyzed {
-                media_type: AnalyzedMediaType::Photo,
-                content_summary: "A test image".to_string(),
-                scene_type: SceneType::Outdoor,
-                temporal_cues: vec![],
-                extracted_text: vec![],
+                scene: SceneAnalysis {
+                    media_type: AnalyzedMediaType::Photo {
+                        color: PhotoColor::Color,
+                    },
+                    content_summary: "A test image".to_string(),
+                    scene_type: SceneType::Outdoor,
+                    scene_observations: Default::default(),
+                    extracted_text: vec![],
+                },
                 thinking: None,
-                embedding: vec![],
+                embedding: None,
                 regions: vec![],
-                region_relationships: vec![],
             },
         }],
         versions: ModelVersions {
