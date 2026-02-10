@@ -195,6 +195,8 @@ struct GalleryData {
 #[derive(Debug, Deserialize)]
 struct GalleryItem {
     media_id: String,
+    caption: Option<String>,
+    outbound_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,7 +384,7 @@ fn extract_media_urls(post: &RedditPost) -> Vec<Url> {
     urls
 }
 
-/// Build markdown content from post selftext, external links, and comments.
+/// Build markdown content from post selftext, external links, gallery captions, and comments.
 fn build_content(post: &RedditPost, comments: &[RedditComment]) -> Option<String> {
     // Collect parts then join with separators - idiomatic Rust for building
     // structured text. String::push_str exists but join() is cleaner here.
@@ -403,6 +405,32 @@ fn build_content(post: &RedditPost, comments: &[RedditComment]) -> Option<String
         && !is_image_url(url)
     {
         parts.push(format!("[Link]({url})"));
+    }
+
+    // Add gallery captions if any items have them
+    if let Some(ref gallery_data) = post.gallery_data {
+        let has_captions = gallery_data
+            .items
+            .iter()
+            .any(|item| item.caption.as_deref().is_some_and(|c| !c.is_empty()));
+
+        if has_captions {
+            let caption_lines: Vec<String> = gallery_data
+                .items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let caption = item.caption.as_deref().filter(|c| !c.is_empty());
+                    match (caption, &item.outbound_url) {
+                        (Some(c), Some(url)) => format!("{}. {} ({})", i + 1, c, url),
+                        (Some(c), None) => format!("{}. {}", i + 1, c),
+                        _ => format!("{}.", i + 1),
+                    }
+                })
+                .collect();
+
+            parts.push(format!("## Captions\n\n{}", caption_lines.join("\n")));
+        }
     }
 
     // Add comments section (double newlines = Markdown paragraph breaks)
@@ -756,6 +784,114 @@ mod tests {
         assert_eq!(
             integration.normalize_url(&url).as_str(),
             "https://reddit.com/r/test"
+        );
+        Ok(())
+    }
+
+    // ==================== Gallery Caption Tests ====================
+
+    /// Helper to build a gallery post JSON with optional captions and selftext.
+    fn gallery_post_json_with_selftext(
+        items: &[serde_json::Value],
+        selftext: &str,
+    ) -> serde_json::Value {
+        let media_metadata: serde_json::Map<String, serde_json::Value> = items
+            .iter()
+            .filter_map(|item| {
+                let media_id = item.get("media_id")?.as_str()?;
+                Some((
+                    media_id.to_string(),
+                    serde_json::json!({
+                        "status": "valid",
+                        "e": "Image",
+                        "m": "image/jpg",
+                        "s": {
+                            "u": format!("https://i.redd.it/{media_id}.jpg"),
+                            "x": 1920,
+                            "y": 1080
+                        },
+                        "id": media_id
+                    }),
+                ))
+            })
+            .collect();
+
+        serde_json::json!([
+            {
+                "kind": "Listing",
+                "data": {
+                    "children": [{
+                        "kind": "t3",
+                        "data": {
+                            "title": "Gallery Post",
+                            "author": "testuser",
+                            "selftext": selftext,
+                            "created_utc": 1700000000.0,
+                            "is_gallery": true,
+                            "gallery_data": { "items": items },
+                            "media_metadata": media_metadata
+                        }
+                    }]
+                }
+            },
+            { "kind": "Listing", "data": { "children": [] } }
+        ])
+    }
+
+    fn gallery_post_json(items: &[serde_json::Value]) -> serde_json::Value {
+        gallery_post_json_with_selftext(items, "")
+    }
+
+    #[test]
+    fn test_gallery_without_captions_produces_no_content() -> TestResult {
+        let json = gallery_post_json(&[
+            serde_json::json!({ "media_id": "img1", "id": 1 }),
+            serde_json::json!({ "media_id": "img2", "id": 2 }),
+        ]);
+
+        let (post, comments) = extract_post_and_comments(&json)?;
+        assert!(
+            build_content(&post, &comments).is_none(),
+            "gallery with no captions and no selftext should produce no content"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_gallery_captions_rendering() -> TestResult {
+        // Exercises: selftext coexistence, gap numbering (positions 2/4 skipped),
+        // empty-caption skipping, outbound URL rendering, caption-only rendering
+        let json = gallery_post_json_with_selftext(
+            &[
+                serde_json::json!({
+                    "media_id": "img1", "id": 1,
+                    "caption": "Town square",
+                    "outbound_url": "https://example.com/square"
+                }),
+                serde_json::json!({ "media_id": "img2", "id": 2 }),
+                serde_json::json!({ "media_id": "img3", "id": 3, "caption": "Church ruins" }),
+                serde_json::json!({ "media_id": "img4", "id": 4, "caption": "" }),
+                serde_json::json!({ "media_id": "img5", "id": 5, "caption": "Overgrown path" }),
+            ],
+            "Some context about the photos.",
+        );
+
+        let (post, comments) = extract_post_and_comments(&json)?;
+        let content = build_content(&post, &comments).expect("should have content");
+
+        assert!(content.contains("Some context about the photos."));
+
+        let captions_section = content
+            .split("## Captions\n\n")
+            .nth(1)
+            .expect("should have captions section");
+        assert_eq!(
+            captions_section.trim(),
+            "1. Town square (https://example.com/square)\n\
+             2.\n\
+             3. Church ruins\n\
+             4.\n\
+             5. Overgrown path"
         );
         Ok(())
     }
