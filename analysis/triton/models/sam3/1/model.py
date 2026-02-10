@@ -1,7 +1,11 @@
 """SAM3 segmentation model for Triton.
 
-Loads SAM3 from HuggingFace and runs entity-prompted segmentation.
-Returns detected regions as RLE-encoded masks.
+Loads SAM3 from HuggingFace and runs text-prompted segmentation.
+Returns raw confidence-filtered regions as RLE-encoded masks.
+
+Post-processing (deduplication, exclusive pixel claiming, sorting) is
+intentionally left to callers — composite subimage detection and entity
+detection have different requirements. See analysis/1/model.py.
 """
 
 import base64
@@ -27,12 +31,11 @@ def get_string_from_tensor(tensor: Any) -> str:
     return result
 
 
-# Entity prompts for automatic segmentation
+# Default prompts when none provided by caller
 ENTITY_PROMPTS = ["building", "bridge", "tower", "monument", "infrastructure"]
 
-# Confidence threshold and limits
+# Minimum confidence for a mask to be included in results
 MIN_CONFIDENCE = 0.5
-MAX_REGIONS = 20
 
 
 def encode_rle(mask: np.ndarray) -> list[int]:
@@ -62,106 +65,6 @@ def encode_rle(mask: np.ndarray) -> list[int]:
     counts.append(run_length)
 
     return counts
-
-
-# NOTE: Duplicated in analysis/1/model.py. Triton's Python backend loads
-# each model in isolation, so there's no clean way to share code between
-# models without complicating the deployment structure.
-def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
-    """Compute Intersection over Union between two masks."""
-    intersection = np.logical_and(mask1, mask2).sum()
-    union = np.logical_or(mask1, mask2).sum()
-    return intersection / union if union > 0 else 0.0
-
-
-def compute_centroid_x(mask: np.ndarray) -> float:
-    """Compute the x-coordinate of a mask's centroid."""
-    ys, xs = np.where(mask)
-    if len(xs) == 0:
-        return 0.0
-    return float(xs.mean())
-
-
-def deduplicate_masks(
-    masks: list[np.ndarray], scores: list[float], iou_threshold: float = 0.7
-) -> list[tuple[np.ndarray, float]]:
-    """Remove duplicate masks based on IoU threshold."""
-    if not masks:
-        return []
-
-    # Sort by score descending
-    sorted_pairs = sorted(
-        zip(masks, scores, strict=True),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-
-    keep: list[tuple[np.ndarray, float]] = []
-    for mask, score in sorted_pairs:
-        # Check if this mask overlaps too much with any kept mask
-        is_duplicate = False
-        for kept_mask, _ in keep:
-            if compute_iou(mask, kept_mask) > iou_threshold:
-                is_duplicate = True
-                break
-
-        if not is_duplicate:
-            keep.append((mask, score))
-
-    return keep
-
-
-def sort_regions_left_to_right(
-    regions: list[tuple[np.ndarray, float]],
-) -> list[tuple[np.ndarray, float]]:
-    """Sort regions by centroid x-coordinate (left to right).
-
-    This makes region numbering predictable for the VLM - region 1 is leftmost.
-    """
-    return sorted(regions, key=lambda r: compute_centroid_x(r[0]))
-
-
-def make_masks_exclusive(
-    masks: list[tuple[np.ndarray, float]],
-    survival_threshold: float = 0.1,
-) -> list[tuple[np.ndarray, float]]:
-    """Make masks mutually exclusive using confidence-based pixel claiming.
-
-    Higher confidence masks claim pixels first. Masks that lose too many
-    pixels (below survival_threshold of original) are removed.
-
-    Args:
-        masks: List of (mask, score) tuples, sorted by confidence descending.
-        survival_threshold: Minimum fraction of original pixels a mask must retain.
-
-    Returns:
-        List of (modified_mask, score) tuples with non-overlapping masks.
-    """
-    if not masks:
-        return []
-
-    # Get image dimensions from first mask
-    h, w = masks[0][0].shape
-    claimed = np.zeros((h, w), dtype=bool)
-
-    result = []
-    for mask, score in masks:
-        original_pixels = mask.sum()
-        if original_pixels == 0:
-            continue
-
-        # Claim only unclaimed pixels
-        exclusive_mask = mask & ~claimed
-        remaining_pixels = exclusive_mask.sum()
-
-        # Check survival threshold
-        survival_ratio = remaining_pixels / original_pixels
-        if survival_ratio >= survival_threshold:
-            # Mark these pixels as claimed
-            claimed |= exclusive_mask.astype(bool)
-            result.append((exclusive_mask.astype(mask.dtype), score))
-
-    return result
 
 
 class TritonPythonModel:
@@ -209,14 +112,17 @@ class TritonPythonModel:
     def _segment_with_sam3(
         self, image: Image.Image, prompts: list[str] | None = None
     ) -> list[dict]:
-        """Run SAM3 segmentation with text prompts."""
+        """Run SAM3 segmentation with text prompts.
+
+        Returns raw confidence-filtered regions. Callers are responsible for
+        any post-processing (deduplication, exclusive masks, sorting, limits).
+        """
         # Set the image once
         inference_state = self.processor.set_image(image)
 
-        all_masks = []
-        all_scores = []
+        all_masks: list[np.ndarray] = []
+        all_scores: list[float] = []
 
-        # Run with each entity prompt
         for prompt in prompts or ENTITY_PROMPTS:
             try:
                 output = self.processor.set_text_prompt(state=inference_state, prompt=prompt)
@@ -236,17 +142,10 @@ class TritonPythonModel:
             except Exception as e:
                 pb_utils.Logger.log_warn(f"Segmentation failed for prompt '{prompt}': {e}")
 
-        # Deduplicate overlapping masks (IoU-based), then make exclusive (pixel-based)
-        filtered = deduplicate_masks(all_masks, all_scores)
-        filtered = make_masks_exclusive(filtered)
-        # Limit count and sort left-to-right for predictable VLM numbering
-        filtered = filtered[:MAX_REGIONS]
-        filtered = sort_regions_left_to_right(filtered)
-
-        # Convert to output format
+        # Convert to output format — raw masks, no post-processing
         regions = [
             {"confidence": score, "mask": encode_rle(mask.astype(np.uint8))}
-            for mask, score in filtered
+            for mask, score in zip(all_masks, all_scores, strict=True)
         ]
 
         return regions

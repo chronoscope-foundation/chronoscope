@@ -59,6 +59,9 @@ VLM_MAX_IMAGE_DIM = 2048
 # SAM3 outputs regions in left-to-right spatial order, not confidence order.
 MAX_REGION_CROPS = 16
 
+# Max entity regions per subimage (caps VLM complexity and DINOv3 budget).
+MAX_ENTITY_REGIONS = 20
+
 # Timeouts are generous placeholder values — no production latency data yet.
 # VLM with 32K max_tokens on a 72B model can take minutes for complex images.
 SAM3_TIMEOUT_MS = 120_000  # 2 min
@@ -74,6 +77,7 @@ SUBIMAGE_MIN_AREA_FRAC = 0.05  # Reject subimages <5% of image area
 SUBIMAGE_MAX_AREA_FRAC = 0.95  # Reject subimages >95% of image area
 SUBIMAGE_MIN_BBOX_FILL = 0.7  # Reject if mask/bbox area ratio < 0.7
 SUBIMAGE_MAX_OVERLAP_IOU = 0.3  # Fallback to single if IoU > 0.3 between any pair
+SUBIMAGE_CONTAINMENT_THRESHOLD = 0.7  # Remove container if smaller mask >70% contained
 
 # Text prompt for composite image panel detection. Targets distinct image
 # regions within collages, side-by-side comparisons, or multi-panel layouts.
@@ -175,14 +179,144 @@ def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     return (x_min, y_min, x_max - x_min + 1, y_max - y_min + 1)
 
 
-# NOTE: Duplicated in sam3/1/model.py. Triton's Python backend loads each
-# model in isolation, so there's no clean way to share code between models
-# without complicating the deployment structure.
 def compute_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
     """Compute Intersection over Union between two masks."""
     intersection = np.logical_and(mask1, mask2).sum()
     union = np.logical_or(mask1, mask2).sum()
     return float(intersection / union) if union > 0 else 0.0
+
+
+def compute_containment(mask1: np.ndarray, mask2: np.ndarray) -> float:
+    """Compute containment: intersection / area of the smaller mask.
+
+    Measures how much of the smaller mask is contained within the larger.
+    Returns 1.0 when the smaller mask is fully inside the larger, 0.0 when
+    they don't overlap at all.
+
+    This is distinct from IoU: two masks can have moderate IoU but high
+    containment when a large region envelops a smaller one.
+    """
+    intersection = float(np.logical_and(mask1, mask2).sum())
+    smaller_area = float(min(mask1.sum(), mask2.sum()))
+    return intersection / smaller_area if smaller_area > 0 else 0.0
+
+
+def compute_centroid_x(mask: np.ndarray) -> float:
+    """Compute the x-coordinate of a mask's centroid."""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return 0.0
+    return float(xs.mean())
+
+
+def deduplicate_masks(
+    masks: list[np.ndarray], scores: list[float], iou_threshold: float = 0.7
+) -> list[tuple[np.ndarray, float]]:
+    """Remove duplicate masks based on IoU threshold."""
+    if not masks:
+        return []
+
+    # Sort by score descending
+    sorted_pairs = sorted(
+        zip(masks, scores, strict=True),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    keep: list[tuple[np.ndarray, float]] = []
+    for mask, score in sorted_pairs:
+        # Check if this mask overlaps too much with any kept mask
+        is_duplicate = False
+        for kept_mask, _ in keep:
+            if compute_iou(mask, kept_mask) > iou_threshold:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            keep.append((mask, score))
+
+    return keep
+
+
+def make_masks_exclusive(
+    masks: list[tuple[np.ndarray, float]],
+    survival_threshold: float = 0.1,
+) -> list[tuple[np.ndarray, float]]:
+    """Make masks mutually exclusive using confidence-based pixel claiming.
+
+    Higher confidence masks claim pixels first. Masks that lose too many
+    pixels (below survival_threshold of original) are removed.
+
+    Args:
+        masks: List of (mask, score) tuples, sorted by confidence descending.
+        survival_threshold: Minimum fraction of original pixels a mask must retain.
+
+    Returns:
+        List of (modified_mask, score) tuples with non-overlapping masks.
+    """
+    if not masks:
+        return []
+
+    # Get image dimensions from first mask
+    h, w = masks[0][0].shape
+    claimed = np.zeros((h, w), dtype=bool)
+
+    result = []
+    for mask, score in masks:
+        original_pixels = mask.sum()
+        if original_pixels == 0:
+            continue
+
+        # Claim only unclaimed pixels
+        exclusive_mask = mask & ~claimed
+        remaining_pixels = exclusive_mask.sum()
+
+        # Check survival threshold
+        survival_ratio = remaining_pixels / original_pixels
+        if survival_ratio >= survival_threshold:
+            # Mark these pixels as claimed
+            claimed |= exclusive_mask.astype(bool)
+            result.append((exclusive_mask.astype(mask.dtype), score))
+
+    return result
+
+
+def sort_regions_left_to_right(
+    regions: list[tuple[np.ndarray, float]],
+) -> list[tuple[np.ndarray, float]]:
+    """Sort regions by centroid x-coordinate (left to right).
+
+    This makes region numbering predictable for the VLM - region 1 is leftmost.
+    """
+    return sorted(regions, key=lambda r: compute_centroid_x(r[0]))
+
+
+def postprocess_entity_regions(raw_regions: list[dict], height: int, width: int) -> list[dict]:
+    """Post-process raw SAM3 output for entity detection.
+
+    Applies deduplication, exclusive pixel claiming, region limit, and
+    left-to-right sorting. This pipeline is specific to entity/building
+    detection — composite subimage detection uses different logic.
+    """
+    if not raw_regions:
+        return []
+
+    # Decode RLE masks back to numpy arrays
+    masks = [decode_rle(r["mask"], height, width) for r in raw_regions]
+    scores = [r["confidence"] for r in raw_regions]
+
+    # Deduplicate overlapping masks (IoU-based), then make exclusive (pixel-based)
+    filtered = deduplicate_masks(masks, scores)
+    filtered = make_masks_exclusive(filtered)
+    # Limit count and sort left-to-right for predictable VLM numbering
+    filtered = filtered[:MAX_ENTITY_REGIONS]
+    filtered = sort_regions_left_to_right(filtered)
+
+    # Re-encode to RLE
+    return [
+        {"confidence": score, "mask": _encode_rle_mask(mask.astype(np.uint8))}
+        for mask, score in filtered
+    ]
 
 
 def annotate_image(image: Image.Image, regions: list[dict[str, Any]]) -> Image.Image:
@@ -412,7 +546,10 @@ class TritonPythonModel:
 
                 regions_tensor = pb_utils.get_output_tensor_by_name(sam_response, "regions")
                 regions_json = get_string_from_tensor(regions_tensor)
-                regions = json.loads(regions_json)
+                raw_regions = json.loads(regions_json)
+
+                # Post-process: dedup, exclusive pixel claiming, sort, limit
+                regions = postprocess_entity_regions(raw_regions, crop.height, crop.width)
 
                 annotated = annotate_image(crop, regions)
                 original_b64 = self._encode_image(crop)
@@ -562,6 +699,26 @@ class TritonPythonModel:
                 continue
 
             usable.append((mask, bbox, region["confidence"]))
+
+        # Filter out container regions: image-wide masks that envelop individual
+        # panels. Unlike entity detection (which uses dedup + exclusive pixel
+        # claiming), composite detection needs to identify and discard the
+        # container to preserve the constituent sub-images.
+        if len(usable) > 1:
+            containers: set[int] = set()
+            for i in range(len(usable)):
+                for j in range(i + 1, len(usable)):
+                    containment = compute_containment(usable[i][0], usable[j][0])
+                    if containment > SUBIMAGE_CONTAINMENT_THRESHOLD:
+                        # Remove the larger region (the container)
+                        area_i = int(usable[i][0].sum())
+                        area_j = int(usable[j][0].sum())
+                        if area_i >= area_j:
+                            containers.add(i)
+                        else:
+                            containers.add(j)
+            if containers:
+                usable = [r for idx, r in enumerate(usable) if idx not in containers]
 
         # Fallback if 0 or 1 usable regions
         if len(usable) <= 1:
@@ -805,8 +962,9 @@ both sides for validation.
 # ==================== Module-level helpers ====================
 
 
-# NOTE: Duplicated as encode_rle() in sam3/1/model.py. See compute_iou
-# above for rationale.
+# NOTE: Duplicated as encode_rle() in sam3/1/model.py. Triton's Python
+# backend loads each model in isolation, so there's no clean way to share
+# code between models without complicating the deployment structure.
 def _encode_rle_mask(mask: np.ndarray) -> list[int]:
     """Encode a binary mask as RLE (COCO-style, column-major order)."""
     flat = mask.flatten(order="F")

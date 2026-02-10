@@ -2,15 +2,15 @@
 """Triton model tests.
 
 Run with: pytest test_models.py -v
-
-Uses pytest fixtures from conftest.py for test isolation and module loading.
 """
 
 import base64
 import copy
+import importlib.util
 import io
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +21,35 @@ from hypothesis.extra import numpy as hn
 from PIL import Image
 
 import mock_triton
+
+# =============================================================================
+# Module loading
+# =============================================================================
+
+_models_dir = Path(__file__).parent / "models"
+
+
+def _load_model_module(model_dir: Path, module_name: str):
+    """Load a model.py from a specific directory as a unique module."""
+    model_path = model_dir / "model.py"
+    spec = importlib.util.spec_from_file_location(module_name, model_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load module from {model_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+sam3_module = _load_model_module(_models_dir / "sam3" / "1", "sam3_model")
+analysis_model = _load_model_module(_models_dir / "analysis" / "1", "analysis_model")
+dinov3_module = _load_model_module(_models_dir / "dinov3" / "1", "dinov3_model")
+
+_baml_path = _models_dir / "analysis" / "1" / "baml_converter.py"
+_baml_spec = importlib.util.spec_from_file_location("baml_converter_test", _baml_path)
+assert _baml_spec is not None and _baml_spec.loader is not None
+baml_converter = importlib.util.module_from_spec(_baml_spec)
+_baml_spec.loader.exec_module(baml_converter)
 
 # =============================================================================
 # Test helpers
@@ -56,7 +85,7 @@ def make_test_schema() -> str:
 class TestRleEncoding:
     """Tests for RLE (run-length encoding) of masks."""
 
-    def test_roundtrip_property_based(self, sam3_module, analysis_model):
+    def test_roundtrip_property_based(self):
         """RLE encode/decode preserves any binary mask (property-based test).
 
         This catches edge cases like checkerboard patterns, diagonal stripes,
@@ -82,7 +111,7 @@ class TestRleEncoding:
 
         check_roundtrip()
 
-    def test_compression_roundtrip_various_run_lengths(self, analysis_model):
+    def test_compression_roundtrip_various_run_lengths(self):
         """RLE compression preserves various run length patterns."""
         test_cases = [
             [0],  # Just zero
@@ -112,7 +141,7 @@ class TestMaskDeduplication:
     with higher-confidence masks, keeping only the highest-confidence version.
     """
 
-    def test_removes_duplicate_masks(self, sam3_module):
+    def test_removes_duplicate_masks(self):
         """Deduplication removes masks with high IoU overlap."""
         mask1 = np.zeros((10, 10), dtype=np.uint8)
         mask1[0:6, 0:6] = 1
@@ -122,27 +151,27 @@ class TestMaskDeduplication:
         mask3 = np.zeros((10, 10), dtype=np.uint8)
         mask3[7:10, 7:10] = 1  # non-overlapping
 
-        result = sam3_module.deduplicate_masks([mask1, mask2, mask3], [0.9, 0.8, 0.7])
+        result = analysis_model.deduplicate_masks([mask1, mask2, mask3], [0.9, 0.8, 0.7])
 
         assert len(result) == 2, "Duplicate should be removed"
 
-    def test_empty_input_returns_empty(self, sam3_module):
+    def test_empty_input_returns_empty(self):
         """Empty input produces empty output."""
-        result = sam3_module.deduplicate_masks([], [])
+        result = analysis_model.deduplicate_masks([], [])
         assert result == []
 
-    def test_single_mask_passes_through(self, sam3_module):
+    def test_single_mask_passes_through(self):
         """Single mask is returned unchanged."""
         mask = np.zeros((10, 10), dtype=np.uint8)
         mask[2:8, 2:8] = 1
 
-        result = sam3_module.deduplicate_masks([mask], [0.9])
+        result = analysis_model.deduplicate_masks([mask], [0.9])
 
         assert len(result) == 1
         assert np.array_equal(result[0][0], mask)
         assert result[0][1] == 0.9
 
-    def test_keeps_higher_confidence_on_overlap(self, sam3_module):
+    def test_keeps_higher_confidence_on_overlap(self):
         """When masks overlap significantly, keeps only the higher-confidence one."""
         mask_high = np.zeros((10, 10), dtype=np.uint8)
         mask_high[0:8, 0:8] = 1  # 64 pixels
@@ -153,12 +182,12 @@ class TestMaskDeduplication:
         mask_low[0, 0] = 0  # 63 pixels, IoU = 63/64 ≈ 0.98 > 0.7
 
         # Lower confidence mask listed first, but higher confidence should be kept
-        result = sam3_module.deduplicate_masks([mask_low, mask_high], [0.7, 0.9])
+        result = analysis_model.deduplicate_masks([mask_low, mask_high], [0.7, 0.9])
 
         assert len(result) == 1
         assert result[0][1] == 0.9, "Should keep higher confidence mask"
 
-    def test_threshold_boundary_keeps_both(self, sam3_module):
+    def test_threshold_boundary_keeps_both(self):
         """Masks with IoU exactly at threshold boundary are both kept."""
         # Two masks with ~70% IoU (at the default 0.7 threshold boundary)
         mask1 = np.zeros((10, 10), dtype=np.uint8)
@@ -168,7 +197,7 @@ class TestMaskDeduplication:
         mask2[3:10, 0:10] = 1  # 70 pixels, overlap = 40 pixels
         # IoU = 40 / (70 + 70 - 40) = 40/100 = 0.4, well below 0.7
 
-        result = sam3_module.deduplicate_masks([mask1, mask2], [0.9, 0.8])
+        result = analysis_model.deduplicate_masks([mask1, mask2], [0.9, 0.8])
         assert len(result) == 2, "Non-duplicate masks should both be kept"
 
 
@@ -181,10 +210,10 @@ class TestExclusiveMasks:
     """Tests for making masks mutually exclusive (no pixel overlap).
 
     When multiple detected regions overlap, higher-confidence regions claim
-    the overlapping pixels. This prevents double-counting in analysis.
+    the overlapping pixels. This prevents double-counting in entity analysis.
     """
 
-    def test_higher_confidence_claims_overlapping_pixels(self, sam3_module):
+    def test_higher_confidence_claims_overlapping_pixels(self):
         """Higher confidence mask keeps all pixels; lower loses overlap."""
         mask_high = np.zeros((10, 10), dtype=np.uint8)
         mask_high[2:8, 2:8] = 1  # 36 pixels in center
@@ -192,7 +221,7 @@ class TestExclusiveMasks:
         mask_low = np.zeros((10, 10), dtype=np.uint8)
         mask_low[4:10, 4:10] = 1  # 36 pixels, overlaps with 16 pixels
 
-        result = sam3_module.make_masks_exclusive([(mask_high, 0.9), (mask_low, 0.7)])
+        result = analysis_model.make_masks_exclusive([(mask_high, 0.9), (mask_low, 0.7)])
 
         assert len(result) == 2, "Both masks should survive"
         high_result, low_result = result[0][0], result[1][0]
@@ -205,7 +234,7 @@ class TestExclusiveMasks:
         overlap = np.logical_and(high_result, low_result).sum()
         assert overlap == 0, "Masks should not overlap"
 
-    def test_prunes_masks_losing_most_pixels(self, sam3_module):
+    def test_prunes_masks_losing_most_pixels(self):
         """Masks losing >90% of pixels are removed to avoid tiny fragments.
 
         This prevents the VLM from receiving noise fragments that would
@@ -217,11 +246,11 @@ class TestExclusiveMasks:
         mask_small = np.zeros((10, 10), dtype=np.uint8)
         mask_small[4:6, 4:6] = 1  # 4 pixels, fully inside mask_big
 
-        result = sam3_module.make_masks_exclusive([(mask_big, 0.9), (mask_small, 0.7)])
+        result = analysis_model.make_masks_exclusive([(mask_big, 0.9), (mask_small, 0.7)])
 
         assert len(result) == 1, "Small mask should be pruned (0% survival)"
 
-    def test_preserves_non_overlapping_masks(self, sam3_module):
+    def test_preserves_non_overlapping_masks(self):
         """Non-overlapping masks are unchanged."""
         mask_left = np.zeros((10, 10), dtype=np.uint8)
         mask_left[0:5, 0:5] = 1
@@ -229,18 +258,18 @@ class TestExclusiveMasks:
         mask_right = np.zeros((10, 10), dtype=np.uint8)
         mask_right[5:10, 5:10] = 1
 
-        result = sam3_module.make_masks_exclusive([(mask_left, 0.9), (mask_right, 0.7)])
+        result = analysis_model.make_masks_exclusive([(mask_left, 0.9), (mask_right, 0.7)])
 
         assert len(result) == 2
         assert result[0][0].sum() == 25
         assert result[1][0].sum() == 25
 
-    def test_empty_input_returns_empty(self, sam3_module):
+    def test_empty_input_returns_empty(self):
         """Empty input list returns empty output."""
-        result = sam3_module.make_masks_exclusive([])
+        result = analysis_model.make_masks_exclusive([])
         assert result == []
 
-    def test_survival_threshold_boundary(self, sam3_module):
+    def test_survival_threshold_boundary(self):
         """Masks with exactly 10% survival pass the threshold.
 
         The 10% threshold balances keeping partial masks (e.g., occluded
@@ -252,10 +281,90 @@ class TestExclusiveMasks:
         mask_partial = np.zeros((10, 10), dtype=np.uint8)
         mask_partial[0:10, 0:10] = 1  # 100 pixels, 90 overlap
 
-        result = sam3_module.make_masks_exclusive([(mask_cover, 0.9), (mask_partial, 0.7)])
+        result = analysis_model.make_masks_exclusive([(mask_cover, 0.9), (mask_partial, 0.7)])
 
         # mask_partial loses 90 pixels, keeps 10 -> 10% survival
         assert len(result) == 2, "10% survival should pass threshold"
+
+
+# =============================================================================
+# Containment tests (composite image detection)
+# =============================================================================
+
+
+class TestContainment:
+    """Tests for containment detection used in composite subimage filtering.
+
+    Containment measures how much of the smaller mask is inside the larger one.
+    This is distinct from IoU: a small panel fully inside a large container has
+    high containment but moderate IoU (because the union is dominated by the
+    container). Composite detection uses this to filter out image-wide regions
+    that SAM3 sometimes produces alongside the actual sub-images.
+    """
+
+    def test_full_containment(self):
+        """Smaller mask fully inside larger returns containment ~1.0."""
+        outer = np.zeros((100, 100), dtype=np.uint8)
+        outer[0:80, 0:80] = 1
+
+        inner = np.zeros((100, 100), dtype=np.uint8)
+        inner[10:30, 10:30] = 1
+
+        assert analysis_model.compute_containment(outer, inner) == pytest.approx(1.0)
+        # Order shouldn't matter — containment is symmetric
+        assert analysis_model.compute_containment(inner, outer) == pytest.approx(1.0)
+
+    def test_no_overlap(self):
+        """Non-overlapping masks return 0.0."""
+        left = np.zeros((100, 100), dtype=np.uint8)
+        left[0:50, 0:40] = 1
+
+        right = np.zeros((100, 100), dtype=np.uint8)
+        right[0:50, 60:100] = 1
+
+        assert analysis_model.compute_containment(left, right) == 0.0
+
+    def test_partial_overlap(self):
+        """Partial overlap returns fraction of smaller mask contained."""
+        mask_a = np.zeros((100, 100), dtype=np.uint8)
+        mask_a[0:50, 0:50] = 1  # 2500 pixels
+
+        mask_b = np.zeros((100, 100), dtype=np.uint8)
+        mask_b[25:75, 25:75] = 1  # 2500 pixels, 625 overlap
+
+        # Both same size, so containment = intersection / area = 625/2500 = 0.25
+        assert analysis_model.compute_containment(mask_a, mask_b) == pytest.approx(0.25)
+
+    def test_empty_masks(self):
+        """Empty masks return 0.0."""
+        empty = np.zeros((10, 10), dtype=np.uint8)
+        nonempty = np.zeros((10, 10), dtype=np.uint8)
+        nonempty[0:5, 0:5] = 1
+
+        assert analysis_model.compute_containment(empty, nonempty) == 0.0
+        assert analysis_model.compute_containment(empty, empty) == 0.0
+
+    def test_containment_vs_iou_distinction(self):
+        """Containment and IoU diverge when sizes differ significantly.
+
+        This is the key scenario for composite detection: a large container
+        mask has moderate IoU with a small panel but high containment.
+        """
+        # Container covers 80% of image
+        container = np.zeros((100, 100), dtype=np.uint8)
+        container[0:80, 0:100] = 1  # 8000 pixels
+
+        # Panel covers 20% of image, fully inside container
+        panel = np.zeros((100, 100), dtype=np.uint8)
+        panel[10:30, 20:70] = 1  # 1000 pixels
+
+        iou = analysis_model.compute_iou(container, panel)
+        containment = analysis_model.compute_containment(container, panel)
+
+        # IoU is moderate (intersection/union = 1000/8000 = 0.125)
+        assert iou < 0.2
+        # Containment is 1.0 (panel fully inside container)
+        assert containment == pytest.approx(1.0)
 
 
 # =============================================================================
@@ -266,7 +375,7 @@ class TestExclusiveMasks:
 class TestVlmPrompt:
     """Tests for VLM prompt generation."""
 
-    def test_prompt_is_deterministic_for_kv_cache(self, analysis_model):
+    def test_prompt_is_deterministic_for_kv_cache(self):
         """Same schema produces identical prompts (enables KV cache reuse)."""
         schema = make_test_schema()
 
@@ -275,7 +384,7 @@ class TestVlmPrompt:
 
         assert p1 == p2, "Prompt should be deterministic"
 
-    def test_prompt_contains_required_elements(self, analysis_model):
+    def test_prompt_contains_required_elements(self):
         """Prompt includes instructions for region analysis and status decision."""
         schema = make_test_schema()
         prompt = analysis_model.build_vlm_prompt(schema)
@@ -285,7 +394,7 @@ class TestVlmPrompt:
         assert "analyzed" in prompt, "Should mention analyzed status"
         assert "rejected" in prompt, "Should mention rejected status"
 
-    def test_prompt_includes_baml_schema(self, analysis_model):
+    def test_prompt_includes_baml_schema(self):
         """Prompt includes BAML-converted schema for clarity."""
         schema = make_test_schema()
         prompt = analysis_model.build_vlm_prompt(schema)
@@ -301,7 +410,7 @@ class TestVlmPrompt:
 class TestBamlConverter:
     """Tests for JSON Schema to BAML conversion."""
 
-    def test_converts_basic_types(self, baml_converter):
+    def test_converts_basic_types(self):
         """Converter handles string, integer, number, boolean types."""
         schema = {
             "type": "object",
@@ -321,7 +430,7 @@ class TestBamlConverter:
         assert "score float?" in baml  # optional
         assert "active bool?" in baml  # optional
 
-    def test_converts_arrays(self, baml_converter):
+    def test_converts_arrays(self):
         """Converter handles array types."""
         schema = {
             "type": "object",
@@ -335,7 +444,7 @@ class TestBamlConverter:
 
         assert "tags string[]" in baml
 
-    def test_converts_nullable_types(self, baml_converter):
+    def test_converts_nullable_types(self):
         """Converter handles nullable (union with null) types."""
         schema = {
             "type": "object",
@@ -349,7 +458,7 @@ class TestBamlConverter:
 
         assert "maybe string?" in baml
 
-    def test_converts_enums(self, baml_converter):
+    def test_converts_enums(self):
         """Converter handles enum definitions."""
         schema = {
             "definitions": {
@@ -368,7 +477,7 @@ class TestBamlConverter:
         assert "active" in baml
         assert "inactive" in baml
 
-    def test_converts_maps(self, baml_converter):
+    def test_converts_maps(self):
         """Converter handles map types (additionalProperties)."""
         schema = {
             "type": "object",
@@ -385,7 +494,7 @@ class TestBamlConverter:
 
         assert "map<string, string>" in baml
 
-    def test_converts_nested_objects_with_refs(self, baml_converter):
+    def test_converts_nested_objects_with_refs(self):
         """Converter handles nested objects via $ref."""
         schema = {
             "definitions": {
@@ -408,7 +517,7 @@ class TestBamlConverter:
         assert "class Outer" in baml
         assert "nested Inner" in baml
 
-    def test_converts_tagged_union(self, baml_converter):
+    def test_converts_tagged_union(self):
         """Converter handles tagged unions (internally-tagged serde enums)."""
         schema = {
             "title": "TestUnion",
@@ -438,7 +547,7 @@ class TestBamlConverter:
         assert "ok" in baml
         assert "error" in baml
 
-    def test_converts_rust_generated_schema(self, baml_converter):
+    def test_converts_rust_generated_schema(self):
         """Converter works with the actual Rust-generated schema.
 
         This ensures Python and Rust components stay in sync.
@@ -478,11 +587,11 @@ class TestBamlConverter:
 class TestDinov3:
     """Tests for DINOv3 embedding model preprocessing and output format."""
 
-    def test_model_loads(self, dinov3_module):
+    def test_model_loads(self):
         """DINOv3 model module loads without errors."""
         assert hasattr(dinov3_module, "TritonPythonModel")
 
-    def test_get_string_from_tensor(self, dinov3_module):
+    def test_get_string_from_tensor(self):
         """String extraction works for the DINOv3 module's copy."""
         tensor = mock_triton.Tensor("test", np.array([b"hello"]))
         result = dinov3_module.get_string_from_tensor(tensor)
@@ -494,11 +603,10 @@ class TestDinov3:
 # =============================================================================
 
 
-def _make_sam3_handler(sam3_module):
+def _make_sam3_handler():
     """Create a mock SAM3 handler that returns valid regions.
 
-    Args:
-        sam3_module: The loaded SAM3 module (for encode_rle).
+    Uses the module-level sam3_module for encode_rle.
     """
 
     def handler(inputs):
@@ -525,13 +633,13 @@ def _make_sam3_handler(sam3_module):
     return handler
 
 
-def _make_subimage_fallback_sam3(sam3_module):
+def _make_subimage_fallback_sam3():
     """Create a SAM3 handler: empty for subimage, valid for entity.
 
     Subimage detection finds nothing (falls back to single full image),
     but entity segmentation returns regions.
     """
-    entity_handler = _make_sam3_handler(sam3_module)
+    entity_handler = _make_sam3_handler()
 
     def handler(inputs):
         prompts = inputs.get("prompts")
@@ -673,9 +781,9 @@ def _make_dinov3_handler():
 class TestAnalysisOrchestration:
     """Integration tests for the subimage-centric analysis pipeline."""
 
-    def test_single_image_pipeline(self, analysis_model, sam3_module):
+    def test_single_image_pipeline(self):
         """Full pipeline with single image: SAM3 subimage detection finds nothing -> full image."""
-        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3())
         mock_triton.register_model("vlm", _make_vlm_handler())
         mock_triton.register_model("dinov3", _make_dinov3_handler())
 
@@ -738,9 +846,9 @@ class TestAnalysisOrchestration:
         assert "dinov3" in result["versions"]
         assert "git_sha" in result["versions"]
 
-    def test_rejected_subimage(self, analysis_model, sam3_module):
+    def test_rejected_subimage(self):
         """VLM rejects a subimage as not relevant."""
-        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3())
         mock_triton.register_model("vlm", _make_rejected_vlm_handler("portrait photo"))
         mock_triton.register_model("dinov3", _make_dinov3_handler())
 
@@ -765,7 +873,7 @@ class TestAnalysisOrchestration:
         assert analysis["status"] == "rejected"
         assert analysis["reason"] == "portrait photo"
 
-    def test_sam3_error_fails_pipeline(self, analysis_model):
+    def test_sam3_error_fails_pipeline(self):
         """SAM3 errors propagate — no silent fallback."""
 
         def failing_sam3(inputs):
@@ -792,9 +900,9 @@ class TestAnalysisOrchestration:
         with pytest.raises(RuntimeError, match="SAM3"):
             model.execute([request])
 
-    def test_handles_vlm_error_gracefully(self, analysis_model, sam3_module):
+    def test_handles_vlm_error_gracefully(self):
         """Pipeline handles VLM errors — result is error status."""
-        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3())
         mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         def failing_vlm(inputs):
@@ -822,7 +930,7 @@ class TestAnalysisOrchestration:
         assert analysis["status"] == "error"
         assert "VLM" in analysis["message"]
 
-    def test_rejects_oversized_images(self, analysis_model):
+    def test_rejects_oversized_images(self):
         """Pipeline rejects images exceeding size limit (5MB)."""
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
@@ -849,7 +957,7 @@ class TestAnalysisOrchestration:
         assert "too large" in analysis["reason"]
         assert "versions" in result, "rejected result must include versions"
 
-    def test_handles_zero_regions_from_sam3(self, analysis_model):
+    def test_handles_zero_regions_from_sam3(self):
         """Pipeline works when entity SAM3 finds no regions."""
 
         def subimage_sam3(inputs):
@@ -883,9 +991,9 @@ class TestAnalysisOrchestration:
         assert analysis["status"] == "analyzed"
         assert analysis["regions"] == []
 
-    def test_handles_vlm_malformed_json(self, analysis_model, sam3_module):
+    def test_handles_vlm_malformed_json(self):
         """Malformed VLM JSON surfaces as per-subimage error, not pipeline crash."""
-        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3())
         mock_triton.register_model("dinov3", _make_dinov3_handler())
 
         def bad_json_vlm(inputs):
@@ -914,9 +1022,9 @@ class TestAnalysisOrchestration:
         assert analysis["status"] == "error"
         assert "VLM call failed" in analysis["message"]
 
-    def test_dinov3_error_preserves_vlm_results(self, analysis_model, sam3_module):
+    def test_dinov3_error_preserves_vlm_results(self):
         """DINOv3 errors are non-fatal — VLM results are preserved without embeddings."""
-        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3())
         mock_triton.register_model("vlm", _make_vlm_handler())
 
         def failing_dinov3(inputs):
@@ -948,10 +1056,10 @@ class TestAnalysisOrchestration:
         assert "embedding" not in analysis, "subimage embedding should be absent"
         assert "embedding" not in analysis["regions"][0], "region embedding should be absent"
 
-    def test_subimage_detection_uses_prompt(self, analysis_model, sam3_module):
+    def test_subimage_detection_uses_prompt(self):
         """Subimage detection calls SAM3 with panel detection prompts."""
         received_prompts = []
-        entity_handler = _make_sam3_handler(sam3_module)
+        entity_handler = _make_sam3_handler()
 
         def tracking_sam3(inputs):
             prompts = inputs.get("prompts")
@@ -985,6 +1093,110 @@ class TestAnalysisOrchestration:
         assert len(received_prompts) == 1
         assert "collage" in received_prompts[0]
 
+    def test_container_region_filtered_from_composite(self):
+        """Image-wide container region is removed, keeping individual sub-images.
+
+        SAM3 sometimes produces a high-confidence region spanning the entire
+        composite alongside the actual sub-image panels. Containment filtering
+        identifies and removes the container so the panels are preserved for
+        independent analysis. This is different from entity detection, which
+        uses exclusive pixel claiming (where the container would eat the panels).
+        """
+        entity_handler = _make_sam3_handler()
+        # Image is 200x150 (from make_test_image)
+        width, height = 200, 150
+
+        def composite_sam3(inputs):
+            prompts = inputs.get("prompts")
+            if prompts is not None:
+                # Subimage detection: container + two panels
+                container = np.zeros((height, width), dtype=np.uint8)
+                container[5:145, 5:195] = 1  # ~90% of image
+
+                left_panel = np.zeros((height, width), dtype=np.uint8)
+                left_panel[10:140, 10:95] = 1  # left half
+
+                right_panel = np.zeros((height, width), dtype=np.uint8)
+                right_panel[10:140, 105:190] = 1  # right half
+
+                regions = [
+                    {"confidence": 0.95, "mask": sam3_module.encode_rle(container)},
+                    {"confidence": 0.85, "mask": sam3_module.encode_rle(left_panel)},
+                    {"confidence": 0.80, "mask": sam3_module.encode_rle(right_panel)},
+                ]
+                return mock_triton.InferenceResponse(
+                    [mock_triton.Tensor("regions", np.array([json.dumps(regions).encode("utf-8")]))]
+                )
+            # Entity segmentation
+            return entity_handler(inputs)
+
+        mock_triton.register_model("sam3", composite_sam3)
+        mock_triton.register_model("vlm", _make_vlm_handler())
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
+
+        model = analysis_model.TritonPythonModel()
+        model.initialize({"model_config": json.dumps({})})
+
+        request = mock_triton.InferenceRequest(
+            model_name="analysis",
+            requested_output_names=["result"],
+            inputs=[
+                mock_triton.Tensor("image", np.array([make_test_image().encode("utf-8")])),
+                mock_triton.Tensor("schema", np.array([make_test_schema().encode("utf-8")])),
+            ],
+        )
+
+        responses = model.execute([request])
+        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
+        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+
+        # Container should be filtered out, leaving two sub-images
+        assert len(result["subimages"]) == 2
+        for subimage in result["subimages"]:
+            assert subimage["analysis"]["status"] == "analyzed"
+
+    def test_no_subimage_regions_produces_single_subimage(self):
+        """When SAM3 finds no composite panels, the full image is analyzed as one subimage.
+
+        This is the expected behavior for non-composite images (single photos)
+        and also the fallback when SAM3 fails to detect any panels.
+        """
+
+        # SAM3 returns empty for both subimage and entity detection
+        def empty_sam3(inputs):
+            return mock_triton.InferenceResponse(
+                [mock_triton.Tensor("regions", np.array([json.dumps([]).encode("utf-8")]))]
+            )
+
+        mock_triton.register_model("sam3", empty_sam3)
+        mock_triton.register_model("vlm", _make_vlm_handler(regions=[]))
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
+
+        model = analysis_model.TritonPythonModel()
+        model.initialize({"model_config": json.dumps({})})
+
+        request = mock_triton.InferenceRequest(
+            model_name="analysis",
+            requested_output_names=["result"],
+            inputs=[
+                mock_triton.Tensor("image", np.array([make_test_image().encode("utf-8")])),
+                mock_triton.Tensor("schema", np.array([make_test_schema().encode("utf-8")])),
+            ],
+        )
+
+        responses = model.execute([request])
+        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
+        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+
+        # Should produce exactly one subimage covering the full image
+        assert len(result["subimages"]) == 1
+        bounds = result["subimages"][0]["bounds"]
+        assert bounds["bbox"]["x"] == 0
+        assert bounds["bbox"]["y"] == 0
+        assert bounds["bbox"]["width"] == 200
+        assert bounds["bbox"]["height"] == 150
+        assert result["subimages"][0]["analysis"]["status"] == "analyzed"
+
 
 # =============================================================================
 # Schema compatibility tests
@@ -998,7 +1210,7 @@ class TestSchemaCompatibility:
     deserialized by the Rust types, catching schema drift early.
     """
 
-    def test_analysis_result_matches_rust_schema(self, analysis_model, sam3_module):
+    def test_analysis_result_matches_rust_schema(self):
         """Full pipeline output validates against Rust AnalysisResult schema."""
         import jsonschema
 
@@ -1015,7 +1227,7 @@ class TestSchemaCompatibility:
         rust_schema = json.loads(result.stdout)
 
         # Set up pipeline with subimage detection fallback
-        mock_triton.register_model("sam3", _make_subimage_fallback_sam3(sam3_module))
+        mock_triton.register_model("sam3", _make_subimage_fallback_sam3())
 
         mock_triton.register_model(
             "vlm",
