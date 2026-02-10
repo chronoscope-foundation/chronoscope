@@ -278,6 +278,7 @@ async fn run_dev_server(
         triton_endpoint: std::env::var("TRITON_ENDPOINT")
             .ok()
             .and_then(|s| url::Url::parse(&s).ok()),
+        dns_resolver: None,
     })
     .await
     .map_err(|e| format!("Failed to start dev server: {e}"))?;

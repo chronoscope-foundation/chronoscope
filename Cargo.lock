@@ -524,6 +524,7 @@ dependencies = [
 name = "chronoscope-dev"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "chrono",
  "chronoscope-analysis",

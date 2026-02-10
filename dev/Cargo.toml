@@ -54,6 +54,7 @@ slog = "2"
 
 [dev-dependencies]
 # Testing
+async-trait.workspace = true
 tokio-test = "0.4"
 test-with = "0.14"
 bytes = "1"
