@@ -20,6 +20,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chronoscope_api::state::default_dns_resolver;
 use chronoscope_dev::{DevServerConfig, start_dev_server};
 use chronoscope_workers::{ApifyConfig, ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
@@ -278,7 +279,8 @@ async fn run_dev_server(
         triton_endpoint: std::env::var("TRITON_ENDPOINT")
             .ok()
             .and_then(|s| url::Url::parse(&s).ok()),
-        dns_resolver: None,
+        dns_resolver: default_dns_resolver()
+            .map_err(|e| format!("Failed to create DNS resolver: {e}"))?,
     })
     .await
     .map_err(|e| format!("Failed to start dev server: {e}"))?;

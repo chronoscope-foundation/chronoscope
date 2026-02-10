@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_api::jwt::JwtConfig;
-use chronoscope_api::state::{AppState, Config, DnsResolver, default_dns_resolver};
+use chronoscope_api::state::{AppState, Config};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId, url_queue_config};
 use chronoscope_workers::analysis::AnalysisWorker;
@@ -120,10 +120,10 @@ pub struct DevServerConfig {
     /// If provided, an analysis worker will be spawned.
     pub triton_endpoint: Option<url::Url>,
 
-    /// Optional: DNS resolver override.
-    /// If `None`, the system DNS resolver is used (requires `/etc/resolv.conf`).
-    /// Provide a custom resolver for environments without system DNS (e.g., offline tests).
-    pub dns_resolver: Option<Box<dyn DnsResolver>>,
+    /// DNS resolver for URL security validation.
+    /// Use `default_dns_resolver()` for system DNS or `permissive_dns_resolver()`
+    /// for offline environments (e.g., tests).
+    pub dns_resolver: Box<dyn chronoscope_api::state::DnsResolver>,
 }
 
 /// Find an available port by binding to port 0 and reading the assigned port.
@@ -410,17 +410,11 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
     };
 
     // Create AppState with our shared database and media store
-    let dns_resolver = match config.dns_resolver {
-        Some(resolver) => resolver,
-        None => {
-            default_dns_resolver().map_err(|e| format!("Failed to create DNS resolver: {e}"))?
-        }
-    };
     let app_state = AppState::new(
         db.as_ref().clone(),
         api_config,
         jwt_config,
-        dns_resolver,
+        config.dns_resolver,
         media_store,
     )
     .await

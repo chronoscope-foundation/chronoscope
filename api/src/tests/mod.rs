@@ -40,7 +40,7 @@ use crate::auth::{
 use crate::jwt::JwtConfig;
 use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
 use crate::research_types::{FollowedUrlSummary, ResearchUrlDossier, ResearchUrlSummary};
-use crate::state::{AppState, Config, DnsResolver};
+use crate::state::{AppState, Config, DnsResolver, SAFE_PUBLIC_IP};
 
 // ==================== Test Utilities ====================
 
@@ -75,13 +75,12 @@ impl TestResolver {
 
 #[async_trait]
 impl DnsResolver for TestResolver {
-    #[allow(clippy::expect_used)] // Parsing constant IP address in test helper
     async fn lookup_ip(&self, host: &str) -> Result<Vec<IpAddr>, HttpError> {
         if let Some(ips) = self.0.get(host) {
             Ok(ips.clone())
         } else if self.0.is_empty() {
-            // Permissive mode: return example.com's IP for any host
-            Ok(vec!["93.184.216.34".parse().expect("valid IP")])
+            // Permissive mode: return a safe public IP for any host
+            Ok(vec![SAFE_PUBLIC_IP])
         } else {
             // Strict mode: only configured hosts resolve
             Err(HttpError::for_bad_request(

@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 #[cfg(feature = "embedded-media")]
 use std::sync::Arc;
 
@@ -128,15 +128,38 @@ pub enum AppStateError {
     DnsResolver(String),
 }
 
-/// Create a default DNS resolver using tokio.
+/// A safe public IP address (example.com) for use in test resolvers.
+/// This is non-private and passes SSRF validation.
+pub const SAFE_PUBLIC_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+
+/// Create a default DNS resolver using tokio and system configuration.
 ///
 /// # Errors
-/// Returns `AppStateError::DnsResolver` if resolver creation fails.
+/// Returns `AppStateError::DnsResolver` if resolver creation fails
+/// (e.g., missing `/etc/resolv.conf`).
 pub fn default_dns_resolver() -> Result<Box<dyn DnsResolver>, AppStateError> {
     let resolver = Resolver::builder_tokio()
         .map_err(|e| AppStateError::DnsResolver(format!("{e}")))?
         .build();
     Ok(Box::new(resolver))
+}
+
+/// A DNS resolver that returns [`SAFE_PUBLIC_IP`] for any hostname.
+/// Useful for testing and development environments without system DNS.
+struct PermissiveDnsResolver;
+
+#[async_trait]
+impl DnsResolver for PermissiveDnsResolver {
+    async fn lookup_ip(&self, _host: &str) -> Result<Vec<IpAddr>, HttpError> {
+        Ok(vec![SAFE_PUBLIC_IP])
+    }
+}
+
+/// Create a DNS resolver that returns a safe public IP for any hostname,
+/// bypassing real DNS resolution entirely. Suitable for offline tests
+/// and environments without `/etc/resolv.conf`.
+pub fn permissive_dns_resolver() -> Box<dyn DnsResolver> {
+    Box::new(PermissiveDnsResolver)
 }
 
 /// Shared application state

@@ -12,18 +12,15 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::net::IpAddr;
-
-use async_trait::async_trait;
 use chronoscope_api::research_types::{
     AnalysisOutcome, MediaReference, ResearchUrlDossier, ResolvedContent,
 };
-use chronoscope_api::state::DnsResolver;
+use chronoscope_api::state::permissive_dns_resolver;
 use chronoscope_db::{MediaType, ResearchUrlStatus};
 use chronoscope_dev::{DevServerConfig, RunningDevServer, start_dev_server};
 use chronoscope_workers::RetryConfig;
 use chronoscope_workers::{ApifyConfig, CacheMode, CachingClient, HttpClient};
-use dropshot::{ConfigLogging, HttpError};
+use dropshot::ConfigLogging;
 use reqwest::Client;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -63,23 +60,6 @@ fn vcr_mode() -> CacheMode {
         CacheMode::Online
     } else {
         CacheMode::Offline
-    }
-}
-
-// ==================== Test DNS Resolver ====================
-
-/// A permissive DNS resolver for offline tests.
-/// Returns a safe public IP (93.184.216.34, example.com) for any hostname,
-/// bypassing the need for system DNS configuration.
-struct TestDnsResolver;
-
-#[async_trait]
-impl DnsResolver for TestDnsResolver {
-    async fn lookup_ip(&self, _host: &str) -> Result<Vec<IpAddr>, HttpError> {
-        // Return example.com's IP — a safe, non-private address that passes SSRF checks
-        Ok(vec!["93.184.216.34".parse().map_err(|e| {
-            HttpError::for_internal_error(format!("{e}"))
-        })?])
     }
 }
 
@@ -140,7 +120,7 @@ impl TestServer {
             ios_app_id: None,
             apify_config,
             triton_endpoint,
-            dns_resolver: Some(Box::new(TestDnsResolver)),
+            dns_resolver: permissive_dns_resolver(),
         })
         .await?;
 
