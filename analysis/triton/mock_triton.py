@@ -113,18 +113,15 @@ class InferenceRequest:
         model_name: str,
         requested_output_names: list[str],
         inputs: list[Tensor],
+        timeout: int = 0,
     ):
         self.model_name = model_name
         self.requested_output_names = requested_output_names
         self._inputs = {t.name: t for t in inputs}
-        self._timeout_ms: int | None = None
+        self._timeout_us = timeout
 
     def inputs(self) -> list[Tensor]:
         return list(self._inputs.values())
-
-    def set_timeout_ms(self, timeout_ms: int) -> None:
-        """Set timeout in milliseconds for this request."""
-        self._timeout_ms = timeout_ms
 
     def async_exec(self) -> InferenceFuture:
         """Execute BLS call asynchronously.

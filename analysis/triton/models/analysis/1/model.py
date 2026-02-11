@@ -64,9 +64,9 @@ MAX_ENTITY_REGIONS = 20
 
 # Timeouts are generous placeholder values — no production latency data yet.
 # VLM with 32K max_tokens on a 72B model can take minutes for complex images.
-SAM3_TIMEOUT_MS = 120_000  # 2 min
-VLM_TIMEOUT_MS = 300_000  # 5 min
-DINOV3_TIMEOUT_MS = 60_000  # 1 min
+SAM3_TIMEOUT_US = 120_000_000  # 2 min
+VLM_TIMEOUT_US = 300_000_000  # 5 min
+DINOV3_TIMEOUT_US = 60_000_000  # 1 min
 # Safety margin for future.result() after as_completed returns it.
 # The future should already be done; this just prevents indefinite hangs
 # from edge cases in the executor.
@@ -514,8 +514,8 @@ class TritonPythonModel:
             # Pre-compute prompt once
             vlm_prompt = build_vlm_prompt(schema_json)
 
-            # Phase 1: Fire all SAM3 requests concurrently
-            sam_futures = []
+            # Per-subimage SAM3 segmentation, then prepare VLM inputs
+            vlm_inputs = []
             for si_idx, bounds in enumerate(subimage_bounds):
                 bbox = bounds["bbox"]
                 crop = original.crop(
@@ -531,14 +531,9 @@ class TritonPythonModel:
                     model_name="sam3",
                     requested_output_names=["regions"],
                     inputs=[pb_utils.Tensor("image", np.array([[crop_b64.encode("utf-8")]]))],
+                    timeout=SAM3_TIMEOUT_US,
                 )
-                sam_request.set_timeout_ms(SAM3_TIMEOUT_MS)
-                sam_futures.append((si_idx, bounds, crop, sam_request.async_exec()))
-
-            # Phase 2: Collect SAM3 results, prepare VLM inputs
-            vlm_inputs = []
-            for si_idx, bounds, crop, sam_future in sam_futures:
-                sam_response = sam_future.get()
+                sam_response = sam_request.exec()
                 if sam_response.has_error():
                     raise RuntimeError(
                         f"SAM3 error on subimage {si_idx}: {sam_response.error().message()}"
@@ -585,7 +580,7 @@ class TritonPythonModel:
                     ): si_idx
                     for si_idx, _, _, _, orig_b64, ann_b64, n_regions in vlm_inputs
                 }
-                for future in as_completed(future_to_idx, timeout=VLM_TIMEOUT_MS / 1000 + 30):
+                for future in as_completed(future_to_idx, timeout=VLM_TIMEOUT_US / 1_000_000 + 30):
                     idx = future_to_idx[future]
                     try:
                         vlm_results[idx] = future.result(timeout=FUTURE_RESULT_TIMEOUT_S)
@@ -665,8 +660,8 @@ class TritonPythonModel:
                 pb_utils.Tensor("image", np.array([[image_b64.encode("utf-8")]])),
                 pb_utils.Tensor("prompts", prompts_array),
             ],
+            timeout=SAM3_TIMEOUT_US,
         )
-        sam_request.set_timeout_ms(SAM3_TIMEOUT_MS)
         sam_response = sam_request.exec()
 
         if sam_response.has_error():
@@ -814,8 +809,8 @@ both sides for validation.
                 pb_utils.Tensor("sampling_parameters", np.array([sampling_params.encode("utf-8")])),
                 pb_utils.Tensor("exclude_input_in_output", np.array([True])),
             ],
+            timeout=VLM_TIMEOUT_US,
         )
-        vlm_request.set_timeout_ms(VLM_TIMEOUT_MS)
         vlm_responses = vlm_request.exec(decoupled=True)
 
         first = next(vlm_responses, None)
@@ -941,8 +936,8 @@ both sides for validation.
             model_name="dinov3",
             requested_output_names=["embeddings"],
             inputs=[pb_utils.Tensor("images", image_array)],
+            timeout=DINOV3_TIMEOUT_US,
         )
-        dino_request.set_timeout_ms(DINOV3_TIMEOUT_MS)
         dino_response = dino_request.exec()
 
         if dino_response.has_error():
