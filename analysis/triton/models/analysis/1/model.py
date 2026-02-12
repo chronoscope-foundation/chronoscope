@@ -437,21 +437,17 @@ class TritonPythonModel:
         """Initialize the orchestrator."""
         self.model_config = json.loads(args["model_config"])
 
-        # Model IDs for provenance tracking
-        self.vlm_model_name = "unknown"
-        vlm_model_json = os.path.join(
-            args.get("model_repository", "/models"),
-            "vlm",
-            "1",
-            "model.json",
-        )
-        if os.path.exists(vlm_model_json):
-            with open(vlm_model_json) as f:
-                vlm_config = json.load(f)
-            self.vlm_model_name = vlm_config.get("model", "unknown")
-
-        self.sam3_model_name = "facebook/sam2.1-hiera-large"
-        self.dinov3_model_name = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+        # Model IDs for provenance tracking.
+        # model_repository points to this model's own dir (e.g. /models/analysis),
+        # so go up one level to reach the root model repository.
+        # VLM and DINOv3 model.json files are authoritative (used to load the model).
+        # SAM3 has no model.json — build_sam3_image_model() bakes in the checkpoint
+        # with no way to parameterize or introspect it. This will improve if/when we
+        # convert SAM3 to ONNX and control the checkpoint path ourselves.
+        model_repo_root = os.path.dirname(args.get("model_repository", "/models/analysis"))
+        self.vlm_model_name = self._read_model_id(model_repo_root, "vlm")
+        self.sam3_model_name = "facebook/sam3"  # see comment above
+        self.dinov3_model_name = self._read_model_id(model_repo_root, "dinov3")
         self.git_revision = os.environ.get("ANALYSIS_GIT_SHA", "unknown")
 
         self.versions = {
@@ -462,6 +458,17 @@ class TritonPythonModel:
         }
 
         pb_utils.Logger.log_info("Analysis BLS model initialized")
+
+    @staticmethod
+    def _read_model_id(model_repo_root: str, model_name: str) -> str:
+        """Read model ID from a sibling model's model.json."""
+        model_json = os.path.join(model_repo_root, model_name, "1", "model.json")
+        if os.path.exists(model_json):
+            with open(model_json) as f:
+                config = json.load(f)
+            result: str = config.get("model", "unknown")
+            return result
+        return "unknown"
 
     def execute(self, requests):
         """Process analysis requests through the subimage pipeline.

@@ -43,9 +43,14 @@ class TritonPythonModel:
         params = self.model_config.get("parameters", {})
         self.image_size = int(params.get("image_size", {}).get("string_value", "512"))
 
-        pb_utils.Logger.log_info(f"Loading DINOv3 ViT-L model (image_size={self.image_size})...")
+        # Read model ID from model.json (authoritative — same pattern as VLM)
+        model_json_path = os.path.join(os.path.dirname(__file__), "model.json")
+        with open(model_json_path) as f:
+            model_name: str = json.load(f)["model"]
 
-        model_name = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+        pb_utils.Logger.log_info(
+            f"Loading DINOv3 model={model_name} (image_size={self.image_size})..."
+        )
 
         # Use shared HF cache on persistent volume (same as SAM3/VLM)
         cache_dir = os.environ.get("HF_HOME", None)
