@@ -13,6 +13,10 @@ workspace = true
 name = "analyze"
 path = "src/bin/analyze.rs"
 
+[features]
+default = []
+testing = []
+
 [dependencies]
 # Serialization
 serde.workspace = true
@@ -23,12 +27,6 @@ schemars.workspace = true
 
 # Async runtime
 tokio.workspace = true
-
-# HTTP client abstraction from integrations crate
-chronoscope-integrations = { path = "../integrations" }
-
-# URL handling
-url.workspace = true
 
 # Error handling
 thiserror.workspace = true
@@ -43,15 +41,21 @@ clap = { version = "4", features = ["derive"] }
 # Base64 for image encoding
 base64.workspace = true
 
-# Byte handling
-bytes.workspace = true
-
-# Async trait for mock implementations
+# Async trait for trait definitions
 async-trait.workspace = true
 
-# HTTP types needed for mock responses in tests (reqwest types exposed via integrations)
-reqwest = { version = "0.12", default-features = false }
+# gRPC client
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+# Hashing for fixture cache keys
+sha2 = "0.10"
+hex = "0.4"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+protobuf-src = "2"
 
 [dev-dependencies]
-# Enable testing utilities (MockHttpClient) for unit tests
-chronoscope-integrations = { path = "../integrations", features = ["testing"] }
+tempfile = "3"

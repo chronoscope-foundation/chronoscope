@@ -20,7 +20,7 @@ pub(crate) mod test_harness;
 
 use std::sync::Arc;
 
-use chronoscope_analysis::TritonClient;
+use chronoscope_analysis::TritonService;
 use chronoscope_db::Database;
 use chronoscope_db::media_store::MediaStore;
 use chronoscope_db::workers::MediaForAnalysis;
@@ -37,7 +37,7 @@ pub use error::AnalysisError;
 /// 2. Sends to the Triton BLS pipeline (subimage detection, SAM3, VLM, DINOv3)
 /// 3. Stores results as JSON in the media table
 pub struct AnalysisWorker {
-    triton: TritonClient,
+    triton: Arc<dyn TritonService>,
     db: Arc<Database>,
     media_store: Arc<dyn MediaStore>,
 }
@@ -45,7 +45,11 @@ pub struct AnalysisWorker {
 impl AnalysisWorker {
     /// Create a new analysis worker.
     #[must_use]
-    pub fn new(triton: TritonClient, db: Arc<Database>, media_store: Arc<dyn MediaStore>) -> Self {
+    pub fn new(
+        triton: Arc<dyn TritonService>,
+        db: Arc<Database>,
+        media_store: Arc<dyn MediaStore>,
+    ) -> Self {
         Self {
             triton,
             db,

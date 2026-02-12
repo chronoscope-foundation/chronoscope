@@ -4,29 +4,22 @@
 //!   analyze [--endpoint URL] <image>
 //!
 //! Examples:
-//!   # Analyze a local image
-//!   analyze --endpoint <http://localhost:8000> photo.jpg
-//!
-//!   # With port forwarding active:
-//!   # Terminal 1: northflank forward service --projectId chronoscope-analysis --serviceId triton --port 8000
-//!   # Terminal 2: analyze photo.jpg
+//!   # Analyze a local image (gRPC endpoint, default port 8001)
+//!   analyze --endpoint <http://localhost:8001> photo.jpg
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use chronoscope_integrations::ReqwestClient;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
-use url::Url;
 
-use chronoscope_analysis::{AnalysisError, TritonClient};
+use chronoscope_analysis::{AnalysisError, GrpcTritonClient, TritonService};
 
 #[derive(Parser)]
 #[command(name = "analyze")]
 #[command(about = "Analyze images for historical building research")]
 struct Args {
-    /// Triton server HTTP endpoint
-    #[arg(long, default_value = "http://localhost:8000")]
+    /// Triton server gRPC endpoint
+    #[arg(long)]
     endpoint: String,
 
     /// Image file to analyze
@@ -42,17 +35,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // Parse endpoint URL and create HTTP client
-    let endpoint = Url::parse(&args.endpoint)?;
-    let http_client = Arc::new(ReqwestClient::new()?);
-    let client = TritonClient::new(endpoint, http_client);
+    // Connect to Triton via gRPC
+    tracing::info!("Connecting to Triton at {}...", args.endpoint);
+    let client = GrpcTritonClient::connect(&args.endpoint).await?;
 
     // Check server health
-    tracing::info!("Checking Triton server at {}...", args.endpoint);
+    tracing::info!("Checking server readiness...");
     client
         .is_server_ready()
         .await
-        .map_err(|e| AnalysisError::Connection(format!("Health check failed: {e}")))?;
+        .map_err(|e| AnalysisError::Transport(format!("Health check failed: {e}")))?;
     tracing::info!("Server ready");
 
     // Read image

@@ -528,6 +528,30 @@ mod tests {
         Ok(results)
     }
 
+    /// Poll a condition until it returns true, with a timeout.
+    ///
+    /// The worker notification fires inside `process_batch` before the runner
+    /// has called `mark_failed`, so tests that check DB state after `collect_n`
+    /// must poll rather than assert immediately.
+    async fn poll_until<F, Fut>(timeout: Duration, mut f: F) -> Result<(), CollectError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if f().await {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(CollectError(
+                    "poll_until timed out waiting for condition".to_string(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     // ==================== Runner Integration Tests ====================
 
     #[tokio::test]
@@ -659,6 +683,24 @@ mod tests {
         // Wait for the single call
         let calls = collect_n(&mut call_rx, 1).await?;
         assert_eq!(calls, vec!["https://example.com/permanent"]);
+
+        // The worker notification fires inside process_batch, before the runner
+        // iterates results and calls mark_failed. Poll until the DB reflects
+        // the expected state before sending shutdown.
+        let db_poll = db.clone();
+        let url_id_poll = url_id.clone();
+        poll_until(Duration::from_secs(5), || {
+            let db = db_poll.clone();
+            let url_id = url_id_poll.clone();
+            async move {
+                db.get_url_by_id(&url_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| r.status == chronoscope_db::ResearchUrlStatus::Failed)
+            }
+        })
+        .await?;
 
         // Shutdown the runner
         let _ = shutdown_tx.send(true);

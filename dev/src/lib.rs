@@ -12,6 +12,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
@@ -116,9 +117,9 @@ pub struct DevServerConfig {
     /// If provided, an Instagram worker will be spawned.
     pub apify_config: Option<ApifyConfig>,
 
-    /// Optional: Triton endpoint for image analysis.
+    /// Optional: Triton service for image analysis.
     /// If provided, an analysis worker will be spawned.
-    pub triton_endpoint: Option<url::Url>,
+    pub triton: Option<Arc<dyn TritonService>>,
 
     /// DNS resolver for URL security validation.
     /// Use `default_dns_resolver()` for system DNS or `permissive_dns_resolver()`
@@ -223,14 +224,11 @@ fn spawn_url_fetcher_worker(
 /// Spawn an analysis worker in a background task.
 fn spawn_analysis_worker(
     worker_id: &str,
-    triton_endpoint: url::Url,
+    triton: Arc<dyn TritonService>,
     ctx: &WorkerContext,
 ) -> JoinHandle<()> {
-    use chronoscope_analysis::TritonClient;
-
     let worker_id = worker_id.to_string();
     let queue = ctx.db.analysis_queue.clone();
-    let triton = TritonClient::new(triton_endpoint, ctx.http_client.clone());
     let worker = AnalysisWorker::new(triton, ctx.db.clone(), ctx.media_store.clone());
     let enqueuer = NoOpEnqueuer;
 
@@ -347,17 +345,14 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         info!(log, "Instagram worker enabled with Apify integration");
     }
 
-    // Spawn analysis worker if Triton endpoint is provided
-    if let Some(triton_endpoint) = config.triton_endpoint.clone() {
+    // Spawn analysis worker if Triton service is provided
+    if let Some(triton) = config.triton {
         worker_handles.push(spawn_analysis_worker(
             "analysis-worker",
-            triton_endpoint.clone(),
+            triton,
             &worker_ctx,
         ));
-        info!(
-            log,
-            "Analysis worker enabled with Triton at {:?}", triton_endpoint
-        );
+        info!(log, "Analysis worker enabled");
     }
 
     info!(log, "Started workers"; "count" => worker_handles.len());

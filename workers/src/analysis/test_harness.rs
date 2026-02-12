@@ -1,6 +1,6 @@
 //! Test harness for analysis worker tests.
 //!
-//! Provides mock HTTP responses for unit testing the worker flow.
+//! Provides mock Triton service for unit testing the worker flow.
 
 #![allow(dead_code)] // Test infrastructure - used by tests in this module
 
@@ -8,13 +8,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::Utc;
-use chronoscope_analysis::{ModelVersions, TritonClient};
+use chronoscope_analysis::mock::MockTritonService;
+use chronoscope_analysis::{ModelVersions, TritonService};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::workers::MediaForAnalysis;
 use chronoscope_db::{Database, Email, MediaData, MediaId, MediaType, UserId};
-use chronoscope_integrations::{HttpClient, MockHttpClient};
 use sha2::{Digest, Sha256};
-use url::Url;
 
 use super::{AnalysisError, AnalysisWorker};
 use crate::worker::{ItemResult, Worker};
@@ -44,24 +43,6 @@ fn sha2_hash(data: &[u8]) -> Vec<u8> {
 }
 
 // ==================== Test Fixtures ====================
-
-/// Build a valid Triton inference response body.
-///
-/// The response wraps an `AnalysisResult` in Triton's output format.
-pub fn triton_success_response(
-    analysis_result: &chronoscope_analysis::AnalysisResult,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let result_json = serde_json::to_string(analysis_result)?;
-
-    let response = serde_json::json!({
-        "outputs": [{
-            "name": "result",
-            "data": [result_json]
-        }]
-    });
-
-    serde_json::to_vec(&response)
-}
 
 /// Create a minimal valid `AnalysisResult` for testing.
 pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
@@ -187,12 +168,12 @@ impl AnalysisTestHarness {
         Ok((media_id, storage_key))
     }
 
-    /// Claim media for analysis and process with a mock HTTP client.
+    /// Claim media for analysis and process with a mock Triton service.
     ///
     /// Returns the worker result for the first claimed item.
     pub async fn process_with_mock(
         &self,
-        http_client: Arc<dyn HttpClient>,
+        triton: Arc<dyn TritonService>,
     ) -> Result<
         (MediaForAnalysis, ItemResult<(), AnalysisError>),
         Box<dyn std::error::Error + Send + Sync>,
@@ -210,9 +191,7 @@ impl AnalysisTestHarness {
             .next()
             .ok_or_else(|| TestError("no media claimed".into()))?;
 
-        // Create worker with mock HTTP client
-        let triton_url = Url::parse("http://localhost:8000")?;
-        let triton = TritonClient::new(triton_url, http_client);
+        // Create worker with mock Triton service
         let worker = AnalysisWorker::new(triton, self.db.clone(), self.media_store.clone());
 
         // Process the batch
@@ -231,18 +210,17 @@ impl AnalysisTestHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::StatusCode;
 
     #[tokio::test]
     async fn test_successful_analysis() -> TestResult {
         let harness = AnalysisTestHarness::new().await?;
         harness.create_media_for_analysis().await?;
 
-        // Mock a successful Triton response
-        let response_body = triton_success_response(&minimal_analysis_result())?;
-        let http = Arc::new(MockHttpClient::success(&response_body)?);
+        let triton = Arc::new(MockTritonService::with_analysis_result(
+            minimal_analysis_result(),
+        ));
 
-        let (_media, result) = harness.process_with_mock(http).await?;
+        let (_media, result) = harness.process_with_mock(triton).await?;
 
         assert!(
             matches!(result, ItemResult::Success { .. }),
@@ -252,101 +230,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retriable_error_triton_503() -> TestResult {
+    async fn test_retriable_error_triton_unavailable() -> TestResult {
         let harness = AnalysisTestHarness::new().await?;
         harness.create_media_for_analysis().await?;
 
-        // Mock a 503 Service Unavailable response
-        let http = Arc::new(MockHttpClient::error_status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service temporarily unavailable",
-        )?);
+        let triton = Arc::new(MockTritonService::with_error(
+            chronoscope_analysis::AnalysisError::Triton {
+                retriable: true,
+                message: "service temporarily unavailable".to_string(),
+            },
+        ));
 
-        let (_media, result) = harness.process_with_mock(http).await?;
+        let (_media, result) = harness.process_with_mock(triton).await?;
 
         assert!(
             matches!(result, ItemResult::RetriableFailure { .. }),
-            "expected RetriableFailure for 503, got {result:?}"
+            "expected RetriableFailure for retriable Triton error, got {result:?}"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_retriable_error_triton_500() -> TestResult {
+    async fn test_retriable_error_triton_internal() -> TestResult {
         let harness = AnalysisTestHarness::new().await?;
         harness.create_media_for_analysis().await?;
 
-        // Mock a 500 Internal Server Error response
-        let http = Arc::new(MockHttpClient::error_status(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal server error",
-        )?);
+        let triton = Arc::new(MockTritonService::with_error(
+            chronoscope_analysis::AnalysisError::Triton {
+                retriable: true,
+                message: "internal server error".to_string(),
+            },
+        ));
 
-        let (_media, result) = harness.process_with_mock(http).await?;
+        let (_media, result) = harness.process_with_mock(triton).await?;
 
         assert!(
             matches!(result, ItemResult::RetriableFailure { .. }),
-            "expected RetriableFailure for 500, got {result:?}"
+            "expected RetriableFailure for retriable Triton error, got {result:?}"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_retriable_error_triton_429() -> TestResult {
+    async fn test_permanent_error_triton_invalid_argument() -> TestResult {
         let harness = AnalysisTestHarness::new().await?;
         harness.create_media_for_analysis().await?;
 
-        // Mock a 429 Too Many Requests response
-        let http = Arc::new(MockHttpClient::error_status(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate limited",
-        )?);
+        let triton = Arc::new(MockTritonService::with_error(
+            chronoscope_analysis::AnalysisError::Triton {
+                retriable: false,
+                message: "invalid image format".to_string(),
+            },
+        ));
 
-        let (_media, result) = harness.process_with_mock(http).await?;
-
-        assert!(
-            matches!(result, ItemResult::RetriableFailure { .. }),
-            "expected RetriableFailure for 429, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_permanent_error_triton_400() -> TestResult {
-        let harness = AnalysisTestHarness::new().await?;
-        harness.create_media_for_analysis().await?;
-
-        // Mock a 400 Bad Request (e.g., invalid image format)
-        let http = Arc::new(MockHttpClient::error_status(
-            StatusCode::BAD_REQUEST,
-            "invalid image format",
-        )?);
-
-        let (_media, result) = harness.process_with_mock(http).await?;
+        let (_media, result) = harness.process_with_mock(triton).await?;
 
         assert!(
             matches!(result, ItemResult::PermanentFailure { .. }),
-            "expected PermanentFailure for 400, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_permanent_error_image_too_large() -> TestResult {
-        let harness = AnalysisTestHarness::new().await?;
-        harness.create_media_for_analysis().await?;
-
-        // Mock a 413 Payload Too Large response
-        let http = Arc::new(MockHttpClient::error_status(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "image exceeds maximum size of 10MB",
-        )?);
-
-        let (_media, result) = harness.process_with_mock(http).await?;
-
-        assert!(
-            matches!(result, ItemResult::PermanentFailure { .. }),
-            "expected PermanentFailure for 413, got {result:?}"
+            "expected PermanentFailure for permanent Triton error, got {result:?}"
         );
         Ok(())
     }
@@ -356,37 +297,15 @@ mod tests {
         let harness = AnalysisTestHarness::new().await?;
         harness.create_media_for_analysis().await?;
 
-        // Mock a 200 OK with unparseable JSON body
-        let http = Arc::new(MockHttpClient::success(b"not valid json {{{")?);
+        let triton = Arc::new(MockTritonService::with_error(
+            chronoscope_analysis::AnalysisError::ResponseParsing("malformed response".to_string()),
+        ));
 
-        let (_media, result) = harness.process_with_mock(http).await?;
-
-        assert!(
-            matches!(result, ItemResult::PermanentFailure { .. }),
-            "expected PermanentFailure for malformed response, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_permanent_error_missing_result_output() -> TestResult {
-        let harness = AnalysisTestHarness::new().await?;
-        harness.create_media_for_analysis().await?;
-
-        // Mock a 200 OK with valid JSON but missing 'result' output
-        let response = serde_json::json!({
-            "outputs": [{
-                "name": "wrong_name",
-                "data": ["{}"]
-            }]
-        });
-        let http = Arc::new(MockHttpClient::success(&serde_json::to_vec(&response)?)?);
-
-        let (_media, result) = harness.process_with_mock(http).await?;
+        let (_media, result) = harness.process_with_mock(triton).await?;
 
         assert!(
             matches!(result, ItemResult::PermanentFailure { .. }),
-            "expected PermanentFailure for missing result output, got {result:?}"
+            "expected PermanentFailure for parsing error, got {result:?}"
         );
         Ok(())
     }
@@ -414,11 +333,12 @@ mod tests {
         };
         harness.db.get_or_create_media(&media_data).await?;
 
-        // The HTTP client won't even be called - storage lookup fails first
-        let response_body = triton_success_response(&minimal_analysis_result())?;
-        let http = Arc::new(MockHttpClient::success(&response_body)?);
+        // The triton client won't even be called - storage lookup fails first
+        let triton = Arc::new(MockTritonService::with_analysis_result(
+            minimal_analysis_result(),
+        ));
 
-        let (_media, result) = harness.process_with_mock(http).await?;
+        let (_media, result) = harness.process_with_mock(triton).await?;
 
         assert!(
             matches!(result, ItemResult::RetriableFailure { .. }),

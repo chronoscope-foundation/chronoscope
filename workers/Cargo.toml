@@ -23,9 +23,11 @@ chronoscope-integrations = { path = "../integrations" }
 # Async runtime
 tokio.workspace = true
 
-# HTTP (types re-exported from integrations, need reqwest for StatusCode in tests)
+# Async
 async-trait = "0.1"
 bytes.workspace = true
+
+# HTTP types (StatusCode used in URL fetcher error handling)
 reqwest = { version = "0.12", default-features = false }
 
 # Hashing (for content storage keys)
@@ -60,3 +62,5 @@ mp4parse = "0.17"
 tempfile = "3"
 # Enable testing utilities (MockHttpClient) for unit tests
 chronoscope-integrations = { path = "../integrations", features = ["testing"] }
+# Enable MockTritonService for analysis worker tests
+chronoscope-analysis = { path = "../analysis", features = ["testing"] }

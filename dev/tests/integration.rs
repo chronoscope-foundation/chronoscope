@@ -12,6 +12,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chronoscope_analysis::{GrpcTritonClient, TritonService};
 use chronoscope_api::research_types::{
     AnalysisOutcome, MediaReference, ResearchUrlDossier, ResolvedContent,
 };
@@ -47,12 +48,20 @@ const EXTERNAL_API_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for analysis operations. Triton inference can be slow
 const ANALYSIS_TIMEOUT: Duration = Duration::from_mins(5);
 
-fn fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
-    // Fixtures are in the integrations crate
+fn http_fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
+    // HTTP fixtures are in the integrations crate
     Ok(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("dev crate should have parent")?
         .join("integrations/fixtures"))
+}
+
+fn triton_fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
+    // Triton gRPC fixtures are in the analysis crate
+    Ok(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or("dev crate should have parent")?
+        .join("analysis/fixtures"))
 }
 
 fn vcr_mode() -> CacheMode {
@@ -87,15 +96,19 @@ impl TestServer {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         init_tracing();
 
-        // Use TRITON_ENDPOINT from environment, or the default endpoint fixtures were recorded with.
-        // The VCR cache key includes the URL, so we need consistent URLs between recording and playback.
-        let triton_endpoint: Option<url::Url> = Some(
-            std::env::var("TRITON_ENDPOINT")
-                .unwrap_or_else(|_| "http://38.80.122.36:12880".to_string())
-                .parse()?,
-        );
+        // Build Triton service: live+recording or offline depending on mode.
+        let triton: Option<Arc<dyn TritonService>> = if cfg!(feature = "record-fixtures") {
+            let endpoint = std::env::var("TRITON_ENDPOINT")
+                .expect("TRITON_ENDPOINT must be set when recording fixtures");
+            Some(Arc::new(
+                GrpcTritonClient::recording(&endpoint, triton_fixtures_dir()?).await?,
+            ))
+        } else {
+            Some(Arc::new(GrpcTritonClient::offline(triton_fixtures_dir()?)))
+        };
+
         let http_client: Arc<dyn HttpClient> =
-            Arc::new(CachingClient::new(fixtures_dir()?, vcr_mode())?);
+            Arc::new(CachingClient::new(http_fixtures_dir()?, vcr_mode())?);
 
         let log = ConfigLogging::StderrTerminal {
             level: dropshot::ConfigLoggingLevel::Warn,
@@ -119,7 +132,7 @@ impl TestServer {
             rp_origin: None,
             ios_app_id: None,
             apify_config,
-            triton_endpoint,
+            triton,
             dns_resolver: permissive_dns_resolver(),
         })
         .await?;

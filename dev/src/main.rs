@@ -275,10 +275,15 @@ async fn run_dev_server(
         rp_origin: Some(ngrok_url.clone()),
         ios_app_id,
         apify_config,
-        // Analysis worker is optional - set via environment variable if available
-        triton_endpoint: std::env::var("TRITON_ENDPOINT")
-            .ok()
-            .and_then(|s| url::Url::parse(&s).ok()),
+        // Analysis worker is optional - connect via gRPC if TRITON_ENDPOINT is set
+        triton: match std::env::var("TRITON_ENDPOINT") {
+            Ok(endpoint) => Some(std::sync::Arc::new(
+                chronoscope_analysis::GrpcTritonClient::connect(&endpoint)
+                    .await
+                    .map_err(|e| format!("Failed to connect to Triton: {e}"))?,
+            )),
+            Err(_) => None,
+        },
         dns_resolver: default_dns_resolver()
             .map_err(|e| format!("Failed to create DNS resolver: {e}"))?,
     })
