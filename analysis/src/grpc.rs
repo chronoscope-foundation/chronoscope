@@ -41,6 +41,8 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 ///   Health checks (`is_server_ready`, `is_model_ready`) always succeed in
 ///   offline mode — the actual fixture lookup happens on `embed`/`analyze`.
 pub struct GrpcTritonClient {
+    /// The endpoint URL used to connect (empty for offline mode).
+    endpoint: String,
     mode: ClientMode,
 }
 
@@ -115,6 +117,7 @@ impl GrpcTritonClient {
     pub async fn connect(endpoint: &str) -> Result<Self, AnalysisError> {
         let client = connect_channel(endpoint).await?;
         Ok(Self {
+            endpoint: endpoint.to_string(),
             mode: ClientMode::Live { client },
         })
     }
@@ -127,6 +130,7 @@ impl GrpcTritonClient {
     pub async fn recording(endpoint: &str, cache_dir: PathBuf) -> Result<Self, AnalysisError> {
         let client = connect_channel(endpoint).await?;
         Ok(Self {
+            endpoint: endpoint.to_string(),
             mode: ClientMode::Recording { client, cache_dir },
         })
     }
@@ -138,8 +142,15 @@ impl GrpcTritonClient {
     #[must_use]
     pub fn offline(cache_dir: PathBuf) -> Self {
         Self {
+            endpoint: String::new(),
             mode: ClientMode::Offline { cache_dir },
         }
+    }
+
+    /// The endpoint URL used to connect, or empty for offline mode.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Compute SHA-256 hash of a serialized protobuf request.
