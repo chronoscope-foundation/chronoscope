@@ -22,12 +22,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy model repository
-COPY models /models
-
 # Git SHA for provenance tracking (pass via --build-arg GIT_SHA=$(git rev-parse --short HEAD))
+# Placed before COPY so that a new commit busts the cache for model configs,
+# working around Apple Container's broken COPY cache invalidation.
 ARG GIT_SHA=unknown
 ENV ANALYSIS_GIT_SHA=$GIT_SHA
+
+# Copy model repository
+COPY models /models
 
 # Environment variables
 # HuggingFace token for gated models (required for SAM3 and Qwen)

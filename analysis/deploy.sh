@@ -51,8 +51,9 @@ echo ""
 if [[ "$SKIP_BUILD" == "false" ]]; then
     # Build with Apple Container (amd64 for NVIDIA GPUs)
     # Use more memory/CPUs for large pip installs in Triton base images
-    echo "Building container for linux/amd64..."
-    container build --platform linux/amd64 --memory 8G --cpus 4 --progress plain ${NO_CACHE:+--no-cache} -t "$REGISTRY/$GHCR_REPO:$IMAGE_TAG" "$SCRIPT_DIR/triton"
+    GIT_SHA="$(git rev-parse --short HEAD)"
+    echo "Building container for linux/amd64 (git: $GIT_SHA)..."
+    container build --platform linux/amd64 --memory 8G --cpus 4 --progress plain --build-arg "GIT_SHA=$GIT_SHA" ${NO_CACHE:+--no-cache} -t "$REGISTRY/$GHCR_REPO:$IMAGE_TAG" "$SCRIPT_DIR/triton"
 
     # Push to GHCR
     echo ""

@@ -44,5 +44,9 @@ instance_group [
   }
 ]
 
+model_transaction_policy {
+  decoupled: True
+}
+
 # TODO: Enable --strict-model-config=true on server startup
 # to catch undeclared inputs/outputs at load time.
