@@ -44,6 +44,9 @@ pub mod mock;
 pub mod schema;
 pub mod service;
 
+#[cfg(feature = "corpus-test")]
+pub mod corpus;
+
 /// Generated protobuf types for the Triton gRPC API.
 #[allow(clippy::enum_variant_names)]
 pub(crate) mod triton_proto {
