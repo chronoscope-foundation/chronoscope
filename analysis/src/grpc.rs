@@ -25,8 +25,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Interval between HTTP/2 keep-alive pings.
 ///
 /// Prevents intermediaries (load balancers, firewalls, cloud NAT) from silently
-/// closing idle TCP connections between analysis requests.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// closing idle TCP connections between analysis requests. Must exceed Triton's
+/// `min_recv_ping_interval` (default ~5 min) to avoid "Too many pings" rejection.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// How long to wait for a keep-alive acknowledgment before considering the
 /// connection dead.
@@ -283,27 +284,59 @@ impl GrpcTritonClient {
     }
 
     /// Extract a named string output from the inference response.
+    ///
+    /// Triton can return BYTES data in two ways:
+    /// 1. Inline in `output.contents.bytes_contents`
+    /// 2. In `response.raw_output_contents[i]` (length-prefixed: 4-byte LE length + data)
+    ///
+    /// The 26.01+ Python backend typically uses raw_output_contents.
     fn extract_output(
         response: &triton_proto::ModelInferResponse,
         output_name: &str,
     ) -> Result<String, AnalysisError> {
-        let output = response
+        let (idx, output) = response
             .outputs
             .iter()
-            .find(|o| o.name == output_name)
+            .enumerate()
+            .find(|(_, o)| o.name == output_name)
             .ok_or_else(|| {
                 AnalysisError::ResponseParsing(format!("missing '{output_name}' output"))
             })?;
 
-        let contents = output.contents.as_ref().ok_or_else(|| {
-            AnalysisError::ResponseParsing(format!("'{output_name}' has no contents"))
+        // Try inline contents first.
+        if let Some(contents) = output.contents.as_ref() {
+            if let Some(bytes) = contents.bytes_contents.first() {
+                return std::str::from_utf8(bytes)
+                    .map(|s| s.to_string())
+                    .map_err(|e| {
+                        AnalysisError::ResponseParsing(format!("invalid UTF-8 in output: {e}"))
+                    });
+            }
+        }
+
+        // Fall back to raw_output_contents (length-prefixed BYTES).
+        let raw = response.raw_output_contents.get(idx).ok_or_else(|| {
+            AnalysisError::ResponseParsing(format!(
+                "'{output_name}' has no contents (inline or raw)"
+            ))
         })?;
 
-        let bytes = contents.bytes_contents.first().ok_or_else(|| {
-            AnalysisError::ResponseParsing(format!("empty {output_name} bytes_contents"))
+        if raw.len() < 4 {
+            return Err(AnalysisError::ResponseParsing(format!(
+                "'{output_name}' raw output too short ({} bytes)",
+                raw.len()
+            )));
+        }
+
+        let len = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+        let data = raw.get(4..4 + len).ok_or_else(|| {
+            AnalysisError::ResponseParsing(format!(
+                "'{output_name}' raw output truncated (expected {len} bytes, have {})",
+                raw.len() - 4
+            ))
         })?;
 
-        std::str::from_utf8(bytes)
+        std::str::from_utf8(data)
             .map(|s| s.to_string())
             .map_err(|e| AnalysisError::ResponseParsing(format!("invalid UTF-8 in output: {e}")))
     }

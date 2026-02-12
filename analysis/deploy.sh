@@ -7,25 +7,30 @@
 #   - (Northflank deploy only) Northflank CLI installed and authenticated
 #
 # Usage:
-#   ./deploy.sh                                              # Build, push, and deploy to Northflank
-#   ./deploy.sh --build-only                                 # Build and push container only (no Northflank)
-#   ./deploy.sh --skip-build                                 # Template-only deploy (no container build)
-#   NF_PROJECT=chronoscope-us-east ./deploy.sh --skip-build  # Deploy to different project
-#   NF_GPU_PLAN=nf-gpu-h100-80-1g VLM_MODEL=Qwen/Qwen3-VL-32B-Instruct ./deploy.sh
-#   NF_GPU_PLAN=nf-gpu-l4-24-1g ./deploy.sh                  # Budget L4 for testing
+#   ./deploy.sh                                              # Build and push container only
+#   ./deploy.sh --deploy                                     # Build, push, and deploy to Northflank
+#   ./deploy.sh --skip-build --deploy                        # Template-only deploy (no container build)
+#   NF_PROJECT=chronoscope-us-east ./deploy.sh --skip-build --deploy
+#   NF_GPU_PLAN=nf-gpu-h100-80-1g VLM_MODEL=Qwen/Qwen3-VL-32B-Instruct ./deploy.sh --deploy
+#   NF_GPU_PLAN=nf-gpu-l4-24-1g ./deploy.sh --deploy         # Budget L4 for testing
 
 set -euo pipefail
 
 # Parse arguments
 SKIP_BUILD=false
-BUILD_ONLY=false
+DEPLOY=false
 for arg in "$@"; do
     case $arg in
         --skip-build)
             SKIP_BUILD=true
             ;;
-        --build-only)
-            BUILD_ONLY=true
+        --deploy)
+            DEPLOY=true
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            echo "Usage: $0 [--skip-build] [--deploy]" >&2
+            exit 1
             ;;
     esac
 done
@@ -57,8 +62,8 @@ else
     echo "Skipping container build (--skip-build)"
 fi
 
-# 2. Deploy to Northflank (skip with --build-only)
-if [[ "$BUILD_ONLY" == "false" && "$SKIP_BUILD" == "false" ]] || [[ "$SKIP_BUILD" == "true" ]]; then
+# 2. Deploy to Northflank (requires --deploy)
+if [[ "$DEPLOY" == "true" ]]; then
     PROJECT="${NF_PROJECT:-chronoscope}"
     GPU_PLAN="${NF_GPU_PLAN:-nf-gpu-a100-80-1g}"
     VLM_MODEL="${VLM_MODEL:-}"  # Default in vlm/config.pbtxt
@@ -85,9 +90,9 @@ if [[ "$BUILD_ONLY" == "false" && "$SKIP_BUILD" == "false" ]] || [[ "$SKIP_BUILD
     echo ""
     echo "To connect to the service:"
     echo "  northflank forward service --projectId $PROJECT --serviceId triton --localPort 8000 --port 8000"
-elif [[ "$BUILD_ONLY" == "true" ]]; then
+else
     echo ""
-    echo "=== Build Complete (--build-only, skipping Northflank deploy) ==="
+    echo "=== Build Complete (pass --deploy to deploy to Northflank) ==="
 fi
 
 echo ""

@@ -1,5 +1,5 @@
 # Triton Inference Server with vLLM backend
-FROM nvcr.io/nvidia/tritonserver:25.12-vllm-python-py3
+FROM nvcr.io/nvidia/tritonserver:26.01-vllm-python-py3
 
 # Install dependencies for SAM3, image processing, and DINOv3
 RUN pip install --no-cache-dir \

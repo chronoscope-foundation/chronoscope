@@ -1,7 +1,6 @@
 {
   "model": "Qwen/Qwen3-VL-32B-Instruct-FP8",
-  "trust_remote_code": true,
-  "gpu_memory_utilization": 0.87,
+  "gpu_memory_utilization": 0.75,
   "max_model_len": 65536,
   "tensor_parallel_size": 2,
   "distributed_executor_backend": "ray",
