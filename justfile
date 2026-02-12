@@ -4,7 +4,7 @@ check:
     cargo fmt --check
     cargo clippy -- -D warnings
     cargo test
-    cargo llvm-cov
+    cargo llvm-cov --fail-under-lines 75
 
 # Format code
 [no-cd]
