@@ -39,7 +39,7 @@ just check
 cargo run -p chronoscope-dev
 
 # Generate OpenAPI spec
-cargo run --bin openapi
+cargo run --bin openapi -- api/target/openapi.json
 ```
 
 ## Code Standards
@@ -69,11 +69,12 @@ See [docs/architecture.md](docs/architecture.md) for details.
        │                                │
        │ WebAuthn                       │ SQLite
        ▼                                ▼
-   [Passkeys]                      [Database]
+   [Passkeys]                      [SQLite]
                                         │
                                         ▼
                                    [Workers]
                                    (URL fetch,
                                     content
-                                    extraction)
+                                    extraction,
+                                    image analysis)
 ```

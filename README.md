@@ -71,10 +71,13 @@ xcodebuild test -scheme Chronoscope -destination 'platform=iOS Simulator,name=iP
 ## Project Structure
 
 ```
+analysis/            Image analysis pipeline (Triton gRPC client, SAM3/VLM)
+  triton/            Python model definitions for Triton Inference Server
 api/                 Rust API server (Dropshot framework)
 db/                  Database layer (sqlx + SQLite)
-workers/             Background workers (URL fetching, content extraction)
 dev/                 Development server with ngrok integration
+integrations/        Domain-specific integrations (Reddit, Instagram), HTTP client
+workers/             Background workers (URL fetching, content extraction, analysis)
 ios/
   App/               Main iOS app (SwiftUI)
   Shared/            Code shared between app and extension

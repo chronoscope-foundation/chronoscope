@@ -5,7 +5,7 @@
 DEVELOPMENT_TEAM = YOUR_TEAM_ID_HERE
 
 // API server domain (production default shown, dev script will override)
-// For local development, run `cargo run --bin dev` in api/ which will:
+// For local development, run `cargo run -p chronoscope-dev` which will:
 //   1. Start an ngrok tunnel
 //   2. Automatically update this file with the tunnel URL
 //   3. Start the API server

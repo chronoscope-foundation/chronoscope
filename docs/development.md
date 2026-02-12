@@ -74,8 +74,8 @@ The API contract is the source of truth:
 
 1. Rust endpoints are defined with Dropshot macros
 2. Request/response types derive `JsonSchema` via schemars
-3. `cargo run --bin openapi` generates `api/target/openapi.json`
-4. iOS project symlinks to this file
+3. `cargo run --bin openapi -- api/target/openapi.json` generates the spec
+4. iOS project symlinks to this file at `ios/ChronoscopeAPI/Sources/ChronoscopeAPI/openapi.json`
 5. Swift OpenAPI Generator creates type-safe client code at Xcode build time
 
 To add a new endpoint:
@@ -115,7 +115,9 @@ Every test should answer: "What bug would this catch?"
 
 | Crate | Purpose |
 |-------|---------|
+| `analysis` | Image analysis pipeline (Triton gRPC client, SAM3/VLM) |
 | `api` | REST API server, authentication, endpoints |
 | `db` | Database layer, models, queries |
-| `workers` | Background processing, URL fetching, content extraction |
 | `dev` | Development server with ngrok integration |
+| `integrations` | Domain-specific integrations (Reddit, Instagram), HTTP client abstraction |
+| `workers` | Background processing, URL fetching, content extraction |
