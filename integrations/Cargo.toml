@@ -36,7 +36,7 @@ chrono.workspace = true
 thiserror.workspace = true
 
 # HTTP client (full implementation)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "gzip", "stream"] }
 bytes.workspace = true
 futures-util = "0.3"
 
