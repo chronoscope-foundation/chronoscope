@@ -67,7 +67,7 @@ def make_test_image(width: int = 200, height: int = 150) -> str:
 def make_test_schema() -> str:
     """Get the actual vlm_schema::SubimageOutput schema from Rust."""
     result = subprocess.run(
-        ["cargo", "run", "--bin", "print_schema"],
+        ["cargo", "run", "--bin", "schematool"],
         capture_output=True,
         text=True,
         cwd=Path(__file__).parent.parent,  # analysis/ directory
@@ -553,7 +553,7 @@ class TestBamlConverter:
         This ensures Python and Rust components stay in sync.
         """
         result = subprocess.run(
-            ["cargo", "run", "--bin", "print_schema"],
+            ["cargo", "run", "--bin", "schematool"],
             capture_output=True,
             text=True,
             cwd=Path(__file__).parent.parent,  # analysis/ directory
@@ -1216,7 +1216,7 @@ class TestSchemaCompatibility:
 
         # Get the Rust-generated schema
         result = subprocess.run(
-            ["cargo", "run", "--bin", "print_schema", "result"],
+            ["cargo", "run", "--bin", "schematool", "result"],
             capture_output=True,
             text=True,
             cwd=Path(__file__).parent.parent,
@@ -1291,7 +1291,7 @@ class TestSchemaCompatibility:
 
         # Validate via serde deserialization (catches deny_unknown_fields, tagging, etc.)
         validate_result = subprocess.run(
-            ["cargo", "run", "--bin", "print_schema", "--", "validate"],
+            ["cargo", "run", "--bin", "schematool", "--", "validate"],
             input=json.dumps(python_output),
             capture_output=True,
             text=True,

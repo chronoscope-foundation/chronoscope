@@ -36,7 +36,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("Usage: print_schema [vlm|result|validate]");
+            eprintln!("Usage: schematool [vlm|result|validate]");
             eprintln!("  vlm      - VLM subimage output schema (default)");
             eprintln!("  result   - Full AnalysisResult schema");
             eprintln!("  validate - Read JSON from stdin and validate against AnalysisResult");

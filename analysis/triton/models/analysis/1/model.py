@@ -853,7 +853,7 @@ both sides for validation.
 
         Note: The conditional inclusion of embedding/thinking keys mirrors the
         Rust-side ``#[serde(skip_serializing_if = "Option::is_none")]``. The
-        cross-language ``print_schema validate`` test catches drift.
+        cross-language ``schematool validate`` test catches drift.
         """
         vlm_regions = vlm["regions"]  # Now a list, not a dict
 
