@@ -31,9 +31,9 @@ import mock_triton
 _models_dir = Path(__file__).parent / "models"
 
 
-def _load_model_module(model_dir: Path, module_name: str):
-    """Load a model.py from a specific directory as a unique module."""
-    model_path = model_dir / "model.py"
+def _load_model_module(model_dir: Path, module_name: str, filename: str = "model.py"):
+    """Load a Python module from a specific directory as a unique module."""
+    model_path = model_dir / filename
     spec = importlib.util.spec_from_file_location(module_name, model_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load module from {model_path}")
@@ -46,12 +46,9 @@ def _load_model_module(model_dir: Path, module_name: str):
 sam3_module = _load_model_module(_models_dir / "sam3" / "1", "sam3_model")
 analysis_model = _load_model_module(_models_dir / "analysis" / "1", "analysis_model")
 dinov3_module = _load_model_module(_models_dir / "dinov3" / "1", "dinov3_model")
-
-_baml_path = _models_dir / "analysis" / "1" / "baml_converter.py"
-_baml_spec = importlib.util.spec_from_file_location("baml_converter_test", _baml_path)
-assert _baml_spec is not None and _baml_spec.loader is not None
-baml_converter = importlib.util.module_from_spec(_baml_spec)
-_baml_spec.loader.exec_module(baml_converter)
+baml_converter = _load_model_module(
+    _models_dir / "analysis" / "1", "baml_converter_test", filename="baml_converter.py"
+)
 
 # =============================================================================
 # Test helpers
@@ -662,7 +659,7 @@ def _make_vlm_response(**overrides: object) -> dict:
     """Build a valid VLM analyzed response with optional field overrides.
 
     Returns a canonical vlm_schema::SubimageOutput (analyzed variant).
-    Callers override specific fields via keyword args for deep merge.
+    Callers override specific fields via keyword args (single-level merge for dicts).
     """
     base = {
         "status": "analyzed",
@@ -1273,3 +1270,110 @@ class TestSchemaCompatibility:
         assert subimage["analysis"]["status"] == "analyzed"
         assert len(subimage["analysis"]["regions"]) == 1
         assert len(subimage["analysis"]["embedding"]) == 1024
+
+
+# =============================================================================
+# Real model integration tests
+# =============================================================================
+
+
+def _make_pipeline_request(image_b64: str) -> mock_triton.InferenceRequest:
+    """Create a pipeline request with VLM skipped (for real-model integration tests)."""
+    return mock_triton.InferenceRequest(
+        model_name="analysis",
+        requested_output_names=["result"],
+        inputs=[
+            mock_triton.Tensor("image", np.array([[image_b64.encode("utf-8")]])),
+            mock_triton.Tensor("schema", np.array([[b"{}"]])),
+            mock_triton.Tensor("skip_vlm", np.array([[True]])),
+        ],
+    )
+
+
+class TestPipelineIntegration:
+    """Integration tests using real SAM3/DINOv3 models (VLM skipped).
+
+    These exercise the full pipeline with actual model inference on MPS/CPU.
+    """
+
+    def test_segmented_output_structure(self, pipeline):
+        """Real pipeline produces valid Segmented output for a solid-color image."""
+        image_b64 = make_test_image()
+
+        responses = pipeline.execute([_make_pipeline_request(image_b64)])
+        result = _parse_result(responses[0])
+
+        assert result["outcome"] == "success"
+        assert len(result["subimages"]) >= 1
+
+        for subimage in result["subimages"]:
+            assert "bounds" in subimage
+            analysis = subimage["analysis"]
+            # VLM skipped -> Segmented variant
+            assert analysis["status"] == "segmented"
+            assert isinstance(analysis["regions"], list)
+            # Subimage embedding should be 1024-dim
+            assert len(analysis["embedding"]) == 1024
+            assert abs(sum(x**2 for x in analysis["embedding"]) - 1.0) < 0.01
+
+    def test_embeddings_are_deterministic(self, pipeline):
+        """Same image produces identical embeddings across runs."""
+        image_b64 = make_test_image(width=100, height=100)
+
+        def run_once() -> list[float]:
+            responses = pipeline.execute([_make_pipeline_request(image_b64)])
+            result = _parse_result(responses[0])
+            embedding: list[float] = result["subimages"][0]["analysis"]["embedding"]
+            return embedding
+
+        emb1 = run_once()
+        emb2 = run_once()
+        diff = sum((a - b) ** 2 for a, b in zip(emb1, emb2, strict=True)) ** 0.5
+        assert diff < 1e-5, f"Embeddings differ by L2={diff}"
+
+    def test_different_images_produce_different_embeddings(self, pipeline):
+        """Distinct images produce meaningfully different embeddings."""
+        img_a = make_test_image(width=200, height=200)
+        # Create a visually different image
+        img_bright = Image.new("RGB", (200, 200), color=(255, 0, 0))
+        buffer = io.BytesIO()
+        img_bright.save(buffer, format="JPEG", quality=85)
+        img_b = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        def get_embedding(b64: str) -> list[float]:
+            responses = pipeline.execute([_make_pipeline_request(b64)])
+            result = _parse_result(responses[0])
+            embedding: list[float] = result["subimages"][0]["analysis"]["embedding"]
+            return embedding
+
+        emb_a = get_embedding(img_a)
+        emb_b = get_embedding(img_b)
+
+        cosine_sim = sum(a * b for a, b in zip(emb_a, emb_b, strict=True))
+        assert cosine_sim < 0.99, f"Distinct images too similar: cosine={cosine_sim:.4f}"
+
+    def test_schema_validation_with_real_output(self, pipeline):
+        """Real pipeline output validates against the Rust AnalysisResult schema."""
+        result_proc = subprocess.run(
+            ["cargo", "run", "--bin", "schematool", "--", "validate"],
+            input="null",
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent.parent,
+        )
+        if result_proc.returncode != 0 and "cargo" in result_proc.stderr.lower():
+            pytest.skip("cargo not available for schema validation")
+
+        image_b64 = make_test_image()
+
+        responses = pipeline.execute([_make_pipeline_request(image_b64)])
+        result = _parse_result(responses[0])
+
+        validate_result = subprocess.run(
+            ["cargo", "run", "--bin", "schematool", "--", "validate"],
+            input=json.dumps(result),
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent.parent,
+        )
+        assert validate_result.returncode == 0, f"serde validation failed: {validate_result.stderr}"

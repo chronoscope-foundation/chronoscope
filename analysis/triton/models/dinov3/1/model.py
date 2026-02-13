@@ -28,11 +28,32 @@ def get_string_from_tensor(tensor: Any) -> str:
     return result
 
 
+# Max images per DINOv3 forward pass (caps GPU memory).
+# At 512x512 with ViT-L, 8 images is ~1GB activation memory.
+CHUNK_SIZE = 8
+
+
+def _select_device() -> str:
+    """Select best available device: CUDA > MPS > CPU.
+
+    NOTE: This helper is intentionally duplicated across model files. Triton's
+    Python backend loads each model in isolation, so there's no clean way to
+    share code between models without complicating the deployment structure.
+    """
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class TritonPythonModel:
     """DINOv3 embedding model."""
 
     def initialize(self, args: dict[str, str]) -> None:
-        """Load DINOv3 model and processor."""
+        """Load DINOv3 model and processor on best available device."""
         import torch
         from transformers import AutoImageProcessor, AutoModel
 
@@ -59,12 +80,15 @@ class TritonPythonModel:
         self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
         self.model.eval()
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("DINOv3 requires a GPU but none is available")
-        self.device = torch.device("cuda")
+        device = _select_device()
+        self.device = torch.device(device)
         self.model = self.model.to(self.device)
 
-        pb_utils.Logger.log_info(f"DINOv3 loaded on {self.device} (image_size={self.image_size})")
+        n_params = sum(p.numel() for p in self.model.parameters())
+        pb_utils.Logger.log_info(
+            f"DINOv3 loaded: {n_params / 1e6:.0f}M params on {self.device} "
+            f"(image_size={self.image_size})"
+        )
 
     def execute(self, requests: list[Any]) -> list[Any]:
         """Process embedding requests.
@@ -87,9 +111,6 @@ class TritonPythonModel:
                 img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
                 pil_images.append(img)
 
-            # Process in chunks to avoid GPU OOM with many region crops.
-            # At 512x512 with ViT-L, 8 images is ~1GB activation memory.
-            CHUNK_SIZE = 8
             all_embeddings = []
 
             for chunk_start in range(0, len(pil_images), CHUNK_SIZE):

@@ -600,7 +600,7 @@ class TritonPythonModel:
             vlm_results: dict[int, dict[str, Any]] = {}
             if vlm_inputs:
                 assert vlm_prompt is not None  # vlm_inputs is only populated when not skip_vlm
-                with ThreadPoolExecutor(max_workers=len(vlm_inputs)) as pool:
+                with ThreadPoolExecutor(max_workers=min(len(vlm_inputs), 8)) as pool:
                     future_to_idx = {
                         pool.submit(
                             self._call_vlm,

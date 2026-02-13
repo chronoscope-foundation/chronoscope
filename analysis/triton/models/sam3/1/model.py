@@ -67,19 +67,56 @@ def encode_rle(mask: np.ndarray) -> list[int]:
     return counts
 
 
+def _select_device() -> str:
+    """Select best available device: CUDA > MPS > CPU.
+
+    NOTE: This helper is intentionally duplicated across model files. Triton's
+    Python backend loads each model in isolation, so there's no clean way to
+    share code between models without complicating the deployment structure.
+    """
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 class TritonPythonModel:
     """SAM3 segmentation model."""
 
     def initialize(self, args):
-        """Load SAM3 model from HuggingFace."""
+        """Load SAM3 model on best available device."""
         self.model_config = json.loads(args["model_config"])
 
         from sam3.model.sam3_image_processor import Sam3Processor
         from sam3.model_builder import build_sam3_image_model
 
-        self.model = build_sam3_image_model()
-        self.processor = Sam3Processor(self.model)
-        pb_utils.Logger.log_info("Loaded SAM3 model")
+        device = _select_device()
+
+        # Build on CPU first — SAM3 initialization has ops that fail on MPS.
+        # Then .to(device) moves parameters and buffers, but compilable_cord_cache
+        # and coord_cache are plain tuples (not registered buffers), so .to()
+        # misses them. We move those manually to avoid device mismatch at inference.
+        self.model = build_sam3_image_model(device="cpu")
+        if device != "cpu":
+            self.model = self.model.to(device)
+            if device == "mps":
+                for module in self.model.modules():
+                    cache = getattr(module, "compilable_cord_cache", None)
+                    if cache is not None:
+                        h, w = cache
+                        module.compilable_cord_cache = (h.to(device), w.to(device))
+                    if hasattr(module, "coord_cache"):
+                        for key in module.coord_cache:
+                            h, w = module.coord_cache[key]
+                            module.coord_cache[key] = (h.to(device), w.to(device))
+
+        self.processor = Sam3Processor(self.model, device=device)
+
+        n_params = sum(p.numel() for p in self.model.parameters())
+        pb_utils.Logger.log_info(f"Loaded SAM3: {n_params / 1e6:.0f}M params on {device}")
 
     def execute(self, requests):
         """Process segmentation requests."""
@@ -141,6 +178,9 @@ class TritonPythonModel:
 
             except Exception as e:
                 pb_utils.Logger.log_warn(f"Segmentation failed for prompt '{prompt}': {e}")
+
+        if not all_masks and (prompts or ENTITY_PROMPTS):
+            pb_utils.Logger.log_warn("All prompts failed to produce regions")
 
         # Convert to output format — raw masks, no post-processing
         regions = [

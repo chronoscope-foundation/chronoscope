@@ -80,6 +80,26 @@ def register_model(name: str, handler: Callable[[dict[str, Any]], InferenceRespo
     _model_handlers[name] = handler
 
 
+def register_model_instance(name: str, model_instance: Any):
+    """Register a TritonPythonModel instance for BLS calls.
+
+    Adapts the model's execute(list[Request]) -> list[Response] interface
+    to the handler's dict[str, Tensor] -> Response interface used by mock dispatch.
+    """
+
+    def handler(inputs: dict[str, Any]) -> InferenceResponse:
+        request = InferenceRequest(
+            model_name=name,
+            requested_output_names=[],
+            inputs=list(inputs.values()),
+        )
+        responses = model_instance.execute([request])
+        result: InferenceResponse = responses[0]
+        return result
+
+    _model_handlers[name] = handler
+
+
 def clear_models():
     """Clear all registered model handlers."""
     _model_handlers.clear()
@@ -123,23 +143,25 @@ class InferenceRequest:
     def inputs(self) -> list[Tensor]:
         return list(self._inputs.values())
 
+    def _dispatch(self) -> InferenceResponse:
+        """Look up handler and execute, wrapping any exception as a TritonError."""
+        handler = _model_handlers.get(self.model_name)
+        if handler is None:
+            return InferenceResponse(
+                error=TritonError(f"No handler registered for model '{self.model_name}'")
+            )
+        try:
+            return handler(self._inputs)
+        except Exception as e:
+            return InferenceResponse(error=TritonError(str(e)))
+
     def async_exec(self) -> InferenceFuture:
         """Execute BLS call asynchronously.
 
         Returns a Future that can be resolved with .get().
         In mock mode, execution happens immediately.
         """
-        handler = _model_handlers.get(self.model_name)
-        if handler is None:
-            response = InferenceResponse(
-                error=TritonError(f"No handler registered for model '{self.model_name}'")
-            )
-        else:
-            try:
-                response = handler(self._inputs)
-            except Exception as e:
-                response = InferenceResponse(error=TritonError(str(e)))
-        return InferenceFuture(response)
+        return InferenceFuture(self._dispatch())
 
     def exec(self, decoupled: bool = False) -> InferenceResponse | Iterator[InferenceResponse]:
         """Execute BLS call by looking up registered handler.
@@ -148,19 +170,8 @@ class InferenceRequest:
             decoupled: If True, return an iterator of responses (for streaming).
                       Mock just yields a single response.
         """
-        handler = _model_handlers.get(self.model_name)
-        if handler is None:
-            response = InferenceResponse(
-                error=TritonError(f"No handler registered for model '{self.model_name}'")
-            )
-        else:
-            try:
-                response = handler(self._inputs)
-            except Exception as e:
-                response = InferenceResponse(error=TritonError(str(e)))
-
+        response = self._dispatch()
         if decoupled:
-            # Return iterator for decoupled mode
             return iter([response])
         return response
 
