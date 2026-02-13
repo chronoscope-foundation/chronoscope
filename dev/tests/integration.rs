@@ -419,13 +419,14 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
         return Err("expected successful analysis".into());
     };
 
+    let chronoscope_analysis::AnalysisResult::Success { subimages, .. } = result else {
+        return Err("expected Success variant".into());
+    };
+
     assert!(
-        !result.subimages.is_empty(),
+        !subimages.is_empty(),
         "analysis should have at least one subimage"
     );
-
-    // Get the primary subimage's analysis
-    let chronoscope_api::research_types::AnalysisResult { subimages, .. } = result;
     let subimage = &subimages[0];
 
     let chronoscope_analysis::SubimageAnalysis::Analyzed { scene, regions, .. } =

@@ -51,7 +51,7 @@ pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
         SceneType, Subimage, SubimageAnalysis, SubimageBounds,
     };
 
-    AnalysisResult {
+    AnalysisResult::Success {
         subimages: vec![Subimage {
             bounds: SubimageBounds {
                 bbox: BoundingBox {
@@ -71,10 +71,7 @@ pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
                     },
                     content_summary: "A test image".to_string(),
                     scene_type: SceneType::Outdoor,
-                    scene_observations: Default::default(),
-                    extracted_text: vec![],
                 },
-                thinking: None,
                 embedding: None,
                 regions: vec![],
             },

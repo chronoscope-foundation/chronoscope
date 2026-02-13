@@ -12,6 +12,12 @@ input [
     name: "schema"
     data_type: TYPE_STRING
     dims: [1]
+  },
+  {
+    name: "skip_vlm"
+    data_type: TYPE_BOOL
+    dims: [1]
+    optional: true
   }
 ]
 

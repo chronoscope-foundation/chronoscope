@@ -564,7 +564,7 @@ mod tests {
             SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds,
         };
 
-        let analysis_result = AnalysisResult {
+        let analysis_result = AnalysisResult::Success {
             subimages: vec![Subimage {
                 bounds: SubimageBounds {
                     bbox: BoundingBox {
@@ -584,10 +584,7 @@ mod tests {
                         },
                         content_summary: "A historic building on a street corner".to_string(),
                         scene_type: SceneType::Outdoor,
-                        scene_observations: Default::default(),
-                        extracted_text: vec![],
                     },
-                    thinking: None,
                     embedding: None,
                     regions: vec![],
                 },
@@ -610,9 +607,12 @@ mod tests {
         let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
             return Err(test_err("Expected analysis Success"));
         };
-        assert_eq!(result.subimages.len(), 1);
+        let AnalysisResult::Success { subimages, .. } = result else {
+            return Err(test_err("Expected Success variant"));
+        };
+        assert_eq!(subimages.len(), 1);
 
-        let SubimageAnalysis::Analyzed { scene, .. } = &result.subimages[0].analysis else {
+        let SubimageAnalysis::Analyzed { scene, .. } = &subimages[0].analysis else {
             return Err(test_err("Expected Analyzed subimage"));
         };
         assert_eq!(
@@ -629,7 +629,7 @@ mod tests {
             SubimageBounds,
         };
 
-        let analysis_result = AnalysisResult {
+        let analysis_result = AnalysisResult::Success {
             subimages: vec![Subimage {
                 bounds: SubimageBounds {
                     bbox: BoundingBox {
@@ -664,8 +664,11 @@ mod tests {
         let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
             return Err(test_err("Expected analysis Success"));
         };
+        let AnalysisResult::Success { subimages, .. } = result else {
+            return Err(test_err("Expected Success variant"));
+        };
         assert!(matches!(
-            &result.subimages[0].analysis,
+            &subimages[0].analysis,
             SubimageAnalysis::Rejected { reason } if reason == "portrait photo"
         ));
         Ok(())
@@ -683,5 +686,30 @@ mod tests {
             result.is_err(),
             "Corrupt analysis JSON should return internal error"
         );
+    }
+
+    #[test]
+    fn test_convert_analysis_image_rejected() -> TestResult {
+        use chronoscope_analysis::AnalysisResult;
+
+        let analysis_result = AnalysisResult::ImageRejected {
+            reason: "image too large".to_string(),
+        };
+
+        let mut media = minimal_media();
+        media.analysis = chronoscope_db::MediaAnalysisState::Complete {
+            analysis_result: serialize(&analysis_result)?,
+        };
+
+        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+
+        let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
+            return Err(test_err("Expected analysis Success"));
+        };
+        assert!(matches!(
+            result,
+            AnalysisResult::ImageRejected { reason } if reason == "image too large"
+        ));
+        Ok(())
     }
 }

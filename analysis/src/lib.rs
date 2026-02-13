@@ -31,7 +31,10 @@
 //! client.is_server_ready().await?;
 //! let image_bytes = std::fs::read("image.jpg")?;
 //! let result: AnalysisResult = client.analyze(&image_bytes).await?;
-//! println!("Subimages: {}", result.subimages.len());
+//! match result {
+//!     AnalysisResult::Success { subimages, .. } => println!("Subimages: {}", subimages.len()),
+//!     AnalysisResult::ImageRejected { reason } => println!("Rejected: {reason}"),
+//! }
 //! ```
 
 #![deny(clippy::unwrap_used)]
@@ -57,10 +60,9 @@ pub(crate) mod triton_proto {
 pub use error::AnalysisError;
 pub use grpc::GrpcTritonClient;
 pub use schema::{
-    AnalysisRequest, AnalysisResult, AnalyzedMediaType, BoundingBox, ConditionIndicator,
-    EntityType, ExtractedText, FacadeMaterial, ModelVersions, PhotoColor, Region, RegionAnalysis,
-    RegionIndex, RegionObservations, RegionRelation, RelationType, RleMask, RoadSurface, RoofType,
-    SceneAnalysis, SceneObservations, SceneType, StreetInfrastructure, StructuralElement, Subimage,
-    SubimageAnalysis, SubimageBounds, SurroundingType, Surroundings, VehicleType, WindowShape,
+    AnalysisRequest, AnalysisResult, AnalyzedMediaType, BoundingBox, EntityType, ModelVersions,
+    PhotoColor, Region, RegionAnalysis, RegionIndex, RegionRelation, RelationType, RleMask,
+    SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds, SurroundingType,
+    Surroundings,
 };
 pub use service::TritonService;

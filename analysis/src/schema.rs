@@ -2,7 +2,7 @@
 //!
 //! The pipeline outputs subimage-centric results: each source image is split into
 //! one or more subimages (panels), and each subimage gets independent SAM3 segmentation,
-//! VLM analysis, and DINOv3 embeddings.
+//! optional VLM analysis, and DINOv3 embeddings.
 //!
 //! Region surroundings form a constraint graph: when external knowledge identifies
 //! one entity, constraints propagate along relationship edges to narrow down unknowns.
@@ -93,195 +93,6 @@ pub enum SceneType {
     Mixed,
 }
 
-/// Text extracted from the image.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ExtractedText {
-    /// The text content
-    #[schemars(description = "The text as it appears")]
-    pub text: String,
-
-    /// Where the text appears
-    #[schemars(
-        description = "Location: 'storefront sign', 'cornerstone', 'awning', 'bottom margin caption', 'watermark'"
-    )]
-    pub location: String,
-}
-
-// ==================== Scene-level Observation Types ====================
-
-/// Type of vehicle visible in the scene (dating signal).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum VehicleType {
-    HorseDrawn,
-    #[schemars(description = "Pre-~1930: exposed running boards, crank starts")]
-    EarlyAutomobile,
-    #[schemars(description = "~1930s-1970s: chrome, fins, rounded bodies")]
-    MidcenturyAutomobile,
-    #[schemars(description = "Post-~1980")]
-    ModernAutomobile,
-    Streetcar,
-    Bicycle,
-}
-
-/// Street infrastructure elements visible in the scene (dating signal).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum StreetInfrastructure {
-    GasLamp,
-    ElectricPole,
-    #[schemars(description = "Trolley, electric, or telegraph wires")]
-    OverheadWires,
-    TrolleyTracks,
-    TrafficSignal,
-    FireHydrant,
-}
-
-/// Road surface type (dating/location signal).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RoadSurface {
-    Dirt,
-    #[schemars(description = "Cobblestone or Belgian block")]
-    Cobblestone,
-    Asphalt,
-    Concrete,
-}
-
-/// Scene-level observations visible across the entire subimage.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SceneObservations {
-    pub vehicles: Vec<VehicleType>,
-    pub street_infrastructure: Vec<StreetInfrastructure>,
-    pub road_surface: Vec<RoadSurface>,
-
-    #[schemars(
-        description = "Other observations not covered above: e.g., 'elevated railway', 'horse trough', 'newsstand'"
-    )]
-    pub other_observations: Vec<String>,
-}
-
-// ==================== Region-level Observation Types ====================
-
-/// Roof type visible on a structure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RoofType {
-    Flat,
-    /// Triangular roof.
-    Gable,
-    /// Slopes on all four sides.
-    Hip,
-    /// Double-sloped, steep lower section.
-    Mansard,
-    /// Barn-style, two slopes per side.
-    Gambrel,
-    Dome,
-    /// Small dome or lantern on top of a roof.
-    Cupola,
-}
-
-/// Facade material of a structure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FacadeMaterial {
-    Brick,
-    Brownstone,
-    Limestone,
-    Marble,
-    CastIron,
-    GlassCurtainWall,
-    Concrete,
-    CorrugatedMetal,
-    Stucco,
-    Wood,
-    TerraCotta,
-    /// Generic or unspecified stone type.
-    Stone,
-}
-
-/// Structural or architectural element visible on a structure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum StructuralElement {
-    /// Projecting molding at roofline.
-    Cornice,
-    /// Triangular gable above entrance or window.
-    Pediment,
-    /// Flat column attached to wall.
-    Pilaster,
-    /// Corner stones.
-    Quoin,
-    /// Horizontal support above opening.
-    Lintel,
-    /// Wedge-shaped stone at arch apex.
-    Keystone,
-    /// Railing with balusters.
-    Balustrade,
-    BayWindow,
-    /// Window projecting from roof.
-    Dormer,
-    FireEscape,
-    WaterTower,
-    Chimney,
-    Tower,
-    Spire,
-    Porch,
-    /// Covered entrance with columns.
-    Portico,
-    Columns,
-    Balcony,
-}
-
-/// Window shape visible on a structure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum WindowShape {
-    Rectangular,
-    Arched,
-    /// Oculus or porthole.
-    Round,
-}
-
-/// Condition indicator for a structure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ConditionIndicator {
-    Intact,
-    #[schemars(description = "Charring, smoke stains, collapsed sections from fire")]
-    FireDamage,
-    PartialDemolition,
-    UnderConstruction,
-    Scaffolding,
-    BoardedUp,
-    Renovated,
-    #[schemars(description = "Peeling paint, crumbling masonry, missing elements")]
-    Deteriorating,
-}
-
-/// Region-level observations for a built structure.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RegionObservations {
-    pub roof_types: Vec<RoofType>,
-    pub facade_materials: Vec<FacadeMaterial>,
-    pub structural_elements: Vec<StructuralElement>,
-
-    // TODO: Add ArchitecturalStyle enum when VLM reliability is validated
-    // (classical, gothic_revival, beaux_arts, art_deco, victorian, etc.)
-    pub window_shapes: Vec<WindowShape>,
-
-    #[schemars(description = "Number of stories (floors) visible, if countable")]
-    pub stories_visible: Option<u32>,
-
-    #[schemars(
-        description = "Other features not covered above: 'clock face', 'distinctive dome', 'ornate cornice with lion heads'"
-    )]
-    pub other_features: Vec<String>,
-}
-
 // ==================== Surroundings Types ====================
 
 /// Type of non-entity context surrounding a region.
@@ -341,9 +152,8 @@ pub struct RegionRelation {
 /// Surroundings of a region: non-entity context and relationships to other regions.
 ///
 /// Each region describes both what non-entity things are around it AND its
-/// relationships to other numbered regions. Relationships may appear from both
-/// sides (region 0 says `shares_wall` with region 1, region 1 says `shares_wall`
-/// with region 0) — the solver can validate symmetry.
+/// relationships to other numbered regions. Relations reference only regions
+/// with a lower index (the solver reconstructs the full symmetric graph).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Surroundings {
@@ -354,6 +164,9 @@ pub struct Surroundings {
     )]
     pub other_non_entity: Vec<String>,
 
+    #[schemars(
+        description = "Spatial relationships to regions with LOWER index only (0-based). The solver reconstructs symmetric relations."
+    )]
     pub related_regions: Vec<RegionRelation>,
 }
 
@@ -382,15 +195,6 @@ pub struct RegionAnalysis {
 
     #[schemars(description = "Brief factual description of what's visible")]
     pub description: String,
-
-    pub observations: RegionObservations,
-    pub condition: Vec<ConditionIndicator>,
-
-    #[schemars(description = "e.g., 'graffiti', 'ivy-covered'")]
-    pub other_condition: Vec<String>,
-
-    #[schemars(description = "Signs, nameplates, cornerstone dates")]
-    pub visible_text: Vec<ExtractedText>,
 
     pub surroundings: Surroundings,
 }
@@ -430,7 +234,7 @@ pub struct SubimageBounds {
     pub mask: RleMask,
 }
 
-/// A unified region combining SAM3 segmentation, VLM analysis, and DINOv3 embedding.
+/// A unified region combining SAM3 segmentation, optional VLM analysis, and DINOv3 embedding.
 ///
 /// Regions are ordered left-to-right by centroid; position in the array IS identity
 /// (0-based index matches annotation labels).
@@ -451,11 +255,12 @@ pub struct Region {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
 
-    /// VLM analysis of this region.
-    pub analysis: RegionAnalysis,
+    /// VLM analysis of this region. `None` when VLM was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<RegionAnalysis>,
 }
 
-/// Scene-level analysis, shared between VLM schema and assembled results.
+/// Scene-level analysis from the VLM.
 ///
 /// Contains the scene-level fields that the VLM produces. Used directly in both
 /// [`vlm_schema::AnalyzedOutput`] (for JSON schema generation) and
@@ -474,36 +279,29 @@ pub struct SceneAnalysis {
     /// Scene type
     #[schemars(description = "Is this an outdoor, indoor, or mixed/ambiguous scene?")]
     pub scene_type: SceneType,
-
-    /// Structured scene-level observations (vehicles, infrastructure, road surface).
-    #[schemars(
-        description = "Scene-level observations: vehicles, street infrastructure, road surfaces, and other temporal cues"
-    )]
-    pub scene_observations: SceneObservations,
-
-    /// Text elsewhere in image (not in any marked region)
-    #[schemars(
-        description = "Legible text not in marked regions: street signs, captions, watermarks, date stamps, photographer credits"
-    )]
-    pub extracted_text: Vec<ExtractedText>,
 }
 
 /// Analysis result for a single subimage.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SubimageAnalysis {
-    /// Subimage was analyzed successfully.
+    /// Subimage was analyzed successfully (VLM + SAM3 + DINOv3).
     Analyzed {
         /// VLM scene-level analysis (shared type with VLM schema).
         scene: SceneAnalysis,
-        /// Chain-of-thought reasoning from the VLM (not part of VLM schema).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        thinking: Option<String>,
         /// DINOv3 CLS embedding for the whole subimage crop (1024 dims, L2-normalized).
         /// `None` if embedding was not computed or failed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         embedding: Option<Vec<f32>>,
         /// Detected and analyzed regions within this subimage.
+        regions: Vec<Region>,
+    },
+    /// Subimage was segmented but VLM was skipped (SAM3 + DINOv3 only).
+    Segmented {
+        /// DINOv3 CLS embedding for the whole subimage crop (1024 dims, L2-normalized).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        embedding: Option<Vec<f32>>,
+        /// Detected regions (no VLM analysis, only segmentation + embeddings).
         regions: Vec<Region>,
     },
     /// Subimage was rejected (not relevant for historical building research).
@@ -530,7 +328,7 @@ pub enum SubimageAnalysis {
 pub struct Subimage {
     /// Bounds of this subimage within the source image.
     pub bounds: SubimageBounds,
-    /// Analysis result (analyzed or rejected).
+    /// Analysis result (analyzed, segmented, rejected, or error).
     pub analysis: SubimageAnalysis,
 }
 
@@ -550,15 +348,23 @@ pub struct ModelVersions {
     pub git_sha: String,
 }
 
-/// Full analysis result — subimage-centric output from the analysis pipeline.
+/// Full analysis result from the analysis pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct AnalysisResult {
-    /// Detected subimages (panels) with their analysis results.
-    /// For single-image inputs, this contains exactly one entry covering the full image.
-    pub subimages: Vec<Subimage>,
-    /// Model versions used for this analysis run.
-    pub versions: ModelVersions,
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AnalysisResult {
+    /// Analysis completed (one or more subimages processed).
+    Success {
+        /// Detected subimages (panels) with their analysis results.
+        /// For single-image inputs, this contains exactly one entry covering the full image.
+        subimages: Vec<Subimage>,
+        /// Model versions used for this analysis run.
+        versions: ModelVersions,
+    },
+    /// Image was rejected before analysis (e.g., too large, unsupported format).
+    ImageRejected {
+        /// Reason for rejection.
+        reason: String,
+    },
 }
 
 /// Types used exclusively for generating the JSON schema passed to the VLM

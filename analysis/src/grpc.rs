@@ -289,7 +289,7 @@ impl GrpcTritonClient {
     /// 1. Inline in `output.contents.bytes_contents`
     /// 2. In `response.raw_output_contents[i]` (length-prefixed: 4-byte LE length + data)
     ///
-    /// The 26.01+ Python backend typically uses raw_output_contents.
+    /// The 26.01+ Python backend typically uses `raw_output_contents`.
     fn extract_output(
         response: &triton_proto::ModelInferResponse,
         output_name: &str,
@@ -304,14 +304,14 @@ impl GrpcTritonClient {
             })?;
 
         // Try inline contents first.
-        if let Some(contents) = output.contents.as_ref() {
-            if let Some(bytes) = contents.bytes_contents.first() {
-                return std::str::from_utf8(bytes)
-                    .map(|s| s.to_string())
-                    .map_err(|e| {
-                        AnalysisError::ResponseParsing(format!("invalid UTF-8 in output: {e}"))
-                    });
-            }
+        if let Some(contents) = output.contents.as_ref()
+            && let Some(bytes) = contents.bytes_contents.first()
+        {
+            return std::str::from_utf8(bytes)
+                .map(|s| s.to_string())
+                .map_err(|e| {
+                    AnalysisError::ResponseParsing(format!("invalid UTF-8 in output: {e}"))
+                });
         }
 
         // Fall back to raw_output_contents (length-prefixed BYTES).
@@ -597,8 +597,8 @@ mod tests {
         assert!(result.is_err(), "empty bytes_contents should fail");
         let err = result.unwrap_err();
         assert!(
-            matches!(err, AnalysisError::ResponseParsing(ref msg) if msg.contains("empty")),
-            "error should mention empty bytes_contents: {err}"
+            matches!(err, AnalysisError::ResponseParsing(ref msg) if msg.contains("no contents")),
+            "error should mention no contents: {err}"
         );
     }
 

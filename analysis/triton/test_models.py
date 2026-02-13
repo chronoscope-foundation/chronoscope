@@ -12,8 +12,10 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
@@ -93,7 +95,7 @@ class TestRleEncoding:
         """
 
         @given(
-            hn.arrays(
+            mask=hn.arrays(
                 dtype=np.uint8,
                 shape=st.tuples(
                     st.integers(min_value=1, max_value=100),
@@ -103,7 +105,7 @@ class TestRleEncoding:
             )
         )
         @settings(max_examples=50, deadline=None)
-        def check_roundtrip(mask):
+        def check_roundtrip(*, mask: npt.NDArray[np.uint8]) -> None:
             counts = sam3_module.encode_rle(mask)
             h, w = mask.shape
             decoded = analysis_model.decode_rle(counts, h, w)
@@ -564,11 +566,9 @@ class TestBamlConverter:
         schema = json.loads(result.stdout)
         baml = baml_converter.jsonschema_to_baml(schema)
 
-        # Check key types from new schema
+        # Check key types from simplified schema
         assert "enum RelationType" in baml
         assert "class RegionAnalysis" in baml
-        assert "class SceneObservations" in baml
-        assert "class RegionObservations" in baml
         assert "class Surroundings" in baml
 
         # Check tagged union structure
@@ -576,7 +576,11 @@ class TestBamlConverter:
         assert "analyzed" in baml
         assert "rejected" in baml
         assert "regions RegionAnalysis[]" in baml
-        assert "scene_observations SceneObservations" in baml
+
+        # Removed types should NOT appear
+        assert "SceneObservations" not in baml
+        assert "RegionObservations" not in baml
+        assert "ExtractedText" not in baml
 
 
 # =============================================================================
@@ -666,29 +670,11 @@ def _make_vlm_response(**overrides: object) -> dict:
             "media_type": {"type": "photo", "color": "color"},
             "content_summary": "Test building",
             "scene_type": "outdoor",
-            "scene_observations": {
-                "vehicles": [],
-                "street_infrastructure": [],
-                "road_surface": [],
-                "other_observations": [],
-            },
-            "extracted_text": [],
         },
         "regions": [
             {
                 "entity_type": "building",
                 "description": "A test building",
-                "observations": {
-                    "roof_types": [],
-                    "facade_materials": [],
-                    "structural_elements": [],
-                    "window_shapes": [],
-                    "stories_visible": None,
-                    "other_features": [],
-                },
-                "condition": [],
-                "other_condition": [],
-                "visible_text": [],
                 "surroundings": {
                     "non_entity": [],
                     "other_non_entity": [],
@@ -778,6 +764,14 @@ def _make_dinov3_handler():
     return handler
 
 
+def _parse_result(response: mock_triton.InferenceResponse) -> dict[str, Any]:
+    """Extract and parse the 'result' JSON from an inference response."""
+    tensor = mock_triton.get_output_tensor_by_name(response, "result")
+    assert tensor is not None, "missing 'result' output tensor"
+    result: dict[str, Any] = json.loads(tensor.as_numpy().flatten()[0].decode("utf-8"))
+    return result
+
+
 class TestAnalysisOrchestration:
     """Integration tests for the subimage-centric analysis pipeline."""
 
@@ -805,10 +799,10 @@ class TestAnalysisOrchestration:
         response = responses[0]
         assert not response.has_error()
 
-        result_tensor = mock_triton.get_output_tensor_by_name(response, "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        result = _parse_result(response)
 
-        # Verify subimage-centric output
+        # Verify top-level AnalysisResult tagged enum
+        assert result["outcome"] == "success"
         assert "subimages" in result
         assert len(result["subimages"]) == 1
 
@@ -865,8 +859,7 @@ class TestAnalysisOrchestration:
         )
 
         responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        result = _parse_result(responses[0])
 
         assert len(result["subimages"]) == 1
         analysis = result["subimages"][0]["analysis"]
@@ -923,8 +916,7 @@ class TestAnalysisOrchestration:
         )
 
         responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        result = _parse_result(responses[0])
 
         analysis = result["subimages"][0]["analysis"]
         assert analysis["status"] == "error"
@@ -948,14 +940,10 @@ class TestAnalysisOrchestration:
         )
 
         responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        result = _parse_result(responses[0])
 
-        assert len(result["subimages"]) == 1
-        analysis = result["subimages"][0]["analysis"]
-        assert analysis["status"] == "rejected"
-        assert "too large" in analysis["reason"]
-        assert "versions" in result, "rejected result must include versions"
+        assert result["outcome"] == "image_rejected"
+        assert "too large" in result["reason"]
 
     def test_handles_zero_regions_from_sam3(self):
         """Pipeline works when entity SAM3 finds no regions."""
@@ -983,8 +971,7 @@ class TestAnalysisOrchestration:
         )
 
         responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        result = _parse_result(responses[0])
 
         assert len(result["subimages"]) == 1
         analysis = result["subimages"][0]["analysis"]
@@ -1048,8 +1035,7 @@ class TestAnalysisOrchestration:
 
         # DINOv3 failure is non-fatal — results come back without embeddings
         responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        result = _parse_result(responses[0])
 
         analysis = result["subimages"][0]["analysis"]
         assert analysis["status"] == "analyzed", "VLM results should be preserved"
@@ -1147,8 +1133,7 @@ class TestAnalysisOrchestration:
         )
 
         responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        result = _parse_result(responses[0])
 
         # Container should be filtered out, leaving two sub-images
         assert len(result["subimages"]) == 2
@@ -1185,8 +1170,7 @@ class TestAnalysisOrchestration:
         )
 
         responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        result = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        result = _parse_result(responses[0])
 
         # Should produce exactly one subimage covering the full image
         assert len(result["subimages"]) == 1
@@ -1236,29 +1220,11 @@ class TestSchemaCompatibility:
                     "media_type": {"type": "photo", "color": "monochrome"},
                     "content_summary": "A building",
                     "scene_type": "outdoor",
-                    "scene_observations": {
-                        "vehicles": [],
-                        "street_infrastructure": [],
-                        "road_surface": [],
-                        "other_observations": [],
-                    },
-                    "extracted_text": [{"text": "1923", "location": "cornerstone"}],
                 },
                 regions=[
                     {
                         "entity_type": "building",
                         "description": "A brick building",
-                        "observations": {
-                            "roof_types": [],
-                            "facade_materials": ["brick"],
-                            "structural_elements": [],
-                            "window_shapes": ["arched"],
-                            "stories_visible": None,
-                            "other_features": [],
-                        },
-                        "condition": [],
-                        "other_condition": [],
-                        "visible_text": [],
                         "surroundings": {
                             "non_entity": [],
                             "other_non_entity": [],
@@ -1283,8 +1249,7 @@ class TestSchemaCompatibility:
         )
 
         responses = model.execute([request])
-        result_tensor = mock_triton.get_output_tensor_by_name(responses[0], "result")
-        python_output = json.loads(result_tensor.as_numpy().flatten()[0].decode("utf-8"))
+        python_output = _parse_result(responses[0])
 
         # Validate against Rust schema
         jsonschema.validate(instance=python_output, schema=rust_schema)

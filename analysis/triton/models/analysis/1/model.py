@@ -11,7 +11,7 @@ import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypedDict
 
 import numpy as np
 import triton_python_backend_utils as pb_utils
@@ -91,6 +91,14 @@ class DinoBatchEntry(NamedTuple):
     entry_type: str  # "subimage" or "region"
     region_idx: int | None
     crop: Image.Image
+
+
+class _SubimageData(TypedDict):
+    """Intermediate per-subimage data passed between pipeline stages."""
+
+    bounds: dict[str, Any]
+    vlm: dict[str, Any] | None
+    compressed_regions: list[dict[str, Any]]
 
 
 def get_string_from_tensor(tensor: Any) -> str:
@@ -417,6 +425,11 @@ infrastructure), respond with status "analyzed". If not relevant (portraits, ani
 food, memes, pure landscapes with no structures), respond with status "rejected" and
 a brief reason.
 
+For media_type classification:
+- "photo_of_model" requires clear evidence of a physical scale model (visible base,
+  miniature details, model railroad context). Do NOT use this for unusual camera
+  angles, aerial views, or tilt-shift effects on real buildings.
+
 For "analyzed" responses:
 - You will see two images showing exactly the same scene:
   1. The original photograph - use this to see fine details clearly
@@ -424,8 +437,7 @@ For "analyzed" responses:
      regions, each labeled with a circled number
 - Find region numbers and boundaries in the ANNOTATED image
   (look for numbers like 1, 2, 3 inside colored circles)
-- Examine the corresponding area in the ORIGINAL image for architectural
-  details, text, and features
+- Examine the corresponding area in the ORIGINAL image for details
 - The annotations may partially obscure details, so always cross-reference
   with the original"""
 
@@ -481,30 +493,29 @@ class TritonPythonModel:
         for request in requests:
             image_tensor = pb_utils.get_input_tensor_by_name(request, "image")
             schema_tensor = pb_utils.get_input_tensor_by_name(request, "schema")
+            skip_vlm_tensor = pb_utils.get_input_tensor_by_name(request, "skip_vlm")
 
             image_b64 = get_string_from_tensor(image_tensor)
             schema_json = get_string_from_tensor(schema_tensor)
+            skip_vlm = (
+                bool(skip_vlm_tensor.as_numpy().flatten()[0])
+                if skip_vlm_tensor is not None
+                else False
+            )
 
             # Validate image size to prevent OOM
             estimated_size = len(image_b64) * 3 // 4
             if estimated_size > MAX_IMAGE_BYTES:
                 size_mb = estimated_size // (1024 * 1024)
                 limit_mb = MAX_IMAGE_BYTES // (1024 * 1024)
-                result = {
-                    "subimages": [
+                responses.append(
+                    _make_response(
                         {
-                            "bounds": _full_image_bounds(1, 1),
-                            "analysis": {
-                                "status": "rejected",
-                                "reason": (
-                                    f"Image too large: {size_mb}MB exceeds {limit_mb}MB limit"
-                                ),
-                            },
+                            "outcome": "image_rejected",
+                            "reason": f"Image too large: {size_mb}MB exceeds {limit_mb}MB limit",
                         }
-                    ],
-                    "versions": self.versions,
-                }
-                responses.append(_make_response(result))
+                    )
+                )
                 continue
 
             # Decode image
@@ -515,11 +526,11 @@ class TritonPythonModel:
             subimage_bounds = self._detect_subimages(image_b64, original)
 
             # Step 2: Per-subimage analysis
-            subimage_results = []
+            subimage_results: list[_SubimageData] = []
             dino_batch: list[DinoBatchEntry] = []
 
-            # Pre-compute prompt once
-            vlm_prompt = build_vlm_prompt(schema_json)
+            # Pre-compute prompt once (only used if VLM runs)
+            vlm_prompt = build_vlm_prompt(schema_json) if not skip_vlm else None
 
             # Per-subimage SAM3 segmentation, then prepare VLM inputs
             vlm_inputs = []
@@ -553,64 +564,77 @@ class TritonPythonModel:
                 # Post-process: dedup, exclusive pixel claiming, sort, limit
                 regions = postprocess_entity_regions(raw_regions, crop.height, crop.width)
 
-                annotated = annotate_image(crop, regions)
-                original_b64 = self._encode_image(crop)
-                annotated_b64 = self._encode_image(annotated)
-
                 compressed_regions = [
                     {**r, "mask": {"counts": compress_rle(r["mask"])}} for r in regions
                 ]
 
-                vlm_inputs.append(
-                    (
-                        si_idx,
-                        bounds,
-                        crop,
-                        compressed_regions,
-                        original_b64,
-                        annotated_b64,
-                        len(regions),
+                if skip_vlm:
+                    # VLM skipped: queue DINOv3 for all subimages/regions
+                    self._queue_dino_crops(si_idx, crop, compressed_regions, dino_batch)
+                    subimage_results.append(
+                        {
+                            "bounds": bounds,
+                            "vlm": None,
+                            "compressed_regions": compressed_regions,
+                        }
                     )
-                )
+                else:
+                    # VLM will run: annotate image and prepare inputs
+                    annotated = annotate_image(crop, regions)
+                    original_b64 = self._encode_image(crop)
+                    annotated_b64 = self._encode_image(annotated)
 
-            # Phase 3: Run VLM concurrently across subimages, then queue DINOv3
+                    vlm_inputs.append(
+                        (
+                            si_idx,
+                            bounds,
+                            crop,
+                            compressed_regions,
+                            original_b64,
+                            annotated_b64,
+                            len(regions),
+                        )
+                    )
+
+            # Run VLM concurrently across subimages (if not skipped)
             vlm_results: dict[int, dict[str, Any]] = {}
-            with ThreadPoolExecutor(max_workers=len(vlm_inputs) or 1) as pool:
-                future_to_idx = {
-                    pool.submit(
-                        self._call_vlm,
-                        vlm_prompt,
-                        orig_b64,
-                        ann_b64,
-                        schema_json,
-                        n_regions,
-                    ): si_idx
-                    for si_idx, _, _, _, orig_b64, ann_b64, n_regions in vlm_inputs
-                }
-                for future in as_completed(future_to_idx, timeout=VLM_TIMEOUT_US / 1_000_000 + 30):
-                    idx = future_to_idx[future]
-                    try:
-                        vlm_results[idx] = future.result(timeout=FUTURE_RESULT_TIMEOUT_S)
-                    except (json.JSONDecodeError, KeyError, TimeoutError) as e:
-                        vlm_results[idx] = {"error": f"VLM call failed: {e}"}
-
-            for si_idx, bounds, crop, compressed_regions, _, _, _ in vlm_inputs:
-                vlm_result = vlm_results[si_idx]
-
-                subimage_results.append(
-                    {
-                        "bounds": bounds,
-                        "vlm": vlm_result,
-                        "compressed_regions": compressed_regions,
+            if vlm_inputs:
+                assert vlm_prompt is not None  # vlm_inputs is only populated when not skip_vlm
+                with ThreadPoolExecutor(max_workers=len(vlm_inputs)) as pool:
+                    future_to_idx = {
+                        pool.submit(
+                            self._call_vlm,
+                            vlm_prompt,
+                            orig_b64,
+                            ann_b64,
+                            schema_json,
+                            n_regions,
+                        ): si_idx
+                        for si_idx, _, _, _, orig_b64, ann_b64, n_regions in vlm_inputs
                     }
-                )
+                    for future in as_completed(
+                        future_to_idx, timeout=VLM_TIMEOUT_US / 1_000_000 + 30
+                    ):
+                        idx = future_to_idx[future]
+                        try:
+                            vlm_results[idx] = future.result(timeout=FUTURE_RESULT_TIMEOUT_S)
+                        except (json.JSONDecodeError, KeyError, TimeoutError) as e:
+                            vlm_results[idx] = {"error": f"VLM call failed: {e}"}
 
-                # Queue DINOv3 crops for analyzed subimages
-                if vlm_result.get("status") == "analyzed":
-                    dino_batch.append(DinoBatchEntry(si_idx, "subimage", None, crop))
-                    for ri, region in enumerate(compressed_regions[:MAX_REGION_CROPS]):
-                        region_crop = self._crop_region_bbox(crop, region["mask"], padding=0.05)
-                        dino_batch.append(DinoBatchEntry(si_idx, "region", ri, region_crop))
+                for si_idx, bounds, crop, compressed_regions, _, _, _ in vlm_inputs:
+                    vlm_result = vlm_results[si_idx]
+
+                    subimage_results.append(
+                        {
+                            "bounds": bounds,
+                            "vlm": vlm_result,
+                            "compressed_regions": compressed_regions,
+                        }
+                    )
+
+                    # Queue DINOv3 crops for analyzed subimages
+                    if vlm_result.get("status") == "analyzed":
+                        self._queue_dino_crops(si_idx, crop, compressed_regions, dino_batch)
 
             # Step 3: Batched DINOv3 embeddings
             embeddings_map: dict[tuple[int, str, int | None], list[float] | None] = {}
@@ -628,7 +652,13 @@ class TritonPythonModel:
                 bounds = si_data["bounds"]
                 compressed_regions = si_data["compressed_regions"]
 
-                if vlm.get("status") == "analyzed":
+                if vlm is None:
+                    # VLM was skipped — return Segmented variant
+                    subimage_embedding = embeddings_map.get((si_idx, "subimage", None))
+                    analysis = self._assemble_segmented(
+                        compressed_regions, si_idx, embeddings_map, subimage_embedding
+                    )
+                elif vlm.get("status") == "analyzed":
                     subimage_embedding = embeddings_map.get((si_idx, "subimage", None))
                     analysis = self._assemble_analyzed(
                         vlm, compressed_regions, si_idx, embeddings_map, subimage_embedding
@@ -642,7 +672,8 @@ class TritonPythonModel:
 
                 subimages.append({"bounds": bounds, "analysis": analysis})
 
-            result = {
+            result: dict[str, Any] = {
+                "outcome": "success",
                 "subimages": subimages,
                 "versions": self.versions,
             }
@@ -782,9 +813,11 @@ Each region has a circled number label. Provide an entry for EVERY numbered regi
 in the regions array. For regions that aren't built structures (trees, sky, streets,
 vehicles), use "non_structure" as the entity_type with an empty description.
 
-Each region has a "surroundings" field. Use the schema to see valid values for
-non_entity types and spatial relationship types. Relationships can be listed from
-both sides for validation.
+Each region has a "surroundings" field with spatial relationships. IMPORTANT: each
+region's related_regions must ONLY reference regions with a LOWER index than itself.
+Region 0 has no related_regions. Region 1 can reference region 0. Region 2 can
+reference regions 0 and 1. And so on. All spatial relations are symmetric, so the
+system reconstructs the full graph from these lower-index-only references.
 """
         text_prompt = (
             "<|im_start|>user\n"
@@ -834,19 +867,46 @@ both sides for validation.
         output_tensor = pb_utils.get_output_tensor_by_name(vlm_response, "text_output")
         output_text = get_string_from_tensor(output_tensor)
 
-        # Parse thinking content from Qwen3-VL-Thinking output.
-        thinking_content = None
+        # Strip thinking tags if present (Qwen3-VL-Thinking wraps output in <think>...</think>).
         json_text = output_text
-
         if "</think>" in output_text:
-            parts = output_text.split("</think>", 1)
-            thinking_content = parts[0].replace("<think>", "").strip()
-            json_text = parts[1].strip() if len(parts) > 1 else ""
+            json_text = output_text.split("</think>", 1)[1].strip()
 
         result: dict[str, Any] = json.loads(json_text)
-        if thinking_content:
-            result["thinking"] = thinking_content
         return result
+
+    def _build_region_dicts(
+        self,
+        compressed_regions: list[dict],
+        si_idx: int,
+        embeddings_map: dict[tuple[int, str, int | None], list[float] | None],
+        vlm_regions: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build unified region dicts from SAM3 + optional VLM + DINOv3.
+
+        The conditional inclusion of embedding/analysis keys mirrors the
+        Rust-side ``#[serde(skip_serializing_if = "Option::is_none")]``. The
+        cross-language ``schematool validate`` test catches drift.
+        """
+        if vlm_regions is not None and len(vlm_regions) != len(compressed_regions):
+            raise RuntimeError(
+                f"VLM returned {len(vlm_regions)} regions but SAM3 detected "
+                f"{len(compressed_regions)}: region count must match"
+            )
+
+        regions = []
+        for ri, sam_region in enumerate(compressed_regions):
+            region_dict: dict[str, Any] = {
+                "segmentation_confidence": sam_region["confidence"],
+                "mask": sam_region["mask"],
+            }
+            if vlm_regions is not None:
+                region_dict["analysis"] = vlm_regions[ri]
+            region_embedding = embeddings_map.get((si_idx, "region", ri))
+            if region_embedding is not None:
+                region_dict["embedding"] = region_embedding
+            regions.append(region_dict)
+        return regions
 
     def _assemble_analyzed(
         self,
@@ -856,50 +916,48 @@ both sides for validation.
         embeddings_map: dict[tuple[int, str, int | None], list[float] | None],
         subimage_embedding: list[float] | None,
     ) -> dict[str, Any]:
-        """Assemble an analyzed SubimageAnalysis from VLM + SAM3 + DINOv3 results.
-
-        Note: The conditional inclusion of embedding/thinking keys mirrors the
-        Rust-side ``#[serde(skip_serializing_if = "Option::is_none")]``. The
-        cross-language ``schematool validate`` test catches drift.
-        """
-        vlm_regions = vlm["regions"]  # Now a list, not a dict
-
-        if len(vlm_regions) != len(compressed_regions):
-            raise RuntimeError(
-                f"VLM returned {len(vlm_regions)} regions but SAM3 detected "
-                f"{len(compressed_regions)}: region count must match"
-            )
-
-        # Merge SAM3 regions with VLM analysis and DINOv3 embeddings
-        unified_regions = []
-        for ri, sam_region in enumerate(compressed_regions):
-            vlm_analysis = vlm_regions[ri]
-
-            # DINOv3 embedding (None if not computed)
-            region_embedding = embeddings_map.get((si_idx, "region", ri))
-
-            region_dict: dict[str, Any] = {
-                "segmentation_confidence": sam_region["confidence"],
-                "mask": sam_region["mask"],
-                "analysis": vlm_analysis,
-            }
-            if region_embedding is not None:
-                region_dict["embedding"] = region_embedding
-            unified_regions.append(region_dict)
-
-        # VLM output has scene-level fields nested under "scene"
-        vlm_scene = vlm["scene"]
-
+        """Assemble an analyzed SubimageAnalysis from VLM + SAM3 + DINOv3 results."""
+        regions = self._build_region_dicts(
+            compressed_regions, si_idx, embeddings_map, vlm_regions=vlm["regions"]
+        )
         result: dict[str, Any] = {
             "status": "analyzed",
-            "scene": vlm_scene,
-            "regions": unified_regions,
+            "scene": vlm["scene"],
+            "regions": regions,
         }
-        if vlm.get("thinking") is not None:
-            result["thinking"] = vlm["thinking"]
         if subimage_embedding is not None:
             result["embedding"] = subimage_embedding
         return result
+
+    def _assemble_segmented(
+        self,
+        compressed_regions: list[dict],
+        si_idx: int,
+        embeddings_map: dict[tuple[int, str, int | None], list[float] | None],
+        subimage_embedding: list[float] | None,
+    ) -> dict[str, Any]:
+        """Assemble a Segmented SubimageAnalysis (VLM skipped, SAM3 + DINOv3 only)."""
+        regions = self._build_region_dicts(compressed_regions, si_idx, embeddings_map)
+        result: dict[str, Any] = {
+            "status": "segmented",
+            "regions": regions,
+        }
+        if subimage_embedding is not None:
+            result["embedding"] = subimage_embedding
+        return result
+
+    def _queue_dino_crops(
+        self,
+        si_idx: int,
+        crop: Image.Image,
+        compressed_regions: list[dict],
+        dino_batch: list[DinoBatchEntry],
+    ) -> None:
+        """Queue DINOv3 embedding crops for a subimage and its regions."""
+        dino_batch.append(DinoBatchEntry(si_idx, "subimage", None, crop))
+        for ri, region in enumerate(compressed_regions[:MAX_REGION_CROPS]):
+            region_crop = self._crop_region_bbox(crop, region["mask"], padding=0.05)
+            dino_batch.append(DinoBatchEntry(si_idx, "region", ri, region_crop))
 
     def _crop_region_bbox(
         self, image: Image.Image, rle_mask: dict[str, str], padding: float = 0.05
