@@ -4,9 +4,14 @@ max_batch_size: 1
 
 input [
   {
-    name: "images"
+    name: "image"
     data_type: TYPE_STRING
-    dims: [-1]
+    dims: [1]
+  },
+  {
+    name: "masks"
+    data_type: TYPE_STRING
+    dims: [1]
   }
 ]
 
@@ -27,11 +32,5 @@ instance_group [
   {
     count: 1
     kind: KIND_GPU
-    gpus: [ 0 ]
-  },
-  {
-    count: 1
-    kind: KIND_GPU
-    gpus: [ 1 ]
   }
 ]

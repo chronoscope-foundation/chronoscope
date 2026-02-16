@@ -13,6 +13,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// DINOv3 CLS embedding dimensionality.
+pub const EMBEDDING_DIM: usize = 1024;
+
 // ==================== Segmentation Types ====================
 
 /// RLE-encoded binary mask (COCO compressed string format).
@@ -247,6 +250,10 @@ pub struct Region {
     /// SAM3 segmentation confidence for this region.
     pub segmentation_confidence: f64,
 
+    /// The SAM3 text prompt that detected this region (e.g. "building", "tower").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detected_as: String,
+
     /// Region mask, RLE-encoded in subimage crop coordinates.
     pub mask: RleMask,
 
@@ -258,6 +265,11 @@ pub struct Region {
     /// VLM analysis of this region. `None` when VLM was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<RegionAnalysis>,
+
+    /// Sub-features detected within this region (e.g. towers within a building).
+    /// One level of nesting only — features do not have their own features.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<Region>,
 }
 
 /// Scene-level analysis from the VLM.
@@ -317,6 +329,26 @@ pub enum SubimageAnalysis {
         /// Error message describing what went wrong.
         message: String,
     },
+}
+
+impl SubimageAnalysis {
+    /// Extract the DINOv3 embedding, if present.
+    pub fn embedding(&self) -> Option<&[f32]> {
+        match self {
+            Self::Analyzed { embedding, .. } | Self::Segmented { embedding, .. } => {
+                embedding.as_deref()
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract the region list, if this is an analyzed or segmented variant.
+    pub fn regions(&self) -> Option<&[Region]> {
+        match self {
+            Self::Analyzed { regions, .. } | Self::Segmented { regions, .. } => Some(regions),
+            _ => None,
+        }
+    }
 }
 
 /// A subimage (panel) detected within the source image.

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 
 use crate::error::AnalysisError;
-use crate::schema::AnalysisResult;
+use crate::schema::{AnalysisResult, EMBEDDING_DIM};
 use crate::service::TritonService;
 
 /// A mock Triton service that returns canned responses.
@@ -23,7 +23,7 @@ impl MockTritonService {
     pub fn with_analysis_result(result: AnalysisResult) -> Self {
         Self {
             analyze_result: Ok(result),
-            embed_result: Ok(vec![0.0; 1024]),
+            embed_result: Ok(vec![0.0; EMBEDDING_DIM]),
         }
     }
 

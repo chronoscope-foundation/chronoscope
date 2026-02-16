@@ -11,7 +11,8 @@ import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, NamedTuple, TypedDict
+from dataclasses import dataclass
+from typing import Any, TypedDict
 
 import numpy as np
 import triton_python_backend_utils as pb_utils
@@ -20,6 +21,9 @@ from PIL import Image, ImageDraw, ImageFont
 # Import from same directory (needed for both Triton and test environments)
 sys.path.insert(0, os.path.dirname(__file__))
 from baml_converter import jsonschema_to_baml
+
+# Max regions per subimage (caps SAM3 post-processing and DINOv3 embedding count).
+MAX_REGIONS = 32
 
 # Kelly's 22 colors of maximum contrast (1965), minus white and black.
 # Colors are ordered for maximum distinguishability; we cycle if >20 regions.
@@ -48,19 +52,13 @@ REGION_COLORS = [
 ]
 
 MASK_ALPHA = int(0.3 * 255)
-MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5MB limit to prevent OOM
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB limit to prevent OOM
 
 # Max image dimension (longest edge) before sending to VLM.
 # Qwen3-VL: 28x28 pixels = 1 token, max 16384 tokens/image.
 # 2048x2048 = ~5.4K tokens × 2 images = ~11K tokens, well within 128K context.
 VLM_MAX_IMAGE_DIM = 2048
 
-# Max region crops to embed via DINOv3 (caps GPU memory usage).
-# SAM3 outputs regions in left-to-right spatial order, not confidence order.
-MAX_REGION_CROPS = 16
-
-# Max entity regions per subimage (caps VLM complexity and DINOv3 budget).
-MAX_ENTITY_REGIONS = 20
 
 # Timeouts are generous placeholder values — no production latency data yet.
 # VLM with 32K max_tokens on a 72B model can take minutes for complex images.
@@ -83,14 +81,36 @@ SUBIMAGE_CONTAINMENT_THRESHOLD = 0.7  # Remove container if smaller mask >70% co
 # regions within collages, side-by-side comparisons, or multi-panel layouts.
 SUBIMAGE_PROMPT = "separate photograph in a collage"
 
+# Text prompts for SAM3 entity segmentation. These are the top-level
+# categories we ask SAM3 to detect. Each additional prompt costs ~420ms
+# (the image encoder runs once and is shared across all prompts).
+ENTITY_PROMPTS = ["building", "bridge", "tower", "monument", "infrastructure"]
 
-class DinoBatchEntry(NamedTuple):
-    """Entry in the DINOv3 embedding batch."""
+# Hierarchical region detection: prompts whose regions should become sub-features
+# of a parent entity when spatially contained. Key = child prompt, value = set of
+# valid parent prompts. Only one level of nesting.
+SUBORDINATE_PROMPTS: dict[str, set[str]] = {
+    "tower": {"building", "infrastructure", "monument"},
+}
+CONTAINMENT_THRESHOLD = 0.7
+DEDUP_IOU_THRESHOLD = 0.7
+MAX_FEATURES_PER_ENTITY = 8
 
-    subimage_idx: int
-    entry_type: str  # "subimage" or "region"
-    region_idx: int | None
-    crop: Image.Image
+
+@dataclass
+class _MaskEntry:
+    """A decoded mask with metadata, used throughout the postprocessing pipeline.
+
+    Replaces parallel arrays / co-indexed tuples to avoid index-mapping bugs.
+    The ``tag`` field is an opaque identity marker that survives pipeline stages
+    (dedup, exclusivity, sorting) so callers can track which original entry a
+    result corresponds to.
+    """
+
+    mask: np.ndarray
+    score: float
+    prompt: str = ""
+    tag: int = -1
 
 
 class _SubimageData(TypedDict):
@@ -98,7 +118,10 @@ class _SubimageData(TypedDict):
 
     bounds: dict[str, Any]
     vlm: dict[str, Any] | None
-    compressed_regions: list[dict[str, Any]]
+    entities: list[dict[str, Any]]
+    crop_b64: str
+    crop_height: int
+    crop_width: int
 
 
 def get_string_from_tensor(tensor: Any) -> str:
@@ -218,113 +241,244 @@ def compute_centroid_x(mask: np.ndarray) -> float:
 
 
 def deduplicate_masks(
-    masks: list[np.ndarray], scores: list[float], iou_threshold: float = 0.7
-) -> list[tuple[np.ndarray, float]]:
-    """Remove duplicate masks based on IoU threshold."""
-    if not masks:
+    entries: list[_MaskEntry], iou_threshold: float = DEDUP_IOU_THRESHOLD
+) -> list[_MaskEntry]:
+    """Remove duplicate masks based on IoU threshold.
+
+    Higher-scoring entries are kept first; lower-scoring entries that overlap
+    above the threshold are discarded.
+    """
+    if not entries:
         return []
 
-    # Sort by score descending
-    sorted_pairs = sorted(
-        zip(masks, scores, strict=True),
-        key=lambda x: x[1],
-        reverse=True,
-    )
+    sorted_entries = sorted(entries, key=lambda e: e.score, reverse=True)
 
-    keep: list[tuple[np.ndarray, float]] = []
-    for mask, score in sorted_pairs:
-        # Check if this mask overlaps too much with any kept mask
-        is_duplicate = False
-        for kept_mask, _ in keep:
-            if compute_iou(mask, kept_mask) > iou_threshold:
-                is_duplicate = True
-                break
-
+    keep: list[_MaskEntry] = []
+    for entry in sorted_entries:
+        is_duplicate = any(compute_iou(entry.mask, kept.mask) > iou_threshold for kept in keep)
         if not is_duplicate:
-            keep.append((mask, score))
+            keep.append(entry)
 
     return keep
 
 
 def make_masks_exclusive(
-    masks: list[tuple[np.ndarray, float]],
+    entries: list[_MaskEntry],
     survival_threshold: float = 0.1,
-) -> list[tuple[np.ndarray, float]]:
+) -> list[_MaskEntry]:
     """Make masks mutually exclusive using confidence-based pixel claiming.
 
-    Higher confidence masks claim pixels first. Masks that lose too many
+    Higher confidence entries claim pixels first. Entries that lose too many
     pixels (below survival_threshold of original) are removed.
 
-    Args:
-        masks: List of (mask, score) tuples, sorted by confidence descending.
-        survival_threshold: Minimum fraction of original pixels a mask must retain.
-
-    Returns:
-        List of (modified_mask, score) tuples with non-overlapping masks.
+    Returns a new list of ``_MaskEntry`` with non-overlapping masks.
+    Metadata (score, prompt) is preserved on each surviving entry.
     """
-    if not masks:
+    if not entries:
         return []
 
-    # Get image dimensions from first mask
-    h, w = masks[0][0].shape
+    h, w = entries[0].mask.shape
     claimed = np.zeros((h, w), dtype=bool)
 
-    result = []
-    for mask, score in masks:
-        original_pixels = mask.sum()
+    result: list[_MaskEntry] = []
+    for entry in entries:
+        original_pixels = entry.mask.sum()
         if original_pixels == 0:
             continue
 
         # Claim only unclaimed pixels
-        exclusive_mask = mask & ~claimed
+        #
+        # WORKAROUND: `mask & ~claimed` silently corrupts `claimed` on
+        # numpy 1.26.x + Python 3.14. The ~ operator goes through CPython's
+        # nb_invert slot, which in 3.14 can decrement the local variable's
+        # refcount before calling the ufunc. numpy's temporary elision sees
+        # refcount == 1 on arrays >= 2^18 elements and reuses the buffer
+        # in-place, so ~claimed mutates claimed and returns the same object.
+        # Calling np.logical_not() (or np.invert()) avoids this because the
+        # function-call path keeps an extra reference alive via the argument.
+        # Fixed in numpy 2.x (numpy/numpy#29685). Remove this workaround
+        # once SAM3 drops the numpy <2 pin.
+        # See: https://github.com/numpy/numpy/issues/28681
+        exclusive_mask = entry.mask & np.logical_not(claimed)
         remaining_pixels = exclusive_mask.sum()
 
-        # Check survival threshold
         survival_ratio = remaining_pixels / original_pixels
         if survival_ratio >= survival_threshold:
-            # Mark these pixels as claimed
             claimed |= exclusive_mask.astype(bool)
-            result.append((exclusive_mask.astype(mask.dtype), score))
+            result.append(
+                _MaskEntry(
+                    mask=exclusive_mask.astype(entry.mask.dtype),
+                    score=entry.score,
+                    prompt=entry.prompt,
+                    tag=entry.tag,
+                )
+            )
 
     return result
 
 
-def sort_regions_left_to_right(
-    regions: list[tuple[np.ndarray, float]],
-) -> list[tuple[np.ndarray, float]]:
+def sort_regions_left_to_right(entries: list[_MaskEntry]) -> list[_MaskEntry]:
     """Sort regions by centroid x-coordinate (left to right).
 
     This makes region numbering predictable for the VLM - region 1 is leftmost.
     """
-    return sorted(regions, key=lambda r: compute_centroid_x(r[0]))
+    return sorted(entries, key=lambda e: compute_centroid_x(e.mask))
+
+
+def group_by_containment(
+    entries: list[_MaskEntry],
+) -> tuple[list[_MaskEntry], dict[int, list[_MaskEntry]]]:
+    """Group regions into parent entities and child features using spatial containment.
+
+    A region becomes a child of a larger region when:
+    1. Its prompt is in SUBORDINATE_PROMPTS
+    2. The larger region's prompt is a valid parent for that subordinate
+    3. The smaller region is >CONTAINMENT_THRESHOLD contained in the larger
+
+    On equal containment, the smallest valid parent (tightest fit) wins.
+
+    Returns (top_level, children) where children maps top-level index to child list.
+    """
+    if not entries:
+        return [], {}
+
+    # Track which indices are claimed as children
+    child_of: dict[int, int] = {}  # child_idx -> parent_idx
+
+    for i, child in enumerate(entries):
+        area_i = int(child.mask.sum())
+
+        # Only subordinate prompts can become children
+        if child.prompt not in SUBORDINATE_PROMPTS:
+            continue
+
+        valid_parents = SUBORDINATE_PROMPTS[child.prompt]
+        best_parent: int | None = None
+        best_containment = CONTAINMENT_THRESHOLD
+        best_parent_area = float("inf")
+
+        for j, parent in enumerate(entries):
+            if i == j:
+                continue
+
+            area_j = int(parent.mask.sum())
+
+            # Parent must be larger and have a valid prompt
+            if area_j <= area_i or parent.prompt not in valid_parents:
+                continue
+
+            # Check containment of smaller (i) within larger (j)
+            intersection = float(np.logical_and(child.mask, parent.mask).sum())
+            containment = intersection / area_i if area_i > 0 else 0.0
+
+            # Prefer higher containment; on tie, prefer smaller parent (tighter fit)
+            if containment > best_containment or (
+                containment == best_containment and area_j < best_parent_area
+            ):
+                best_containment = containment
+                best_parent = j
+                best_parent_area = area_j
+
+        if best_parent is not None:
+            child_of[i] = best_parent
+
+    # Build top-level and children lists
+    top_level_indices = [i for i in range(len(entries)) if i not in child_of]
+    new_idx = {old: new for new, old in enumerate(top_level_indices)}
+
+    top_level = [entries[i] for i in top_level_indices]
+    children: dict[int, list[_MaskEntry]] = {}
+    for child_idx, parent_idx in child_of.items():
+        if parent_idx in new_idx:
+            new_parent = new_idx[parent_idx]
+            children.setdefault(new_parent, []).append(entries[child_idx])
+
+    return top_level, children
 
 
 def postprocess_entity_regions(raw_regions: list[dict], height: int, width: int) -> list[dict]:
-    """Post-process raw SAM3 output for entity detection.
+    """Post-process raw SAM3 output into hierarchical entity structure.
 
-    Applies deduplication, exclusive pixel claiming, region limit, and
-    left-to-right sorting. This pipeline is specific to entity/building
-    detection — composite subimage detection uses different logic.
+    Pipeline:
+    1. Decode all masks into ``_MaskEntry`` objects
+    2. Deduplicate (IoU-based, prompt-agnostic)
+    3. Group by containment -> top-level entities + child features
+    4. Union child masks into parent, then make top-level exclusive
+    5. Make sibling features exclusive (per parent)
+    6. Sort left-to-right, limit to MAX_REGIONS, cap features
+    7. Re-encode all masks
+
+    Each entity dict has a ``features`` list of child sub-regions.
+    Parent masks keep their FULL mask (including sub-feature pixels).
     """
     if not raw_regions:
         return []
 
-    # Decode RLE masks back to numpy arrays
-    masks = [decode_rle(r["mask"], height, width) for r in raw_regions]
-    scores = [r["confidence"] for r in raw_regions]
-
-    # Deduplicate overlapping masks (IoU-based), then make exclusive (pixel-based)
-    filtered = deduplicate_masks(masks, scores)
-    filtered = make_masks_exclusive(filtered)
-    # Limit count and sort left-to-right for predictable VLM numbering
-    filtered = filtered[:MAX_ENTITY_REGIONS]
-    filtered = sort_regions_left_to_right(filtered)
-
-    # Re-encode to RLE
-    return [
-        {"confidence": score, "mask": _encode_rle_mask(mask.astype(np.uint8))}
-        for mask, score in filtered
+    # Step 1: Decode into _MaskEntry objects (tagged for tracking through pipeline)
+    entries = [
+        _MaskEntry(
+            mask=decode_rle(r["mask"], height, width),
+            score=r["confidence"],
+            prompt=r.get("prompt", ""),
+            tag=i,
+        )
+        for i, r in enumerate(raw_regions)
     ]
+
+    # Step 2: Deduplicate overlapping masks (IoU-based, prompt-agnostic)
+    deduped = deduplicate_masks(entries)
+
+    # Step 3: Group by containment
+    top_level, children_map = group_by_containment(deduped)
+
+    # Step 3b: Union child masks into parent — extend parent to cover children
+    for parent_idx, child_list in children_map.items():
+        parent = top_level[parent_idx]
+        for child in child_list:
+            parent.mask = np.logical_or(parent.mask, child.mask).astype(parent.mask.dtype)
+
+    # Step 4: Make top-level masks exclusive.
+    # Tags survive through make_masks_exclusive, so we can match parents.
+    top_exclusive = make_masks_exclusive(top_level)
+
+    # Step 5: For each surviving parent, make sibling features exclusive.
+    # Stay in tag-space so sorting/filtering doesn't invalidate mappings.
+    surviving_tags = {e.tag for e in top_exclusive}
+    children_by_tag: dict[int, list[_MaskEntry]] = {}
+    for parent_idx, child_list in children_map.items():
+        parent_tag = top_level[parent_idx].tag
+        if parent_tag in surviving_tags:
+            children_by_tag[parent_tag] = make_masks_exclusive(child_list)
+
+    # Step 6: Sort top-level left-to-right, limit to MAX_REGIONS
+    sorted_top = sort_regions_left_to_right(top_exclusive)[:MAX_REGIONS]
+
+    # Step 7: Re-encode to hierarchical structure
+    result = []
+    for entry in sorted_top:
+        entity: dict[str, Any] = {
+            "confidence": entry.score,
+            "mask": _encode_rle_mask(entry.mask.astype(np.uint8)),
+            "prompt": entry.prompt,
+            "features": [],
+        }
+
+        # Add children, sorted left-to-right, capped
+        child_list = children_by_tag.get(entry.tag, [])
+        if child_list:
+            child_sorted = sort_regions_left_to_right(child_list)
+            for child in child_sorted[:MAX_FEATURES_PER_ENTITY]:
+                entity["features"].append(
+                    {
+                        "confidence": child.score,
+                        "mask": _encode_rle_mask(child.mask.astype(np.uint8)),
+                        "prompt": child.prompt,
+                    }
+                )
+
+        result.append(entity)
+
+    return result
 
 
 def annotate_image(image: Image.Image, regions: list[dict[str, Any]]) -> Image.Image:
@@ -527,13 +681,13 @@ class TritonPythonModel:
 
             # Step 2: Per-subimage analysis
             subimage_results: list[_SubimageData] = []
-            dino_batch: list[DinoBatchEntry] = []
 
             # Pre-compute prompt once (only used if VLM runs)
             vlm_prompt = build_vlm_prompt(schema_json) if not skip_vlm else None
 
-            # Per-subimage SAM3 segmentation, then prepare VLM inputs
-            vlm_inputs = []
+            # Per-subimage SAM3 segmentation
+            vlm_inputs: list[tuple[int, str, str, int]] = []
+            prompts_array = np.array([p.encode("utf-8") for p in ENTITY_PROMPTS])
             for si_idx, bounds in enumerate(subimage_bounds):
                 bbox = bounds["bbox"]
                 crop = original.crop(
@@ -548,7 +702,10 @@ class TritonPythonModel:
                 sam_request = pb_utils.InferenceRequest(
                     model_name="sam3",
                     requested_output_names=["regions"],
-                    inputs=[pb_utils.Tensor("image", np.array([[crop_b64.encode("utf-8")]]))],
+                    inputs=[
+                        pb_utils.Tensor("image", np.array([[crop_b64.encode("utf-8")]])),
+                        pb_utils.Tensor("prompts", prompts_array.reshape(1, -1)),
+                    ],
                     timeout=SAM3_TIMEOUT_US,
                 )
                 sam_response = sam_request.exec()
@@ -561,107 +718,89 @@ class TritonPythonModel:
                 regions_json = get_string_from_tensor(regions_tensor)
                 raw_regions = json.loads(regions_json)
 
-                # Post-process: dedup, exclusive pixel claiming, sort, limit
-                regions = postprocess_entity_regions(raw_regions, crop.height, crop.width)
+                # Post-process: dedup, containment grouping, exclusive, sort, limit
+                entities = postprocess_entity_regions(raw_regions, crop.height, crop.width)
 
-                compressed_regions = [
-                    {**r, "mask": {"counts": compress_rle(r["mask"])}} for r in regions
-                ]
+                # Compress masks for wire transfer
+                compressed_entities = []
+                for ent in entities:
+                    c_ent = {
+                        **ent,
+                        "mask": {"counts": compress_rle(ent["mask"])},
+                        "features": [
+                            {**f, "mask": {"counts": compress_rle(f["mask"])}}
+                            for f in ent.get("features", [])
+                        ],
+                    }
+                    compressed_entities.append(c_ent)
 
-                if skip_vlm:
-                    # VLM skipped: queue DINOv3 for all subimages/regions
-                    self._queue_dino_crops(si_idx, crop, compressed_regions, dino_batch)
-                    subimage_results.append(
-                        {
-                            "bounds": bounds,
-                            "vlm": None,
-                            "compressed_regions": compressed_regions,
-                        }
-                    )
-                else:
-                    # VLM will run: annotate image and prepare inputs
-                    annotated = annotate_image(crop, regions)
+                si_data: _SubimageData = {
+                    "bounds": bounds,
+                    "vlm": None,
+                    "entities": compressed_entities,
+                    "crop_b64": crop_b64,
+                    "crop_height": crop.height,
+                    "crop_width": crop.width,
+                }
+                subimage_results.append(si_data)
+
+                if not skip_vlm:
+                    # Prepare VLM input: annotate with top-level entities only
+                    # (sub-features are structural metadata, not VLM targets)
+                    annotated = annotate_image(crop, entities)
                     original_b64 = self._encode_image(crop)
                     annotated_b64 = self._encode_image(annotated)
+                    vlm_inputs.append((si_idx, original_b64, annotated_b64, len(entities)))
 
-                    vlm_inputs.append(
-                        (
-                            si_idx,
-                            bounds,
-                            crop,
-                            compressed_regions,
-                            original_b64,
-                            annotated_b64,
-                            len(regions),
-                        )
-                    )
-
-            # Run VLM concurrently across subimages (if not skipped)
-            vlm_results: dict[int, dict[str, Any]] = {}
+            # Step 2b: Run VLM concurrently, then update subimage results
             if vlm_inputs:
-                assert vlm_prompt is not None  # vlm_inputs is only populated when not skip_vlm
-                with ThreadPoolExecutor(max_workers=min(len(vlm_inputs), 8)) as pool:
-                    future_to_idx = {
-                        pool.submit(
-                            self._call_vlm,
-                            vlm_prompt,
-                            orig_b64,
-                            ann_b64,
-                            schema_json,
-                            n_regions,
-                        ): si_idx
-                        for si_idx, _, _, _, orig_b64, ann_b64, n_regions in vlm_inputs
-                    }
-                    for future in as_completed(
-                        future_to_idx, timeout=VLM_TIMEOUT_US / 1_000_000 + 30
-                    ):
-                        idx = future_to_idx[future]
-                        try:
-                            vlm_results[idx] = future.result(timeout=FUTURE_RESULT_TIMEOUT_S)
-                        except (json.JSONDecodeError, KeyError, TimeoutError) as e:
-                            vlm_results[idx] = {"error": f"VLM call failed: {e}"}
+                if vlm_prompt is None:
+                    raise RuntimeError("vlm_prompt is None but VLM analysis requested")
+                vlm_results = self._run_vlm_concurrent(vlm_inputs, vlm_prompt, schema_json)
+                for si_idx, vlm_result in vlm_results.items():
+                    subimage_results[si_idx]["vlm"] = vlm_result
 
-                for si_idx, bounds, crop, compressed_regions, _, _, _ in vlm_inputs:
-                    vlm_result = vlm_results[si_idx]
+            # Step 3: DINOv3 embeddings (one forward pass per subimage)
+            # Keys: (si_idx, entity_idx, feature_idx), -1 = N/A
+            # e.g. (0, -1, -1) = CLS, (0, 2, -1) = entity 2
+            embeddings_map: dict[tuple[int, int, int], list[float] | None] = {}
+            for si_idx, si_data in enumerate(subimage_results):
+                needs_embedding = (
+                    si_data["vlm"] is None  # skip_vlm
+                    or si_data["vlm"].get("status") == "analyzed"
+                )
+                if not needs_embedding:
+                    continue
 
-                    subimage_results.append(
-                        {
-                            "bounds": bounds,
-                            "vlm": vlm_result,
-                            "compressed_regions": compressed_regions,
-                        }
-                    )
-
-                    # Queue DINOv3 crops for analyzed subimages
-                    if vlm_result.get("status") == "analyzed":
-                        self._queue_dino_crops(si_idx, crop, compressed_regions, dino_batch)
-
-            # Step 3: Batched DINOv3 embeddings
-            embeddings_map: dict[tuple[int, str, int | None], list[float] | None] = {}
-            if dino_batch:
-                dino_images = [entry.crop for entry in dino_batch]
-                embeddings = self._call_dinov3(dino_images)
-                for i, entry in enumerate(dino_batch):
-                    key = (entry.subimage_idx, entry.entry_type, entry.region_idx)
-                    embeddings_map[key] = embeddings[i]
+                sub_emb, entity_embs, feature_embs = self._call_dinov3(
+                    si_data["crop_b64"],
+                    si_data["crop_height"],
+                    si_data["crop_width"],
+                    si_data["entities"],
+                )
+                embeddings_map[(si_idx, -1, -1)] = sub_emb
+                for ei, emb in enumerate(entity_embs):
+                    embeddings_map[(si_idx, ei, -1)] = emb
+                for (ei, fi), emb in feature_embs.items():
+                    embeddings_map[(si_idx, ei, fi)] = emb
 
             # Step 4: Assemble final AnalysisResult
             subimages = []
             for si_idx, si_data in enumerate(subimage_results):
                 vlm = si_data["vlm"]
                 bounds = si_data["bounds"]
-                compressed_regions = si_data["compressed_regions"]
+                entities = si_data["entities"]
 
                 if vlm is None:
                     # VLM was skipped — return Segmented variant
-                    subimage_embedding = embeddings_map.get((si_idx, "subimage", None))
+                    subimage_embedding = embeddings_map.get((si_idx, -1, -1))
                     analysis = self._assemble_segmented(
-                        compressed_regions, si_idx, embeddings_map, subimage_embedding
+                        entities, si_idx, embeddings_map, subimage_embedding
                     )
                 elif vlm.get("status") == "analyzed":
-                    subimage_embedding = embeddings_map.get((si_idx, "subimage", None))
+                    subimage_embedding = embeddings_map.get((si_idx, -1, -1))
                     analysis = self._assemble_analyzed(
-                        vlm, compressed_regions, si_idx, embeddings_map, subimage_embedding
+                        vlm, entities, si_idx, embeddings_map, subimage_embedding
                     )
                 elif vlm.get("status") == "rejected":
                     analysis = {"status": "rejected", "reason": vlm.get("reason", "Unknown")}
@@ -763,6 +902,9 @@ class TritonPythonModel:
                 if compute_iou(usable[i][0], usable[j][0]) > SUBIMAGE_MAX_OVERLAP_IOU:
                     return [full_bounds]
 
+        # Sort in row-major order
+        usable.sort(key=lambda r: (r[1][1], r[1][0]))
+
         # Convert to SubimageBounds
         result = []
         for mask, (bx, by, bw, bh), _ in usable:
@@ -793,6 +935,43 @@ class TritonPythonModel:
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=90)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    def _run_vlm_concurrent(
+        self,
+        vlm_inputs: list[tuple[int, str, str, int]],
+        vlm_prompt: str,
+        schema_json: str,
+    ) -> dict[int, dict[str, Any]]:
+        """Run VLM analysis concurrently across subimages.
+
+        Args:
+            vlm_inputs: List of (si_idx, original_b64, annotated_b64, n_regions).
+            vlm_prompt: Pre-built VLM prompt string.
+            schema_json: JSON schema for structured output.
+
+        Returns:
+            Map from subimage index to VLM result dict.
+        """
+        results: dict[int, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(len(vlm_inputs), 8)) as pool:
+            future_to_idx = {
+                pool.submit(
+                    self._call_vlm,
+                    vlm_prompt,
+                    orig_b64,
+                    ann_b64,
+                    schema_json,
+                    n_regions,
+                ): si_idx
+                for si_idx, orig_b64, ann_b64, n_regions in vlm_inputs
+            }
+            for future in as_completed(future_to_idx, timeout=VLM_TIMEOUT_US / 1_000_000 + 30):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result(timeout=FUTURE_RESULT_TIMEOUT_S)
+                except (json.JSONDecodeError, KeyError, TimeoutError) as e:
+                    results[idx] = {"error": f"VLM call failed: {e}"}
+        return results
 
     def _call_vlm(
         self,
@@ -877,48 +1056,64 @@ system reconstructs the full graph from these lower-index-only references.
 
     def _build_region_dicts(
         self,
-        compressed_regions: list[dict],
+        entities: list[dict],
         si_idx: int,
-        embeddings_map: dict[tuple[int, str, int | None], list[float] | None],
+        embeddings_map: dict[tuple[int, int, int], list[float] | None],
         vlm_regions: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        """Build unified region dicts from SAM3 + optional VLM + DINOv3.
+        """Build unified region dicts from hierarchical SAM3 + optional VLM + DINOv3.
 
-        The conditional inclusion of embedding/analysis keys mirrors the
-        Rust-side ``#[serde(skip_serializing_if = "Option::is_none")]``. The
-        cross-language ``schematool validate`` test catches drift.
+        Each entity becomes a region dict with a "features" list of sub-regions.
+        VLM annotations apply only to top-level entities.
         """
-        if vlm_regions is not None and len(vlm_regions) != len(compressed_regions):
+        if vlm_regions is not None and len(vlm_regions) != len(entities):
             raise RuntimeError(
                 f"VLM returned {len(vlm_regions)} regions but SAM3 detected "
-                f"{len(compressed_regions)}: region count must match"
+                f"{len(entities)}: region count must match"
             )
 
         regions = []
-        for ri, sam_region in enumerate(compressed_regions):
+        for ei, entity in enumerate(entities):
             region_dict: dict[str, Any] = {
-                "segmentation_confidence": sam_region["confidence"],
-                "mask": sam_region["mask"],
+                "segmentation_confidence": entity["confidence"],
+                "detected_as": entity.get("prompt", ""),
+                "mask": entity["mask"],
             }
             if vlm_regions is not None:
-                region_dict["analysis"] = vlm_regions[ri]
-            region_embedding = embeddings_map.get((si_idx, "region", ri))
-            if region_embedding is not None:
-                region_dict["embedding"] = region_embedding
+                region_dict["analysis"] = vlm_regions[ei]
+            entity_embedding = embeddings_map.get((si_idx, ei, -1))
+            if entity_embedding is not None:
+                region_dict["embedding"] = entity_embedding
+
+            # Build feature sub-regions
+            features = []
+            for fi, feature in enumerate(entity.get("features", [])):
+                feat_dict: dict[str, Any] = {
+                    "segmentation_confidence": feature["confidence"],
+                    "detected_as": feature.get("prompt", ""),
+                    "mask": feature["mask"],
+                    "features": [],
+                }
+                feat_embedding = embeddings_map.get((si_idx, ei, fi))
+                if feat_embedding is not None:
+                    feat_dict["embedding"] = feat_embedding
+                features.append(feat_dict)
+            region_dict["features"] = features
+
             regions.append(region_dict)
         return regions
 
     def _assemble_analyzed(
         self,
         vlm: dict[str, Any],
-        compressed_regions: list[dict],
+        entities: list[dict],
         si_idx: int,
-        embeddings_map: dict[tuple[int, str, int | None], list[float] | None],
+        embeddings_map: dict[tuple[int, int, int], list[float] | None],
         subimage_embedding: list[float] | None,
     ) -> dict[str, Any]:
         """Assemble an analyzed SubimageAnalysis from VLM + SAM3 + DINOv3 results."""
         regions = self._build_region_dicts(
-            compressed_regions, si_idx, embeddings_map, vlm_regions=vlm["regions"]
+            entities, si_idx, embeddings_map, vlm_regions=vlm["regions"]
         )
         result: dict[str, Any] = {
             "status": "analyzed",
@@ -931,13 +1126,13 @@ system reconstructs the full graph from these lower-index-only references.
 
     def _assemble_segmented(
         self,
-        compressed_regions: list[dict],
+        entities: list[dict],
         si_idx: int,
-        embeddings_map: dict[tuple[int, str, int | None], list[float] | None],
+        embeddings_map: dict[tuple[int, int, int], list[float] | None],
         subimage_embedding: list[float] | None,
     ) -> dict[str, Any]:
         """Assemble a Segmented SubimageAnalysis (VLM skipped, SAM3 + DINOv3 only)."""
-        regions = self._build_region_dicts(compressed_regions, si_idx, embeddings_map)
+        regions = self._build_region_dicts(entities, si_idx, embeddings_map)
         result: dict[str, Any] = {
             "status": "segmented",
             "regions": regions,
@@ -946,73 +1141,85 @@ system reconstructs the full graph from these lower-index-only references.
             result["embedding"] = subimage_embedding
         return result
 
-    def _queue_dino_crops(
+    def _call_dinov3(
         self,
-        si_idx: int,
-        crop: Image.Image,
-        compressed_regions: list[dict],
-        dino_batch: list[DinoBatchEntry],
-    ) -> None:
-        """Queue DINOv3 embedding crops for a subimage and its regions."""
-        dino_batch.append(DinoBatchEntry(si_idx, "subimage", None, crop))
-        for ri, region in enumerate(compressed_regions[:MAX_REGION_CROPS]):
-            region_crop = self._crop_region_bbox(crop, region["mask"], padding=0.05)
-            dino_batch.append(DinoBatchEntry(si_idx, "region", ri, region_crop))
+        image_b64: str,
+        crop_height: int,
+        crop_width: int,
+        entities: list[dict[str, Any]],
+    ) -> tuple[
+        list[float] | None,
+        list[list[float] | None],
+        dict[tuple[int, int], list[float] | None],
+    ]:
+        """Call DINOv3 for one subimage: CLS + entity + feature embeddings.
 
-    def _crop_region_bbox(
-        self, image: Image.Image, rle_mask: dict[str, str], padding: float = 0.05
-    ) -> Image.Image:
-        """Crop image to bounding box of an RLE mask with padding."""
-        counts = decompress_rle(rle_mask["counts"])
-        mask = decode_rle(counts, image.height, image.width)
+        Sends all masks (entities + their features) in one call. Maps
+        embeddings back to (entity_idx, feature_idx) pairs.
 
-        bbox = mask_bbox(mask)
-        if bbox is None:
-            return image
-
-        x_min, y_min, w, h = bbox
-        x_max = x_min + w - 1
-        y_max = y_min + h - 1
-
-        pad_x = int(w * padding)
-        pad_y = int(h * padding)
-
-        x_min = max(0, x_min - pad_x)
-        y_min = max(0, y_min - pad_y)
-        x_max = min(image.width, x_max + pad_x)
-        y_max = min(image.height, y_max + pad_y)
-
-        return image.crop((x_min, y_min, x_max, y_max))
-
-    def _call_dinov3(self, images: list[Image.Image]) -> list[list[float] | None]:
-        """Call DINOv3 model with a list of PIL images.
-
-        Returns list of 1024-dim L2-normalized embeddings.
+        Returns (subimage_embedding, entity_embeddings, feature_embeddings_map).
         """
-        b64_images = []
-        for img in images:
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=90)
-            b64_images.append(base64.b64encode(buffer.getvalue()).decode("utf-8"))
+        mask_specs: list[dict[str, Any] | None] = [None]  # index 0: CLS
+        index_map: list[tuple[int, int | None]] = []  # (entity_idx, feature_idx_or_None)
 
-        image_array = np.array([b.encode("utf-8") for b in b64_images]).reshape(1, -1)
+        for ei, entity in enumerate(entities[:MAX_REGIONS]):
+            mask_specs.append(
+                {
+                    "counts": entity["mask"]["counts"],
+                    "height": crop_height,
+                    "width": crop_width,
+                }
+            )
+            index_map.append((ei, None))
+            for fi, feature in enumerate(entity.get("features", [])[:MAX_FEATURES_PER_ENTITY]):
+                mask_specs.append(
+                    {
+                        "counts": feature["mask"]["counts"],
+                        "height": crop_height,
+                        "width": crop_width,
+                    }
+                )
+                index_map.append((ei, fi))
+
+        masks_json = json.dumps(mask_specs)
 
         dino_request = pb_utils.InferenceRequest(
             model_name="dinov3",
             requested_output_names=["embeddings"],
-            inputs=[pb_utils.Tensor("images", image_array)],
+            inputs=[
+                pb_utils.Tensor("image", np.array([[image_b64.encode("utf-8")]])),
+                pb_utils.Tensor("masks", np.array([[masks_json.encode("utf-8")]])),
+            ],
             timeout=DINOV3_TIMEOUT_US,
         )
         dino_response = dino_request.exec()
 
+        n_entities = min(len(entities), MAX_REGIONS)
         if dino_response.has_error():
             pb_utils.Logger.log_error(f"DINOv3 error: {dino_response.error().message()}")
-            return [None for _ in range(len(images))]
+            feature_map: dict[tuple[int, int], list[float] | None] = {}
+            for ei, ent in enumerate(entities[:MAX_REGIONS]):
+                for fi in range(len(ent.get("features", []))):
+                    feature_map[(ei, fi)] = None
+            return None, [None] * n_entities, feature_map
 
         embeddings_tensor = pb_utils.get_output_tensor_by_name(dino_response, "embeddings")
         embeddings_json = get_string_from_tensor(embeddings_tensor)
-        result: list[list[float] | None] = json.loads(embeddings_json)
-        return result
+        all_embeddings: list[list[float]] = json.loads(embeddings_json)
+
+        # Map embeddings back: index 0 is CLS, rest follow index_map
+        subimage_emb = all_embeddings[0]
+        entity_embs: list[list[float] | None] = [None] * n_entities
+        feature_embs: dict[tuple[int, int], list[float] | None] = {}
+
+        for map_idx, (eidx, fidx) in enumerate(index_map):
+            emb = all_embeddings[map_idx + 1]  # +1 because index 0 is CLS
+            if fidx is None:
+                entity_embs[eidx] = emb
+            else:
+                feature_embs[(eidx, fidx)] = emb
+
+        return subimage_emb, entity_embs, feature_embs
 
     def finalize(self):
         """Clean up."""

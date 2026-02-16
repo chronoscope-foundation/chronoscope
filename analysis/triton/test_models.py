@@ -140,6 +140,10 @@ class TestMaskDeduplication:
     with higher-confidence masks, keeping only the highest-confidence version.
     """
 
+    @staticmethod
+    def _entry(mask: np.ndarray, score: float) -> Any:
+        return analysis_model._MaskEntry(mask=mask, score=score)
+
     def test_removes_duplicate_masks(self):
         """Deduplication removes masks with high IoU overlap."""
         mask1 = np.zeros((10, 10), dtype=np.uint8)
@@ -150,13 +154,14 @@ class TestMaskDeduplication:
         mask3 = np.zeros((10, 10), dtype=np.uint8)
         mask3[7:10, 7:10] = 1  # non-overlapping
 
-        result = analysis_model.deduplicate_masks([mask1, mask2, mask3], [0.9, 0.8, 0.7])
-
+        result = analysis_model.deduplicate_masks(
+            [self._entry(mask1, 0.9), self._entry(mask2, 0.8), self._entry(mask3, 0.7)]
+        )
         assert len(result) == 2, "Duplicate should be removed"
 
     def test_empty_input_returns_empty(self):
         """Empty input produces empty output."""
-        result = analysis_model.deduplicate_masks([], [])
+        result = analysis_model.deduplicate_masks([])
         assert result == []
 
     def test_single_mask_passes_through(self):
@@ -164,11 +169,11 @@ class TestMaskDeduplication:
         mask = np.zeros((10, 10), dtype=np.uint8)
         mask[2:8, 2:8] = 1
 
-        result = analysis_model.deduplicate_masks([mask], [0.9])
+        result = analysis_model.deduplicate_masks([self._entry(mask, 0.9)])
 
         assert len(result) == 1
-        assert np.array_equal(result[0][0], mask)
-        assert result[0][1] == 0.9
+        assert np.array_equal(result[0].mask, mask)
+        assert result[0].score == 0.9
 
     def test_keeps_higher_confidence_on_overlap(self):
         """When masks overlap significantly, keeps only the higher-confidence one."""
@@ -181,14 +186,15 @@ class TestMaskDeduplication:
         mask_low[0, 0] = 0  # 63 pixels, IoU = 63/64 ≈ 0.98 > 0.7
 
         # Lower confidence mask listed first, but higher confidence should be kept
-        result = analysis_model.deduplicate_masks([mask_low, mask_high], [0.7, 0.9])
+        result = analysis_model.deduplicate_masks(
+            [self._entry(mask_low, 0.7), self._entry(mask_high, 0.9)]
+        )
 
         assert len(result) == 1
-        assert result[0][1] == 0.9, "Should keep higher confidence mask"
+        assert result[0].score == 0.9, "Should keep higher confidence mask"
 
     def test_threshold_boundary_keeps_both(self):
         """Masks with IoU exactly at threshold boundary are both kept."""
-        # Two masks with ~70% IoU (at the default 0.7 threshold boundary)
         mask1 = np.zeros((10, 10), dtype=np.uint8)
         mask1[0:7, 0:10] = 1  # 70 pixels
 
@@ -196,7 +202,9 @@ class TestMaskDeduplication:
         mask2[3:10, 0:10] = 1  # 70 pixels, overlap = 40 pixels
         # IoU = 40 / (70 + 70 - 40) = 40/100 = 0.4, well below 0.7
 
-        result = analysis_model.deduplicate_masks([mask1, mask2], [0.9, 0.8])
+        result = analysis_model.deduplicate_masks(
+            [self._entry(mask1, 0.9), self._entry(mask2, 0.8)]
+        )
         assert len(result) == 2, "Non-duplicate masks should both be kept"
 
 
@@ -212,6 +220,10 @@ class TestExclusiveMasks:
     the overlapping pixels. This prevents double-counting in entity analysis.
     """
 
+    @staticmethod
+    def _entry(mask: np.ndarray, score: float) -> Any:
+        return analysis_model._MaskEntry(mask=mask, score=score)
+
     def test_higher_confidence_claims_overlapping_pixels(self):
         """Higher confidence mask keeps all pixels; lower loses overlap."""
         mask_high = np.zeros((10, 10), dtype=np.uint8)
@@ -220,33 +232,30 @@ class TestExclusiveMasks:
         mask_low = np.zeros((10, 10), dtype=np.uint8)
         mask_low[4:10, 4:10] = 1  # 36 pixels, overlaps with 16 pixels
 
-        result = analysis_model.make_masks_exclusive([(mask_high, 0.9), (mask_low, 0.7)])
-
-        assert len(result) == 2, "Both masks should survive"
-        high_result, low_result = result[0][0], result[1][0]
-
-        assert high_result.sum() == 36, "High confidence mask unchanged"
-        assert low_result.sum() == 20, (
-            f"Low confidence should have 20 pixels, got {low_result.sum()}"
+        result = analysis_model.make_masks_exclusive(
+            [self._entry(mask_high, 0.9), self._entry(mask_low, 0.7)]
         )
 
-        overlap = np.logical_and(high_result, low_result).sum()
+        assert len(result) == 2, "Both masks should survive"
+        assert result[0].mask.sum() == 36, "High confidence mask unchanged"
+        assert result[1].mask.sum() == 20, (
+            f"Low confidence should have 20 pixels, got {result[1].mask.sum()}"
+        )
+
+        overlap = np.logical_and(result[0].mask, result[1].mask).sum()
         assert overlap == 0, "Masks should not overlap"
 
     def test_prunes_masks_losing_most_pixels(self):
-        """Masks losing >90% of pixels are removed to avoid tiny fragments.
-
-        This prevents the VLM from receiving noise fragments that would
-        confuse region analysis.
-        """
+        """Masks losing >90% of pixels are removed to avoid tiny fragments."""
         mask_big = np.zeros((10, 10), dtype=np.uint8)
         mask_big[0:10, 0:10] = 1  # 100 pixels
 
         mask_small = np.zeros((10, 10), dtype=np.uint8)
         mask_small[4:6, 4:6] = 1  # 4 pixels, fully inside mask_big
 
-        result = analysis_model.make_masks_exclusive([(mask_big, 0.9), (mask_small, 0.7)])
-
+        result = analysis_model.make_masks_exclusive(
+            [self._entry(mask_big, 0.9), self._entry(mask_small, 0.7)]
+        )
         assert len(result) == 1, "Small mask should be pruned (0% survival)"
 
     def test_preserves_non_overlapping_masks(self):
@@ -257,11 +266,13 @@ class TestExclusiveMasks:
         mask_right = np.zeros((10, 10), dtype=np.uint8)
         mask_right[5:10, 5:10] = 1
 
-        result = analysis_model.make_masks_exclusive([(mask_left, 0.9), (mask_right, 0.7)])
+        result = analysis_model.make_masks_exclusive(
+            [self._entry(mask_left, 0.9), self._entry(mask_right, 0.7)]
+        )
 
         assert len(result) == 2
-        assert result[0][0].sum() == 25
-        assert result[1][0].sum() == 25
+        assert result[0].mask.sum() == 25
+        assert result[1].mask.sum() == 25
 
     def test_empty_input_returns_empty(self):
         """Empty input list returns empty output."""
@@ -269,18 +280,16 @@ class TestExclusiveMasks:
         assert result == []
 
     def test_survival_threshold_boundary(self):
-        """Masks with exactly 10% survival pass the threshold.
-
-        The 10% threshold balances keeping partial masks (e.g., occluded
-        buildings) vs removing noise fragments.
-        """
+        """Masks with exactly 10% survival pass the threshold."""
         mask_cover = np.zeros((10, 10), dtype=np.uint8)
         mask_cover[0:9, 0:10] = 1  # 90 pixels
 
         mask_partial = np.zeros((10, 10), dtype=np.uint8)
         mask_partial[0:10, 0:10] = 1  # 100 pixels, 90 overlap
 
-        result = analysis_model.make_masks_exclusive([(mask_cover, 0.9), (mask_partial, 0.7)])
+        result = analysis_model.make_masks_exclusive(
+            [self._entry(mask_cover, 0.9), self._entry(mask_partial, 0.7)]
+        )
 
         # mask_partial loses 90 pixels, keeps 10 -> 10% survival
         assert len(result) == 2, "10% survival should pass threshold"
@@ -364,6 +373,217 @@ class TestContainment:
         assert iou < 0.2
         # Containment is 1.0 (panel fully inside container)
         assert containment == pytest.approx(1.0)
+
+
+# =============================================================================
+# Hierarchical region grouping tests
+# =============================================================================
+
+
+class TestGroupByContainment:
+    """Tests for containment-based hierarchical region grouping.
+
+    When SAM3 returns overlapping regions from different prompts (e.g., "building"
+    and "tower"), group_by_containment nests the subordinate region (tower) under
+    its parent (building) based on spatial containment + prompt relationships.
+    """
+
+    @staticmethod
+    def _entry(mask: np.ndarray, score: float, prompt: str) -> Any:
+        return analysis_model._MaskEntry(mask=mask, score=score, prompt=prompt)
+
+    def test_tower_contained_in_building_becomes_feature(self):
+        """Tower mask inside building mask becomes a sub-feature."""
+        building = np.zeros((100, 100), dtype=np.uint8)
+        building[10:90, 10:90] = 1
+
+        tower = np.zeros((100, 100), dtype=np.uint8)
+        tower[20:50, 30:50] = 1
+
+        entries = [self._entry(building, 0.9, "building"), self._entry(tower, 0.8, "tower")]
+        top_level, children = analysis_model.group_by_containment(entries)
+
+        assert len(top_level) == 1, "Building should be the only top-level entity"
+        assert top_level[0].prompt == "building"
+        assert 0 in children, "Building should have children"
+        assert len(children[0]) == 1
+        assert children[0][0].prompt == "tower"
+
+    def test_standalone_tower_stays_top_level(self):
+        """Tower NOT contained in any building remains top-level."""
+        building = np.zeros((100, 100), dtype=np.uint8)
+        building[10:40, 10:40] = 1
+
+        tower = np.zeros((100, 100), dtype=np.uint8)
+        tower[60:90, 60:90] = 1
+
+        entries = [self._entry(building, 0.9, "building"), self._entry(tower, 0.8, "tower")]
+        top_level, children = analysis_model.group_by_containment(entries)
+
+        assert len(top_level) == 2, "Both should be top-level (no containment)"
+        assert len(children) == 0
+
+    def test_tower_partially_contained_stays_top_level(self):
+        """Tower with <70% containment in building stays top-level."""
+        building = np.zeros((100, 100), dtype=np.uint8)
+        building[0:50, 0:50] = 1
+
+        tower = np.zeros((100, 100), dtype=np.uint8)
+        tower[30:70, 30:70] = 1  # only partial overlap
+
+        # Containment of tower in building: intersection = 20*20=400, tower area = 40*40=1600
+        # 400/1600 = 0.25 < 0.7 threshold
+        entries = [self._entry(building, 0.9, "building"), self._entry(tower, 0.8, "tower")]
+        top_level, children = analysis_model.group_by_containment(entries)
+
+        assert len(top_level) == 2
+        assert len(children) == 0
+
+    def test_non_subordinate_prompt_stays_top_level(self):
+        """A prompt not in SUBORDINATE_PROMPTS stays top-level even if contained."""
+        building = np.zeros((100, 100), dtype=np.uint8)
+        building[10:90, 10:90] = 1
+
+        window = np.zeros((100, 100), dtype=np.uint8)
+        window[30:50, 30:50] = 1
+
+        entries = [self._entry(building, 0.9, "building"), self._entry(window, 0.8, "window")]
+        top_level, children = analysis_model.group_by_containment(entries)
+
+        assert len(top_level) == 2
+
+    def test_tower_picks_tightest_parent(self):
+        """Tower contained equally in two buildings picks the smaller (tighter fit)."""
+        big_building = np.zeros((100, 100), dtype=np.uint8)
+        big_building[0:80, 0:80] = 1  # area = 6400
+
+        small_building = np.zeros((100, 100), dtype=np.uint8)
+        small_building[20:60, 20:60] = 1  # area = 1600
+
+        tower = np.zeros((100, 100), dtype=np.uint8)
+        tower[25:45, 25:45] = 1  # fully inside both, containment = 1.0 for both
+
+        entries = [
+            self._entry(big_building, 0.9, "building"),
+            self._entry(small_building, 0.85, "building"),
+            self._entry(tower, 0.8, "tower"),
+        ]
+        top_level, children = analysis_model.group_by_containment(entries)
+
+        assert len(top_level) == 2
+        # Find which top-level entity has the child
+        parent_idx = next(idx for idx, kids in children.items() if len(kids) > 0)
+        # The parent should be the smaller building (tighter fit)
+        assert top_level[parent_idx].prompt == "building"
+        assert int(top_level[parent_idx].mask.sum()) == 1600, (
+            "Tower should nest under smaller building"
+        )
+
+    def test_empty_input(self):
+        """Empty input returns empty results."""
+        top_level, children = analysis_model.group_by_containment([])
+        assert top_level == []
+        assert children == {}
+
+
+# =============================================================================
+# Hierarchical postprocessing tests
+# =============================================================================
+
+
+class TestHierarchicalPostprocessing:
+    """Tests for the full postprocess_entity_regions pipeline with hierarchy."""
+
+    def test_building_with_tower_produces_features(self):
+        """Building containing a tower produces a hierarchical entity."""
+        height, width = 100, 100
+        building = np.zeros((height, width), dtype=np.uint8)
+        building[10:90, 10:90] = 1
+
+        tower = np.zeros((height, width), dtype=np.uint8)
+        tower[20:50, 30:50] = 1
+
+        raw_regions = [
+            {"confidence": 0.9, "mask": sam3_module.encode_rle(building), "prompt": "building"},
+            {"confidence": 0.8, "mask": sam3_module.encode_rle(tower), "prompt": "tower"},
+        ]
+        result = analysis_model.postprocess_entity_regions(raw_regions, height, width)
+
+        assert len(result) == 1, "Should have one top-level entity (building)"
+        entity = result[0]
+        assert entity["prompt"] == "building"
+        assert len(entity["features"]) == 1
+        assert entity["features"][0]["prompt"] == "tower"
+
+    def test_standalone_regions_have_empty_features(self):
+        """Regions without sub-features get empty features list."""
+        height, width = 100, 100
+        mask = np.zeros((height, width), dtype=np.uint8)
+        mask[10:50, 10:50] = 1
+
+        raw_regions = [
+            {"confidence": 0.9, "mask": sam3_module.encode_rle(mask), "prompt": "building"},
+        ]
+        result = analysis_model.postprocess_entity_regions(raw_regions, height, width)
+
+        assert len(result) == 1
+        assert result[0]["features"] == []
+
+    def test_no_prompt_field_treated_as_empty(self):
+        """Regions without prompt field are treated as empty string prompt."""
+        height, width = 100, 100
+        mask = np.zeros((height, width), dtype=np.uint8)
+        mask[10:50, 10:50] = 1
+
+        raw_regions = [{"confidence": 0.9, "mask": sam3_module.encode_rle(mask)}]
+        result = analysis_model.postprocess_entity_regions(raw_regions, height, width)
+
+        assert len(result) == 1
+        assert result[0]["prompt"] == ""
+
+    def test_exclusivity_preserves_children_when_parent_survives(self):
+        """When exclusive claiming drops a top-level entity, children of surviving parents are kept.
+
+        Regression test: an earlier implementation used parallel arrays with positional
+        indexing through make_masks_exclusive. When an entry was dropped, indices shifted
+        and children were mapped to the wrong parent or lost entirely.
+        """
+        height, width = 100, 100
+
+        # Building A: high confidence, large, on the left
+        building_a = np.zeros((height, width), dtype=np.uint8)
+        building_a[10:90, 5:50] = 1  # area = 80*45 = 3600
+
+        # Building B: lower confidence, overlaps heavily with A
+        building_b = np.zeros((height, width), dtype=np.uint8)
+        building_b[10:90, 20:65] = 1  # area = 80*45 = 3600, big overlap with A
+
+        # Building C: on the right, no overlap, has a tower
+        building_c = np.zeros((height, width), dtype=np.uint8)
+        building_c[10:90, 70:95] = 1  # area = 80*25 = 2000
+
+        # Tower inside building C
+        tower = np.zeros((height, width), dtype=np.uint8)
+        tower[20:50, 75:90] = 1  # fully inside C
+
+        raw_regions = [
+            {"confidence": 0.95, "mask": sam3_module.encode_rle(building_a), "prompt": "building"},
+            {"confidence": 0.6, "mask": sam3_module.encode_rle(building_b), "prompt": "building"},
+            {"confidence": 0.85, "mask": sam3_module.encode_rle(building_c), "prompt": "building"},
+            {"confidence": 0.8, "mask": sam3_module.encode_rle(tower), "prompt": "tower"},
+        ]
+        result = analysis_model.postprocess_entity_regions(raw_regions, height, width)
+
+        # Building B should be dropped by exclusivity (loses most pixels to A).
+        # Building A and C should survive. Tower should be a child of C.
+        prompts = [r["prompt"] for r in result]
+        assert "building" in prompts
+        assert len(result) >= 2, f"Expected at least 2 entities, got {len(result)}: {prompts}"
+
+        # Find the entity with children — it should be building C with the tower
+        entities_with_features = [r for r in result if len(r["features"]) > 0]
+        assert len(entities_with_features) == 1, "Exactly one entity should have features"
+        assert entities_with_features[0]["features"][0]["prompt"] == "tower"
 
 
 # =============================================================================
@@ -604,6 +824,15 @@ class TestDinov3:
 # =============================================================================
 
 
+def _is_subimage_detection(inputs: dict) -> bool:
+    """Check if a SAM3 call is for subimage (panel) detection vs entity segmentation."""
+    prompts = inputs.get("prompts")
+    if prompts is None:
+        return False
+    prompt_list = [p.decode("utf-8") for p in prompts.as_numpy().flatten()]
+    return "separate photograph in a collage" in prompt_list
+
+
 def _make_sam3_handler():
     """Create a mock SAM3 handler that returns valid regions.
 
@@ -625,7 +854,7 @@ def _make_sam3_handler():
         # Create a mock region (0-indexed, no region_id)
         mask = np.zeros((img.height, img.width), dtype=np.uint8)
         mask[10:50, 10:50] = 1
-        regions = [{"confidence": 0.85, "mask": sam3_module.encode_rle(mask)}]
+        regions = [{"confidence": 0.85, "mask": sam3_module.encode_rle(mask), "prompt": "building"}]
 
         return mock_triton.InferenceResponse(
             [mock_triton.Tensor("regions", np.array([json.dumps(regions).encode("utf-8")]))]
@@ -643,8 +872,7 @@ def _make_subimage_fallback_sam3():
     entity_handler = _make_sam3_handler()
 
     def handler(inputs):
-        prompts = inputs.get("prompts")
-        if prompts is not None:
+        if _is_subimage_detection(inputs):
             # Subimage detection — return empty to trigger full-image fallback
             return mock_triton.InferenceResponse(
                 [mock_triton.Tensor("regions", np.array([json.dumps([]).encode("utf-8")]))]
@@ -739,17 +967,24 @@ def _make_rejected_vlm_handler(reason: str = "No structures detected"):
 
 
 def _make_dinov3_handler():
-    """Create a mock DINOv3 handler that returns fake embeddings."""
+    """Create a mock DINOv3 handler that returns fake embeddings.
+
+    New interface: image + masks → per-mask embeddings.
+    null mask → CLS-like embedding, RLE mask → region embedding.
+    """
 
     def handler(inputs):
-        images_tensor = inputs.get("images")
-        assert images_tensor is not None, "DINOv3 should receive images input"
+        image_tensor = inputs.get("image")
+        masks_tensor = inputs.get("masks")
+        assert image_tensor is not None, "DINOv3 should receive image input"
+        assert masks_tensor is not None, "DINOv3 should receive masks input"
 
-        num_images = len(images_tensor.as_numpy().flatten())
+        masks_json = masks_tensor.as_numpy().flatten()[0].decode("utf-8")
+        mask_specs = json.loads(masks_json)
 
-        # Return fake 1024-dim L2-normalized embeddings
+        # Return fake 1024-dim L2-normalized embeddings (one per mask)
         embeddings = []
-        for i in range(num_images):
+        for i, _spec in enumerate(mask_specs):
             emb = [0.0] * 1024
             emb[i % 1024] = 1.0  # Unit vector for easy verification
             embeddings.append(emb)
@@ -824,6 +1059,8 @@ class TestAnalysisOrchestration:
         region = analysis["regions"][0]
         assert region["analysis"]["entity_type"] == "building"
         assert region["mask"]["counts"] != ""  # Should have RLE mask
+        assert region["detected_as"] == "building"
+        assert isinstance(region["features"], list)
         assert "region_id" not in region
 
         # Should have embeddings
@@ -920,12 +1157,13 @@ class TestAnalysisOrchestration:
         assert "VLM" in analysis["message"]
 
     def test_rejects_oversized_images(self):
-        """Pipeline rejects images exceeding size limit (5MB)."""
+        """Pipeline rejects images exceeding size limit (10MB)."""
         model = analysis_model.TritonPythonModel()
         model.initialize({"model_config": json.dumps({})})
 
-        # Create a "large" image by making a long base64 string
-        fake_large_b64 = "A" * (7 * 1024 * 1024)
+        # Create a "large" image by making a long base64 string.
+        # 14MB base64 ≈ 10.5MB decoded, exceeding MAX_IMAGE_BYTES (10MB).
+        fake_large_b64 = "A" * (14 * 1024 * 1024)
 
         request = mock_triton.InferenceRequest(
             model_name="analysis",
@@ -1037,7 +1275,10 @@ class TestAnalysisOrchestration:
         analysis = result["subimages"][0]["analysis"]
         assert analysis["status"] == "analyzed", "VLM results should be preserved"
         assert "embedding" not in analysis, "subimage embedding should be absent"
-        assert "embedding" not in analysis["regions"][0], "region embedding should be absent"
+        region = analysis["regions"][0]
+        assert "embedding" not in region, "region embedding should be absent"
+        assert region["detected_as"] == "building"
+        assert isinstance(region["features"], list)
 
     def test_subimage_detection_uses_prompt(self):
         """Subimage detection calls SAM3 with panel detection prompts."""
@@ -1048,7 +1289,7 @@ class TestAnalysisOrchestration:
             prompts = inputs.get("prompts")
             if prompts is not None:
                 received_prompts.extend([p.decode("utf-8") for p in prompts.as_numpy().flatten()])
-                # Return empty to trigger fallback
+            if _is_subimage_detection(inputs):
                 return mock_triton.InferenceResponse(
                     [mock_triton.Tensor("regions", np.array([json.dumps([]).encode("utf-8")]))]
                 )
@@ -1072,9 +1313,78 @@ class TestAnalysisOrchestration:
 
         model.execute([request])
 
-        # Should have received subimage detection prompt for collage detection
-        assert len(received_prompts) == 1
-        assert "collage" in received_prompts[0]
+        # Should have received subimage detection prompt + entity prompts
+        assert any("collage" in p for p in received_prompts)
+        # Entity prompts should also have been sent
+        assert any("building" in p for p in received_prompts)
+
+    def test_hierarchical_regions_building_with_tower(self):
+        """Building containing a tower produces hierarchical region output."""
+        width, height = 200, 150
+        entity_building = np.zeros((height, width), dtype=np.uint8)
+        entity_building[10:140, 10:190] = 1
+
+        entity_tower = np.zeros((height, width), dtype=np.uint8)
+        entity_tower[20:80, 80:120] = 1  # tower inside building
+
+        def hierarchical_sam3(inputs):
+            if _is_subimage_detection(inputs):
+                return mock_triton.InferenceResponse(
+                    [mock_triton.Tensor("regions", np.array([json.dumps([]).encode("utf-8")]))]
+                )
+            # Entity segmentation: build masks at received image dimensions
+            img_b64 = inputs["image"].as_numpy().flatten()[0].decode("utf-8")
+            img_bytes = base64.b64decode(img_b64)
+            img = Image.open(io.BytesIO(img_bytes))
+            h, w = img.height, img.width
+
+            building = np.zeros((h, w), dtype=np.uint8)
+            building[10 : min(140, h), 10 : min(190, w)] = 1
+
+            tower = np.zeros((h, w), dtype=np.uint8)
+            tower[20 : min(80, h), 80 : min(120, w)] = 1
+
+            regions = [
+                {"confidence": 0.9, "mask": sam3_module.encode_rle(building), "prompt": "building"},
+                {"confidence": 0.85, "mask": sam3_module.encode_rle(tower), "prompt": "tower"},
+            ]
+            return mock_triton.InferenceResponse(
+                [mock_triton.Tensor("regions", np.array([json.dumps(regions).encode("utf-8")]))]
+            )
+
+        mock_triton.register_model("sam3", hierarchical_sam3)
+        mock_triton.register_model("vlm", _make_vlm_handler())
+        mock_triton.register_model("dinov3", _make_dinov3_handler())
+
+        model = analysis_model.TritonPythonModel()
+        model.initialize({"model_config": json.dumps({})})
+
+        request = mock_triton.InferenceRequest(
+            model_name="analysis",
+            requested_output_names=["result"],
+            inputs=[
+                mock_triton.Tensor("image", np.array([make_test_image().encode("utf-8")])),
+                mock_triton.Tensor("schema", np.array([make_test_schema().encode("utf-8")])),
+            ],
+        )
+
+        responses = model.execute([request])
+        result = _parse_result(responses[0])
+
+        assert result["outcome"] == "success"
+        analysis = result["subimages"][0]["analysis"]
+        assert analysis["status"] == "analyzed"
+
+        # Should have 1 top-level region (building) with 1 feature (tower)
+        assert len(analysis["regions"]) == 1
+        region = analysis["regions"][0]
+        assert region["detected_as"] == "building"
+        assert len(region["features"]) == 1
+        assert region["features"][0]["detected_as"] == "tower"
+
+        # Both entity and feature should have embeddings
+        assert len(region["embedding"]) == 1024
+        assert len(region["features"][0]["embedding"]) == 1024
 
     def test_container_region_filtered_from_composite(self):
         """Image-wide container region is removed, keeping individual sub-images.
@@ -1090,8 +1400,7 @@ class TestAnalysisOrchestration:
         width, height = 200, 150
 
         def composite_sam3(inputs):
-            prompts = inputs.get("prompts")
-            if prompts is not None:
+            if _is_subimage_detection(inputs):
                 # Subimage detection: container + two panels
                 container = np.zeros((height, width), dtype=np.uint8)
                 container[5:145, 5:195] = 1  # ~90% of image

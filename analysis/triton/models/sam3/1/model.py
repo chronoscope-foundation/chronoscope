@@ -31,11 +31,11 @@ def get_string_from_tensor(tensor: Any) -> str:
     return result
 
 
-# Default prompts when none provided by caller
-ENTITY_PROMPTS = ["building", "bridge", "tower", "monument", "infrastructure"]
-
 # Minimum confidence for a mask to be included in results
 MIN_CONFIDENCE = 0.5
+
+# Threshold for binarizing soft probability masks from SAM3's decoder
+MASK_BINARIZATION_THRESHOLD = 0.5
 
 
 def encode_rle(mask: np.ndarray) -> list[int]:
@@ -113,7 +113,9 @@ class TritonPythonModel:
                             h, w = module.coord_cache[key]
                             module.coord_cache[key] = (h.to(device), w.to(device))
 
-        self.processor = Sam3Processor(self.model, device=device)
+        self.processor = Sam3Processor(
+            self.model, device=device, confidence_threshold=MIN_CONFIDENCE
+        )
 
         n_params = sum(p.numel() for p in self.model.parameters())
         pb_utils.Logger.log_info(f"Loaded SAM3: {n_params / 1e6:.0f}M params on {device}")
@@ -126,11 +128,11 @@ class TritonPythonModel:
             image_tensor = pb_utils.get_input_tensor_by_name(request, "image")
             image_b64 = get_string_from_tensor(image_tensor)
 
-            # Check for optional prompts
+            # Prompts are required — the caller decides what to segment
             prompts_tensor = pb_utils.get_input_tensor_by_name(request, "prompts")
-            prompts = None
-            if prompts_tensor is not None:
-                prompts = [p.decode("utf-8") for p in prompts_tensor.as_numpy().flatten()]
+            if prompts_tensor is None:
+                raise RuntimeError("SAM3 requires 'prompts' input")
+            prompts = [p.decode("utf-8") for p in prompts_tensor.as_numpy().flatten()]
 
             # Decode image
             image_bytes = base64.b64decode(image_b64)
@@ -146,49 +148,51 @@ class TritonPythonModel:
 
         return responses
 
-    def _segment_with_sam3(
-        self, image: Image.Image, prompts: list[str] | None = None
-    ) -> list[dict]:
+    def _segment_with_sam3(self, image: Image.Image, prompts: list[str]) -> list[dict]:
         """Run SAM3 segmentation with text prompts.
+
+        Processes prompts sequentially via the public Sam3Processor API.
+        The image backbone runs once (set_image) and is shared across all
+        prompts; each set_text_prompt call runs the encoder/decoder/segmentation
+        heads for one prompt at a time, keeping peak memory bounded.
 
         Returns raw confidence-filtered regions. Callers are responsible for
         any post-processing (deduplication, exclusive masks, sorting, limits).
         """
-        # Set the image once
-        inference_state = self.processor.set_image(image)
 
-        all_masks: list[np.ndarray] = []
-        all_scores: list[float] = []
+        # Image backbone runs once (shared across all prompts)
+        state = self.processor.set_image(image)
 
-        for prompt in prompts or ENTITY_PROMPTS:
+        return self._segment_sequential(state, prompts)
+
+    def _segment_sequential(self, state: dict, prompts: list[str]) -> list[dict]:
+        """One forward pass per prompt via the public API."""
+        results: list[dict] = []
+
+        for prompt in prompts:
             try:
-                output = self.processor.set_text_prompt(state=inference_state, prompt=prompt)
+                output = self.processor.set_text_prompt(state=state, prompt=prompt)
                 masks = output["masks"]
                 scores = output["scores"]
 
                 for mask, score in zip(masks, scores, strict=True):
-                    if score >= MIN_CONFIDENCE:
-                        # Convert mask to numpy if needed
-                        if hasattr(mask, "cpu"):
-                            mask = mask.cpu().numpy()
-                        if mask.ndim == 3:
-                            mask = mask.squeeze(0)
-                        all_masks.append(mask > 0.5)
-                        all_scores.append(float(score))
-
+                    if hasattr(mask, "cpu"):
+                        mask = mask.cpu().numpy()
+                    if mask.ndim == 3:
+                        mask = mask.squeeze(0)
+                    results.append(
+                        {
+                            "confidence": float(score),
+                            "mask": encode_rle(
+                                (mask > MASK_BINARIZATION_THRESHOLD).astype(np.uint8)
+                            ),
+                            "prompt": prompt,
+                        }
+                    )
             except Exception as e:
                 pb_utils.Logger.log_warn(f"Segmentation failed for prompt '{prompt}': {e}")
 
-        if not all_masks and (prompts or ENTITY_PROMPTS):
-            pb_utils.Logger.log_warn("All prompts failed to produce regions")
-
-        # Convert to output format — raw masks, no post-processing
-        regions = [
-            {"confidence": score, "mask": encode_rle(mask.astype(np.uint8))}
-            for mask, score in zip(all_masks, all_scores, strict=True)
-        ]
-
-        return regions
+        return results
 
     def finalize(self):
         """Clean up."""

@@ -3,6 +3,7 @@
 Provides enough of the pb_utils API to test model orchestration locally.
 """
 
+import sys
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -106,19 +107,19 @@ def clear_models():
 
 
 class Logger:
-    """Mock logger that prints to stdout."""
+    """Mock logger that prints to stderr."""
 
     @staticmethod
     def log_info(msg: str):
-        print(f"[INFO] {msg}")
+        print(f"[INFO] {msg}", file=sys.stderr)
 
     @staticmethod
     def log_warn(msg: str):
-        print(f"[WARN] {msg}")
+        print(f"[WARN] {msg}", file=sys.stderr)
 
     @staticmethod
     def log_error(msg: str):
-        print(f"[ERROR] {msg}")
+        print(f"[ERROR] {msg}", file=sys.stderr)
 
 
 class InferenceRequest:
