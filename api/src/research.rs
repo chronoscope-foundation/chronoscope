@@ -560,8 +560,8 @@ mod tests {
     #[test]
     fn test_convert_analysis_complete_with_results() -> TestResult {
         use chronoscope_analysis::{
-            AnalysisResult, AnalyzedMediaType, BoundingBox, ModelVersions, PhotoColor, RleMask,
-            SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds,
+            AnalysisResult, AnalyzedMediaType, BoundingBox, Embedding, ModelVersions, PhotoColor,
+            RleMask, SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds,
         };
 
         let analysis_result = AnalysisResult::Success {
@@ -585,7 +585,7 @@ mod tests {
                         content_summary: "A historic building on a street corner".to_string(),
                         scene_type: SceneType::Outdoor,
                     },
-                    embedding: None,
+                    embedding: Embedding::test_default(),
                     regions: vec![],
                 },
             }],

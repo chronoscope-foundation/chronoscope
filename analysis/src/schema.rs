@@ -16,6 +16,72 @@ use serde::{Deserialize, Serialize};
 /// DINOv3 CLS embedding dimensionality.
 pub const EMBEDDING_DIM: usize = 1024;
 
+/// Tolerance for checking that embeddings are L2-normalized.
+const NORM_TOLERANCE: f32 = 0.01;
+
+/// Error constructing an [`Embedding`].
+#[derive(Debug, thiserror::Error)]
+pub enum EmbeddingError {
+    #[error("expected {expected} dimensions, got {actual}")]
+    DimMismatch { expected: usize, actual: usize },
+    #[error("L2 norm {norm:.4} is not approximately 1.0")]
+    NotNormalized { norm: f32 },
+}
+
+/// A validated DINOv3 CLS embedding (1024 dimensions, L2-normalized).
+///
+/// Validated on construction: correct dimensionality and approximately
+/// unit L2 norm. Deserialization from JSON enforces the same constraints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(try_from = "Vec<f32>", into = "Vec<f32>")]
+pub struct Embedding(Vec<f32>);
+
+impl Embedding {
+    /// Create a new embedding, validating dimension and normalization.
+    pub fn try_new(v: Vec<f32>) -> Result<Self, EmbeddingError> {
+        if v.len() != EMBEDDING_DIM {
+            return Err(EmbeddingError::DimMismatch {
+                expected: EMBEDDING_DIM,
+                actual: v.len(),
+            });
+        }
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if (norm - 1.0).abs() >= NORM_TOLERANCE {
+            return Err(EmbeddingError::NotNormalized { norm });
+        }
+        Ok(Self(v))
+    }
+
+    /// View the embedding as a float slice.
+    pub fn as_slice(&self) -> &[f32] {
+        &self.0
+    }
+
+    /// Create a zero-content embedding for tests.
+    ///
+    /// Returns a unit vector (first component = 1.0, rest = 0.0) which
+    /// satisfies dimension and normalization constraints.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_default() -> Self {
+        let mut v = vec![0.0; EMBEDDING_DIM];
+        v[0] = 1.0;
+        Self(v)
+    }
+}
+
+impl TryFrom<Vec<f32>> for Embedding {
+    type Error = EmbeddingError;
+    fn try_from(v: Vec<f32>) -> Result<Self, Self::Error> {
+        Self::try_new(v)
+    }
+}
+
+impl From<Embedding> for Vec<f32> {
+    fn from(e: Embedding) -> Self {
+        e.0
+    }
+}
+
 // ==================== Segmentation Types ====================
 
 /// RLE-encoded binary mask (COCO compressed string format).
@@ -258,9 +324,7 @@ pub struct Region {
     pub mask: RleMask,
 
     /// DINOv3 CLS embedding for this region crop (1024 dims, L2-normalized).
-    /// `None` if embedding was not computed or failed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding: Option<Vec<f32>>,
+    pub embedding: Embedding,
 
     /// VLM analysis of this region. `None` when VLM was skipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -302,17 +366,14 @@ pub enum SubimageAnalysis {
         /// VLM scene-level analysis (shared type with VLM schema).
         scene: SceneAnalysis,
         /// DINOv3 CLS embedding for the whole subimage crop (1024 dims, L2-normalized).
-        /// `None` if embedding was not computed or failed.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        embedding: Option<Vec<f32>>,
+        embedding: Embedding,
         /// Detected and analyzed regions within this subimage.
         regions: Vec<Region>,
     },
     /// Subimage was segmented but VLM was skipped (SAM3 + DINOv3 only).
     Segmented {
         /// DINOv3 CLS embedding for the whole subimage crop (1024 dims, L2-normalized).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        embedding: Option<Vec<f32>>,
+        embedding: Embedding,
         /// Detected regions (no VLM analysis, only segmentation + embeddings).
         regions: Vec<Region>,
     },
@@ -332,12 +393,10 @@ pub enum SubimageAnalysis {
 }
 
 impl SubimageAnalysis {
-    /// Extract the DINOv3 embedding, if present.
-    pub fn embedding(&self) -> Option<&[f32]> {
+    /// Extract the DINOv3 embedding, if this is a segmented or analyzed variant.
+    pub fn embedding(&self) -> Option<&Embedding> {
         match self {
-            Self::Analyzed { embedding, .. } | Self::Segmented { embedding, .. } => {
-                embedding.as_deref()
-            }
+            Self::Analyzed { embedding, .. } | Self::Segmented { embedding, .. } => Some(embedding),
             _ => None,
         }
     }

@@ -60,9 +60,9 @@ pub(crate) mod triton_proto {
 pub use error::AnalysisError;
 pub use grpc::GrpcTritonClient;
 pub use schema::{
-    AnalysisRequest, AnalysisResult, AnalyzedMediaType, BoundingBox, EMBEDDING_DIM, EntityType,
-    ModelVersions, PhotoColor, Region, RegionAnalysis, RegionIndex, RegionRelation, RelationType,
-    RleMask, SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds, SurroundingType,
-    Surroundings,
+    AnalysisRequest, AnalysisResult, AnalyzedMediaType, BoundingBox, EMBEDDING_DIM, Embedding,
+    EntityType, ModelVersions, PhotoColor, Region, RegionAnalysis, RegionIndex, RegionRelation,
+    RelationType, RleMask, SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds,
+    SurroundingType, Surroundings,
 };
 pub use service::TritonService;

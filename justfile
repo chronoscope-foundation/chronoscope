@@ -26,6 +26,18 @@ test:
 coverage:
     cargo llvm-cov --fail-under-lines 75
 
+# Download corpus images (no models needed)
+corpus-download:
+    cargo run --features corpus-test -p chronoscope-analysis --bin corpus -- download
+
+# Run corpus test suite (per-image + per-cluster, with known-issue tracking)
+corpus-test: triton-venv
+    cargo test --features corpus-test -p chronoscope-analysis --test corpus_tests
+
+# Run corpus test suite with VLM (requires remote Triton)
+corpus-test-vlm: triton-venv
+    cargo test --features corpus-test-vlm -p chronoscope-analysis --test corpus_tests
+
 # Set up Triton test venv
 triton-venv:
     #!/usr/bin/env bash

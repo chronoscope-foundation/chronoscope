@@ -21,9 +21,11 @@ required-features = ["corpus-test"]
 [features]
 default = []
 testing = []
-## Corpus regression test suite (requires live Triton server + internet).
+## Corpus test suite (downloads images, runs SAM3+DINOv3 via Python subprocess).
 ## Never part of `just check` or normal CI.
-corpus-test = ["dep:toml", "dep:chrono", "dep:futures"]
+corpus-test = ["dep:chrono", "dep:glob", "dep:chronoscope-integrations", "dep:url"]
+## Superset: includes VLM-dependent tests (requires remote Triton with VLM).
+corpus-test-vlm = ["corpus-test"]
 
 [dependencies]
 # Serialization
@@ -62,9 +64,10 @@ sha2 = "0.10"
 hex = "0.4"
 
 # Corpus test suite (optional, gated behind corpus-test feature)
-toml = { version = "0.8", optional = true }
 chrono = { workspace = true, optional = true }
-futures = { version = "0.3", optional = true }
+glob = { version = "0.3", optional = true }
+chronoscope-integrations = { path = "../integrations", optional = true }
+url = { workspace = true, optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
@@ -72,3 +75,10 @@ protobuf-src = "2"
 
 [dev-dependencies]
 tempfile = "3"
+libtest-mimic = "0.8"
+
+[[test]]
+name = "corpus_tests"
+path = "tests/corpus_tests.rs"
+harness = false
+required-features = ["corpus-test"]

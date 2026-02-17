@@ -9,7 +9,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use chrono::Utc;
 use chronoscope_analysis::mock::MockTritonService;
-use chronoscope_analysis::{ModelVersions, TritonService};
+use chronoscope_analysis::{Embedding, ModelVersions, TritonService};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::workers::MediaForAnalysis;
 use chronoscope_db::{Database, Email, MediaData, MediaId, MediaType, UserId};
@@ -72,7 +72,7 @@ pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
                     content_summary: "A test image".to_string(),
                     scene_type: SceneType::Outdoor,
                 },
-                embedding: None,
+                embedding: Embedding::test_default(),
                 regions: vec![],
             },
         }],
