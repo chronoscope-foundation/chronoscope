@@ -1,8 +1,10 @@
 //! Database models.
 
 use chrono::NaiveDateTime;
+use chronoscope_core::{UncertainDate, UncertainLocation};
+use sqlx::FromRow;
+use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
-use sqlx::{FromRow, Row};
 
 use crate::types::{
     AnalysisStatus, Email, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
@@ -30,42 +32,6 @@ fn build_analysis_state(
         AnalysisStatus::Failed => MediaAnalysisState::Failed {
             error: analysis_error.unwrap_or_else(|| "Unknown error".to_string()),
         },
-    }
-}
-
-// ==================== Data Types ====================
-
-/// GPS location with latitude, longitude, and optional altitude.
-/// Designed to match future PostGIS/Spatialite POINT type.
-#[derive(Debug, Clone)]
-pub struct GpsLocation {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub altitude: Option<f64>,
-}
-
-impl GpsLocation {
-    /// Reconstruct GPS location from separate lat/lon/alt columns.
-    /// Returns None if lat/lon are missing or only partially present.
-    #[must_use]
-    pub fn from_columns(lat: Option<f64>, lon: Option<f64>, alt: Option<f64>) -> Option<Self> {
-        match (lat, lon) {
-            (Some(latitude), Some(longitude)) => Some(GpsLocation {
-                latitude,
-                longitude,
-                altitude: alt,
-            }),
-            _ => None,
-        }
-    }
-
-    /// Decompose an optional GPS location into separate column values for database storage.
-    #[must_use]
-    pub fn to_columns(location: Option<&Self>) -> (Option<f64>, Option<f64>, Option<f64>) {
-        match location {
-            Some(loc) => (Some(loc.latitude), Some(loc.longitude), loc.altitude),
-            None => (None, None, None),
-        }
     }
 }
 
@@ -170,7 +136,7 @@ pub struct PageData {
     pub source_type: SourceType,
     pub title: Option<String>,
     pub author: Option<String>,
-    pub published_at: Option<NaiveDateTime>,
+    pub published: Option<UncertainDate>,
     pub content: Option<String>,
     pub fetched_at: NaiveDateTime,
     /// Media referenced by this page (in source order)
@@ -192,7 +158,8 @@ pub(crate) struct PageDbRow {
     pub(crate) source_type: SourceType,
     pub(crate) title: Option<String>,
     pub(crate) author: Option<String>,
-    pub(crate) published_at: Option<NaiveDateTime>,
+    #[sqlx(json(nullable), rename = "published_meta")]
+    pub(crate) published: Option<UncertainDate>,
     pub(crate) content: Option<String>,
     pub(crate) fetched_at: NaiveDateTime,
     pub(crate) created_at: NaiveDateTime,
@@ -208,8 +175,8 @@ pub struct MediaData {
     pub width: i32,
     pub height: i32,
     pub duration_seconds: Option<f32>,
-    pub captured_at: Option<NaiveDateTime>,
-    pub location: Option<GpsLocation>,
+    pub captured: Option<UncertainDate>,
+    pub location: Option<UncertainLocation>,
     pub source_metadata: Option<String>, // JSON stored as text
     pub fetched_at: NaiveDateTime,
 }
@@ -235,10 +202,10 @@ pub(crate) struct MediaDbRow {
     pub(crate) width: i32,
     pub(crate) height: i32,
     pub(crate) duration_seconds: Option<f32>,
-    pub(crate) captured_at: Option<NaiveDateTime>,
-    pub(crate) gps_latitude: Option<f64>,
-    pub(crate) gps_longitude: Option<f64>,
-    pub(crate) gps_altitude: Option<f64>,
+    #[sqlx(json(nullable), rename = "captured_meta")]
+    pub(crate) captured: Option<UncertainDate>,
+    #[sqlx(json(nullable), rename = "location_meta")]
+    pub(crate) location: Option<UncertainLocation>,
     pub(crate) source_metadata: Option<String>,
     pub(crate) fetched_at: NaiveDateTime,
     pub(crate) created_at: NaiveDateTime,
@@ -265,12 +232,8 @@ impl MediaDbRow {
                 width: self.width,
                 height: self.height,
                 duration_seconds: self.duration_seconds,
-                captured_at: self.captured_at,
-                location: GpsLocation::from_columns(
-                    self.gps_latitude,
-                    self.gps_longitude,
-                    self.gps_altitude,
-                ),
+                captured: self.captured,
+                location: self.location,
                 source_metadata: self.source_metadata,
                 fetched_at: self.fetched_at,
             },
@@ -307,10 +270,10 @@ pub(crate) struct PageMediaRow {
     pub(crate) width: Option<i32>,
     pub(crate) height: Option<i32>,
     pub(crate) duration_seconds: Option<f32>,
-    pub(crate) captured_at: Option<NaiveDateTime>,
-    pub(crate) gps_latitude: Option<f64>,
-    pub(crate) gps_longitude: Option<f64>,
-    pub(crate) gps_altitude: Option<f64>,
+    #[sqlx(json(nullable), rename = "captured_meta")]
+    pub(crate) captured: Option<UncertainDate>,
+    #[sqlx(json(nullable), rename = "location_meta")]
+    pub(crate) location: Option<UncertainLocation>,
     pub(crate) source_metadata: Option<String>,
     pub(crate) fetched_at: Option<NaiveDateTime>,
     pub(crate) created_at: Option<NaiveDateTime>,
@@ -324,15 +287,12 @@ impl PageMediaRow {
         let url = std::mem::take(&mut self.source_url);
         MediaSlot {
             url,
-            resolved: self.try_into_media(),
+            resolved: self.into_media(),
         }
     }
 
-    /// Try to construct a Media from the LEFT JOIN fields.
-    ///
-    /// Returns None if the LEFT JOIN didn't match a media row (id is None).
-    /// Uses `?` on required fields - if id exists, all NOT NULL columns must exist.
-    fn try_into_media(self) -> Option<Media> {
+    /// Build Media from LEFT JOIN fields. Returns None if id is absent.
+    fn into_media(self) -> Option<Media> {
         let id = self.id?;
         let analysis = build_analysis_state(
             self.analysis_status?,
@@ -350,12 +310,8 @@ impl PageMediaRow {
                 width: self.width?,
                 height: self.height?,
                 duration_seconds: self.duration_seconds,
-                captured_at: self.captured_at,
-                location: GpsLocation::from_columns(
-                    self.gps_latitude,
-                    self.gps_longitude,
-                    self.gps_altitude,
-                ),
+                captured: self.captured,
+                location: self.location,
                 source_metadata: self.source_metadata,
                 fetched_at: self.fetched_at?,
             },
@@ -369,80 +325,6 @@ impl PageMediaRow {
 mod tests {
     use super::*;
 
-    // GpsLocation::from_columns tests
-    #[test]
-    fn gps_from_columns_both_present() {
-        let loc = GpsLocation::from_columns(Some(41.5), Some(-87.5), None);
-        assert!(loc.is_some());
-        // Safe because we just asserted is_some
-        if let Some(loc) = loc {
-            assert!((loc.latitude - 41.5).abs() < f64::EPSILON);
-            assert!((loc.longitude - -87.5).abs() < f64::EPSILON);
-            assert!(loc.altitude.is_none());
-        }
-    }
-
-    #[test]
-    fn gps_from_columns_with_altitude() {
-        let loc = GpsLocation::from_columns(Some(41.5), Some(-87.5), Some(200.0));
-        assert!(loc.is_some());
-        if let Some(loc) = loc {
-            assert_eq!(loc.altitude, Some(200.0));
-        }
-    }
-
-    #[test]
-    fn gps_from_columns_lat_only_returns_none() {
-        assert!(GpsLocation::from_columns(Some(41.5), None, None).is_none());
-    }
-
-    #[test]
-    fn gps_from_columns_lon_only_returns_none() {
-        assert!(GpsLocation::from_columns(None, Some(-87.5), None).is_none());
-    }
-
-    #[test]
-    fn gps_from_columns_neither_returns_none() {
-        assert!(GpsLocation::from_columns(None, None, None).is_none());
-    }
-
-    // GpsLocation::to_columns tests
-    #[test]
-    fn gps_to_columns_none() {
-        assert_eq!(GpsLocation::to_columns(None), (None, None, None));
-    }
-
-    #[test]
-    fn gps_to_columns_roundtrip() {
-        let loc = GpsLocation {
-            latitude: 41.5,
-            longitude: -87.5,
-            altitude: Some(200.0),
-        };
-        let (lat, lon, alt) = GpsLocation::to_columns(Some(&loc));
-        let reconstructed = GpsLocation::from_columns(lat, lon, alt);
-        assert!(reconstructed.is_some());
-        if let Some(reconstructed) = reconstructed {
-            assert!((reconstructed.latitude - loc.latitude).abs() < f64::EPSILON);
-            assert!((reconstructed.longitude - loc.longitude).abs() < f64::EPSILON);
-            assert_eq!(reconstructed.altitude, loc.altitude);
-        }
-    }
-
-    #[test]
-    fn gps_to_columns_without_altitude() {
-        let loc = GpsLocation {
-            latitude: 41.5,
-            longitude: -87.5,
-            altitude: None,
-        };
-        let (lat, lon, alt) = GpsLocation::to_columns(Some(&loc));
-        assert_eq!(lat, Some(41.5));
-        assert_eq!(lon, Some(-87.5));
-        assert_eq!(alt, None);
-    }
-
-    // MediaSlot::pending test
     #[test]
     fn media_slot_pending_has_no_resolved() {
         let slot = MediaSlot::pending("https://example.com/image.jpg");

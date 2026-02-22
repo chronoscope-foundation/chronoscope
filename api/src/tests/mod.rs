@@ -20,8 +20,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{
-    Database, Email, GpsLocation, MediaData, MediaId, MediaSlot, MediaType, PageData, PageId,
-    ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
+    Database, Email, MediaData, MediaId, MediaSlot, MediaType, PageData, PageId, ResearchUrlId,
+    ResearchUrlStatus, SourceType, UserId,
 };
 use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpError,
@@ -508,7 +508,7 @@ impl TestContext {
             source_type,
             title: Some("Test Post".to_string()),
             author: Some("testuser".to_string()),
-            published_at: None,
+            published: None,
             content: Some("This is test content".to_string()),
             fetched_at: chrono::Utc::now().naive_utc(),
             media: media_urls
@@ -528,7 +528,7 @@ impl TestContext {
             width: 800,
             height: 600,
             duration_seconds: None,
-            captured_at: None,
+            captured: None,
             location: None,
             source_metadata: None,
             fetched_at: chrono::Utc::now().naive_utc(),

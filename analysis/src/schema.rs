@@ -13,6 +13,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub use chronoscope_core::RleMask;
+
 /// DINOv3 CLS embedding dimensionality.
 pub const EMBEDDING_DIM: usize = 1024;
 
@@ -80,21 +82,6 @@ impl From<Embedding> for Vec<f32> {
     fn from(e: Embedding) -> Self {
         e.0
     }
-}
-
-// ==================== Segmentation Types ====================
-
-/// RLE-encoded binary mask (COCO compressed string format).
-///
-/// Run-length encoding alternates between background and foreground run lengths,
-/// compressed into a compact ASCII string using modified LEB128 encoding.
-/// This is the same format used by pycocotools.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct RleMask {
-    /// Compressed run lengths as COCO string (modified LEB128, +48 ASCII offset).
-    /// Alternates background/foreground; first run is always background.
-    pub counts: String,
 }
 
 // ==================== Shared Analysis Types ====================

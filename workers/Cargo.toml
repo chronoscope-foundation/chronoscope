@@ -17,6 +17,7 @@ record-fixtures = []
 [dependencies]
 # Internal crates
 chronoscope-analysis = { path = "../analysis" }
+chronoscope-core = { path = "../core" }
 chronoscope-db = { path = "../db" }
 chronoscope-integrations = { path = "../integrations" }
 

@@ -58,17 +58,18 @@ pub async fn process(
     let markdown = html2md::parse_html(&article.content);
 
     // Parse published time if available
-    let published_at = article
+    let published = article
         .published_time
         .as_ref()
-        .and_then(|t| parse_published_time(t));
+        .and_then(|t| parse_published_time(t))
+        .and_then(|dt| chronoscope_core::UncertainDate::exact(dt).ok());
 
     // Create page data
     let page_data = PageData {
         source_type: SourceType::Generic,
         title: Some(article.title),
         author: article.byline,
-        published_at,
+        published,
         content: Some(markdown),
         fetched_at: Utc::now().naive_utc(),
         media: discovered_urls

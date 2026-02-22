@@ -154,18 +154,18 @@ define_queries! {
     DELETE_FOLLOW: "DELETE FROM follows WHERE user_id = ? AND url_id = ?",
 
     // Pages
-    GET_PAGE_BY_ID: "SELECT id, source_type, title, author, published_at, content, fetched_at, created_at FROM pages WHERE id = ?",
-    CREATE_PAGE: "INSERT INTO pages (id, source_type, title, author, published_at, content, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    GET_PAGE_BY_ID: "SELECT id, source_type, title, author, published_meta, content, fetched_at, created_at FROM pages WHERE id = ?",
+    CREATE_PAGE: "INSERT INTO pages (id, source_type, title, author, published_earliest, published_latest, published_meta, content, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 
     // Media
-    GET_MEDIA_BY_ID: "SELECT id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at, analysis_status, analysis_result, analysis_error FROM media WHERE id = ?",
+    GET_MEDIA_BY_ID: "SELECT id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_meta, location_meta, source_metadata, fetched_at, created_at, analysis_status, analysis_result, analysis_error FROM media WHERE id = ?",
     // Uses ON CONFLICT DO UPDATE SET id = id to make RETURNING work even on conflict.
     // This is a no-op update that allows us to get the ID in a single atomic query.
-    CREATE_MEDIA: "INSERT INTO media (id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_at, gps_latitude, gps_longitude, gps_altitude, source_metadata, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(exact_hash) DO UPDATE SET id = id RETURNING id",
+    CREATE_MEDIA: "INSERT INTO media (id, exact_hash, perceptual_hash, storage_key, media_type, width, height, duration_seconds, captured_earliest, captured_latest, captured_meta, latitude, longitude, location_meta, source_metadata, fetched_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(exact_hash) DO UPDATE SET id = id RETURNING id",
 
     // Page media items (ordered by source_order, with optional resolved media)
     // Returns source_url from research_urls, plus media fields if resolved (NULL if pending)
-    GET_PAGE_MEDIA: "SELECT r.url as source_url, m.id, m.exact_hash, m.perceptual_hash, m.storage_key, m.media_type, m.width, m.height, m.duration_seconds, m.captured_at, m.gps_latitude, m.gps_longitude, m.gps_altitude, m.source_metadata, m.fetched_at, m.created_at, m.analysis_status, m.analysis_result, m.analysis_error FROM page_media pm JOIN research_urls r ON pm.url_id = r.id LEFT JOIN media m ON r.media_id = m.id WHERE pm.page_id = ? ORDER BY pm.source_order",
+    GET_PAGE_MEDIA: "SELECT r.url as source_url, m.id, m.exact_hash, m.perceptual_hash, m.storage_key, m.media_type, m.width, m.height, m.duration_seconds, m.captured_meta, m.location_meta, m.source_metadata, m.fetched_at, m.created_at, m.analysis_status, m.analysis_result, m.analysis_error FROM page_media pm JOIN research_urls r ON pm.url_id = r.id LEFT JOIN media m ON r.media_id = m.id WHERE pm.page_id = ? ORDER BY pm.source_order",
     // Batch insert page_media from JSON array of URLs. Resolves URLs to IDs via join.
     // Uses json_each key as source_order to preserve array ordering.
     // Params: ?1=page_id, ?2=JSON array of URL strings

@@ -5,9 +5,12 @@
 
 use serde::Serialize;
 use sqlx::FromRow;
+use sqlx::types::Json;
+
+use chronoscope_core::{UncertainDate, UncertainLocation};
 
 use crate::error::{DbError, DbResult};
-use crate::models::{GpsLocation, MediaData, PageData};
+use crate::models::{MediaData, PageData};
 use crate::types::{MediaId, PageId, ResearchUrlId};
 use crate::{Database, now, queries};
 
@@ -70,13 +73,15 @@ impl Database {
 
         let mut tx = self.pool.begin().await?;
 
-        // 1. Insert page row
+        // 1. Insert page row (shadow columns for indexing + JSON meta as source of truth)
         sqlx::query(queries::CREATE_PAGE.sql)
             .bind(&page_id)
             .bind(data.source_type)
             .bind(&data.title)
             .bind(&data.author)
-            .bind(data.published_at)
+            .bind(date_earliest(&data.published))
+            .bind(date_latest(&data.published))
+            .bind(data.published.as_ref().map(Json))
             .bind(&data.content)
             .bind(data.fetched_at)
             .bind(timestamp)
@@ -143,7 +148,8 @@ impl Database {
     /// Returns `DbError::Sqlx` if the database operation fails.
     pub async fn get_or_create_media(&self, data: &MediaData) -> DbResult<MediaId> {
         let id = MediaId::generate();
-        let (gps_lat, gps_lon, gps_alt) = GpsLocation::to_columns(data.location.as_ref());
+
+        let (lat, lon) = location_coords(&data.location);
 
         // Single atomic query: insert or return existing ID
         let (returned_id,): (MediaId,) = sqlx::query_as(queries::CREATE_MEDIA.sql)
@@ -155,10 +161,12 @@ impl Database {
             .bind(data.width)
             .bind(data.height)
             .bind(data.duration_seconds)
-            .bind(data.captured_at)
-            .bind(gps_lat)
-            .bind(gps_lon)
-            .bind(gps_alt)
+            .bind(date_earliest(&data.captured))
+            .bind(date_latest(&data.captured))
+            .bind(data.captured.as_ref().map(Json))
+            .bind(lat)
+            .bind(lon)
+            .bind(data.location.as_ref().map(Json))
             .bind(&data.source_metadata)
             .bind(data.fetched_at)
             .bind(now())
@@ -223,5 +231,25 @@ impl Database {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Format a date's earliest bound as an ISO 8601 TEXT shadow column value.
+fn date_earliest(date: &Option<UncertainDate>) -> Option<String> {
+    date.as_ref()
+        .map(|d| d.earliest().format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+/// Format a date's latest bound as an ISO 8601 TEXT shadow column value.
+fn date_latest(date: &Option<UncertainDate>) -> Option<String> {
+    date.as_ref()
+        .map(|d| d.latest().format("%Y-%m-%dT%H:%M:%S").to_string())
+}
+
+/// Extract lat/lon shadow columns from an optional location.
+fn location_coords(loc: &Option<UncertainLocation>) -> (Option<f64>, Option<f64>) {
+    match loc {
+        Some(UncertainLocation::Coordinates { lat, lon, .. }) => (Some(*lat), Some(*lon)),
+        _ => (None, None), // TODO: geocode non-coordinate location variants
     }
 }

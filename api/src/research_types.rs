@@ -4,6 +4,7 @@
 //! the resolved content (page or media), extracted metadata, and analysis results.
 
 use chrono::NaiveDateTime;
+use chronoscope_core::{UncertainDate, UncertainLocation};
 use chronoscope_db::{
     FollowedUrl, MediaId, MediaType, ResearchUrl, ResearchUrlId, ResearchUrlStatus, SourceType,
 };
@@ -165,7 +166,7 @@ pub struct PageDossier {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub published_at: Option<NaiveDateTime>,
+    pub published: Option<UncertainDate>,
     /// Content as markdown (includes comments under heading)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
@@ -196,20 +197,11 @@ pub struct MediaDossier {
     pub thumbnail_url: String,
     pub full_url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub captured_at: Option<NaiveDateTime>,
+    pub captured: Option<UncertainDate>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<GpsCoordinates>,
+    pub location: Option<UncertainLocation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_metadata: Option<serde_json::Value>,
     pub fetched_at: NaiveDateTime,
     pub analysis: MediaAnalysis,
-}
-
-/// GPS coordinates with optional altitude.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct GpsCoordinates {
-    pub latitude: f64,
-    pub longitude: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub altitude: Option<f64>,
 }

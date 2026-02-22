@@ -4,6 +4,19 @@ use crate::models::MediaSlot;
 use crate::queue::{Queue, url_queue_config};
 use crate::types::{Email, MediaAnalysisState, MediaType, ResearchUrlStatus, SourceType, UserId};
 use chrono::{Duration, Utc};
+use chronoscope_core::UncertainLocation;
+
+macro_rules! assert_approx_eq {
+    ($left:expr, $right:expr, $epsilon:expr) => {
+        let (left, right) = ($left, $right);
+        assert!(
+            (left - right).abs() < $epsilon,
+            "assertion failed: |{left} - {right}| = {} >= {epsilon}",
+            (left - right).abs(),
+            epsilon = $epsilon,
+        );
+    };
+}
 
 /// Helper to create a database and test user.
 async fn setup() -> DbResult<(Database, UserId)> {
@@ -224,7 +237,7 @@ async fn test_create_page_without_media() -> DbResult<()> {
         source_type: SourceType::Generic,
         title: Some("Test Article".to_string()),
         author: Some("Test Author".to_string()),
-        published_at: None,
+        published: None,
         content: Some("This is test content.".to_string()),
         fetched_at: Utc::now().naive_utc(),
         media: vec![],
@@ -257,7 +270,7 @@ async fn test_create_page_with_media_slots() -> DbResult<()> {
         source_type: SourceType::Reddit,
         title: Some("Post with Images".to_string()),
         author: None,
-        published_at: None,
+        published: None,
         content: None,
         fetched_at: Utc::now().naive_utc(),
         media: media_urls.iter().map(|u| MediaSlot::pending(*u)).collect(),
@@ -307,7 +320,7 @@ async fn test_create_page_rejects_pre_resolved_media() -> DbResult<()> {
             width: 100,
             height: 100,
             duration_seconds: None,
-            captured_at: None,
+            captured: None,
             location: None,
             source_metadata: None,
             fetched_at: Utc::now().naive_utc(),
@@ -320,7 +333,7 @@ async fn test_create_page_rejects_pre_resolved_media() -> DbResult<()> {
         source_type: SourceType::Generic,
         title: None,
         author: None,
-        published_at: None,
+        published: None,
         content: None,
         fetched_at: Utc::now().naive_utc(),
         media: vec![slot],
@@ -345,7 +358,7 @@ async fn test_create_page_with_existing_media_url() -> DbResult<()> {
         source_type: SourceType::Generic,
         title: None,
         author: None,
-        published_at: None,
+        published: None,
         content: None,
         fetched_at: Utc::now().naive_utc(),
         media: vec![
@@ -389,7 +402,7 @@ async fn test_get_or_create_media_creates_new() -> DbResult<()> {
         width: 1920,
         height: 1080,
         duration_seconds: None,
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: Some(r#"{"camera": "test"}"#.to_string()),
         fetched_at: Utc::now().naive_utc(),
@@ -428,7 +441,7 @@ async fn test_get_or_create_media_deduplicates_by_hash() -> DbResult<()> {
         width: 100,
         height: 100,
         duration_seconds: None,
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
@@ -444,7 +457,7 @@ async fn test_get_or_create_media_deduplicates_by_hash() -> DbResult<()> {
         width: 200, // Different dimensions
         height: 200,
         duration_seconds: None,
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
@@ -476,7 +489,7 @@ async fn test_get_or_create_media_different_hash_creates_new() -> DbResult<()> {
         width: 100,
         height: 100,
         duration_seconds: None,
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
@@ -490,7 +503,7 @@ async fn test_get_or_create_media_different_hash_creates_new() -> DbResult<()> {
         width: 100,
         height: 100,
         duration_seconds: None,
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
@@ -516,7 +529,7 @@ async fn test_get_or_create_media_with_video() -> DbResult<()> {
         width: 1280,
         height: 720,
         duration_seconds: Some(120.5),
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
@@ -533,13 +546,13 @@ async fn test_get_or_create_media_with_video() -> DbResult<()> {
     let (media_type, duration) =
         row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
     assert_eq!(media_type, "video");
-    assert!((duration - 120.5).abs() < 0.01);
+    assert_approx_eq!(duration, 120.5, 1e-4);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_get_or_create_media_with_gps() -> DbResult<()> {
+async fn test_get_or_create_media_with_location() -> DbResult<()> {
     let (db, _) = setup().await?;
 
     let media_data = MediaData {
@@ -550,29 +563,46 @@ async fn test_get_or_create_media_with_gps() -> DbResult<()> {
         width: 640,
         height: 480,
         duration_seconds: None,
-        captured_at: None,
-        location: Some(GpsLocation {
-            latitude: 37.7749,
-            longitude: -122.4194,
-            altitude: Some(10.5),
-        }),
+        captured: None,
+        location: Some(
+            UncertainLocation::coordinates(37.7749, -122.4194, None, None)
+                .expect("valid test coordinates"),
+        ),
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
     };
 
     let media_id = db.get_or_create_media(&media_data).await?;
 
-    let row: Option<(f64, f64, Option<f64>)> =
-        sqlx::query_as("SELECT gps_latitude, gps_longitude, gps_altitude FROM media WHERE id = ?")
+    // Verify shadow columns
+    let row: Option<(f64, f64)> =
+        sqlx::query_as("SELECT latitude, longitude FROM media WHERE id = ?")
             .bind(&media_id)
             .fetch_optional(&db.pool)
             .await?;
 
-    let (lat, lon, alt) =
+    let (lat, lon) =
         row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
-    assert!((lat - 37.7749).abs() < 0.0001);
-    assert!((lon - (-122.4194)).abs() < 0.0001);
-    assert!((alt.unwrap_or(0.0) - 10.5).abs() < 0.01);
+    assert_approx_eq!(lat, 37.7749, 1e-4);
+    assert_approx_eq!(lon, -122.4194, 1e-4);
+
+    // Verify meta JSON roundtrip
+    let meta_row: Option<(String,)> =
+        sqlx::query_as("SELECT location_meta FROM media WHERE id = ?")
+            .bind(&media_id)
+            .fetch_optional(&db.pool)
+            .await?;
+    let (meta_json,) =
+        meta_row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
+    let loc: UncertainLocation = serde_json::from_str(&meta_json)
+        .map_err(|e| DbError::InvalidArgument(format!("bad json: {e}")))?;
+    match loc {
+        UncertainLocation::Coordinates { lat, lon, .. } => {
+            assert_approx_eq!(lat, 37.7749, 1e-4);
+            assert_approx_eq!(lon, -122.4194, 1e-4);
+        }
+        other => panic!("expected Coordinates, got {other:?}"),
+    }
 
     Ok(())
 }
@@ -596,7 +626,7 @@ async fn test_mark_url_resolved_to_page() -> DbResult<()> {
         source_type: SourceType::Generic,
         title: Some("Test".to_string()),
         author: None,
-        published_at: None,
+        published: None,
         content: None,
         fetched_at: Utc::now().naive_utc(),
         media: vec![],
@@ -641,7 +671,7 @@ async fn test_mark_url_resolved_to_media() -> DbResult<()> {
         width: 100,
         height: 100,
         duration_seconds: None,
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),

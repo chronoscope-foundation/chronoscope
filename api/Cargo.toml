@@ -29,6 +29,9 @@ webauthn-rs-proto = "0.5"
 # JWT for session tokens - using jwt-compact with pure Rust HMAC (no RSA dep)
 jwt-compact = { version = "0.8", features = ["clock"] }
 
+# Core types
+chronoscope-core = { path = "../core" }
+
 # Database layer
 chronoscope-db = { path = "../db" }
 

@@ -33,7 +33,9 @@ CREATE TABLE pages (
     source_type TEXT NOT NULL CHECK (source_type IN ('reddit', 'instagram', 'generic')),
     title TEXT,
     author TEXT,
-    published_at TIMESTAMP,
+    published_earliest TEXT,
+    published_latest TEXT,
+    published_meta TEXT,
     content TEXT,  -- Markdown with comments under heading
 
     fetched_at TIMESTAMP NOT NULL,
@@ -54,11 +56,16 @@ CREATE TABLE media (
     height INT NOT NULL,
     duration_seconds REAL,  -- Video only
 
-    -- EXIF/metadata (nullable - often missing)
-    captured_at TIMESTAMP,
-    gps_latitude REAL,
-    gps_longitude REAL,
-    gps_altitude REAL,
+    -- Temporal: queryable bounds + full UncertainDate JSON
+    captured_earliest TEXT,    -- ISO 8601, NULL = unbounded below
+    captured_latest TEXT,      -- ISO 8601, NULL = unbounded above
+    captured_meta TEXT,        -- JSON: full UncertainDate (source of truth)
+
+    -- Spatial: queryable point + full UncertainLocation JSON
+    latitude REAL,             -- best-guess for map display
+    longitude REAL,
+    location_meta TEXT,        -- JSON: full UncertainLocation (source of truth)
+
     source_metadata JSON,  -- Source-specific extras (photographer, format, etc.)
 
     fetched_at TIMESTAMP NOT NULL,

@@ -72,7 +72,7 @@ pub async fn process(
         // TODO: Video metadata extraction (captured_at, location) is possible via the `creation_time`
         // field in MP4/MOV mvhd atoms, but mp4parse doesn't expose it directly. Would need to parse
         // raw atoms or use a different library. No standard like EXIF exists for video.
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: Some(
             serde_json::json!({

@@ -426,7 +426,7 @@ mod tests {
                         source_type: chronoscope_db::SourceType::Generic,
                         title: Some(format!("Test: {}", item.url)),
                         author: None,
-                        published_at: None,
+                        published: None,
                         content: None,
                         fetched_at: Utc::now().naive_utc(),
                         media: vec![],

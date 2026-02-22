@@ -28,6 +28,9 @@ corpus-test = ["dep:chrono", "dep:glob", "dep:chronoscope-integrations", "dep:ur
 corpus-test-vlm = ["corpus-test"]
 
 [dependencies]
+# Internal crates
+chronoscope-core = { path = "../core" }
+
 # Serialization
 serde.workspace = true
 serde_json.workspace = true

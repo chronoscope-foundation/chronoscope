@@ -23,8 +23,8 @@ use chronoscope_integrations::IntegrationRegistry;
 
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
-    FollowedUrl, GpsLocation, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl,
-    ResearchUrlWithResolved, ResolvedContent, ResolvedTarget, User,
+    FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
+    ResolvedContent, ResolvedTarget, User,
 };
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use types::{
@@ -581,7 +581,7 @@ impl Database {
                             source_type: row.source_type,
                             title: row.title,
                             author: row.author,
-                            published_at: row.published_at,
+                            published: row.published,
                             content: row.content,
                             fetched_at: row.fetched_at,
                             media,

@@ -241,7 +241,9 @@ impl UrlFetcherWorker {
             source_type: integration_name.into(),
             title: content.title,
             author: content.author,
-            published_at: content.published_at,
+            published: content
+                .published_at
+                .and_then(|dt| chronoscope_core::UncertainDate::exact(dt).ok()),
             content: content.content,
             fetched_at: now,
             media: media_slots,

@@ -6,8 +6,9 @@
 use std::io::Cursor;
 
 use bytes::Bytes;
-use chrono::{NaiveDateTime, Utc};
-use chronoscope_db::{GpsLocation, MediaData, MediaType, ResearchUrl};
+use chrono::Utc;
+use chronoscope_core::{UncertainDate, UncertainLocation};
+use chronoscope_db::{MediaData, MediaType, ResearchUrl};
 use image::{GenericImageView, ImageEncoder};
 use image_hasher::{HashAlg, HasherConfig};
 use tracing::instrument;
@@ -48,7 +49,7 @@ pub async fn process(
     let perceptual_hash = Some(compute_perceptual_hash(&img));
 
     // Extract EXIF data
-    let (captured_at, location) = extract_exif(body);
+    let (captured, location) = extract_exif(body);
 
     // Generate storage key based on exact hash
     let storage_key = storage_key(&exact_hash, format.extension());
@@ -84,7 +85,7 @@ pub async fn process(
         width: i32::try_from(width).unwrap_or(i32::MAX),
         height: i32::try_from(height).unwrap_or(i32::MAX),
         duration_seconds: None,
-        captured_at,
+        captured,
         location,
         source_metadata: Some(
             serde_json::json!({
@@ -155,8 +156,9 @@ fn generate_thumbnail(img: &image::DynamicImage) -> Result<Bytes, String> {
 
 /// Extract EXIF data from image bytes.
 ///
-/// Returns captured timestamp and GPS location if available.
-pub fn extract_exif(body: &Bytes) -> (Option<NaiveDateTime>, Option<GpsLocation>) {
+/// Returns captured timestamp (as `UncertainDate` with second precision)
+/// and GPS location (as `UncertainLocation::Coordinates`) if available.
+pub fn extract_exif(body: &Bytes) -> (Option<UncertainDate>, Option<UncertainLocation>) {
     let cursor = Cursor::new(body.as_ref());
     let exif_reader = exif::Reader::new();
 
@@ -164,29 +166,32 @@ pub fn extract_exif(body: &Bytes) -> (Option<NaiveDateTime>, Option<GpsLocation>
         return (None, None);
     };
 
-    let captured_at = extract_capture_time(&exif);
+    let captured = extract_capture_time(&exif);
     let location = extract_gps_location(&exif);
 
-    (captured_at, location)
+    (captured, location)
 }
 
-/// Extract capture time from EXIF data.
-fn extract_capture_time(exif: &exif::Exif) -> Option<NaiveDateTime> {
+/// Extract capture time from EXIF data as `UncertainDate` (second precision).
+fn extract_capture_time(exif: &exif::Exif) -> Option<UncertainDate> {
     exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
         .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))
         .and_then(|field| {
             if let exif::Value::Ascii(vec) = &field.value {
                 vec.first()
                     .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                    .and_then(|s| NaiveDateTime::parse_from_str(s, "%Y:%m:%d %H:%M:%S").ok())
+                    .and_then(|s| {
+                        chrono::NaiveDateTime::parse_from_str(s, "%Y:%m:%d %H:%M:%S").ok()
+                    })
+                    .and_then(|dt| UncertainDate::exact(dt).ok())
             } else {
                 None
             }
         })
 }
 
-/// Extract GPS location from EXIF data.
-fn extract_gps_location(exif: &exif::Exif) -> Option<GpsLocation> {
+/// Extract GPS location from EXIF data as `UncertainLocation::Coordinates`.
+fn extract_gps_location(exif: &exif::Exif) -> Option<UncertainLocation> {
     let lat = exif.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)?;
     let lat_ref = exif.get_field(exif::Tag::GPSLatitudeRef, exif::In::PRIMARY)?;
     let lon = exif.get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)?;
@@ -199,16 +204,27 @@ fn extract_gps_location(exif: &exif::Exif) -> Option<GpsLocation> {
     let latitude = apply_gps_sign(latitude, &lat_ref.value, b"S");
     let longitude = apply_gps_sign(longitude, &lon_ref.value, b"W");
 
-    // Extract altitude if available
-    let altitude = exif
+    // Extract altitude if available, checking GPSAltitudeRef for sign.
+    // Per EXIF spec: GPSAltitudeRef 0 = above sea level (default), 1 = below sea level.
+    let elevation = exif
         .get_field(exif::Tag::GPSAltitude, exif::In::PRIMARY)
-        .and_then(|field| parse_gps_altitude(&field.value));
+        .and_then(|field| parse_gps_altitude(&field.value))
+        .map(|alt| {
+            let below_sea_level = exif
+                .get_field(exif::Tag::GPSAltitudeRef, exif::In::PRIMARY)
+                .is_some_and(|ref_field| {
+                    matches!(&ref_field.value, exif::Value::Byte(v) if v.first() == Some(&1))
+                });
+            let rounded = alt.round();
+            let meters = if below_sea_level {
+                i32::try_from(-(rounded as i64)).unwrap_or(i32::MIN)
+            } else {
+                i32::try_from(rounded as i64).unwrap_or(i32::MAX)
+            };
+            chronoscope_core::Elevation::SeaLevelOffset { meters }
+        });
 
-    Some(GpsLocation {
-        latitude,
-        longitude,
-        altitude,
-    })
+    UncertainLocation::coordinates(latitude, longitude, elevation, None).ok()
 }
 
 /// Apply sign to GPS coordinate based on reference (S/W are negative).
@@ -260,9 +276,9 @@ mod tests {
         // PNG with no EXIF data
         let png_bytes = Bytes::from_static(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
 
-        let (captured_at, location) = extract_exif(&png_bytes);
+        let (captured, location) = extract_exif(&png_bytes);
 
-        assert!(captured_at.is_none());
+        assert!(captured.is_none());
         assert!(location.is_none());
     }
 }

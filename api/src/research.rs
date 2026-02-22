@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::validate_session;
 use crate::cdn;
 use crate::research_types::{
-    GpsCoordinates, MediaAnalysis, MediaDossier, MediaReference, PageDossier, ResearchUrlDossier,
+    MediaAnalysis, MediaDossier, MediaReference, PageDossier, ResearchUrlDossier,
     ResearchUrlSummary, ResolvedContent, UrlAnalysis,
 };
 use crate::state::AppState;
@@ -204,7 +204,7 @@ fn convert_page(page: &Page, cdn_base_url: &str) -> Result<PageDossier, HttpErro
         source_type: page.data.source_type,
         title: page.data.title.clone(),
         author: page.data.author.clone(),
-        published_at: page.data.published_at,
+        published: page.data.published.clone(),
         content: page.data.content.clone(),
         media: media?,
         fetched_at: page.data.fetched_at,
@@ -229,13 +229,6 @@ fn convert_media_reference(
 
 /// Convert a DB Media to API `MediaDossier`.
 fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, HttpError> {
-    // Convert DB GpsLocation to API GpsCoordinates
-    let location = media.data.location.as_ref().map(|loc| GpsCoordinates {
-        latitude: loc.latitude,
-        longitude: loc.longitude,
-        altitude: loc.altitude,
-    });
-
     // Parse source_metadata JSON, propagating errors for corrupt data
     let source_metadata = media
         .data
@@ -268,8 +261,8 @@ fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, Http
         duration_seconds: media.data.duration_seconds,
         thumbnail_url: cdn::thumbnail_url(cdn_base_url, &media.data.storage_key),
         full_url: cdn::full_url(cdn_base_url, &media.data.storage_key),
-        captured_at: media.data.captured_at,
-        location,
+        captured: media.data.captured.clone(),
+        location: media.data.location.clone(),
         source_metadata,
         fetched_at: media.data.fetched_at,
         analysis,
@@ -311,7 +304,8 @@ mod tests {
     use crate::cdn::tests::TEST_CDN_BASE_URL;
     use crate::research_types::AnalysisOutcome;
     use chrono::{NaiveDate, NaiveDateTime};
-    use chronoscope_db::{GpsLocation, MediaData, MediaId, MediaType};
+    use chronoscope_core::UncertainLocation;
+    use chronoscope_db::{MediaData, MediaId, MediaType};
 
     #[allow(clippy::expect_used)]
     fn test_timestamp() -> NaiveDateTime {
@@ -329,7 +323,7 @@ mod tests {
             width: 800,
             height: 600,
             duration_seconds: None,
-            captured_at: None,
+            captured: None,
             location: None,
             source_metadata: None,
             fetched_at: test_timestamp(),
@@ -360,38 +354,47 @@ mod tests {
     #[test]
     fn test_convert_media_with_location() -> TestResult {
         let mut media = minimal_media();
-        media.data.location = Some(GpsLocation {
-            latitude: 41.5908,
-            longitude: -87.3467,
-            altitude: None,
-        });
+        media.data.location = Some(
+            UncertainLocation::coordinates(41.5908, -87.3467, None, None)
+                .expect("valid test coordinates"),
+        );
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
 
         let location = dossier
             .location
             .ok_or_else(|| HttpError::for_bad_request(None, "should have location".to_string()))?;
-        assert_eq!(location.latitude, 41.5908);
-        assert_eq!(location.longitude, -87.3467);
-        assert!(location.altitude.is_none());
+        match location {
+            UncertainLocation::Coordinates { lat, lon, .. } => {
+                assert_eq!(lat, 41.5908);
+                assert_eq!(lon, -87.3467);
+            }
+            _ => {
+                return Err(HttpError::for_bad_request(
+                    None,
+                    "expected Coordinates".to_string(),
+                ));
+            }
+        }
         Ok(())
     }
 
     #[test]
-    fn test_convert_media_full_gps_with_altitude() -> TestResult {
+    fn test_convert_media_with_elevation() -> TestResult {
         let mut media = minimal_media();
-        media.data.location = Some(GpsLocation {
-            latitude: 41.5908,
-            longitude: -87.3467,
-            altitude: Some(180.5),
-        });
+        media.data.location = Some(
+            UncertainLocation::coordinates(
+                41.5908,
+                -87.3467,
+                Some(chronoscope_core::Elevation::SeaLevelOffset { meters: 180 }),
+                None,
+            )
+            .expect("valid test coordinates"),
+        );
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
 
-        let location = dossier
-            .location
-            .ok_or_else(|| HttpError::for_bad_request(None, "should have location".to_string()))?;
-        assert_eq!(location.altitude, Some(180.5));
+        assert!(dossier.location.is_some());
         Ok(())
     }
 

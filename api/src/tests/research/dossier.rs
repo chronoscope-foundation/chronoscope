@@ -257,17 +257,23 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
         width: 1920,
         height: 1080,
         duration_seconds: None,
-        captured_at: Some(
+        captured: Some(chronoscope_core::UncertainDate::exact(
             chrono::NaiveDate::from_ymd_opt(1965, 8, 15)
                 .ok_or("valid date")?
                 .and_hms_opt(12, 0, 0)
                 .ok_or("valid time")?,
+        )?),
+        location: Some(
+            chronoscope_core::UncertainLocation::coordinates(
+                GARY_INDIANA_LAT,
+                GARY_INDIANA_LON,
+                Some(chronoscope_core::Elevation::SeaLevelOffset {
+                    meters: GARY_INDIANA_ALT as i32,
+                }),
+                None,
+            )
+            .expect("valid test coordinates"),
         ),
-        location: Some(GpsLocation {
-            latitude: GARY_INDIANA_LAT,
-            longitude: GARY_INDIANA_LON,
-            altitude: Some(GARY_INDIANA_ALT),
-        }),
         source_metadata: None,
         fetched_at: chrono::Utc::now().naive_utc(),
     };
@@ -286,12 +292,27 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
     };
     assert_eq!(media.width, 1920);
     assert_eq!(media.height, 1080);
-    assert!(media.captured_at.is_some());
+    assert!(media.captured.is_some());
 
     let location = media.location.as_ref().ok_or("should have GPS location")?;
-    assert_eq!(location.latitude, GARY_INDIANA_LAT);
-    assert_eq!(location.longitude, GARY_INDIANA_LON);
-    assert_eq!(location.altitude, Some(GARY_INDIANA_ALT));
+    if let chronoscope_core::UncertainLocation::Coordinates {
+        lat,
+        lon,
+        elevation,
+        ..
+    } = location
+    {
+        assert_eq!(*lat, GARY_INDIANA_LAT);
+        assert_eq!(*lon, GARY_INDIANA_LON);
+        assert_eq!(
+            *elevation,
+            Some(chronoscope_core::Elevation::SeaLevelOffset {
+                meters: GARY_INDIANA_ALT as i32,
+            })
+        );
+    } else {
+        return Err("expected Coordinates location".into());
+    }
     Ok(())
 }
 
@@ -380,7 +401,7 @@ async fn test_dossier_video_with_duration() -> TestResult {
         width: 1920,
         height: 1080,
         duration_seconds: Some(125.5), // 2 min 5.5 sec
-        captured_at: None,
+        captured: None,
         location: None,
         source_metadata: None,
         fetched_at: chrono::Utc::now().naive_utc(),

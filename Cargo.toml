@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["analysis", "api", "db", "dev", "integrations", "workers"]
+members = ["analysis", "api", "core", "db", "dev", "integrations", "workers"]
 
 [workspace.package]
 edition = "2024"
@@ -27,6 +27,7 @@ async-trait = "0.1"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_with = { version = "3", default-features = false, features = ["macros"] }
 
 # Schema generation for OpenAPI
 schemars = { version = "0.8", features = ["chrono"] }
@@ -38,3 +39,4 @@ uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 base64 = "0.22"
 thiserror = "2"
 bytes = "1"
+oxilangtag = { version = "0.1", features = ["serde"] }

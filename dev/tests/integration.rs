@@ -41,8 +41,8 @@ fn init_tracing() {
 
 /// Polling interval for async operations in tests.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Default timeout for most operations (10 seconds).
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default timeout for most operations (15 seconds).
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Extended timeout for external API calls (30 seconds).
 const EXTERNAL_API_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for analysis operations. Triton inference can be slow

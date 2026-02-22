@@ -137,20 +137,20 @@ mod tests {
         let captured = fetched
             .media
             .data
-            .captured_at
+            .captured
             .ok_or("should have capture time")?;
-        assert_eq!(captured.and_utc().year(), 2008);
+        assert_eq!(captured.earliest().year(), 2008);
 
         let location = fetched
             .media
             .data
             .location
             .ok_or("should have GPS location")?;
-        assert!(
-            (location.latitude - 43.467).abs() < 0.01,
-            "lat: {}",
-            location.latitude
-        );
+        if let chronoscope_core::UncertainLocation::Coordinates { lat, .. } = &location {
+            assert!((*lat - 43.467).abs() < 0.01, "lat: {lat}",);
+        } else {
+            return Err("expected Coordinates location".into());
+        }
 
         // Stored in media store
         assert!(
