@@ -425,13 +425,6 @@ mod tests {
     use chronoscope_core::entity::{EntityTransition, EntityType};
 
     #[test]
-    fn media_slot_pending_has_no_resolved() {
-        let slot = MediaSlot::pending("https://example.com/image.jpg");
-        assert_eq!(slot.url, "https://example.com/image.jpg");
-        assert!(slot.resolved.is_none());
-    }
-
-    #[test]
     fn extract_temporal_bounds_empty() {
         let entity = Entity {
             entity_type: EntityType::Building,

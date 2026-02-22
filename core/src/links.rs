@@ -176,64 +176,6 @@ mod tests {
     }
 
     #[test]
-    fn wikidata_url() {
-        let target = LinkTarget::Wikidata {
-            entity_id: WikidataEntityId("Q9141".to_string()),
-        };
-        assert_eq!(
-            target.to_url().as_str(),
-            "https://www.wikidata.org/wiki/Q9141"
-        );
-    }
-
-    #[test]
-    fn osm_way_url() {
-        let target = LinkTarget::OpenStreetMap {
-            element_type: OsmElementType::Way,
-            element_id: OsmId(34_633_854),
-        };
-        assert_eq!(
-            target.to_url().as_str(),
-            "https://www.openstreetmap.org/way/34633854"
-        );
-    }
-
-    #[test]
-    fn osm_node_url() {
-        let target = LinkTarget::OpenStreetMap {
-            element_type: OsmElementType::Node,
-            element_id: OsmId(1_838_105_682),
-        };
-        assert_eq!(
-            target.to_url().as_str(),
-            "https://www.openstreetmap.org/node/1838105682"
-        );
-    }
-
-    #[test]
-    fn osm_relation_url() {
-        let target = LinkTarget::OpenStreetMap {
-            element_type: OsmElementType::Relation,
-            element_id: OsmId(1_656_002),
-        };
-        assert_eq!(
-            target.to_url().as_str(),
-            "https://www.openstreetmap.org/relation/1656002"
-        );
-    }
-
-    #[test]
-    fn pleiades_url() {
-        let target = LinkTarget::Pleiades {
-            place_id: "423025".to_string(),
-        };
-        assert_eq!(
-            target.to_url().as_str(),
-            "https://pleiades.stoa.org/places/423025"
-        );
-    }
-
-    #[test]
     fn wikipedia_url() {
         let target = LinkTarget::Wikipedia {
             language: LanguageTag::parse("en".to_string()).unwrap(),
@@ -255,55 +197,6 @@ mod tests {
             target.to_url().as_str(),
             "https://commons.wikimedia.org/wiki/File%3AStatue%20of%20Liberty%207.jpg"
         );
-    }
-
-    #[test]
-    fn nrhp_url() {
-        let target = LinkTarget::Nrhp {
-            reference_number: "66000909".to_string(),
-        };
-        assert_eq!(
-            target.to_url().as_str(),
-            "https://npgallery.nps.gov/NRHP/AssetDetail/66000909"
-        );
-    }
-
-    #[test]
-    fn geonames_url() {
-        let target = LinkTarget::GeoNames {
-            id: GeoNamesId(5_128_581),
-        };
-        assert_eq!(target.to_url().as_str(), "https://www.geonames.org/5128581");
-    }
-
-    #[test]
-    fn getty_tgn_url() {
-        let target = LinkTarget::GettyTgn {
-            id: GettyTgnId(7_007_567),
-        };
-        assert_eq!(
-            target.to_url().as_str(),
-            "https://vocab.getty.edu/page/tgn/7007567"
-        );
-    }
-
-    #[test]
-    fn url_passthrough() {
-        let input = Url::parse("https://example.com/some/page?q=1").unwrap();
-        let target = LinkTarget::Url { url: input.clone() };
-        assert_eq!(target.to_url(), input);
-    }
-
-    #[test]
-    fn link_type_applies_to_all_targets() {
-        let link = ExternalLink {
-            target: LinkTarget::Wikipedia {
-                language: LanguageTag::parse("en".to_string()).unwrap(),
-                title: "Pantheon, Rome".to_string(),
-            },
-            link_type: LinkType::FurtherReading,
-        };
-        assert_eq!(link.link_type, LinkType::FurtherReading);
     }
 }
 

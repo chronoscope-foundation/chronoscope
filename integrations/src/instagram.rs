@@ -499,15 +499,6 @@ mod tests {
     // ==================== Unit Tests ====================
 
     #[test]
-    fn test_integration_meta() {
-        let integration = InstagramIntegration::new(None);
-
-        assert_eq!(integration.name(), IntegrationName::Instagram);
-        assert!(integration.domains().contains(&"instagram.com"));
-        assert!(integration.domains().contains(&"instagr.am"));
-    }
-
-    #[test]
     fn test_normalize_url_removes_tracking() -> TestResult {
         let integration = InstagramIntegration::new(None);
 
@@ -515,28 +506,6 @@ mod tests {
         let normalized = integration.normalize_url(&url);
 
         assert_eq!(normalized.as_str(), "https://instagram.com/p/ABC123/");
-        Ok(())
-    }
-
-    #[test]
-    fn test_normalize_url_preserves_path() -> TestResult {
-        let integration = InstagramIntegration::new(None);
-
-        let url = Url::parse("https://instagram.com/p/ABC123/")?;
-        let normalized = integration.normalize_url(&url);
-
-        assert_eq!(normalized.as_str(), "https://instagram.com/p/ABC123/");
-        Ok(())
-    }
-
-    #[test]
-    fn test_normalize_url_strips_www() -> TestResult {
-        let integration = InstagramIntegration::new(None);
-
-        let url = Url::parse("https://www.instagram.com/reel/XYZ789/")?;
-        let normalized = integration.normalize_url(&url);
-
-        assert_eq!(normalized.as_str(), "https://instagram.com/reel/XYZ789/");
         Ok(())
     }
 

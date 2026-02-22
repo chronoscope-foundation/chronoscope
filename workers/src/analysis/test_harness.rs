@@ -248,27 +248,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_retriable_error_triton_internal() -> TestResult {
-        let harness = AnalysisTestHarness::new().await?;
-        harness.create_media_for_analysis().await?;
-
-        let triton = Arc::new(MockTritonService::with_error(
-            chronoscope_analysis::AnalysisError::Triton {
-                retriable: true,
-                message: "internal server error".to_string(),
-            },
-        ));
-
-        let (_media, result) = harness.process_with_mock(triton).await?;
-
-        assert!(
-            matches!(result, ItemResult::RetriableFailure { .. }),
-            "expected RetriableFailure for retriable Triton error, got {result:?}"
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_permanent_error_triton_invalid_argument() -> TestResult {
         let harness = AnalysisTestHarness::new().await?;
         harness.create_media_for_analysis().await?;

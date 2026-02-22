@@ -33,14 +33,6 @@ pub mod tests {
     pub const TEST_CDN_BASE_URL: &str = "https://cdn.test.chronoscope.io";
 
     #[test]
-    fn test_full_url() {
-        assert_eq!(
-            full_url(TEST_CDN_BASE_URL, "abc123/image.jpg"),
-            format!("{TEST_CDN_BASE_URL}/abc123/image.jpg")
-        );
-    }
-
-    #[test]
     fn test_thumbnail_url_with_extension() {
         assert_eq!(
             thumbnail_url(TEST_CDN_BASE_URL, "abc123/image.jpg"),

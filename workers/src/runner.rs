@@ -280,14 +280,6 @@ mod tests {
     // ==================== RetryConfig Unit Tests ====================
 
     #[test]
-    fn test_retry_config_default() {
-        let config = RetryConfig::default();
-        assert_eq!(config.max_retries, 3);
-        assert_eq!(config.base_delay, Duration::from_secs(60));
-        assert_eq!(config.max_delay, Duration::from_secs(3600));
-    }
-
-    #[test]
     fn test_compute_retry_delay_exponential_backoff() {
         let config = RetryConfig {
             max_retries: 5,

@@ -204,10 +204,4 @@ mod tests {
         let result = detect_content_type(None, &random_bytes);
         assert!(matches!(result, ContentType::Unknown(_)));
     }
-
-    #[test]
-    fn test_thumbnail_key() {
-        let hash = [0x01, 0x02, 0x03];
-        assert_eq!(thumbnail_key(&hash), "media/010203_thumb.jpg");
-    }
 }

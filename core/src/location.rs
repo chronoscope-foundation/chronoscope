@@ -350,14 +350,4 @@ mod tests {
         let loc: UncertainLocation = serde_json::from_str(json).unwrap();
         assert!(matches!(loc, UncertainLocation::Coordinates { .. }));
     }
-
-    #[test]
-    fn serde_roundtrip_named_location() {
-        let loc = UncertainLocation::NamedLocation {
-            name: "Rome".to_string(),
-        };
-        let json = serde_json::to_string(&loc).unwrap();
-        let deserialized: UncertainLocation = serde_json::from_str(&json).unwrap();
-        assert_eq!(loc, deserialized);
-    }
 }

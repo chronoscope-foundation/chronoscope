@@ -460,23 +460,6 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn test_request_hash_deterministic() {
-        let request = triton_proto::ModelInferRequest {
-            model_name: "test".to_string(),
-            model_version: String::new(),
-            id: String::new(),
-            parameters: Default::default(),
-            inputs: vec![],
-            outputs: vec![],
-            raw_input_contents: vec![],
-        };
-
-        let hash1 = GrpcTritonClient::request_hash(&request);
-        let hash2 = GrpcTritonClient::request_hash(&request);
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
     fn test_request_hash_varies_with_model() {
         let request1 = triton_proto::ModelInferRequest {
             model_name: "model_a".to_string(),

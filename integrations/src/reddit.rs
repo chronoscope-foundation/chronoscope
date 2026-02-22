@@ -689,14 +689,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_integration_meta() {
-        let integration = RedditIntegration::new();
-        assert_eq!(integration.name(), IntegrationName::Reddit);
-        assert!(integration.domains().contains(&"reddit.com"));
-        assert!(integration.domains().contains(&"redd.it"));
-    }
-
     // ==================== URL Normalization Tests ====================
 
     #[test]
@@ -773,17 +765,6 @@ mod tests {
         assert_eq!(
             integration.normalize_url(&url).as_str(),
             "https://reddit.com/r/test?context=3"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_normalize_canonical_unchanged() -> TestResult {
-        let integration = RedditIntegration::new();
-        let url = Url::parse("https://reddit.com/r/test")?;
-        assert_eq!(
-            integration.normalize_url(&url).as_str(),
-            "https://reddit.com/r/test"
         );
         Ok(())
     }

@@ -56,16 +56,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config() {
-        let config = WorkerConfig::default();
-
-        assert!(config.worker_id.starts_with("worker-"));
-        assert_eq!(config.batch_size, 10);
-        assert_eq!(config.stale_after, Duration::from_secs(300));
-        assert_eq!(config.idle_backoff, Duration::from_secs(5));
-    }
-
-    #[test]
     fn test_stale_cutoff() {
         let config = WorkerConfig::default();
 

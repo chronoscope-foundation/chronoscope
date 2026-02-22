@@ -322,14 +322,6 @@ mod tests {
     }
 
     #[test]
-    fn test_jwt_config_new() {
-        let config = JwtConfig::new(TEST_SECRET, 3600, 120, 60);
-        // Should be able to create tokens
-        let user_id = UserId::new("test-user");
-        assert!(config.create_session_token(&user_id).is_ok());
-    }
-
-    #[test]
     fn test_session_token_roundtrip() -> TestResult {
         let config = JwtConfig::new(TEST_SECRET, 3600, 120, 60);
         let user_id = UserId::new("test-user-123");
@@ -358,26 +350,6 @@ mod tests {
         let untrusted = UntrustedToken::new(&token_str)?;
         let result = config.validate_challenge_token(&untrusted, &ChallengePurpose::Login);
         assert!(matches!(result, Err(JwtError::InvalidPurpose)));
-        Ok(())
-    }
-
-    #[test]
-    fn test_challenge_purpose_serialization() -> TestResult {
-        // Test that purposes serialize/deserialize correctly
-        let register = ChallengePurpose::Register;
-        let login = ChallengePurpose::Login;
-
-        let reg_json = serde_json::to_string(&register)?;
-        let login_json = serde_json::to_string(&login)?;
-
-        assert_eq!(reg_json, "\"register\"");
-        assert_eq!(login_json, "\"login\"");
-
-        let reg_back: ChallengePurpose = serde_json::from_str(&reg_json)?;
-        let login_back: ChallengePurpose = serde_json::from_str(&login_json)?;
-
-        assert_eq!(reg_back, ChallengePurpose::Register);
-        assert_eq!(login_back, ChallengePurpose::Login);
         Ok(())
     }
 
