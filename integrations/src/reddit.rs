@@ -877,14 +877,14 @@ mod tests {
         );
 
         let (post, comments) = extract_post_and_comments(&json)?;
-        let content = build_content(&post, &comments).expect("should have content");
+        let content = build_content(&post, &comments).ok_or("should have content")?;
 
         assert!(content.contains("Some context about the photos."));
 
         let captions_section = content
             .split("## Captions\n\n")
             .nth(1)
-            .expect("should have captions section");
+            .ok_or("should have captions section")?;
         assert_eq!(
             captions_section.trim(),
             "1. Town square (https://example.com/square)\n\

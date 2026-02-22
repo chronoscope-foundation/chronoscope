@@ -2,7 +2,7 @@
 [no-cd]
 check:
     cargo fmt --check
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
     cargo test
     cargo llvm-cov --fail-under-lines 75
 
@@ -14,7 +14,7 @@ fmt:
 # Run clippy
 [no-cd]
 clippy:
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
 
 # Run tests
 [no-cd]

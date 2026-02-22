@@ -231,6 +231,8 @@ mod tests {
     use crate::entity::{Entity, EntityRelation, EntityRelationType, EntityType};
     use crate::links::{ExternalLink, LinkTarget, LinkType};
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     fn test_entity() -> Entity {
         Entity {
             entity_type: EntityType::Building,
@@ -246,14 +248,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_references_ok_for_valid_bundle() {
+    fn validate_references_ok_for_valid_bundle() -> TestResult {
         let bundle = TestBundle {
             entities: BTreeMap::from([("e1", test_entity())]),
             external_links: BTreeMap::from([(
                 "l1",
                 ExternalLink {
                     target: LinkTarget::Url {
-                        url: url::Url::parse("https://example.com").expect("valid url"),
+                        url: url::Url::parse("https://example.com")?,
                     },
                     link_type: LinkType::SameAs,
                 },
@@ -262,10 +264,11 @@ mod tests {
             ..TestBundle::new()
         };
         assert!(bundle.validate_references().is_ok());
+        Ok(())
     }
 
     #[test]
-    fn validate_references_catches_dangling_entity_relation() {
+    fn validate_references_catches_dangling_entity_relation() -> TestResult {
         let bundle = TestBundle {
             entities: BTreeMap::from([("e1", test_entity())]),
             entity_relations: vec![EntityRelation {
@@ -276,49 +279,58 @@ mod tests {
             }],
             ..TestBundle::new()
         };
-        let errors = bundle.validate_references().unwrap_err();
+        let Err(errors) = bundle.validate_references() else {
+            return Err("expected validation to fail".into());
+        };
         assert!(errors.iter().any(|e| matches!(
             e,
             ReferenceError::DanglingEntityRelation {
                 entity_key: "e_missing"
             }
         )));
+        Ok(())
     }
 
     #[test]
-    fn validate_references_catches_dangling_link() {
+    fn validate_references_catches_dangling_link() -> TestResult {
         let bundle = TestBundle {
             entities: BTreeMap::from([("e1", test_entity())]),
             entity_links: BTreeMap::from([("e1", vec!["l_missing"])]),
             ..TestBundle::new()
         };
-        let errors = bundle.validate_references().unwrap_err();
+        let Err(errors) = bundle.validate_references() else {
+            return Err("expected validation to fail".into());
+        };
         assert!(errors.iter().any(|e| matches!(
             e,
             ReferenceError::DanglingLinkRef {
                 link_key: "l_missing"
             }
         )));
+        Ok(())
     }
 
     #[test]
-    fn validate_references_catches_dangling_entity_link_key() {
+    fn validate_references_catches_dangling_entity_link_key() -> TestResult {
         let bundle = TestBundle {
             entities: BTreeMap::from([("e1", test_entity())]),
             entity_links: BTreeMap::from([("e_missing", vec![])]),
             ..TestBundle::new()
         };
-        let errors = bundle.validate_references().unwrap_err();
+        let Err(errors) = bundle.validate_references() else {
+            return Err("expected validation to fail".into());
+        };
         assert!(errors.iter().any(|e| matches!(
             e,
             ReferenceError::DanglingEntityLink {
                 entity_key: "e_missing"
             }
         )));
+        Ok(())
     }
 
     #[test]
-    fn validate_references_catches_dangling_annotation_refs() {
+    fn validate_references_catches_dangling_annotation_refs() -> TestResult {
         let bundle = TestBundle {
             entities: BTreeMap::from([("e1", test_entity())]),
             annotations: vec![Annotation {
@@ -328,7 +340,9 @@ mod tests {
             }],
             ..TestBundle::new()
         };
-        let errors = bundle.validate_references().unwrap_err();
+        let Err(errors) = bundle.validate_references() else {
+            return Err("expected validation to fail".into());
+        };
         assert!(errors.iter().any(|e| matches!(
             e,
             ReferenceError::DanglingAnnotationSource {
@@ -341,5 +355,6 @@ mod tests {
                 entity_key: "e_missing"
             }
         )));
+        Ok(())
     }
 }

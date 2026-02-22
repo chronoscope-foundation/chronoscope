@@ -548,6 +548,7 @@ mod tests {
                     "poll_until timed out waiting for condition".to_string(),
                 ));
             }
+            #[allow(clippy::disallowed_methods)] // test-only polling helper
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }

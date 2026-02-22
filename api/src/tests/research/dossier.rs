@@ -263,17 +263,14 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
                 .and_hms_opt(12, 0, 0)
                 .ok_or("valid time")?,
         )?),
-        location: Some(
-            chronoscope_core::UncertainLocation::coordinates(
-                GARY_INDIANA_LAT,
-                GARY_INDIANA_LON,
-                Some(chronoscope_core::Elevation::SeaLevelOffset {
-                    meters: GARY_INDIANA_ALT as i32,
-                }),
-                None,
-            )
-            .expect("valid test coordinates"),
-        ),
+        location: Some(chronoscope_core::UncertainLocation::coordinates(
+            GARY_INDIANA_LAT,
+            GARY_INDIANA_LON,
+            Some(chronoscope_core::Elevation::SeaLevelOffset {
+                meters: GARY_INDIANA_ALT as i32,
+            }),
+            None,
+        )?),
         source_metadata: None,
         fetched_at: chrono::Utc::now().naive_utc(),
     };

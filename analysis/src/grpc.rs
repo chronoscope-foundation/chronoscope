@@ -457,6 +457,8 @@ mod tests {
     use super::*;
     use crate::triton_proto;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
     fn test_request_hash_deterministic() {
         let request = triton_proto::ModelInferRequest {
@@ -522,19 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn test_bytes_input_construction() {
+    fn test_bytes_input_construction() -> TestResult {
         let input = GrpcTritonClient::bytes_input("test_input", b"hello".to_vec());
 
         assert_eq!(input.name, "test_input");
         assert_eq!(input.datatype, "BYTES");
         assert_eq!(input.shape, vec![1, 1]);
-        let contents = input.contents.as_ref().expect("should have contents");
+        let contents = input.contents.as_ref().ok_or("should have contents")?;
         assert_eq!(contents.bytes_contents.len(), 1);
         assert_eq!(contents.bytes_contents[0], b"hello");
+        Ok(())
     }
 
     #[test]
-    fn test_extract_output_success() {
+    fn test_extract_output_success() -> TestResult {
         let response = triton_proto::ModelInferResponse {
             model_name: "test".to_string(),
             model_version: "1".to_string(),
@@ -553,9 +556,9 @@ mod tests {
             raw_output_contents: vec![],
         };
 
-        let output =
-            GrpcTritonClient::extract_output(&response, "result").expect("should extract output");
+        let output = GrpcTritonClient::extract_output(&response, "result")?;
         assert_eq!(output, "hello world");
+        Ok(())
     }
 
     #[test]
@@ -574,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_output_empty_bytes_contents() {
+    fn test_extract_output_empty_bytes_contents() -> TestResult {
         let response = triton_proto::ModelInferResponse {
             model_name: "test".to_string(),
             model_version: "1".to_string(),
@@ -594,16 +597,18 @@ mod tests {
         };
 
         let result = GrpcTritonClient::extract_output(&response, "result");
-        assert!(result.is_err(), "empty bytes_contents should fail");
-        let err = result.unwrap_err();
+        let Err(err) = result else {
+            return Err("empty bytes_contents should fail".into());
+        };
         assert!(
             matches!(err, AnalysisError::ResponseParsing(ref msg) if msg.contains("no contents")),
             "error should mention no contents: {err}"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_extract_output_invalid_utf8() {
+    fn test_extract_output_invalid_utf8() -> TestResult {
         let response = triton_proto::ModelInferResponse {
             model_name: "test".to_string(),
             model_version: "1".to_string(),
@@ -623,12 +628,14 @@ mod tests {
         };
 
         let result = GrpcTritonClient::extract_output(&response, "result");
-        assert!(result.is_err(), "non-UTF-8 bytes should fail");
-        let err = result.unwrap_err();
+        let Err(err) = result else {
+            return Err("non-UTF-8 bytes should fail".into());
+        };
         assert!(
             matches!(err, AnalysisError::ResponseParsing(ref msg) if msg.contains("UTF-8")),
             "error should mention UTF-8: {err}"
         );
+        Ok(())
     }
 
     #[test]
@@ -662,8 +669,8 @@ mod tests {
     }
 
     #[test]
-    fn test_offline_fixture_roundtrip() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_offline_fixture_roundtrip() -> TestResult {
+        let dir = tempfile::tempdir()?;
         let response = triton_proto::ModelInferResponse {
             model_name: "test_model".to_string(),
             model_version: "1".to_string(),
@@ -683,24 +690,26 @@ mod tests {
         };
 
         let hash = "abc123";
-        GrpcTritonClient::write_cache(dir.path(), hash, &response).expect("write should succeed");
+        GrpcTritonClient::write_cache(dir.path(), hash, &response)?;
 
-        let loaded = GrpcTritonClient::read_cache(dir.path(), hash).expect("read should succeed");
+        let loaded = GrpcTritonClient::read_cache(dir.path(), hash)?;
 
         assert_eq!(loaded.model_name, "test_model");
         assert_eq!(loaded.outputs.len(), 1);
         let contents = loaded.outputs[0]
             .contents
             .as_ref()
-            .expect("should have contents");
+            .ok_or("should have contents")?;
         assert_eq!(contents.bytes_contents[0], b"test data");
+        Ok(())
     }
 
     #[test]
-    fn test_offline_fixture_missing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    fn test_offline_fixture_missing() -> TestResult {
+        let dir = tempfile::tempdir()?;
         let result = GrpcTritonClient::read_cache(dir.path(), "nonexistent");
         assert!(result.is_err());
+        Ok(())
     }
 
     #[test]
@@ -721,19 +730,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_offline_health_checks() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    async fn test_offline_health_checks() -> TestResult {
+        let dir = tempfile::tempdir()?;
         let client = GrpcTritonClient::offline(dir.path().to_path_buf());
 
-        client
-            .is_server_ready()
-            .await
-            .expect("offline should always be ready");
-        assert!(
-            client
-                .is_model_ready("any_model")
-                .await
-                .expect("offline model ready should succeed")
-        );
+        client.is_server_ready().await?;
+        assert!(client.is_model_ready("any_model").await?);
+        Ok(())
     }
 }

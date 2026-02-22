@@ -168,7 +168,7 @@ fn check_events_after_demolished(transitions: &[EntityTransition]) -> Vec<Consis
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::date::{DateError, DatePrecision};
+    use crate::date::DatePrecision;
     use crate::entity::EntityType;
     use chrono::NaiveDate;
 
@@ -181,8 +181,11 @@ mod tests {
             .ok_or("invalid time")
     }
 
-    fn year(y: i32) -> UncertainDate {
-        UncertainDate::with_precision(midnight(y, 1, 1).unwrap(), DatePrecision::Year).unwrap()
+    fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+        Ok(UncertainDate::with_precision(
+            midnight(y, 1, 1)?,
+            DatePrecision::Year,
+        )?)
     }
 
     #[test]
@@ -247,17 +250,17 @@ mod tests {
     }
 
     #[test]
-    fn same_year_is_ok() -> Result<(), DateError> {
+    fn same_year_is_ok() -> TestResult {
         let entity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![EntityTransition::Constructed {
                 started_at: Some(Cited::uncited(UncertainDate::with_precision(
-                    midnight(1830, 6, 15).expect("valid date"),
+                    midnight(1830, 6, 15)?,
                     DatePrecision::Year,
                 )?)),
                 completed_at: Some(Cited::uncited(UncertainDate::with_precision(
-                    midnight(1830, 9, 20).expect("valid date"),
+                    midnight(1830, 9, 20)?,
                     DatePrecision::Year,
                 )?)),
                 location: None,
@@ -355,8 +358,8 @@ mod tests {
                 name: "Old Name".to_string(),
                 name_type: NameType::Historical,
                 language: LanguageTag::parse("en".to_string())?,
-                valid_from: Some(year(2000)),
-                valid_to: Some(year(1990)),
+                valid_from: Some(year(2000)?),
+                valid_to: Some(year(1990)?),
             })],
             transitions: vec![],
         };
@@ -443,8 +446,8 @@ mod tests {
                 name: "Current Name".to_string(),
                 name_type: NameType::Official,
                 language: LanguageTag::parse("en".to_string())?,
-                valid_from: Some(year(1990)),
-                valid_to: Some(year(2000)),
+                valid_from: Some(year(1990)?),
+                valid_to: Some(year(2000)?),
             })],
             transitions: vec![],
         };

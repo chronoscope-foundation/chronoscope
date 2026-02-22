@@ -566,7 +566,7 @@ async fn test_get_or_create_media_with_location() -> DbResult<()> {
         captured: None,
         location: Some(
             UncertainLocation::coordinates(37.7749, -122.4194, None, None)
-                .expect("valid test coordinates"),
+                .map_err(|e| DbError::InvalidArgument(e.to_string()))?,
         ),
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
@@ -601,7 +601,11 @@ async fn test_get_or_create_media_with_location() -> DbResult<()> {
             assert_approx_eq!(lat, 37.7749, 1e-4);
             assert_approx_eq!(lon, -122.4194, 1e-4);
         }
-        other => panic!("expected Coordinates, got {other:?}"),
+        other => {
+            return Err(DbError::InvalidArgument(format!(
+                "expected Coordinates, got {other:?}"
+            )));
+        }
     }
 
     Ok(())

@@ -99,7 +99,7 @@ impl TestServer {
         // Build Triton service: live+recording or offline depending on mode.
         let triton: Option<Arc<dyn TritonService>> = if cfg!(feature = "record-fixtures") {
             let endpoint = std::env::var("TRITON_ENDPOINT")
-                .expect("TRITON_ENDPOINT must be set when recording fixtures");
+                .map_err(|_| "TRITON_ENDPOINT must be set when recording fixtures")?;
             Some(Arc::new(
                 GrpcTritonClient::recording(&endpoint, triton_fixtures_dir()?).await?,
             ))

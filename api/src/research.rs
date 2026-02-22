@@ -356,7 +356,7 @@ mod tests {
         let mut media = minimal_media();
         media.data.location = Some(
             UncertainLocation::coordinates(41.5908, -87.3467, None, None)
-                .expect("valid test coordinates"),
+                .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
         );
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
@@ -389,7 +389,7 @@ mod tests {
                 Some(chronoscope_core::Elevation::SeaLevelOffset { meters: 180 }),
                 None,
             )
-            .expect("valid test coordinates"),
+            .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
         );
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
