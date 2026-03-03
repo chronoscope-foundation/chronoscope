@@ -43,9 +43,11 @@ Packages/
 Package.resolved
 
 # Python
-.venv/
 __pycache__/
 .hypothesis/
 
-# Corpus test suite artifacts (downloaded images, baselines, run reports)
-analysis/corpus/
+# Nix
+/result
+/result-*
+.direnv/
+.nix-gc-roots/

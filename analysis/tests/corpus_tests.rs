@@ -148,7 +148,7 @@ fn make_trial(
             (None, Some(msg)) => Err(msg.into()),
             (Some(_), Some(_)) => Ok(()),
             (Some(reason), None) => Err(format!(
-                "known issue appears resolved — remove known_issue from corpus.json\n  \
+                "known issue appears resolved — remove known_issue from the corpus manifest\n  \
                  was: {reason}"
             )
             .into()),

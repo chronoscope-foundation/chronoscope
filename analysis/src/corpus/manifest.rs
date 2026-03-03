@@ -42,7 +42,7 @@ where
     m.end()
 }
 
-/// Top-level corpus manifest parsed from `corpus.json`.
+/// Top-level corpus manifest.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CorpusManifest {
     pub images: BTreeMap<String, ImageEntry>,
@@ -140,6 +140,16 @@ pub struct ClusterEntry {
 }
 
 impl CorpusManifest {
+    /// Return the set of unique URLs referenced by all image entries.
+    pub fn unique_urls(&self) -> HashSet<String> {
+        self.images
+            .values()
+            .map(|entry| match entry {
+                ImageEntry::Single { url, .. } | ImageEntry::Composite { url, .. } => url.clone(),
+            })
+            .collect()
+    }
+
     /// Load a corpus manifest from a JSON file.
     pub fn load(path: &Path) -> Result<Self, CorpusError> {
         let content = std::fs::read_to_string(path).map_err(CorpusError::Io)?;

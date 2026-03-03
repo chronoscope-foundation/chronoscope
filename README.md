@@ -31,10 +31,34 @@ The thin slice establishes the patterns for the full platform. Next steps includ
 
 ### Prerequisites
 
-- Rust
+- [Nix](https://nixos.org/download/) ([Determinate Nix](https://determinate.systems/nix/) recommended)
 - Xcode 16+
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 - ngrok (authenticated - `ngrok config add-authtoken YOUR_TOKEN`)
+
+### Development Environment
+
+All Rust, Python, and native dependencies are managed by Nix. The dev shell also provides pre-fetched ML model weights (SAM3, DINOv3) from the Nix store.
+
+**First-time setup** — fetch model weights (requires a [HuggingFace token](https://huggingface.co/settings/tokens) with access to the gated models):
+
+```bash
+HF_TOKEN=hf_... nix build --impure .#dinov3-weights .#sam3-weights
+```
+
+This is a one-time step. Once the weights are in the Nix store, the token is no longer needed and all builds are pure. The dev shell pins them as GC roots (in `.nix-gc-roots/`) so Determinate Nix's automatic garbage collection won't sweep them. If weights get collected, `just` commands will fail early with re-fetch instructions.
+
+**Enter the dev shell:**
+
+```bash
+# Option 1: direnv (recommended — auto-activates on cd)
+direnv allow
+
+# Option 2: manual
+nix develop
+```
+
+`just` commands auto-wrap with `nix develop` if you're not already in the shell, so you can always just run `just check` directly.
 
 ### Quick Start
 
@@ -58,11 +82,20 @@ That's it - one terminal command and one Xcode shortcut for a fully functioning 
 
 See [docs/development.md](docs/development.md) for detailed development practices.
 
-### Running Tests
+### Running Checks
 
 ```bash
-# API tests (includes auth flow with simulated passkeys)
-cargo test
+# Run everything: Nix linting, Rust (fmt, clippy, test, coverage), Python (ruff, mypy, pytest)
+just check
+
+# Auto-fix all formatting (Nix + Rust + Python)
+just fmt
+
+# Hermetic sandboxed checks (no GPU required)
+nix flake check
+
+# Run a single Nix check (e.g., Python tests only)
+nix build .#checks.$(nix eval --impure --expr builtins.currentSystem --raw).triton-test
 
 # iOS UI tests
 xcodebuild test -scheme Chronoscope -destination 'platform=iOS Simulator,name=iPhone 16'

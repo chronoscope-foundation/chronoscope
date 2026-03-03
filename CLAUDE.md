@@ -23,24 +23,51 @@ See [docs/design.md](docs/design.md) for the full design philosophy. Key points:
 - **Collaborative research** - AI assists humans, doesn't replace them; behavior must be interpretable
 - **API-first platform** - all clients are API consumers; easy ingestion for external datasets
 
+## Development Environment
+
+All tooling comes from Nix. Install [Nix](https://nixos.org/download/) (Determinate Nix recommended), then either:
+
+- **direnv**: `direnv allow` (auto-activates on `cd`)
+- **Manual**: `nix develop`
+
+`just` commands auto-wrap with `nix develop` if you're not already in the shell.
+
 ## Commit Requirements
 
-Every commit must pass `just check`, which runs formatting, linting, tests, and coverage. Line coverage must stay above 75%.
-
-Run from the repo root for workspace-wide checks, or from a crate directory (e.g., `api/`) to check just that crate.
+Every commit must pass `just check`, which runs Nix linting (nixfmt, statix, deadnix), Rust checks (fmt, clippy, test, coverage), and Python checks (ruff, mypy, pytest). Line coverage must stay above 75%.
 
 ## Quick Reference
 
 ```bash
-# Run all checks (fmt, clippy, test, coverage)
+# Run all checks (Nix + Rust + Python)
 just check
+
+# Auto-fix all formatting
+just fmt
 
 # Start dev server (ngrok + API + workers)
 cargo run -p chronoscope-dev
 
 # Generate OpenAPI spec
 cargo run --bin openapi -- api/target/openapi.json
+
+# Hermetic sandboxed checks (CI-style, no GPU required)
+nix flake check
+
+# Run individual Nix checks
+nix build .#checks.$(nix eval --impure --expr builtins.currentSystem --raw).triton-test
+
+# Corpus tests (builds GPU analysis results on demand, then runs Rust assertions)
+just corpus-test
 ```
+
+## Cross-Language Testing
+
+Python tests call `schematool` (a Rust binary from `analysis/src/bin/schematool.rs`) to validate that Python model output matches Rust schema expectations. This catches schema drift between the two languages.
+
+- **`nix flake check`**: schematool comes from `rust.packages.default` (the workspace build)
+- **`just check`**: schematool is built by `cargo build --bin schematool` and added to PATH
+- **Model weights**: SAM3 and DINOv3 weights are pre-fetched into the Nix store via fixed-output derivations (`hf download` in a sandboxed FOD). `HF_HUB_OFFLINE=1` ensures no network access — missing weights fail hard, never download silently.
 
 ## Code Standards
 

@@ -114,15 +114,20 @@ class TritonPythonModel:
         with open(model_json_path) as f:
             model_name: str = json.load(f)["model"]
 
+        # DINOV3_MODEL_DIR: Nix-provided local directory with pre-fetched weights.
+        # Falls back to HF Hub download when not set (Triton server, non-Nix dev).
+        local_dir = os.environ.get("DINOV3_MODEL_DIR")
+        model_source = local_dir or model_name
+
         pb_utils.Logger.log_info(
-            f"Loading DINOv3 model={model_name} (image_size={self.image_size})..."
+            f"Loading DINOv3 model={model_source} (image_size={self.image_size})..."
         )
 
         # Use shared HF cache on persistent volume (same as SAM3/VLM)
         cache_dir = os.environ.get("HF_HOME", None)
 
-        self.processor = AutoImageProcessor.from_pretrained(model_name, cache_dir=cache_dir)
-        self.model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
+        self.processor = AutoImageProcessor.from_pretrained(model_source, cache_dir=cache_dir)
+        self.model = AutoModel.from_pretrained(model_source, cache_dir=cache_dir)
         self.model.eval()
 
         device = _select_device()

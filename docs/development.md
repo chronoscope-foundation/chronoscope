@@ -97,12 +97,26 @@ Every test should answer: "What bug would this catch?"
 - Test behavior, not implementation details
 - If refactoring breaks a test but not the behavior, the test was wrong
 
+### Cross-Language Testing
+
+Python model tests call `schematool` (Rust binary from `analysis/src/bin/schematool.rs`) to validate Python output against Rust schema definitions. This catches schema drift between the two languages at test time.
+
+- In `nix flake check`: schematool comes from the Rust workspace build (`rust.packages.default`)
+- In `just check`: schematool is built by `cargo build --bin schematool` and added to `PATH`
+- Model weights (SAM3, DINOv3) are pre-fetched into the Nix store via fixed-output derivations (`hf download` in a sandboxed FOD) and passed via `DINOV3_MODEL_DIR` / `HF_HOME` env vars
+- `HF_HUB_OFFLINE=1` is always set — any attempt to download at test time is a hard failure
+
 ### Test Organization
 
 **Rust:**
 - `api/src/tests/` - API endpoint tests organized by feature
 - Workers use `record-fixtures` feature for HTTP fixture recording
 - In-memory SQLite for fast, isolated database tests
+
+**Python:**
+- `analysis/triton/test_models.py` — unit + integration tests for SAM3/DINOv3/VLM pipeline
+- `conftest.py` — session-scoped real model fixtures for integration tests
+- Tests run with real model inference (MPS/CPU), not mocked weights
 
 **Swift:**
 - `MockAPIClient` provides predictable responses for UI tests and previews

@@ -5,14 +5,8 @@ FROM nvcr.io/nvidia/tritonserver:26.01-vllm-python-py3
 RUN pip install --no-cache-dir \
     pillow \
     numpy \
-    opencv-python-headless \
-    qwen-vl-utils \
-    decord \
     pycocotools \
     transformers
-
-# Install iopath from GitHub (the PyPI tarball has issues)
-RUN pip install --no-cache-dir git+https://github.com/facebookresearch/iopath.git
 
 # Install SAM3 from GitHub (requires HF_TOKEN for model weights)
 RUN pip install --no-cache-dir git+https://github.com/facebookresearch/sam3.git

@@ -1,11 +1,12 @@
-//! Corpus test suite for the analysis pipeline.
+//! Corpus image pipeline.
 //!
-//! Downloads a curated set of images, runs them through real SAM3 + DINOv3
-//! models via Python subprocess, caches results on disk in content-addressed
-//! run directories, and makes specific per-image assertions driven by metadata
-//! in `corpus.json`.
-//!
+//! Manifest parsing, rate-limited image downloading (for the `corpus-fetch`
+//! FOD binary), per-image assertions, and pre-computed result loading.
 //! Gated behind the `corpus-test` feature — never runs in `just check`.
+//!
+//! Environment variables (set by Nix):
+//! - `CORPUS_MANIFEST` — path to the corpus manifest JSON (dev shell)
+//! - `ANALYSIS_RESULTS` — path to the analysis results directory (`just corpus-test` builds on demand)
 
 pub mod assertions;
 pub mod download;
@@ -13,21 +14,36 @@ pub mod manifest;
 pub mod runner;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use tracing::info;
 
 use crate::schema::{AnalysisResult, Embedding};
 
-use download::ImageDownloader;
-use manifest::CorpusManifest;
+pub use download::ImageDownloader;
+pub use manifest::CorpusManifest;
 
-/// Filename of the corpus manifest.
-const CORPUS_JSON: &str = "corpus.json";
+/// Resolve the corpus manifest path from the `CORPUS_MANIFEST` env var (set by Nix).
+pub fn manifest_path() -> Result<PathBuf, CorpusError> {
+    std::env::var("CORPUS_MANIFEST")
+        .map(PathBuf::from)
+        .map_err(|_| {
+            CorpusError::Manifest(
+                "CORPUS_MANIFEST env var not set — run from `nix develop` or `just`".into(),
+            )
+        })
+}
 
-/// Directory for cached images (relative to analysis dir).
-const CORPUS_IMAGE_DIR: &str = "corpus/images";
+/// Resolve the analysis results directory from the `ANALYSIS_RESULTS` env var (set by Nix).
+fn analysis_results_dir() -> Result<PathBuf, CorpusError> {
+    std::env::var("ANALYSIS_RESULTS")
+        .map(PathBuf::from)
+        .map_err(|_| {
+            CorpusError::Pipeline(
+                "ANALYSIS_RESULTS env var not set — run from `nix develop` or `just`".into(),
+            )
+        })
+}
 
 // ==================== Error ====================
 
@@ -48,49 +64,33 @@ pub enum CorpusError {
 
 // ==================== Corpus Fixture ====================
 
-/// Eagerly-loaded corpus fixture with incremental caching.
+/// Corpus fixture: manifest + pre-computed analysis results.
 ///
-/// Downloads images and runs pipeline on first access.
-/// Results cached in content-addressed run directories, invalidated
-/// when pipeline code changes.
+/// Reads results from the `ANALYSIS_RESULTS` directory (a Nix derivation
+/// output containing `results.jsonl`). Nix content-addressing handles
+/// cache invalidation — the store path changes when pipeline code changes.
 pub struct CorpusFixture {
     manifest: CorpusManifest,
     results: BTreeMap<String, AnalysisResult>,
 }
 
 impl CorpusFixture {
-    /// Build from pre-loaded manifest and results.
-    ///
-    /// Used by the viewer subcommand (loads cached results without running pipeline).
-    pub fn from_parts(
-        manifest: CorpusManifest,
-        results: BTreeMap<String, AnalysisResult>,
-    ) -> Result<Self, CorpusError> {
-        manifest.validate()?;
-        Ok(Self { manifest, results })
-    }
-
     /// Reference to the underlying manifest.
     pub fn manifest(&self) -> &CorpusManifest {
         &self.manifest
     }
 
-    /// Load corpus fixture, running the pipeline on any uncached images.
+    /// Load corpus fixture from pre-computed analysis results.
     ///
-    /// Downloads all images (cached on disk) and runs the pipeline
-    /// incrementally — only images not yet in the run cache are processed.
+    /// Reads `ANALYSIS_RESULTS/results.jsonl` produced by the Nix
+    /// `analysis-results` derivation.
     pub fn load() -> Result<Self, CorpusError> {
-        let analysis_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let manifest = CorpusManifest::load(&analysis_dir.join(CORPUS_JSON))?;
+        let manifest = CorpusManifest::load(&manifest_path()?)?;
 
-        let pipeline_hash = runner::compute_pipeline_hash(&analysis_dir)?;
-        info!(%pipeline_hash, "corpus pipeline hash");
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| CorpusError::Pipeline(format!("creating tokio runtime: {e}")))?;
-
-        let image_paths = rt.block_on(download_all_inner(&analysis_dir, &manifest))?;
-        let results = runner::run_pipeline(&analysis_dir, &pipeline_hash, &image_paths)?;
+        let results_dir = analysis_results_dir()?;
+        let jsonl_path = results_dir.join("results.jsonl");
+        info!(path = %jsonl_path.display(), "loading pre-computed analysis results");
+        let results = runner::load_results_jsonl(&jsonl_path)?;
 
         Ok(Self { manifest, results })
     }
@@ -135,27 +135,4 @@ impl CorpusFixture {
         }
         out
     }
-}
-
-/// Download all corpus images (shared async helper).
-async fn download_all_inner(
-    analysis_dir: &Path,
-    manifest: &CorpusManifest,
-) -> Result<BTreeMap<String, PathBuf>, CorpusError> {
-    let http: Arc<dyn chronoscope_integrations::HttpClient> = Arc::new(
-        chronoscope_integrations::ReqwestClient::new()
-            .map_err(|e| CorpusError::Download(format!("creating HTTP client: {e}")))?,
-    );
-
-    let image_dir = analysis_dir.join(CORPUS_IMAGE_DIR);
-    let downloader = ImageDownloader::new(http, image_dir);
-    downloader.download_all(manifest).await
-}
-
-/// Download all corpus images without running the pipeline.
-pub async fn download_all(analysis_dir: &Path) -> Result<BTreeMap<String, PathBuf>, CorpusError> {
-    let manifest = CorpusManifest::load(&analysis_dir.join(CORPUS_JSON))?;
-    let image_paths = download_all_inner(analysis_dir, &manifest).await?;
-    info!(count = image_paths.len(), "downloaded all corpus images");
-    Ok(image_paths)
 }

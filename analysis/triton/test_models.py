@@ -66,13 +66,12 @@ def make_test_image(width: int = 200, height: int = 150) -> str:
 def make_test_schema() -> str:
     """Get the actual vlm_schema::SubimageOutput schema from Rust."""
     result = subprocess.run(
-        ["cargo", "run", "--bin", "schematool"],
+        ["schematool"],
         capture_output=True,
         text=True,
-        cwd=Path(__file__).parent.parent,  # analysis/ directory
     )
     if result.returncode != 0:
-        pytest.skip("cargo required for schema generation (run from repo with Rust toolchain)")
+        raise RuntimeError(f"schematool failed: {result.stderr}")
     return result.stdout
 
 
@@ -772,13 +771,12 @@ class TestBamlConverter:
         This ensures Python and Rust components stay in sync.
         """
         result = subprocess.run(
-            ["cargo", "run", "--bin", "schematool"],
+            ["schematool"],
             capture_output=True,
             text=True,
-            cwd=Path(__file__).parent.parent,  # analysis/ directory
         )
         if result.returncode != 0:
-            pytest.skip(f"cargo not available: {result.stderr[:100]}")
+            raise RuntimeError(f"schematool failed: {result.stderr}")
 
         schema = json.loads(result.stdout)
         baml = baml_converter.jsonschema_to_baml(schema)
@@ -1506,13 +1504,12 @@ class TestSchemaCompatibility:
 
         # Get the Rust-generated schema
         result = subprocess.run(
-            ["cargo", "run", "--bin", "schematool", "result"],
+            ["schematool", "result"],
             capture_output=True,
             text=True,
-            cwd=Path(__file__).parent.parent,
         )
         if result.returncode != 0:
-            pytest.skip(f"cargo not available: {result.stderr[:100]}")
+            raise RuntimeError(f"schematool failed: {result.stderr}")
 
         rust_schema = json.loads(result.stdout)
 
@@ -1562,11 +1559,10 @@ class TestSchemaCompatibility:
 
         # Validate via serde deserialization (catches deny_unknown_fields, tagging, etc.)
         validate_result = subprocess.run(
-            ["cargo", "run", "--bin", "schematool", "--", "validate"],
+            ["schematool", "validate"],
             input=json.dumps(python_output),
             capture_output=True,
             text=True,
-            cwd=Path(__file__).parent.parent,
         )
         assert validate_result.returncode == 0, f"serde validation failed: {validate_result.stderr}"
 
@@ -1663,15 +1659,6 @@ class TestPipelineIntegration:
 
     def test_schema_validation_with_real_output(self, pipeline):
         """Real pipeline output validates against the Rust AnalysisResult schema."""
-        result_proc = subprocess.run(
-            ["cargo", "run", "--bin", "schematool", "--", "validate"],
-            input="null",
-            capture_output=True,
-            text=True,
-            cwd=Path(__file__).parent.parent,
-        )
-        if result_proc.returncode != 0 and "cargo" in result_proc.stderr.lower():
-            pytest.skip("cargo not available for schema validation")
 
         image_b64 = make_test_image()
 
@@ -1679,10 +1666,9 @@ class TestPipelineIntegration:
         result = _parse_result(responses[0])
 
         validate_result = subprocess.run(
-            ["cargo", "run", "--bin", "schematool", "--", "validate"],
+            ["schematool", "validate"],
             input=json.dumps(result),
             capture_output=True,
             text=True,
-            cwd=Path(__file__).parent.parent,
         )
         assert validate_result.returncode == 0, f"serde validation failed: {validate_result.stderr}"
