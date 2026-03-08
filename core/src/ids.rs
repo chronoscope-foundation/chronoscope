@@ -84,18 +84,39 @@ pub struct OhmId(pub i64);
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(transparent)]
-pub struct EntityIdx(pub usize);
+pub struct EntityIdx(usize);
+
+impl EntityIdx {
+    #[must_use]
+    pub fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+}
 
 /// Index into an ingestion source list (images, maps, documents).
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(transparent)]
-pub struct SourceIdx(pub usize);
+pub struct SourceIdx(usize);
+
+impl SourceIdx {
+    #[must_use]
+    pub fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+}
 
 /// Index into an ingestion external link list.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(transparent)]
-pub struct LinkIdx(pub usize);
+pub struct LinkIdx(usize);
+
+impl LinkIdx {
+    #[must_use]
+    pub fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+}

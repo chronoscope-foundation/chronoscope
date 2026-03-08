@@ -208,12 +208,12 @@ fn statue_of_liberty() -> Entity {
             },
             EntityTransition::Moved {
                 occurred_at: Some(uncited(range(1885, 1886))),
-                location: uncited(UncertainLocation::Coordinates {
+                location: Some(uncited(UncertainLocation::Coordinates {
                     lat: 40.6892,
                     lon: -74.0445,
                     elevation: None,
                     precision_m: Some(10),
-                }),
+                })),
                 cause: Some("gift from France to United States".to_string()),
                 method: Some(MoveMethod::Disassembled),
                 trigger_event: None,

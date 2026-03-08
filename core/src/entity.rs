@@ -154,7 +154,7 @@ pub enum EntityTransition {
     },
     Moved {
         occurred_at: Option<Cited<UncertainDate>>,
-        location: Cited<UncertainLocation>,
+        location: Option<Cited<UncertainLocation>>,
         cause: Option<String>,
         method: Option<MoveMethod>,
         trigger_event: Option<TriggerEventId>,
@@ -255,7 +255,6 @@ pub struct EntityRelation<E> {
     pub from_entity: E,
     pub to_entity: E,
     pub relation_type: EntityRelationType,
-    #[serde(default)]
     pub evidence: Vec<crate::evidence::Evidence>,
 }
 
