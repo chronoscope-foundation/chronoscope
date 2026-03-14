@@ -112,7 +112,7 @@ impl SingleFetcher for RedditIntegration {
         let response = fetch_json(http, &json_url).await?;
 
         // Parse and return the content
-        self.parse_json_response(&response.body)
+        Self::parse_json_response(&response.body)
     }
 }
 
@@ -139,7 +139,7 @@ impl RedditIntegration {
     }
 
     /// Process JSON response body and extract content.
-    fn parse_json_response(&self, body: &[u8]) -> Result<FetchedContent, FetchError> {
+    fn parse_json_response(body: &[u8]) -> Result<FetchedContent, FetchError> {
         let json: serde_json::Value = serde_json::from_slice(body)
             .map_err(|e| FetchError::ParseError(format!("invalid JSON: {e}")))?;
 

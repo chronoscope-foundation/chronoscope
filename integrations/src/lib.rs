@@ -18,6 +18,7 @@ pub mod http;
 pub mod instagram;
 pub mod reddit;
 mod registry;
+pub mod wikidata;
 
 pub use content::FetchedContent;
 pub use http::{

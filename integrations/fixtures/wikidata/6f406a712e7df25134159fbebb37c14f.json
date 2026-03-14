@@ -1,0 +1,30 @@
+{
+  "url": "https://www.wikidata.org/w/api.php?action=query&titles=Q243&prop=revisions&rvprop=ids&rvstart=2022-01-03T00:00:00Z&rvdir=older&rvlimit=1&format=json",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "server": "mw-api-ext.codfw.main-5d5848f7c-kzlv5",
+    "date": "Thu, 12 Mar 2026 05:41:03 GMT",
+    "strict-transport-security": "max-age=106384710; includeSubDomains; preload",
+    "server-timing": "cache;desc=\"pass\", host;desc=\"cp4038\"",
+    "content-type": "application/json; charset=utf-8",
+    "nel": "{ \"report_to\": \"wm_nel\", \"max_age\": 604800, \"failure_fraction\": 0.05, \"success_fraction\": 0.0}",
+    "x-content-type-options": "nosniff",
+    "age": "0",
+    "x-frame-options": "DENY",
+    "accept-ranges": "bytes",
+    "content-disposition": "inline; filename=api-result.json",
+    "x-cache": "cp4038 miss, cp4038 pass",
+    "x-cache-status": "pass",
+    "content-security-policy": "default-src 'self'; script-src 'none'; object-src 'none'",
+    "cache-control": "private, must-revalidate, max-age=0",
+    "x-client-ip": "50.35.157.188",
+    "x-request-id": "38bf985a-9f52-4ac8-8560-b7e0c51f31ef",
+    "set-cookie": "WMF-Uniq=QsWXT10NsRk0dSbMXAoVkwMhAAAAAFvdHFmZNqbsCKbqf8sjm5fFHnU6kQ73vxzG;Domain=.wikidata.org;Path=/;HttpOnly;secure;SameSite=None;Expires=Fri, 12 Mar 2027 00:00:00 GMT",
+    "vary": "Accept-Encoding,X-Subdomain,Treat-as-Untrusted,X-Forwarded-Proto,Cookie,Authorization,User-Agent",
+    "x-analytics": "",
+    "report-to": "{ \"group\": \"wm_nel\", \"max_age\": 604800, \"endpoints\": [{ \"url\": \"https://intake-logging.wikimedia.org/v1/events?stream=w3c.reportingapi.network_error&schema_uri=/w3c/reportingapi/network_error/1.0.0\" }] }"
+  },
+  "body": "eyJjb250aW51ZSI6eyJydmNvbnRpbnVlIjoiMjAyMjAxMDEwOTA5MzB8MTU1Mzk4NzU0NiIsImNvbnRpbnVlIjoifHwifSwicXVlcnkiOnsicGFnZXMiOnsiMzg1Ijp7InBhZ2VpZCI6Mzg1LCJucyI6MCwidGl0bGUiOiJRMjQzIiwicmV2aXNpb25zIjpbeyJyZXZpZCI6MTU1NDg1NzMzMywicGFyZW50aWQiOjE1NTM5ODc1NDZ9XX19fX0=",
+  "final_url": "https://www.wikidata.org/w/api.php?action=query&titles=Q243&prop=revisions&rvprop=ids&rvstart=2022-01-03T00:00:00Z&rvdir=older&rvlimit=1&format=json"
+}

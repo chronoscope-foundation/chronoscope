@@ -3,11 +3,9 @@
 //! Maps Wikidata Q-IDs to Chronoscope Usage types.
 
 use chronoscope_core::{Entity, EntityTransition, Usage};
-use serde_json::Value;
+use chronoscope_integrations::wikidata::WikidataEntity;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
-
-use crate::wikidata::parsing::{get_claim_qid, get_claims};
 
 /// P366 (has use) -> Usage mapping.
 /// These are direct "has use" values from Wikidata.
@@ -113,14 +111,14 @@ pub static P31_USAGE_MAP: LazyLock<HashMap<&'static str, Usage>> = LazyLock::new
 
 /// Infer usage from Wikidata entity claims.
 /// Priority: P366 (has use) > P31 (instance of) > Unknown
-pub fn infer(wd_entity: &Value) -> BTreeSet<Usage> {
+pub fn infer(wd_entity: &WikidataEntity) -> BTreeSet<Usage> {
     let mut usages = BTreeSet::new();
 
     // First try P366 (has use)
-    if let Some(claims) = get_claims(wd_entity, "P366") {
+    if let Some(claims) = wd_entity.claims.get("P366") {
         for claim in claims {
-            if let Some(qid) = get_claim_qid(claim)
-                && let Some(usage) = P366_USAGE_MAP.get(qid)
+            if let Some(qid) = claim.mainsnak.entity_id()
+                && let Some(usage) = P366_USAGE_MAP.get(qid.as_str())
             {
                 usages.insert(usage.clone());
             }
@@ -129,11 +127,11 @@ pub fn infer(wd_entity: &Value) -> BTreeSet<Usage> {
 
     // If no P366 matches, try P31 (instance of)
     if usages.is_empty()
-        && let Some(claims) = get_claims(wd_entity, "P31")
+        && let Some(claims) = wd_entity.claims.get("P31")
     {
         for claim in claims {
-            if let Some(qid) = get_claim_qid(claim)
-                && let Some(usage) = P31_USAGE_MAP.get(qid)
+            if let Some(qid) = claim.mainsnak.entity_id()
+                && let Some(usage) = P31_USAGE_MAP.get(qid.as_str())
             {
                 usages.insert(usage.clone());
             }
@@ -164,9 +162,41 @@ pub fn replace_unknown(entity: &mut Entity, inferred_usages: &BTreeSet<Usage>) {
 mod tests {
     use super::*;
     use chronoscope_core::EntityType;
-    use serde_json::json;
+    use chronoscope_integrations::wikidata::{
+        Claim, DataValue, EntityRefValue, PropertyId, RevisionId, Snak, WikidataEntityType,
+        WikidataId,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn wikidata_id(s: &str) -> Result<WikidataId, String> {
+        WikidataId::try_from(s.to_string())
+    }
+
+    fn property_id(s: &str) -> Result<PropertyId, String> {
+        PropertyId::try_from(s.to_string())
+    }
+
+    fn entity_with_claims(
+        claims: HashMap<PropertyId, Vec<Claim>>,
+    ) -> Result<WikidataEntity, String> {
+        Ok(WikidataEntity {
+            id: wikidata_id("Q1")?,
+            entity_type: WikidataEntityType::Item,
+            lastrevid: RevisionId(0),
+            labels: HashMap::new(),
+            claims,
+            sitelinks: HashMap::new(),
+        })
+    }
+
+    fn entity_id_claim(qid: &str) -> Result<Claim, String> {
+        Ok(Claim::simple(Snak::Value(DataValue::WikibaseEntityId(
+            EntityRefValue {
+                id: wikidata_id(qid)?,
+            },
+        ))))
+    }
 
     // =========================================================================
     // infer() tests
@@ -174,20 +204,11 @@ mod tests {
 
     #[test]
     fn infer_p366_has_use_transportation() -> TestResult {
-        // Q1571929 = general aviation → Transportation
-        let entity = json!({
-            "claims": {
-                "P366": [{
-                    "mainsnak": {
-                        "snaktype": "value",
-                        "datavalue": {
-                            "type": "wikibase-entityid",
-                            "value": { "id": "Q1571929" }
-                        }
-                    }
-                }]
-            }
-        });
+        // Q1571929 = general aviation -> Transportation
+        let entity = entity_with_claims(HashMap::from([(
+            property_id("P366")?,
+            vec![entity_id_claim("Q1571929")?],
+        )]))?;
         let result = infer(&entity);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&Usage::Transportation));
@@ -197,30 +218,10 @@ mod tests {
     #[test]
     fn infer_p366_multiple_usages() -> TestResult {
         // Q1571929 = Transportation, Q33506 = Cultural (museum)
-        let entity = json!({
-            "claims": {
-                "P366": [
-                    {
-                        "mainsnak": {
-                            "snaktype": "value",
-                            "datavalue": {
-                                "type": "wikibase-entityid",
-                                "value": { "id": "Q1571929" }
-                            }
-                        }
-                    },
-                    {
-                        "mainsnak": {
-                            "snaktype": "value",
-                            "datavalue": {
-                                "type": "wikibase-entityid",
-                                "value": { "id": "Q33506" }
-                            }
-                        }
-                    }
-                ]
-            }
-        });
+        let entity = entity_with_claims(HashMap::from([(
+            property_id("P366")?,
+            vec![entity_id_claim("Q1571929")?, entity_id_claim("Q33506")?],
+        )]))?;
         let result = infer(&entity);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&Usage::Transportation));
@@ -230,20 +231,11 @@ mod tests {
 
     #[test]
     fn infer_p31_fallback_when_no_p366() -> TestResult {
-        // Q55488 = railway station → Transportation (via P31)
-        let entity = json!({
-            "claims": {
-                "P31": [{
-                    "mainsnak": {
-                        "snaktype": "value",
-                        "datavalue": {
-                            "type": "wikibase-entityid",
-                            "value": { "id": "Q55488" }
-                        }
-                    }
-                }]
-            }
-        });
+        // Q55488 = railway station -> Transportation (via P31)
+        let entity = entity_with_claims(HashMap::from([(
+            property_id("P31")?,
+            vec![entity_id_claim("Q55488")?],
+        )]))?;
         let result = infer(&entity);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&Usage::Transportation));
@@ -253,28 +245,10 @@ mod tests {
     #[test]
     fn infer_p366_takes_priority_over_p31() -> TestResult {
         // P366 gives Transportation, P31 gives Religious — P366 should win
-        let entity = json!({
-            "claims": {
-                "P366": [{
-                    "mainsnak": {
-                        "snaktype": "value",
-                        "datavalue": {
-                            "type": "wikibase-entityid",
-                            "value": { "id": "Q1571929" }
-                        }
-                    }
-                }],
-                "P31": [{
-                    "mainsnak": {
-                        "snaktype": "value",
-                        "datavalue": {
-                            "type": "wikibase-entityid",
-                            "value": { "id": "Q16970" }
-                        }
-                    }
-                }]
-            }
-        });
+        let entity = entity_with_claims(HashMap::from([
+            (property_id("P366")?, vec![entity_id_claim("Q1571929")?]),
+            (property_id("P31")?, vec![entity_id_claim("Q16970")?]),
+        ]))?;
         let result = infer(&entity);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&Usage::Transportation));
@@ -285,19 +259,10 @@ mod tests {
 
     #[test]
     fn infer_unknown_when_no_match() -> TestResult {
-        let entity = json!({
-            "claims": {
-                "P366": [{
-                    "mainsnak": {
-                        "snaktype": "value",
-                        "datavalue": {
-                            "type": "wikibase-entityid",
-                            "value": { "id": "Q999999999" }
-                        }
-                    }
-                }]
-            }
-        });
+        let entity = entity_with_claims(HashMap::from([(
+            property_id("P366")?,
+            vec![entity_id_claim("Q999999999")?],
+        )]))?;
         let result = infer(&entity);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&Usage::Unknown));
@@ -306,7 +271,7 @@ mod tests {
 
     #[test]
     fn infer_unknown_when_no_claims() -> TestResult {
-        let entity = json!({});
+        let entity = entity_with_claims(HashMap::new())?;
         let result = infer(&entity);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&Usage::Unknown));
@@ -327,19 +292,10 @@ mod tests {
             ("Q12280", Usage::Infrastructure),
         ];
         for (qid, expected_usage) in test_cases {
-            let entity = json!({
-                "claims": {
-                    "P366": [{
-                        "mainsnak": {
-                            "snaktype": "value",
-                            "datavalue": {
-                                "type": "wikibase-entityid",
-                                "value": { "id": qid }
-                            }
-                        }
-                    }]
-                }
-            });
+            let entity = entity_with_claims(HashMap::from([(
+                property_id("P366")?,
+                vec![entity_id_claim(qid)?],
+            )]))?;
             let result = infer(&entity);
             assert!(
                 result.contains(&expected_usage),
@@ -364,19 +320,10 @@ mod tests {
             ("Q12280", Usage::Infrastructure),
         ];
         for (qid, expected_usage) in test_cases {
-            let entity = json!({
-                "claims": {
-                    "P31": [{
-                        "mainsnak": {
-                            "snaktype": "value",
-                            "datavalue": {
-                                "type": "wikibase-entityid",
-                                "value": { "id": qid }
-                            }
-                        }
-                    }]
-                }
-            });
+            let entity = entity_with_claims(HashMap::from([(
+                property_id("P31")?,
+                vec![entity_id_claim(qid)?],
+            )]))?;
             let result = infer(&entity);
             assert!(
                 result.contains(&expected_usage),

@@ -14,6 +14,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
+pub use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue};
 use reqwest::{Method, StatusCode};
 use url::Url;
 
@@ -276,11 +277,7 @@ impl HttpRequest {
 
     /// Add a header to the request.
     #[must_use]
-    pub fn header(
-        mut self,
-        name: impl Into<reqwest::header::HeaderName>,
-        value: impl Into<reqwest::header::HeaderValue>,
-    ) -> Self {
+    pub fn header(mut self, name: impl Into<HeaderName>, value: impl Into<HeaderValue>) -> Self {
         self.headers.insert(name.into(), value.into());
         self
     }
@@ -288,10 +285,8 @@ impl HttpRequest {
     /// Set a JSON body, automatically adding the Content-Type header.
     #[must_use]
     pub fn json_body(mut self, body: impl Into<Bytes>) -> Self {
-        self.headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            reqwest::header::HeaderValue::from_static("application/json"),
-        );
+        self.headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         self.body = Some(body.into());
         self
     }
@@ -409,8 +404,9 @@ impl Default for ReqwestConfig {
         Self {
             timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
-            // Reddit blocks generic user agents; use a descriptive one
-            user_agent: "Chronoscope/0.1 (historical research tool)".to_string(),
+            // Wikimedia requires descriptive user-agents for bots; Reddit
+            // blocks generic ones. One string for the whole project.
+            user_agent: "ChronoscopeBot/1.0 (historical research tool)".to_string(),
             max_redirects: 10,
             // TODO: Split into separate limits for images (conservative, ~10MB) and video
             // (larger, ~100MB+). Currently using a single limit that accommodates video.
@@ -510,7 +506,7 @@ pub struct CachingClient {
 }
 
 impl CachingClient {
-    /// Create a new caching client.
+    /// Create a new caching client with default HTTP configuration.
     ///
     /// # Errors
     /// Returns an error if the inner client cannot be created.

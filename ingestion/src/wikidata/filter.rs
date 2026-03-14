@@ -3,17 +3,19 @@
 //! Filters a Wikidata JSON dump for entities that are instances of
 //! architectural structures (transitively via P31).
 
-use anyhow::{Context, Result};
-use futures::StreamExt;
-use futures::stream::Stream;
-use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use anyhow::{Context, Result};
+use chronoscope_integrations::http::HttpClient;
+use chronoscope_integrations::wikidata::{WikidataClient, WikidataId};
+use futures::StreamExt;
+use futures::stream::Stream;
+use serde_json::Value;
+
 use crate::wikidata::stream::{is_instance_of, open_compressed, wikidata_entities};
-use crate::wikidata::types::fetch_architectural_types;
 
 /// Statistics from a filter run.
 #[derive(Debug, Default)]
@@ -29,6 +31,57 @@ const PROGRESS_INTERVAL: u64 = 1_000_000;
 /// Buffer size for output file.
 const OUTPUT_BUFFER_SIZE: usize = 1024 * 1024;
 
+/// Fetch architectural structure types from Wikidata SPARQL.
+///
+/// Fetches all transitive subclasses of `Q811979` (architectural structure),
+/// then subtracts excluded hierarchies (elements, metaclasses, etc.).
+///
+/// # Errors
+/// Returns an error if any SPARQL query fails.
+pub async fn fetch_architectural_types<H: HttpClient>(
+    client: &WikidataClient<H>,
+) -> Result<HashSet<WikidataId>> {
+    let qid = |s: &str| -> Result<WikidataId> {
+        WikidataId::try_from(s.to_string()).map_err(|e| anyhow::anyhow!("{e}"))
+    };
+
+    let architectural_structure_type = qid("Q811979")?;
+
+    let exclude_root_types = [
+        qid("Q391414")?,   // architectural element
+        qid("Q2996394")?,  // architectural structure type (metaclass)
+        qid("Q811909")?,   // building part
+        qid("Q19953632")?, // building component
+        qid("Q702492")?,   // urban area (cities, towns, etc.)
+        // Q254978 (burgh) is a Scottish administrative unit erroneously classified as
+        // a subclass of fortification in Wikidata. We exclude it specifically because
+        // we can't exclude its parent (fortification) without losing real buildings.
+        qid("Q254978")?, // burgh (Scottish town type, not a building)
+    ];
+
+    let mut types: HashSet<WikidataId> = client
+        .fetch_subclasses(&architectural_structure_type)
+        .await
+        .context("Failed to fetch architectural structure subclasses")?;
+
+    // Subtract excluded hierarchies (fetched concurrently)
+    let exclude_futures: Vec<_> = exclude_root_types
+        .iter()
+        .map(|t| client.fetch_subclasses(t))
+        .collect();
+    let exclude_results = futures::future::try_join_all(exclude_futures)
+        .await
+        .context("Failed to fetch exclusion types")?;
+
+    for exclude_set in exclude_results {
+        for t in &exclude_set {
+            types.remove(t.as_str());
+        }
+    }
+
+    Ok(types)
+}
+
 /// Filter a Wikidata dump to extract architectural entities.
 ///
 /// Writes matching entities as JSONL to the output path.
@@ -37,7 +90,8 @@ const OUTPUT_BUFFER_SIZE: usize = 1024 * 1024;
 /// # Errors
 /// Returns an error if the input file cannot be read, SPARQL query fails,
 /// or the output file cannot be written.
-pub async fn filter_dump(
+pub async fn filter_dump<H: HttpClient>(
+    client: &WikidataClient<H>,
     input_path: &Path,
     output_path: &Path,
     limit: Option<u64>,
@@ -47,7 +101,9 @@ pub async fn filter_dump(
     if verbose {
         eprintln!("Fetching architectural structure types from Wikidata SPARQL...");
     }
-    let target_types = fetch_architectural_types(verbose).await?;
+    let target_types = fetch_architectural_types(client)
+        .await
+        .context("Failed to fetch architectural types")?;
     if verbose {
         eprintln!("  Found {} types to match", target_types.len());
         eprintln!("Opening {}...", input_path.display());
@@ -87,7 +143,7 @@ pub async fn filter_dump(
 /// Process a stream of entities, filtering and writing matches.
 async fn process_entities<S>(
     entities: S,
-    target_types: &HashSet<String>,
+    target_types: &HashSet<WikidataId>,
     writer: &mut BufWriter<File>,
     verbose: bool,
 ) -> Result<FilterStats>

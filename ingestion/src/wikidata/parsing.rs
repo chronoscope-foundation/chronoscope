@@ -1,139 +1,21 @@
 //! Wikidata JSON parsing utilities.
 //!
 //! Functions for extracting data from Wikidata entity JSON structures.
+//! Some functions operate on raw `serde_json::Value` (for dump filtering),
+//! while others use the typed [`WikidataEntity`] model.
 
 use chrono::NaiveDate;
 use chronoscope_core::{
     Cited, DatePrecision, EntityName, Evidence, ExternalLink, LinkTarget, LinkType, NameType,
     UncertainDate, WikidataEntityId, WikidataPropertyId,
 };
+use chronoscope_integrations::wikidata::{DataValue, Snak, WikidataEntity, WikidataPrecision};
 use oxilangtag::LanguageTag;
-use serde_json::Value;
 
-/// Wikidata time precision values.
-///
-/// See <https://www.wikidata.org/wiki/Help:Dates#Precision>
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WikidataPrecision {
-    BillionYears = 0,
-    HundredMillionYears = 1,
-    TenMillionYears = 2,
-    MillionYears = 3,
-    HundredThousandYears = 4,
-    TenThousandYears = 5,
-    Millennium = 6,
-    Century = 7,
-    Decade = 8,
-    Year = 9,
-    Month = 10,
-    Day = 11,
-}
-
-impl WikidataPrecision {
-    /// Convert from Wikidata's numeric precision value.
-    ///
-    /// Returns `None` for unknown precision values (12+). Wikidata only supports
-    /// precisions 0-11 in practice; values 12-14 (hour/minute/second) are defined
-    /// but not actually usable on wikidata.org.
-    #[must_use]
-    pub fn from_u64(value: u64) -> Option<Self> {
-        match value {
-            0 => Some(Self::BillionYears),
-            1 => Some(Self::HundredMillionYears),
-            2 => Some(Self::TenMillionYears),
-            3 => Some(Self::MillionYears),
-            4 => Some(Self::HundredThousandYears),
-            5 => Some(Self::TenThousandYears),
-            6 => Some(Self::Millennium),
-            7 => Some(Self::Century),
-            8 => Some(Self::Decade),
-            9 => Some(Self::Year),
-            10 => Some(Self::Month),
-            11 => Some(Self::Day),
-            _ => None,
-        }
-    }
-}
-
-/// Check if a claim has a special snaktype (novalue/somevalue) instead of actual data.
-///
-/// Wikidata uses "novalue" for explicitly absent values and "somevalue" for
-/// values known to exist but whose content is unknown.
-pub fn is_special_snaktype(claim: &Value) -> bool {
-    claim
-        .get("mainsnak")
-        .and_then(|m| m.get("snaktype"))
-        .and_then(|s| s.as_str())
-        .is_some_and(|t| t == "novalue" || t == "somevalue")
-}
-
-/// Get the inner value from a datavalue wrapper.
-///
-/// Wikidata wraps values in `{ "datavalue": { "value": ... } }`.
-/// This extracts the inner value. Used for qualifiers and snaks.
-pub fn get_datavalue(container: &Value) -> Option<&Value> {
-    container.get("datavalue").and_then(|d| d.get("value"))
-}
-
-/// Get the mainsnak value from a claim.
-///
-/// Claims have structure `{ "mainsnak": { "datavalue": { "value": ... } } }`.
-pub fn get_claim_value(claim: &Value) -> Option<&Value> {
-    claim.get("mainsnak").and_then(get_datavalue)
-}
-
-/// Get a string value from a claim's mainsnak.
-pub fn get_claim_str(claim: &Value) -> Option<&str> {
-    get_claim_value(claim).and_then(|v| v.as_str())
-}
-
-/// Get a Q-ID reference from a claim's mainsnak (for wikibase-entityid type).
-pub fn get_claim_qid(claim: &Value) -> Option<&str> {
-    get_claim_value(claim)
-        .and_then(|v| v.get("id"))
-        .and_then(|i| i.as_str())
-}
-
-/// Get claims array for a property.
-pub fn get_claims<'a>(wd: &'a Value, property: &str) -> Option<&'a Vec<Value>> {
-    wd.get("claims")
-        .and_then(|c| c.get(property))
-        .and_then(|p| p.as_array())
-}
-
-/// Extract time from a qualifier value.
-pub fn extract_time_from_qualifier(qualifier: &Value) -> Option<(UncertainDate, String)> {
-    let value = get_datavalue(qualifier)?;
-    let time_str = value.get("time").and_then(|t| t.as_str())?;
-    let precision = value
-        .get("precision")
-        .and_then(|p| p.as_u64())
-        .and_then(WikidataPrecision::from_u64)?;
-    let date = parse_wikidata_time(time_str, precision)?;
-    Some((date, time_str.to_string()))
-}
-
-/// Extract time from top-level claims array.
-pub fn extract_time_from_claims(claims: &[Value]) -> Option<(UncertainDate, String)> {
-    let claim = claims.first()?;
-    let value = get_claim_value(claim)?;
-    let time_str = value.get("time").and_then(|t| t.as_str())?;
-    let precision = value
-        .get("precision")
-        .and_then(|p| p.as_u64())
-        .and_then(WikidataPrecision::from_u64)?;
-    let date = parse_wikidata_time(time_str, precision)?;
-    Some((date, time_str.to_string()))
-}
-
-/// Extract all date values for a specific qualifier property (P580, P582, or P585).
-pub fn extract_qualifier_dates(claim: &Value, property: &str) -> Vec<(UncertainDate, String)> {
-    claim
-        .get("qualifiers")
-        .and_then(|q| q.get(property))
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(extract_time_from_qualifier).collect())
-        .unwrap_or_default()
+/// Build an `UncertainDate` at year granularity or coarser.
+fn coarse_date(year: i32, precision: DatePrecision) -> Option<UncertainDate> {
+    let datetime = NaiveDate::from_ymd_opt(year, 1, 1)?.and_hms_opt(0, 0, 0)?;
+    UncertainDate::with_precision(datetime, precision).ok()
 }
 
 /// Parse Wikidata time format to `UncertainDate`.
@@ -165,82 +47,64 @@ pub fn parse_wikidata_time(time_str: &str, precision: WikidataPrecision) -> Opti
             let datetime = NaiveDate::from_ymd_opt(year, month, 1)?.and_hms_opt(0, 0, 0)?;
             UncertainDate::with_precision(datetime, DatePrecision::Month).ok()
         }
-        WikidataPrecision::Year
-        | WikidataPrecision::Decade
-        | WikidataPrecision::Century
-        | WikidataPrecision::Millennium => {
-            let date_precision = match precision {
-                WikidataPrecision::Year => DatePrecision::Year,
-                WikidataPrecision::Decade => DatePrecision::Decade,
-                WikidataPrecision::Century => DatePrecision::Century,
-                WikidataPrecision::Millennium => DatePrecision::Millennium,
-                _ => return None,
-            };
-            let datetime = NaiveDate::from_ymd_opt(year, 1, 1)?.and_hms_opt(0, 0, 0)?;
-            UncertainDate::with_precision(datetime, date_precision).ok()
-        }
+        WikidataPrecision::Year => coarse_date(year, DatePrecision::Year),
+        WikidataPrecision::Decade => coarse_date(year, DatePrecision::Decade),
+        WikidataPrecision::Century => coarse_date(year, DatePrecision::Century),
+        WikidataPrecision::Millennium => coarse_date(year, DatePrecision::Millennium),
         // Precisions coarser than millennium not supported
         _ => None,
     }
 }
 
 /// Extract names from labels and P1448 (official name).
-pub fn extract_names(wd: &Value, wikidata_id: &str, revision_id: u64) -> Vec<Cited<EntityName>> {
+pub fn extract_names(
+    wd: &WikidataEntity,
+    wikidata_id: &str,
+    revision_id: u64,
+) -> Vec<Cited<EntityName>> {
     let mut names = Vec::new();
 
-    if let Some(labels) = wd.get("labels").and_then(|l| l.as_object()) {
-        for (lang, label_obj) in labels {
-            if let Some(value) = label_obj.get("value").and_then(|v| v.as_str())
-                && let Ok(language_tag) = LanguageTag::parse(lang.clone())
+    for (lang, label) in &wd.labels {
+        if let Ok(language_tag) = LanguageTag::parse(lang.0.clone()) {
+            names.push(Cited::new(
+                EntityName {
+                    name: label.value.clone(),
+                    name_type: NameType::Common,
+                    language: language_tag,
+                    valid_from: None,
+                    valid_to: None,
+                },
+                vec![Evidence::Wikidata {
+                    entity_id: WikidataEntityId(wikidata_id.to_string()),
+                    property_id: WikidataPropertyId("label".to_string()),
+                    property_value: format!("{}:{}", lang, label.value),
+                    revision_id,
+                }],
+            ));
+        }
+    }
+
+    // P1448 (official name)
+    if let Some(claims) = wd.claims.get("P1448") {
+        for claim in claims {
+            if let Snak::Value(DataValue::MonolingualText(mono)) = &claim.mainsnak
+                && let Ok(language_tag) = LanguageTag::parse(mono.language.0.clone())
             {
                 names.push(Cited::new(
                     EntityName {
-                        name: value.to_string(),
-                        name_type: NameType::Common,
+                        name: mono.text.clone(),
+                        name_type: NameType::Official,
                         language: language_tag,
                         valid_from: None,
                         valid_to: None,
                     },
                     vec![Evidence::Wikidata {
                         entity_id: WikidataEntityId(wikidata_id.to_string()),
-                        property_id: WikidataPropertyId("label".to_string()),
-                        property_value: format!("{}:{}", lang, value),
+                        property_id: WikidataPropertyId("P1448".to_string()),
+                        property_value: format!("{}:{}", mono.language, mono.text),
                         revision_id,
                     }],
                 ));
-            }
-        }
-    }
-
-    // P1448 (official name)
-    if let Some(claims) = get_claims(wd, "P1448") {
-        for claim in claims {
-            if let Some(value) = get_claim_value(claim) {
-                let Some(text) = value.get("text").and_then(|t| t.as_str()) else {
-                    continue;
-                };
-                let lang = value
-                    .get("language")
-                    .and_then(|l| l.as_str())
-                    .unwrap_or("und");
-
-                if let Ok(language_tag) = LanguageTag::parse(lang.to_string()) {
-                    names.push(Cited::new(
-                        EntityName {
-                            name: text.to_string(),
-                            name_type: NameType::Official,
-                            language: language_tag,
-                            valid_from: None,
-                            valid_to: None,
-                        },
-                        vec![Evidence::Wikidata {
-                            entity_id: WikidataEntityId(wikidata_id.to_string()),
-                            property_id: WikidataPropertyId("P1448".to_string()),
-                            property_value: format!("{}:{}", lang, text),
-                            revision_id,
-                        }],
-                    ));
-                }
             }
         }
     }
@@ -288,8 +152,17 @@ pub fn parse_sitelink(site: &str, title: &str) -> Option<ExternalLink> {
 mod tests {
     use super::*;
     use chrono::{Datelike, NaiveDateTime};
+    use chronoscope_integrations::wikidata::{
+        Claim, Label, LanguageCode, MonolingualTextValue, PropertyId, Rank, RevisionId, Snak,
+        WikidataEntityType, WikidataId,
+    };
+    use std::collections::HashMap;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn wikidata_id(s: &str) -> Result<WikidataId, String> {
+        WikidataId::try_from(s.to_string())
+    }
 
     fn midnight(y: i32, m: u32, d: u32) -> Option<NaiveDateTime> {
         NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(0, 0, 0)
@@ -417,6 +290,124 @@ mod tests {
         let date =
             parse_wikidata_time("+1920-01-01T00:00:00Z", WikidataPrecision::TenThousandYears);
         assert!(date.is_none());
+    }
+
+    #[test]
+    fn test_parse_unknown_precision_is_deser_error() {
+        // Unknown precision values (e.g., 14) now error at deserialization rather
+        // than being silently accepted. Verify the TryFrom<u64> rejects them.
+        let result = WikidataPrecision::try_from(14u64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_year_zero_returns_none() {
+        // Wikidata uses astronomical year numbering where year 0 = 1 BCE.
+        // chrono uses proleptic Gregorian where year 0 doesn't exist
+        // (year -1 = 1 BCE, year 1 = 1 CE). So "+0000" parses to
+        // chrono year 0 which chrono rejects.
+        let date = parse_wikidata_time("+0000-01-01T00:00:00Z", WikidataPrecision::Year);
+        assert!(
+            date.is_none(),
+            "year 0 is not representable in chrono's proleptic Gregorian"
+        );
+    }
+
+    #[test]
+    fn test_parse_february_leap_year_boundary() -> TestResult {
+        // Feb 29 on a leap year should parse at day precision
+        let date = parse_wikidata_time("+2000-02-29T00:00:00Z", WikidataPrecision::Day)
+            .ok_or("should parse Feb 29 in leap year")?;
+        assert_eq!(date.earliest(), midnight(2000, 2, 29).ok_or("invalid")?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_february_non_leap_year() {
+        // Feb 29 on a non-leap year should return None
+        let date = parse_wikidata_time("+1900-02-29T00:00:00Z", WikidataPrecision::Day);
+        assert!(date.is_none(), "Feb 29 in non-leap year should fail");
+    }
+
+    #[test]
+    fn test_parse_month_february_last_day() -> TestResult {
+        // Month precision in February should end on the 28th (or 29th in leap year)
+        let date = parse_wikidata_time("+2001-02-01T00:00:00Z", WikidataPrecision::Month)
+            .ok_or("should parse")?;
+        assert_eq!(
+            date.latest(),
+            NaiveDate::from_ymd_opt(2001, 2, 28)
+                .ok_or("invalid date")?
+                .and_hms_opt(23, 59, 59)
+                .ok_or("invalid time")?
+        );
+        Ok(())
+    }
+
+    // =============================================================================
+    // extract_names Unit Tests
+    // =============================================================================
+
+    #[test]
+    fn test_extract_names_from_labels() -> TestResult {
+        let entity = WikidataEntity {
+            id: wikidata_id("Q243")?,
+            entity_type: WikidataEntityType::Item,
+            lastrevid: RevisionId(100),
+            labels: HashMap::from([
+                (
+                    LanguageCode("en".to_string()),
+                    Label {
+                        language: LanguageCode("en".to_string()),
+                        value: "Eiffel Tower".to_string(),
+                    },
+                ),
+                (
+                    LanguageCode("fr".to_string()),
+                    Label {
+                        language: LanguageCode("fr".to_string()),
+                        value: "Tour Eiffel".to_string(),
+                    },
+                ),
+            ]),
+            claims: HashMap::new(),
+            sitelinks: HashMap::new(),
+        };
+
+        let names = extract_names(&entity, "Q243", 100);
+        assert_eq!(names.len(), 2);
+        let name_values: Vec<&str> = names.iter().map(|n| n.value.name.as_str()).collect();
+        assert!(name_values.contains(&"Eiffel Tower"));
+        assert!(name_values.contains(&"Tour Eiffel"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_names_p1448_official() -> TestResult {
+        let entity = WikidataEntity {
+            id: wikidata_id("Q243")?,
+            entity_type: WikidataEntityType::Item,
+            lastrevid: RevisionId(100),
+            labels: HashMap::new(),
+            claims: HashMap::from([(
+                PropertyId::try_from("P1448".to_string())?,
+                vec![Claim {
+                    mainsnak: Snak::Value(DataValue::MonolingualText(MonolingualTextValue {
+                        text: "Tour Eiffel".to_string(),
+                        language: LanguageCode("fr".to_string()),
+                    })),
+                    qualifiers: HashMap::new(),
+                    rank: Rank::Normal,
+                }],
+            )]),
+            sitelinks: HashMap::new(),
+        };
+
+        let names = extract_names(&entity, "Q243", 100);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].value.name, "Tour Eiffel");
+        assert_eq!(names[0].value.name_type, NameType::Official);
+        Ok(())
     }
 
     // =============================================================================

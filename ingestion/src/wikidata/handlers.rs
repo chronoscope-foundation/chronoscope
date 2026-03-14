@@ -11,12 +11,10 @@ use anyhow::Result;
 use chronoscope_core::{
     AnnotationKind, ExternalLink, ImageSource, LinkTarget, LinkType, OsmElementType, OsmId,
 };
-use serde_json::Value;
+use chronoscope_integrations::wikidata::{Claim, CommonsFilename, url_for_filename};
 use url::Url;
 
-use crate::wikidata::commons::url_for_filename;
 use crate::wikidata::ingest::{HandlerOutput, PropertyContext};
-use crate::wikidata::parsing::{get_claim_str, is_special_snaktype};
 
 // =============================================================================
 // CONSTANTS
@@ -34,7 +32,7 @@ const MAX_URL_LENGTH: usize = 2048;
 /// and return what they want to add. Issues are automatically tagged with
 /// the property by the caller.
 pub type PropertyHandler =
-    Box<dyn Fn(&[Value], &PropertyContext<'_>) -> Result<HandlerOutput> + Send + Sync>;
+    Box<dyn Fn(&[Claim], &PropertyContext<'_>) -> Result<HandlerOutput> + Send + Sync>;
 
 // =============================================================================
 // PROPERTY HANDLER REGISTRY
@@ -47,7 +45,7 @@ pub type PropertyHandler =
 pub static PROPERTY_HANDLERS: LazyLock<HashMap<&'static str, PropertyHandler>> =
     LazyLock::new(|| {
         // Wrapper for infallible handlers
-        let h = |f: fn(&[Value], &PropertyContext<'_>) -> HandlerOutput| -> PropertyHandler {
+        let h = |f: fn(&[Claim], &PropertyContext<'_>) -> HandlerOutput| -> PropertyHandler {
             Box::new(move |claims, ctx| Ok(f(claims, ctx)))
         };
         HashMap::from([
@@ -82,23 +80,21 @@ fn image(annotation_kind: AnnotationKind) -> PropertyHandler {
         let mut out = HandlerOutput::new();
         for claim in claims {
             // Skip claims with explicit "no value" or "unknown value"
-            if is_special_snaktype(claim) {
+            if claim.mainsnak.is_special() {
                 continue;
             }
-            match get_claim_str(claim) {
-                Some(filename) => match url_for_filename(filename) {
-                    Ok(url) => {
-                        out.add_image(
-                            ImageSource {
-                                url,
-                                date: None,
-                                location: None,
-                            },
-                            annotation_kind.clone(),
-                        );
-                    }
-                    Err(e) => out.issue(format!("invalid Commons URL for '{filename}': {e}")),
-                },
+            match claim.mainsnak.string_value() {
+                Some(filename) => {
+                    let url = url_for_filename(&CommonsFilename(filename.to_string()));
+                    out.add_image(
+                        ImageSource {
+                            url,
+                            date: None,
+                            location: None,
+                        },
+                        annotation_kind.clone(),
+                    );
+                }
                 None => out.issue("claim has no string value"),
             }
         }
@@ -110,7 +106,7 @@ fn url_link(link_type: LinkType) -> PropertyHandler {
     Box::new(move |claims, _ctx| {
         let mut out = HandlerOutput::new();
         for claim in claims {
-            if let Some(url_str) = get_claim_str(claim) {
+            if let Some(url_str) = claim.mainsnak.string_value() {
                 if url_str.len() > MAX_URL_LENGTH {
                     out.issue(format!("URL too long ({} chars)", url_str.len()));
                     continue;
@@ -141,10 +137,10 @@ fn url_link(link_type: LinkType) -> PropertyHandler {
 // CUSTOM HANDLERS
 // =============================================================================
 
-fn handle_osm_relation(claims: &[Value], _ctx: &PropertyContext<'_>) -> HandlerOutput {
+fn handle_osm_relation(claims: &[Claim], _ctx: &PropertyContext<'_>) -> HandlerOutput {
     let mut out = HandlerOutput::new();
     for claim in claims {
-        match get_claim_str(claim) {
+        match claim.mainsnak.string_value() {
             Some(id_str) => match id_str.parse::<i64>() {
                 Ok(element_id) => {
                     out.add_link(ExternalLink {
@@ -163,10 +159,10 @@ fn handle_osm_relation(claims: &[Value], _ctx: &PropertyContext<'_>) -> HandlerO
     out
 }
 
-fn handle_pleiades(claims: &[Value], _ctx: &PropertyContext<'_>) -> HandlerOutput {
+fn handle_pleiades(claims: &[Claim], _ctx: &PropertyContext<'_>) -> HandlerOutput {
     let mut out = HandlerOutput::new();
     for claim in claims {
-        match get_claim_str(claim) {
+        match claim.mainsnak.string_value() {
             Some(place_id) => {
                 out.add_link(ExternalLink {
                     target: LinkTarget::Pleiades {
@@ -184,7 +180,9 @@ fn handle_pleiades(claims: &[Value], _ctx: &PropertyContext<'_>) -> HandlerOutpu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use chronoscope_integrations::wikidata::{
+        DataValue, QuantityAmount, QuantityUnit, QuantityValue, Snak, WikidataId,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -192,57 +190,23 @@ mod tests {
         PropertyContext::new("Q12345", 100, "P18")
     }
 
-    fn claim_with_string(value: &str) -> Value {
-        json!({
-            "mainsnak": {
-                "snaktype": "value",
-                "datavalue": {
-                    "type": "string",
-                    "value": value
-                }
-            }
-        })
+    fn claim_with_string(value: &str) -> Claim {
+        Claim::simple(Snak::Value(DataValue::String(value.to_string())))
     }
 
-    fn claim_novalue() -> Value {
-        json!({
-            "mainsnak": {
-                "snaktype": "novalue"
-            }
-        })
+    fn claim_novalue() -> Claim {
+        Claim::simple(Snak::NoValue)
     }
 
-    fn claim_somevalue() -> Value {
-        json!({
-            "mainsnak": {
-                "snaktype": "somevalue"
-            }
-        })
+    fn claim_somevalue() -> Claim {
+        Claim::simple(Snak::SomeValue)
     }
 
-    // =========================================================================
-    // is_special_snaktype (shared from parsing module)
-    // =========================================================================
-
-    #[test]
-    fn special_snaktype_novalue() -> TestResult {
-        use crate::wikidata::parsing::is_special_snaktype;
-        assert!(is_special_snaktype(&claim_novalue()));
-        Ok(())
-    }
-
-    #[test]
-    fn special_snaktype_somevalue() -> TestResult {
-        use crate::wikidata::parsing::is_special_snaktype;
-        assert!(is_special_snaktype(&claim_somevalue()));
-        Ok(())
-    }
-
-    #[test]
-    fn special_snaktype_normal_value() -> TestResult {
-        use crate::wikidata::parsing::is_special_snaktype;
-        assert!(!is_special_snaktype(&claim_with_string("test")));
-        Ok(())
+    fn claim_non_string() -> Claim {
+        Claim::simple(Snak::Value(DataValue::Quantity(QuantityValue {
+            amount: QuantityAmount("1".to_string()),
+            unit: QuantityUnit::Dimensionless,
+        })))
     }
 
     // =========================================================================
@@ -324,16 +288,12 @@ mod tests {
     }
 
     #[test]
-    fn image_handler_no_string_value_issues() -> TestResult {
+    fn image_handler_non_string_value_issues() -> TestResult {
         let handler = PROPERTY_HANDLERS
             .get("P18")
             .ok_or("P18 handler not found")?;
-        // A normal snaktype but missing datavalue
-        let claims = vec![json!({
-            "mainsnak": {
-                "snaktype": "value"
-            }
-        })];
+        // A value snak but with a non-string DataValue (e.g., Quantity)
+        let claims = vec![claim_non_string()];
         let ctx = test_ctx();
         let output = handler(&claims, &ctx)?;
 
@@ -425,6 +385,24 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn url_link_handler_exactly_at_max_length() -> TestResult {
+        let handler = PROPERTY_HANDLERS
+            .get("P856")
+            .ok_or("P856 handler not found")?;
+        // URL exactly at MAX_URL_LENGTH should be accepted
+        let padding = MAX_URL_LENGTH - "https://example.com/".len();
+        let url = format!("https://example.com/{}", "x".repeat(padding));
+        assert_eq!(url.len(), MAX_URL_LENGTH);
+        let claims = vec![claim_with_string(&url)];
+        let ctx = test_ctx();
+        let output = handler(&claims, &ctx)?;
+
+        assert_eq!(output.links.len(), 1);
+        assert!(output.issues.is_empty());
+        Ok(())
+    }
+
     // =========================================================================
     // OSM handler (P402)
     // =========================================================================
@@ -466,15 +444,11 @@ mod tests {
     }
 
     #[test]
-    fn osm_handler_no_value() -> TestResult {
+    fn osm_handler_non_string_value() -> TestResult {
         let handler = PROPERTY_HANDLERS
             .get("P402")
             .ok_or("P402 handler not found")?;
-        let claims = vec![json!({
-            "mainsnak": {
-                "snaktype": "value"
-            }
-        })];
+        let claims = vec![claim_non_string()];
         let ctx = test_ctx();
         let output = handler(&claims, &ctx)?;
 
@@ -506,15 +480,11 @@ mod tests {
     }
 
     #[test]
-    fn pleiades_handler_no_value() -> TestResult {
+    fn pleiades_handler_non_string_value() -> TestResult {
         let handler = PROPERTY_HANDLERS
             .get("P1584")
             .ok_or("P1584 handler not found")?;
-        let claims = vec![json!({
-            "mainsnak": {
-                "snaktype": "value"
-            }
-        })];
+        let claims = vec![claim_non_string()];
         let ctx = test_ctx();
         let output = handler(&claims, &ctx)?;
 
@@ -524,52 +494,17 @@ mod tests {
     }
 
     // =========================================================================
-    // HandlerOutput and entity_accumulator
+    // entity_accumulator
     // =========================================================================
-
-    #[test]
-    fn handler_output_add_methods() -> TestResult {
-        let mut out = HandlerOutput::new();
-        out.add_transition(chronoscope_core::EntityTransition::Constructed {
-            started_at: None,
-            completed_at: None,
-            location: None,
-            trigger_event: None,
-        });
-        out.add_image(
-            ImageSource {
-                url: url::Url::parse("https://example.com/img.jpg")?,
-                date: None,
-                location: None,
-            },
-            AnnotationKind::ExteriorView { region: None },
-        );
-        out.add_link(ExternalLink {
-            target: LinkTarget::Pleiades {
-                place_id: "test".to_string(),
-            },
-            link_type: LinkType::SameAs,
-        });
-        out.issue("test issue");
-
-        assert_eq!(out.transitions.len(), 1);
-        assert_eq!(out.images.len(), 1);
-        assert_eq!(out.links.len(), 1);
-        assert_eq!(out.issues.len(), 1);
-        Ok(())
-    }
 
     #[test]
     fn entity_accumulator_lifecycle() -> TestResult {
         use crate::wikidata::ingest::EntityAccumulator;
-        use chronoscope_core::{Entity, EntityType};
+        use chronoscope_core::EntityType;
 
-        let entity = Entity {
-            entity_type: EntityType::Building,
-            names: vec![],
-            transitions: vec![],
-        };
-        let mut acc = EntityAccumulator::new(0, "Q100".to_string(), 42, entity);
+        let wid = WikidataId::try_from("Q100".to_string())?;
+        use chronoscope_integrations::wikidata::RevisionId;
+        let mut acc = EntityAccumulator::new(0, wid, RevisionId(42), EntityType::Building);
         assert_eq!(acc.wikidata_id(), "Q100");
 
         // Add image
@@ -604,9 +539,9 @@ mod tests {
         acc.merge_output("P856", output);
 
         // Convert to result
-        let result = acc.into_result();
+        let result = acc.into_result(vec![]);
         assert_eq!(result.wikidata_id, "Q100");
-        assert_eq!(result.revision_id, 42);
+        assert_eq!(result.revision_id, RevisionId(42));
         assert_eq!(result.images.len(), 1);
         assert_eq!(result.links.len(), 1);
         assert_eq!(result.annotations.len(), 1);

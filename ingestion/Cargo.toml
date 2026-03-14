@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 chronoscope-core = { path = "../core" }
+chronoscope-integrations = { path = "../integrations" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
@@ -19,26 +20,22 @@ async-compression = { version = "0.4", features = ["tokio", "gzip", "bzip2"] }
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 
+# Geospatial math (coordinate precision conversion)
+geo = "0.29"
+
 # CLI utilities
 anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
 
-# HTTP client (async) with middleware support
-reqwest = { version = "0.12", features = ["json", "stream"] }
-reqwest-middleware = "0.4"
-reqwest-retry = "0.8"
+# Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs"] }
-
-# XML parsing for SPARQL results
-quick-xml = "0.38"
-
-# MD5 hashing for Wikimedia Commons URLs
-md-5 = "0.10"
-
-# URL encoding
-urlencoding = "2.1"
 
 [dev-dependencies]
 proptest = "1.4"
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "ingest"
+path = "src/bin/ingest.rs"

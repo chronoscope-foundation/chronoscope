@@ -799,7 +799,7 @@ mod tests {
         }
 
         let report = analyze(&output);
-        // 3 images → "2-5" bucket
+        // 3 images -> "2-5" bucket
         assert_eq!(report.distributions.images_per_entity.get("2-5"), Some(&1));
         Ok(())
     }

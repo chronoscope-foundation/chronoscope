@@ -8,6 +8,7 @@ doc-valid-idents = [
     "EdDSA",
     "IPv4",
     "IPv6",
+    "MediaWiki",
     "OpenAPI",
     "SQLite",
     "UUIDv7",

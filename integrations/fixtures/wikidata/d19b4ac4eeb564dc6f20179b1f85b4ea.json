@@ -1,0 +1,30 @@
+{
+  "url": "https://commons.wikimedia.org/w/api.php?action=query&titles=NonexistentGalleryPage12345&prop=revisions&rvprop=ids&rvstart=2022-01-03T00:00:00Z&rvdir=older&rvlimit=1&format=json",
+  "method": "GET",
+  "status": 200,
+  "headers": {
+    "x-content-type-options": "nosniff",
+    "content-disposition": "inline; filename=api-result.json",
+    "x-cache-status": "pass",
+    "x-cache": "cp4038 miss, cp4038 pass",
+    "strict-transport-security": "max-age=106384710; includeSubDomains; preload",
+    "date": "Tue, 10 Mar 2026 06:22:03 GMT",
+    "nel": "{ \"report_to\": \"wm_nel\", \"max_age\": 604800, \"failure_fraction\": 0.05, \"success_fraction\": 0.0}",
+    "vary": "Accept-Encoding,X-Subdomain,Treat-as-Untrusted,X-Forwarded-Proto,Cookie,Authorization,User-Agent",
+    "content-security-policy": "default-src 'self'; script-src 'none'; object-src 'none'",
+    "accept-ranges": "bytes",
+    "x-frame-options": "DENY",
+    "content-type": "application/json; charset=utf-8",
+    "server-timing": "cache;desc=\"pass\", host;desc=\"cp4038\"",
+    "age": "0",
+    "report-to": "{ \"group\": \"wm_nel\", \"max_age\": 604800, \"endpoints\": [{ \"url\": \"https://intake-logging.wikimedia.org/v1/events?stream=w3c.reportingapi.network_error&schema_uri=/w3c/reportingapi/network_error/1.0.0\" }] }",
+    "x-request-id": "4a8e1507-cd65-40cf-90c6-a33cde3a08a2",
+    "cache-control": "private, must-revalidate, max-age=0",
+    "set-cookie": "WMF-Uniq=_gIIleZzi-bCDT8qW_6tpQMfAAAAAFvdnDLy0CkZHwiDp_wDy-ALpxgu6kIz5dcO;Domain=commons.wikimedia.org;Path=/;HttpOnly;secure;SameSite=None;Expires=Wed, 10 Mar 2027 00:00:00 GMT",
+    "x-client-ip": "50.35.157.188",
+    "x-analytics": "",
+    "server": "mw-api-ext.codfw.main-56d85bc587-92c6n"
+  },
+  "body": "eyJiYXRjaGNvbXBsZXRlIjoiIiwicXVlcnkiOnsicGFnZXMiOnsiLTEiOnsibnMiOjAsInRpdGxlIjoiTm9uZXhpc3RlbnRHYWxsZXJ5UGFnZTEyMzQ1IiwibWlzc2luZyI6IiJ9fX19",
+  "final_url": "https://commons.wikimedia.org/w/api.php?action=query&titles=NonexistentGalleryPage12345&prop=revisions&rvprop=ids&rvstart=2022-01-03T00:00:00Z&rvdir=older&rvlimit=1&format=json"
+}

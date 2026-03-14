@@ -44,7 +44,7 @@ pub struct EntityName {
     pub valid_to: Option<UncertainDate>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum NameType {
     Official,

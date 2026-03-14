@@ -4,11 +4,13 @@
 //! from Wikidata properties. Handles entity splitting when demolish->rebuild patterns
 //! indicate a new entity.
 
+use std::collections::HashMap;
+
 use chrono::NaiveDateTime;
 use chronoscope_core::{
     Cited, DamageCause, EntityTransition, TriggerEventId, UncertainDate, UncertainLocation, Usage,
 };
-use serde_json::{Map, Value};
+use chronoscope_integrations::wikidata::{Claim, PropertyId};
 
 use crate::wikidata::ingest::PropertyContext;
 
@@ -18,139 +20,103 @@ use crate::wikidata::ingest::PropertyContext;
 
 mod extract {
     use chronoscope_core::{UncertainDate, UncertainLocation};
-    use serde_json::Value;
+    use chronoscope_integrations::wikidata::{Claim, DataValue, Snak};
 
-    use crate::wikidata::parsing::{
-        WikidataPrecision, get_claim_value, get_datavalue, is_special_snaktype, parse_wikidata_time,
-    };
+    use crate::wikidata::parsing::parse_wikidata_time;
 
     /// Extract time from claim's mainsnak. Returns (value, warnings).
-    pub fn mainsnak_time(claim: &Value) -> (Option<(UncertainDate, String)>, Vec<String>) {
+    pub fn mainsnak_time(claim: &Claim) -> (Option<(UncertainDate, String)>, Vec<String>) {
         let mut warnings = Vec::new();
 
-        if is_special_snaktype(claim) {
-            return (None, warnings);
-        }
-
-        let Some(value) = get_claim_value(claim) else {
-            return (None, warnings);
+        let time_val = match &claim.mainsnak {
+            Snak::Value(DataValue::Time(tv)) => tv,
+            Snak::NoValue | Snak::SomeValue => return (None, warnings),
+            Snak::Value(_) => {
+                warnings.push("expected time value but got different type".to_string());
+                return (None, warnings);
+            }
         };
 
-        let Some(time_str) = value.get("time").and_then(|t| t.as_str()) else {
-            warnings.push("time value missing 'time' field".to_string());
-            return (None, warnings);
-        };
-
-        let Some(precision) = value
-            .get("precision")
-            .and_then(|p| p.as_u64())
-            .and_then(WikidataPrecision::from_u64)
-        else {
-            warnings.push(format!("invalid precision in time value: {}", time_str));
-            return (None, warnings);
-        };
-
-        match parse_wikidata_time(time_str, precision) {
-            Some(date) => (Some((date, time_str.to_string())), warnings),
+        match parse_wikidata_time(time_val.time.as_str(), time_val.precision) {
+            Some(date) => (Some((date, time_val.time.to_string())), warnings),
             None => {
-                warnings.push(format!("failed to parse time: {}", time_str));
+                warnings.push(format!("failed to parse time: {}", time_val.time));
                 (None, warnings)
             }
         }
     }
 
     /// Extract coordinates from claim's mainsnak.
-    pub fn mainsnak_coordinates(claim: &Value) -> (Option<UncertainLocation>, Vec<String>) {
+    pub fn mainsnak_coordinates(claim: &Claim) -> (Option<UncertainLocation>, Vec<String>) {
         let mut warnings = Vec::new();
 
-        if is_special_snaktype(claim) {
-            return (None, warnings);
-        }
-
-        let Some(value) = get_claim_value(claim) else {
-            return (None, warnings);
+        let coord = match &claim.mainsnak {
+            Snak::Value(DataValue::GlobeCoordinate(c)) => c,
+            Snak::NoValue | Snak::SomeValue => return (None, warnings),
+            Snak::Value(_) => {
+                warnings.push("expected coordinate value but got different type".to_string());
+                return (None, warnings);
+            }
         };
 
-        let Some(lat) = value.get("latitude").and_then(|v| v.as_f64()) else {
-            warnings.push("coordinates missing latitude".to_string());
-            return (None, warnings);
-        };
-
-        let Some(lon) = value.get("longitude").and_then(|v| v.as_f64()) else {
-            warnings.push("coordinates missing longitude".to_string());
-            return (None, warnings);
-        };
-
-        // Convert degrees to meters (1 degree ~ 111km at equator)
+        // Convert coordinate precision from degrees to meters using Haversine distance.
+        // This accounts for longitude convergence at higher latitudes, unlike the
+        // equator-only approximation (deg * 111_000).
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let precision_m = value
-            .get("precision")
-            .and_then(|p| p.as_f64())
-            .map(|deg| (deg * 111_000.0).abs() as u32);
+        let precision_m = coord.precision.map(|deg| {
+            use geo::{Distance, Haversine};
+            let center = geo::Point::new(coord.longitude, coord.latitude);
+            let offset = geo::Point::new(coord.longitude + deg.abs(), coord.latitude);
+            Haversine::distance(center, offset) as u32
+        });
 
-        match UncertainLocation::coordinates(lat, lon, None, precision_m) {
+        match UncertainLocation::coordinates(coord.latitude, coord.longitude, None, precision_m) {
             Ok(location) => (Some(location), warnings),
             Err(e) => {
-                warnings.push(format!("invalid coordinates ({lat}, {lon}): {e}"));
+                warnings.push(format!(
+                    "invalid coordinates ({}, {}): {e}",
+                    coord.latitude, coord.longitude
+                ));
                 (None, warnings)
             }
         }
     }
 
     /// Extract Q-ID from claim's mainsnak.
-    pub fn mainsnak_qid(claim: &Value) -> (Option<String>, Vec<String>) {
+    pub fn mainsnak_qid(claim: &Claim) -> (Option<String>, Vec<String>) {
         let warnings = Vec::new();
 
-        if is_special_snaktype(claim) {
+        if claim.mainsnak.is_special() {
             return (None, warnings);
         }
 
-        let qid = get_claim_value(claim)
-            .and_then(|v| v.get("id"))
-            .and_then(|i| i.as_str())
-            .map(|s| s.to_string());
-
-        (qid, warnings)
+        (
+            claim.mainsnak.entity_id().map(|id| id.to_string()),
+            warnings,
+        )
     }
 
     /// Extract all times from a qualifier property.
     pub fn qualifier_times(
-        claim: &Value,
+        claim: &Claim,
         prop: &str,
     ) -> (Vec<(UncertainDate, String)>, Vec<String>) {
         let mut warnings = Vec::new();
         let mut results = Vec::new();
 
-        let Some(qualifiers) = claim
-            .get("qualifiers")
-            .and_then(|q| q.get(prop))
-            .and_then(|v| v.as_array())
-        else {
+        let Some(qualifiers) = claim.qualifiers.get(prop) else {
             return (results, warnings);
         };
 
-        for qualifier in qualifiers {
-            let Some(value) = get_datavalue(qualifier) else {
+        for snak in qualifiers {
+            let Snak::Value(DataValue::Time(time_val)) = snak else {
+                warnings.push(format!("{prop}: qualifier missing time value"));
                 continue;
             };
 
-            let Some(time_str) = value.get("time").and_then(|t| t.as_str()) else {
-                warnings.push(format!("{}: qualifier missing 'time' field", prop));
-                continue;
-            };
-
-            let Some(precision) = value
-                .get("precision")
-                .and_then(|p| p.as_u64())
-                .and_then(WikidataPrecision::from_u64)
-            else {
-                warnings.push(format!("{}: invalid precision in {}", prop, time_str));
-                continue;
-            };
-
-            match parse_wikidata_time(time_str, precision) {
-                Some(date) => results.push((date, time_str.to_string())),
-                None => warnings.push(format!("{}: failed to parse {}", prop, time_str)),
+            match parse_wikidata_time(time_val.time.as_str(), time_val.precision) {
+                Some(date) => results.push((date, time_val.time.to_string())),
+                None => warnings.push(format!("{prop}: failed to parse {}", time_val.time)),
             }
         }
 
@@ -158,7 +124,7 @@ mod extract {
     }
 
     /// Take first claim from array, warn if multiple where one expected.
-    pub fn first_claim<'a>(claims: &'a [Value], prop: &str) -> (Option<&'a Value>, Vec<String>) {
+    pub fn first_claim<'a>(claims: &'a [Claim], prop: &str) -> (Option<&'a Claim>, Vec<String>) {
         let mut warnings = Vec::new();
 
         if claims.len() > 1 {
@@ -206,13 +172,13 @@ fn cite_all(
 
 /// Extract single time from a property's claims.
 fn extract_property_time(
-    claims: &Map<String, Value>,
+    claims: &HashMap<PropertyId, Vec<Claim>>,
     prop: &str,
     ctx: &PropertyContext<'_>,
 ) -> (Option<Cited<UncertainDate>>, Vec<String>) {
     let mut warnings = Vec::new();
 
-    let Some(prop_claims) = claims.get(prop).and_then(|v| v.as_array()) else {
+    let Some(prop_claims) = claims.get(prop) else {
         return (None, warnings);
     };
 
@@ -232,12 +198,12 @@ fn extract_property_time(
 
 /// Extract location from P625.
 fn extract_property_location(
-    claims: &Map<String, Value>,
+    claims: &HashMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext<'_>,
 ) -> (Option<Cited<UncertainLocation>>, Vec<String>) {
     let mut warnings = Vec::new();
 
-    let Some(prop_claims) = claims.get("P625").and_then(|v| v.as_array()) else {
+    let Some(prop_claims) = claims.get("P625") else {
         return (None, warnings);
     };
 
@@ -276,7 +242,7 @@ struct DatedTransition {
 
 /// Process one P793 claim. May return multiple transitions for point-in-time events.
 fn process_p793_claim(
-    claim: &Value,
+    claim: &Claim,
     ctx: &PropertyContext<'_>,
 ) -> (Vec<DatedTransition>, Vec<String>) {
     let mut warnings = Vec::new();
@@ -535,7 +501,7 @@ fn process_p793_claim(
 /// Returns (`entity_lifecycles`, warnings). Multiple inner vecs when demolish->construct
 /// indicates entity splitting. Caller creates `EntityRelation::Replaces` between them.
 pub fn build_lifecycles(
-    claims: &Map<String, Value>,
+    claims: &HashMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext<'_>,
 ) -> (Vec<Vec<EntityTransition>>, Vec<String>) {
     let mut warnings = Vec::new();
@@ -567,7 +533,7 @@ pub fn build_lifecycles(
     let mut p793_constructions: Vec<DatedTransition> = Vec::new();
     let mut p793_other: Vec<DatedTransition> = Vec::new();
 
-    if let Some(p793_claims) = claims.get("P793").and_then(|v| v.as_array()) {
+    if let Some(p793_claims) = claims.get("P793") {
         for claim in p793_claims {
             let (transitions, w) = process_p793_claim(claim, ctx);
             warnings.extend(w);
@@ -751,28 +717,101 @@ fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransiti
 mod tests {
     use super::*;
     use chrono::{Datelike, NaiveDate};
-    use serde_json::json;
+    use chronoscope_integrations::wikidata::{
+        CoordinateValue, DataValue, EntityRefValue, PropertyId, Rank, Snak, TimeValue, WikidataId,
+        WikidataPrecision, WikidataTimestamp,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn wikidata_id(s: &str) -> Result<WikidataId, String> {
+        WikidataId::try_from(s.to_string())
+    }
+
+    fn property_id(s: &str) -> Result<PropertyId, String> {
+        PropertyId::try_from(s.to_string())
+    }
 
     fn midnight(y: i32, m: u32, d: u32) -> Option<NaiveDateTime> {
         NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(0, 0, 0)
     }
 
+    fn time_claim(time_str: &str, precision: WikidataPrecision) -> Result<Claim, String> {
+        Ok(Claim::simple(Snak::Value(DataValue::Time(TimeValue {
+            time: WikidataTimestamp::try_from(time_str.to_string())?,
+            precision,
+        }))))
+    }
+
+    fn coordinate_claim(lat: f64, lon: f64) -> Claim {
+        Claim::simple(Snak::Value(DataValue::GlobeCoordinate(CoordinateValue {
+            latitude: lat,
+            longitude: lon,
+            precision: Some(0.0001),
+        })))
+    }
+
+    fn p793_event(
+        qid: &str,
+        point_in_time: &str,
+        precision: WikidataPrecision,
+    ) -> Result<Claim, String> {
+        let mut qualifiers = HashMap::new();
+        qualifiers.insert(
+            property_id("P585")?,
+            vec![Snak::Value(DataValue::Time(TimeValue {
+                time: WikidataTimestamp::try_from(point_in_time.to_string())?,
+                precision,
+            }))],
+        );
+
+        Ok(Claim {
+            mainsnak: Snak::Value(DataValue::WikibaseEntityId(EntityRefValue {
+                id: wikidata_id(qid)?,
+            })),
+            qualifiers,
+            rank: Rank::Normal,
+        })
+    }
+
+    fn p793_event_with_range(qid: &str, start: &str, end: &str) -> Result<Claim, String> {
+        let mut qualifiers = HashMap::new();
+        qualifiers.insert(
+            property_id("P580")?,
+            vec![Snak::Value(DataValue::Time(TimeValue {
+                time: WikidataTimestamp::try_from(start.to_string())?,
+                precision: WikidataPrecision::Year,
+            }))],
+        );
+        qualifiers.insert(
+            property_id("P582")?,
+            vec![Snak::Value(DataValue::Time(TimeValue {
+                time: WikidataTimestamp::try_from(end.to_string())?,
+                precision: WikidataPrecision::Year,
+            }))],
+        );
+
+        Ok(Claim {
+            mainsnak: Snak::Value(DataValue::WikibaseEntityId(EntityRefValue {
+                id: wikidata_id(qid)?,
+            })),
+            qualifiers,
+            rank: Rank::Normal,
+        })
+    }
+
+    fn claims_from(
+        pairs: Vec<(&str, Vec<Claim>)>,
+    ) -> Result<HashMap<PropertyId, Vec<Claim>>, String> {
+        pairs
+            .into_iter()
+            .map(|(k, v)| Ok((property_id(k)?, v)))
+            .collect()
+    }
+
     #[test]
     fn test_extract_mainsnak_time() -> TestResult {
-        let claim = json!({
-            "mainsnak": {
-                "snaktype": "value",
-                "datavalue": {
-                    "value": {
-                        "time": "+1920-01-01T00:00:00Z",
-                        "precision": 9
-                    }
-                }
-            }
-        });
-
+        let claim = time_claim("+1920-01-01T00:00:00Z", WikidataPrecision::Year)?;
         let (result, warnings) = extract::mainsnak_time(&claim);
         assert!(warnings.is_empty());
         assert!(result.is_some());
@@ -785,19 +824,7 @@ mod tests {
 
     #[test]
     fn test_extract_mainsnak_coordinates() -> TestResult {
-        let claim = json!({
-            "mainsnak": {
-                "snaktype": "value",
-                "datavalue": {
-                    "value": {
-                        "latitude": 40.7128,
-                        "longitude": -74.0060,
-                        "precision": 0.0001
-                    }
-                }
-            }
-        });
-
+        let claim = coordinate_claim(40.7128, -74.0060);
         let (result, warnings) = extract::mainsnak_coordinates(&claim);
         assert!(warnings.is_empty());
         let result = result.ok_or("expected Some")?;
@@ -812,27 +839,43 @@ mod tests {
     }
 
     #[test]
+    fn test_coordinate_precision_accounts_for_latitude() -> TestResult {
+        // At 60°N, 1 degree of longitude is ~55.8km (cos(60°) * 111km).
+        // The old equator approximation would give ~111km for any latitude.
+        let claim_high_lat = Claim {
+            mainsnak: Snak::Value(DataValue::GlobeCoordinate(CoordinateValue {
+                latitude: 60.0,
+                longitude: 25.0,
+                precision: Some(1.0),
+            })),
+            qualifiers: HashMap::new(),
+            rank: Rank::Normal,
+        };
+        let (loc, warnings) = extract::mainsnak_coordinates(&claim_high_lat);
+        assert!(warnings.is_empty());
+        let loc = loc.ok_or("expected Some")?;
+
+        if let UncertainLocation::Coordinates { precision_m, .. } = loc {
+            let p = precision_m.ok_or("expected precision")?;
+            // At 60°N, 1 degree longitude ≈ 55,800m (not 111,000m)
+            assert!(
+                p < 70_000,
+                "precision at 60°N should be well under 70km, got {p}m"
+            );
+            assert!(
+                p > 40_000,
+                "precision at 60°N should be over 40km, got {p}m"
+            );
+        } else {
+            return Err("expected Coordinates".into());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_extract_qualifier_times() -> TestResult {
-        let claim = json!({
-            "qualifiers": {
-                "P580": [{
-                    "datavalue": {
-                        "value": {
-                            "time": "+1918-01-01T00:00:00Z",
-                            "precision": 9
-                        }
-                    }
-                }],
-                "P582": [{
-                    "datavalue": {
-                        "value": {
-                            "time": "+1920-01-01T00:00:00Z",
-                            "precision": 9
-                        }
-                    }
-                }]
-            }
-        });
+        let claim =
+            p793_event_with_range("Q385378", "+1918-01-01T00:00:00Z", "+1920-01-01T00:00:00Z")?;
 
         let (p580, w1) = extract::qualifier_times(&claim, "P580");
         let (p582, w2) = extract::qualifier_times(&claim, "P582");
@@ -893,109 +936,16 @@ mod tests {
         PropertyContext::new("Q12345", 100, "lifecycle")
     }
 
-    fn time_claim(time_str: &str, precision: u64) -> Value {
-        json!({
-            "mainsnak": {
-                "snaktype": "value",
-                "datavalue": {
-                    "value": {
-                        "time": time_str,
-                        "precision": precision
-                    }
-                }
-            }
-        })
-    }
-
-    fn coordinate_claim(lat: f64, lon: f64) -> Value {
-        json!({
-            "mainsnak": {
-                "snaktype": "value",
-                "datavalue": {
-                    "value": {
-                        "latitude": lat,
-                        "longitude": lon,
-                        "precision": 0.0001
-                    }
-                }
-            }
-        })
-    }
-
-    fn p793_event(qid: &str, point_in_time: &str, precision: u64) -> Value {
-        json!({
-            "mainsnak": {
-                "snaktype": "value",
-                "datavalue": {
-                    "value": { "id": qid }
-                }
-            },
-            "qualifiers": {
-                "P585": [{
-                    "datavalue": {
-                        "value": {
-                            "time": point_in_time,
-                            "precision": precision
-                        }
-                    }
-                }]
-            }
-        })
-    }
-
-    fn p793_event_with_range(qid: &str, start: &str, end: &str) -> Value {
-        json!({
-            "mainsnak": {
-                "snaktype": "value",
-                "datavalue": {
-                    "value": { "id": qid }
-                }
-            },
-            "qualifiers": {
-                "P580": [{
-                    "datavalue": {
-                        "value": {
-                            "time": start,
-                            "precision": 9
-                        }
-                    }
-                }],
-                "P582": [{
-                    "datavalue": {
-                        "value": {
-                            "time": end,
-                            "precision": 9
-                        }
-                    }
-                }]
-            }
-        })
-    }
-
-    fn claims_from(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
-        let mut map = Map::new();
-        for (key, val) in pairs {
-            // If key already exists, merge into existing array
-            if let Some(existing) = map.get_mut(key) {
-                if let Some(arr) = existing.as_array_mut()
-                    && let Some(new_arr) = val.as_array()
-                {
-                    arr.extend(new_arr.iter().cloned());
-                }
-            } else {
-                map.insert(key.to_string(), val);
-            }
-        }
-        map
-    }
-
-    /// P571 inception date only → single Constructed transition
+    /// P571 inception date only -> single Constructed transition
     #[test]
     fn build_p571_inception_only() -> TestResult {
         let claims = claims_from(vec![(
             "P571",
-            json!([time_claim("+1920-01-01T00:00:00Z", 9)]),
-        )]);
+            vec![time_claim(
+                "+1920-01-01T00:00:00Z",
+                WikidataPrecision::Year,
+            )?],
+        )])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1021,13 +971,16 @@ mod tests {
         Ok(())
     }
 
-    /// P571 + P625 → Constructed with date and location
+    /// P571 + P625 -> Constructed with date and location
     #[test]
     fn build_p571_with_p625_location() -> TestResult {
         let claims = claims_from(vec![
-            ("P571", json!([time_claim("+1889-03-31T00:00:00Z", 11)])),
-            ("P625", json!([coordinate_claim(48.8584, 2.2945)])),
-        ]);
+            (
+                "P571",
+                vec![time_claim("+1889-03-31T00:00:00Z", WikidataPrecision::Day)?],
+            ),
+            ("P625", vec![coordinate_claim(48.8584, 2.2945)]),
+        ])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1054,13 +1007,25 @@ mod tests {
         Ok(())
     }
 
-    /// P571 + P576 → Constructed + Demolished
+    /// P571 + P576 -> Constructed + Demolished
     #[test]
     fn build_p571_p576_construction_and_demolition() -> TestResult {
         let claims = claims_from(vec![
-            ("P571", json!([time_claim("+1900-01-01T00:00:00Z", 9)])),
-            ("P576", json!([time_claim("+1960-01-01T00:00:00Z", 9)])),
-        ]);
+            (
+                "P571",
+                vec![time_claim(
+                    "+1900-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+            (
+                "P576",
+                vec![time_claim(
+                    "+1960-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+        ])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1084,12 +1049,12 @@ mod tests {
     fn build_p793_construction_with_date_range() -> TestResult {
         let claims = claims_from(vec![(
             "P793",
-            json!([p793_event_with_range(
+            vec![p793_event_with_range(
                 "Q385378",
                 "+1887-01-28T00:00:00Z",
-                "+1889-03-31T00:00:00Z"
-            )]),
-        )]);
+                "+1889-03-31T00:00:00Z",
+            )?],
+        )])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1117,12 +1082,12 @@ mod tests {
     fn build_p793_damage_events() -> TestResult {
         let claims = claims_from(vec![(
             "P793",
-            json!([
-                p793_event("Q168983", "+1871-10-08T00:00:00Z", 11), // fire
-                p793_event("Q7944", "+1906-04-18T00:00:00Z", 11),   // earthquake
-                p793_event("Q8068", "+1927-04-15T00:00:00Z", 11),   // flood
-            ]),
-        )]);
+            vec![
+                p793_event("Q168983", "+1871-10-08T00:00:00Z", WikidataPrecision::Day)?, // fire
+                p793_event("Q7944", "+1906-04-18T00:00:00Z", WikidataPrecision::Day)?, // earthquake
+                p793_event("Q8068", "+1927-04-15T00:00:00Z", WikidataPrecision::Day)?, // flood
+            ],
+        )])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1150,17 +1115,17 @@ mod tests {
         Ok(())
     }
 
-    /// P793 demolish→construct pattern triggers entity splitting
+    /// P793 demolish->construct pattern triggers entity splitting
     #[test]
     fn build_p793_demolish_rebuild_splits_entities() -> TestResult {
         let claims = claims_from(vec![(
             "P793",
-            json!([
-                p793_event("Q385378", "+1850-01-01T00:00:00Z", 9), // construction
-                p793_event("Q331483", "+1900-01-01T00:00:00Z", 9), // demolition
-                p793_event("Q385378", "+1910-01-01T00:00:00Z", 9), // reconstruction
-            ]),
-        )]);
+            vec![
+                p793_event("Q385378", "+1850-01-01T00:00:00Z", WikidataPrecision::Year)?, // construction
+                p793_event("Q331483", "+1900-01-01T00:00:00Z", WikidataPrecision::Year)?, // demolition
+                p793_event("Q385378", "+1910-01-01T00:00:00Z", WikidataPrecision::Year)?, // reconstruction
+            ],
+        )])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1193,14 +1158,36 @@ mod tests {
     #[test]
     fn build_combined_lifecycle() -> TestResult {
         let claims = claims_from(vec![
-            ("P571", json!([time_claim("+1850-01-01T00:00:00Z", 9)])),
-            ("P576", json!([time_claim("+1960-01-01T00:00:00Z", 9)])),
+            (
+                "P571",
+                vec![time_claim(
+                    "+1850-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+            (
+                "P576",
+                vec![time_claim(
+                    "+1960-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
             (
                 "P793",
-                json!([p793_event("Q2144402", "+1920-01-01T00:00:00Z", 9)]),
+                vec![p793_event(
+                    "Q2144402",
+                    "+1920-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
             ), // renovation
-            ("P1619", json!([time_claim("+1855-06-01T00:00:00Z", 10)])), // opening
-        ]);
+            (
+                "P1619",
+                vec![time_claim(
+                    "+1855-06-01T00:00:00Z",
+                    WikidataPrecision::Month,
+                )?],
+            ), // opening
+        ])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1231,12 +1218,16 @@ mod tests {
     #[test]
     fn build_p793_construction_inherits_p625_location() -> TestResult {
         let claims = claims_from(vec![
-            ("P625", json!([coordinate_claim(51.5074, -0.1278)])),
+            ("P625", vec![coordinate_claim(51.5074, -0.1278)]),
             (
                 "P793",
-                json!([p793_event("Q385378", "+1850-01-01T00:00:00Z", 9)]),
+                vec![p793_event(
+                    "Q385378",
+                    "+1850-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
             ),
-        ]);
+        ])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1259,20 +1250,26 @@ mod tests {
         Ok(())
     }
 
-    /// P729/P730 service entry/retirement → transportation usage transitions
+    /// P729/P730 service entry/retirement -> transportation usage transitions
     #[test]
     fn build_service_entry_and_retirement() -> TestResult {
         let claims = claims_from(vec![
-            ("P729", json!([time_claim("+1935-05-01T00:00:00Z", 11)])),
-            ("P730", json!([time_claim("+1980-09-15T00:00:00Z", 11)])),
-        ]);
+            (
+                "P729",
+                vec![time_claim("+1935-05-01T00:00:00Z", WikidataPrecision::Day)?],
+            ),
+            (
+                "P730",
+                vec![time_claim("+1980-09-15T00:00:00Z", WikidataPrecision::Day)?],
+            ),
+        ])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
-        // Service entry → Transportation usage
+        // Service entry -> Transportation usage
         if let EntityTransition::UsageModified {
             new_usages,
             description,
@@ -1285,7 +1282,7 @@ mod tests {
             return Err("expected UsageModified for service entry".into());
         }
 
-        // Service retirement → empty usage (closed)
+        // Service retirement -> empty usage (closed)
         if let EntityTransition::UsageModified {
             new_usages,
             description,
@@ -1303,13 +1300,17 @@ mod tests {
         Ok(())
     }
 
-    /// P793 consecration → Religious usage
+    /// P793 consecration -> Religious usage
     #[test]
     fn build_p793_consecration() -> TestResult {
         let claims = claims_from(vec![(
             "P793",
-            json!([p793_event("Q125375", "+1626-11-18T00:00:00Z", 11)]),
-        )]);
+            vec![p793_event(
+                "Q125375",
+                "+1626-11-18T00:00:00Z",
+                WikidataPrecision::Day,
+            )?],
+        )])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
@@ -1333,7 +1334,7 @@ mod tests {
     /// Out-of-range coordinates produce a warning, not a crash
     #[test]
     fn build_invalid_coordinates_warns() -> TestResult {
-        let claims = claims_from(vec![("P625", json!([coordinate_claim(999.0, -999.0)]))]);
+        let claims = claims_from(vec![("P625", vec![coordinate_claim(999.0, -999.0)])])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         // Should produce a warning about invalid coordinates
@@ -1349,7 +1350,7 @@ mod tests {
     /// Empty claims produce no transitions and no warnings
     #[test]
     fn build_empty_claims() -> TestResult {
-        let claims = Map::new();
+        let claims = HashMap::new();
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty());
         assert!(lifecycles.is_empty());
@@ -1361,12 +1362,16 @@ mod tests {
     fn build_p793_unknown_event_skipped() -> TestResult {
         let claims = claims_from(vec![(
             "P793",
-            json!([p793_event("Q99999999", "+1920-01-01T00:00:00Z", 9)]),
-        )]);
+            vec![p793_event(
+                "Q99999999",
+                "+1920-01-01T00:00:00Z",
+                WikidataPrecision::Year,
+            )?],
+        )])?;
 
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        // Unknown event → no transitions
+        // Unknown event -> no transitions
         assert!(lifecycles.is_empty());
         Ok(())
     }

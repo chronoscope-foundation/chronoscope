@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder};
+use chronoscope_integrations::wikidata::WikidataId;
 use futures::stream::{self, Stream};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -14,7 +15,19 @@ use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
-use crate::wikidata::parsing::{get_claim_qid, get_claims};
+/// Get a Q-ID reference from a raw claim JSON's mainsnak (for wikibase-entityid type).
+fn get_claim_qid(claim: &Value) -> Option<&str> {
+    claim
+        .pointer("/mainsnak/datavalue/value/id")
+        .and_then(|i| i.as_str())
+}
+
+/// Get claims array for a property from a raw entity JSON.
+fn get_claims<'a>(wd: &'a Value, property: &str) -> Option<&'a Vec<Value>> {
+    wd.get("claims")
+        .and_then(|c| c.get(property))
+        .and_then(|p| p.as_array())
+}
 
 /// Buffer size for async I/O (8 MB).
 const BUFFER_SIZE: usize = 8 * 1024 * 1024;
@@ -95,7 +108,7 @@ pub fn is_item(entity: &Value) -> bool {
 }
 
 /// Check if an entity is an instance of any target type (via P31).
-pub fn is_instance_of(entity: &Value, target_types: &HashSet<String>) -> bool {
+pub fn is_instance_of(entity: &Value, target_types: &HashSet<WikidataId>) -> bool {
     if !is_item(entity) {
         return false;
     }
@@ -123,8 +136,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_instance_of() {
-        let targets: HashSet<String> = ["Q41176".to_string()].into_iter().collect();
+    fn test_is_instance_of() -> Result<(), Box<dyn std::error::Error>> {
+        let targets: HashSet<WikidataId> = [WikidataId::try_from("Q41176".to_string())?]
+            .into_iter()
+            .collect();
 
         let building = json!({
             "type": "item",
@@ -157,5 +172,7 @@ mod tests {
         // Not an item
         let property = json!({"type": "property"});
         assert!(!is_instance_of(&property, &targets));
+
+        Ok(())
     }
 }
