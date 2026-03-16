@@ -95,8 +95,12 @@ in
     nativeBuildInputs =
       commonArgs.nativeBuildInputs
       ++ (with pkgs; [
+        binaryen
         cargo-llvm-cov
         just
+        tailwindcss_4
+        trunk
+        wasm-bindgen-cli
       ]);
     inherit (commonArgs) buildInputs;
     env = {

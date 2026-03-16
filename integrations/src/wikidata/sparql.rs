@@ -26,9 +26,7 @@ pub(super) async fn fetch_subclasses<H: HttpClient>(
             message: format!("expected Q-ID for SPARQL query, got '{root_type}'"),
         });
     }
-    let query = format!(
-        "SELECT ?class WHERE {{ ?class wdt:P279* wd:{root_type} . }}"
-    );
+    let query = format!("SELECT ?class WHERE {{ ?class wdt:P279* wd:{root_type} . }}");
 
     let url = format!(
         "https://query.wikidata.org/sparql?query={}",

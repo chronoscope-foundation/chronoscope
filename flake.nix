@@ -45,12 +45,13 @@
             stable.rustfmt
             stable.rust-src
             stable.llvm-tools-preview
+            targets.wasm32-unknown-unknown.stable.rust-std
           ];
 
         craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
 
         # Source filtering: Cargo sources + .proto (protobuf) + .sql (migrations)
-        # + .json (test fixtures, schemas).
+        # + .json (test fixtures, schemas) + .html/.css (web frontend).
         src = lib.cleanSourceWith {
           src = craneLib.path ./.;
           filter =
@@ -58,7 +59,9 @@
             (craneLib.filterCargoSources path type)
             || (lib.hasSuffix ".proto" path)
             || (lib.hasSuffix ".sql" path)
-            || (lib.hasSuffix ".json" path);
+            || (lib.hasSuffix ".json" path)
+            || (lib.hasSuffix ".html" path)
+            || (lib.hasSuffix ".css" path);
           name = "chronoscope-source";
         };
 
@@ -85,6 +88,18 @@
           rustCommonArgs = rust.commonArgs;
         };
 
+        # Phase 3: Web frontend (WASM).
+        web = import ./nix/web.nix {
+          inherit
+            pkgs
+            lib
+            fenix
+            crane
+            system
+            src
+            ;
+        };
+
         pythonChecks = pythonEnvs.checks {
           rustPackage = rust.packages.default;
         };
@@ -101,6 +116,7 @@
         # `nix flake check` — all quality gates.
         checks =
           rust.checks
+          // web.checks
           // pythonChecks
           // {
             nix-lint =
@@ -128,15 +144,18 @@
         # analysis-results requires torch (available on all eachDefaultSystem platforms
         # in nixpkgs, but only with CUDA on x86_64-linux). Guard with a comment so
         # future platform additions consider torch availability.
-        packages = rust.packages // {
-          corpus-images = corpus.corpusImages;
-          corpus-fetch = corpus.corpusFetchBin;
-          corpus-tests = corpus.corpusTests;
-          analysis-results = corpus.analysisResults;
-          # Model weights — build with --impure and HF_TOKEN to populate store.
-          dinov3-weights = pythonEnvs.dinov3Repo;
-          sam3-weights = pythonEnvs.sam3Cache;
-        };
+        packages =
+          rust.packages
+          // web.packages
+          // {
+            corpus-images = corpus.corpusImages;
+            corpus-fetch = corpus.corpusFetchBin;
+            corpus-tests = corpus.corpusTests;
+            analysis-results = corpus.analysisResults;
+            # Model weights — build with --impure and HF_TOKEN to populate store.
+            dinov3-weights = pythonEnvs.dinov3Repo;
+            sam3-weights = pythonEnvs.sam3Cache;
+          };
 
         # `nix fmt` — format Nix files.
         formatter = pkgs.nixfmt;
@@ -171,10 +190,13 @@
 
           shellHook = ''
             # Pin large store paths as GC roots so determinate-nixd auto-GC won't collect them.
-            mkdir -p .nix-gc-roots
-            nix-store --realise ${pythonEnvs.dinov3Repo} --add-root .nix-gc-roots/dinov3-weights > /dev/null 2>&1 || true
-            nix-store --realise ${pythonEnvs.sam3Cache} --add-root .nix-gc-roots/sam3-weights > /dev/null 2>&1 || true
-            nix-store --realise ${corpus.corpusImages} --add-root .nix-gc-roots/corpus-images > /dev/null 2>&1 || true
+            # Use an absolute path anchored to the repo root so roots don't scatter
+            # into whatever subdirectory `nix develop` happens to be invoked from.
+            _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
+            mkdir -p "$_gc_root_dir"
+            nix-store --realise ${pythonEnvs.dinov3Repo} --add-root "$_gc_root_dir/dinov3-weights" > /dev/null 2>&1 || true
+            nix-store --realise ${pythonEnvs.sam3Cache} --add-root "$_gc_root_dir/sam3-weights" > /dev/null 2>&1 || true
+            nix-store --realise ${corpus.corpusImages} --add-root "$_gc_root_dir/corpus-images" > /dev/null 2>&1 || true
 
             echo "chronoscope dev shell"
             echo "  rust: $(rustc --version)"

@@ -46,6 +46,11 @@ Package.resolved
 __pycache__/
 .hypothesis/
 
+# Trunk (web frontend build artifacts)
+web/dist/
+web/result
+web/tailwind.css
+
 # Nix
 /result
 /result-*

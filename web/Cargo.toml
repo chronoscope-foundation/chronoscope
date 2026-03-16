@@ -1,0 +1,19 @@
+[package]
+name = "chronoscope-web"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+leptos_router = "0.8"
+console_error_panic_hook = "0.1"
+# Exact pin: must match wasm-bindgen-cli version in nix/rust.nix devShell.
+# A mismatch causes cryptic link-time errors. Cargo resolves this independently
+# of Nix, so the pin prevents `cargo update` from drifting past what Nix provides.
+wasm-bindgen = "= 0.2.108"
+web-sys = { version = "0.3", features = ["HtmlDivElement", "Storage"] }
+send_wrapper = "0.6"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }

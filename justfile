@@ -43,6 +43,12 @@ check:
     cargo test
     cargo llvm-cov --fail-under-lines 75
 
+    # Web crate targets wasm32-unknown-unknown and is excluded from default-members
+    # because cargo can't mix native and WASM targets in one invocation.
+    echo "==> Web (WASM)"
+    cargo fmt -p chronoscope-web --check
+    cargo clippy -p chronoscope-web --target wasm32-unknown-unknown -- -D warnings
+
     echo "==> Python (triton)"
     cargo build --bin schematool
     export PATH="$PWD/target/debug:$PATH"
@@ -57,6 +63,14 @@ check:
     done
     pytest -v
 
+# Start web frontend dev server (Trunk live reload)
+web-dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _nix_reexec }}
+    if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec web-dev; fi
+    cd web && trunk serve
+
 # Auto-fix formatting (Nix + Rust + Python)
 fmt:
     #!/usr/bin/env bash
@@ -65,6 +79,7 @@ fmt:
     if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec fmt; fi
     find . -name '*.nix' -not -path './.git/*' -not -path './.direnv/*' -print0 | xargs -0 nixfmt
     cargo fmt
+    cargo fmt -p chronoscope-web  # excluded from default-members (WASM target)
     cd analysis/triton && ruff format .
 
 # Generate/update corpus FOD hashes (fetches new URLs, skips existing)

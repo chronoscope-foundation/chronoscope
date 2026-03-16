@@ -1,0 +1,11 @@
+[serve]
+address = "127.0.0.1"
+port = 8080
+
+[build]
+target = "index.html"
+
+[[hooks]]
+stage = "pre_build"
+command = "tailwindcss"
+command_arguments = ["-i", "input.css", "-o", "tailwind.css"]
