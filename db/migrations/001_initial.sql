@@ -172,3 +172,83 @@ CREATE TABLE follows (
 -- Composite index supports filtering by user and ordering by created_at for pagination
 CREATE INDEX idx_follows_user_created ON follows(user_id, created_at DESC);
 CREATE INDEX idx_follows_url ON follows(url_id);
+
+-- ==================== Entities ====================
+
+-- Core entity table. entity_json is the source of truth; shadow columns
+-- project queryable fields for indexing.
+CREATE TABLE entities (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT GENERATED ALWAYS AS (json_extract(entity_json, '$.entity_type')) STORED NOT NULL
+        CHECK (entity_type IN ('area', 'building', 'infrastructure', 'monument', 'natural_feature')),
+    entity_json TEXT NOT NULL,
+
+    -- Temporal shadow columns: min/max across all transitions
+    earliest_date TIMESTAMP,    -- ISO 8601
+    latest_date TIMESTAMP,      -- ISO 8601
+
+    -- Spatial shadow columns: first coordinate found
+    latitude REAL,
+    longitude REAL,
+
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+
+    CHECK ((latitude IS NULL) = (longitude IS NULL))
+);
+
+CREATE INDEX idx_entities_temporal ON entities(earliest_date, latest_date)
+    WHERE earliest_date IS NOT NULL;
+CREATE INDEX idx_entities_spatial ON entities(latitude, longitude)
+    WHERE latitude IS NOT NULL;
+CREATE INDEX idx_entities_type_updated ON entities(entity_type, updated_at DESC);
+
+-- External ID dedup lookup (e.g., "does Q12345 exist?")
+CREATE TABLE entity_external_ids (
+    id_type TEXT NOT NULL CHECK (id_type IN (
+        'wikidata', 'osm_node', 'osm_way', 'osm_relation',
+        'geonames', 'pleiades', 'getty_tgn', 'nrhp'
+    )),
+    external_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    PRIMARY KEY (id_type, external_id, entity_id)
+);
+
+CREATE INDEX idx_external_ids_entity ON entity_external_ids(entity_id);
+
+-- External links per entity
+CREATE TABLE entity_links (
+    id TEXT PRIMARY KEY,
+    entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    link_type TEXT NOT NULL CHECK (link_type IN ('same_as', 'related', 'further_reading')),
+    target_url TEXT NOT NULL,
+    UNIQUE (entity_id, link_type, target_url)
+);
+
+CREATE INDEX idx_entity_links_entity ON entity_links(entity_id);
+
+-- Entity-to-entity relationships
+CREATE TABLE entity_relations (
+    from_entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    to_entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL CHECK (relation_type IN ('replaces', 'contains', 'merged_from', 'split_from')),
+    evidence_json TEXT NOT NULL,
+    PRIMARY KEY (from_entity_id, to_entity_id, relation_type)
+);
+
+CREATE INDEX idx_entity_relations_to ON entity_relations(to_entity_id);
+
+-- Annotations: link entities to image sources
+CREATE TABLE annotations (
+    id TEXT PRIMARY KEY,
+    entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    url_id TEXT NOT NULL REFERENCES research_urls(id) ON DELETE CASCADE,
+    kind TEXT GENERATED ALWAYS AS (json_extract(kind_json, '$.type')) STORED NOT NULL
+        CHECK (kind IN ('spatial_trace', 'exterior_view', 'interior_view', 'textual_note')),
+    kind_json TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    UNIQUE (entity_id, url_id, kind)
+);
+
+CREATE INDEX idx_annotations_entity ON annotations(entity_id);
+CREATE INDEX idx_annotations_url ON annotations(url_id);

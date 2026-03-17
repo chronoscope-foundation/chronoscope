@@ -30,6 +30,8 @@ clap = { version = "4", features = ["derive"] }
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs"] }
 
+chronoscope-db = { path = "../db" }
+
 [dev-dependencies]
 proptest = "1.4"
 

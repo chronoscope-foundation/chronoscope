@@ -29,6 +29,9 @@ pub enum DbError {
 
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
+
+    #[error("Bundle has invalid cross-references: {}", .0.join("; "))]
+    InvalidBundle(Vec<String>),
 }
 
 pub type DbResult<T> = Result<T, DbError>;

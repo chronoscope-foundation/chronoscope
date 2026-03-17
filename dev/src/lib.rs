@@ -53,6 +53,9 @@ pub struct RunningDevServer {
     /// User ID of the test user
     pub test_user_id: UserId,
 
+    /// Database pool for direct access (e.g., loading ingestion bundles in tests)
+    db: Arc<Database>,
+
     /// Send `true` to trigger graceful shutdown of workers
     shutdown_tx: watch::Sender<bool>,
 
@@ -61,6 +64,15 @@ pub struct RunningDevServer {
 }
 
 impl RunningDevServer {
+    /// Get the database for direct access.
+    ///
+    /// Used by integration tests to load ingestion bundles or query DB state
+    /// directly, bypassing the HTTP API layer.
+    #[must_use]
+    pub fn db(&self) -> &Database {
+        &self.db
+    }
+
     /// Gracefully shut down the server and wait for all workers to stop.
     pub async fn shutdown(mut self) {
         // Signal workers to stop
@@ -444,6 +456,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         port,
         auth_token,
         test_user_id,
+        db,
         shutdown_tx,
         worker_handles,
     })

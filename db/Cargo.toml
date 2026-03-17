@@ -40,3 +40,4 @@ bytes.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
+oxilangtag = { version = "0.1", features = ["serde"] }

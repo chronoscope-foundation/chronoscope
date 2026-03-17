@@ -231,7 +231,7 @@ impl EntityTransition {
 }
 
 /// Type of relationship between two entities.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityRelationType {
     /// This entity replaces the target (e.g., new building on same site after demolition)

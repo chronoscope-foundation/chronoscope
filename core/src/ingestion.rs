@@ -108,6 +108,11 @@ impl<E: Ord, S: Ord, L: Ord> IngestionBundle<E, S, L> {
 pub enum ReferenceError<E, S, L> {
     /// An entity key in `entity_relations` doesn't exist in `entities`.
     DanglingEntityRelation { entity_key: E },
+    /// An entity relation has the same entity as both source and target.
+    SelfRelation {
+        entity_key: E,
+        relation_type: crate::entity::EntityRelationType,
+    },
     /// An entity key in `entity_links` doesn't exist in `entities`.
     DanglingEntityLink { entity_key: E },
     /// A link key in `entity_links` values doesn't exist in `external_links`.
@@ -125,6 +130,15 @@ impl<E: fmt::Debug, S: fmt::Debug, L: fmt::Debug> fmt::Display for ReferenceErro
                 write!(
                     f,
                     "entity relation references unknown entity {entity_key:?}"
+                )
+            }
+            Self::SelfRelation {
+                entity_key,
+                relation_type,
+            } => {
+                write!(
+                    f,
+                    "entity {entity_key:?} has self-referential {relation_type:?} relation"
                 )
             }
             Self::DanglingEntityLink { entity_key } => {
@@ -151,14 +165,24 @@ impl<E: Ord + Clone, S: Ord + Clone, L: Ord + Clone> IngestionBundle<E, S, L> {
     ///
     /// Checks that:
     /// - All entity keys in `entity_relations` exist in `entities`
+    /// - No entity relation is self-referential
     /// - All entity keys in `entity_links` exist in `entities`
     /// - All link keys in `entity_links` values exist in `external_links`
     /// - All source/entity keys in `annotations` exist in their maps
-    pub fn validate_references(&self) -> Result<(), Vec<ReferenceError<E, S, L>>> {
+    pub fn validate_references(&self) -> Result<(), Vec<ReferenceError<E, S, L>>>
+    where
+        E: PartialEq,
+    {
         let mut errors = Vec::new();
 
         // Check entity_relations
         for relation in &self.entity_relations {
+            if relation.from_entity == relation.to_entity {
+                errors.push(ReferenceError::SelfRelation {
+                    entity_key: relation.from_entity.clone(),
+                    relation_type: relation.relation_type.clone(),
+                });
+            }
             if !self.entities.contains_key(&relation.from_entity) {
                 errors.push(ReferenceError::DanglingEntityRelation {
                     entity_key: relation.from_entity.clone(),

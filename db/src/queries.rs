@@ -192,6 +192,25 @@ define_queries! {
         WHERE id = ?1
     ",
 
+    // ==================== Entities ====================
+
+    INSERT_ENTITY: "
+        INSERT INTO entities (id, entity_json, earliest_date, latest_date, latitude, longitude, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ",
+
+    // External IDs
+    INSERT_EXTERNAL_ID: "INSERT INTO entity_external_ids (id_type, external_id, entity_id) VALUES (?, ?, ?)",
+
+    // Entity links
+    INSERT_ENTITY_LINK: "INSERT OR IGNORE INTO entity_links (id, entity_id, link_type, target_url) VALUES (?, ?, ?, ?)",
+
+    // Entity relations
+    INSERT_ENTITY_RELATION: "INSERT INTO entity_relations (from_entity_id, to_entity_id, relation_type, evidence_json) VALUES (?, ?, ?, ?)",
+
+    // Annotations
+    INSERT_ANNOTATION: "INSERT OR IGNORE INTO annotations (id, entity_id, url_id, kind_json, created_at) VALUES (?, ?, ?, ?, ?)",
+
 }
 
 #[cfg(test)]

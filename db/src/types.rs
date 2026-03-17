@@ -55,6 +55,115 @@ define_id!(UserId);
 define_id!(ResearchUrlId);
 define_id!(PageId);
 define_id!(MediaId);
+define_id!(EntityDbId);
+define_id!(AnnotationDbId);
+define_id!(EntityLinkDbId);
+
+/// External ID source type for entity deduplication.
+///
+/// Must stay in sync with the CHECK constraint on `entity_external_ids.id_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExternalIdType {
+    Wikidata,
+    OsmNode,
+    OsmWay,
+    OsmRelation,
+    GeoNames,
+    Pleiades,
+    GettyTgn,
+    Nrhp,
+}
+
+impl ExternalIdType {
+    /// All variants, for exhaustive testing against DB CHECK constraints.
+    #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Wikidata,
+            Self::OsmNode,
+            Self::OsmWay,
+            Self::OsmRelation,
+            Self::GeoNames,
+            Self::Pleiades,
+            Self::GettyTgn,
+            Self::Nrhp,
+        ]
+    }
+
+    /// DB string representation (matches the SQL CHECK constraint).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Wikidata => "wikidata",
+            Self::OsmNode => "osm_node",
+            Self::OsmWay => "osm_way",
+            Self::OsmRelation => "osm_relation",
+            Self::GeoNames => "geonames",
+            Self::Pleiades => "pleiades",
+            Self::GettyTgn => "getty_tgn",
+            Self::Nrhp => "nrhp",
+        }
+    }
+}
+
+impl fmt::Display for ExternalIdType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Entity type as stored in the database.
+///
+/// Mirrors `chronoscope_core::entity::EntityType` with `sqlx::Type` support
+/// for direct mapping from SQLite TEXT columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
+pub enum DbEntityType {
+    Area,
+    Building,
+    Infrastructure,
+    Monument,
+    NaturalFeature,
+}
+
+impl DbEntityType {
+    /// All variants, for exhaustive testing against DB CHECK constraints.
+    #[must_use]
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Area,
+            Self::Building,
+            Self::Infrastructure,
+            Self::Monument,
+            Self::NaturalFeature,
+        ]
+    }
+}
+
+impl std::fmt::Display for DbEntityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Area => "area",
+            Self::Building => "building",
+            Self::Infrastructure => "infrastructure",
+            Self::Monument => "monument",
+            Self::NaturalFeature => "natural_feature",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl From<chronoscope_core::entity::EntityType> for DbEntityType {
+    fn from(et: chronoscope_core::entity::EntityType) -> Self {
+        match et {
+            chronoscope_core::entity::EntityType::Area => Self::Area,
+            chronoscope_core::entity::EntityType::Building => Self::Building,
+            chronoscope_core::entity::EntityType::Infrastructure => Self::Infrastructure,
+            chronoscope_core::entity::EntityType::Monument => Self::Monument,
+            chronoscope_core::entity::EntityType::NaturalFeature => Self::NaturalFeature,
+        }
+    }
+}
 
 /// Status of a research URL in the processing pipeline.
 #[derive(

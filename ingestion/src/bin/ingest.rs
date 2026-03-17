@@ -109,6 +109,23 @@ enum Command {
         #[arg(short, long)]
         input: PathBuf,
     },
+
+    /// Load an `IngestionBundle` into a SQLite database.
+    ///
+    /// Creates or opens the database, runs migrations, and loads all
+    /// entities, images, relations, and annotations from the bundle.
+    ///
+    /// Currently Wikidata-specific (uses Wikidata Q-IDs for entity dedup).
+    /// A source flag will be added when additional ingestion sources exist.
+    Load {
+        /// Path to SQLite database file (created if missing)
+        #[arg(short, long)]
+        db: String,
+
+        /// Input `IngestionBundle` JSON file path
+        #[arg(short, long)]
+        input: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -144,6 +161,7 @@ async fn run(cli: Cli) -> Result<()> {
             verbose,
         } => cmd_ingest(&input, &output, verbose).await,
         Command::Check { input } => cmd_check(&input),
+        Command::Load { db, input } => cmd_load(&db, &input).await,
     }
 }
 
@@ -423,5 +441,42 @@ fn cmd_check(input: &Path) -> Result<()> {
     let report = chronoscope_ingestion::check::analyze(&bundle);
     let json = serde_json::to_string_pretty(&report).context("Failed to serialize report")?;
     println!("{json}");
+    Ok(())
+}
+
+// =============================================================================
+// LOAD
+// =============================================================================
+
+async fn cmd_load(db_path: &str, input: &str) -> Result<()> {
+    let data = std::fs::read_to_string(input).with_context(|| format!("Failed to read {input}"))?;
+    let bundle: chronoscope_core::IngestionOutput =
+        serde_json::from_str(&data).context("Failed to parse IngestionBundle")?;
+
+    eprintln!(
+        "Loading bundle: {} entities, {} images, {} relations, {} annotations",
+        bundle.entities.len(),
+        bundle.images.len(),
+        bundle.entity_relations.len(),
+        bundle.annotations.len(),
+    );
+
+    let db_url = format!("sqlite:{db_path}?mode=rwc");
+    let db = chronoscope_db::Database::new(&db_url)
+        .await
+        .context("Failed to open database")?;
+
+    let result = chronoscope_db::ingestion::load_bundle(db.pool_ref(), &bundle)
+        .await
+        .context("Failed to load bundle")?;
+
+    eprintln!(
+        "Done! Created {} entities, {} images, {} annotations, {} relations",
+        result.entities_created,
+        result.images_created,
+        result.annotations_created,
+        result.relations_created,
+    );
+
     Ok(())
 }

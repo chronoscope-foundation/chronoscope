@@ -4,6 +4,7 @@
 //! It is used by both the API server and background workers.
 
 pub mod error;
+pub mod ingestion;
 pub mod media_store;
 pub mod models;
 pub mod queries;
@@ -28,7 +29,8 @@ pub use models::{
 };
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use types::{
-    AnalysisStatus, Email, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
+    AnalysisStatus, AnnotationDbId, DbEntityType, Email, EntityDbId, EntityLinkDbId,
+    ExternalIdType, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
     ResearchUrlStatus, SourceType, UserId,
 };
 
