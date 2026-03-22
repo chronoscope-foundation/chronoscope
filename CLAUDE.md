@@ -32,6 +32,34 @@ All tooling comes from Nix. Install [Nix](https://nixos.org/download/) (Determin
 
 `just` commands auto-wrap with `nix develop` if you're not already in the shell.
 
+### Shell Tiers
+
+Three dev shells provide increasing levels of data, so the base shell starts fast without large downloads:
+
+| Shell | What it adds | Use case |
+|-------|-------------|----------|
+| `default` | Rust + Python + lint tools | Web dev, API work, most of the repo |
+| `analysis` | + model weights (DINOv3, SAM3) | Analysis pipeline tests |
+| `corpus` | + corpus images | Full corpus test suite |
+
+```bash
+nix develop              # default — no large downloads
+nix develop .#analysis   # requires: just fetch-weights
+nix develop .#corpus     # requires: just fetch-weights + just fetch-corpus
+```
+
+`just` recipes automatically select the right shell tier (e.g., `just check` uses `analysis`, `just corpus-test` uses `corpus`).
+
+### Fetching Data
+
+```bash
+HF_TOKEN=hf_... just fetch-weights   # ~2GB model weights (one-time, needs HF token)
+just fetch-corpus                     # corpus images from external URLs
+just fetch-all                        # both of the above
+```
+
+Fetched data is pinned as GC roots in `.nix-gc-roots/` so Nix garbage collection won't sweep it.
+
 ## Commit Requirements
 
 Every commit must pass `just check`, which runs Nix linting (nixfmt, statix, deadnix), Rust checks (fmt, clippy, test, coverage), and Python checks (ruff, mypy, pytest). Line coverage must stay above 75%.
@@ -39,11 +67,14 @@ Every commit must pass `just check`, which runs Nix linting (nixfmt, statix, dea
 ## Quick Reference
 
 ```bash
-# Run all checks (Nix + Rust + Python)
+# Run all checks (Nix + Rust + Python — needs analysis shell)
 just check
 
 # Auto-fix all formatting
 just fmt
+
+# Start web frontend dev server (Trunk live reload)
+just web-dev
 
 # Start dev server (ngrok + API + workers)
 cargo run -p chronoscope-dev
@@ -57,7 +88,7 @@ nix flake check
 # Run individual Nix checks
 nix build .#checks.$(nix eval --impure --expr builtins.currentSystem --raw).triton-test
 
-# Corpus tests (builds GPU analysis results on demand, then runs Rust assertions)
+# Corpus tests (needs corpus shell — builds GPU analysis results on demand)
 just corpus-test
 ```
 
@@ -67,7 +98,7 @@ Python tests call `schematool` (a Rust binary from `analysis/src/bin/schematool.
 
 - **`nix flake check`**: schematool comes from `rust.packages.default` (the workspace build)
 - **`just check`**: schematool is built by `cargo build --bin schematool` and added to PATH
-- **Model weights**: SAM3 and DINOv3 weights are pre-fetched into the Nix store via fixed-output derivations (`hf download` in a sandboxed FOD). `HF_HUB_OFFLINE=1` ensures no network access — missing weights fail hard, never download silently.
+- **Model weights**: SAM3 and DINOv3 weights are fetched via `just fetch-weights` into the Nix store as fixed-output derivations (`hf download` in a sandboxed FOD). `HF_HUB_OFFLINE=1` is set in the analysis/corpus shells — missing weights fail hard, never download silently.
 
 ## Code Standards
 

@@ -1,36 +1,62 @@
-# Helper: ensure we're in a Nix dev shell, re-exec if not.
-# Placed at the top of each recipe's shebang script:
-#   if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec <recipe>; fi
-_nix_reexec := '''
-_nix_reexec() {
-    # Source Nix profile if nix isn't on PATH
+# Ensure nix is on PATH, sourcing the daemon profile as a fallback.
+_ensure_nix := '''
+_ensure_nix() {
     if ! command -v nix &>/dev/null; then
         . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh 2>/dev/null \
         || . /nix/var/nix/profiles/default/etc/profile.d/nix.sh 2>/dev/null \
         || { echo "error: nix not found" >&2; exit 1; }
     fi
-    # Model weights are gated HF repos that require a one-time --impure build.
-    # The shellHook creates GC root symlinks on first `nix develop`. If the
-    # directory exists but symlinks are missing/broken, weights were GC'd.
-    if [ -d .nix-gc-roots ] && { [ ! -L .nix-gc-roots/dinov3-weights ] || [ ! -L .nix-gc-roots/sam3-weights ]; }; then
-        echo "error: Model weights not in Nix store (likely garbage collected)." >&2
-        echo "" >&2
-        echo "  Run once (requires Hugging Face token):" >&2
-        echo "    HF_TOKEN=<your-token> nix build .#dinov3-weights .#sam3-weights --impure" >&2
-        echo "" >&2
-        echo "  Then re-run your command. The dev shell will pin them as GC roots." >&2
-        exit 1
-    fi
-    exec nix develop --command just "$@"
 }
 '''
+
+# Helper: ensure we're in a Nix dev shell, re-exec if not.
+# Placed at the top of each recipe's shebang script:
+#   if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec <recipe>; fi
+#
+# Accepts an optional shell name as second argument (default: "default"):
+#   _nix_reexec <recipe> [shell]
+_nix_reexec := '''
+_nix_reexec() {
+    local recipe="$1"
+    local shell="${2:-default}"
+    ''' + _ensure_nix + '''
+    _ensure_nix
+    exec nix develop ".#$shell" --command just "$recipe"
+}
+'''
+
+# Fetch model weights (DINOv3 + SAM3) from Hugging Face.
+# Requires HF_TOKEN env var (the derivation will fail with instructions if missing).
+fetch-weights:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    _ensure_nix
+    echo "==> Fetching DINOv3 weights..."
+    nix build .#dinov3-weights --impure --no-link
+    echo "==> Fetching SAM3 weights..."
+    nix build .#sam3-weights --impure --no-link
+    echo "Done. Weights will be pinned as GC roots on next shell entry."
+
+# Fetch corpus images from external URLs.
+fetch-corpus:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    _ensure_nix
+    echo "==> Fetching corpus images..."
+    nix build .#corpus-images --no-link
+    echo "Done. Corpus images will be pinned as GC roots on next shell entry."
+
+# Fetch everything: model weights + corpus images.
+fetch-all: fetch-weights fetch-corpus
 
 # Run all checks: Nix, Rust, Python
 check:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _nix_reexec }}
-    if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec check; fi
+    if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec check analysis; fi
 
     echo "==> Nix"
     find . -name '*.nix' -not -path './.git/*' -not -path './.direnv/*' -print0 | xargs -0 nixfmt --check
@@ -106,7 +132,7 @@ corpus-test:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _nix_reexec }}
-    if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec corpus-test; fi
+    if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec corpus-test corpus; fi
     {{ _build_analysis_results }}
     _build_analysis_results
     cargo test --features corpus-test -p chronoscope-analysis --test corpus_tests
@@ -116,7 +142,7 @@ corpus-test-vlm:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _nix_reexec }}
-    if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec corpus-test-vlm; fi
+    if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec corpus-test-vlm corpus; fi
     {{ _build_analysis_results }}
     _build_analysis_results
     cargo test --features corpus-test-vlm -p chronoscope-analysis --test corpus_tests

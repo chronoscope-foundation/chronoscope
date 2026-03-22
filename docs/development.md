@@ -103,8 +103,8 @@ Python model tests call `schematool` (Rust binary from `analysis/src/bin/schemat
 
 - In `nix flake check`: schematool comes from the Rust workspace build (`rust.packages.default`)
 - In `just check`: schematool is built by `cargo build --bin schematool` and added to `PATH`
-- Model weights (SAM3, DINOv3) are pre-fetched into the Nix store via fixed-output derivations (`hf download` in a sandboxed FOD) and passed via `DINOV3_MODEL_DIR` / `HF_HOME` env vars
-- `HF_HUB_OFFLINE=1` is always set — any attempt to download at test time is a hard failure
+- Model weights (SAM3, DINOv3) are fetched via `just fetch-weights` into the Nix store as fixed-output derivations (`hf download` in a sandboxed FOD) and passed via `DINOV3_MODEL_DIR` / `HF_HOME` env vars in the `analysis` and `corpus` shells
+- `HF_HUB_OFFLINE=1` is set in those shells — any attempt to download at test time is a hard failure
 
 ### Test Organization
 

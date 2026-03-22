@@ -38,15 +38,13 @@ The thin slice establishes the patterns for the full platform. Next steps includ
 
 ### Development Environment
 
-All Rust, Python, and native dependencies are managed by Nix. The dev shell also provides pre-fetched ML model weights (SAM3, DINOv3) from the Nix store.
+All Rust, Python, and native dependencies are managed by Nix. Three shell tiers provide increasing levels of data so the base shell starts fast:
 
-**First-time setup** — fetch model weights (requires a [HuggingFace token](https://huggingface.co/settings/tokens) with access to the gated models):
-
-```bash
-HF_TOKEN=hf_... nix build --impure .#dinov3-weights .#sam3-weights
-```
-
-This is a one-time step. Once the weights are in the Nix store, the token is no longer needed and all builds are pure. The dev shell pins them as GC roots (in `.nix-gc-roots/`) so Determinate Nix's automatic garbage collection won't sweep them. If weights get collected, `just` commands will fail early with re-fetch instructions.
+| Shell | What it adds | Use case |
+|-------|-------------|----------|
+| `default` | Rust + Python + lint tools | Web dev, API work, most of the repo |
+| `analysis` | + model weights (DINOv3, SAM3) | Analysis pipeline tests |
+| `corpus` | + corpus images | Full corpus test suite |
 
 **Enter the dev shell:**
 
@@ -55,10 +53,24 @@ This is a one-time step. Once the weights are in the Nix store, the token is no 
 direnv allow
 
 # Option 2: manual
-nix develop
+nix develop              # default shell — no large downloads
+nix develop .#analysis   # requires fetch-weights (see below)
+nix develop .#corpus     # requires fetch-weights + fetch-corpus
 ```
 
-`just` commands auto-wrap with `nix develop` if you're not already in the shell, so you can always just run `just check` directly.
+`just` commands auto-wrap with the appropriate shell tier, so you can always just run `just check` directly.
+
+**Fetching model weights and corpus data:**
+
+Model weights (~2 GB) require a one-time fetch with a [HuggingFace token](https://huggingface.co/settings/tokens) that has access to the gated repos:
+
+```bash
+HF_TOKEN=hf_... just fetch-weights   # DINOv3 + SAM3 model weights
+just fetch-corpus                     # corpus images from external URLs
+just fetch-all                        # both of the above
+```
+
+Once fetched, data is pinned as GC roots in `.nix-gc-roots/` so Nix garbage collection won't sweep it. The HF token is only needed for the initial fetch.
 
 ### Quick Start
 

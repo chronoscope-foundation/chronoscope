@@ -146,6 +146,13 @@ let
 
       buildCommand = ''
         export HOME="$TMPDIR"
+        if [ -z "$HF_TOKEN" ]; then
+          echo "error: HF_TOKEN is not set." >&2
+          echo "" >&2
+          echo "  This is a gated model repo that requires a Hugging Face token." >&2
+          echo "  Run: HF_TOKEN=hf_... just fetch-weights" >&2
+          exit 1
+        fi
         hf download "${repo}" \
           --revision "${rev}" \
           --local-dir "$out"

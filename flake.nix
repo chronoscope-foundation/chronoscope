@@ -160,50 +160,102 @@
         # `nix fmt` — format Nix files.
         formatter = pkgs.nixfmt;
 
-        # `nix develop` — interactive development shell.
-        devShells.default = pkgs.mkShell {
-          nativeBuildInputs = rust.devShell.nativeBuildInputs ++ [
-            toolchain
-            pythonEnvs.analysisEnv
-            pkgs.nixfmt
-            pkgs.statix
-            pkgs.deadnix
-          ];
+        # `nix develop` — three-tier interactive development shells.
+        #
+        # default:  Rust + Python + lint tools. No model weights or corpus images.
+        #           Good for web dev, API work, and most of the repo.
+        #
+        # analysis: default + model weights (DINOv3, SAM3). For running
+        #           analysis pipeline tests. Requires `just fetch-weights` first.
+        #
+        # corpus:   analysis + corpus images. For the full corpus test suite.
+        #           Requires `just fetch-corpus` (or `just fetch-all`) first.
+        #
+        # Model weights and corpus images are fetched on demand via just recipes
+        # rather than as Nix derivation dependencies, because they require network
+        # access to gated HF repos (which require an HF account and token) and
+        # external URLs that can be rate-limited.
 
-          inherit (rust.devShell) buildInputs;
+        devShells =
+          let
+            # Shared inputs and env across all shell tiers.
+            baseNativeBuildInputs = rust.devShell.nativeBuildInputs ++ [
+              toolchain
+              pythonEnvs.analysisEnv
+              pkgs.nixfmt
+              pkgs.statix
+              pkgs.deadnix
+            ];
 
-          env =
-            rust.devShell.env
-            // pythonEnvs.modelEnv
-            // {
-              # fenix's combined toolchain has a sysroot layout rust-analyzer
-              # can't always auto-detect. Explicit path is the standard Nix workaround.
+            baseEnv = rust.devShell.env // {
               RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
-              # Corpus manifest for Rust (Nix-evaluated JSON of analysis/corpus.nix)
               CORPUS_MANIFEST = corpus.corpusManifestJson;
-              # Pre-fetched corpus images (Nix link farm: entry-id → image file)
-              CORPUS_IMAGES = corpus.corpusImages;
-              # ANALYSIS_RESULTS is NOT set here — it requires the expensive GPU
-              # derivation, which would block `nix develop`. Corpus test recipes
-              # build it on demand via `nix build .#analysis-results`.
+              PYTORCH_ENABLE_MPS_FALLBACK = "1";
+              HF_HUB_OFFLINE = "1";
             };
 
-          shellHook = ''
-            # Pin large store paths as GC roots so determinate-nixd auto-GC won't collect them.
-            # Use an absolute path anchored to the repo root so roots don't scatter
-            # into whatever subdirectory `nix develop` happens to be invoked from.
-            _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
-            mkdir -p "$_gc_root_dir"
-            nix-store --realise ${pythonEnvs.dinov3Repo} --add-root "$_gc_root_dir/dinov3-weights" > /dev/null 2>&1 || true
-            nix-store --realise ${pythonEnvs.sam3Cache} --add-root "$_gc_root_dir/sam3-weights" > /dev/null 2>&1 || true
-            nix-store --realise ${corpus.corpusImages} --add-root "$_gc_root_dir/corpus-images" > /dev/null 2>&1 || true
+            # Pin store paths as GC roots so determinate-nixd auto-GC won't collect them.
+            gcRootPreamble = ''
+              _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
+              mkdir -p "$_gc_root_dir"
+            '';
 
-            echo "chronoscope dev shell"
-            echo "  rust: $(rustc --version)"
-            echo "  protoc: $(protoc --version)"
-            echo "  python: $(python3 --version)"
-          '';
-        };
+            pinWeightsAsRoots = ''
+              nix-store --realise ${pythonEnvs.dinov3Repo} --add-root "$_gc_root_dir/dinov3-weights" > /dev/null 2>&1
+              nix-store --realise ${pythonEnvs.sam3Cache} --add-root "$_gc_root_dir/sam3-weights" > /dev/null 2>&1
+            '';
+
+            pinCorpusAsRoots = ''
+              nix-store --realise ${corpus.corpusImages} --add-root "$_gc_root_dir/corpus-images" > /dev/null 2>&1
+            '';
+
+            shellInfo = ''
+              echo "chronoscope dev shell"
+              echo "  rust: $(rustc --version)"
+              echo "  protoc: $($PROTOC --version)"
+              echo "  python: $(python3 --version)"
+            '';
+          in
+          {
+            default = pkgs.mkShell {
+              nativeBuildInputs = baseNativeBuildInputs;
+              inherit (rust.devShell) buildInputs;
+              env = baseEnv;
+              shellHook = ''
+                ${shellInfo}
+              '';
+            };
+
+            analysis = pkgs.mkShell {
+              nativeBuildInputs = baseNativeBuildInputs;
+              inherit (rust.devShell) buildInputs;
+              env =
+                baseEnv
+                // pythonEnvs.modelEnv;
+              shellHook = ''
+                ${gcRootPreamble}
+                ${pinWeightsAsRoots}
+                ${shellInfo}
+              '';
+            };
+
+            corpus = pkgs.mkShell {
+              nativeBuildInputs = baseNativeBuildInputs;
+              inherit (rust.devShell) buildInputs;
+              env =
+                baseEnv
+                // pythonEnvs.modelEnv
+                // {
+                  CORPUS_IMAGES = corpus.corpusImages;
+                };
+              shellHook = ''
+                ${gcRootPreamble}
+                ${pinWeightsAsRoots}
+                ${pinCorpusAsRoots}
+                ${shellInfo}
+              '';
+            };
+          };
       }
     );
 }
