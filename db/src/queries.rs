@@ -198,18 +198,33 @@ define_queries! {
         INSERT INTO entities (id, entity_json, earliest_date, latest_date, latitude, longitude, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ",
+    FIND_ENTITY_BY_ID: "
+        SELECT id, entity_json, earliest_date, latest_date,
+               latitude, longitude, created_at, updated_at
+        FROM entities WHERE id = ?
+    ",
+    FIND_ENTITIES_BY_EXTERNAL_ID: "
+        SELECT e.id, e.entity_json, e.earliest_date, e.latest_date,
+               e.latitude, e.longitude, e.created_at, e.updated_at
+        FROM entities e
+        JOIN entity_external_ids x ON x.entity_id = e.id
+        WHERE x.id_type = ? AND x.external_id = ?
+    ",
 
     // External IDs
     INSERT_EXTERNAL_ID: "INSERT INTO entity_external_ids (id_type, external_id, entity_id) VALUES (?, ?, ?)",
 
     // Entity links
-    INSERT_ENTITY_LINK: "INSERT OR IGNORE INTO entity_links (id, entity_id, link_type, target_url) VALUES (?, ?, ?, ?)",
+    INSERT_ENTITY_LINK: "INSERT OR IGNORE INTO entity_links (id, entity_id, link_type, target_json, target_url) VALUES (?, ?, ?, ?, ?)",
+    FIND_ENTITY_LINKS: "SELECT id, entity_id, link_type, target_json, target_url FROM entity_links WHERE entity_id = ?",
 
     // Entity relations
     INSERT_ENTITY_RELATION: "INSERT INTO entity_relations (from_entity_id, to_entity_id, relation_type, evidence_json) VALUES (?, ?, ?, ?)",
 
     // Annotations
     INSERT_ANNOTATION: "INSERT OR IGNORE INTO annotations (id, entity_id, url_id, kind_json, created_at) VALUES (?, ?, ?, ?, ?)",
+    FIND_ANNOTATIONS_BY_ENTITY: "SELECT id, entity_id, url_id, kind, kind_json, created_at FROM annotations WHERE entity_id = ?",
+    FIND_ANNOTATIONS_BY_URL: "SELECT id, entity_id, url_id, kind, kind_json, created_at FROM annotations WHERE url_id = ?",
 
 }
 

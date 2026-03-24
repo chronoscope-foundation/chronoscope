@@ -9,6 +9,9 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+sqlx = ["dep:sqlx"]
+
 [dependencies]
 chrono.workspace = true
 serde.workspace = true
@@ -18,6 +21,7 @@ schemars.workspace = true
 url.workspace = true
 oxilangtag.workspace = true
 urlencoding = "2.1"
+sqlx = { version = "0.8", default-features = false, features = ["derive"], optional = true }
 
 [dev-dependencies]
 proptest = "1.4"

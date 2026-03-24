@@ -229,9 +229,7 @@
             analysis = pkgs.mkShell {
               nativeBuildInputs = baseNativeBuildInputs;
               inherit (rust.devShell) buildInputs;
-              env =
-                baseEnv
-                // pythonEnvs.modelEnv;
+              env = baseEnv // pythonEnvs.modelEnv;
               shellHook = ''
                 ${gcRootPreamble}
                 ${pinWeightsAsRoots}

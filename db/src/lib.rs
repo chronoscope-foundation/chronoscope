@@ -9,6 +9,7 @@ pub mod media_store;
 pub mod models;
 pub mod queries;
 pub mod queue;
+pub(crate) mod row;
 pub mod types;
 pub mod url;
 pub mod workers;
@@ -22,21 +23,22 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 use chronoscope_integrations::IntegrationRegistry;
 
+pub use chronoscope_core::entity::{EntityRelationType, EntityType};
+pub use chronoscope_core::links::LinkType;
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
-    FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
-    ResolvedContent, ResolvedTarget, User,
+    Annotation, Coordinates, DateRange, EntityLink, FollowedUrl, Media, MediaData, MediaSlot, Page,
+    PageData, ResearchUrl, ResearchUrlWithResolved, ResolvedContent, ResolvedTarget, StoredEntity,
+    User,
 };
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use types::{
-    AnalysisStatus, AnnotationDbId, DbEntityType, Email, EntityDbId, EntityLinkDbId,
+    AnalysisStatus, AnnotationDbId, AnnotationKind, Email, EntityDbId, EntityLinkDbId,
     ExternalIdType, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
     ResearchUrlStatus, SourceType, UserId,
 };
 
 pub use workers::MediaForAnalysis;
-
-use models::{MediaDbRow, PageDbRow, PageMediaRow};
 
 /// Get the current UTC timestamp as `NaiveDateTime` for database storage.
 pub(crate) fn now() -> NaiveDateTime {
@@ -533,6 +535,64 @@ impl Database {
         Ok(rows_affected > 0)
     }
 
+    // ==================== Entities ====================
+
+    /// Find an entity by its database ID.
+    pub async fn find_entity_by_id(&self, id: &EntityDbId) -> DbResult<Option<StoredEntity>> {
+        let row: Option<row::Entity> = sqlx::query_as(queries::FIND_ENTITY_BY_ID.sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|r| r.into_domain()).transpose()
+    }
+
+    /// Find entities by an external ID (e.g., Wikidata Q-ID).
+    pub async fn find_entities_by_external_id(
+        &self,
+        id_type: &ExternalIdType,
+        external_id: &str,
+    ) -> DbResult<Vec<StoredEntity>> {
+        let rows: Vec<row::Entity> = sqlx::query_as(queries::FIND_ENTITIES_BY_EXTERNAL_ID.sql)
+            .bind(id_type)
+            .bind(external_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(|r| r.into_domain()).collect()
+    }
+
+    /// Get all links for an entity.
+    pub async fn find_entity_links(&self, entity_id: &EntityDbId) -> DbResult<Vec<EntityLink>> {
+        let rows: Vec<row::EntityLink> = sqlx::query_as(queries::FIND_ENTITY_LINKS.sql)
+            .bind(entity_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(|r| r.into_domain()).collect()
+    }
+
+    /// Get all annotations for an entity.
+    pub async fn find_annotations_by_entity(
+        &self,
+        entity_id: &EntityDbId,
+    ) -> DbResult<Vec<Annotation>> {
+        let rows: Vec<row::Annotation> = sqlx::query_as(queries::FIND_ANNOTATIONS_BY_ENTITY.sql)
+            .bind(entity_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(|r| r.into_domain()).collect()
+    }
+
+    /// Get all annotations for a research URL.
+    pub async fn find_annotations_by_url(
+        &self,
+        url_id: &ResearchUrlId,
+    ) -> DbResult<Vec<Annotation>> {
+        let rows: Vec<row::Annotation> = sqlx::query_as(queries::FIND_ANNOTATIONS_BY_URL.sql)
+            .bind(url_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(|r| r.into_domain()).collect()
+    }
+
     // ==================== Dossier ====================
 
     /// Get a research URL with all resolved content (page or direct media).
@@ -561,44 +621,31 @@ impl Database {
             ResolvedTarget::Unresolved => None,
             ResolvedTarget::Page(page_id) => {
                 // Fetch page row
-                let page_row: Option<PageDbRow> = sqlx::query_as(queries::GET_PAGE_BY_ID.sql)
+                let page_row: Option<row::Page> = sqlx::query_as(queries::GET_PAGE_BY_ID.sql)
                     .bind(page_id)
                     .fetch_optional(&self.pool)
                     .await?;
 
                 // Fetch media slots for the page
-                let rows: Vec<PageMediaRow> = sqlx::query_as(queries::GET_PAGE_MEDIA.sql)
+                let rows: Vec<row::PageMedia> = sqlx::query_as(queries::GET_PAGE_MEDIA.sql)
                     .bind(page_id)
                     .fetch_all(&self.pool)
                     .await?;
                 let media: Vec<MediaSlot> = rows
                     .into_iter()
-                    .map(PageMediaRow::into_media_slot)
-                    .collect();
+                    .map(row::PageMedia::into_domain)
+                    .collect::<DbResult<_>>()?;
 
-                page_row.map(|row| {
-                    ResolvedContent::Page(Page {
-                        id: row.id,
-                        data: PageData {
-                            source_type: row.source_type,
-                            title: row.title,
-                            author: row.author,
-                            published: row.published,
-                            content: row.content,
-                            fetched_at: row.fetched_at,
-                            media,
-                        },
-                        created_at: row.created_at,
-                    })
-                })
+                page_row.map(|r| ResolvedContent::Page(r.into_domain(media)))
             }
             ResolvedTarget::Media(media_id) => {
                 // Fetch direct media
-                let row: Option<MediaDbRow> = sqlx::query_as(queries::GET_MEDIA_BY_ID.sql)
+                let row: Option<row::Media> = sqlx::query_as(queries::GET_MEDIA_BY_ID.sql)
                     .bind(media_id)
                     .fetch_optional(&self.pool)
                     .await?;
-                row.map(|r| ResolvedContent::Media(r.into_media()))
+                row.map(|r| r.into_domain().map(ResolvedContent::Media))
+                    .transpose()?
             }
         };
 

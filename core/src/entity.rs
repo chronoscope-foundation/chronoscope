@@ -20,7 +20,9 @@ pub struct Entity {
     pub transitions: Vec<EntityTransition>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
     Area,
@@ -231,7 +233,9 @@ impl EntityTransition {
 }
 
 /// Type of relationship between two entities.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
 pub enum EntityRelationType {
     /// This entity replaces the target (e.g., new building on same site after demolition)

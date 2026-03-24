@@ -216,11 +216,13 @@ CREATE TABLE entity_external_ids (
 
 CREATE INDEX idx_external_ids_entity ON entity_external_ids(entity_id);
 
--- External links per entity
+-- External links per entity. target_json is the source of truth (full LinkTarget);
+-- target_url is a shadow column for dedup and display.
 CREATE TABLE entity_links (
     id TEXT PRIMARY KEY,
     entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     link_type TEXT NOT NULL CHECK (link_type IN ('same_as', 'related', 'further_reading')),
+    target_json TEXT NOT NULL,
     target_url TEXT NOT NULL,
     UNIQUE (entity_id, link_type, target_url)
 );

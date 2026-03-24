@@ -62,15 +62,24 @@ define_id!(EntityLinkDbId);
 /// External ID source type for entity deduplication.
 ///
 /// Must stay in sync with the CHECK constraint on `entity_external_ids.id_type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
 pub enum ExternalIdType {
+    #[sqlx(rename = "wikidata")]
     Wikidata,
+    #[sqlx(rename = "osm_node")]
     OsmNode,
+    #[sqlx(rename = "osm_way")]
     OsmWay,
+    #[sqlx(rename = "osm_relation")]
     OsmRelation,
+    #[sqlx(rename = "geonames")]
     GeoNames,
+    #[sqlx(rename = "pleiades")]
     Pleiades,
+    #[sqlx(rename = "getty_tgn")]
     GettyTgn,
+    #[sqlx(rename = "nrhp")]
     Nrhp,
 }
 
@@ -112,56 +121,58 @@ impl fmt::Display for ExternalIdType {
     }
 }
 
-/// Entity type as stored in the database.
+/// Annotation kind discriminant as stored in the database.
 ///
-/// Mirrors `chronoscope_core::entity::EntityType` with `sqlx::Type` support
-/// for direct mapping from SQLite TEXT columns.
+/// This is the tag-only version of `chronoscope_core::annotation::AnnotationKind`
+/// (which is a data-carrying enum). The full JSON lives in `kind_json`; this enum
+/// maps the generated `kind` column used for indexing.
+///
+/// Mirrors the discriminant tag of `chronoscope_core::annotation::AnnotationKind`
+/// with `sqlx::Type` support.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
 #[sqlx(type_name = "TEXT", rename_all = "snake_case")]
-pub enum DbEntityType {
-    Area,
-    Building,
-    Infrastructure,
-    Monument,
-    NaturalFeature,
+pub enum AnnotationKind {
+    SpatialTrace,
+    ExteriorView,
+    InteriorView,
+    TextualNote,
 }
 
-impl DbEntityType {
+impl AnnotationKind {
     /// All variants, for exhaustive testing against DB CHECK constraints.
     #[must_use]
     pub fn all() -> &'static [Self] {
         &[
-            Self::Area,
-            Self::Building,
-            Self::Infrastructure,
-            Self::Monument,
-            Self::NaturalFeature,
+            Self::SpatialTrace,
+            Self::ExteriorView,
+            Self::InteriorView,
+            Self::TextualNote,
         ]
     }
 }
 
-impl std::fmt::Display for DbEntityType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Self::Area => "area",
-            Self::Building => "building",
-            Self::Infrastructure => "infrastructure",
-            Self::Monument => "monument",
-            Self::NaturalFeature => "natural_feature",
-        };
-        write!(f, "{s}")
+/// Exhaustive match ensures adding a variant to
+/// `chronoscope_core::annotation::AnnotationKind` forces a db-side update.
+impl From<&chronoscope_core::annotation::AnnotationKind> for AnnotationKind {
+    fn from(kind: &chronoscope_core::annotation::AnnotationKind) -> Self {
+        match kind {
+            chronoscope_core::annotation::AnnotationKind::SpatialTrace { .. } => Self::SpatialTrace,
+            chronoscope_core::annotation::AnnotationKind::ExteriorView { .. } => Self::ExteriorView,
+            chronoscope_core::annotation::AnnotationKind::InteriorView { .. } => Self::InteriorView,
+            chronoscope_core::annotation::AnnotationKind::TextualNote { .. } => Self::TextualNote,
+        }
     }
 }
 
-impl From<chronoscope_core::entity::EntityType> for DbEntityType {
-    fn from(et: chronoscope_core::entity::EntityType) -> Self {
-        match et {
-            chronoscope_core::entity::EntityType::Area => Self::Area,
-            chronoscope_core::entity::EntityType::Building => Self::Building,
-            chronoscope_core::entity::EntityType::Infrastructure => Self::Infrastructure,
-            chronoscope_core::entity::EntityType::Monument => Self::Monument,
-            chronoscope_core::entity::EntityType::NaturalFeature => Self::NaturalFeature,
-        }
+impl fmt::Display for AnnotationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::SpatialTrace => "spatial_trace",
+            Self::ExteriorView => "exterior_view",
+            Self::InteriorView => "interior_view",
+            Self::TextualNote => "textual_note",
+        };
+        write!(f, "{s}")
     }
 }
 

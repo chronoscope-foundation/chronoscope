@@ -1,41 +1,22 @@
-//! Database models.
+//! Database domain types.
+//!
+//! These are the public types returned by `Database` methods. Raw sqlx row
+//! types live in the `row` module (pub(crate)) and are converted via
+//! `into_domain()` before escaping the crate.
 
 use chrono::NaiveDateTime;
-use chronoscope_core::entity::{Entity, EntityRelationType, EntityTransition};
-use chronoscope_core::links::LinkTarget;
+use chronoscope_core::annotation::AnnotationKind;
+use chronoscope_core::entity::{Entity, EntityTransition, EntityType};
+use chronoscope_core::links::{LinkTarget, LinkType};
 use chronoscope_core::{UncertainDate, UncertainLocation};
 use sqlx::FromRow;
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use crate::types::{
-    AnalysisStatus, DbEntityType, Email, MediaAnalysisState, MediaId, MediaType, PageId,
-    ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
+    AnnotationDbId, Email, EntityDbId, EntityLinkDbId, MediaAnalysisState, MediaId, MediaType,
+    PageId, ResearchUrlId, ResearchUrlStatus, SourceType, UserId,
 };
-
-/// Construct analysis state from raw DB fields, enforcing invariants.
-/// Invalid combinations (e.g., Complete without results) fall back to safe states.
-///
-fn build_analysis_state(
-    status: AnalysisStatus,
-    analysis_result: Option<String>,
-    analysis_error: Option<String>,
-) -> MediaAnalysisState {
-    match status {
-        AnalysisStatus::Pending => MediaAnalysisState::Pending,
-        AnalysisStatus::Processing => MediaAnalysisState::Processing,
-        AnalysisStatus::Complete => match analysis_result {
-            Some(result) => MediaAnalysisState::Complete {
-                analysis_result: result,
-            },
-            // DB corruption: Complete without results. Treat as pending.
-            None => MediaAnalysisState::Pending,
-        },
-        AnalysisStatus::Failed => MediaAnalysisState::Failed {
-            error: analysis_error.unwrap_or_else(|| "Unknown error".to_string()),
-        },
-    }
-}
 
 /// A user account
 #[derive(Debug, Clone, FromRow)]
@@ -153,20 +134,6 @@ pub struct Page {
     pub created_at: NaiveDateTime,
 }
 
-/// Internal row type for reading pages from DB (no media, fetched separately)
-#[derive(Debug, FromRow)]
-pub(crate) struct PageDbRow {
-    pub(crate) id: PageId,
-    pub(crate) source_type: SourceType,
-    pub(crate) title: Option<String>,
-    pub(crate) author: Option<String>,
-    #[sqlx(json(nullable), rename = "published_meta")]
-    pub(crate) published: Option<UncertainDate>,
-    pub(crate) content: Option<String>,
-    pub(crate) fetched_at: NaiveDateTime,
-    pub(crate) created_at: NaiveDateTime,
-}
-
 /// Core media data (used for both creation and reading)
 #[derive(Debug, Clone)]
 pub struct MediaData {
@@ -193,58 +160,6 @@ pub struct Media {
     pub analysis: MediaAnalysisState,
 }
 
-/// Internal row type for sqlx (maps to flat DB columns)
-#[derive(Debug, FromRow)]
-pub(crate) struct MediaDbRow {
-    pub(crate) id: MediaId,
-    pub(crate) exact_hash: Vec<u8>,
-    pub(crate) perceptual_hash: Option<Vec<u8>>,
-    pub(crate) storage_key: String,
-    pub(crate) media_type: MediaType,
-    pub(crate) width: i32,
-    pub(crate) height: i32,
-    pub(crate) duration_seconds: Option<f32>,
-    #[sqlx(json(nullable), rename = "captured_meta")]
-    pub(crate) captured: Option<UncertainDate>,
-    #[sqlx(json(nullable), rename = "location_meta")]
-    pub(crate) location: Option<UncertainLocation>,
-    pub(crate) source_metadata: Option<String>,
-    pub(crate) fetched_at: NaiveDateTime,
-    pub(crate) created_at: NaiveDateTime,
-    pub(crate) analysis_status: AnalysisStatus,
-    pub(crate) analysis_result: Option<String>,
-    pub(crate) analysis_error: Option<String>,
-}
-
-impl MediaDbRow {
-    pub(crate) fn into_media(self) -> Media {
-        let analysis = build_analysis_state(
-            self.analysis_status,
-            self.analysis_result,
-            self.analysis_error,
-        );
-
-        Media {
-            id: self.id,
-            data: MediaData {
-                exact_hash: self.exact_hash,
-                perceptual_hash: self.perceptual_hash,
-                storage_key: self.storage_key,
-                media_type: self.media_type,
-                width: self.width,
-                height: self.height,
-                duration_seconds: self.duration_seconds,
-                captured: self.captured,
-                location: self.location,
-                source_metadata: self.source_metadata,
-                fetched_at: self.fetched_at,
-            },
-            created_at: self.created_at,
-            analysis,
-        }
-    }
-}
-
 /// Resolved content - either a page with embedded media, or direct media
 #[derive(Debug, Clone)]
 pub enum ResolvedContent {
@@ -259,84 +174,64 @@ pub struct ResearchUrlWithResolved {
     pub resolved: Option<ResolvedContent>,
 }
 
-/// Raw row from the page media query (internal use only)
-#[derive(Debug, FromRow)]
-pub(crate) struct PageMediaRow {
-    pub(crate) source_url: String,
-    // Media fields (all optional since LEFT JOIN)
-    pub(crate) id: Option<MediaId>,
-    pub(crate) exact_hash: Option<Vec<u8>>,
-    pub(crate) perceptual_hash: Option<Vec<u8>>,
-    pub(crate) storage_key: Option<String>,
-    pub(crate) media_type: Option<MediaType>,
-    pub(crate) width: Option<i32>,
-    pub(crate) height: Option<i32>,
-    pub(crate) duration_seconds: Option<f32>,
-    #[sqlx(json(nullable), rename = "captured_meta")]
-    pub(crate) captured: Option<UncertainDate>,
-    #[sqlx(json(nullable), rename = "location_meta")]
-    pub(crate) location: Option<UncertainLocation>,
-    pub(crate) source_metadata: Option<String>,
-    pub(crate) fetched_at: Option<NaiveDateTime>,
-    pub(crate) created_at: Option<NaiveDateTime>,
-    pub(crate) analysis_status: Option<AnalysisStatus>,
-    pub(crate) analysis_result: Option<String>,
-    pub(crate) analysis_error: Option<String>,
-}
-
-impl PageMediaRow {
-    pub(crate) fn into_media_slot(mut self) -> MediaSlot {
-        let url = std::mem::take(&mut self.source_url);
-        MediaSlot {
-            url,
-            resolved: self.into_media(),
-        }
-    }
-
-    /// Build Media from LEFT JOIN fields. Returns None if id is absent.
-    fn into_media(self) -> Option<Media> {
-        let id = self.id?;
-        let analysis = build_analysis_state(
-            self.analysis_status?,
-            self.analysis_result,
-            self.analysis_error,
-        );
-
-        Some(Media {
-            id,
-            data: MediaData {
-                exact_hash: self.exact_hash?,
-                perceptual_hash: self.perceptual_hash,
-                storage_key: self.storage_key?,
-                media_type: self.media_type?,
-                width: self.width?,
-                height: self.height?,
-                duration_seconds: self.duration_seconds,
-                captured: self.captured,
-                location: self.location,
-                source_metadata: self.source_metadata,
-                fetched_at: self.fetched_at?,
-            },
-            created_at: self.created_at?,
-            analysis,
-        })
-    }
-}
-
 // ==================== Entities ====================
 
-/// Row type for reading entities from DB.
-#[derive(Debug, FromRow)]
-pub struct EntityDbRow {
-    pub id: crate::types::EntityDbId,
-    pub entity_type: DbEntityType,
-    pub entity_json: String,
-    pub earliest_date: Option<NaiveDateTime>,
-    pub latest_date: Option<NaiveDateTime>,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
+/// Temporal bounds extracted from entity transitions.
+///
+/// Both fields are always present together — a single transition date
+/// populates both earliest and latest with the same value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DateRange {
+    pub earliest: NaiveDateTime,
+    pub latest: NaiveDateTime,
+}
+
+/// A WGS 84 coordinate pair.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Coordinates {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// An entity as stored in the database.
+///
+/// Wraps `chronoscope_core::entity::Entity` (the domain model) with
+/// database metadata: ID, timestamps, and cached shadow columns.
+#[derive(Debug, Clone)]
+pub struct StoredEntity {
+    pub id: EntityDbId,
+    pub entity: Entity,
+    pub temporal_bounds: Option<DateRange>,
+    pub location: Option<Coordinates>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+}
+
+impl StoredEntity {
+    /// Entity type, derived from the stored entity.
+    #[must_use]
+    pub fn entity_type(&self) -> EntityType {
+        self.entity.entity_type
+    }
+}
+
+/// An external link attached to an entity, with the full structured target.
+#[derive(Debug, Clone)]
+pub struct EntityLink {
+    pub id: EntityLinkDbId,
+    pub entity_id: EntityDbId,
+    pub link_type: LinkType,
+    pub target: LinkTarget,
+}
+
+/// An annotation linking an entity to a source image region.
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub id: AnnotationDbId,
+    pub entity_id: EntityDbId,
+    pub url_id: ResearchUrlId,
+    pub kind: AnnotationKind,
+    pub created_at: NaiveDateTime,
 }
 
 // ==================== Shadow Column Extraction ====================
@@ -345,7 +240,7 @@ pub struct EntityDbRow {
 ///
 /// Scans all transitions for the earliest and latest dates across all
 /// date fields (`started_at`, `completed_at`, `occurred_at`).
-pub fn extract_temporal_bounds(entity: &Entity) -> (Option<String>, Option<String>) {
+pub fn extract_temporal_bounds(entity: &Entity) -> (Option<NaiveDateTime>, Option<NaiveDateTime>) {
     let mut earliest: Option<NaiveDateTime> = None;
     let mut latest: Option<NaiveDateTime> = None;
 
@@ -359,10 +254,7 @@ pub fn extract_temporal_bounds(entity: &Entity) -> (Option<String>, Option<Strin
         }
     }
 
-    (
-        earliest.map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string()),
-        latest.map(|dt| dt.format("%Y-%m-%dT%H:%M:%S").to_string()),
-    )
+    (earliest, latest)
 }
 
 /// Extract location (lat, lon) from entity transitions.
@@ -398,31 +290,11 @@ pub fn extract_target_url(target: &LinkTarget) -> String {
     target.to_url().to_string()
 }
 
-// Manual match rather than serde because these are flat strings, not tagged JSON objects.
-
-/// Serialize [`LinkType`] to its `snake_case` DB string.
-pub fn link_type_to_db(lt: &chronoscope_core::links::LinkType) -> &'static str {
-    match lt {
-        chronoscope_core::links::LinkType::SameAs => "same_as",
-        chronoscope_core::links::LinkType::Related => "related",
-        chronoscope_core::links::LinkType::FurtherReading => "further_reading",
-    }
-}
-
-/// Serialize [`EntityRelationType`] to its `snake_case` DB string.
-pub fn relation_type_to_db(rt: &EntityRelationType) -> &'static str {
-    match rt {
-        EntityRelationType::Replaces => "replaces",
-        EntityRelationType::Contains => "contains",
-        EntityRelationType::MergedFrom => "merged_from",
-        EntityRelationType::SplitFrom => "split_from",
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use chrono::Datelike;
+
     use super::*;
-    use chronoscope_core::entity::{EntityTransition, EntityType};
 
     #[test]
     fn extract_temporal_bounds_empty() {
@@ -458,9 +330,8 @@ mod tests {
         };
         let (earliest, latest) = extract_temporal_bounds(&entity);
         // completed_at populates both earliest and latest
-        assert!(earliest.is_some());
-        let earliest_str = earliest.ok_or("no earliest")?;
-        assert!(earliest_str.starts_with("1889"));
+        let earliest_dt = earliest.ok_or("no earliest")?;
+        assert_eq!(earliest_dt.and_utc().year(), 1889);
         assert!(latest.is_some());
         Ok(())
     }
@@ -483,34 +354,5 @@ mod tests {
         assert!((lat - 48.8584).abs() < f64::EPSILON);
         assert!((lon - 2.2945).abs() < f64::EPSILON);
         Ok(())
-    }
-
-    #[test]
-    fn link_type_to_db_values() {
-        assert_eq!(
-            link_type_to_db(&chronoscope_core::links::LinkType::SameAs),
-            "same_as"
-        );
-        assert_eq!(
-            link_type_to_db(&chronoscope_core::links::LinkType::Related),
-            "related"
-        );
-        assert_eq!(
-            link_type_to_db(&chronoscope_core::links::LinkType::FurtherReading),
-            "further_reading"
-        );
-    }
-
-    #[test]
-    fn relation_type_to_db_values() {
-        use chronoscope_core::entity::EntityRelationType;
-        assert_eq!(
-            relation_type_to_db(&EntityRelationType::Replaces),
-            "replaces"
-        );
-        assert_eq!(
-            relation_type_to_db(&EntityRelationType::Contains),
-            "contains"
-        );
     }
 }

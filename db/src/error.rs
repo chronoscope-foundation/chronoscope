@@ -32,6 +32,9 @@ pub enum DbError {
 
     #[error("Bundle has invalid cross-references: {}", .0.join("; "))]
     InvalidBundle(Vec<String>),
+
+    #[error("Inconsistent row data: {0}")]
+    InconsistentRow(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;

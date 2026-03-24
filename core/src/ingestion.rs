@@ -180,7 +180,7 @@ impl<E: Ord + Clone, S: Ord + Clone, L: Ord + Clone> IngestionBundle<E, S, L> {
             if relation.from_entity == relation.to_entity {
                 errors.push(ReferenceError::SelfRelation {
                     entity_key: relation.from_entity.clone(),
-                    relation_type: relation.relation_type.clone(),
+                    relation_type: relation.relation_type,
                 });
             }
             if !self.entities.contains_key(&relation.from_entity) {

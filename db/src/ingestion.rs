@@ -15,10 +15,7 @@ use chronoscope_core::links::LinkTarget;
 use sqlx::SqlitePool;
 
 use crate::error::{DbError, DbResult};
-use crate::models::{
-    extract_location, extract_target_url, extract_temporal_bounds, link_type_to_db,
-    relation_type_to_db,
-};
+use crate::models::{extract_location, extract_target_url, extract_temporal_bounds};
 use crate::types::{
     AnnotationDbId, EntityDbId, EntityLinkDbId, ExternalIdType, ResearchUrlId, ResearchUrlStatus,
 };
@@ -120,8 +117,8 @@ where
             .query()
             .bind(&new_id)
             .bind(&entity_json)
-            .bind(&earliest)
-            .bind(&latest)
+            .bind(earliest)
+            .bind(latest)
             .bind(location.map(|(lat, _)| lat))
             .bind(location.map(|(_, lon)| lon))
             .bind(timestamp)
@@ -144,13 +141,15 @@ where
         // Insert links
         for link in &links {
             let link_id = EntityLinkDbId::generate();
+            let target_json = serde_json::to_string(&link.target)?;
             let target_url = extract_target_url(&link.target);
 
             queries::INSERT_ENTITY_LINK
                 .query()
                 .bind(&link_id)
                 .bind(&new_id)
-                .bind(link_type_to_db(&link.link_type))
+                .bind(link.link_type)
+                .bind(&target_json)
                 .bind(&target_url)
                 .execute(&mut *tx)
                 .await?;
@@ -198,7 +197,7 @@ where
             )])
         })?;
 
-        let relation_type = relation_type_to_db(&relation.relation_type);
+        let relation_type = relation.relation_type;
         let evidence_json = serde_json::to_string(&relation.evidence)?;
 
         queries::INSERT_ENTITY_RELATION
@@ -281,17 +280,8 @@ mod tests {
 
     use super::*;
     use crate::Database;
-    use crate::models::EntityDbRow;
     use crate::queue::{Queue, url_queue_config};
-
-    /// Query entity by external ID, returning all columns `EntityDbRow` expects.
-    const FIND_ENTITY_FOR_TEST: &str = "
-        SELECT e.id, e.entity_type, e.entity_json, e.earliest_date, e.latest_date,
-               e.latitude, e.longitude, e.created_at, e.updated_at
-        FROM entities e
-        JOIN entity_external_ids x ON x.entity_id = e.id
-        WHERE x.id_type = ? AND x.external_id = ?
-    ";
+    use crate::row;
 
     fn test_entity(name: &str) -> Entity {
         #[allow(clippy::expect_used)]
@@ -403,16 +393,15 @@ mod tests {
         assert_eq!(result.entities_created, 1);
 
         // Verify entity exists via external ID lookup
-        let row: Option<EntityDbRow> = sqlx::query_as(FIND_ENTITY_FOR_TEST)
+        let row: Option<row::Entity> = sqlx::query_as(queries::FIND_ENTITIES_BY_EXTERNAL_ID.sql)
             .bind("wikidata")
             .bind("Q243")
             .fetch_optional(db.pool_ref())
             .await?;
-        let row = row.ok_or("entity not found")?;
-        assert_eq!(row.entity_type, crate::types::DbEntityType::Building);
-        let entity: Entity = serde_json::from_str(&row.entity_json)?;
-        assert_eq!(entity.names.len(), 1);
-        assert_eq!(entity.names[0].value.name, "Eiffel Tower");
+        let stored = row.ok_or("entity not found")?.into_domain()?;
+        assert_eq!(stored.entity_type(), EntityType::Building);
+        assert_eq!(stored.entity.names.len(), 1);
+        assert_eq!(stored.entity.names[0].value.name, "Eiffel Tower");
         Ok(())
     }
 
@@ -506,7 +495,7 @@ mod tests {
 
         load_bundle(db.pool_ref(), &bundle).await?;
 
-        let row: Option<EntityDbRow> = sqlx::query_as(FIND_ENTITY_FOR_TEST)
+        let row: Option<row::Entity> = sqlx::query_as(queries::FIND_ENTITIES_BY_EXTERNAL_ID.sql)
             .bind("wikidata")
             .bind("Q243")
             .fetch_optional(db.pool_ref())
@@ -539,7 +528,7 @@ mod tests {
 
         load_bundle(db.pool_ref(), &bundle).await?;
 
-        let row: Option<EntityDbRow> = sqlx::query_as(FIND_ENTITY_FOR_TEST)
+        let row: Option<row::Entity> = sqlx::query_as(queries::FIND_ENTITIES_BY_EXTERNAL_ID.sql)
             .bind("wikidata")
             .bind("Q243")
             .fetch_optional(db.pool_ref())
@@ -600,25 +589,25 @@ mod tests {
     #[tokio::test]
     async fn all_enum_variants_accepted_by_db_checks()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use crate::types::{DbEntityType, EntityLinkDbId, ExternalIdType};
+        use crate::types::{EntityLinkDbId, ExternalIdType};
         use chronoscope_core::links::LinkType;
 
         let db = test_db().await?;
         let timestamp = crate::now();
 
         // --- EntityType: insert one entity per variant ---
-        let entity_types = DbEntityType::all();
+        let entity_types = [
+            EntityType::Area,
+            EntityType::Building,
+            EntityType::Infrastructure,
+            EntityType::Monument,
+            EntityType::NaturalFeature,
+        ];
         let mut entity_ids = Vec::new();
         for (i, &et) in entity_types.iter().enumerate() {
             let id = EntityDbId::generate();
             let entity = Entity {
-                entity_type: match et {
-                    DbEntityType::Area => EntityType::Area,
-                    DbEntityType::Building => EntityType::Building,
-                    DbEntityType::Infrastructure => EntityType::Infrastructure,
-                    DbEntityType::Monument => EntityType::Monument,
-                    DbEntityType::NaturalFeature => EntityType::NaturalFeature,
-                },
+                entity_type: et,
                 names: vec![],
                 transitions: vec![],
             };
@@ -637,13 +626,12 @@ mod tests {
                 .await?;
 
             // Verify the generated column round-trips the type
-            let row: EntityDbRow = sqlx::query_as(
-                "SELECT id, entity_type, entity_json, earliest_date, latest_date, latitude, longitude, created_at, updated_at FROM entities WHERE id = ?",
-            )
-            .bind(&id)
-            .fetch_one(db.pool_ref())
-            .await?;
-            assert_eq!(row.entity_type, et, "entity_type mismatch for variant {i}");
+            let (stored_type,): (EntityType,) =
+                sqlx::query_as("SELECT entity_type FROM entities WHERE id = ?")
+                    .bind(&id)
+                    .fetch_one(db.pool_ref())
+                    .await?;
+            assert_eq!(stored_type, et, "entity_type mismatch for variant {i}");
 
             entity_ids.push(id);
         }
@@ -656,7 +644,7 @@ mod tests {
         for (i, id_type) in ExternalIdType::all().iter().enumerate() {
             queries::INSERT_EXTERNAL_ID
                 .query()
-                .bind(id_type.as_str())
+                .bind(id_type)
                 .bind(format!("test-ext-{i}"))
                 .bind(entity_a)
                 .execute(db.pool_ref())
@@ -671,12 +659,18 @@ mod tests {
         ];
         for (i, lt) in link_types.iter().enumerate() {
             let link_id = EntityLinkDbId::generate();
+            let url = format!("https://example.com/link-{i}");
+            let target = LinkTarget::Url {
+                url: url::Url::parse(&url)?,
+            };
+            let target_json = serde_json::to_string(&target)?;
             queries::INSERT_ENTITY_LINK
                 .query()
                 .bind(&link_id)
                 .bind(entity_a)
-                .bind(crate::models::link_type_to_db(lt))
-                .bind(format!("https://example.com/link-{i}"))
+                .bind(*lt)
+                .bind(&target_json)
+                .bind(&url)
                 .execute(db.pool_ref())
                 .await?;
         }
@@ -693,7 +687,7 @@ mod tests {
                 .query()
                 .bind(entity_a)
                 .bind(entity_b)
-                .bind(crate::models::relation_type_to_db(rt))
+                .bind(*rt)
                 .bind("[]")
                 .execute(db.pool_ref())
                 .await?;
@@ -758,6 +752,156 @@ mod tests {
 
         let result = load_bundle(db.pool_ref(), &bundle).await?;
         assert_eq!(result.entities_created, 1);
+        Ok(())
+    }
+
+    // ==================== Round-trip read query tests ====================
+
+    /// Verifies the full pipeline: load bundle → insert entity + external IDs →
+    /// query via JOIN → deserialize JSON → produce `StoredEntity` with correct fields.
+    /// Tests both the single-entity case and the split-entity case where multiple
+    /// entities share the same external ID (e.g., lifecycle phases of one Wikidata entity).
+    #[tokio::test]
+    async fn find_entities_by_external_id_round_trip()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let db = test_db().await?;
+
+        // Two entities sharing the same Wikidata Q-ID (entity split: the original
+        // Saint Thomas Church burned in 1905, a new building was constructed in 1914.
+        // Wikidata models both as Q4356655, but we split them into separate entities.)
+        let e0 = EntityIdx::new(0);
+        let e1 = EntityIdx::new(1);
+        let l0 = LinkIdx::new(0);
+        let bundle = IngestionOutput {
+            entities: BTreeMap::from([
+                (e0, test_entity("Saint Thomas Church (1870)")),
+                (e1, test_entity("Saint Thomas Church (1914)")),
+            ]),
+            images: BTreeMap::new(),
+            external_links: BTreeMap::from([(l0, wikidata_link("Q4356655"))]),
+            entity_links: BTreeMap::from([(e0, vec![l0]), (e1, vec![l0])]),
+            entity_relations: vec![],
+            annotations: vec![],
+            notes: None,
+        };
+
+        load_bundle(db.pool_ref(), &bundle).await?;
+
+        let results = db
+            .find_entities_by_external_id(&crate::types::ExternalIdType::Wikidata, "Q4356655")
+            .await?;
+
+        assert_eq!(results.len(), 2);
+        let mut names: Vec<&str> = results
+            .iter()
+            .map(|e| e.entity.names[0].value.name.as_str())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["Saint Thomas Church (1870)", "Saint Thomas Church (1914)"]
+        );
+
+        // Both should be distinct entities
+        assert_ne!(results[0].id, results[1].id);
+        Ok(())
+    }
+
+    /// Verifies `LinkType` `sqlx::Type` mapping round-trips correctly through the DB.
+    #[tokio::test]
+    async fn find_entity_links_round_trip() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    {
+        let db = test_db().await?;
+        let bundle = test_bundle(); // has one Wikidata same_as link
+
+        load_bundle(db.pool_ref(), &bundle).await?;
+
+        let stored = db
+            .find_entities_by_external_id(&crate::types::ExternalIdType::Wikidata, "Q243")
+            .await?
+            .into_iter()
+            .next()
+            .ok_or("entity not found")?;
+
+        let links = db.find_entity_links(&stored.id).await?;
+        assert_eq!(links.len(), 1);
+        assert_eq!(
+            links[0].link_type,
+            chronoscope_core::links::LinkType::SameAs
+        );
+        // target is the parsed LinkTarget, not a raw JSON string
+        assert!(matches!(
+            links[0].target,
+            chronoscope_core::links::LinkTarget::Wikidata { .. }
+        ));
+        Ok(())
+    }
+
+    /// Verifies `AnnotationKind` `sqlx::Type` mapping and both query paths
+    /// (by entity, by URL) return consistent results.
+    #[tokio::test]
+    async fn find_annotations_round_trip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let db = test_db().await?;
+
+        let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
+        let s0 = add_image(&mut bundle, "https://example.com/eiffel.jpg");
+        bundle.annotations.push(Annotation {
+            source: s0,
+            entity: eidxs[0],
+            kind: AnnotationKind::ExteriorView { region: None },
+        });
+
+        load_bundle(db.pool_ref(), &bundle).await?;
+
+        let stored = db
+            .find_entities_by_external_id(&crate::types::ExternalIdType::Wikidata, "Q243")
+            .await?
+            .into_iter()
+            .next()
+            .ok_or("entity not found")?;
+
+        // By entity
+        let by_entity = db.find_annotations_by_entity(&stored.id).await?;
+        assert_eq!(by_entity.len(), 1);
+        assert!(matches!(
+            by_entity[0].kind,
+            AnnotationKind::ExteriorView { .. }
+        ));
+        assert_eq!(by_entity[0].entity_id, stored.id);
+
+        // By URL
+        let by_url = db.find_annotations_by_url(&by_entity[0].url_id).await?;
+        assert_eq!(by_url.len(), 1);
+        assert_eq!(by_url[0].id, by_entity[0].id);
+        Ok(())
+    }
+
+    /// Verifies `DateRange` assembly in `into_domain`: two separate DB columns
+    /// (`earliest_date`, `latest_date`) must combine into `Option<DateRange>`.
+    #[tokio::test]
+    async fn stored_entity_temporal_bounds_assembled_from_shadow_columns()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let db = test_db().await?;
+
+        let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
+        bundle
+            .entities
+            .insert(eidxs[0], test_entity_with_date("Eiffel Tower", 1889));
+
+        load_bundle(db.pool_ref(), &bundle).await?;
+
+        let stored = db
+            .find_entities_by_external_id(&crate::types::ExternalIdType::Wikidata, "Q243")
+            .await?
+            .into_iter()
+            .next()
+            .ok_or("entity not found")?;
+
+        let bounds = stored.temporal_bounds.ok_or("no temporal_bounds")?;
+        assert_eq!(bounds.latest.and_utc().year(), 1889);
+        assert_eq!(bounds.earliest.and_utc().year(), 1889);
+        // The deserialized Entity should also have the transition
+        assert_eq!(stored.entity.transitions.len(), 1);
         Ok(())
     }
 }

@@ -122,7 +122,7 @@ fn url_link(link_type: LinkType) -> PropertyHandler {
                     Ok(url) => {
                         out.add_link(ExternalLink {
                             target: LinkTarget::Url { url },
-                            link_type: link_type.clone(),
+                            link_type,
                         });
                     }
                     Err(e) => out.issue(format!("invalid URL: {e}")),

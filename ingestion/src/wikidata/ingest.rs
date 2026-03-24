@@ -175,7 +175,7 @@ mod entity_accumulator {
 
             for transitions in lifecycles {
                 let mut entity = Entity {
-                    entity_type: self.entity_type.clone(),
+                    entity_type: self.entity_type,
                     names: names.clone(),
                     transitions,
                 };
