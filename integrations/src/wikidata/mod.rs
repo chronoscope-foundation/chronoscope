@@ -88,6 +88,14 @@ impl TryFrom<String> for ApiTimestamp {
     }
 }
 
+impl std::str::FromStr for ApiTimestamp {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s.to_string())
+    }
+}
+
 impl std::fmt::Display for ApiTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)

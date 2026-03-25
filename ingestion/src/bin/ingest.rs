@@ -1,19 +1,18 @@
 //! Chronoscope ingestion CLI.
 //!
 //! Subcommands for the Wikidata ingestion pipeline:
-//! - `resolve`: Resolve entity IDs + timestamp to a versioned manifest
-//! - `fetch`: Fetch entities at pinned revisions (produces JSONL)
+//! - `fetch`: Fetch entities at a timestamp (resolves revisions, produces JSONL)
 //! - `filter`: Filter a Wikidata dump for architectural entities
-//! - `ingest`: Transform JSONL into an `IngestionBundle`
+//! - `bundle`: Transform JSONL into an `IngestionBundle`
 //! - `check`: Analyze an `IngestionBundle` for consistency
+//! - `load`: Load an `IngestionBundle` into a SQLite database
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chronoscope_integrations::wikidata::{
-    ApiTimestamp, PageId, RevisionId, WikidataClient, WikidataEntity, WikidataId,
-};
+use chronoscope_integrations::wikidata::{ApiTimestamp, RevisionId, WikidataClient, WikidataId};
 use chronoscope_integrations::{ReqwestClient, ReqwestConfig};
 
 /// Chronoscope ingestion pipeline
@@ -24,39 +23,62 @@ struct Cli {
     command: Command,
 }
 
+/// Output target: file path or stdout.
+#[derive(Clone)]
+enum OutputTarget {
+    Stdout,
+    File(PathBuf),
+}
+
+impl OutputTarget {
+    fn open(&self) -> Result<std::io::BufWriter<Box<dyn std::io::Write>>> {
+        let writer: Box<dyn std::io::Write> = match self {
+            Self::Stdout => Box::new(std::io::stdout().lock()),
+            Self::File(path) => {
+                let file = std::fs::File::create(path)
+                    .with_context(|| format!("Failed to create {}", path.display()))?;
+                Box::new(file)
+            }
+        };
+        Ok(std::io::BufWriter::new(writer))
+    }
+}
+
+fn parse_output_target(s: &str) -> std::result::Result<OutputTarget, String> {
+    if s == "-" {
+        Ok(OutputTarget::Stdout)
+    } else {
+        Ok(OutputTarget::File(PathBuf::from(s)))
+    }
+}
+
+fn parse_entity_arg(s: &str) -> std::result::Result<(WikidataId, String), String> {
+    let (qid, name) = s
+        .split_once('=')
+        .ok_or_else(|| format!("entity must be QID=Name, got: {s}"))?;
+    let id = WikidataId::try_from(qid.to_string())?;
+    Ok((id, name.to_string()))
+}
+
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Resolve entity IDs at a timestamp to produce a versioned manifest.
+    /// Fetch entities from Wikidata at a specific timestamp.
     ///
-    /// Takes a list of entity IDs and a timestamp, resolves revision IDs
-    /// for each entity (and any Commons gallery pages), and outputs a
-    /// manifest with pinned revisions suitable for deterministic fetching.
-    Resolve {
+    /// Resolves revision IDs at the given timestamp, fetches entity data,
+    /// and validates that each entity has a label matching the provided name.
+    /// Produces deterministic sorted JSONL.
+    Fetch {
         /// Timestamp to pin revisions to (e.g., "2022-01-03T00:00:00Z")
         #[arg(short, long)]
-        timestamp: String,
+        timestamp: ApiTimestamp,
 
-        /// Entity IDs to resolve (e.g., Q243 Q2981)
-        #[arg(required = true)]
-        entities: Vec<String>,
-
-        /// Output manifest JSON file path (or - for stdout)
-        #[arg(short, long, default_value = "-")]
-        output: String,
-    },
-
-    /// Fetch entities at pinned revisions, producing JSONL.
-    ///
-    /// Reads a versioned manifest (from `resolve`) and fetches entity data
-    /// at the exact revisions specified.
-    Fetch {
-        /// Path to manifest JSON file (or - for stdin)
-        #[arg(short, long)]
-        manifest: String,
+        /// Entities to fetch as QID=Name pairs (e.g., Q243="Eiffel Tower")
+        #[arg(short, long = "entity", required = true, value_parser = parse_entity_arg)]
+        entities: Vec<(WikidataId, String)>,
 
         /// Output JSONL file path (or - for stdout)
-        #[arg(short, long, default_value = "-")]
-        output: String,
+        #[arg(short, long, default_value = "-", value_parser = parse_output_target)]
+        output: OutputTarget,
     },
 
     /// Filter a Wikidata dump for architectural entities.
@@ -85,14 +107,14 @@ enum Command {
     ///
     /// Reads pre-filtered JSONL (from `fetch` or `filter`), processes each
     /// entity concurrently, and writes a complete `IngestionBundle` as JSON.
-    Ingest {
+    Bundle {
         /// Input JSONL file path
         #[arg(short, long)]
-        input: String,
+        input: PathBuf,
 
         /// Output `IngestionBundle` JSON file path
         #[arg(short, long)]
-        output: String,
+        output: PathBuf,
 
         /// Print progress information
         #[arg(short, long)]
@@ -114,17 +136,14 @@ enum Command {
     ///
     /// Creates or opens the database, runs migrations, and loads all
     /// entities, images, relations, and annotations from the bundle.
-    ///
-    /// Currently Wikidata-specific (uses Wikidata Q-IDs for entity dedup).
-    /// A source flag will be added when additional ingestion sources exist.
     Load {
         /// Path to SQLite database file (created if missing)
         #[arg(short, long)]
-        db: String,
+        db: PathBuf,
 
         /// Input `IngestionBundle` JSON file path
         #[arg(short, long)]
-        input: String,
+        input: PathBuf,
     },
 }
 
@@ -140,26 +159,22 @@ fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Resolve {
+        Command::Fetch {
             timestamp,
             entities,
             output,
-        } => {
-            let ts = ApiTimestamp::try_from(timestamp).map_err(|e| anyhow::anyhow!("{e}"))?;
-            cmd_resolve(&ts, &entities, &output).await
-        }
-        Command::Fetch { manifest, output } => cmd_fetch(&manifest, &output).await,
+        } => cmd_fetch(&timestamp, &entities, &output).await,
         Command::Filter {
             input,
             output,
             limit,
             verbose,
         } => cmd_filter(&input, &output, limit, verbose).await,
-        Command::Ingest {
+        Command::Bundle {
             input,
             output,
             verbose,
-        } => cmd_ingest(&input, &output, verbose).await,
+        } => cmd_bundle(&input, &output, verbose).await,
         Command::Check { input } => cmd_check(&input),
         Command::Load { db, input } => cmd_load(&db, &input).await,
     }
@@ -174,91 +189,24 @@ fn wikidata_client(timeout_secs: u64) -> Result<WikidataClient<ReqwestClient>> {
     Ok(WikidataClient::new(http))
 }
 
-/// Open a buffered writer to stdout (if path is "-") or a file.
-fn open_output(path: &str) -> Result<std::io::BufWriter<Box<dyn std::io::Write>>> {
-    let writer: Box<dyn std::io::Write> = if path == "-" {
-        Box::new(std::io::stdout().lock())
-    } else {
-        let file = std::fs::File::create(path)
-            .with_context(|| format!("Failed to create output file {path}"))?;
-        Box::new(file)
-    };
-    Ok(std::io::BufWriter::new(writer))
-}
-
-/// Write entities as JSONL to stdout or a file, sorted by entity ID for determinism.
-fn write_jsonl(output_path: &str, entities: &HashMap<WikidataId, WikidataEntity>) -> Result<()> {
-    use std::io::Write;
-    let mut writer = open_output(output_path)?;
-    let mut sorted_keys: Vec<&WikidataId> = entities.keys().collect();
-    sorted_keys.sort_by_key(|k| k.as_str());
-    for key in sorted_keys {
-        serde_json::to_writer(&mut writer, &entities[key])?;
-        writeln!(writer)?;
-    }
-    Ok(())
-}
-
-/// Write JSON to stdout or a file.
-fn write_json(output_path: &str, value: &impl serde::Serialize) -> Result<()> {
-    use std::io::Write;
-    let mut writer = open_output(output_path)?;
-    serde_json::to_writer_pretty(&mut writer, value)?;
-    writeln!(writer)?;
-    Ok(())
-}
-
 // =============================================================================
-// MANIFEST
+// FETCH
 // =============================================================================
 
-/// Versioned manifest: entity IDs and gallery pages pinned to specific revisions.
-///
-/// Produced by `resolve`, consumed by `fetch`. All revision IDs are explicit,
-/// making fetches fully deterministic. Entity names are validated against the
-/// fetched data — they serve as both documentation and a correctness check.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Manifest {
-    /// Entity ID -> pinned revision with human-readable name.
-    versioned_entities: BTreeMap<WikidataId, VersionedEntity>,
-
-    /// Gallery title -> pinned page/revision.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    gallery_pages: BTreeMap<String, GalleryRevision>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct VersionedEntity {
-    /// Human-readable name, validated against the entity's labels on fetch.
-    name: String,
-    /// Pinned revision ID.
-    revision: RevisionId,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct GalleryRevision {
-    page_id: PageId,
-    revision: RevisionId,
-}
-
-// =============================================================================
-// RESOLVE
-// =============================================================================
-
-async fn cmd_resolve(
+async fn cmd_fetch(
     timestamp: &ApiTimestamp,
-    entity_ids: &[String],
-    output_path: &str,
+    entities: &[(WikidataId, String)],
+    output: &OutputTarget,
 ) -> Result<()> {
     let client = wikidata_client(60)?;
 
     eprintln!(
-        "Resolving {} entities at timestamp {timestamp}",
-        entity_ids.len()
+        "Fetching {} entities at timestamp {timestamp}",
+        entities.len()
     );
 
-    // Resolve and fetch everything at once (entities + gallery media)
-    let ids: Vec<&str> = entity_ids.iter().map(|s| s.as_str()).collect();
+    // Step 1: Resolve revision IDs at the timestamp
+    let ids: Vec<&str> = entities.iter().map(|(id, _)| id.as_str()).collect();
     let revisions = client
         .resolve_revisions(&ids, timestamp)
         .await
@@ -268,134 +216,50 @@ async fn cmd_resolve(
         eprintln!("  {entity_id} -> rev {rev_id}");
     }
 
+    // Step 2: Fetch entities at those revisions
     let revision_pairs: Vec<(&str, RevisionId)> = revisions
         .iter()
         .map(|(id, rev)| (id.as_str(), *rev))
         .collect();
-    let entities = client
+    let fetched = client
         .get_entities_at_revisions(&revision_pairs)
         .await
         .context("Failed to fetch entities")?;
 
-    // Build versioned_entities with English label as name
-    let mut versioned_entities = BTreeMap::new();
-    for (entity_id, rev_id) in &revisions {
-        let name = entities
-            .get(entity_id.as_str())
-            .and_then(|e| e.labels.get("en"))
-            .map(|l| l.value.clone())
-            .unwrap_or_else(|| format!("({entity_id})"));
-        eprintln!("  {entity_id}: {name}");
-        versioned_entities.insert(
-            entity_id.clone(),
-            VersionedEntity {
-                name,
-                revision: *rev_id,
-            },
-        );
-    }
+    eprintln!("  Fetched {} entities", fetched.len());
 
-    // Resolve gallery revisions using the shared helper
-    eprintln!("Resolving gallery pages...");
-    let gallery_resolutions = client
-        .resolve_gallery_revisions_from_entities(&entities, timestamp)
-        .await
-        .context("Failed to resolve gallery revisions")?;
-
-    let mut gallery_pages = BTreeMap::new();
-    for (gallery_name, resolution) in &gallery_resolutions {
-        match resolution {
-            Some((page_id, rev_id)) => {
-                eprintln!("  {gallery_name} -> page {page_id}, rev {rev_id}");
-                gallery_pages.insert(
-                    gallery_name.clone(),
-                    GalleryRevision {
-                        page_id: *page_id,
-                        revision: *rev_id,
-                    },
-                );
-            }
-            None => {
-                eprintln!("  {gallery_name}: page not found");
-            }
+    // Step 3: Validate names against provided names
+    for (qid, expected_name) in entities {
+        let entity = fetched
+            .get(qid)
+            .ok_or_else(|| anyhow::anyhow!("entity {qid} not found in fetched results"))?;
+        let has_matching_label = entity
+            .labels
+            .values()
+            .any(|label| label.value == *expected_name);
+        if !has_matching_label {
+            let actual_labels: Vec<&str> = entity
+                .labels
+                .values()
+                .map(|l| l.value.as_str())
+                .take(5)
+                .collect();
+            anyhow::bail!(
+                "name mismatch for {qid}: expected '{expected_name}' but labels are {actual_labels:?}",
+            );
         }
     }
 
-    let manifest = Manifest {
-        versioned_entities,
-        gallery_pages,
-    };
-
-    write_json(output_path, &manifest)?;
-    eprintln!("Done!");
-    Ok(())
-}
-
-// =============================================================================
-// FETCH
-// =============================================================================
-
-async fn cmd_fetch(manifest_path: &str, output_path: &str) -> Result<()> {
-    // Read manifest
-    let manifest_json = if manifest_path == "-" {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .context("Failed to read manifest from stdin")?;
-        buf
-    } else {
-        std::fs::read_to_string(manifest_path)
-            .with_context(|| format!("Failed to read manifest from {manifest_path}"))?
-    };
-    let manifest: Manifest =
-        serde_json::from_str(&manifest_json).context("Failed to parse manifest")?;
-
-    eprintln!(
-        "Fetching {} entities at pinned revisions",
-        manifest.versioned_entities.len()
-    );
-
-    let client = wikidata_client(60)?;
-
-    // Fetch entities at their pinned revisions
-    let revision_pairs: Vec<(&str, RevisionId)> = manifest
-        .versioned_entities
-        .iter()
-        .map(|(id, ve)| (id.as_str(), ve.revision))
-        .collect();
-
-    let entities = client
-        .get_entities_at_revisions(&revision_pairs)
-        .await
-        .context("Failed to fetch entities")?;
-
-    eprintln!("  Fetched {} entities", entities.len());
-
-    // Validate names: each entity must have a label matching the manifest name
-    for (entity_id, entity) in &entities {
-        if let Some(ve) = manifest.versioned_entities.get(entity_id) {
-            let has_matching_label = entity.labels.values().any(|label| label.value == ve.name);
-            if !has_matching_label {
-                let actual_labels: Vec<&str> = entity
-                    .labels
-                    .values()
-                    .map(|l| l.value.as_str())
-                    .take(5)
-                    .collect();
-                anyhow::bail!(
-                    "name mismatch for {}: manifest says '{}' but entity labels are {:?}",
-                    entity_id,
-                    ve.name,
-                    actual_labels
-                );
-            }
-        }
+    // Step 4: Write sorted JSONL
+    let mut writer = output.open()?;
+    let mut sorted_keys: Vec<&WikidataId> = fetched.keys().collect();
+    sorted_keys.sort_by_key(|k| k.as_str());
+    for key in sorted_keys {
+        serde_json::to_writer(&mut writer, &fetched[key])?;
+        writeln!(writer)?;
     }
 
-    write_jsonl(output_path, &entities)?;
-
-    eprintln!("Done! Wrote {} entities", entities.len());
+    eprintln!("Done! Wrote {} entities", fetched.len());
     Ok(())
 }
 
@@ -412,18 +276,18 @@ async fn cmd_filter(input: &Path, output: &Path, limit: Option<u64>, verbose: bo
 }
 
 // =============================================================================
-// INGEST
+// BUNDLE
 // =============================================================================
 
-async fn cmd_ingest(input: &str, output: &str, verbose: bool) -> Result<()> {
+async fn cmd_bundle(input: &Path, output: &Path, verbose: bool) -> Result<()> {
     let config = chronoscope_ingestion::wikidata::ingest::Config {
-        input_path: input.to_string(),
-        output_path: output.to_string(),
+        input_path: input.to_path_buf(),
+        output_path: output.to_path_buf(),
         verbose,
     };
 
-    // TODO: Load gallery media from a pre-resolved file when available.
-    // For now, pass an empty map (galleries will be skipped during ingestion).
+    // Gallery media is not resolved at bundle time — gallery images will be
+    // handled by a dedicated Commons worker in a future commit.
     let gallery_media = HashMap::new();
     chronoscope_ingestion::wikidata::ingest::run(&config, &gallery_media).await
 }
@@ -448,8 +312,9 @@ fn cmd_check(input: &Path) -> Result<()> {
 // LOAD
 // =============================================================================
 
-async fn cmd_load(db_path: &str, input: &str) -> Result<()> {
-    let data = std::fs::read_to_string(input).with_context(|| format!("Failed to read {input}"))?;
+async fn cmd_load(db_path: &Path, input: &Path) -> Result<()> {
+    let data = std::fs::read_to_string(input)
+        .with_context(|| format!("Failed to read {}", input.display()))?;
     let bundle: chronoscope_core::IngestionOutput =
         serde_json::from_str(&data).context("Failed to parse IngestionBundle")?;
 
@@ -461,7 +326,7 @@ async fn cmd_load(db_path: &str, input: &str) -> Result<()> {
         bundle.annotations.len(),
     );
 
-    let db_url = format!("sqlite:{db_path}?mode=rwc");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
     let db = chronoscope_db::Database::new(&db_url)
         .await
         .context("Failed to open database")?;

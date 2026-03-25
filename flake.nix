@@ -88,6 +88,15 @@
           rustCommonArgs = rust.commonArgs;
         };
 
+        wikidata = import ./nix/wikidata.nix {
+          inherit
+            pkgs
+            lib
+            craneLib
+            ;
+          rustCommonArgs = rust.commonArgs;
+        };
+
         # Phase 3: Web frontend (WASM).
         web = import ./nix/web.nix {
           inherit
@@ -155,6 +164,10 @@
             # Model weights — build with --impure and HF_TOKEN to populate store.
             dinov3-weights = pythonEnvs.dinov3Repo;
             sam3-weights = pythonEnvs.sam3Cache;
+            # Wikidata entity pipeline.
+            wikidata-curated-entities = wikidata.bundles.curated.entities;
+            wikidata-curated-bundle = wikidata.bundles.curated.ingestionBundle;
+            wikidata-curated-db = wikidata.bundles.curated.testDb;
           };
 
         # `nix fmt` — format Nix files.
@@ -190,14 +203,20 @@
             baseEnv = rust.devShell.env // {
               RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
               CORPUS_MANIFEST = corpus.corpusManifestJson;
+              WIKIDATA_TEST_DB = wikidata.bundles.curated.testDb;
               PYTORCH_ENABLE_MPS_FALLBACK = "1";
               HF_HUB_OFFLINE = "1";
             };
 
-            # Pin store paths as GC roots so determinate-nixd auto-GC won't collect them.
-            gcRootPreamble = ''
+            # Common shell hook: GC root setup + wikidata test DB pinning.
+            baseShellHook = ''
               _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
               mkdir -p "$_gc_root_dir"
+              nix-store --realise ${wikidata.bundles.curated.testDb} --add-root "$_gc_root_dir/wikidata-test-db" > /dev/null 2>&1
+              echo "chronoscope dev shell"
+              echo "  rust: $(rustc --version)"
+              echo "  protoc: $($PROTOC --version)"
+              echo "  python: $(python3 --version)"
             '';
 
             pinWeightsAsRoots = ''
@@ -208,22 +227,13 @@
             pinCorpusAsRoots = ''
               nix-store --realise ${corpus.corpusImages} --add-root "$_gc_root_dir/corpus-images" > /dev/null 2>&1
             '';
-
-            shellInfo = ''
-              echo "chronoscope dev shell"
-              echo "  rust: $(rustc --version)"
-              echo "  protoc: $($PROTOC --version)"
-              echo "  python: $(python3 --version)"
-            '';
           in
           {
             default = pkgs.mkShell {
               nativeBuildInputs = baseNativeBuildInputs;
               inherit (rust.devShell) buildInputs;
               env = baseEnv;
-              shellHook = ''
-                ${shellInfo}
-              '';
+              shellHook = baseShellHook;
             };
 
             analysis = pkgs.mkShell {
@@ -231,9 +241,8 @@
               inherit (rust.devShell) buildInputs;
               env = baseEnv // pythonEnvs.modelEnv;
               shellHook = ''
-                ${gcRootPreamble}
+                ${baseShellHook}
                 ${pinWeightsAsRoots}
-                ${shellInfo}
               '';
             };
 
@@ -247,10 +256,9 @@
                   CORPUS_IMAGES = corpus.corpusImages;
                 };
               shellHook = ''
-                ${gcRootPreamble}
+                ${baseShellHook}
                 ${pinWeightsAsRoots}
                 ${pinCorpusAsRoots}
-                ${shellInfo}
               '';
             };
           };

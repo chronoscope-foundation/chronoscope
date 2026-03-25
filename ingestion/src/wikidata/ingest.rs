@@ -13,6 +13,7 @@ use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncBufReadExt;
@@ -284,8 +285,8 @@ mod entity_accumulator {
 
 /// Configuration for the Wikidata ingestion process.
 pub struct Config {
-    pub input_path: String,
-    pub output_path: String,
+    pub input_path: PathBuf,
+    pub output_path: PathBuf,
     pub verbose: bool,
 }
 
@@ -410,7 +411,7 @@ pub async fn run(
 
     // Write output
     if verbose {
-        eprintln!("Writing to {}...", config.output_path);
+        eprintln!("Writing to {}...", config.output_path.display());
     }
     let out_file = File::create(&config.output_path)?;
     let mut writer = BufWriter::new(out_file);
