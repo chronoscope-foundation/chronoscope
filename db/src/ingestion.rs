@@ -66,31 +66,46 @@ where
     for (&source_idx, image) in &bundle.images {
         let url_str = image.url.to_string();
 
-        let existing: Option<(ResearchUrlId,)> = sqlx::query_as(queries::GET_URL_BY_URL.sql)
+        // INSERT OR IGNORE handles duplicates; then SELECT to get the id
+        // (either our new one or the pre-existing one).
+        let new_id = ResearchUrlId::generate();
+        let inserted = queries::CREATE_URL_OR_IGNORE
+            .query()
+            .bind(&new_id)
             .bind(&url_str)
-            .fetch_optional(&mut *tx)
+            .bind(ResearchUrlStatus::Pending)
+            .bind(0_i32)
+            .bind(None::<String>) // worker_affinity
+            .bind(timestamp)
+            .execute(&mut *tx)
             .await?;
 
-        let url_id = if let Some((id,)) = existing {
-            id
-        } else {
-            let new_id = ResearchUrlId::generate();
-            queries::CREATE_URL_OR_IGNORE
-                .query()
-                .bind(&new_id)
-                .bind(&url_str)
-                .bind(ResearchUrlStatus::Pending)
-                .bind(0_i32)
-                .bind(None::<String>) // worker_affinity
-                .bind(timestamp)
-                .execute(&mut *tx)
-                .await?;
+        let url_id = if inserted.rows_affected() > 0 {
             result.images_created += 1;
             new_id
+        } else {
+            let (id,): (ResearchUrlId,) = sqlx::query_as(queries::GET_URL_BY_URL.sql)
+                .bind(&url_str)
+                .fetch_one(&mut *tx)
+                .await?;
+            id
         };
 
         source_id_map.insert(source_idx, url_id);
     }
+
+    // Pre-group annotations by entity to avoid O(E*A) scan in the entity loop.
+    let mut annotations_by_entity: HashMap<E, Vec<_>> = HashMap::new();
+    for annotation in &bundle.annotations {
+        annotations_by_entity
+            .entry(annotation.entity)
+            .or_default()
+            .push(annotation);
+    }
+
+    // TODO: For full-dump ingestion (millions of entities), batch inserts using
+    // json_each (like CREATE_URLS_BATCH) with chunked flushes would be much faster
+    // than individual INSERT per link/external-id/annotation.
 
     // Phase 2: Load entities (insert every entity unconditionally)
     let mut entity_id_map: HashMap<E, EntityDbId> = HashMap::new();
@@ -156,7 +171,7 @@ where
         }
 
         // Insert annotations for this entity (source_id_map is complete from Phase 1)
-        for annotation in bundle.annotations.iter().filter(|a| a.entity == entity_idx) {
+        for annotation in annotations_by_entity.get(&entity_idx).into_iter().flatten() {
             let uid = source_id_map.get(&annotation.source).ok_or_else(|| {
                 DbError::InvalidBundle(vec![format!(
                     "annotation references unmapped source {:?}",
