@@ -681,6 +681,10 @@ pub fn build_lifecycles(
 }
 
 /// Split transitions into separate entities when demolish->construct indicates rebuild.
+///
+/// When splitting, if the construction that triggers the split has a location, the
+/// predecessor gets a synthetic `Constructed` with that same location and no dates —
+/// the previous building occupied the same site, we just don't know when it was built.
 fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransition>> {
     if transitions.is_empty() {
         return vec![];
@@ -693,8 +697,37 @@ fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransiti
         let is_construction = matches!(dt.transition, EntityTransition::Constructed { .. });
         let is_demolition = matches!(dt.transition, EntityTransition::Demolished { .. });
 
-        // If we see construction after demolition, start a new entity
+        // If we see construction after demolition, start a new entity.
+        // Give the predecessor entity a Constructed at the same location.
         if saw_demolition && is_construction {
+            if let EntityTransition::Constructed {
+                location: Some(ref loc),
+                ..
+            } = dt.transition
+            {
+                if let Some(prev) = entities.last_mut() {
+                    let has_location = prev.iter().any(|t| {
+                        matches!(
+                            t,
+                            EntityTransition::Constructed {
+                                location: Some(_),
+                                ..
+                            }
+                        )
+                    });
+                    if !has_location {
+                        prev.insert(
+                            0,
+                            EntityTransition::Constructed {
+                                started_at: None,
+                                completed_at: None,
+                                location: Some(loc.clone()),
+                                trigger_event: None,
+                            },
+                        );
+                    }
+                }
+            }
             entities.push(vec![]);
             saw_demolition = false;
         }
@@ -926,6 +959,67 @@ mod tests {
         assert_eq!(entities.len(), 2);
         assert_eq!(entities[0].len(), 2); // Constructed + Demolished
         assert_eq!(entities[1].len(), 1); // Constructed
+    }
+
+    #[test]
+    fn test_split_on_rebuild_propagates_location() -> TestResult {
+        // Predecessor has no location; successor was constructed at a known location.
+        // The predecessor should get a synthetic Constructed with the inherited location.
+        let loc = UncertainLocation::coordinates(45.217, 12.277, None, None)?;
+        let transitions = vec![
+            DatedTransition {
+                transition: EntityTransition::Demolished {
+                    started_at: None,
+                    completed_at: None,
+                    cause: None,
+                    trigger_event: None,
+                },
+                sort_key: midnight(1623, 1, 1),
+            },
+            DatedTransition {
+                transition: EntityTransition::Constructed {
+                    started_at: None,
+                    completed_at: None,
+                    location: Some(Cited::uncited(loc)),
+                    trigger_event: None,
+                },
+                sort_key: midnight(1633, 1, 1),
+            },
+        ];
+
+        let entities = split_on_rebuild(transitions);
+        assert_eq!(entities.len(), 2);
+
+        // Predecessor: should have synthetic Constructed (with location) + Demolished
+        assert_eq!(entities[0].len(), 2);
+        assert!(
+            matches!(
+                &entities[0][0],
+                EntityTransition::Constructed {
+                    location: Some(_),
+                    started_at: None,
+                    completed_at: None,
+                    ..
+                }
+            ),
+            "predecessor should have synthetic Constructed with inherited location"
+        );
+        assert!(matches!(
+            &entities[0][1],
+            EntityTransition::Demolished { .. }
+        ));
+
+        // Successor: Constructed with location
+        assert_eq!(entities[1].len(), 1);
+        assert!(matches!(
+            &entities[1][0],
+            EntityTransition::Constructed {
+                location: Some(_),
+                ..
+            }
+        ));
+
+        Ok(())
     }
 
     // =========================================================================

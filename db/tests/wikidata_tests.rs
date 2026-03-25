@@ -194,6 +194,14 @@ async fn chioggia_cathedral_splits_on_rebuild() -> Result<()> {
     // Both should have distinct DB IDs
     assert_ne!(old.id, new.id);
 
+    // Both should have the same location (predecessor inherits from successor)
+    let old_loc = old.location.ok_or("old cathedral should have location")?;
+    let new_loc = new.location.ok_or("new cathedral should have location")?;
+    assert_eq!(
+        old_loc, new_loc,
+        "both cathedrals should be at the same site"
+    );
+
     // There should be a Replaces relation between them
     let relation_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM entity_relations")
         .fetch_one(db.pool_ref())
