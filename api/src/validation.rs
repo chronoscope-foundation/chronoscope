@@ -1,7 +1,8 @@
 //! Shared validation utilities for request data.
 
 use chronoscope_db::DbError;
-use dropshot::HttpError;
+use dropshot::{Body, HttpError};
+use http::Response;
 
 // Re-export from db crate for convenience
 pub use chronoscope_db::is_unique_violation;
@@ -12,6 +13,55 @@ pub use chronoscope_db::is_unique_violation;
 /// returning a generic "Internal Server Error" to clients.
 pub fn db_err(e: DbError) -> HttpError {
     HttpError::for_internal_error(e.to_string())
+}
+
+/// Standard CORS headers for cross-origin access.
+fn cors_builder() -> http::response::Builder {
+    Response::builder()
+        .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .header(http::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS")
+        .header(http::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type")
+        .header(http::header::ACCESS_CONTROL_MAX_AGE, "86400")
+}
+
+/// Wrap a serializable value in a JSON response with CORS headers.
+///
+/// Used by endpoints that need cross-origin access (e.g., entity endpoints
+/// called from the web frontend on a different port).
+pub fn json_with_cors<T: serde::Serialize>(value: &T) -> Result<Response<Body>, HttpError> {
+    let body_bytes = serde_json::to_vec(value)
+        .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize response: {e}")))?;
+
+    cors_builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body_bytes.into())
+        .map_err(|e| HttpError::for_internal_error(format!("Failed to build response: {e}")))
+}
+
+/// Return a JSON error response with CORS headers and the given status code.
+///
+/// Dropshot's `HttpError` path doesn't attach CORS headers, so cross-origin
+/// clients (e.g., the web frontend on a different port) can't read the error
+/// body. This helper attaches CORS headers so the browser lets the JS read
+/// the 400 message.
+pub fn error_with_cors(status: http::StatusCode, message: &str) -> Result<Response<Body>, HttpError> {
+    let body_bytes = serde_json::to_vec(&serde_json::json!({"message": message}))
+        .unwrap_or_else(|_| message.as_bytes().to_vec());
+
+    cors_builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body_bytes.into())
+        .map_err(|e| HttpError::for_internal_error(format!("Failed to build error response: {e}")))
+}
+
+/// Empty CORS preflight response for OPTIONS requests.
+pub fn cors_preflight() -> Result<Response<Body>, HttpError> {
+    cors_builder()
+        .status(http::StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .map_err(|e| HttpError::for_internal_error(format!("Failed to build response: {e}")))
 }
 
 /// Validate username format.

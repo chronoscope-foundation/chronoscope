@@ -581,6 +581,53 @@ impl Database {
         rows.into_iter().map(|r| r.into_domain()).collect()
     }
 
+    /// List entities within a geographic bounding box (keyset pagination).
+    ///
+    /// Antimeridian-crossing viewports (where `min_lon > max_lon`, e.g., 170°
+    /// to -170°) are handled automatically: the query matches the union of
+    /// `[min_lon, 180] ∪ [-180, max_lon]`.
+    ///
+    /// # Errors
+    /// Returns `DbError::Sqlx` if the database operation fails.
+    pub async fn list_entities_in_bbox(
+        &self,
+        min_lat: f64,
+        max_lat: f64,
+        min_lon: f64,
+        max_lon: f64,
+        limit: i64,
+        cursor: Option<(NaiveDateTime, &EntityDbId)>,
+    ) -> DbResult<Vec<StoredEntity>> {
+        let crosses_antimeridian = min_lon > max_lon;
+        let rows: Vec<row::Entity> = match cursor {
+            None => {
+                sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_FIRST.sql)
+                    .bind(min_lat)
+                    .bind(max_lat)
+                    .bind(min_lon)
+                    .bind(max_lon)
+                    .bind(crosses_antimeridian)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            Some((updated_at, id)) => {
+                sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_PAGE.sql)
+                    .bind(min_lat)
+                    .bind(max_lat)
+                    .bind(min_lon)
+                    .bind(max_lon)
+                    .bind(crosses_antimeridian)
+                    .bind(updated_at)
+                    .bind(id)
+                    .bind(limit)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        rows.into_iter().map(|r| r.into_domain()).collect()
+    }
+
     /// Get all annotations for a research URL.
     pub async fn find_annotations_by_url(
         &self,

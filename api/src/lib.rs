@@ -4,7 +4,10 @@ use dropshot::ApiDescription;
 
 pub mod auth;
 pub mod cdn;
+pub mod entities;
+pub mod entity_types;
 pub mod jwt;
+pub mod limits;
 #[cfg(feature = "embedded-media")]
 pub mod media;
 pub mod research;
@@ -43,6 +46,12 @@ pub fn register_api(
     api.register(research::submit_research)?;
     api.register(research::list_research)?;
     api.register(research::get_research)?;
+
+    // Entity endpoints
+    api.register(entities::list_entities)?;
+    api.register(entities::get_entity)?;
+    api.register(entities::entities_options)?;
+    api.register(entities::entity_options)?;
 
     // Well-known endpoints
     api.register(well_known::apple_app_site_association)?;

@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[[bin]]
+name = "web-dev"
+path = "src/bin/web_dev.rs"
+
 [lints]
 workspace = true
 
@@ -48,6 +52,9 @@ tokio.workspace = true
 url.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+
+# Temp files (for copying read-only Nix store DBs)
+tempfile = "3"
 
 # Logging
 slog = "2"

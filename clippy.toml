@@ -5,6 +5,7 @@
 doc-valid-idents = [
     "AdGuard",
     "DINOv3",
+    "GeoJSON",
     "EdDSA",
     "IPv4",
     "IPv6",

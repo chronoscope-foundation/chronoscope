@@ -265,6 +265,7 @@ async fn run_dev_server(
 
     // 8. Start the dev server with ngrok URL as CDN base
     let server = start_dev_server(DevServerConfig {
+        database_url: None,
         http_client,
         worker_idle_backoff: Duration::from_secs(5),
         retry_config: RetryConfig::default(),

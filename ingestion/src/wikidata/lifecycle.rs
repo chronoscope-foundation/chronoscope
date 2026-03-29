@@ -704,28 +704,27 @@ fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransiti
                 location: Some(ref loc),
                 ..
             } = dt.transition
+                && let Some(prev) = entities.last_mut()
             {
-                if let Some(prev) = entities.last_mut() {
-                    let has_location = prev.iter().any(|t| {
-                        matches!(
-                            t,
-                            EntityTransition::Constructed {
-                                location: Some(_),
-                                ..
-                            }
-                        )
-                    });
-                    if !has_location {
-                        prev.insert(
-                            0,
-                            EntityTransition::Constructed {
-                                started_at: None,
-                                completed_at: None,
-                                location: Some(loc.clone()),
-                                trigger_event: None,
-                            },
-                        );
-                    }
+                let has_location = prev.iter().any(|t| {
+                    matches!(
+                        t,
+                        EntityTransition::Constructed {
+                            location: Some(_),
+                            ..
+                        }
+                    )
+                });
+                if !has_location {
+                    prev.insert(
+                        0,
+                        EntityTransition::Constructed {
+                            started_at: None,
+                            completed_at: None,
+                            location: Some(loc.clone()),
+                            trigger_event: None,
+                        },
+                    );
                 }
             }
             entities.push(vec![]);

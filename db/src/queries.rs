@@ -226,6 +226,34 @@ define_queries! {
     FIND_ANNOTATIONS_BY_ENTITY: "SELECT id, entity_id, url_id, kind, kind_json, created_at FROM annotations WHERE entity_id = ?",
     FIND_ANNOTATIONS_BY_URL: "SELECT id, entity_id, url_id, kind, kind_json, created_at FROM annotations WHERE url_id = ?",
 
+    // Entity listing (bounding box + keyset pagination).
+    // Ordered by (updated_at DESC, id DESC) so recently-modified entities
+    // appear first; both columns are part of the keyset cursor.
+    // ?5 = crosses_antimeridian (bool): when true, matches lon >= min OR lon <= max
+    // instead of lon BETWEEN min AND max. This handles viewports that wrap
+    // around the 180° meridian.
+    LIST_ENTITIES_IN_BBOX_FIRST: "
+        SELECT id, entity_json, earliest_date, latest_date,
+               latitude, longitude, created_at, updated_at
+        FROM entities
+        WHERE latitude BETWEEN ?1 AND ?2
+          AND CASE WHEN ?5 THEN (longitude >= ?3 OR longitude <= ?4)
+                   ELSE longitude BETWEEN ?3 AND ?4 END
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?6
+    ",
+    LIST_ENTITIES_IN_BBOX_PAGE: "
+        SELECT id, entity_json, earliest_date, latest_date,
+               latitude, longitude, created_at, updated_at
+        FROM entities
+        WHERE latitude BETWEEN ?1 AND ?2
+          AND CASE WHEN ?5 THEN (longitude >= ?3 OR longitude <= ?4)
+                   ELSE longitude BETWEEN ?3 AND ?4 END
+          AND (updated_at, id) < (?6, ?7)
+        ORDER BY updated_at DESC, id DESC
+        LIMIT ?8
+    ",
+
 }
 
 #[cfg(test)]

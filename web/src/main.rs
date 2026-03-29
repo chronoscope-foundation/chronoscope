@@ -1,5 +1,7 @@
+mod api;
 mod app;
 mod components;
+mod maplibre;
 mod markdown;
 mod pages;
 

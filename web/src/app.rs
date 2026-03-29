@@ -2,6 +2,7 @@ use leptos::prelude::*;
 use leptos_router::components::*;
 use leptos_router::path;
 
+use crate::components::error_banner::ErrorBanner;
 use crate::components::nav::Sidebar;
 use crate::pages::about::About;
 use crate::pages::faq::Faq;
@@ -11,6 +12,7 @@ use crate::pages::landing::Landing;
 pub fn App() -> impl IntoView {
     view! {
         <Router>
+            <ErrorBanner/>
             // Skip link for keyboard/screen reader users to bypass sidebar nav
             <a href="#main-content" class="sr-only focus:not-sr-only focus:absolute focus:z-[100] focus:top-2 focus:left-2 focus:bg-parchment focus:px-4 focus:py-2 focus:rounded focus:shadow-md focus:text-ink font-sans text-sm">
                 "Skip to content"

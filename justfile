@@ -89,13 +89,13 @@ check:
     done
     pytest -v
 
-# Start web frontend dev server (Trunk live reload)
+# Start web dev server (API + Trunk live reload)
 web-dev:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _nix_reexec }}
     if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec web-dev; fi
-    cd web && trunk serve
+    cargo run -p chronoscope-dev --bin web-dev
 
 # Auto-fix formatting (Nix + Rust + Python)
 fmt:

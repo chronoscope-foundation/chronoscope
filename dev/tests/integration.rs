@@ -119,6 +119,7 @@ impl TestServer {
         let base_url = format!("http://127.0.0.1:{port}");
 
         let server = start_dev_server(DevServerConfig {
+            database_url: None,
             http_client,
             worker_idle_backoff: Duration::from_millis(50),
             retry_config: RetryConfig {

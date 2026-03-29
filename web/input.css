@@ -72,3 +72,6 @@
 .prose-chronoscope a:hover {
   color: var(--color-body);
 }
+
+/* Outbound link indicator: added inline in Leptos templates as
+   <span aria-hidden="true"> so screen readers don't announce the arrow. */

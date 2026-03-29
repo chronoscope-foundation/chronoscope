@@ -98,6 +98,10 @@ impl Drop for RunningDevServer {
 
 /// Configuration for starting the dev server.
 pub struct DevServerConfig {
+    /// Optional database URL. If `None`, uses `sqlite::memory:`.
+    /// The server creates a writable copy if the source is read-only.
+    pub database_url: Option<String>,
+
     /// HTTP client for workers to use (real or VCR)
     pub http_client: Arc<dyn HttpClient>,
 
@@ -301,8 +305,9 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
     // ==================== Shared Infrastructure ====================
 
     // Create shared database (includes default integration registry)
+    let db_url = config.database_url.as_deref().unwrap_or("sqlite::memory:");
     let db = Arc::new(
-        Database::new("sqlite::memory:")
+        Database::new(db_url)
             .await
             .map_err(|e| format!("Failed to create database: {e}"))?,
     );
