@@ -31,9 +31,10 @@ pub use instagram::{ApifyConfig, InstagramIntegration};
 pub use reddit::RedditIntegration;
 pub use registry::{IntegrationRegistry, RegistrationError};
 
-use std::fmt;
 use std::sync::Arc;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Create an integration registry with all supported integrations.
@@ -60,28 +61,30 @@ pub fn create_registry(
     Ok(registry)
 }
 
-/// Typed integration names - avoids stringly-typed APIs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Source type — which integration (if any) processed a page.
+///
+/// `Generic` means no specialized integration matched; the generic fetcher was used.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    strum::Display,
+    strum::AsRefStr,
+    strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum IntegrationName {
+    /// No specialized integration — generic fetcher
+    Generic,
     Reddit,
     Instagram,
-}
-
-impl IntegrationName {
-    /// Get the string representation for database storage.
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Reddit => "reddit",
-            Self::Instagram => "instagram",
-        }
-    }
-}
-
-impl fmt::Display for IntegrationName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Metadata shared by all integrations.

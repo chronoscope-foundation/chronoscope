@@ -415,7 +415,7 @@ mod tests {
                 if matches!(result, ItemResult::Success { .. }) {
                     // Create a minimal page and mark resolved
                     let page_data = chronoscope_db::PageData {
-                        source_type: chronoscope_db::SourceType::Generic,
+                        source_type: chronoscope_integrations::IntegrationName::Generic,
                         title: Some(format!("Test: {}", item.url)),
                         author: None,
                         published: None,

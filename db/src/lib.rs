@@ -27,15 +27,15 @@ pub use chronoscope_core::entity::{EntityRelationType, EntityType};
 pub use chronoscope_core::links::LinkType;
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
-    Annotation, Coordinates, DateRange, EntityLink, FollowedUrl, Media, MediaData, MediaSlot, Page,
-    PageData, ResearchUrl, ResearchUrlWithResolved, ResolvedContent, ResolvedTarget, StoredEntity,
-    User,
+    Annotation, Coordinates, DateRange, Entity, EntityLink, FollowedUrl, Media, MediaData,
+    MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved, ResolvedContent,
+    ResolvedTarget, User,
 };
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use types::{
-    AnalysisStatus, AnnotationDbId, AnnotationKind, Email, EntityDbId, EntityLinkDbId,
-    ExternalIdType, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
-    ResearchUrlStatus, SourceType, UserId,
+    AnalysisStatus, AnnotationId, AnnotationKindTag, Email, EntityId, EntityLinkId, ExternalIdType,
+    MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId, ResearchUrlStatus, SourceId,
+    UserId,
 };
 
 pub use workers::MediaForAnalysis;
@@ -365,7 +365,7 @@ impl Database {
         let worker_affinity: Option<String> = normalized_url
             .host_str()
             .and_then(|domain| self.registry.integration_name_for_domain(domain))
-            .map(|name| name.as_str().to_string());
+            .map(|name| name.to_string());
 
         // Try to insert the URL (ignored if already exists)
         let new_id = ResearchUrlId::generate();
@@ -538,7 +538,7 @@ impl Database {
     // ==================== Entities ====================
 
     /// Find an entity by its database ID.
-    pub async fn find_entity_by_id(&self, id: &EntityDbId) -> DbResult<Option<StoredEntity>> {
+    pub async fn find_entity_by_id(&self, id: &EntityId) -> DbResult<Option<Entity>> {
         let row: Option<row::Entity> = sqlx::query_as(queries::FIND_ENTITY_BY_ID.sql)
             .bind(id)
             .fetch_optional(&self.pool)
@@ -551,7 +551,7 @@ impl Database {
         &self,
         id_type: &ExternalIdType,
         external_id: &str,
-    ) -> DbResult<Vec<StoredEntity>> {
+    ) -> DbResult<Vec<Entity>> {
         let rows: Vec<row::Entity> = sqlx::query_as(queries::FIND_ENTITIES_BY_EXTERNAL_ID.sql)
             .bind(id_type)
             .bind(external_id)
@@ -561,7 +561,7 @@ impl Database {
     }
 
     /// Get all links for an entity.
-    pub async fn find_entity_links(&self, entity_id: &EntityDbId) -> DbResult<Vec<EntityLink>> {
+    pub async fn find_entity_links(&self, entity_id: &EntityId) -> DbResult<Vec<EntityLink>> {
         let rows: Vec<row::EntityLink> = sqlx::query_as(queries::FIND_ENTITY_LINKS.sql)
             .bind(entity_id)
             .fetch_all(&self.pool)
@@ -572,7 +572,7 @@ impl Database {
     /// Get all annotations for an entity.
     pub async fn find_annotations_by_entity(
         &self,
-        entity_id: &EntityDbId,
+        entity_id: &EntityId,
     ) -> DbResult<Vec<Annotation>> {
         let rows: Vec<row::Annotation> = sqlx::query_as(queries::FIND_ANNOTATIONS_BY_ENTITY.sql)
             .bind(entity_id)
@@ -591,21 +591,18 @@ impl Database {
     /// Returns `DbError::Sqlx` if the database operation fails.
     pub async fn list_entities_in_bbox(
         &self,
-        min_lat: f64,
-        max_lat: f64,
-        min_lon: f64,
-        max_lon: f64,
+        bbox: &chronoscope_api_client::Bbox,
         limit: i64,
-        cursor: Option<(NaiveDateTime, &EntityDbId)>,
-    ) -> DbResult<Vec<StoredEntity>> {
-        let crosses_antimeridian = min_lon > max_lon;
+        cursor: Option<(NaiveDateTime, &EntityId)>,
+    ) -> DbResult<Vec<Entity>> {
+        let crosses_antimeridian = bbox.min_lon() > bbox.max_lon();
         let rows: Vec<row::Entity> = match cursor {
             None => {
                 sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_FIRST.sql)
-                    .bind(min_lat)
-                    .bind(max_lat)
-                    .bind(min_lon)
-                    .bind(max_lon)
+                    .bind(bbox.min_lat())
+                    .bind(bbox.max_lat())
+                    .bind(bbox.min_lon())
+                    .bind(bbox.max_lon())
                     .bind(crosses_antimeridian)
                     .bind(limit)
                     .fetch_all(&self.pool)
@@ -613,10 +610,10 @@ impl Database {
             }
             Some((updated_at, id)) => {
                 sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_PAGE.sql)
-                    .bind(min_lat)
-                    .bind(max_lat)
-                    .bind(min_lon)
-                    .bind(max_lon)
+                    .bind(bbox.min_lat())
+                    .bind(bbox.max_lat())
+                    .bind(bbox.min_lon())
+                    .bind(bbox.max_lon())
                     .bind(crosses_antimeridian)
                     .bind(updated_at)
                     .bind(id)
@@ -683,7 +680,9 @@ impl Database {
                     .map(row::PageMedia::into_domain)
                     .collect::<DbResult<_>>()?;
 
-                page_row.map(|r| ResolvedContent::Page(r.into_domain(media)))
+                page_row
+                    .map(|r| r.into_domain(media).map(ResolvedContent::Page))
+                    .transpose()?
             }
             ResolvedTarget::Media(media_id) => {
                 // Fetch direct media

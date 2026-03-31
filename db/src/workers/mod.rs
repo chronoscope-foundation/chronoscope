@@ -7,11 +7,11 @@ use serde::Serialize;
 use sqlx::FromRow;
 use sqlx::types::Json;
 
-use chronoscope_core::{UncertainDate, UncertainLocation};
+use chronoscope_core::UncertainDate;
 
 use crate::error::{DbError, DbResult};
 use crate::models::{MediaData, PageData};
-use crate::types::{MediaId, PageId, ResearchUrlId};
+use crate::types::{EntityId, MediaId, PageId, ResearchUrlId};
 use crate::{Database, now, queries};
 
 /// Media item claimed for analysis.
@@ -76,7 +76,7 @@ impl Database {
         // 1. Insert page row (shadow columns for indexing + JSON meta as source of truth)
         sqlx::query(queries::CREATE_PAGE.sql)
             .bind(&page_id)
-            .bind(data.source_type)
+            .bind(data.source_type.as_ref())
             .bind(&data.title)
             .bind(&data.author)
             .bind(date_earliest(&data.published))
@@ -247,9 +247,13 @@ fn date_latest(date: &Option<UncertainDate>) -> Option<String> {
 }
 
 /// Extract lat/lon shadow columns from an optional location.
-fn location_coords(loc: &Option<UncertainLocation>) -> (Option<f64>, Option<f64>) {
+fn location_coords(
+    loc: &Option<chronoscope_core::UncertainLocation<EntityId>>,
+) -> (Option<f64>, Option<f64>) {
     match loc {
-        Some(UncertainLocation::Coordinates { lat, lon, .. }) => (Some(*lat), Some(*lon)),
+        Some(chronoscope_core::UncertainLocation::Coordinates { lat, lon, .. }) => {
+            (Some(*lat), Some(*lon))
+        }
         _ => (None, None), // TODO: geocode non-coordinate location variants
     }
 }

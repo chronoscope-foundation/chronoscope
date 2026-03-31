@@ -58,10 +58,7 @@ fn register_event_handler<E: JsCast + wasm_bindgen::convert::FromWasmAbi + 'stat
     });
     let js_func: js_sys::Function = cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
     let _ = window.add_event_listener_with_callback(event_name, &js_func);
-    (
-        Box::new(cb),
-        (event_name.to_string(), js_func),
-    )
+    (Box::new(cb), (event_name.to_string(), js_func))
 }
 
 /// Extract a message from an unhandled promise rejection.
@@ -111,12 +108,7 @@ pub fn ErrorBanner() -> impl IntoView {
 
         // Synchronous JS errors (via addEventListener, not set_onerror — the
         // latter receives 5 positional args, not an ErrorEvent).
-        let (cb, listener) = register_event_handler(
-            &window,
-            "error",
-            &push_error,
-            error_message,
-        );
+        let (cb, listener) = register_event_handler(&window, "error", &push_error, error_message);
         closures_effect.borrow_mut().push(cb);
         listener_refs_effect.borrow_mut().push(listener);
 

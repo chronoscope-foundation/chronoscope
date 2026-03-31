@@ -70,6 +70,7 @@ serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 # For bundle loading e2e tests
 chronoscope-core = { path = "../core" }
+chronoscope-ingestion = { path = "../ingestion" }
 oxilangtag = { version = "0.1", features = ["serde"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 url.workspace = true

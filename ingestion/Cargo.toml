@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 chronoscope-core = { path = "../core" }
 chronoscope-integrations = { path = "../integrations" }
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

@@ -299,7 +299,7 @@ async fn cmd_bundle(input: &Path, output: &Path, verbose: bool) -> Result<()> {
 fn cmd_check(input: &Path) -> Result<()> {
     let data = std::fs::read_to_string(input)
         .with_context(|| format!("Failed to read {}", input.display()))?;
-    let bundle: chronoscope_core::IngestionOutput =
+    let bundle: chronoscope_ingestion::IngestionOutput =
         serde_json::from_str(&data).context("Failed to parse IngestionBundle")?;
 
     let report = chronoscope_ingestion::check::analyze(&bundle);
@@ -315,7 +315,7 @@ fn cmd_check(input: &Path) -> Result<()> {
 async fn cmd_load(db_path: &Path, input: &Path) -> Result<()> {
     let data = std::fs::read_to_string(input)
         .with_context(|| format!("Failed to read {}", input.display()))?;
-    let bundle: chronoscope_core::IngestionOutput =
+    let bundle: chronoscope_ingestion::IngestionOutput =
         serde_json::from_str(&data).context("Failed to parse IngestionBundle")?;
 
     eprintln!(

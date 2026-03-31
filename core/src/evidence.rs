@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::ids::{DocumentId, ImageId, MapId, WikidataEntityId, WikidataPropertyId};
+use crate::ids::{WikidataEntityId, WikidataPropertyId};
 
 /// A value with its supporting evidence.
 ///
@@ -18,16 +18,20 @@ use crate::ids::{DocumentId, ImageId, MapId, WikidataEntityId, WikidataPropertyI
 /// - `None` = we don't know this value (no citation needed)
 /// - `Some(Cited { value, evidence: [] })` = we claim X but have no evidence yet
 /// - `Some(Cited { value, evidence: [...] })` = we claim X with supporting evidence
+///
+/// Generic over `S` (source reference type), following the same parametricity pattern
+/// as `Annotation<S, E>` and `Entity<E, S>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct Cited<T> {
+#[serde(bound(deserialize = "T: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
+pub struct Cited<T, S> {
     pub value: T,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<Evidence>,
+    pub evidence: Vec<Evidence<S>>,
 }
 
-impl<T> Cited<T> {
+impl<T, S> Cited<T, S> {
     #[must_use]
-    pub fn new(value: T, evidence: Vec<Evidence>) -> Self {
+    pub fn new(value: T, evidence: Vec<Evidence<S>>) -> Self {
         Self { value, evidence }
     }
 
@@ -42,7 +46,7 @@ impl<T> Cited<T> {
 
     /// Map the inner value while preserving evidence.
     #[must_use]
-    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Cited<U> {
+    pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> Cited<U, S> {
         Cited {
             value: f(self.value),
             evidence: self.evidence,
@@ -64,30 +68,29 @@ pub struct RleMask {
 }
 
 /// Evidence supporting a claim about an entity.
+///
+/// Generic over `S` (source reference type). The `Source` variant uses `S` to reference
+/// an image, map, or document in our system. Other variants reference external systems
+/// (web URLs, Wikidata, DBpedia) with their own identifiers.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Evidence {
-    ImageEvidence {
-        image_id: ImageId,
-        region: Option<ImageRegion>,
+#[serde(bound(deserialize = "S: serde::de::DeserializeOwned"))]
+pub enum Evidence<S> {
+    /// Evidence from a source in our system (image, map, or document).
+    Source {
+        source_id: S,
+        #[serde(flatten)]
+        detail: SourceDetail,
     },
-    MapEvidence {
-        map_id: MapId,
-        map_region: Option<ImageRegion>,
-    },
-    DocumentEvidence {
-        document_id: DocumentId,
-        excerpt: Option<String>,
-        page_number: Option<i32>,
-        #[schemars(with = "Option<String>")]
-        source_url: Option<Url>,
-    },
-    WebEvidence {
+    /// Evidence from a web page.
+    #[serde(rename = "web_evidence")]
+    Web {
         #[schemars(with = "String")]
         source_url: Url,
         excerpt: Option<String>,
     },
+    /// Evidence from `DBpedia`.
     Dbpedia {
         /// `DBpedia` version (e.g., "2022.12.01")
         version: String,
@@ -97,6 +100,7 @@ pub enum Evidence {
         /// Properties and their values that support this claim
         properties: std::collections::BTreeMap<String, String>,
     },
+    /// Evidence from Wikidata.
     Wikidata {
         entity_id: WikidataEntityId,
         property_id: WikidataPropertyId,
@@ -104,6 +108,22 @@ pub enum Evidence {
         property_value: String,
         /// Entity revision ID for permalink construction
         revision_id: u64,
+    },
+}
+
+/// Detail for source evidence — what kind of source and per-type metadata.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "source_type", rename_all = "snake_case")]
+pub enum SourceDetail {
+    /// Photographic image evidence.
+    Image { region: Option<ImageRegion> },
+    /// Historical map evidence.
+    Map { region: Option<ImageRegion> },
+    /// Document evidence (book, article, report, etc.).
+    Document {
+        excerpt: Option<String>,
+        page_number: Option<i32>,
     },
 }
 

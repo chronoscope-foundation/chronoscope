@@ -238,7 +238,7 @@ impl UrlFetcherWorker {
 
         // Build PageData
         let page_data = PageData {
-            source_type: integration_name.into(),
+            source_type: integration_name.unwrap_or(IntegrationName::Generic),
             title: content.title,
             author: content.author,
             published: content

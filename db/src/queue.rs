@@ -258,7 +258,7 @@ fn make_url_config(affinity: Option<IntegrationName>) -> QueueConfig {
     let (name_static, filter_static): (&'static str, &'static str) = match affinity {
         None => ("url_generic", "worker_affinity IS NULL"),
         Some(integration) => {
-            let affinity_str = integration.as_str();
+            let affinity_str: &str = integration.as_ref();
             let filter = format!("worker_affinity = '{affinity_str}'");
             let name = format!("url_{affinity_str}");
             (
@@ -294,7 +294,7 @@ static INSTAGRAM_URL_CONFIG: LazyLock<QueueConfig> =
 #[must_use]
 pub fn url_queue_config(affinity: Option<IntegrationName>) -> &'static QueueConfig {
     match affinity {
-        None => &GENERIC_URL_CONFIG,
+        None | Some(IntegrationName::Generic) => &GENERIC_URL_CONFIG,
         Some(IntegrationName::Reddit) => &REDDIT_URL_CONFIG,
         Some(IntegrationName::Instagram) => &INSTAGRAM_URL_CONFIG,
     }

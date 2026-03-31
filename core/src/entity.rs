@@ -13,17 +13,40 @@ use crate::ids::TriggerEventId;
 use crate::location::UncertainLocation;
 
 /// Core entity representing a building, infrastructure, natural feature, or area.
+///
+/// Generic over:
+/// - `E` — entity reference type (e.g., `EntityId` for stored data, `EntityIdx` for ingestion)
+/// - `S` — source reference type (e.g., `SourceId` for stored data, `SourceIdx` for ingestion)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Entity {
+#[serde(bound(deserialize = "E: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
+pub struct Entity<E, S> {
     pub entity_type: EntityType,
-    pub names: Vec<Cited<EntityName>>,
-    pub transitions: Vec<EntityTransition>,
+    pub names: Vec<Cited<EntityName, S>>,
+    pub transitions: Vec<EntityTransition<E, S>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+impl<E, S> Entity<E, S> {
+    /// Pick the best display name: prefer names whose language tag starts with `lang_prefix`,
+    /// fall back to first available.
+    #[must_use]
+    pub fn best_name(&self, lang_prefix: &str) -> Option<&str> {
+        let preferred = self
+            .names
+            .iter()
+            .find(|n| n.value.language.as_str().starts_with(lang_prefix));
+        preferred
+            .or_else(|| self.names.first())
+            .map(|n| n.value.name.as_str())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, strum::Display,
+)]
 #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum EntityType {
     Area,
     Building,
@@ -126,65 +149,77 @@ pub enum MoveMethod {
 /// Dates and locations are wrapped in `Option<Cited<...>>` where:
 /// - `None` = unknown (no citation needed)
 /// - `Some(Cited { value, evidence })` = known value with optional supporting evidence
+///
+/// Generic over:
+/// - `E` — entity reference type (used by `UncertainLocation<E>::NearEntity`)
+/// - `S` — source reference type (used by `Cited<T, S>` for evidence)
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, strum::Display, strum::AsRefStr)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum EntityTransition {
+#[strum(serialize_all = "snake_case")]
+#[serde(bound(deserialize = "E: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
+pub enum EntityTransition<E, S> {
     Constructed {
-        started_at: Option<Cited<UncertainDate>>,
-        completed_at: Option<Cited<UncertainDate>>,
-        location: Option<Cited<UncertainLocation>>,
+        started_at: Option<Cited<UncertainDate, S>>,
+        completed_at: Option<Cited<UncertainDate, S>>,
+        location: Option<Cited<UncertainLocation<E>, S>>,
         trigger_event: Option<TriggerEventId>,
     },
     Modified {
-        started_at: Option<Cited<UncertainDate>>,
-        completed_at: Option<Cited<UncertainDate>>,
+        started_at: Option<Cited<UncertainDate, S>>,
+        completed_at: Option<Cited<UncertainDate, S>>,
         description: Option<String>,
         trigger_event: Option<TriggerEventId>,
     },
     Damaged {
-        occurred_at: Option<Cited<UncertainDate>>,
+        occurred_at: Option<Cited<UncertainDate, S>>,
         cause: Option<DamageCause>,
         description: Option<String>,
         trigger_event: Option<TriggerEventId>,
     },
     Repaired {
-        started_at: Option<Cited<UncertainDate>>,
-        completed_at: Option<Cited<UncertainDate>>,
+        started_at: Option<Cited<UncertainDate, S>>,
+        completed_at: Option<Cited<UncertainDate, S>>,
         description: Option<String>,
         trigger_event: Option<TriggerEventId>,
     },
     Moved {
-        occurred_at: Option<Cited<UncertainDate>>,
-        location: Option<Cited<UncertainLocation>>,
+        occurred_at: Option<Cited<UncertainDate, S>>,
+        location: Option<Cited<UncertainLocation<E>, S>>,
         cause: Option<String>,
         method: Option<MoveMethod>,
         trigger_event: Option<TriggerEventId>,
     },
     Demolished {
-        started_at: Option<Cited<UncertainDate>>,
-        completed_at: Option<Cited<UncertainDate>>,
+        started_at: Option<Cited<UncertainDate, S>>,
+        completed_at: Option<Cited<UncertainDate, S>>,
         cause: Option<String>,
         trigger_event: Option<TriggerEventId>,
     },
     UsageModified {
-        occurred_at: Option<Cited<UncertainDate>>,
+        occurred_at: Option<Cited<UncertainDate, S>>,
         new_usages: std::collections::BTreeSet<Usage>,
         description: Option<String>,
         trigger_event: Option<TriggerEventId>,
     },
     Designated {
-        occurred_at: Option<Cited<UncertainDate>>,
+        occurred_at: Option<Cited<UncertainDate, S>>,
         designation: String,
         description: Option<String>,
         trigger_event: Option<TriggerEventId>,
     },
 }
 
-impl EntityTransition {
+/// Start/end date pair for a transition.
+pub type DateRange<'a, S> = (
+    Option<&'a Cited<UncertainDate, S>>,
+    Option<&'a Cited<UncertainDate, S>>,
+);
+
+impl<E, S> EntityTransition<E, S> {
     /// The primary event date (`started_at` for durational transitions, `occurred_at` for point events).
     #[must_use]
-    pub fn event_date(&self) -> Option<&Cited<UncertainDate>> {
+    pub fn event_date(&self) -> Option<&Cited<UncertainDate, S>> {
         match self {
             Self::Constructed { started_at, .. }
             | Self::Modified { started_at, .. }
@@ -202,7 +237,7 @@ impl EntityTransition {
     /// Returns `(started_at, completed_at)` for durational transitions (Constructed,
     /// Modified, Repaired, Demolished), or `(occurred_at, None)` for point events.
     #[must_use]
-    pub fn date_range(&self) -> (Option<&Cited<UncertainDate>>, Option<&Cited<UncertainDate>>) {
+    pub fn date_range(&self) -> DateRange<'_, S> {
         match self {
             Self::Constructed {
                 started_at,
@@ -250,17 +285,14 @@ pub enum EntityRelationType {
 
 /// A relationship between two entities.
 ///
-/// Generic over the entity reference type:
-/// - For ingestion bundles: `EntityRelation<EntityIdx>` (typed indices)
-/// - For test fixtures: `EntityRelation<&str>` (readable keys)
+/// Generic over:
+/// - `E` — entity reference type
+/// - `S` — source reference type (for evidence)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(bound(deserialize = "E: serde::de::DeserializeOwned"))]
-pub struct EntityRelation<E> {
+#[serde(bound(deserialize = "E: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
+pub struct EntityRelation<E, S> {
     pub from_entity: E,
     pub to_entity: E,
     pub relation_type: EntityRelationType,
-    pub evidence: Vec<crate::evidence::Evidence>,
+    pub evidence: Vec<crate::evidence::Evidence<S>>,
 }
-
-/// Relation using ingestion-time entity keys.
-pub type IngestionRelation = EntityRelation<crate::ids::EntityIdx>;

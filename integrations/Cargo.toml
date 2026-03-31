@@ -28,11 +28,13 @@ urlencoding = "2"
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
 
 # Time handling
 chrono.workspace = true
 
 # Error handling
+strum.workspace = true
 thiserror.workspace = true
 
 # HTTP client (full implementation)

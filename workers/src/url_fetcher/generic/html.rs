@@ -5,7 +5,8 @@
 
 use bytes::Bytes;
 use chrono::{NaiveDateTime, Utc};
-use chronoscope_db::{MediaSlot, PageData, ResearchUrl, SourceType};
+use chronoscope_db::{MediaSlot, PageData, ResearchUrl};
+use chronoscope_integrations::IntegrationName;
 use scraper::{Html, Selector};
 use tracing::{instrument, warn};
 use url::Url;
@@ -66,7 +67,7 @@ pub async fn process(
 
     // Create page data
     let page_data = PageData {
-        source_type: SourceType::Generic,
+        source_type: IntegrationName::Generic,
         title: Some(article.title),
         author: article.byline,
         published,

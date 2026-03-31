@@ -4,10 +4,11 @@
 //! the resolved content (page or media), extracted metadata, and analysis results.
 
 use chrono::NaiveDateTime;
-use chronoscope_core::{UncertainDate, UncertainLocation};
+use chronoscope_core::UncertainDate;
 use chronoscope_db::{
-    FollowedUrl, MediaId, MediaType, ResearchUrl, ResearchUrlId, ResearchUrlStatus, SourceType,
+    EntityId, FollowedUrl, MediaId, MediaType, ResearchUrl, ResearchUrlId, ResearchUrlStatus,
 };
+use chronoscope_integrations::IntegrationName;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -160,7 +161,7 @@ pub enum ResolvedContent {
 /// Page content (Instagram post, Reddit thread, etc.).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PageDossier {
-    pub source_type: SourceType,
+    pub source_type: IntegrationName,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -199,7 +200,7 @@ pub struct MediaDossier {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub captured: Option<UncertainDate>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<UncertainLocation>,
+    pub location: Option<chronoscope_core::UncertainLocation<EntityId>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_metadata: Option<serde_json::Value>,
     pub fetched_at: NaiveDateTime,

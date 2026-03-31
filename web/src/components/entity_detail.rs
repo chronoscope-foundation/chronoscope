@@ -15,7 +15,7 @@ use crate::components::map::{EntityPickerEntry, EntitySelection, SelectedEntity}
 /// when nothing is selected. On desktop it slides in from the right; on mobile
 /// it slides up as a bottom sheet.
 #[component]
-pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::ApiClient>>>) -> impl IntoView {
+pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::ChronoscopeClient>>>) -> impl IntoView {
     let api_client = SendWrapper::new(api_client);
     let SelectedEntity(selected, set_selected) = expect_context::<SelectedEntity>();
     let panel_ref = NodeRef::<leptos::html::Div>::new();
@@ -31,10 +31,9 @@ pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::ApiClient>>>) -> imp
         } else if let Some(main) = web_sys::window()
             .and_then(|w| w.document())
             .and_then(|d| d.get_element_by_id("main-content"))
+            && let Ok(el) = main.dyn_into::<web_sys::HtmlElement>()
         {
-            if let Ok(el) = main.dyn_into::<web_sys::HtmlElement>() {
-                let _ = el.focus();
-            }
+            let _ = el.focus();
         }
     });
 
@@ -151,7 +150,7 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
 #[component]
 fn EntityDetailContent(
     id: String,
-    api_client: Rc<RefCell<Option<api::ApiClient>>>,
+    api_client: Rc<RefCell<Option<api::ChronoscopeClient>>>,
 ) -> impl IntoView {
     let id_clone = id.clone();
     let (retry_count, set_retry_count) = signal(0u32);
@@ -161,7 +160,7 @@ fn EntityDetailContent(
         let id = id_clone.clone();
         let api = api_client.clone();
         async move {
-            let client = crate::api::get_or_init_api_client(&api)
+            let client = crate::api::get_or_init_client(&api)
                 .await
                 .ok_or_else(|| "Failed to load API configuration".to_string())?;
             fetch_entity_detail(&id, &client).await
@@ -279,63 +278,44 @@ fn browser_language_prefix() -> String {
         .unwrap_or_else(|| "en".to_string())
 }
 
-// TODO: Replace this hand-rolled JSON parsing with proper Deserialize structs
-// once the API crate's types are shared with the web crate (feature-gate work).
-// The current approach silently degrades if the API response shape changes.
-async fn fetch_entity_detail(id: &str, client: &api::ApiClient) -> Result<EntityDetailView, String> {
-    let json = client.fetch_entity(id).await.map_err(|e| e.to_string())?;
+use chronoscope_api_client::EntityId;
+use chronoscope_core::date::{DatePrecision, UncertainDate};
+use chronoscope_core::entity::EntityTransition;
+use chronoscope_core::links::{LinkTarget, LinkType};
 
-    let entity = json.get("entity").ok_or("missing entity field")?;
+/// Fetch entity detail using the typed API client.
+async fn fetch_entity_detail(
+    id: &str,
+    client: &api::ChronoscopeClient,
+) -> Result<EntityDetailView, String> {
+    let entity_id = EntityId::new(id);
+    let resp = client
+        .get_entity(&entity_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let lang_prefix = browser_language_prefix();
-    let name = entity
-        .get("names")
-        .and_then(|n| n.as_array())
-        .and_then(|names| {
-            names
-                .iter()
-                .find(|n| {
-                    n.get("value")
-                        .and_then(|v| v.get("language"))
-                        .and_then(|l| l.as_str())
-                        .is_some_and(|l| l.starts_with(&lang_prefix))
-                })
-                .or_else(|| names.first())
-        })
-        .and_then(|n| n.get("value"))
-        .and_then(|v| v.get("name"))
-        .and_then(|n| n.as_str())
+    let name = resp
+        .entity
+        .best_name(&browser_language_prefix())
         .map(String::from);
 
-    let entity_type = entity
-        .get("entity_type")
-        .and_then(|t| t.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let entity_type = resp.entity.entity_type.to_string();
 
-    let transitions = entity
-        .get("transitions")
-        .and_then(|t| t.as_array())
-        .map(|arr| arr.iter().map(parse_transition).collect())
-        .unwrap_or_default();
+    let transitions = resp
+        .entity
+        .transitions
+        .iter()
+        .map(format_transition)
+        .collect();
 
-    let links = json
-        .get("links")
-        .and_then(|l| l.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|link| {
-                    let target = link.get("target")?;
-                    let link_type = link
-                        .get("link_type")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("link");
-                    let (url, label) = parse_link(link_type, target)?;
-                    Some(LinkInfo { label, url })
-                })
-                .collect()
+    let links = resp
+        .links
+        .iter()
+        .filter_map(|link| {
+            let (url, label) = format_link(&link.link_type, &link.target)?;
+            Some(LinkInfo { label, url })
         })
-        .unwrap_or_default();
+        .collect();
 
     Ok(EntityDetailView {
         name,
@@ -345,48 +325,45 @@ async fn fetch_entity_detail(id: &str, client: &api::ApiClient) -> Result<Entity
     })
 }
 
-fn parse_transition(t: &serde_json::Value) -> TransitionSummary {
-    let transition_type = t
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+/// Extract a display-friendly transition type name from the enum variant.
+/// Format a typed transition into a display summary.
+fn format_transition(
+    t: &EntityTransition<EntityId, chronoscope_api_client::SourceId>,
+) -> TransitionSummary {
+    let transition_type = t.as_ref().replace('_', " ");
+    let date = t
+        .event_date()
+        .map(|cited| format_uncertain_date(&cited.value));
     TransitionSummary {
         transition_type,
-        date: extract_transition_date(t),
+        date,
     }
 }
 
-fn extract_transition_date(t: &serde_json::Value) -> Option<String> {
-    for field in ["completed_at", "occurred_at", "started_at"] {
-        if let Some(date_str) = t.get(field).and_then(extract_uncertain_date) {
-            return Some(date_str);
+/// Format an `UncertainDate` for display, truncating to the appropriate precision.
+fn format_uncertain_date(date: &UncertainDate) -> String {
+    let dt = date.earliest();
+    match date.precision() {
+        Some(
+            DatePrecision::Year
+            | DatePrecision::Decade
+            | DatePrecision::Century
+            | DatePrecision::Millennium,
+        ) => {
+            format!("{}", dt.format("%Y"))
+        }
+        Some(DatePrecision::Month) => format!("{}", dt.format("%Y-%m")),
+        Some(_) => format!("{}", dt.format("%Y-%m-%d")),
+        // Range: show "earliest - latest"
+        None => {
+            let latest = date.latest();
+            format!("{} \u{2013} {}", dt.format("%Y"), latest.format("%Y"))
         }
     }
-    None
 }
 
-/// The `UncertainDate` is a tagged enum. The `precise` variant has:
-/// `{ "type": "precise", "datetime": "...", "precision": "year"|"month"|"day" }`
-fn extract_uncertain_date(cited: &serde_json::Value) -> Option<String> {
-    let value = cited.get("value")?;
-    let datetime = value.get("datetime").and_then(|d| d.as_str())?;
-    let precision = value
-        .get("precision")
-        .and_then(|p| p.as_str())
-        .unwrap_or("day");
-    Some(match precision {
-        "year" => datetime.get(..4)?.to_string(),
-        "month" => datetime.get(..7)?.to_string(),
-        _ => datetime.get(..10)?.to_string(),
-    })
-}
-
-use chronoscope_core::links::LinkTarget;
-
-/// Parse a link target from JSON and return its URL and a human-readable label.
-fn parse_link(link_type: &str, target_json: &serde_json::Value) -> Option<(String, String)> {
-    let target: LinkTarget = serde_json::from_value(target_json.clone()).ok()?;
+/// Format a link target into a URL and human-readable label.
+fn format_link(link_type: &LinkType, target: &LinkTarget) -> Option<(String, String)> {
     let url = target.to_url().to_string();
 
     // Filter out non-HTTP URLs (e.g., javascript:)
@@ -394,7 +371,7 @@ fn parse_link(link_type: &str, target_json: &serde_json::Value) -> Option<(Strin
         return None;
     }
 
-    let target_label = match &target {
+    let target_label = match target {
         LinkTarget::Wikidata { .. } => "Wikidata".to_string(),
         LinkTarget::Wikipedia { language, .. } => format!("Wikipedia ({})", language.as_str()),
         LinkTarget::Pleiades { .. } => "Pleiades".to_string(),
@@ -412,9 +389,9 @@ fn parse_link(link_type: &str, target_json: &serde_json::Value) -> Option<(Strin
     // For same_as links, just show the target name.
     // For other relationship types, prefix with the relationship.
     let label = match link_type {
-        "same_as" => target_label,
+        LinkType::SameAs => target_label,
         _ => {
-            let rel = link_type.replace('_', " ");
+            let rel = link_type.as_ref().replace('_', " ");
             format!("{rel}: {target_label}")
         }
     };
@@ -422,7 +399,7 @@ fn parse_link(link_type: &str, target_json: &serde_json::Value) -> Option<(Strin
     Some((url, label))
 }
 
-/// Extract the domain from a URL string (e.g., `"https://example.com/path"` → `"example.com"`).
+/// Extract the domain from a URL string (e.g., `"https://example.com/path"` -> `"example.com"`).
 fn extract_domain(url: &str) -> Option<String> {
     let after_scheme = url
         .strip_prefix("https://")

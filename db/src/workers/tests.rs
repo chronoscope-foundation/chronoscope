@@ -2,7 +2,9 @@ use super::*;
 use crate::error::DbError;
 use crate::models::MediaSlot;
 use crate::queue::{Queue, url_queue_config};
-use crate::types::{Email, MediaAnalysisState, MediaType, ResearchUrlStatus, SourceType, UserId};
+use chronoscope_integrations::IntegrationName;
+
+use crate::types::{Email, MediaAnalysisState, MediaType, ResearchUrlStatus, UserId};
 use chrono::{Duration, Utc};
 use chronoscope_core::UncertainLocation;
 
@@ -234,7 +236,7 @@ async fn test_create_page_without_media() -> DbResult<()> {
     let (db, _) = setup().await?;
 
     let page_data = PageData {
-        source_type: SourceType::Generic,
+        source_type: IntegrationName::Generic,
         title: Some("Test Article".to_string()),
         author: Some("Test Author".to_string()),
         published: None,
@@ -267,7 +269,7 @@ async fn test_create_page_with_media_slots() -> DbResult<()> {
     ];
 
     let page_data = PageData {
-        source_type: SourceType::Reddit,
+        source_type: IntegrationName::Reddit,
         title: Some("Post with Images".to_string()),
         author: None,
         published: None,
@@ -330,7 +332,7 @@ async fn test_create_page_rejects_pre_resolved_media() -> DbResult<()> {
     });
 
     let page_data = PageData {
-        source_type: SourceType::Generic,
+        source_type: IntegrationName::Generic,
         title: None,
         author: None,
         published: None,
@@ -355,7 +357,7 @@ async fn test_create_page_with_existing_media_url() -> DbResult<()> {
 
     // Create page referencing the existing URL plus a new one
     let page_data = PageData {
-        source_type: SourceType::Generic,
+        source_type: IntegrationName::Generic,
         title: None,
         author: None,
         published: None,
@@ -377,13 +379,13 @@ async fn test_create_page_with_existing_media_url() -> DbResult<()> {
     assert_eq!(count.0, 1, "Should not duplicate existing URL");
 
     // Verify page_media links to the existing URL
-    let link: Option<(ResearchUrlId,)> =
+    let link: Option<(String,)> =
         sqlx::query_as("SELECT url_id FROM page_media WHERE page_id = ? AND source_order = 0")
             .bind(&page_id)
             .fetch_optional(&db.pool)
             .await?;
 
-    assert_eq!(link.map(|(id,)| id), Some(existing_id));
+    assert_eq!(link.map(|(id,)| ResearchUrlId::new(id)), Some(existing_id));
 
     Ok(())
 }
@@ -594,7 +596,7 @@ async fn test_get_or_create_media_with_location() -> DbResult<()> {
             .await?;
     let (meta_json,) =
         meta_row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
-    let loc: UncertainLocation = serde_json::from_str(&meta_json)
+    let loc: UncertainLocation<EntityId> = serde_json::from_str(&meta_json)
         .map_err(|e| DbError::InvalidArgument(format!("bad json: {e}")))?;
     match loc {
         UncertainLocation::Coordinates { lat, lon, .. } => {
@@ -627,7 +629,7 @@ async fn test_mark_url_resolved_to_page() -> DbResult<()> {
 
     // Create a page and mark resolved
     let page_data = PageData {
-        source_type: SourceType::Generic,
+        source_type: IntegrationName::Generic,
         title: Some("Test".to_string()),
         author: None,
         published: None,
@@ -684,14 +686,14 @@ async fn test_mark_url_resolved_to_media() -> DbResult<()> {
     db.mark_url_resolved_to_media(&url_id, &media_id).await?;
 
     // Verify: media_id set, status complete, claim cleared
-    let row: (Option<MediaId>, String, Option<String>, Option<String>) = sqlx::query_as(
+    let row: (Option<String>, String, Option<String>, Option<String>) = sqlx::query_as(
         "SELECT media_id, status, claimed_at, claimed_by FROM research_urls WHERE id = ?",
     )
     .bind(&url_id)
     .fetch_one(&db.pool)
     .await?;
 
-    assert_eq!(row.0, Some(media_id));
+    assert_eq!(row.0.map(MediaId::new), Some(media_id));
     assert_eq!(row.1, "complete");
     assert!(row.2.is_none(), "claimed_at should be cleared");
     assert!(row.3.is_none(), "claimed_by should be cleared");
@@ -702,7 +704,6 @@ async fn test_mark_url_resolved_to_media() -> DbResult<()> {
 // ==================== Affinity-Based Claiming Tests ====================
 
 use crate::models::ResearchUrl;
-use chronoscope_integrations::IntegrationName;
 
 #[tokio::test]
 async fn test_claim_urls_with_affinity_only_claims_matching() -> DbResult<()> {
@@ -762,7 +763,7 @@ async fn assert_affinity(
 ) -> DbResult<()> {
     let affinity: Option<(Option<String>,)> =
         sqlx::query_as("SELECT worker_affinity FROM research_urls WHERE id = ?")
-            .bind(url_id.as_str())
+            .bind(url_id)
             .fetch_optional(&db.pool)
             .await?;
     assert_eq!(

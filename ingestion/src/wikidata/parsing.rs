@@ -4,6 +4,7 @@
 //! Some functions operate on raw `serde_json::Value` (for dump filtering),
 //! while others use the typed [`WikidataEntity`] model.
 
+use crate::SourceIdx;
 use chrono::NaiveDate;
 use chronoscope_core::{
     Cited, DatePrecision, EntityName, Evidence, ExternalLink, LinkTarget, LinkType, NameType,
@@ -61,7 +62,7 @@ pub fn extract_names(
     wd: &WikidataEntity,
     wikidata_id: &str,
     revision_id: u64,
-) -> Vec<Cited<EntityName>> {
+) -> Vec<Cited<EntityName, SourceIdx>> {
     let mut names = Vec::new();
 
     for (lang, label) in &wd.labels {

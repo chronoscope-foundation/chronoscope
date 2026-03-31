@@ -1,7 +1,7 @@
-//! Bundle loader: loads an [`IngestionOutput`] into the database.
+//! Bundle loader: loads an [`IngestionBundle`] into the database.
 //!
 //! This module is the bridge between the ingestion pipeline (which produces
-//! [`IngestionOutput`] bundles) and the entity database. It handles:
+//! bundles) and the entity database. It handles:
 //! - Inserting entities with their external IDs, links, and annotations
 //! - Creating `research_urls` entries for image sources
 //! - Linking entities to sources via annotations
@@ -17,7 +17,7 @@ use sqlx::SqlitePool;
 use crate::error::{DbError, DbResult};
 use crate::models::{extract_location, extract_target_url, extract_temporal_bounds};
 use crate::types::{
-    AnnotationDbId, EntityDbId, EntityLinkDbId, ExternalIdType, ResearchUrlId, ResearchUrlStatus,
+    AnnotationId, EntityId, EntityLinkId, ExternalIdType, ResearchUrlId, ResearchUrlStatus,
 };
 use crate::{now, queries};
 
@@ -46,8 +46,8 @@ pub async fn load_bundle<E, S, L>(
     bundle: &IngestionBundle<E, S, L>,
 ) -> DbResult<LoadResult>
 where
-    E: Ord + Clone + Eq + Hash + Copy + Debug,
-    S: Ord + Clone + Eq + Hash + Copy + Debug,
+    E: Ord + Clone + Eq + Hash + Copy + Debug + serde::Serialize,
+    S: Ord + Clone + Eq + Hash + Copy + Debug + serde::Serialize,
     L: Ord + Clone + Debug,
 {
     // Validate cross-references before any DB writes
@@ -108,7 +108,7 @@ where
     // than individual INSERT per link/external-id/annotation.
 
     // Phase 2: Load entities (insert every entity unconditionally)
-    let mut entity_id_map: HashMap<E, EntityDbId> = HashMap::new();
+    let mut entity_id_map: HashMap<E, EntityId> = HashMap::new();
 
     for (&entity_idx, entity) in &bundle.entities {
         let links: Vec<_> = bundle
@@ -127,7 +127,7 @@ where
         let (earliest, latest) = extract_temporal_bounds(entity);
         let location = extract_location(entity);
 
-        let new_id = EntityDbId::generate();
+        let new_id = EntityId::generate();
         queries::INSERT_ENTITY
             .query()
             .bind(&new_id)
@@ -146,7 +146,7 @@ where
         for ext_id in extract_external_ids(&links) {
             queries::INSERT_EXTERNAL_ID
                 .query()
-                .bind(ext_id.0.as_str())
+                .bind(ext_id.0)
                 .bind(&ext_id.1)
                 .bind(&new_id)
                 .execute(&mut *tx)
@@ -155,7 +155,7 @@ where
 
         // Insert links
         for link in &links {
-            let link_id = EntityLinkDbId::generate();
+            let link_id = EntityLinkId::generate();
             let target_json = serde_json::to_string(&link.target)?;
             let target_url = extract_target_url(&link.target);
 
@@ -179,7 +179,7 @@ where
                 )])
             })?;
 
-            let annotation_id = AnnotationDbId::generate();
+            let annotation_id = AnnotationId::generate();
             let kind_json = serde_json::to_string(&annotation.kind)?;
 
             queries::INSERT_ANNOTATION
@@ -287,8 +287,8 @@ mod tests {
     use chronoscope_core::entity::{
         Entity, EntityRelation, EntityRelationType, EntityTransition, EntityType,
     };
-    use chronoscope_core::ids::{EntityIdx, LinkIdx, SourceIdx, WikidataEntityId};
-    use chronoscope_core::ingestion::{ImageSource, IngestionOutput};
+    use chronoscope_core::ids::WikidataEntityId;
+    use chronoscope_core::ingestion::{ImageSource, TestBundle};
     use chronoscope_core::links::{ExternalLink, LinkTarget, LinkType};
     use chronoscope_core::{Cited, DatePrecision, UncertainDate, UncertainLocation};
     use oxilangtag::LanguageTag;
@@ -298,7 +298,7 @@ mod tests {
     use crate::queue::{Queue, url_queue_config};
     use crate::row;
 
-    fn test_entity(name: &str) -> Entity {
+    fn test_entity(name: &str) -> Entity<&'static str, &'static str> {
         #[allow(clippy::expect_used)]
         Entity {
             entity_type: EntityType::Building,
@@ -313,7 +313,7 @@ mod tests {
         }
     }
 
-    fn test_entity_with_date(name: &str, year: i32) -> Entity {
+    fn test_entity_with_date(name: &str, year: i32) -> Entity<&'static str, &'static str> {
         #[allow(clippy::expect_used)]
         let date = UncertainDate::with_precision(
             NaiveDate::from_ymd_opt(year, 1, 1)
@@ -344,10 +344,14 @@ mod tests {
     }
 
     /// Build a bundle with one entity per (name, qid) pair, each with a Wikidata link.
-    /// Returns the bundle plus the `EntityIdx` and `LinkIdx` vectors for further customization.
+    /// Returns the bundle plus the entity and link key vectors for further customization.
     fn bundle_with_entities(
         entries: &[(&str, &str)],
-    ) -> (IngestionOutput, Vec<EntityIdx>, Vec<LinkIdx>) {
+    ) -> (TestBundle, Vec<&'static str>, Vec<&'static str>) {
+        // Leak string keys for 'static lifetime in tests (small, bounded set).
+        static ENTITY_KEYS: &[&str] = &["e0", "e1", "e2", "e3", "e4"];
+        static LINK_KEYS: &[&str] = &["l0", "l1", "l2", "l3", "l4"];
+
         let mut entities = BTreeMap::new();
         let mut external_links = BTreeMap::new();
         let mut entity_links = BTreeMap::new();
@@ -355,8 +359,8 @@ mod tests {
         let mut lidxs = Vec::new();
 
         for (i, (name, qid)) in entries.iter().enumerate() {
-            let ei = EntityIdx::new(i);
-            let li = LinkIdx::new(i);
+            let ei = ENTITY_KEYS[i];
+            let li = LINK_KEYS[i];
             entities.insert(ei, test_entity(name));
             external_links.insert(li, wikidata_link(qid));
             entity_links.insert(ei, vec![li]);
@@ -364,7 +368,7 @@ mod tests {
             lidxs.push(li);
         }
 
-        let bundle = IngestionOutput {
+        let bundle = TestBundle {
             entities,
             images: BTreeMap::new(),
             external_links,
@@ -376,10 +380,11 @@ mod tests {
         (bundle, eidxs, lidxs)
     }
 
-    /// Add an image to a bundle, returning its `SourceIdx`.
+    /// Add an image to a bundle, returning its source key.
     #[allow(clippy::expect_used)]
-    fn add_image(bundle: &mut IngestionOutput, url: &str) -> SourceIdx {
-        let idx = SourceIdx::new(bundle.images.len());
+    fn add_image(bundle: &mut TestBundle, url: &str) -> &'static str {
+        static SOURCE_KEYS: &[&str] = &["s0", "s1", "s2", "s3", "s4"];
+        let idx = SOURCE_KEYS[bundle.images.len()];
         bundle.images.insert(
             idx,
             ImageSource {
@@ -391,7 +396,7 @@ mod tests {
         idx
     }
 
-    fn test_bundle() -> IngestionOutput {
+    fn test_bundle() -> TestBundle {
         bundle_with_entities(&[("Eiffel Tower", "Q243")]).0
     }
 
@@ -588,10 +593,9 @@ mod tests {
         let db = test_db().await?;
 
         let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
-        let e_missing = EntityIdx::new(99);
         bundle.entity_relations.push(EntityRelation {
             from_entity: eidxs[0],
-            to_entity: e_missing,
+            to_entity: "e_missing",
             relation_type: EntityRelationType::Replaces,
             evidence: vec![],
         });
@@ -604,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn all_enum_variants_accepted_by_db_checks()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        use crate::types::{EntityLinkDbId, ExternalIdType};
+        use crate::types::{EntityLinkId, ExternalIdType};
         use chronoscope_core::links::LinkType;
 
         let db = test_db().await?;
@@ -620,8 +624,8 @@ mod tests {
         ];
         let mut entity_ids = Vec::new();
         for (i, &et) in entity_types.iter().enumerate() {
-            let id = EntityDbId::generate();
-            let entity = Entity {
+            let id = EntityId::generate();
+            let entity: Entity<EntityId, crate::types::SourceId> = Entity {
                 entity_type: et,
                 names: vec![],
                 transitions: vec![],
@@ -673,7 +677,7 @@ mod tests {
             LinkType::FurtherReading,
         ];
         for (i, lt) in link_types.iter().enumerate() {
-            let link_id = EntityLinkDbId::generate();
+            let link_id = EntityLinkId::generate();
             let url = format!("https://example.com/link-{i}");
             let target = LinkTarget::Url {
                 url: url::Url::parse(&url)?,
@@ -732,7 +736,7 @@ mod tests {
             },
         ];
         for kind in &annotation_kinds {
-            let ann_id = crate::types::AnnotationDbId::generate();
+            let ann_id = AnnotationId::generate();
             let kind_json = serde_json::to_string(kind)?;
             queries::INSERT_ANNOTATION
                 .query()
@@ -754,9 +758,8 @@ mod tests {
         let db = test_db().await?;
 
         // Bundle with an entity but no external links
-        let e0 = EntityIdx::new(0);
-        let bundle = IngestionOutput {
-            entities: BTreeMap::from([(e0, test_entity("Mystery Building"))]),
+        let bundle = TestBundle {
+            entities: BTreeMap::from([("e0", test_entity("Mystery Building"))]),
             images: BTreeMap::new(),
             external_links: BTreeMap::new(),
             entity_links: BTreeMap::new(),
@@ -772,8 +775,8 @@ mod tests {
 
     // ==================== Round-trip read query tests ====================
 
-    /// Verifies the full pipeline: load bundle → insert entity + external IDs →
-    /// query via JOIN → deserialize JSON → produce `StoredEntity` with correct fields.
+    /// Verifies the full pipeline: load bundle -> insert entity + external IDs ->
+    /// query via JOIN -> deserialize JSON -> produce `Entity` with correct fields.
     /// Tests both the single-entity case and the split-entity case where multiple
     /// entities share the same external ID (e.g., lifecycle phases of one Wikidata entity).
     #[tokio::test]
@@ -784,17 +787,14 @@ mod tests {
         // Two entities sharing the same Wikidata Q-ID (entity split: the original
         // Saint Thomas Church burned in 1905, a new building was constructed in 1914.
         // Wikidata models both as Q4356655, but we split them into separate entities.)
-        let e0 = EntityIdx::new(0);
-        let e1 = EntityIdx::new(1);
-        let l0 = LinkIdx::new(0);
-        let bundle = IngestionOutput {
+        let bundle = TestBundle {
             entities: BTreeMap::from([
-                (e0, test_entity("Saint Thomas Church (1870)")),
-                (e1, test_entity("Saint Thomas Church (1914)")),
+                ("e0", test_entity("Saint Thomas Church (1870)")),
+                ("e1", test_entity("Saint Thomas Church (1914)")),
             ]),
             images: BTreeMap::new(),
-            external_links: BTreeMap::from([(l0, wikidata_link("Q4356655"))]),
-            entity_links: BTreeMap::from([(e0, vec![l0]), (e1, vec![l0])]),
+            external_links: BTreeMap::from([("l0", wikidata_link("Q4356655"))]),
+            entity_links: BTreeMap::from([("e0", vec!["l0"]), ("e1", vec!["l0"])]),
             entity_relations: vec![],
             annotations: vec![],
             notes: None,

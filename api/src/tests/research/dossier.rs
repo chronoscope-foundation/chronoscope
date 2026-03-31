@@ -38,7 +38,7 @@ async fn test_dossier_with_page_content() -> TestResult {
     let url_id = ctx
         .add_research(&token, "https://reddit.com/r/test/post")
         .await?;
-    let page_data = TestContext::test_page_data(SourceType::Reddit, &[]);
+    let page_data = TestContext::test_page_data(IntegrationName::Reddit, &[]);
     ctx.create_page_for_url(&url_id, &page_data).await?;
 
     let dossier: ResearchUrlDossier = ctx
@@ -53,7 +53,7 @@ async fn test_dossier_with_page_content() -> TestResult {
         Some(ResolvedContent::Media(_)) => return Err("Expected page content, got media".into()),
         None => return Err("Expected resolved content, got none".into()),
     };
-    assert_eq!(page.source_type, SourceType::Reddit);
+    assert_eq!(page.source_type, IntegrationName::Reddit);
     assert_eq!(page.title.as_deref(), Some("Test Post"));
     assert_eq!(page.author.as_deref(), Some("testuser"));
     assert_eq!(page.content.as_deref(), Some("This is test content"));
@@ -111,7 +111,7 @@ async fn test_dossier_page_with_fetched_media() -> TestResult {
     let page_url_id = ctx
         .add_research(&token, "https://instagram.com/p/abc123")
         .await?;
-    let page_data = TestContext::test_page_data(SourceType::Instagram, &[media_url]);
+    let page_data = TestContext::test_page_data(IntegrationName::Instagram, &[media_url]);
     ctx.create_page_for_url(&page_url_id, &page_data).await?;
 
     // Resolve the media
@@ -152,7 +152,7 @@ async fn test_dossier_page_with_pending_media() -> TestResult {
     let page_url_id = ctx
         .add_research(&token, "https://instagram.com/p/def456")
         .await?;
-    let page_data = TestContext::test_page_data(SourceType::Instagram, &[media_url]);
+    let page_data = TestContext::test_page_data(IntegrationName::Instagram, &[media_url]);
     ctx.create_page_for_url(&page_url_id, &page_data).await?;
 
     let dossier: ResearchUrlDossier = ctx
@@ -196,8 +196,10 @@ async fn test_dossier_page_with_mixed_media_order() -> TestResult {
     let page_url_id = ctx
         .add_research(&token, "https://reddit.com/gallery")
         .await?;
-    let page_data =
-        TestContext::test_page_data(SourceType::Reddit, &[media1_url, media2_url, media3_url]);
+    let page_data = TestContext::test_page_data(
+        IntegrationName::Reddit,
+        &[media1_url, media2_url, media3_url],
+    );
     ctx.create_page_for_url(&page_url_id, &page_data).await?;
 
     // Resolve first and third media, leave second pending
@@ -453,7 +455,7 @@ async fn test_create_page_with_mixed_existing_and_new_urls() -> TestResult {
         .add_research(&token, "https://example.com/mixed-page")
         .await?;
     let page_data = TestContext::test_page_data(
-        SourceType::Generic,
+        IntegrationName::Generic,
         &[existing_url1, new_url1, existing_url2, new_url2],
     );
     ctx.create_page_for_url(&page_url_id, &page_data).await?;

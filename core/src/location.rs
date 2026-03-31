@@ -7,7 +7,7 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{EntityId, OhmId, OsmElementType, OsmId};
+use crate::ids::{OhmId, OsmElementType, OsmId};
 
 /// Errors from location construction or validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,10 +45,14 @@ impl fmt::Display for LocationError {
 impl std::error::Error for LocationError {}
 
 /// Location representation with multiple possible forms.
+///
+/// Generic over `E` (entity reference type) for the `NearEntity` variant.
+/// This follows the same parametricity pattern as `Entity<E, S>` and `Annotation<S, E>`.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum UncertainLocation {
+#[serde(bound(serialize = "E: Serialize"))]
+pub enum UncertainLocation<E> {
     #[non_exhaustive]
     Coordinates {
         lat: f64,
@@ -73,16 +77,16 @@ pub enum UncertainLocation {
         address_text: String,
     },
     NearEntity {
-        reference_entity: EntityId,
+        reference_entity: E,
         distance: Option<Distance>,
     },
     #[non_exhaustive]
     MultipleConstraints {
-        constraints: Vec<UncertainLocation>,
+        constraints: Vec<UncertainLocation<E>>,
     },
 }
 
-impl UncertainLocation {
+impl<E> UncertainLocation<E> {
     /// Create a validated `Coordinates` location.
     ///
     /// Checks that latitude is in `[-90, 90]`, longitude is in `[-180, 180]`,
@@ -121,7 +125,7 @@ impl UncertainLocation {
     /// Checks that at least 2 constraints are provided and none are themselves
     /// `MultipleConstraints` (no recursive nesting).
     pub fn multiple_constraints(
-        constraints: Vec<UncertainLocation>,
+        constraints: Vec<UncertainLocation<E>>,
     ) -> Result<Self, LocationError> {
         if constraints.len() < 2 {
             return Err(LocationError::TooFewConstraints {
@@ -138,7 +142,9 @@ impl UncertainLocation {
 }
 
 // Custom Deserialize that validates Coordinates and MultipleConstraints on deserialization.
-impl<'de> Deserialize<'de> for UncertainLocation {
+// Requires DeserializeOwned because MultipleConstraints contains Vec<UncertainLocation<E>>
+// (recursive ownership).
+impl<'de, E: serde::de::DeserializeOwned> Deserialize<'de> for UncertainLocation<E> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -147,7 +153,8 @@ impl<'de> Deserialize<'de> for UncertainLocation {
         #[serde_with::skip_serializing_none]
         #[derive(Deserialize)]
         #[serde(tag = "type", rename_all = "snake_case")]
-        enum UncertainLocationRaw {
+        #[serde(bound(deserialize = "E: serde::de::DeserializeOwned"))]
+        enum UncertainLocationRaw<E> {
             Coordinates {
                 lat: f64,
                 lon: f64,
@@ -170,11 +177,11 @@ impl<'de> Deserialize<'de> for UncertainLocation {
                 address_text: String,
             },
             NearEntity {
-                reference_entity: EntityId,
+                reference_entity: E,
                 distance: Option<Distance>,
             },
             MultipleConstraints {
-                constraints: Vec<UncertainLocation>,
+                constraints: Vec<UncertainLocation<E>>,
             },
         }
 
@@ -242,45 +249,48 @@ pub enum Distance {
 mod tests {
     use super::*;
 
+    // Tests use () for entity refs since they don't test NearEntity.
+    type TestLocation = UncertainLocation<()>;
+
     #[test]
     fn valid_coordinates() {
-        let loc = UncertainLocation::coordinates(40.7505, -73.9934, None, Some(10));
+        let loc = TestLocation::coordinates(40.7505, -73.9934, None, Some(10));
         assert!(loc.is_ok());
     }
 
     #[test]
     fn coordinates_rejects_out_of_range_lat() {
-        let loc = UncertainLocation::coordinates(91.0, 0.0, None, None);
+        let loc = TestLocation::coordinates(91.0, 0.0, None, None);
         assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
     }
 
     #[test]
     fn coordinates_rejects_out_of_range_lon() {
-        let loc = UncertainLocation::coordinates(0.0, 181.0, None, None);
+        let loc = TestLocation::coordinates(0.0, 181.0, None, None);
         assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
     }
 
     #[test]
     fn coordinates_rejects_nan() {
-        let loc = UncertainLocation::coordinates(f64::NAN, 0.0, None, None);
+        let loc = TestLocation::coordinates(f64::NAN, 0.0, None, None);
         assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
     }
 
     #[test]
     fn coordinates_rejects_infinity() {
-        let loc = UncertainLocation::coordinates(0.0, f64::INFINITY, None, None);
+        let loc = TestLocation::coordinates(0.0, f64::INFINITY, None, None);
         assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
     }
 
     #[test]
     fn coordinates_boundary_values() {
-        assert!(UncertainLocation::coordinates(90.0, 180.0, None, None).is_ok());
-        assert!(UncertainLocation::coordinates(-90.0, -180.0, None, None).is_ok());
+        assert!(TestLocation::coordinates(90.0, 180.0, None, None).is_ok());
+        assert!(TestLocation::coordinates(-90.0, -180.0, None, None).is_ok());
     }
 
     #[test]
     fn multiple_constraints_valid() {
-        let loc = UncertainLocation::multiple_constraints(vec![
+        let loc = TestLocation::multiple_constraints(vec![
             UncertainLocation::NamedLocation {
                 name: "Paris".to_string(),
             },
@@ -293,7 +303,7 @@ mod tests {
 
     #[test]
     fn multiple_constraints_rejects_too_few() {
-        let loc = UncertainLocation::multiple_constraints(vec![UncertainLocation::NamedLocation {
+        let loc = TestLocation::multiple_constraints(vec![UncertainLocation::NamedLocation {
             name: "Paris".to_string(),
         }]);
         assert!(matches!(
@@ -304,7 +314,7 @@ mod tests {
 
     #[test]
     fn multiple_constraints_rejects_empty() {
-        let loc = UncertainLocation::multiple_constraints(vec![]);
+        let loc = TestLocation::multiple_constraints(vec![]);
         assert!(matches!(
             loc,
             Err(LocationError::TooFewConstraints { count: 0 })
@@ -313,7 +323,7 @@ mod tests {
 
     #[test]
     fn multiple_constraints_rejects_recursive() {
-        let inner = UncertainLocation::multiple_constraints(vec![
+        let inner = TestLocation::multiple_constraints(vec![
             UncertainLocation::NamedLocation {
                 name: "A".to_string(),
             },
@@ -323,7 +333,7 @@ mod tests {
         ])
         .unwrap();
 
-        let loc = UncertainLocation::multiple_constraints(vec![
+        let loc = TestLocation::multiple_constraints(vec![
             inner,
             UncertainLocation::NamedLocation {
                 name: "C".to_string(),
@@ -335,19 +345,19 @@ mod tests {
     #[test]
     fn deserialize_rejects_invalid_coordinates() {
         let json = r#"{"type":"coordinates","lat":91.0,"lon":0.0}"#;
-        assert!(serde_json::from_str::<UncertainLocation>(json).is_err());
+        assert!(serde_json::from_str::<TestLocation>(json).is_err());
     }
 
     #[test]
     fn deserialize_rejects_single_constraint() {
         let json = r#"{"type":"multiple_constraints","constraints":[{"type":"named_location","name":"Paris"}]}"#;
-        assert!(serde_json::from_str::<UncertainLocation>(json).is_err());
+        assert!(serde_json::from_str::<TestLocation>(json).is_err());
     }
 
     #[test]
     fn deserialize_valid_coordinates() {
         let json = r#"{"type":"coordinates","lat":40.7505,"lon":-73.9934,"precision_m":10}"#;
-        let loc: UncertainLocation = serde_json::from_str(json).unwrap();
+        let loc: TestLocation = serde_json::from_str(json).unwrap();
         assert!(matches!(loc, UncertainLocation::Coordinates { .. }));
     }
 }

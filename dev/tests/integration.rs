@@ -770,10 +770,11 @@ async fn test_bundle_loaded_images_flow_through_worker_pipeline() -> TestResult 
 
     use chronoscope_core::annotation::{Annotation, AnnotationKind};
     use chronoscope_core::entity::{Entity, EntityType};
-    use chronoscope_core::ids::{EntityIdx, LinkIdx, SourceIdx, WikidataEntityId};
-    use chronoscope_core::ingestion::{ImageSource, IngestionOutput};
+    use chronoscope_core::ids::WikidataEntityId;
+    use chronoscope_core::ingestion::ImageSource;
     use chronoscope_core::links::{ExternalLink, LinkTarget, LinkType};
     use chronoscope_core::{Cited, EntityName, NameType};
+    use chronoscope_ingestion::{EntityIdx, IngestionOutput, LinkIdx, SourceIdx};
 
     let server = TestServer::start().await?;
 

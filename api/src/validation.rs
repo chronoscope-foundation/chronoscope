@@ -45,7 +45,10 @@ pub fn json_with_cors<T: serde::Serialize>(value: &T) -> Result<Response<Body>, 
 /// clients (e.g., the web frontend on a different port) can't read the error
 /// body. This helper attaches CORS headers so the browser lets the JS read
 /// the 400 message.
-pub fn error_with_cors(status: http::StatusCode, message: &str) -> Result<Response<Body>, HttpError> {
+pub fn error_with_cors(
+    status: http::StatusCode,
+    message: &str,
+) -> Result<Response<Body>, HttpError> {
     let body_bytes = serde_json::to_vec(&serde_json::json!({"message": message}))
         .unwrap_or_else(|_| message.as_bytes().to_vec());
 

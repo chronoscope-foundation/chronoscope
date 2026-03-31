@@ -11,6 +11,9 @@ use crate::date::UncertainDate;
 use crate::entity::{Entity, EntityTransition};
 use crate::evidence::Cited;
 
+// Consistency checking is generic over entity/source reference types — it only
+// inspects dates and names, never the reference types themselves.
+
 /// A consistency warning carrying structured data.
 ///
 /// Presentation-layer code is responsible for formatting these into human-readable
@@ -43,7 +46,7 @@ pub enum ConsistencyWarning {
     },
 }
 
-impl Entity {
+impl<E, S> Entity<E, S> {
     /// Check this entity for consistency issues.
     #[must_use]
     pub fn check_consistency(&self) -> Vec<ConsistencyWarning> {
@@ -87,9 +90,9 @@ impl Entity {
     }
 }
 
-fn check_date_ordering(
-    started: Option<&Cited<UncertainDate>>,
-    completed: Option<&Cited<UncertainDate>>,
+fn check_date_ordering<S>(
+    started: Option<&Cited<UncertainDate, S>>,
+    completed: Option<&Cited<UncertainDate, S>>,
 ) -> Option<ConsistencyWarning> {
     let start_earliest = started.map(|c| c.value.earliest());
     let complete_latest = completed.map(|c| c.value.latest());
@@ -105,11 +108,13 @@ fn check_date_ordering(
     }
 }
 
-fn get_event_date(transition: &EntityTransition) -> Option<NaiveDateTime> {
+fn get_event_date<E, S>(transition: &EntityTransition<E, S>) -> Option<NaiveDateTime> {
     transition.event_date().map(|c| c.value.earliest())
 }
 
-fn check_chronological_order(transitions: &[EntityTransition]) -> Vec<ConsistencyWarning> {
+fn check_chronological_order<E, S>(
+    transitions: &[EntityTransition<E, S>],
+) -> Vec<ConsistencyWarning> {
     let dated_events: Vec<_> = transitions.iter().filter_map(get_event_date).collect();
 
     let mut warnings = Vec::new();
@@ -126,7 +131,9 @@ fn check_chronological_order(transitions: &[EntityTransition]) -> Vec<Consistenc
     warnings
 }
 
-fn check_events_after_demolished(transitions: &[EntityTransition]) -> Vec<ConsistencyWarning> {
+fn check_events_after_demolished<E, S>(
+    transitions: &[EntityTransition<E, S>],
+) -> Vec<ConsistencyWarning> {
     let demolished_date = transitions.iter().find_map(|t| {
         if let EntityTransition::Demolished {
             started_at,
@@ -172,6 +179,9 @@ mod tests {
     use crate::entity::EntityType;
     use chrono::NaiveDate;
 
+    // Tests use () for entity/source refs since consistency checking doesn't inspect them.
+    type TestEntity = Entity<(), ()>;
+    type TestTransition = EntityTransition<(), ()>;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn midnight(y: i32, m: u32, d: u32) -> Result<NaiveDateTime, &'static str> {
@@ -190,10 +200,10 @@ mod tests {
 
     #[test]
     fn completion_before_start() -> TestResult {
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
-            transitions: vec![EntityTransition::Constructed {
+            transitions: vec![TestTransition::Constructed {
                 started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1950, 1, 1)?)?)),
                 completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(1940, 1, 1)?)?)),
                 location: None,
@@ -212,10 +222,10 @@ mod tests {
 
     #[test]
     fn completion_before_start_on_demolition() -> TestResult {
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
-            transitions: vec![EntityTransition::Demolished {
+            transitions: vec![TestTransition::Demolished {
                 started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1950, 1, 1)?)?)),
                 completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(1940, 1, 1)?)?)),
                 cause: None,
@@ -234,10 +244,10 @@ mod tests {
 
     #[test]
     fn valid_construction() -> TestResult {
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
-            transitions: vec![EntityTransition::Constructed {
+            transitions: vec![TestTransition::Constructed {
                 started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1940, 1, 1)?)?)),
                 completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(1950, 1, 1)?)?)),
                 location: None,
@@ -251,10 +261,10 @@ mod tests {
 
     #[test]
     fn same_year_is_ok() -> TestResult {
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
-            transitions: vec![EntityTransition::Constructed {
+            transitions: vec![TestTransition::Constructed {
                 started_at: Some(Cited::uncited(UncertainDate::with_precision(
                     midnight(1830, 6, 15)?,
                     DatePrecision::Year,
@@ -277,7 +287,7 @@ mod tests {
 
     #[test]
     fn demolished_completed_at_fallback() -> TestResult {
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
@@ -310,7 +320,7 @@ mod tests {
 
     #[test]
     fn reports_all_post_demolition_events() -> TestResult {
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
@@ -352,7 +362,7 @@ mod tests {
         use crate::entity::{EntityName, NameType};
         use oxilangtag::LanguageTag;
 
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![Cited::uncited(EntityName {
                 name: "Old Name".to_string(),
@@ -375,7 +385,7 @@ mod tests {
 
     #[test]
     fn events_out_of_order() -> TestResult {
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
@@ -406,7 +416,7 @@ mod tests {
 
     #[test]
     fn multiple_constructions() -> TestResult {
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
@@ -440,7 +450,7 @@ mod tests {
         use crate::entity::{EntityName, NameType};
         use oxilangtag::LanguageTag;
 
-        let entity = Entity {
+        let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![Cited::uncited(EntityName {
                 name: "Current Name".to_string(),

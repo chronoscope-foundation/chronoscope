@@ -12,8 +12,8 @@ use crate::maplibre;
 
 // ==================== Constants ====================
 
-/// OpenFreeMap Liberty style — a free, open-source map style.
-/// https://openfreemap.org/
+/// `OpenFreeMap` Liberty style — a free, open-source map style.
+/// <https://openfreemap.org/>
 const MAP_STYLE_URL: &str = "https://tiles.openfreemap.org/styles/liberty";
 
 /// Initial map center: Rome, Italy (roughly central in the Mediterranean).
@@ -107,9 +107,9 @@ fn build_geojson(entities: &[api::EntitySummary], selected_id: Option<&str>) -> 
         let entries: Vec<EntityPickerEntry> = group
             .iter()
             .map(|e| EntityPickerEntry {
-                id: e.id.clone(),
+                id: e.id.to_string(),
                 name: e.name.clone().unwrap_or_else(|| "Unknown".to_string()),
-                entity_type: e.entity_type.clone(),
+                entity_type: e.entity_type.to_string(),
             })
             .collect();
 
@@ -137,9 +137,7 @@ fn build_geojson(entities: &[api::EntitySummary], selected_id: Option<&str>) -> 
                 props.insert("group".into(), json.into());
             }
             Err(e) => {
-                web_sys::console::warn_1(
-                    &format!("Failed to serialize entity group: {e}").into(),
-                );
+                web_sys::console::warn_1(&format!("Failed to serialize entity group: {e}").into());
             }
         }
 
@@ -172,7 +170,7 @@ struct GeoJsonSourceSpec {
     data: EmptyFeatureCollection,
 }
 
-/// An empty GeoJSON FeatureCollection (used as initial source data).
+/// An empty GeoJSON `FeatureCollection` (used as initial source data).
 #[derive(Serialize)]
 struct EmptyFeatureCollection {
     r#type: &'static str,
@@ -290,7 +288,7 @@ struct ViewportSignals {
 
 async fn load_entities_for_viewport(
     map: &maplibre::Map,
-    client: &api::ApiClient,
+    client: &api::ChronoscopeClient,
     generation: u64,
     generation_counter: &Rc<Cell<u64>>,
     signals: ViewportSignals,
@@ -300,25 +298,39 @@ async fn load_entities_for_viewport(
     signals.set_loading.set(true);
     signals.set_fetch_error.set(None);
 
-    match client
-        .fetch_entities(min_lat, max_lat, min_lon, max_lon)
-        .await
-    {
-        Ok(result) => {
-            // Discard stale response: when the user pans rapidly, multiple
-            // fetches fire concurrently. Without this check, a slow early
-            // response could overwrite a newer one.
-            if generation_counter.get() != generation {
-                return;
-            }
+    let bbox = match chronoscope_api_client::Bbox::new(min_lat, max_lat, min_lon, max_lon) {
+        Ok(b) => b,
+        Err(e) => {
             signals.set_loading.set(false);
-            signals.set_truncated.set(result.truncated);
+            signals
+                .set_fetch_error
+                .set(Some(format!("Invalid viewport bounds: {e}")));
+            return;
+        }
+    };
+
+    // Paginate through results up to MAX_ENTITIES.
+    let result = client
+        .list_entities_all(&bbox, api::MAX_ENTITIES, api::PAGE_SIZE)
+        .await;
+
+    // Discard stale response: when the user pans rapidly, multiple
+    // fetches fire concurrently. Without this check, a slow early
+    // response could overwrite a newer one.
+    if generation_counter.get() != generation {
+        return;
+    }
+
+    match result {
+        Ok(fetch_result) => {
+            signals.set_loading.set(false);
+            signals.set_truncated.set(fetch_result.truncated);
             signals.set_fetch_error.set(None);
-            signals.set_empty.set(result.entities.is_empty());
+            signals.set_empty.set(fetch_result.entities.is_empty());
             // Write entities to the signal — the GeoJSON rebuild effect
             // (effect_rebuild_geojson_on_selection) tracks this and will
             // rebuild the map layer automatically.
-            signals.set_cached_entities.set(result.entities);
+            signals.set_cached_entities.set(fetch_result.entities);
         }
         Err(e) => {
             signals.set_loading.set(false);
@@ -388,7 +400,7 @@ fn handle_background_click(
 /// Register click, hover, and background-click handlers on the entity layer.
 ///
 /// Returns the closures that must be kept alive for the handlers to work.
-/// (wasm_bindgen::Closure is invalidated when dropped — the Vec keeps
+/// (`wasm_bindgen::Closure` is invalidated when dropped — the Vec keeps
 /// them alive for the map's lifetime, and they're cleared on cleanup/remount.)
 fn register_layer_handlers(
     map: &maplibre::Map,
@@ -434,7 +446,7 @@ fn register_layer_handlers(
 /// Returns the closure that must be kept alive.
 fn register_moveend_handler(
     map: &maplibre::Map,
-    api_client: &Rc<RefCell<Option<api::ApiClient>>>,
+    api_client: &Rc<RefCell<Option<api::ChronoscopeClient>>>,
     generation: &Rc<Cell<u64>>,
     debounce_timer: &Rc<Cell<Option<i32>>>,
     signals: ViewportSignals,
@@ -446,10 +458,10 @@ fn register_moveend_handler(
 
     let move_cb = Closure::<dyn Fn()>::new(move || {
         // Clear any pending debounce timer
-        if let Some(timer_id) = debounce_for_move.get() {
-            if let Some(w) = web_sys::window() {
-                w.clear_timeout_with_handle(timer_id);
-            }
+        if let Some(timer_id) = debounce_for_move.get()
+            && let Some(w) = web_sys::window()
+        {
+            w.clear_timeout_with_handle(timer_id);
         }
 
         let map_ref = map_for_move.clone();
@@ -464,8 +476,10 @@ fn register_moveend_handler(
             let g = gc.get() + 1;
             gc.set(g);
             wasm_bindgen_futures::spawn_local(async move {
-                let Some(client) = api::get_or_init_api_client(&api_ref).await else {
-                    signals.set_fetch_error.set(Some("Failed to load API configuration".to_string()));
+                let Some(client) = api::get_or_init_client(&api_ref).await else {
+                    signals
+                        .set_fetch_error
+                        .set(Some("Failed to load API configuration".to_string()));
                     return;
                 };
                 load_entities_for_viewport(&map_ref, &client, g, &gc, signals).await;
@@ -487,17 +501,17 @@ fn register_moveend_handler(
 
 // ==================== Shared map state ====================
 
-/// State shared between the MapView component, its Effects, and JS closures.
+/// State shared between the `MapView` component, its Effects, and JS closures.
 ///
 /// All fields are `Rc` (cheap to clone) so we can hand out copies to closures
-/// without threading dozens of individual Rc::clone calls.
+/// without threading dozens of individual `Rc::clone` calls.
 #[derive(Clone)]
 struct MapState {
     source_initialized: SourceInitialized,
     generation: Rc<Cell<u64>>,
     debounce_timer: Rc<Cell<Option<i32>>>,
     closures: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
-    api_client: Rc<RefCell<Option<api::ApiClient>>>,
+    api_client: Rc<RefCell<Option<api::ChronoscopeClient>>>,
 }
 
 /// Create the map, register the style-load callback (which adds source/layers,
@@ -537,8 +551,10 @@ fn initialize_map(
         st.closures.borrow_mut().extend(handler_closures);
 
         wasm_bindgen_futures::spawn_local(async move {
-            let Some(client) = api::get_or_init_api_client(&api_ref).await else {
-                signals.set_fetch_error.set(Some("Failed to load API configuration".to_string()));
+            let Some(client) = api::get_or_init_client(&api_ref).await else {
+                signals
+                    .set_fetch_error
+                    .set(Some("Failed to load API configuration".to_string()));
                 return;
             };
             load_entities_for_viewport(&map_ref, &client, g, &gc, signals).await;
@@ -611,12 +627,12 @@ fn effect_rebuild_geojson(
         // Tracked read: re-runs this effect when entities change.
         let entities = signals.cached_entities.get();
 
-        if source_initialized.get() && !entities.is_empty() {
-            if let Some(geojson) = build_geojson(&entities, selected_id.as_deref())
-                && let Some(map) = map_handle.borrow().as_ref()
-            {
-                update_source_data(map, &geojson);
-            }
+        if source_initialized.get()
+            && !entities.is_empty()
+            && let Some(geojson) = build_geojson(&entities, selected_id.as_deref())
+            && let Some(map) = map_handle.borrow().as_ref()
+        {
+            update_source_data(map, &geojson);
         }
     });
 }
@@ -639,20 +655,13 @@ fn effect_retry_on_signal(
                 let g = st.generation.get() + 1;
                 st.generation.set(g);
                 wasm_bindgen_futures::spawn_local(async move {
-                    let Some(client) = api::get_or_init_api_client(&st.api_client).await else {
-                        signals.set_fetch_error.set(Some(
-                            "Failed to load API configuration".to_string(),
-                        ));
+                    let Some(client) = api::get_or_init_client(&st.api_client).await else {
+                        signals
+                            .set_fetch_error
+                            .set(Some("Failed to load API configuration".to_string()));
                         return;
                     };
-                    load_entities_for_viewport(
-                        &map,
-                        &client,
-                        g,
-                        &st.generation,
-                        signals,
-                    )
-                    .await;
+                    load_entities_for_viewport(&map, &client, g, &st.generation, signals).await;
                 });
             }
         }
@@ -662,7 +671,7 @@ fn effect_retry_on_signal(
 // ==================== Component ====================
 
 #[component]
-pub fn MapView(api_client: Rc<RefCell<Option<api::ApiClient>>>) -> impl IntoView {
+pub fn MapView(api_client: Rc<RefCell<Option<api::ChronoscopeClient>>>) -> impl IntoView {
     let container = NodeRef::<leptos::html::Div>::new();
     let map_handle: Rc<RefCell<Option<maplibre::Map>>> = Rc::new(RefCell::new(None));
 

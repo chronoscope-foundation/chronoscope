@@ -3,13 +3,20 @@
 //! Analyzes `IngestionOutput` for consistency, distributions, and interesting entities.
 //! Source-agnostic - works with output from any ingestion pathway.
 
+use crate::{EntityIdx, IngestionOutput, SourceIdx};
 use chrono::Datelike;
 use chronoscope_core::{
-    ConsistencyWarning, Entity, EntityIdx, EntityTransition, IngestionOutput, LinkTarget,
-    UncertainDate, UncertainLocation,
+    ConsistencyWarning, Entity, EntityTransition, LinkTarget, UncertainDate, UncertainLocation,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// Entity type specialized for ingestion output.
+type IngestionEntity = Entity<EntityIdx, SourceIdx>;
+/// Entity transition type specialized for ingestion output.
+type IngestionTransition = EntityTransition<EntityIdx, SourceIdx>;
+/// Uncertain location type specialized for ingestion output.
+type IngestionLocation = UncertainLocation<EntityIdx>;
 
 // =============================================================================
 // OUTPUT STRUCTURES
@@ -148,8 +155,7 @@ fn compute_distributions(output: &IngestionOutput) -> Distributions {
 
         for transition in &entity.transitions {
             // Transition types
-            let type_name = transition_type_name(transition);
-            *transition_types.entry(type_name.to_string()).or_default() += 1;
+            *transition_types.entry(transition.to_string()).or_default() += 1;
 
             // Extract dates and locations from transitions
             for date in extract_dates(transition) {
@@ -270,7 +276,7 @@ fn find_interesting_entities(output: &IngestionOutput) -> Vec<InterestingEntity>
                 details: serde_json::json!({
                     "transition_count": entity.transitions.len(),
                     "transition_types": entity.transitions.iter()
-                        .map(transition_type_name)
+                        .map(|t| t.to_string())
                         .collect::<Vec<_>>()
                 }),
             });
@@ -385,7 +391,7 @@ fn find_interesting_entities(output: &IngestionOutput) -> Vec<InterestingEntity>
 // HELPERS
 // =============================================================================
 
-fn has_location(entity: &Entity) -> bool {
+fn has_location(entity: &IngestionEntity) -> bool {
     entity.transitions.iter().any(|t| {
         if let EntityTransition::Constructed { location, .. } = t {
             location.is_some()
@@ -395,14 +401,14 @@ fn has_location(entity: &Entity) -> bool {
     })
 }
 
-fn has_dates(entity: &Entity) -> bool {
+fn has_dates(entity: &IngestionEntity) -> bool {
     entity
         .transitions
         .iter()
         .any(|t| !extract_dates(t).is_empty())
 }
 
-fn extract_dates(transition: &EntityTransition) -> Vec<&UncertainDate> {
+fn extract_dates(transition: &IngestionTransition) -> Vec<&UncertainDate> {
     let mut dates = Vec::new();
     match transition {
         EntityTransition::Constructed {
@@ -451,7 +457,7 @@ fn extract_dates(transition: &EntityTransition) -> Vec<&UncertainDate> {
     dates
 }
 
-fn extract_location(transition: &EntityTransition) -> Option<&UncertainLocation> {
+fn extract_location(transition: &IngestionTransition) -> Option<&IngestionLocation> {
     if let EntityTransition::Constructed { location, .. } = transition {
         location.as_ref().map(|l| &l.value)
     } else {
@@ -459,7 +465,7 @@ fn extract_location(transition: &EntityTransition) -> Option<&UncertainLocation>
     }
 }
 
-fn get_entity_name(entity: &Entity) -> String {
+fn get_entity_name(entity: &IngestionEntity) -> String {
     entity
         .names
         .iter()
@@ -482,19 +488,6 @@ fn get_wikidata_id(output: &IngestionOutput, entity_key: &EntityIdx) -> Option<S
     })
 }
 
-fn transition_type_name(t: &EntityTransition) -> &'static str {
-    match t {
-        EntityTransition::Constructed { .. } => "Constructed",
-        EntityTransition::Modified { .. } => "Modified",
-        EntityTransition::Damaged { .. } => "Damaged",
-        EntityTransition::Repaired { .. } => "Repaired",
-        EntityTransition::Moved { .. } => "Moved",
-        EntityTransition::Demolished { .. } => "Demolished",
-        EntityTransition::UsageModified { .. } => "UsageModified",
-        EntityTransition::Designated { .. } => "Designated",
-    }
-}
-
 fn get_date_precision(date: &UncertainDate) -> String {
     match date.precision() {
         Some(precision) => format!("{precision:?}"),
@@ -515,11 +508,11 @@ fn warning_code(w: &ConsistencyWarning) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{EntityIdx, LinkIdx, SourceIdx};
     use chrono::NaiveDate;
     use chronoscope_core::{
-        Annotation, AnnotationKind, Cited, DamageCause, DatePrecision, Entity, EntityIdx,
-        EntityType, ExternalLink, ImageSource, LinkIdx, LinkTarget, LinkType, SourceIdx,
-        UncertainDate, Usage, WikidataEntityId,
+        Annotation, AnnotationKind, Cited, DamageCause, DatePrecision, Entity, EntityType,
+        ExternalLink, ImageSource, LinkTarget, LinkType, UncertainDate, Usage, WikidataEntityId,
     };
     use oxilangtag::LanguageTag;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -531,7 +524,7 @@ mod tests {
             .ok_or("invalid time")
     }
 
-    fn make_name(name: &str, lang: &str) -> Cited<chronoscope_core::EntityName> {
+    fn make_name(name: &str, lang: &str) -> Cited<chronoscope_core::EntityName, SourceIdx> {
         #[allow(clippy::expect_used)]
         Cited::uncited(chronoscope_core::EntityName {
             name: name.to_string(),
@@ -542,7 +535,7 @@ mod tests {
         })
     }
 
-    fn simple_entity(name: &str) -> Entity {
+    fn simple_entity(name: &str) -> IngestionEntity {
         Entity {
             entity_type: EntityType::Building,
             names: vec![make_name(name, "en")],
@@ -553,7 +546,7 @@ mod tests {
     fn entity_with_construction(
         name: &str,
         year: i32,
-    ) -> Result<Entity, Box<dyn std::error::Error>> {
+    ) -> Result<IngestionEntity, Box<dyn std::error::Error>> {
         let date = UncertainDate::with_precision(midnight(year, 1, 1)?, DatePrecision::Year)?;
         Ok(Entity {
             entity_type: EntityType::Building,
@@ -684,11 +677,11 @@ mod tests {
 
         let report = analyze(&output);
         assert_eq!(
-            report.distributions.transition_types.get("Constructed"),
+            report.distributions.transition_types.get("constructed"),
             Some(&1)
         );
         assert_eq!(
-            report.distributions.transition_types.get("Damaged"),
+            report.distributions.transition_types.get("damaged"),
             Some(&1)
         );
         Ok(())
@@ -952,79 +945,6 @@ mod tests {
     // =========================================================================
     // Helper tests
     // =========================================================================
-
-    #[test]
-    fn transition_type_name_covers_all_variants() -> TestResult {
-        let cases = [
-            (
-                EntityTransition::Constructed {
-                    started_at: None,
-                    completed_at: None,
-                    location: None,
-                    trigger_event: None,
-                },
-                "Constructed",
-            ),
-            (
-                EntityTransition::Modified {
-                    started_at: None,
-                    completed_at: None,
-                    description: None,
-                    trigger_event: None,
-                },
-                "Modified",
-            ),
-            (
-                EntityTransition::Damaged {
-                    occurred_at: None,
-                    cause: None,
-                    description: None,
-                    trigger_event: None,
-                },
-                "Damaged",
-            ),
-            (
-                EntityTransition::Repaired {
-                    started_at: None,
-                    completed_at: None,
-                    description: None,
-                    trigger_event: None,
-                },
-                "Repaired",
-            ),
-            (
-                EntityTransition::Demolished {
-                    started_at: None,
-                    completed_at: None,
-                    cause: None,
-                    trigger_event: None,
-                },
-                "Demolished",
-            ),
-            (
-                EntityTransition::UsageModified {
-                    occurred_at: None,
-                    new_usages: std::collections::BTreeSet::new(),
-                    description: None,
-                    trigger_event: None,
-                },
-                "UsageModified",
-            ),
-            (
-                EntityTransition::Designated {
-                    occurred_at: None,
-                    designation: "UNESCO".to_string(),
-                    description: None,
-                    trigger_event: None,
-                },
-                "Designated",
-            ),
-        ];
-        for (transition, expected_name) in &cases {
-            assert_eq!(transition_type_name(transition), *expected_name);
-        }
-        Ok(())
-    }
 
     #[test]
     fn get_entity_name_prefers_english() -> TestResult {

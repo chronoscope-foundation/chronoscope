@@ -4,66 +4,50 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// Macro to define a strongly-typed ID newtype.
-///
-/// Each ID type wraps a String (UUIDv7) and provides:
-/// - `new()` to create from any string-like value
-/// - `generate()` to create a new UUIDv7
-/// - `as_str()` to get the inner string reference
-/// - Display, `AsRef<str>`, and derives for serialization/database
-macro_rules! define_id {
-    ($name:ident) => {
-        #[derive(
-            Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type,
-        )]
-        #[serde(transparent)]
-        #[sqlx(transparent)]
-        pub struct $name(String);
+// Re-export ID types and enums from api-client for convenience.
+pub use chronoscope_api_client::{
+    AnnotationId, Email, EntityId, EntityLinkId, MediaId, MediaType, ResearchUrlId,
+    ResearchUrlStatus, SourceId, UserId,
+};
 
-        impl $name {
-            #[must_use]
-            pub fn new(id: impl Into<String>) -> Self {
-                Self(id.into())
-            }
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type)]
+#[serde(transparent)]
+#[sqlx(transparent)]
+pub struct PageId(String);
 
-            #[must_use]
-            pub fn generate() -> Self {
-                Self(uuid::Uuid::now_v7().to_string())
-            }
-
-            #[must_use]
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}", self.0)
-            }
-        }
-
-        impl AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
-        }
-    };
+impl PageId {
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::now_v7().to_string())
+    }
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-define_id!(UserId);
-define_id!(ResearchUrlId);
-define_id!(PageId);
-define_id!(MediaId);
-define_id!(EntityDbId);
-define_id!(AnnotationDbId);
-define_id!(EntityLinkDbId);
+impl fmt::Display for PageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl AsRef<str> for PageId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 /// External ID source type for entity deduplication.
 ///
 /// Must stay in sync with the CHECK constraint on `entity_external_ids.id_type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, strum::Display, strum::AsRefStr)]
 #[sqlx(type_name = "TEXT")]
+#[strum(serialize_all = "snake_case")]
 pub enum ExternalIdType {
     #[sqlx(rename = "wikidata")]
     Wikidata,
@@ -74,6 +58,7 @@ pub enum ExternalIdType {
     #[sqlx(rename = "osm_relation")]
     OsmRelation,
     #[sqlx(rename = "geonames")]
+    #[strum(serialize = "geonames")]
     GeoNames,
     #[sqlx(rename = "pleiades")]
     Pleiades,
@@ -98,27 +83,6 @@ impl ExternalIdType {
             Self::Nrhp,
         ]
     }
-
-    /// DB string representation (matches the SQL CHECK constraint).
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Wikidata => "wikidata",
-            Self::OsmNode => "osm_node",
-            Self::OsmWay => "osm_way",
-            Self::OsmRelation => "osm_relation",
-            Self::GeoNames => "geonames",
-            Self::Pleiades => "pleiades",
-            Self::GettyTgn => "getty_tgn",
-            Self::Nrhp => "nrhp",
-        }
-    }
-}
-
-impl fmt::Display for ExternalIdType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
 }
 
 /// Annotation kind discriminant as stored in the database.
@@ -129,16 +93,17 @@ impl fmt::Display for ExternalIdType {
 ///
 /// Mirrors the discriminant tag of `chronoscope_core::annotation::AnnotationKind`
 /// with `sqlx::Type` support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, strum::Display)]
 #[sqlx(type_name = "TEXT", rename_all = "snake_case")]
-pub enum AnnotationKind {
+#[strum(serialize_all = "snake_case")]
+pub enum AnnotationKindTag {
     SpatialTrace,
     ExteriorView,
     InteriorView,
     TextualNote,
 }
 
-impl AnnotationKind {
+impl AnnotationKindTag {
     /// All variants, for exhaustive testing against DB CHECK constraints.
     #[must_use]
     pub fn all() -> &'static [Self] {
@@ -153,7 +118,7 @@ impl AnnotationKind {
 
 /// Exhaustive match ensures adding a variant to
 /// `chronoscope_core::annotation::AnnotationKind` forces a db-side update.
-impl From<&chronoscope_core::annotation::AnnotationKind> for AnnotationKind {
+impl From<&chronoscope_core::annotation::AnnotationKind> for AnnotationKindTag {
     fn from(kind: &chronoscope_core::annotation::AnnotationKind) -> Self {
         match kind {
             chronoscope_core::annotation::AnnotationKind::SpatialTrace { .. } => Self::SpatialTrace,
@@ -164,59 +129,24 @@ impl From<&chronoscope_core::annotation::AnnotationKind> for AnnotationKind {
     }
 }
 
-impl fmt::Display for AnnotationKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Self::SpatialTrace => "spatial_trace",
-            Self::ExteriorView => "exterior_view",
-            Self::InteriorView => "interior_view",
-            Self::TextualNote => "textual_note",
-        };
-        write!(f, "{s}")
-    }
-}
-
-/// Status of a research URL in the processing pipeline.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type,
-)]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
-pub enum ResearchUrlStatus {
-    /// Submitted, waiting to be fetched
-    Pending,
-    /// Currently being processed by a worker
-    Processing,
-    /// All automated processing complete
-    Complete,
-    /// Processing failed (see `error_message`)
-    Failed,
-}
-
-impl ResearchUrlStatus {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Processing => "processing",
-            Self::Complete => "complete",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-impl fmt::Display for ResearchUrlStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
 /// Status of media analysis in the processing pipeline.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    sqlx::Type,
+    strum::Display,
+    strum::AsRefStr,
 )]
 #[sqlx(type_name = "TEXT", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum AnalysisStatus {
     /// Waiting to be analyzed
     Pending,
@@ -226,24 +156,6 @@ pub enum AnalysisStatus {
     Complete,
     /// Analysis failed (see `analysis_error`)
     Failed,
-}
-
-impl AnalysisStatus {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Processing => "processing",
-            Self::Complete => "complete",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-impl fmt::Display for AnalysisStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
 }
 
 /// Analysis state with associated data - enforces valid state combinations.
@@ -281,112 +193,6 @@ impl MediaAnalysisState {
     }
 }
 
-/// Source type for a page (which integration processed it).
-///
-/// This indicates which specialized integration fetched and processed the content.
-/// `Generic` means the generic fetcher was used (no specialized integration).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type,
-)]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
-#[serde(rename_all = "snake_case")]
-pub enum SourceType {
-    Reddit,
-    Instagram,
-    Twitter,
-    Flickr,
-    /// Library of Congress
-    Loc,
-    Generic,
-}
-
-impl SourceType {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Reddit => "reddit",
-            Self::Instagram => "instagram",
-            Self::Twitter => "twitter",
-            Self::Flickr => "flickr",
-            Self::Loc => "loc",
-            Self::Generic => "generic",
-        }
-    }
-}
-
-impl fmt::Display for SourceType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl From<Option<chronoscope_integrations::IntegrationName>> for SourceType {
-    fn from(name: Option<chronoscope_integrations::IntegrationName>) -> Self {
-        match name {
-            Some(chronoscope_integrations::IntegrationName::Reddit) => Self::Reddit,
-            Some(chronoscope_integrations::IntegrationName::Instagram) => Self::Instagram,
-            None => Self::Generic,
-        }
-    }
-}
-
-/// Type of media content.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type,
-)]
-#[sqlx(type_name = "TEXT", rename_all = "lowercase")]
-#[serde(rename_all = "snake_case")]
-pub enum MediaType {
-    Image,
-    Video,
-}
-
-impl MediaType {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Image => "image",
-            Self::Video => "video",
-        }
-    }
-}
-
-impl fmt::Display for MediaType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// An email address.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type)]
-#[serde(transparent)]
-#[sqlx(transparent)]
-pub struct Email(String);
-
-impl Email {
-    #[must_use]
-    pub fn new(email: impl Into<String>) -> Self {
-        Self(email.into())
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for Email {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl AsRef<str> for Email {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,23 +214,8 @@ mod tests {
             ResearchUrlStatus::Failed,
         ] {
             let json = serde_json::to_string(&status)?;
-            assert_eq!(json, format!("\"{}\"", status.as_str()));
+            assert_eq!(json, format!("\"{}\"", status.as_ref()));
         }
         Ok(())
-    }
-
-    #[test]
-    fn source_type_from_integration_name() {
-        use chronoscope_integrations::IntegrationName;
-
-        assert_eq!(
-            SourceType::from(Some(IntegrationName::Reddit)),
-            SourceType::Reddit
-        );
-        assert_eq!(
-            SourceType::from(Some(IntegrationName::Instagram)),
-            SourceType::Instagram
-        );
-        assert_eq!(SourceType::from(None), SourceType::Generic);
     }
 }

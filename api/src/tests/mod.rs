@@ -21,8 +21,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{
     Database, Email, MediaData, MediaId, MediaSlot, MediaType, PageData, PageId, ResearchUrlId,
-    ResearchUrlStatus, SourceType, UserId,
+    ResearchUrlStatus, UserId,
 };
+use chronoscope_integrations::IntegrationName;
 use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpError,
     HttpServerStarter, ResultsPage,
@@ -503,7 +504,7 @@ impl TestContext {
     }
 
     /// Helper to create a simple test page data
-    fn test_page_data(source_type: SourceType, media_urls: &[&str]) -> PageData {
+    fn test_page_data(source_type: IntegrationName, media_urls: &[&str]) -> PageData {
         PageData {
             source_type,
             title: Some("Test Post".to_string()),

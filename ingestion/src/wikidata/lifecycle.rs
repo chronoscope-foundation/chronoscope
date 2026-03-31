@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::{EntityIdx, SourceIdx};
 use chrono::NaiveDateTime;
 use chronoscope_core::{
     Cited, DamageCause, EntityTransition, TriggerEventId, UncertainDate, UncertainLocation, Usage,
@@ -19,6 +20,7 @@ use crate::wikidata::ingest::PropertyContext;
 // =============================================================================
 
 mod extract {
+    use crate::EntityIdx;
     use chronoscope_core::{UncertainDate, UncertainLocation};
     use chronoscope_integrations::wikidata::{Claim, DataValue, Snak};
 
@@ -47,7 +49,9 @@ mod extract {
     }
 
     /// Extract coordinates from claim's mainsnak.
-    pub fn mainsnak_coordinates(claim: &Claim) -> (Option<UncertainLocation>, Vec<String>) {
+    pub fn mainsnak_coordinates(
+        claim: &Claim,
+    ) -> (Option<UncertainLocation<EntityIdx>>, Vec<String>) {
         let mut warnings = Vec::new();
 
         let coord = match &claim.mainsnak {
@@ -148,7 +152,7 @@ fn cite_first(
     dates: &[(UncertainDate, String)],
     prop: &str,
     ctx: &PropertyContext<'_>,
-) -> Option<Cited<UncertainDate>> {
+) -> Option<Cited<UncertainDate, SourceIdx>> {
     dates
         .first()
         .map(|(date, raw)| ctx.cited(format!("{prop}:{raw}"), date.clone()))
@@ -159,7 +163,7 @@ fn cite_all(
     dates: &[(UncertainDate, String)],
     prop: &str,
     ctx: &PropertyContext<'_>,
-) -> Vec<Cited<UncertainDate>> {
+) -> Vec<Cited<UncertainDate, SourceIdx>> {
     dates
         .iter()
         .map(|(date, raw)| ctx.cited(format!("{prop}:{raw}"), date.clone()))
@@ -175,7 +179,7 @@ fn extract_property_time(
     claims: &HashMap<PropertyId, Vec<Claim>>,
     prop: &str,
     ctx: &PropertyContext<'_>,
-) -> (Option<Cited<UncertainDate>>, Vec<String>) {
+) -> (Option<Cited<UncertainDate, SourceIdx>>, Vec<String>) {
     let mut warnings = Vec::new();
 
     let Some(prop_claims) = claims.get(prop) else {
@@ -200,7 +204,10 @@ fn extract_property_time(
 fn extract_property_location(
     claims: &HashMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext<'_>,
-) -> (Option<Cited<UncertainLocation>>, Vec<String>) {
+) -> (
+    Option<Cited<UncertainLocation<EntityIdx>, SourceIdx>>,
+    Vec<String>,
+) {
     let mut warnings = Vec::new();
 
     let Some(prop_claims) = claims.get("P625") else {
@@ -236,7 +243,7 @@ fn extract_property_location(
 
 /// A transition with its sort key for chronological ordering.
 struct DatedTransition {
-    transition: EntityTransition,
+    transition: EntityTransition<EntityIdx, SourceIdx>,
     sort_key: Option<NaiveDateTime>,
 }
 
@@ -279,7 +286,7 @@ fn process_p793_claim(
         .or(p585.first())
         .map(|(d, _)| d.earliest());
 
-    let transitions: Vec<EntityTransition> = match qid.as_str() {
+    let transitions: Vec<EntityTransition<EntityIdx, SourceIdx>> = match qid.as_str() {
         // =================================================================
         // CONSTRUCTION EVENTS
         // =================================================================
@@ -503,7 +510,10 @@ fn process_p793_claim(
 pub fn build_lifecycles(
     claims: &HashMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext<'_>,
-) -> (Vec<Vec<EntityTransition>>, Vec<String>) {
+) -> (
+    Vec<Vec<EntityTransition<EntityIdx, SourceIdx>>>,
+    Vec<String>,
+) {
     let mut warnings = Vec::new();
     let mut dated_transitions: Vec<DatedTransition> = Vec::new();
 
@@ -685,12 +695,14 @@ pub fn build_lifecycles(
 /// When splitting, if the construction that triggers the split has a location, the
 /// predecessor gets a synthetic `Constructed` with that same location and no dates —
 /// the previous building occupied the same site, we just don't know when it was built.
-fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransition>> {
+fn split_on_rebuild(
+    transitions: Vec<DatedTransition>,
+) -> Vec<Vec<EntityTransition<EntityIdx, SourceIdx>>> {
     if transitions.is_empty() {
         return vec![];
     }
 
-    let mut entities: Vec<Vec<EntityTransition>> = vec![vec![]];
+    let mut entities: Vec<Vec<EntityTransition<EntityIdx, SourceIdx>>> = vec![vec![]];
     let mut saw_demolition = false;
 
     for dt in transitions {

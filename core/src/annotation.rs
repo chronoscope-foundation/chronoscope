@@ -6,7 +6,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::evidence::{ImageRegion, SpatialGeometry};
-use crate::ids::{EntityId, SourceId};
 
 /// What kind of annotation this is, with per-variant geometry.
 ///
@@ -48,7 +47,7 @@ pub enum AnnotationKind {
 ///
 /// Generic over reference types:
 /// - For ingestion bundles: `Annotation<SourceIdx, EntityIdx>` (typed indices into vectors)
-/// - For production database: `Annotation<SourceId, EntityId>` (real IDs)
+/// - For stored data: `Annotation<SourceId, EntityId>` (persistent IDs from api-client)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(
     deserialize = "SourceRef: serde::de::DeserializeOwned, EntityRef: serde::de::DeserializeOwned"
@@ -58,6 +57,3 @@ pub struct Annotation<SourceRef, EntityRef> {
     pub entity: EntityRef,
     pub kind: AnnotationKind,
 }
-
-/// Annotation using real IDs (for production database).
-pub type StoredAnnotation = Annotation<SourceId, EntityId>;

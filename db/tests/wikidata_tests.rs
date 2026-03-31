@@ -7,9 +7,7 @@
 use std::ops::Deref;
 
 use chrono::Datelike;
-use chronoscope_db::{
-    Coordinates, Database, DateRange, ExternalIdType, ResearchUrlStatus, StoredEntity,
-};
+use chronoscope_db::{Coordinates, Database, DateRange, Entity, ExternalIdType, ResearchUrlStatus};
 use tempfile::NamedTempFile;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -41,7 +39,7 @@ async fn wikidata_db() -> Result<TestDb> {
 
 /// Look up exactly one entity by Wikidata Q-ID.
 /// The `name` parameter is a self-documenting label validated against the entity's names.
-async fn lookup_one(db: &TestDb, qid: &str, name: &str) -> Result<StoredEntity> {
+async fn lookup_one(db: &TestDb, qid: &str, name: &str) -> Result<Entity> {
     let mut results = db
         .find_entities_by_external_id(&ExternalIdType::Wikidata, qid)
         .await?;
@@ -56,14 +54,14 @@ async fn lookup_one(db: &TestDb, qid: &str, name: &str) -> Result<StoredEntity> 
     Ok(entity)
 }
 
-fn bounds(entity: &StoredEntity) -> Result<&DateRange> {
+fn bounds(entity: &Entity) -> Result<&DateRange> {
     entity
         .temporal_bounds
         .as_ref()
         .ok_or_else(|| format!("entity {} has no temporal bounds", entity.id).into())
 }
 
-fn location(entity: &StoredEntity) -> Result<Coordinates> {
+fn location(entity: &Entity) -> Result<Coordinates> {
     entity
         .location
         .ok_or_else(|| format!("entity {} has no location", entity.id).into())

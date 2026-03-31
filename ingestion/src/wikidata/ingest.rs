@@ -2,11 +2,11 @@
 //!
 //! Entity processing and result merging for the Wikidata ingestion pipeline.
 
+use crate::{EntityIdx, IngestionOutput, LinkIdx, SourceIdx};
 use anyhow::{Context, Result};
 use chronoscope_core::{
-    Annotation, AnnotationKind, EntityIdx, EntityRelation, EntityRelationType, EntityType,
-    Evidence, ExternalLink, ImageSource, IngestionOutput, LinkIdx, LinkTarget, LinkType, SourceIdx,
-    WikidataEntityId, WikidataPropertyId,
+    Annotation, AnnotationKind, EntityRelationType, EntityType, Evidence, ExternalLink,
+    ImageSource, LinkTarget, LinkType, WikidataEntityId, WikidataPropertyId,
 };
 use chronoscope_integrations::wikidata::WikidataEntity;
 use futures::stream::{self, StreamExt};
@@ -30,6 +30,7 @@ pub use self::entity_accumulator::*;
 mod entity_accumulator {
     use std::collections::BTreeSet;
 
+    use crate::{EntityIdx, SourceIdx};
     use chronoscope_core::{
         AnnotationKind, Cited, Entity, EntityName, EntityTransition, EntityType, Evidence,
         ExternalLink, ImageSource, Usage, WikidataEntityId, WikidataPropertyId,
@@ -42,8 +43,8 @@ mod entity_accumulator {
         pub entity_idx: usize,
         pub wikidata_id: WikidataId,
         pub revision_id: RevisionId,
-        pub entity: Entity,
-        pub images: Vec<ImageSource>,
+        pub entity: Entity<EntityIdx, SourceIdx>,
+        pub images: Vec<ImageSource<EntityIdx>>,
         pub annotations: Vec<LocalAnnotation>,
         pub links: Vec<ExternalLink>,
         pub issues: Vec<(String, String)>,
@@ -64,7 +65,7 @@ mod entity_accumulator {
         wikidata_id: WikidataId,
         revision_id: RevisionId,
         entity_type: EntityType,
-        images: Vec<ImageSource>,
+        images: Vec<ImageSource<EntityIdx>>,
         annotations: Vec<LocalAnnotation>,
         links: Vec<ExternalLink>,
         issues: Vec<(String, String)>,
@@ -98,7 +99,7 @@ mod entity_accumulator {
         }
 
         /// Add an image with an annotation linking it to this entity.
-        pub fn add_image(&mut self, image: ImageSource, kind: AnnotationKind) {
+        pub fn add_image(&mut self, image: ImageSource<EntityIdx>, kind: AnnotationKind) {
             let local_idx = self.images.len();
             self.images.push(image);
             self.annotations.push(LocalAnnotation {
@@ -140,7 +141,7 @@ mod entity_accumulator {
 
         /// Convert to final result (single entity, no splitting).
         #[must_use]
-        pub fn into_result(self, names: Vec<Cited<EntityName>>) -> EntityResult {
+        pub fn into_result(self, names: Vec<Cited<EntityName, SourceIdx>>) -> EntityResult {
             EntityResult {
                 entity_idx: self.entity_idx,
                 wikidata_id: self.wikidata_id,
@@ -164,8 +165,8 @@ mod entity_accumulator {
         /// into each result.
         pub fn split_into_results(
             self,
-            names: Vec<Cited<EntityName>>,
-            mut lifecycles: Vec<Vec<EntityTransition>>,
+            names: Vec<Cited<EntityName, SourceIdx>>,
+            mut lifecycles: Vec<Vec<EntityTransition<EntityIdx, SourceIdx>>>,
             inferred_usages: &BTreeSet<Usage>,
         ) -> Vec<EntityResult> {
             if lifecycles.is_empty() {
@@ -220,7 +221,7 @@ mod entity_accumulator {
 
         /// Create a cited value with Wikidata evidence for this property.
         #[must_use]
-        pub fn cited<T>(&self, raw: impl Into<String>, value: T) -> Cited<T> {
+        pub fn cited<T>(&self, raw: impl Into<String>, value: T) -> Cited<T, SourceIdx> {
             Cited::new(
                 value,
                 vec![Evidence::Wikidata {
@@ -250,7 +251,7 @@ mod entity_accumulator {
     /// Handlers are pure functions that return what they want to add.
     #[derive(Default)]
     pub struct HandlerOutput {
-        pub images: Vec<(ImageSource, AnnotationKind)>,
+        pub images: Vec<(ImageSource<EntityIdx>, AnnotationKind)>,
         pub links: Vec<ExternalLink>,
         pub issues: Vec<String>,
     }
@@ -263,7 +264,7 @@ mod entity_accumulator {
         }
 
         /// Add an image with annotation kind.
-        pub fn add_image(&mut self, image: ImageSource, kind: AnnotationKind) {
+        pub fn add_image(&mut self, image: ImageSource<EntityIdx>, kind: AnnotationKind) {
             self.images.push((image, kind));
         }
 
@@ -496,7 +497,7 @@ fn merge_results(results: &[Vec<EntityResult>]) -> IngestionOutput {
             for window in group_entity_keys.windows(2) {
                 let older_key = window[0];
                 let newer_key = window[1];
-                output.entity_relations.push(EntityRelation {
+                output.entity_relations.push(crate::IngestionRelation {
                     from_entity: newer_key,
                     to_entity: older_key,
                     relation_type: EntityRelationType::Replaces,

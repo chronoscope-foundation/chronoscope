@@ -130,27 +130,21 @@ pub fn create_map(container: &web_sys::HtmlDivElement, options: &MapOptions<'_>)
     let opts = match options.serialize(&serializer) {
         Ok(v) => v,
         Err(e) => {
-            web_sys::console::error_1(
-                &format!("Failed to serialize map options: {e}").into(),
-            );
+            web_sys::console::error_1(&format!("Failed to serialize map options: {e}").into());
             return None;
         }
     };
 
     // `container` is a DOM element, not serializable — set it on the JS object directly.
     if let Err(e) = js_sys::Reflect::set(&opts, &"container".into(), container) {
-        web_sys::console::error_1(
-            &format!("Failed to set container on map options: {e:?}").into(),
-        );
+        web_sys::console::error_1(&format!("Failed to set container on map options: {e:?}").into());
         return None;
     }
 
     match Map::new(&opts) {
         Ok(map) => Some(map),
         Err(e) => {
-            web_sys::console::error_1(
-                &format!("maplibregl.Map constructor failed: {e:?}").into(),
-            );
+            web_sys::console::error_1(&format!("maplibregl.Map constructor failed: {e:?}").into());
             None
         }
     }

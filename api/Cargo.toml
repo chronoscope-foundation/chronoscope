@@ -32,8 +32,14 @@ jwt-compact = { version = "0.8", features = ["clock"] }
 # Core types
 chronoscope-core = { path = "../core" }
 
+# API contract (shared types with client)
+chronoscope-api-client = { path = "../api-client" }
+
 # Database layer
 chronoscope-db = { path = "../db" }
+
+# Integrations (for IntegrationName type)
+chronoscope-integrations = { path = "../integrations" }
 
 # Analysis types
 chronoscope-analysis = { path = "../analysis" }

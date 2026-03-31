@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["analysis", "api", "core", "db", "dev", "ingestion", "integrations", "web", "workers"]
-default-members = ["analysis", "api", "core", "db", "dev", "ingestion", "integrations", "workers"]
+members = ["analysis", "api", "api-client", "core", "db", "dev", "ingestion", "integrations", "web", "workers"]
+default-members = ["analysis", "api", "api-client", "core", "db", "dev", "ingestion", "integrations", "workers"]
 
 [workspace.package]
 edition = "2024"
@@ -40,8 +40,9 @@ schemars = { version = "0.8", features = ["chrono"] }
 # Common utilities
 chrono = { version = "0.4", features = ["serde"] }
 url = { version = "2.5", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde", "js"] }
 base64 = "0.22"
 thiserror = "2"
 bytes = "1"
 oxilangtag = { version = "0.1", features = ["serde"] }
+strum = { version = "0.27", features = ["derive"] }

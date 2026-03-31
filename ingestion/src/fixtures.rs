@@ -12,12 +12,14 @@ use std::collections::BTreeSet;
 use chrono::NaiveDate;
 use oxilangtag::LanguageTag;
 
-use crate::ingestion::TestBundle;
-use crate::{
+use chronoscope_core::ingestion::TestBundle;
+use chronoscope_core::{
     Cited, DatePrecision, Elevation, Entity, EntityName, EntityRelation, EntityRelationType,
     EntityTransition, EntityType, MoveMethod, NameType, PreciseDate, UncertainDate,
     UncertainLocation, Usage,
 };
+
+type FixtureEntity = Entity<&'static str, &'static str>;
 
 fn year(y: i32) -> UncertainDate {
     UncertainDate::with_precision(
@@ -62,7 +64,7 @@ fn range(y1: i32, y2: i32) -> UncertainDate {
     .expect("fixture date range is always valid")
 }
 
-fn uncited<T>(value: T) -> Cited<T> {
+fn uncited<T>(value: T) -> Cited<T, &'static str> {
     Cited::uncited(value)
 }
 
@@ -71,7 +73,17 @@ fn lang(tag: &str) -> LanguageTag<String> {
     LanguageTag::parse(tag.to_string()).expect("hardcoded BCP 47 tag is valid")
 }
 
-fn en_name(name: &str, name_type: NameType) -> Cited<EntityName> {
+fn coords(
+    lat: f64,
+    lon: f64,
+    elevation: Option<Elevation>,
+    precision_m: Option<u32>,
+) -> UncertainLocation<&'static str> {
+    UncertainLocation::coordinates(lat, lon, elevation, precision_m)
+        .expect("fixture coordinates always valid")
+}
+
+fn en_name(name: &str, name_type: NameType) -> Cited<EntityName, &'static str> {
     uncited(EntityName {
         name: name.to_string(),
         name_type,
@@ -87,7 +99,7 @@ fn name_with_validity(
     language: &str,
     valid_from: Option<UncertainDate>,
     valid_to: Option<UncertainDate>,
-) -> Cited<EntityName> {
+) -> Cited<EntityName, &'static str> {
     uncited(EntityName {
         name: name.to_string(),
         name_type,
@@ -97,7 +109,7 @@ fn name_with_validity(
     })
 }
 
-fn penn_station_original() -> Entity {
+fn penn_station_original() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Building,
         names: vec![en_name("Pennsylvania Station", NameType::Official)],
@@ -105,12 +117,7 @@ fn penn_station_original() -> Entity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1904))),
                 completed_at: Some(uncited(year(1910))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 40.7505,
-                    lon: -73.9934,
-                    elevation: None,
-                    precision_m: Some(10),
-                })),
+                location: Some(uncited(coords(40.7505, -73.9934, None, Some(10)))),
                 trigger_event: None,
             },
             EntityTransition::Modified {
@@ -125,25 +132,25 @@ fn penn_station_original() -> Entity {
     }
 }
 
-fn madison_square_garden() -> Entity {
+fn madison_square_garden() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Building,
         names: vec![en_name("Madison Square Garden", NameType::Official)],
         transitions: vec![EntityTransition::Constructed {
             started_at: Some(uncited(year(1964))),
             completed_at: Some(uncited(year(1968))),
-            location: Some(uncited(UncertainLocation::Coordinates {
-                lat: 40.7505,
-                lon: -73.9934,
-                elevation: Some(Elevation::CurrentGroundOffset { meters: 0 }),
-                precision_m: Some(10),
-            })),
+            location: Some(uncited(coords(
+                40.7505,
+                -73.9934,
+                Some(Elevation::CurrentGroundOffset { meters: 0 }),
+                Some(10),
+            ))),
             trigger_event: None,
         }],
     }
 }
 
-fn palace_of_fine_arts_original() -> Entity {
+fn palace_of_fine_arts_original() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Building,
         names: vec![en_name("Palace of Fine Arts", NameType::Official)],
@@ -151,12 +158,7 @@ fn palace_of_fine_arts_original() -> Entity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1914))),
                 completed_at: Some(uncited(year(1915))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 37.8029,
-                    lon: -122.4484,
-                    elevation: None,
-                    precision_m: Some(20),
-                })),
+                location: Some(uncited(coords(37.8029, -122.4484, None, Some(20)))),
                 trigger_event: None,
             },
             EntityTransition::Demolished {
@@ -169,25 +171,20 @@ fn palace_of_fine_arts_original() -> Entity {
     }
 }
 
-fn palace_of_fine_arts_rebuilt() -> Entity {
+fn palace_of_fine_arts_rebuilt() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Building,
         names: vec![en_name("Palace of Fine Arts", NameType::Official)],
         transitions: vec![EntityTransition::Constructed {
             started_at: Some(uncited(year(1964))),
             completed_at: Some(uncited(year(1967))),
-            location: Some(uncited(UncertainLocation::Coordinates {
-                lat: 37.8029,
-                lon: -122.4484,
-                elevation: None,
-                precision_m: Some(20),
-            })),
+            location: Some(uncited(coords(37.8029, -122.4484, None, Some(20)))),
             trigger_event: None,
         }],
     }
 }
 
-fn statue_of_liberty() -> Entity {
+fn statue_of_liberty() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Monument,
         names: vec![
@@ -198,22 +195,12 @@ fn statue_of_liberty() -> Entity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1876))),
                 completed_at: Some(uncited(year(1884))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 48.8566,
-                    lon: 2.3522,
-                    elevation: None,
-                    precision_m: Some(100),
-                })),
+                location: Some(uncited(coords(48.8566, 2.3522, None, Some(100)))),
                 trigger_event: None,
             },
             EntityTransition::Moved {
                 occurred_at: Some(uncited(range(1885, 1886))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 40.6892,
-                    lon: -74.0445,
-                    elevation: None,
-                    precision_m: Some(10),
-                })),
+                location: Some(uncited(coords(40.6892, -74.0445, None, Some(10)))),
                 cause: Some("gift from France to United States".to_string()),
                 method: Some(MoveMethod::Disassembled),
                 trigger_event: None,
@@ -230,7 +217,7 @@ fn statue_of_liberty() -> Entity {
     }
 }
 
-fn route_66() -> Entity {
+fn route_66() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name("U.S. Route 66", NameType::Official)],
@@ -251,7 +238,7 @@ fn route_66() -> Entity {
     }
 }
 
-fn route_66_illinois_segment() -> Entity {
+fn route_66_illinois_segment() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name("Route 66 Illinois segment", NameType::Common)],
@@ -264,7 +251,7 @@ fn route_66_illinois_segment() -> Entity {
     }
 }
 
-fn route_66_arizona_segment() -> Entity {
+fn route_66_arizona_segment() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name("Route 66 Arizona segment", NameType::Common)],
@@ -277,7 +264,7 @@ fn route_66_arizona_segment() -> Entity {
     }
 }
 
-fn high_line() -> Entity {
+fn high_line() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![
@@ -325,7 +312,7 @@ fn high_line() -> Entity {
     }
 }
 
-fn berlin_wall() -> Entity {
+fn berlin_wall() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![
@@ -357,7 +344,7 @@ fn berlin_wall() -> Entity {
     }
 }
 
-fn east_side_gallery() -> Entity {
+fn east_side_gallery() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![
@@ -379,7 +366,7 @@ fn east_side_gallery() -> Entity {
     }
 }
 
-fn burning_man_2023() -> Entity {
+fn burning_man_2023() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Area,
         names: vec![en_name("Black Rock City 2023", NameType::Official)],
@@ -387,12 +374,7 @@ fn burning_man_2023() -> Entity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(exact(2023, 8, 20))),
                 completed_at: Some(uncited(exact(2023, 8, 27))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 40.7864,
-                    lon: -119.2065,
-                    elevation: None,
-                    precision_m: Some(100),
-                })),
+                location: Some(uncited(coords(40.7864, -119.2065, None, Some(100)))),
                 trigger_event: None,
             },
             EntityTransition::Demolished {
@@ -405,7 +387,7 @@ fn burning_man_2023() -> Entity {
     }
 }
 
-fn hagia_sophia() -> Entity {
+fn hagia_sophia() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Building,
         names: vec![
@@ -422,12 +404,7 @@ fn hagia_sophia() -> Entity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(532))),
                 completed_at: Some(uncited(year(537))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 41.0086,
-                    lon: 28.9802,
-                    elevation: None,
-                    precision_m: Some(20),
-                })),
+                location: Some(uncited(coords(41.0086, 28.9802, None, Some(20)))),
                 trigger_event: None,
             },
             EntityTransition::UsageModified {
@@ -464,7 +441,7 @@ fn hagia_sophia() -> Entity {
     }
 }
 
-fn pioneer_building_seattle() -> Entity {
+fn pioneer_building_seattle() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Building,
         names: vec![en_name("Pioneer Building", NameType::Official)],
@@ -472,12 +449,7 @@ fn pioneer_building_seattle() -> Entity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1889))),
                 completed_at: Some(uncited(year(1892))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 47.6021,
-                    lon: -122.3319,
-                    elevation: None,
-                    precision_m: Some(10),
-                })),
+                location: Some(uncited(coords(47.6021, -122.3319, None, Some(10)))),
                 trigger_event: None,
             },
             EntityTransition::Modified {
@@ -492,7 +464,7 @@ fn pioneer_building_seattle() -> Entity {
     }
 }
 
-fn kowloon_walled_city() -> Entity {
+fn kowloon_walled_city() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Area,
         names: vec![en_name("Kowloon Walled City", NameType::Common)],
@@ -500,12 +472,7 @@ fn kowloon_walled_city() -> Entity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1847))),
                 completed_at: Some(uncited(year(1847))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 22.3321,
-                    lon: 114.1907,
-                    elevation: None,
-                    precision_m: Some(50),
-                })),
+                location: Some(uncited(coords(22.3321, 114.1907, None, Some(50)))),
                 trigger_event: None,
             },
             EntityTransition::Modified {
@@ -528,7 +495,7 @@ fn kowloon_walled_city() -> Entity {
 // Exercises: parent with system-level transitions, child segments with divergent fates,
 // gradual processes via date ranges, destruction/preservation/restoration patterns.
 
-fn jrk_canal() -> Entity {
+fn jrk_canal() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name("James River and Kanawha Canal", NameType::Official)],
@@ -550,7 +517,7 @@ fn jrk_canal() -> Entity {
 }
 
 /// Bosher Dam to Pump House Park — still an active waterway feeding city water supply.
-fn jrk_canal_bosher_dam_segment() -> Entity {
+fn jrk_canal_bosher_dam_segment() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name(
@@ -567,7 +534,7 @@ fn jrk_canal_bosher_dam_segment() -> Entity {
 }
 
 /// Tidewater Connection Locks 1-3 — destroyed by I-195 expressway construction in 1976.
-fn jrk_canal_tidewater_locks_1_3() -> Entity {
+fn jrk_canal_tidewater_locks_1_3() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name("Tidewater Connection Locks 1-3", NameType::Common)],
@@ -589,7 +556,7 @@ fn jrk_canal_tidewater_locks_1_3() -> Entity {
 }
 
 /// Tidewater Connection Locks 4-5 — preserved in situ by Reynolds Metals.
-fn jrk_canal_tidewater_locks_4_5() -> Entity {
+fn jrk_canal_tidewater_locks_4_5() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name("Tidewater Connection Locks 4-5", NameType::Common)],
@@ -611,7 +578,7 @@ fn jrk_canal_tidewater_locks_4_5() -> Entity {
 }
 
 /// Great Basin — progressively covered by railroad yards (1880s) then development (by 1920s).
-fn jrk_canal_great_basin() -> Entity {
+fn jrk_canal_great_basin() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name("Great Basin", NameType::Common)],
@@ -639,7 +606,7 @@ fn jrk_canal_great_basin() -> Entity {
 }
 
 /// Canal Walk segment — buried in late 19th century, restored 1995-1999.
-fn jrk_canal_canal_walk() -> Entity {
+fn jrk_canal_canal_walk() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![
@@ -679,7 +646,7 @@ fn jrk_canal_canal_walk() -> Entity {
 }
 
 /// Great Ship Lock — intact and operational since 1854, renovated 2013.
-fn jrk_canal_great_ship_lock() -> Entity {
+fn jrk_canal_great_ship_lock() -> FixtureEntity {
     Entity {
         entity_type: EntityType::Infrastructure,
         names: vec![en_name("Great Ship Lock", NameType::Common)],
@@ -687,12 +654,7 @@ fn jrk_canal_great_ship_lock() -> Entity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1850))),
                 completed_at: Some(uncited(year(1854))),
-                location: Some(uncited(UncertainLocation::Coordinates {
-                    lat: 37.5295,
-                    lon: -77.4175,
-                    elevation: None,
-                    precision_m: Some(30),
-                })),
+                location: Some(uncited(coords(37.5295, -77.4175, None, Some(30)))),
                 trigger_event: None,
             },
             EntityTransition::Repaired {
@@ -709,7 +671,7 @@ fn jrk_canal_great_ship_lock() -> Entity {
 
 // --- Bundle constructors ---
 
-fn contains(from: &'static str, to: &'static str) -> EntityRelation<&'static str> {
+fn contains(from: &'static str, to: &'static str) -> EntityRelation<&'static str, &'static str> {
     EntityRelation {
         from_entity: from,
         to_entity: to,
@@ -718,7 +680,7 @@ fn contains(from: &'static str, to: &'static str) -> EntityRelation<&'static str
     }
 }
 
-fn replaces(from: &'static str, to: &'static str) -> EntityRelation<&'static str> {
+fn replaces(from: &'static str, to: &'static str) -> EntityRelation<&'static str, &'static str> {
     EntityRelation {
         from_entity: from,
         to_entity: to,
@@ -812,7 +774,7 @@ pub(crate) fn all_bundles() -> Vec<(&'static str, TestBundle)> {
         ("jrk_canal", jrk_canal_bundle()),
     ];
 
-    let singletons: Vec<(&str, Entity)> = vec![
+    let singletons: Vec<(&str, FixtureEntity)> = vec![
         ("statue_of_liberty", statue_of_liberty()),
         ("high_line", high_line()),
         ("burning_man_2023", burning_man_2023()),

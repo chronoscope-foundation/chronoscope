@@ -4,18 +4,22 @@
 # These are product/protocol/format names, not code identifiers.
 doc-valid-idents = [
     "AdGuard",
+    "DBpedia",
     "DINOv3",
-    "GeoJSON",
     "EdDSA",
+    "GeoJSON",
+    "GeoNames",
     "IPv4",
     "IPv6",
     "MapLibre",
     "MediaWiki",
-    "WebGL",
     "OpenAPI",
+    "OpenFreeMap",
+    "OpenStreetMap",
     "SQLite",
     "UUIDv7",
     "WebAuthn",
+    "WebGL",
     "WebP",
 ]
 

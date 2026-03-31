@@ -5,15 +5,17 @@
 //! into domain types via `into_domain()` before returning.
 
 use chrono::NaiveDateTime;
+use chronoscope_core::UncertainDate;
 use chronoscope_core::links::LinkType;
-use chronoscope_core::{UncertainDate, UncertainLocation};
 use sqlx::FromRow;
 
 use crate::error::DbError;
 use crate::models;
+use chronoscope_integrations::IntegrationName;
+
 use crate::types::{
-    AnalysisStatus, AnnotationDbId, EntityDbId, EntityLinkDbId, MediaAnalysisState, MediaId,
-    MediaType, PageId, ResearchUrlId, SourceType,
+    AnalysisStatus, AnnotationId, AnnotationKindTag, EntityId, EntityLinkId, MediaAnalysisState,
+    MediaId, MediaType, PageId, ResearchUrlId, SourceId,
 };
 
 /// Construct analysis state from raw DB fields.
@@ -45,12 +47,18 @@ fn build_analysis_state(
     }
 }
 
+/// Parse a source type DB string into `IntegrationName`.
+fn parse_source_type(s: &str) -> Result<IntegrationName, DbError> {
+    s.parse()
+        .map_err(|e: strum::ParseError| DbError::InconsistentRow(e.to_string()))
+}
+
 // ==================== Page ====================
 
 #[derive(Debug, FromRow)]
 pub struct Page {
     pub id: PageId,
-    pub source_type: SourceType,
+    pub source_type: String,
     pub title: Option<String>,
     pub author: Option<String>,
     #[sqlx(json(nullable), rename = "published_meta")]
@@ -61,11 +69,11 @@ pub struct Page {
 }
 
 impl Page {
-    pub fn into_domain(self, media: Vec<models::MediaSlot>) -> models::Page {
-        models::Page {
+    pub fn into_domain(self, media: Vec<models::MediaSlot>) -> Result<models::Page, DbError> {
+        Ok(models::Page {
             id: self.id,
             data: models::PageData {
-                source_type: self.source_type,
+                source_type: parse_source_type(&self.source_type)?,
                 title: self.title,
                 author: self.author,
                 published: self.published,
@@ -74,7 +82,7 @@ impl Page {
                 media,
             },
             created_at: self.created_at,
-        }
+        })
     }
 }
 
@@ -93,7 +101,7 @@ pub struct Media {
     #[sqlx(json(nullable), rename = "captured_meta")]
     pub captured: Option<UncertainDate>,
     #[sqlx(json(nullable), rename = "location_meta")]
-    pub location: Option<UncertainLocation>,
+    pub location: Option<chronoscope_core::UncertainLocation<EntityId>>,
     pub source_metadata: Option<String>,
     pub fetched_at: NaiveDateTime,
     pub created_at: NaiveDateTime,
@@ -148,7 +156,7 @@ pub struct PageMedia {
     #[sqlx(json(nullable), rename = "captured_meta")]
     pub captured: Option<UncertainDate>,
     #[sqlx(json(nullable), rename = "location_meta")]
-    pub location: Option<UncertainLocation>,
+    pub location: Option<chronoscope_core::UncertainLocation<EntityId>>,
     pub source_metadata: Option<String>,
     pub fetched_at: Option<NaiveDateTime>,
     pub created_at: Option<NaiveDateTime>,
@@ -173,10 +181,10 @@ impl PageMedia {
             return Ok(None);
         };
 
-        let id_str = id.as_str().to_string();
+        let id_clone = id.clone();
         let missing = move |field: &str| {
             DbError::InconsistentRow(format!(
-                "media {id_str} has NULL {field} in page_media join"
+                "media {id_clone} has NULL {field} in page_media join"
             ))
         };
 
@@ -207,7 +215,7 @@ impl PageMedia {
 
 #[derive(Debug, FromRow)]
 pub struct Entity {
-    pub id: EntityDbId,
+    pub id: EntityId,
     pub entity_json: String,
     pub earliest_date: Option<NaiveDateTime>,
     pub latest_date: Option<NaiveDateTime>,
@@ -218,8 +226,11 @@ pub struct Entity {
 }
 
 impl Entity {
-    pub fn into_domain(self) -> Result<models::StoredEntity, DbError> {
-        let entity = serde_json::from_str(&self.entity_json)?;
+    pub fn into_domain(self) -> Result<models::Entity, DbError> {
+        let entity: chronoscope_core::entity::Entity<EntityId, SourceId> =
+            serde_json::from_str(&self.entity_json)?;
+
+        let id = self.id;
 
         let temporal_bounds = match (self.earliest_date, self.latest_date) {
             (Some(earliest), Some(latest)) => Some(models::DateRange { earliest, latest }),
@@ -227,7 +238,7 @@ impl Entity {
             _ => {
                 return Err(DbError::InconsistentRow(format!(
                     "entity {} has mismatched temporal shadow columns",
-                    self.id
+                    id
                 )));
             }
         };
@@ -238,13 +249,13 @@ impl Entity {
             _ => {
                 return Err(DbError::InconsistentRow(format!(
                     "entity {} has latitude without longitude or vice versa",
-                    self.id
+                    id
                 )));
             }
         };
 
-        Ok(models::StoredEntity {
-            id: self.id,
+        Ok(models::Entity {
+            id,
             entity,
             temporal_bounds,
             location,
@@ -258,8 +269,8 @@ impl Entity {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct EntityLink {
-    pub id: EntityLinkDbId,
-    pub entity_id: EntityDbId,
+    pub id: EntityLinkId,
+    pub entity_id: EntityId,
     pub link_type: LinkType,
     pub target_json: String,
     /// Shadow column for dedup/display — domain type derives this from `target`.
@@ -283,12 +294,12 @@ impl EntityLink {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct Annotation {
-    pub id: AnnotationDbId,
-    pub entity_id: EntityDbId,
+    pub id: AnnotationId,
+    pub entity_id: EntityId,
     pub url_id: ResearchUrlId,
     /// Shadow column (generated from `kind_json`) — domain type has the parsed `AnnotationKind`.
     #[allow(dead_code)]
-    pub kind: crate::types::AnnotationKind,
+    pub kind: AnnotationKindTag,
     pub kind_json: String,
     pub created_at: NaiveDateTime,
 }

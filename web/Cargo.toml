@@ -17,11 +17,12 @@ wasm-bindgen = "= 0.2.108"
 web-sys = { version = "0.3", features = ["CustomEvent", "CustomEventInit", "ErrorEvent", "EventTarget", "HtmlDivElement", "HtmlElement", "Navigator", "PromiseRejectionEvent", "Storage", "Window"] }
 send_wrapper = "0.6"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-gloo-net = { version = "0.6", features = ["http"] }
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 chronoscope-core = { path = "../core" }
+chronoscope-api-client = { path = "../api-client" }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde-wasm-bindgen = "0.6"
 geojson = "0.24"

@@ -12,13 +12,16 @@ use url::Url;
 use crate::annotation::Annotation;
 use crate::date::UncertainDate;
 use crate::entity::{Entity, EntityRelation};
-use crate::ids::{EntityIdx, LinkIdx, SourceIdx};
 use crate::links::ExternalLink;
 use crate::location::UncertainLocation;
 
-/// An image of an entity.
+/// An image/media source for an entity.
+///
+/// Generic over `E` (entity reference type) because the location may contain
+/// `UncertainLocation::NearEntity` references.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ImageSource {
+#[serde(bound(deserialize = "E: serde::de::DeserializeOwned"))]
+pub struct ImageSource<E> {
     #[schemars(with = "String")]
     pub url: Url,
 
@@ -32,7 +35,7 @@ pub struct ImageSource {
     /// coordinates. Will be enriched with geocoding, cross-referencing, and
     /// uncertainty modeling as the ingestion pipeline matures.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<UncertainLocation>,
+    pub location: Option<UncertainLocation<E>>,
 }
 
 /// Metadata about the ingestion process.
@@ -57,9 +60,9 @@ pub struct IngestionNotes {
     deserialize = "E: serde::de::DeserializeOwned + Ord, S: serde::de::DeserializeOwned + Ord, L: serde::de::DeserializeOwned + Ord"
 ))]
 pub struct IngestionBundle<E, S, L> {
-    pub entities: BTreeMap<E, Entity>,
+    pub entities: BTreeMap<E, Entity<E, S>>,
     #[serde(default)]
-    pub images: BTreeMap<S, ImageSource>,
+    pub images: BTreeMap<S, ImageSource<E>>,
     #[serde(default)]
     pub external_links: BTreeMap<L, ExternalLink>,
 
@@ -69,7 +72,7 @@ pub struct IngestionBundle<E, S, L> {
 
     /// Relationships between entities.
     #[serde(default)]
-    pub entity_relations: Vec<EntityRelation<E>>,
+    pub entity_relations: Vec<EntityRelation<E, S>>,
 
     /// Annotations connecting entities to sources.
     #[serde(default)]
@@ -95,7 +98,7 @@ impl<E: Ord, S: Ord, L: Ord> IngestionBundle<E, S, L> {
 
     /// Create a bundle containing a single entity with no relations or sources.
     #[must_use]
-    pub fn single(key: E, entity: Entity) -> Self {
+    pub fn single(key: E, entity: Entity<E, S>) -> Self {
         Self {
             entities: BTreeMap::from([(key, entity)]),
             ..Self::new()
@@ -239,11 +242,7 @@ impl<E: Ord, S: Ord, L: Ord> Default for IngestionBundle<E, S, L> {
     }
 }
 
-/// Ingestion bundle using typed positional indices (production key types).
-pub type IngestionOutput = IngestionBundle<EntityIdx, SourceIdx, LinkIdx>;
-
 /// Ingestion bundle using string keys for test fixtures.
-#[cfg(test)]
 pub type TestBundle = IngestionBundle<&'static str, &'static str, &'static str>;
 
 #[cfg(test)]
@@ -257,7 +256,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn test_entity() -> Entity {
+    fn test_entity() -> Entity<&'static str, &'static str> {
         Entity {
             entity_type: EntityType::Building,
             names: vec![],
