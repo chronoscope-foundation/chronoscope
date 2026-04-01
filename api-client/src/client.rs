@@ -11,7 +11,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 
 use futures_util::FutureExt;
-use futures_util::stream::{self, Stream, TryStreamExt};
+use futures_util::stream::{self, Stream};
 
 use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
@@ -26,6 +26,17 @@ use crate::webauthn_types::{
 use crate::pagination::{PageToken, ResultsPage};
 use crate::types::Bbox;
 use crate::users::{UpdateUserRequest, UserResponse};
+
+// Conditional `Send` bound for pagination return types. See `define_paginate!`
+// below for a detailed explanation of why this is needed.
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! maybe_send {
+    ($lt:lifetime, $T:ty) => { Pin<Box<dyn Stream<Item = Result<$T, ApiError>> + Send + $lt>> };
+}
+#[cfg(target_arch = "wasm32")]
+macro_rules! maybe_send {
+    ($lt:lifetime, $T:ty) => { Pin<Box<dyn Stream<Item = Result<$T, ApiError>> + $lt>> };
+}
 
 // ==================== Error ====================
 
@@ -107,7 +118,7 @@ impl Client {
         &self,
         bbox: &Bbox,
         page_size: u32,
-    ) -> Pin<Box<dyn Stream<Item = Result<EntitySummary, ApiError>> + Send + '_>> {
+    ) -> maybe_send!('_, EntitySummary) {
         let first_url = format!(
             "{}/entities?min_lat={}&max_lat={}&min_lon={}&max_lon={}&limit={page_size}",
             self.base_url,
@@ -405,50 +416,77 @@ enum PageFetch {
 /// `fetch_page` is called with `None` for the first page, then `Some(&PageToken)`
 /// for subsequent pages. The stream yields individual items and stops when there
 /// are no more pages or an error occurs.
-pub fn paginate<'a, T, F, Fut>(
-    fetch_page: F,
-) -> Pin<Box<dyn Stream<Item = Result<T, ApiError>> + Send + 'a>>
-where
-    T: Send + 'a,
-    F: Fn(Option<&PageToken>) -> Fut + Send + 'a,
-    Fut: std::future::Future<Output = Result<ResultsPage<T>, ApiError>> + Send + 'a,
-{
-    type State<T> = (std::vec::IntoIter<T>, PageFetch);
+///
+/// On native targets the returned stream and all closure/future bounds must be
+/// `Send` so callers can pass the stream to `tokio::spawn`. On WASM, the async
+/// runtime (`wasm_bindgen_futures`) uses `Rc<RefCell<>>` internally, which is
+/// `!Send`, so any `Send` requirement on futures makes the whole thing fail to
+/// compile.
+///
+/// We use a macro rather than a helper function because:
+///   - A `+ Send` bound on a `dyn` return type is part of the *type*, not just
+///     a where-clause. `Box<dyn Stream + Send>` is a different type from
+///     `Box<dyn Stream>` — you can't coerce the latter into the former.
+///   - A shared inner function without `Send` would return `Box<dyn Stream>`,
+///     which the native wrapper can't upcast to `Box<dyn Stream + Send>`.
+///   - Duplicating the function body in two `cfg` blocks is fragile and hard to
+///     keep in sync.
+///
+/// The macro stamps out one copy of the body with the right bounds per target.
+macro_rules! define_paginate {
+    ( $( + $marker:ident )? ) => {
+        pub fn paginate<'a, T, F, Fut>(
+            fetch_page: F,
+        ) -> Pin<Box<dyn Stream<Item = Result<T, ApiError>> $( + $marker )? + 'a>>
+        where
+            T: $( $marker + )? 'a,
+            F: Fn(Option<&PageToken>) -> Fut + $( $marker + )? 'a,
+            Fut: std::future::Future<Output = Result<ResultsPage<T>, ApiError>> + $( $marker + )? 'a,
+        {
+            type State<T> = (std::vec::IntoIter<T>, PageFetch);
 
-    Box::pin(stream::try_unfold(
-        (Vec::new().into_iter(), PageFetch::First) as State<T>,
-        move |(mut items, fetch_state)| {
-            // If we have buffered items, yield the next one.
-            if let Some(item) = items.next() {
-                return std::future::ready(Ok(Some((item, (items, fetch_state))))).left_future();
-            }
+            Box::pin(stream::try_unfold(
+                (Vec::new().into_iter(), PageFetch::First) as State<T>,
+                move |(mut items, fetch_state)| {
+                    // If we have buffered items, yield the next one.
+                    if let Some(item) = items.next() {
+                        return std::future::ready(Ok(Some((item, (items, fetch_state))))).left_future();
+                    }
 
-            // Items exhausted — fetch the next page if available.
-            let page_token = match &fetch_state {
-                PageFetch::First => None,
-                PageFetch::Next(token) => Some(token),
-                PageFetch::Done => {
-                    return std::future::ready(Ok(None)).left_future();
-                }
-            };
+                    // Items exhausted — fetch the next page if available.
+                    let page_token = match &fetch_state {
+                        PageFetch::First => None,
+                        PageFetch::Next(token) => Some(token),
+                        PageFetch::Done => {
+                            return std::future::ready(Ok(None)).left_future();
+                        }
+                    };
 
-            let fut = fetch_page(page_token);
-            async move {
-                let page = fut.await?;
-                let next = match page.next_page {
-                    Some(token) => PageFetch::Next(token),
-                    None => PageFetch::Done,
-                };
-                let mut items = page.items.into_iter();
-                match items.next() {
-                    Some(item) => Ok(Some((item, (items, next)))),
-                    None => Ok(None), // empty page = done
-                }
-            }
-            .right_future()
-        },
-    ))
+                    let fut = fetch_page(page_token);
+                    async move {
+                        let page = fut.await?;
+                        let next = match page.next_page {
+                            Some(token) => PageFetch::Next(token),
+                            None => PageFetch::Done,
+                        };
+                        let mut items = page.items.into_iter();
+                        match items.next() {
+                            Some(item) => Ok(Some((item, (items, next)))),
+                            None => Ok(None), // empty page = done
+                        }
+                    }
+                    .right_future()
+                },
+            ))
+        }
+    };
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+define_paginate!(+ Send);
+
+#[cfg(target_arch = "wasm32")]
+define_paginate!();
 
 // ==================== Helpers ====================
 
