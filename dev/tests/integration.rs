@@ -17,12 +17,14 @@ use chronoscope_api::research_types::{
     AnalysisOutcome, MediaReference, ResearchUrlDossier, ResolvedContent,
 };
 use chronoscope_api::state::permissive_dns_resolver;
+use chronoscope_api_client::client::AuthClient;
+use chronoscope_api_client::Client;
 use chronoscope_db::{MediaType, ResearchUrlStatus};
 use chronoscope_dev::{DevServerConfig, RunningDevServer, start_dev_server};
 use chronoscope_workers::RetryConfig;
 use chronoscope_workers::{ApifyConfig, CacheMode, CachingClient, HttpClient};
 use dropshot::ConfigLogging;
-use reqwest::Client;
+use secrecy::ExposeSecret;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -81,7 +83,7 @@ fn vcr_mode() -> CacheMode {
 /// call `shutdown().await` explicitly to wait for workers to finish.
 struct TestServer {
     server: RunningDevServer,
-    client: Client,
+    auth: AuthClient,
 }
 
 impl TestServer {
@@ -128,7 +130,7 @@ impl TestServer {
             },
             log,
             port,
-            cdn_base_url: base_url,
+            cdn_base_url: base_url.clone(),
             rp_id: None,
             rp_origin: None,
             ios_app_id: None,
@@ -138,10 +140,10 @@ impl TestServer {
         })
         .await?;
 
-        Ok(Self {
-            server,
-            client: Client::new(),
-        })
+        let client = Client::new(base_url);
+        let auth = AuthClient::new(client, server.auth_token.clone());
+
+        Ok(Self { server, auth })
     }
 
     /// Submit a URL for research.
@@ -150,12 +152,10 @@ impl TestServer {
         url: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let resp = self
-            .client
-            .post(format!("{}/research", self.server.base_url))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.server.auth_token),
-            )
+            .auth
+            .reqwest_client()
+            .post(format!("{}/research", self.auth.base_url()))
+            .bearer_auth(self.auth.token().expose_secret())
             .json(&serde_json::json!({"url": url}))
             .send()
             .await?;
@@ -183,12 +183,10 @@ impl TestServer {
         url_id: &str,
     ) -> Result<ResearchUrlDossier, Box<dyn std::error::Error + Send + Sync>> {
         let resp = self
-            .client
-            .get(format!("{}/research/{}", self.server.base_url, url_id))
-            .header(
-                "Authorization",
-                format!("Bearer {}", self.server.auth_token),
-            )
+            .auth
+            .reqwest_client()
+            .get(format!("{}/research/{}", self.auth.base_url(), url_id))
+            .bearer_auth(self.auth.token().expose_secret())
             .send()
             .await?;
 
@@ -226,7 +224,7 @@ impl TestServer {
         &self,
         url: &str,
     ) -> Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> {
-        let resp = self.client.get(url).send().await?;
+        let resp = self.auth.reqwest_client().get(url).send().await?;
         if !resp.status().is_success() {
             return Err(format!("fetch failed with {}", resp.status()).into());
         }

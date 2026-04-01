@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
-use chronoscope_db::{Email, ResearchUrlId, UserId};
+use chronoscope_db::ResearchUrlId;
 use dropshot::{
     ClientErrorStatusCode, EmptyScanParams, HttpError, HttpResponseDeleted, HttpResponseOk,
     HttpResponseUpdatedNoContent, PaginationParams, Query, RequestContext, ResultsPage, TypedBody,
@@ -18,6 +18,9 @@ use crate::state::AppState;
 use crate::validation::db_err;
 use crate::validation::{is_unique_violation, validate_email, validate_username};
 
+// Re-export request/response types from api-client
+pub use chronoscope_api_client::users::{UpdateUserRequest, UserResponse};
+
 // ==================== Pagination Types ====================
 
 /// Page selector for following list pagination (cursor-based).
@@ -26,26 +29,6 @@ use crate::validation::{is_unique_violation, validate_email, validate_username};
 pub struct FollowingPageSelector {
     pub followed_at: NaiveDateTime,
     pub id: ResearchUrlId,
-}
-
-// ==================== Request/Response Types ====================
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct UserResponse {
-    pub user_id: UserId,
-    pub username: String,
-    pub email: Email,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct UpdateUserRequest {
-    /// New username (if updating)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-
-    /// New email (if updating)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub email: Option<Email>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

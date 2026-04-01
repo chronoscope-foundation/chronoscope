@@ -3,12 +3,13 @@
 //! These types mirror the W3C WebAuthn specification exactly:
 //! <https://www.w3.org/TR/webauthn-3/>
 //!
-//! They exist here only because the upstream Rust crates don't yet support
-//! `schemars::JsonSchema`, which we need for OpenAPI schema generation with Dropshot.
+//! Hand-written rather than using upstream crates because:
+//! - `webauthn-rs-proto` lacks `schemars::JsonSchema` derives (needed for OpenAPI/Dropshot),
+//!   uses different field names (`type_` vs `cred_type`), wraps types in extra layers
+//!   (`CreationChallengeResponse`), and uses `Base64UrlSafeData` instead of plain strings.
+//! - `passkey-types` also lacks JsonSchema support.
 //!
-//! Upstream alternatives (switch to these once they support JsonSchema):
-//! - `passkey-types`: <https://crates.io/crates/passkey-types>
-//! - `webauthn-rs-proto`: <https://crates.io/crates/webauthn-rs-proto>
+//! If either crate adds JsonSchema support and aligns on W3C naming, we should switch.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

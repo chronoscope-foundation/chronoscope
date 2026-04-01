@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use base64::prelude::*;
-use chronoscope_db::{Email, UserId};
+use chronoscope_db::UserId;
 use dropshot::{
     ClientErrorStatusCode, HttpError, HttpResponseOk, RequestContext, TypedBody, endpoint,
 };
 use jwt_compact::UntrustedToken;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use slog::warn;
 use webauthn_rs::prelude::*;
@@ -14,57 +13,13 @@ use webauthn_rs::prelude::*;
 use crate::jwt::ChallengePurpose;
 use crate::state::AppState;
 use crate::validation::{db_err, is_unique_violation, validate_email, validate_username};
-use crate::webauthn_types::{
-    CredentialCreationOptions, CredentialRequestOptions, PublicKeyCredentialAssertion,
-    PublicKeyCredentialAttestation,
+use chronoscope_api_client::webauthn_types::{CredentialCreationOptions, CredentialRequestOptions};
+
+// Re-export request/response types from api-client
+pub use chronoscope_api_client::auth::{
+    AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
+    RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-
-// ==================== Request/Response Types ====================
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct RegisterStartRequest {
-    pub username: String,
-    pub email: Email,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct RegisterStartResponse {
-    pub challenge_token: String,
-    pub options: CredentialCreationOptions,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct RegisterFinishRequest {
-    pub challenge_token: String,
-    pub credential: PublicKeyCredentialAttestation,
-    /// Username for the new account (may differ from `register_start` if there was a conflict)
-    pub username: String,
-    /// Email for the new account (may differ from `register_start` if there was a conflict)
-    pub email: Email,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct LoginStartRequest {
-    /// Username or email
-    pub identifier: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct LoginStartResponse {
-    pub challenge_token: String,
-    pub options: CredentialRequestOptions,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct LoginFinishRequest {
-    pub challenge_token: String,
-    pub credential: PublicKeyCredentialAssertion,
-}
-
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct AuthTokenResponse {
-    pub token: String,
-}
 
 /// Internal state stored in registration challenge token.
 /// Only contains the webauthn state - username/email come from the finish request.

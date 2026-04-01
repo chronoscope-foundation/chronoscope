@@ -1,9 +1,9 @@
 //! API client integration for the web frontend.
 //!
-//! Uses the shared `ChronoscopeClient` from `chronoscope-api-client` for typed
+//! Uses the shared [`Client`] from `chronoscope-api-client` for typed
 //! API access. Handles runtime configuration discovery from `/config.json`.
 
-pub use chronoscope_api_client::{ChronoscopeClient, EntitySummary};
+pub use chronoscope_api_client::{Client, EntitySummary};
 
 // ==================== Runtime Configuration ====================
 
@@ -16,7 +16,7 @@ struct AppConfig {
 /// Discover the API URL from `/config.json` and create a client.
 ///
 /// Returns `None` if the config fetch fails (e.g., no API server running).
-pub async fn client_from_config() -> Option<ChronoscopeClient> {
+pub async fn client_from_config() -> Option<Client> {
     let resp = reqwest::get("/config.json").await.ok()?;
     if !resp.status().is_success() {
         web_sys::console::warn_1(&"Failed to load /config.json — API features disabled".into());
@@ -26,7 +26,7 @@ pub async fn client_from_config() -> Option<ChronoscopeClient> {
         web_sys::console::warn_1(&"Failed to parse /config.json".into());
         None
     })?;
-    Some(ChronoscopeClient::new(config.api_url))
+    Some(Client::new(config.api_url))
 }
 
 // ==================== Lazy initialization ====================
@@ -34,10 +34,10 @@ pub async fn client_from_config() -> Option<ChronoscopeClient> {
 /// Lazily initialize the API client, fetching `/config.json` on first call.
 ///
 /// Returns a clone of the initialized client, or `None` if config loading
-/// fails. `ChronoscopeClient` is cheap to clone (just a URL string + `reqwest::Client`).
+/// fails. [`Client`] is cheap to clone (just a URL string + `reqwest::Client`).
 pub async fn get_or_init_client(
-    handle: &std::rc::Rc<std::cell::RefCell<Option<ChronoscopeClient>>>,
-) -> Option<ChronoscopeClient> {
+    handle: &std::rc::Rc<std::cell::RefCell<Option<Client>>>,
+) -> Option<Client> {
     let needs_init = handle.borrow().is_none();
     if needs_init {
         let client = client_from_config().await?;

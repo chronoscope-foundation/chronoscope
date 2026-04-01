@@ -11,8 +11,8 @@ async fn test_follow_nonexistent_url() -> TestResult {
 
     // Try to follow a non-existent URL
     let fake_id = ResearchUrlId::generate();
-    let resp = user.follow(&fake_id).await?;
-    assert_eq!(resp.status(), 404);
+    let result = user.follow(&fake_id).await;
+    assert!(matches!(result, Err(ApiError::Api { status: 404, .. })));
     Ok(())
 }
 
@@ -24,7 +24,7 @@ async fn test_unfollow_url() -> TestResult {
     let id = user.add_research("https://example.com/to-unfollow").await?;
 
     // Unfollow the URL
-    assert_eq!(user.unfollow(&id).await?.status(), 204);
+    user.unfollow(&id).await?;
 
     // Should no longer be in following list
     assert_eq!(user.list_following("").await?.items.len(), 0);
@@ -42,7 +42,8 @@ async fn test_unfollow_nonexistent() -> TestResult {
 
     // Try to unfollow something we never followed
     let fake_id = ResearchUrlId::generate();
-    assert_eq!(user.unfollow(&fake_id).await?.status(), 404);
+    let result = user.unfollow(&fake_id).await;
+    assert!(matches!(result, Err(ApiError::Api { status: 404, .. })));
     Ok(())
 }
 
@@ -59,8 +60,7 @@ async fn test_multiuser_both_can_follow_same_url() -> TestResult {
     let url_id = alice.add_research("https://example.com/shared").await?;
 
     // Bob follows the same URL
-    let resp = bob.follow(&url_id).await?;
-    assert_eq!(resp.status(), 204);
+    bob.follow(&url_id).await?;
 
     // Both should see the URL in their following list
     let alice_list = alice.list_following("").await?;
@@ -127,8 +127,7 @@ async fn test_multiuser_unfollow_doesnt_affect_others() -> TestResult {
     bob.follow(&url_id).await?;
 
     // Alice unfollows
-    let resp = alice.unfollow(&url_id).await?;
-    assert_eq!(resp.status(), 204);
+    alice.unfollow(&url_id).await?;
 
     // Alice should see nothing in following, Bob should still see the URL
     let alice_list = alice.list_following("").await?;

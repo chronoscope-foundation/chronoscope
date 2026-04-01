@@ -5,14 +5,14 @@ use super::*;
 #[tokio::test]
 async fn test_research_add_and_list() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let _id = ctx
-        .add_research(&token, "https://example.com/article")
+        .add_research(&auth, "https://example.com/article")
         .await?;
 
     // Should appear in user's following list
-    let following = ctx.list_following(&token, "").await?;
+    let following = ctx.list_following(&auth, "").await?;
     assert_eq!(following.items.len(), 1);
     assert_eq!(
         following.items[0].research_url.url,
@@ -29,28 +29,28 @@ async fn test_research_add_and_list() -> TestResult {
 #[tokio::test]
 async fn test_research_duplicate_url_idempotent() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let id1 = ctx
-        .add_research(&token, "https://example.com/duplicate")
+        .add_research(&auth, "https://example.com/duplicate")
         .await?;
     let id2 = ctx
-        .add_research(&token, "https://example.com/duplicate")
+        .add_research(&auth, "https://example.com/duplicate")
         .await?;
 
     // Should return the same ID (idempotent)
     assert_eq!(id1, id2);
-    assert_eq!(ctx.list_following(&token, "").await?.items.len(), 1);
+    assert_eq!(ctx.list_following(&auth, "").await?.items.len(), 1);
     Ok(())
 }
 
 #[tokio::test]
 async fn test_research_get_single() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let id = ctx
-        .add_research(&token, "https://example.com/single")
+        .add_research(&auth, "https://example.com/single")
         .await?;
 
     let resp = ctx.get(&format!("/research/{id}")).await?;
@@ -75,9 +75,9 @@ async fn test_research_get_not_found() -> TestResult {
 #[tokio::test]
 async fn test_research_list_is_public() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
-    ctx.add_research(&token, "https://example.com/public-item")
+    ctx.add_research(&auth, "https://example.com/public-item")
         .await?;
 
     // GET /research should work without auth

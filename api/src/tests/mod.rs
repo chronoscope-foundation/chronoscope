@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use chronoscope_api_client::client::{ApiError, AuthClient};
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{
@@ -28,15 +29,15 @@ use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpError,
     HttpServerStarter, ResultsPage,
 };
-use reqwest::{Client, Response};
+use reqwest::Response;
+use secrecy::ExposeSecret;
 use serde::Serialize;
 use url::Url;
 use webauthn_authenticator_rs::prelude::*;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 
 use crate::auth::{
-    AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
-    RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
+    LoginFinishRequest, LoginStartRequest, RegisterFinishRequest, RegisterStartRequest,
 };
 use crate::jwt::JwtConfig;
 use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
@@ -108,8 +109,7 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 /// Test context that sets up a server with in-memory database
 struct TestContext {
-    base_url: String,
-    client: Client,
+    client: chronoscope_api_client::Client,
     app_state: Arc<AppState>,
     /// Kept alive to maintain the server running for the duration of the test.
     /// The server runs in a background task and is dropped when `TestContext` is dropped.
@@ -215,22 +215,17 @@ impl TestContext {
             HttpServerStarter::new(&config_dropshot, api, Arc::clone(&app_state), &log)?.start();
 
         let base_url = format!("http://localhost:{}", addr.port());
-        let client = Client::new();
+        let client = chronoscope_api_client::Client::new(base_url);
 
         Ok(Self {
-            base_url,
             client,
             app_state,
             server,
         })
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
-    }
-
     fn origin(&self) -> Result<Url, url::ParseError> {
-        Url::parse(&self.base_url)
+        Url::parse(self.client.base_url())
     }
 
     /// Direct access to the database for testing DB layer error paths.
@@ -238,55 +233,38 @@ impl TestContext {
         &self.app_state.db
     }
 
-    // ==================== HTTP Helpers ====================
+    // ==================== Raw HTTP Helpers ====================
+    //
+    // These are used for endpoints not yet on the typed client, and for tests
+    // that need to check raw HTTP status codes on error responses.
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.client.base_url(), path)
+    }
 
     async fn get(&self, path: &str) -> reqwest::Result<Response> {
-        self.client.get(self.url(path)).send().await
+        self.client.reqwest_client().get(self.url(path)).send().await
     }
 
-    async fn get_auth(&self, path: &str, token: &str) -> reqwest::Result<Response> {
+    async fn get_auth(&self, path: &str, auth: &AuthClient) -> reqwest::Result<Response> {
         self.client
+            .reqwest_client()
             .get(self.url(path))
-            .bearer_auth(token)
+            .bearer_auth(auth.token().expose_secret())
             .send()
             .await
-    }
-
-    async fn post_json<T: Serialize>(&self, path: &str, body: &T) -> reqwest::Result<Response> {
-        self.client.post(self.url(path)).json(body).send().await
     }
 
     async fn post_auth<T: Serialize>(
         &self,
         path: &str,
-        token: &str,
+        auth: &AuthClient,
         body: &T,
     ) -> reqwest::Result<Response> {
         self.client
+            .reqwest_client()
             .post(self.url(path))
-            .bearer_auth(token)
-            .json(body)
-            .send()
-            .await
-    }
-
-    async fn delete_auth(&self, path: &str, token: &str) -> reqwest::Result<Response> {
-        self.client
-            .delete(self.url(path))
-            .bearer_auth(token)
-            .send()
-            .await
-    }
-
-    async fn patch_auth<T: Serialize>(
-        &self,
-        path: &str,
-        token: &str,
-        body: &T,
-    ) -> reqwest::Result<Response> {
-        self.client
-            .patch(self.url(path))
-            .bearer_auth(token)
+            .bearer_auth(auth.token().expose_secret())
             .json(body)
             .send()
             .await
@@ -305,88 +283,74 @@ impl TestContext {
         format!("testuser{n}")
     }
 
-    /// Register with the given authenticator and username, return the session token
+    /// Generate a unique email for testing, derived from a unique username.
+    fn unique_email() -> Email {
+        Email::new(format!("{}@test.example.com", Self::unique_username()))
+    }
+
+    /// Register with the given authenticator and username, return an `AuthClient`
     async fn register_with_username(
         &self,
         authenticator: &mut Authenticator,
         username: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let start_req = RegisterStartRequest {
-            username: username.to_string(),
-            email: Email::new(format!("{username}@test.example.com")),
-        };
-        let start_resp: RegisterStartResponse = self
-            .post_json("/auth/register/start", &start_req)
-            .await?
-            .json()
-            .await?;
-
-        let ccr: webauthn_rs::prelude::CreationChallengeResponse =
-            serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
-
-        let credential = authenticator
-            .do_registration(self.origin()?, ccr)
-            .map_err(|e| format!("Registration failed: {e:?}"))?;
-
-        let finish_req = RegisterFinishRequest {
-            challenge_token: start_resp.challenge_token,
-            credential: serde_json::from_value(serde_json::to_value(&credential)?)?,
-            username: username.to_string(),
-            email: Email::new(format!("{username}@test.example.com")),
-        };
-
-        let resp = self.post_json("/auth/register/finish", &finish_req).await?;
-        assert_eq!(resp.status(), 200);
-
-        Ok(resp.json::<AuthTokenResponse>().await?.token)
+    ) -> Result<AuthClient, Box<dyn std::error::Error + Send + Sync>> {
+        let email = Email::new(format!("{username}@test.example.com"));
+        let origin = self.origin()?;
+        let auth = chronoscope_api_client::register(
+            &self.client,
+            username,
+            &email,
+            |options| async move {
+                let ccr: webauthn_rs::prelude::CreationChallengeResponse =
+                    serde_json::from_value(serde_json::to_value(&options)?)?;
+                let credential = authenticator
+                    .do_registration(origin.clone(), ccr)
+                    .map_err(|e| format!("Registration failed: {e:?}"))?;
+                let result = serde_json::from_value(serde_json::to_value(&credential)?)?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(result)
+            },
+        )
+        .await?;
+        Ok(auth)
     }
 
-    /// Register with the given authenticator (auto-generated username), return the session token
+    /// Register with the given authenticator (auto-generated username), return an `AuthClient`
     async fn register(
         &self,
         authenticator: &mut Authenticator,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<AuthClient, Box<dyn std::error::Error + Send + Sync>> {
         self.register_with_username(authenticator, &Self::unique_username())
             .await
     }
 
-    /// Login with username/email and authenticator, return the session token
+    /// Login with username/email and authenticator, return an `AuthClient`
     async fn login(
         &self,
         identifier: &str,
         authenticator: &mut Authenticator,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let start_req = LoginStartRequest {
-            identifier: identifier.to_string(),
-        };
-        let start_resp: LoginStartResponse = self
-            .post_json("/auth/login/start", &start_req)
-            .await?
-            .json()
-            .await?;
-
-        let rcr: webauthn_rs::prelude::RequestChallengeResponse =
-            serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
-
-        let auth_credential = authenticator
-            .do_authentication(self.origin()?, rcr)
-            .map_err(|e| format!("Authentication failed: {e:?}"))?;
-
-        let finish_req = LoginFinishRequest {
-            challenge_token: start_resp.challenge_token,
-            credential: serde_json::from_value(serde_json::to_value(&auth_credential)?)?,
-        };
-
-        let resp = self.post_json("/auth/login/finish", &finish_req).await?;
-        assert_eq!(resp.status(), 200);
-
-        Ok(resp.json::<AuthTokenResponse>().await?.token)
+    ) -> Result<AuthClient, Box<dyn std::error::Error + Send + Sync>> {
+        let origin = self.origin()?;
+        let auth = chronoscope_api_client::login(
+            &self.client,
+            identifier,
+            |options| async move {
+                let rcr: webauthn_rs::prelude::RequestChallengeResponse =
+                    serde_json::from_value(serde_json::to_value(&options)?)?;
+                let credential = authenticator
+                    .do_authentication(origin.clone(), rcr)
+                    .map_err(|e| format!("Authentication failed: {e:?}"))?;
+                let result = serde_json::from_value(serde_json::to_value(&credential)?)?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(result)
+            },
+        )
+        .await?;
+        Ok(auth)
     }
 
-    /// Convenience: register with a new authenticator and return just the token
-    async fn register_and_get_token(
+    /// Convenience: register with a new authenticator and return an `AuthClient`
+    async fn register_and_get_auth(
         &self,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<AuthClient, Box<dyn std::error::Error + Send + Sync>> {
         self.register(&mut Self::new_authenticator()).await
     }
 
@@ -394,13 +358,13 @@ impl TestContext {
 
     async fn add_research(
         &self,
-        token: &str,
+        auth: &AuthClient,
         url: &str,
     ) -> Result<ResearchUrlId, Box<dyn std::error::Error + Send + Sync>> {
         let req = SubmitResearchRequest {
             url: url.to_string(),
         };
-        let resp = self.post_auth("/research", token, &req).await?;
+        let resp = self.post_auth("/research", auth, &req).await?;
         // 201 = newly created, 200 = already existed
         assert!(
             resp.status() == 200 || resp.status() == 201,
@@ -422,20 +386,20 @@ impl TestContext {
     /// List URLs the user is following
     async fn list_following(
         &self,
-        token: &str,
+        auth: &AuthClient,
         query: &str,
     ) -> Result<ResultsPage<FollowedUrlSummary>, Box<dyn std::error::Error + Send + Sync>> {
         let path = path_with_query("/users/me/following", query);
-        Ok(self.get_auth(&path, token).await?.json().await?)
+        Ok(self.get_auth(&path, auth).await?.json().await?)
     }
 
     /// Create an authenticated client for a new user
     async fn new_user(&self) -> Result<TestClient<'_>, Box<dyn std::error::Error + Send + Sync>> {
         let mut authenticator = Self::new_authenticator();
-        let token = self.register(&mut authenticator).await?;
+        let auth = self.register(&mut authenticator).await?;
         Ok(TestClient {
             ctx: self,
-            token,
+            auth,
             authenticator,
         })
     }
@@ -540,7 +504,7 @@ impl TestContext {
 /// An authenticated test client for a single user
 struct TestClient<'a> {
     ctx: &'a TestContext,
-    token: String,
+    auth: AuthClient,
     /// Kept alive because the authenticator maintains state (private keys, counters)
     /// that must persist across multiple WebAuthn operations in the same test.
     #[allow(dead_code)]
@@ -552,28 +516,21 @@ impl TestClient<'_> {
         &self,
         url: &str,
     ) -> Result<ResearchUrlId, Box<dyn std::error::Error + Send + Sync>> {
-        self.ctx.add_research(&self.token, url).await
+        self.ctx.add_research(&self.auth, url).await
     }
 
     async fn list_following(
         &self,
         query: &str,
     ) -> Result<ResultsPage<FollowedUrlSummary>, Box<dyn std::error::Error + Send + Sync>> {
-        self.ctx.list_following(&self.token, query).await
+        self.ctx.list_following(&self.auth, query).await
     }
 
-    async fn follow(&self, id: &ResearchUrlId) -> reqwest::Result<Response> {
-        self.ctx
-            .client
-            .put(self.ctx.url(&format!("/users/me/following/{id}")))
-            .bearer_auth(&self.token)
-            .send()
-            .await
+    async fn follow(&self, id: &ResearchUrlId) -> Result<(), ApiError> {
+        self.auth.follow(id).await
     }
 
-    async fn unfollow(&self, id: &ResearchUrlId) -> reqwest::Result<Response> {
-        self.ctx
-            .delete_auth(&format!("/users/me/following/{id}"), &self.token)
-            .await
+    async fn unfollow(&self, id: &ResearchUrlId) -> Result<(), ApiError> {
+        self.auth.unfollow(id).await
     }
 }

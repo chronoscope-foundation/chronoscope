@@ -7,13 +7,13 @@ use super::*;
 #[tokio::test]
 async fn test_validation_empty_url() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let req = SubmitResearchRequest {
         url: "".to_string(),
     };
     assert_eq!(
-        ctx.post_auth("/research", &token, &req).await?.status(),
+        ctx.post_auth("/research", &auth, &req).await?.status(),
         400
     );
     Ok(())
@@ -22,13 +22,13 @@ async fn test_validation_empty_url() -> TestResult {
 #[tokio::test]
 async fn test_validation_invalid_url_format() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let req = SubmitResearchRequest {
         url: "not a valid url".to_string(),
     };
     assert_eq!(
-        ctx.post_auth("/research", &token, &req).await?.status(),
+        ctx.post_auth("/research", &auth, &req).await?.status(),
         400
     );
     Ok(())
@@ -37,7 +37,7 @@ async fn test_validation_invalid_url_format() -> TestResult {
 #[tokio::test]
 async fn test_validation_non_http_schemes_rejected() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     // Test various non-HTTP schemes that should be rejected
     for invalid_url in &[
@@ -50,7 +50,7 @@ async fn test_validation_non_http_schemes_rejected() -> TestResult {
         let req = SubmitResearchRequest {
             url: invalid_url.to_string(),
         };
-        let resp = ctx.post_auth("/research", &token, &req).await?;
+        let resp = ctx.post_auth("/research", &auth, &req).await?;
         assert_eq!(resp.status(), 400, "Expected 400 for URL: {invalid_url}");
     }
     Ok(())
@@ -59,14 +59,14 @@ async fn test_validation_non_http_schemes_rejected() -> TestResult {
 #[tokio::test]
 async fn test_validation_http_schemes_accepted() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     // Both http and https should work
     let req = SubmitResearchRequest {
         url: "http://example.com/article".to_string(),
     };
     assert_eq!(
-        ctx.post_auth("/research", &token, &req).await?.status(),
+        ctx.post_auth("/research", &auth, &req).await?.status(),
         201
     );
 
@@ -74,7 +74,7 @@ async fn test_validation_http_schemes_accepted() -> TestResult {
         url: "https://example.com/secure".to_string(),
     };
     assert_eq!(
-        ctx.post_auth("/research", &token, &req).await?.status(),
+        ctx.post_auth("/research", &auth, &req).await?.status(),
         201
     );
     Ok(())
@@ -85,7 +85,7 @@ async fn test_validation_http_schemes_accepted() -> TestResult {
 #[tokio::test]
 async fn test_ssrf_private_ip_rejected() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     // URLs with private/internal IPs should be rejected to prevent SSRF attacks
     let blocked_urls = [
@@ -100,7 +100,7 @@ async fn test_ssrf_private_ip_rejected() -> TestResult {
         let req = SubmitResearchRequest {
             url: url.to_string(),
         };
-        let resp = ctx.post_auth("/research", &token, &req).await?;
+        let resp = ctx.post_auth("/research", &auth, &req).await?;
         assert_eq!(resp.status(), 400, "Expected {desc} to be blocked: {url}");
 
         let body: serde_json::Value = resp.json().await?;

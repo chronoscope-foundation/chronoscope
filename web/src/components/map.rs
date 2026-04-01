@@ -288,7 +288,7 @@ struct ViewportSignals {
 
 async fn load_entities_for_viewport(
     map: &maplibre::Map,
-    client: &api::ChronoscopeClient,
+    client: &api::Client,
     generation: u64,
     generation_counter: &Rc<Cell<u64>>,
     signals: ViewportSignals,
@@ -309,9 +309,12 @@ async fn load_entities_for_viewport(
         }
     };
 
-    // Paginate through results up to MAX_ENTITIES.
-    let result = client
-        .list_entities_all(&bbox, api::MAX_ENTITIES, api::PAGE_SIZE)
+    // Fetch one extra to detect whether there are more results than we display.
+    use futures_util::{StreamExt, TryStreamExt};
+    let result: Result<Vec<_>, _> = client
+        .list_entities_pages(&bbox, api::PAGE_SIZE)
+        .take(api::MAX_ENTITIES + 1)
+        .try_collect()
         .await;
 
     // Discard stale response: when the user pans rapidly, multiple
@@ -322,15 +325,17 @@ async fn load_entities_for_viewport(
     }
 
     match result {
-        Ok(fetch_result) => {
+        Ok(mut entities) => {
+            let truncated = entities.len() > api::MAX_ENTITIES;
+            entities.truncate(api::MAX_ENTITIES);
             signals.set_loading.set(false);
-            signals.set_truncated.set(fetch_result.truncated);
+            signals.set_truncated.set(truncated);
             signals.set_fetch_error.set(None);
-            signals.set_empty.set(fetch_result.entities.is_empty());
+            signals.set_empty.set(entities.is_empty());
             // Write entities to the signal — the GeoJSON rebuild effect
             // (effect_rebuild_geojson_on_selection) tracks this and will
             // rebuild the map layer automatically.
-            signals.set_cached_entities.set(fetch_result.entities);
+            signals.set_cached_entities.set(entities);
         }
         Err(e) => {
             signals.set_loading.set(false);
@@ -446,7 +451,7 @@ fn register_layer_handlers(
 /// Returns the closure that must be kept alive.
 fn register_moveend_handler(
     map: &maplibre::Map,
-    api_client: &Rc<RefCell<Option<api::ChronoscopeClient>>>,
+    api_client: &Rc<RefCell<Option<api::Client>>>,
     generation: &Rc<Cell<u64>>,
     debounce_timer: &Rc<Cell<Option<i32>>>,
     signals: ViewportSignals,
@@ -511,7 +516,7 @@ struct MapState {
     generation: Rc<Cell<u64>>,
     debounce_timer: Rc<Cell<Option<i32>>>,
     closures: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
-    api_client: Rc<RefCell<Option<api::ChronoscopeClient>>>,
+    api_client: Rc<RefCell<Option<api::Client>>>,
 }
 
 /// Create the map, register the style-load callback (which adds source/layers,
@@ -671,7 +676,7 @@ fn effect_retry_on_signal(
 // ==================== Component ====================
 
 #[component]
-pub fn MapView(api_client: Rc<RefCell<Option<api::ChronoscopeClient>>>) -> impl IntoView {
+pub fn MapView(api_client: Rc<RefCell<Option<api::Client>>>) -> impl IntoView {
     let container = NodeRef::<leptos::html::Div>::new();
     let map_handle: Rc<RefCell<Option<maplibre::Map>>> = Rc::new(RefCell::new(None));
 

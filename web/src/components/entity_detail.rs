@@ -15,7 +15,7 @@ use crate::components::map::{EntityPickerEntry, EntitySelection, SelectedEntity}
 /// when nothing is selected. On desktop it slides in from the right; on mobile
 /// it slides up as a bottom sheet.
 #[component]
-pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::ChronoscopeClient>>>) -> impl IntoView {
+pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::Client>>>) -> impl IntoView {
     let api_client = SendWrapper::new(api_client);
     let SelectedEntity(selected, set_selected) = expect_context::<SelectedEntity>();
     let panel_ref = NodeRef::<leptos::html::Div>::new();
@@ -150,7 +150,7 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
 #[component]
 fn EntityDetailContent(
     id: String,
-    api_client: Rc<RefCell<Option<api::ChronoscopeClient>>>,
+    api_client: Rc<RefCell<Option<api::Client>>>,
 ) -> impl IntoView {
     let id_clone = id.clone();
     let (retry_count, set_retry_count) = signal(0u32);
@@ -286,7 +286,7 @@ use chronoscope_core::links::{LinkTarget, LinkType};
 /// Fetch entity detail using the typed API client.
 async fn fetch_entity_detail(
     id: &str,
-    client: &api::ChronoscopeClient,
+    client: &api::Client,
 ) -> Result<EntityDetailView, String> {
     let entity_id = EntityId::new(id);
     let resp = client

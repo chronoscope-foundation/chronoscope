@@ -7,11 +7,10 @@ use super::*;
 #[tokio::test]
 async fn test_registration_full_flow() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
-    assert!(!token.is_empty());
+    let auth = ctx.register_and_get_auth().await?;
 
-    // Verify the token works
-    assert_eq!(ctx.get_auth("/users/me", &token).await?.status(), 200);
+    // Verify the token works by calling a typed endpoint
+    let _me = auth.get_me().await?;
     Ok(())
 }
 
@@ -21,17 +20,13 @@ async fn test_registration_invalid_challenge_token() -> TestResult {
     let mut authenticator = TestContext::new_authenticator();
 
     // Start registration to get a valid credential
-    let start_req = RegisterStartRequest {
-        username: TestContext::unique_username(),
-        email: Email::new(format!(
-            "{}@test.example.com",
-            TestContext::unique_username()
-        )),
-    };
-    let start_resp: RegisterStartResponse = ctx
-        .post_json("/auth/register/start", &start_req)
-        .await?
-        .json()
+    let username = TestContext::unique_username();
+    let start_resp = ctx
+        .client
+        .register_start(&RegisterStartRequest {
+            username: username.clone(),
+            email: TestContext::unique_email(),
+        })
         .await?;
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
@@ -40,19 +35,17 @@ async fn test_registration_invalid_challenge_token() -> TestResult {
         .map_err(|e| format!("Registration failed: {e:?}"))?;
 
     // Try to finish with an invalid challenge token
-    let finish_req = RegisterFinishRequest {
-        challenge_token: "invalid-token".to_string(),
-        credential: serde_json::from_value(serde_json::to_value(&credential)?)?,
-        username: start_req.username.clone(),
-        email: start_req.email.clone(),
-    };
+    let result = ctx
+        .client
+        .register_finish(&RegisterFinishRequest {
+            challenge_token: "invalid-token".to_string(),
+            credential: serde_json::from_value(serde_json::to_value(&credential)?)?,
+            username,
+            email: TestContext::unique_email(),
+        })
+        .await;
 
-    assert_eq!(
-        ctx.post_json("/auth/register/finish", &finish_req)
-            .await?
-            .status(),
-        400
-    );
+    assert!(matches!(result, Err(ApiError::Api { status: 400, .. })));
     Ok(())
 }
 
@@ -66,15 +59,14 @@ async fn test_register_duplicate_username_rejected() -> TestResult {
     ctx.register_with_username(&mut auth, &username).await?;
 
     // Second registration with same username fails
-    let start_req = RegisterStartRequest {
-        username: username.clone(),
-        email: Email::new(format!(
-            "{}@test.example.com",
-            TestContext::unique_username()
-        )),
-    };
-    let resp = ctx.post_json("/auth/register/start", &start_req).await?;
-    assert_eq!(resp.status(), 400);
+    let result = ctx
+        .client
+        .register_start(&RegisterStartRequest {
+            username: username.clone(),
+            email: TestContext::unique_email(),
+        })
+        .await;
+    assert!(matches!(result, Err(ApiError::Api { status: 400, .. })));
     Ok(())
 }
 
@@ -87,17 +79,13 @@ async fn test_register_mid_flow_username_conflict() -> TestResult {
 
     // User A starts registration with the contested username
     let mut auth_a = TestContext::new_authenticator();
-    let start_req_a = RegisterStartRequest {
-        username: contested_username.clone(),
-        email: Email::new(format!(
-            "user_a_{}@test.example.com",
-            TestContext::unique_username()
-        )),
-    };
-    let start_resp_a: RegisterStartResponse = ctx
-        .post_json("/auth/register/start", &start_req_a)
-        .await?
-        .json()
+    let email_a = TestContext::unique_email();
+    let start_resp_a = ctx
+        .client
+        .register_start(&RegisterStartRequest {
+            username: contested_username.clone(),
+            email: email_a.clone(),
+        })
         .await?;
     let ccr_a: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp_a.options)?)?;
@@ -111,41 +99,36 @@ async fn test_register_mid_flow_username_conflict() -> TestResult {
         .await?;
 
     // User A tries to finish registration with the contested username - should get 409
-    let finish_req_a = RegisterFinishRequest {
-        challenge_token: start_resp_a.challenge_token.clone(),
-        credential: serde_json::from_value(serde_json::to_value(&credential_a)?)?,
-        username: contested_username.clone(),
-        email: start_req_a.email.clone(),
-    };
-    let resp = ctx
-        .post_json("/auth/register/finish", &finish_req_a)
-        .await?;
-    assert_eq!(
-        resp.status(),
-        409,
+    let result = ctx
+        .client
+        .register_finish(&RegisterFinishRequest {
+            challenge_token: start_resp_a.challenge_token.clone(),
+            credential: serde_json::from_value(serde_json::to_value(&credential_a)?)?,
+            username: contested_username.clone(),
+            email: email_a.clone(),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(ApiError::Api { status: 409, .. })),
         "Expected 409 Conflict when username is taken"
     );
 
     // User A retries with a new username - should succeed
     let new_username = TestContext::unique_username();
-    let finish_req_retry = RegisterFinishRequest {
-        challenge_token: start_resp_a.challenge_token,
-        credential: serde_json::from_value(serde_json::to_value(&credential_a)?)?,
-        username: new_username.clone(),
-        email: start_req_a.email.clone(),
-    };
-    let resp = ctx
-        .post_json("/auth/register/finish", &finish_req_retry)
+    let finish_resp = ctx
+        .client
+        .register_finish(&RegisterFinishRequest {
+            challenge_token: start_resp_a.challenge_token,
+            credential: serde_json::from_value(serde_json::to_value(&credential_a)?)?,
+            username: new_username.clone(),
+            email: email_a,
+        })
         .await?;
-    assert_eq!(
-        resp.status(),
-        200,
-        "Registration with new username should succeed"
-    );
 
     // Verify User A can use their new account
-    let token: AuthTokenResponse = resp.json().await?;
-    assert_eq!(ctx.get_auth("/users/me", &token.token).await?.status(), 200);
+    let auth_a = AuthClient::new(ctx.client.clone(), finish_resp.token);
+    let me = auth_a.get_me().await?;
+    assert_eq!(me.username, new_username);
 
     Ok(())
 }
@@ -154,21 +137,16 @@ async fn test_register_mid_flow_username_conflict() -> TestResult {
 async fn test_register_duplicate_email_rejected() -> TestResult {
     let ctx = TestContext::new().await?;
     let mut auth = TestContext::new_authenticator();
-    let email = Email::new(format!(
-        "{}@test.example.com",
-        TestContext::unique_username()
-    ));
+    let email = TestContext::unique_email();
 
     // First registration succeeds
     let username1 = TestContext::unique_username();
-    let start_req = RegisterStartRequest {
-        username: username1.clone(),
-        email: email.clone(),
-    };
-    let start_resp: RegisterStartResponse = ctx
-        .post_json("/auth/register/start", &start_req)
-        .await?
-        .json()
+    let start_resp = ctx
+        .client
+        .register_start(&RegisterStartRequest {
+            username: username1.clone(),
+            email: email.clone(),
+        })
         .await?;
 
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
@@ -177,23 +155,28 @@ async fn test_register_duplicate_email_rejected() -> TestResult {
         .do_registration(ctx.origin()?, ccr)
         .map_err(|e| format!("Registration failed: {e:?}"))?;
 
-    let finish_req = RegisterFinishRequest {
-        challenge_token: start_resp.challenge_token,
-        credential: serde_json::from_value(serde_json::to_value(&credential)?)?,
-        username: username1,
-        email: email.clone(),
-    };
-    let resp = ctx.post_json("/auth/register/finish", &finish_req).await?;
-    assert_eq!(resp.status(), 200);
+    ctx.client
+        .register_finish(&RegisterFinishRequest {
+            challenge_token: start_resp.challenge_token,
+            credential: serde_json::from_value(serde_json::to_value(&credential)?)?,
+            username: username1,
+            email: email.clone(),
+        })
+        .await?;
 
     // Second registration with same email but different username fails
     let username2 = TestContext::unique_username();
-    let start_req2 = RegisterStartRequest {
-        username: username2,
-        email: email.clone(),
-    };
-    let resp = ctx.post_json("/auth/register/start", &start_req2).await?;
-    assert_eq!(resp.status(), 400, "Should reject duplicate email");
+    let result = ctx
+        .client
+        .register_start(&RegisterStartRequest {
+            username: username2,
+            email: email.clone(),
+        })
+        .await;
+    assert!(
+        matches!(result, Err(ApiError::Api { status: 400, .. })),
+        "Should reject duplicate email"
+    );
     Ok(())
 }
 
@@ -208,21 +191,22 @@ async fn test_login_full_flow() -> TestResult {
     // Register first, then login with the same authenticator
     ctx.register_with_username(&mut authenticator, &username)
         .await?;
-    let token = ctx.login(&username, &mut authenticator).await?;
-    assert!(!token.is_empty());
+    let auth = ctx.login(&username, &mut authenticator).await?;
+    // Verify we can use the auth client
+    let _me = auth.get_me().await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn test_login_no_credentials_registered() -> TestResult {
     let ctx = TestContext::new().await?;
-    let req = LoginStartRequest {
-        identifier: "nonexistent".to_string(),
-    };
-    assert_eq!(
-        ctx.post_json("/auth/login/start", &req).await?.status(),
-        400
-    );
+    let result = ctx
+        .client
+        .login_start(&LoginStartRequest {
+            identifier: "nonexistent".to_string(),
+        })
+        .await;
+    assert!(matches!(result, Err(ApiError::Api { status: 400, .. })));
     Ok(())
 }
 
@@ -237,13 +221,11 @@ async fn test_login_invalid_challenge_token() -> TestResult {
         .await?;
 
     // Start login to get a valid auth credential
-    let start_req = LoginStartRequest {
-        identifier: username,
-    };
-    let start_resp: LoginStartResponse = ctx
-        .post_json("/auth/login/start", &start_req)
-        .await?
-        .json()
+    let start_resp = ctx
+        .client
+        .login_start(&LoginStartRequest {
+            identifier: username,
+        })
         .await?;
     let rcr: webauthn_rs::prelude::RequestChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
@@ -252,17 +234,15 @@ async fn test_login_invalid_challenge_token() -> TestResult {
         .map_err(|e| format!("Authentication failed: {e:?}"))?;
 
     // Try to finish with invalid token
-    let finish_req = LoginFinishRequest {
-        challenge_token: "invalid-token".to_string(),
-        credential: serde_json::from_value(serde_json::to_value(&auth_credential)?)?,
-    };
+    let result = ctx
+        .client
+        .login_finish(&LoginFinishRequest {
+            challenge_token: "invalid-token".to_string(),
+            credential: serde_json::from_value(serde_json::to_value(&auth_credential)?)?,
+        })
+        .await;
 
-    assert_eq!(
-        ctx.post_json("/auth/login/finish", &finish_req)
-            .await?
-            .status(),
-        400
-    );
+    assert!(matches!(result, Err(ApiError::Api { status: 400, .. })));
     Ok(())
 }
 
@@ -271,17 +251,18 @@ async fn test_login_invalid_challenge_token() -> TestResult {
 #[tokio::test]
 async fn test_auth_no_token() -> TestResult {
     let ctx = TestContext::new().await?;
-    assert_eq!(ctx.get("/users/me").await?.status(), 401);
+    // GET /users/me without auth should return 401
+    let resp = ctx.get("/users/me").await?;
+    assert_eq!(resp.status(), 401);
     Ok(())
 }
 
 #[tokio::test]
 async fn test_auth_malformed_token() -> TestResult {
     let ctx = TestContext::new().await?;
-    assert_eq!(
-        ctx.get_auth("/users/me", "not-a-valid-jwt").await?.status(),
-        401
-    );
+    let bad_auth = AuthClient::new(ctx.client.clone(), "not-a-valid-jwt");
+    let result = bad_auth.get_me().await;
+    assert!(matches!(result, Err(ApiError::Api { status: 401, .. })));
     Ok(())
 }
 
@@ -295,7 +276,9 @@ async fn test_auth_expired_token() -> TestResult {
         .jwt
         .create_expired_session_token(&UserId::new("test-user"))?;
 
-    assert_eq!(ctx.get_auth("/users/me", &token).await?.status(), 401);
+    let expired_auth = AuthClient::new(ctx.client.clone(), token);
+    let result = expired_auth.get_me().await;
+    assert!(matches!(result, Err(ApiError::Api { status: 401, .. })));
     Ok(())
 }
 
@@ -312,27 +295,20 @@ async fn test_challenge_purpose_mismatch_register_for_login() -> TestResult {
         .await?;
 
     // Start registration to get a Register challenge token
-    let register_req = RegisterStartRequest {
-        username: TestContext::unique_username(),
-        email: Email::new(format!(
-            "{}@test.example.com",
-            TestContext::unique_username()
-        )),
-    };
-    let register_resp: RegisterStartResponse = ctx
-        .post_json("/auth/register/start", &register_req)
-        .await?
-        .json()
+    let register_resp = ctx
+        .client
+        .register_start(&RegisterStartRequest {
+            username: TestContext::unique_username(),
+            email: TestContext::unique_email(),
+        })
         .await?;
 
     // Start login to get a valid authentication credential
-    let login_req = LoginStartRequest {
-        identifier: username,
-    };
-    let login_resp: LoginStartResponse = ctx
-        .post_json("/auth/login/start", &login_req)
-        .await?
-        .json()
+    let login_resp = ctx
+        .client
+        .login_start(&LoginStartRequest {
+            identifier: username,
+        })
         .await?;
     let rcr: webauthn_rs::prelude::RequestChallengeResponse =
         serde_json::from_value(serde_json::to_value(&login_resp.options)?)?;
@@ -341,17 +317,15 @@ async fn test_challenge_purpose_mismatch_register_for_login() -> TestResult {
         .map_err(|e| format!("Authentication failed: {e:?}"))?;
 
     // Try to use the Register challenge token for login - should fail
-    let finish_req = LoginFinishRequest {
-        challenge_token: register_resp.challenge_token, // Wrong purpose!
-        credential: serde_json::from_value(serde_json::to_value(&auth_credential)?)?,
-    };
+    let result = ctx
+        .client
+        .login_finish(&LoginFinishRequest {
+            challenge_token: register_resp.challenge_token, // Wrong purpose!
+            credential: serde_json::from_value(serde_json::to_value(&auth_credential)?)?,
+        })
+        .await;
 
-    assert_eq!(
-        ctx.post_json("/auth/login/finish", &finish_req)
-            .await?
-            .status(),
-        400
-    );
+    assert!(matches!(result, Err(ApiError::Api { status: 400, .. })));
     Ok(())
 }
 
@@ -366,27 +340,20 @@ async fn test_challenge_purpose_mismatch_login_for_register() -> TestResult {
         .await?;
 
     // Start login to get a Login challenge token
-    let login_req = LoginStartRequest {
-        identifier: username,
-    };
-    let login_resp: LoginStartResponse = ctx
-        .post_json("/auth/login/start", &login_req)
-        .await?
-        .json()
+    let login_resp = ctx
+        .client
+        .login_start(&LoginStartRequest {
+            identifier: username,
+        })
         .await?;
 
     // Start registration to get a valid registration credential
-    let register_req = RegisterStartRequest {
-        username: TestContext::unique_username(),
-        email: Email::new(format!(
-            "{}@test.example.com",
-            TestContext::unique_username()
-        )),
-    };
-    let register_resp: RegisterStartResponse = ctx
-        .post_json("/auth/register/start", &register_req)
-        .await?
-        .json()
+    let register_resp = ctx
+        .client
+        .register_start(&RegisterStartRequest {
+            username: TestContext::unique_username(),
+            email: TestContext::unique_email(),
+        })
         .await?;
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(serde_json::to_value(&register_resp.options)?)?;
@@ -398,19 +365,17 @@ async fn test_challenge_purpose_mismatch_login_for_register() -> TestResult {
         .map_err(|e| format!("Registration failed: {e:?}"))?;
 
     // Try to use the Login challenge token for registration - should fail
-    let finish_req = RegisterFinishRequest {
-        challenge_token: login_resp.challenge_token, // Wrong purpose!
-        credential: serde_json::from_value(serde_json::to_value(&reg_credential)?)?,
-        username: register_req.username.clone(),
-        email: register_req.email.clone(),
-    };
+    let result = ctx
+        .client
+        .register_finish(&RegisterFinishRequest {
+            challenge_token: login_resp.challenge_token, // Wrong purpose!
+            credential: serde_json::from_value(serde_json::to_value(&reg_credential)?)?,
+            username: TestContext::unique_username(),
+            email: TestContext::unique_email(),
+        })
+        .await;
 
-    assert_eq!(
-        ctx.post_json("/auth/register/finish", &finish_req)
-            .await?
-            .status(),
-        400
-    );
+    assert!(matches!(result, Err(ApiError::Api { status: 400, .. })));
     Ok(())
 }
 
@@ -420,17 +385,13 @@ async fn test_challenge_token_tampering() -> TestResult {
     let mut authenticator = TestContext::new_authenticator();
 
     // Start registration
-    let start_req = RegisterStartRequest {
-        username: TestContext::unique_username(),
-        email: Email::new(format!(
-            "{}@test.example.com",
-            TestContext::unique_username()
-        )),
-    };
-    let start_resp: RegisterStartResponse = ctx
-        .post_json("/auth/register/start", &start_req)
-        .await?
-        .json()
+    let username = TestContext::unique_username();
+    let start_resp = ctx
+        .client
+        .register_start(&RegisterStartRequest {
+            username: username.clone(),
+            email: TestContext::unique_email(),
+        })
         .await?;
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
@@ -449,19 +410,17 @@ async fn test_challenge_token_tampering() -> TestResult {
     let tampered_token = format!("{}.{}.{}", parts[0], payload, parts[2]);
 
     // Try to finish with tampered token - should fail signature verification
-    let finish_req = RegisterFinishRequest {
-        challenge_token: tampered_token,
-        credential: serde_json::from_value(serde_json::to_value(&credential)?)?,
-        username: start_req.username.clone(),
-        email: start_req.email.clone(),
-    };
+    let result = ctx
+        .client
+        .register_finish(&RegisterFinishRequest {
+            challenge_token: tampered_token,
+            credential: serde_json::from_value(serde_json::to_value(&credential)?)?,
+            username,
+            email: TestContext::unique_email(),
+        })
+        .await;
 
-    assert_eq!(
-        ctx.post_json("/auth/register/finish", &finish_req)
-            .await?
-            .status(),
-        400
-    );
+    assert!(matches!(result, Err(ApiError::Api { status: 400, .. })));
     Ok(())
 }
 
@@ -489,19 +448,17 @@ async fn test_challenge_token_expired() -> TestResult {
         "type": "public-key"
     }))?;
 
-    let finish_req = RegisterFinishRequest {
-        challenge_token: expired_token,
-        credential: dummy_credential,
-        username: "dummy-user".to_string(),
-        email: Email::new("dummy@test.example.com".to_string()),
-    };
+    let result = ctx
+        .client
+        .register_finish(&RegisterFinishRequest {
+            challenge_token: expired_token,
+            credential: dummy_credential,
+            username: "dummy-user".to_string(),
+            email: Email::new("dummy@test.example.com".to_string()),
+        })
+        .await;
 
-    assert_eq!(
-        ctx.post_json("/auth/register/finish", &finish_req)
-            .await?
-            .status(),
-        400
-    );
+    assert!(matches!(result, Err(ApiError::Api { status: 400, .. })));
     Ok(())
 }
 
@@ -542,13 +499,11 @@ async fn test_clone_detection_rejects_stale_counter() -> TestResult {
 
     // Now try to login again. The authenticator's counter will be ~2,
     // but the stored counter is 999999. webauthn-rs should reject this.
-    let start_req = LoginStartRequest {
-        identifier: username.clone(),
-    };
-    let start_resp: LoginStartResponse = ctx
-        .post_json("/auth/login/start", &start_req)
-        .await?
-        .json()
+    let start_resp = ctx
+        .client
+        .login_start(&LoginStartRequest {
+            identifier: username.clone(),
+        })
         .await?;
 
     let rcr: webauthn_rs::prelude::RequestChallengeResponse =
@@ -558,16 +513,16 @@ async fn test_clone_detection_rejects_stale_counter() -> TestResult {
         .do_authentication(ctx.origin()?, rcr)
         .map_err(|e| format!("Authentication failed: {e:?}"))?;
 
-    let finish_req = LoginFinishRequest {
-        challenge_token: start_resp.challenge_token,
-        credential: serde_json::from_value(serde_json::to_value(&auth_credential)?)?,
-    };
-
     // This should fail with a 400 because webauthn-rs detects the counter regression
-    let resp = ctx.post_json("/auth/login/finish", &finish_req).await?;
-    assert_eq!(
-        resp.status(),
-        400,
+    let result = ctx
+        .client
+        .login_finish(&LoginFinishRequest {
+            challenge_token: start_resp.challenge_token,
+            credential: serde_json::from_value(serde_json::to_value(&auth_credential)?)?,
+        })
+        .await;
+    assert!(
+        matches!(result, Err(ApiError::Api { status: 400, .. })),
         "Expected clone detection to reject stale counter"
     );
 

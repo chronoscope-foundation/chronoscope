@@ -10,10 +10,10 @@ const GARY_INDIANA_ALT: f64 = 180.5;
 #[tokio::test]
 async fn test_dossier_pending_has_no_resolved_content() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let id = ctx
-        .add_research(&token, "https://example.com/pending")
+        .add_research(&auth, "https://example.com/pending")
         .await?;
 
     let dossier: ResearchUrlDossier = ctx.get(&format!("/research/{id}")).await?.json().await?;
@@ -32,11 +32,11 @@ async fn test_dossier_with_page_content() -> TestResult {
     use crate::research_types::ResolvedContent;
 
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     // Create URL and resolve it to a page
     let url_id = ctx
-        .add_research(&token, "https://reddit.com/r/test/post")
+        .add_research(&auth, "https://reddit.com/r/test/post")
         .await?;
     let page_data = TestContext::test_page_data(IntegrationName::Reddit, &[]);
     ctx.create_page_for_url(&url_id, &page_data).await?;
@@ -66,11 +66,11 @@ async fn test_dossier_with_direct_media() -> TestResult {
     use crate::research_types::ResolvedContent;
 
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     // Create URL and resolve it directly to media
     let url_id = ctx
-        .add_research(&token, "https://example.com/image.jpg")
+        .add_research(&auth, "https://example.com/image.jpg")
         .await?;
     let media_data = TestContext::test_media_data(&[0x01, 0x02, 0x03, 0x04]);
     ctx.create_media_for_url(&url_id, &media_data).await?;
@@ -100,16 +100,16 @@ async fn test_dossier_page_with_fetched_media() -> TestResult {
     use crate::research_types::{MediaReference, ResolvedContent};
 
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let media_url = "https://instagram.com/media/img1.jpg";
 
     // Create media URL first so we can resolve it later
-    let media_url_id = ctx.add_research(&token, media_url).await?;
+    let media_url_id = ctx.add_research(&auth, media_url).await?;
 
     // Create page URL with media included
     let page_url_id = ctx
-        .add_research(&token, "https://instagram.com/p/abc123")
+        .add_research(&auth, "https://instagram.com/p/abc123")
         .await?;
     let page_data = TestContext::test_page_data(IntegrationName::Instagram, &[media_url]);
     ctx.create_page_for_url(&page_url_id, &page_data).await?;
@@ -144,13 +144,13 @@ async fn test_dossier_page_with_pending_media() -> TestResult {
     use crate::research_types::{MediaReference, ResolvedContent};
 
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let media_url = "https://instagram.com/media/pending.jpg";
 
     // Create page URL with pending media included (media URL not resolved)
     let page_url_id = ctx
-        .add_research(&token, "https://instagram.com/p/def456")
+        .add_research(&auth, "https://instagram.com/p/def456")
         .await?;
     let page_data = TestContext::test_page_data(IntegrationName::Instagram, &[media_url]);
     ctx.create_page_for_url(&page_url_id, &page_data).await?;
@@ -181,20 +181,20 @@ async fn test_dossier_page_with_mixed_media_order() -> TestResult {
     use crate::research_types::{MediaReference, ResolvedContent};
 
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let media1_url = "https://i.redd.it/img1.jpg";
     let media2_url = "https://i.redd.it/img2.jpg";
     let media3_url = "https://i.redd.it/img3.jpg";
 
     // Create media URLs first so we can resolve some of them
-    let media1_url_id = ctx.add_research(&token, media1_url).await?;
-    let _media2_url_id = ctx.add_research(&token, media2_url).await?;
-    let media3_url_id = ctx.add_research(&token, media3_url).await?;
+    let media1_url_id = ctx.add_research(&auth, media1_url).await?;
+    let _media2_url_id = ctx.add_research(&auth, media2_url).await?;
+    let media3_url_id = ctx.add_research(&auth, media3_url).await?;
 
     // Create page with all 3 media URLs
     let page_url_id = ctx
-        .add_research(&token, "https://reddit.com/gallery")
+        .add_research(&auth, "https://reddit.com/gallery")
         .await?;
     let page_data = TestContext::test_page_data(
         IntegrationName::Reddit,
@@ -244,10 +244,10 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
     use crate::research_types::ResolvedContent;
 
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let url_id = ctx
-        .add_research(&token, "https://example.com/geotagged.jpg")
+        .add_research(&auth, "https://example.com/geotagged.jpg")
         .await?;
 
     // Create media with GPS data
@@ -318,10 +318,10 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
 #[tokio::test]
 async fn test_dossier_failed_url_shows_status() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let url_id = ctx
-        .add_research(&token, "https://example.com/will-fail")
+        .add_research(&auth, "https://example.com/will-fail")
         .await?;
 
     // Mark the URL as failed (simulating worker failure)
@@ -344,14 +344,14 @@ async fn test_dossier_failed_url_shows_status() -> TestResult {
 #[tokio::test]
 async fn test_media_deduplication_returns_same_id() -> TestResult {
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     // Create two different URLs (different paths, same eventual content)
     let url1 = ctx
-        .add_research(&token, "https://example.com/image1.jpg")
+        .add_research(&auth, "https://example.com/image1.jpg")
         .await?;
     let url2 = ctx
-        .add_research(&token, "https://example.com/alternate/same-image.jpg")
+        .add_research(&auth, "https://example.com/alternate/same-image.jpg")
         .await?;
 
     // Resolve both URLs to media with the SAME hash (simulating same image from different sources)
@@ -385,10 +385,10 @@ async fn test_dossier_video_with_duration() -> TestResult {
     use crate::research_types::ResolvedContent;
 
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     let url_id = ctx
-        .add_research(&token, "https://example.com/video.mp4")
+        .add_research(&auth, "https://example.com/video.mp4")
         .await?;
 
     // Create video media with duration
@@ -433,13 +433,13 @@ async fn test_create_page_with_mixed_existing_and_new_urls() -> TestResult {
     use crate::research_types::{MediaReference, ResolvedContent};
 
     let ctx = TestContext::new().await?;
-    let token = ctx.register_and_get_token().await?;
+    let auth = ctx.register_and_get_auth().await?;
 
     // Pre-existing URLs: create these via add_research before creating the page
     let existing_url1 = "https://example.com/existing1.jpg";
     let existing_url2 = "https://example.com/existing2.jpg";
-    let existing_url1_id = ctx.add_research(&token, existing_url1).await?;
-    let existing_url2_id = ctx.add_research(&token, existing_url2).await?;
+    let existing_url1_id = ctx.add_research(&auth, existing_url1).await?;
+    let existing_url2_id = ctx.add_research(&auth, existing_url2).await?;
 
     // Resolve one of the existing URLs to verify it stays resolved
     let media_data = TestContext::test_media_data(&[0xAA, 0xBB]);
@@ -452,7 +452,7 @@ async fn test_create_page_with_mixed_existing_and_new_urls() -> TestResult {
 
     // Create page with a mix: 2 existing + 2 new, interleaved
     let page_url_id = ctx
-        .add_research(&token, "https://example.com/mixed-page")
+        .add_research(&auth, "https://example.com/mixed-page")
         .await?;
     let page_data = TestContext::test_page_data(
         IntegrationName::Generic,

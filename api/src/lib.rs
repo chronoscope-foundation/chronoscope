@@ -16,7 +16,6 @@ pub mod state;
 pub mod url_security;
 pub mod users;
 pub mod validation;
-pub mod webauthn_types;
 pub mod well_known;
 
 #[cfg(test)]

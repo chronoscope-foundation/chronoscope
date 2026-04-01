@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use leptos::prelude::*;
 
-use crate::api::ChronoscopeClient;
+use crate::api::Client;
 use crate::components::dismiss_button::DismissButton;
 use crate::components::entity_detail::EntityDetailPanel;
 use crate::components::map::{MapStatus, MapView, SelectedEntity};
@@ -43,7 +43,7 @@ pub fn Landing() -> impl IntoView {
 
     // API client handle — lazily initialized on first fetch, shared between
     // the map (entity list) and the detail panel (entity detail).
-    let api_client: Rc<RefCell<Option<ChronoscopeClient>>> = Rc::new(RefCell::new(None));
+    let api_client: Rc<RefCell<Option<Client>>> = Rc::new(RefCell::new(None));
 
     view! {
         // Map fills the entire main area — no scrolling.

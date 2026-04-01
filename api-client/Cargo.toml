@@ -28,6 +28,8 @@ chrono.workspace = true
 uuid.workspace = true
 strum.workspace = true
 thiserror.workspace = true
+secrecy.workspace = true
+futures-util.workspace = true
 
 # HTTP client (uses web-sys fetch on WASM, hyper/tokio natively)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
