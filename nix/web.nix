@@ -94,8 +94,9 @@ let
           --out-name chronoscope_web \
           ${wasmBuild}/lib/chronoscope_web.wasm
 
-        # wasm-opt shrinks the binary
-        wasm-opt -Oz -o work/chronoscope_web_bg_opt.wasm work/chronoscope_web_bg.wasm
+        # wasm-opt shrinks the binary; --all-features accepts whatever WASM
+        # features rustc emits (bulk-memory, mutable-globals, etc.)
+        wasm-opt -Oz --all-features -o work/chronoscope_web_bg_opt.wasm work/chronoscope_web_bg.wasm
         mv work/chronoscope_web_bg_opt.wasm work/chronoscope_web_bg.wasm
 
         # Tailwind CSS (v4 auto-detects content via @source in input.css).
