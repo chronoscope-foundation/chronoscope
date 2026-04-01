@@ -46,7 +46,6 @@ thiserror = "2"
 bytes = "1"
 oxilangtag = { version = "0.1", features = ["serde"] }
 strum = { version = "0.27", features = ["derive"] }
-secrecy = { version = "0.10", features = ["serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # WASM size optimizations — applied to all release builds but the savings

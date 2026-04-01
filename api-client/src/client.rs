@@ -12,7 +12,6 @@ use std::pin::Pin;
 
 use futures_util::FutureExt;
 use futures_util::stream::{self, Stream, TryStreamExt};
-use secrecy::{ExposeSecret, SecretString};
 
 use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
@@ -274,7 +273,7 @@ where
 #[derive(Clone)]
 pub struct AuthClient {
     client: Client,
-    token: SecretString,
+    token: String,
 }
 
 impl AuthClient {
@@ -282,14 +281,14 @@ impl AuthClient {
     pub fn new(client: Client, token: impl Into<String>) -> Self {
         Self {
             client,
-            token: SecretString::from(token.into()),
+            token: token.into(),
         }
     }
 
     /// The bearer token. Exposed for test code that makes raw HTTP requests
     /// for endpoints not yet on the typed client (research/analysis).
     // TODO: remove once all endpoints have typed client methods.
-    pub fn token(&self) -> &SecretString {
+    pub fn token(&self) -> &str {
         &self.token
     }
 
@@ -297,7 +296,7 @@ impl AuthClient {
 
     /// Attach the bearer token to a request builder.
     fn authed(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder.bearer_auth(self.token.expose_secret())
+        builder.bearer_auth(&self.token)
     }
 
     async fn get_json_auth<T: serde::de::DeserializeOwned>(

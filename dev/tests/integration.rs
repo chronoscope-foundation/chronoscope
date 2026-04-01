@@ -24,7 +24,7 @@ use chronoscope_dev::{DevServerConfig, RunningDevServer, start_dev_server};
 use chronoscope_workers::RetryConfig;
 use chronoscope_workers::{ApifyConfig, CacheMode, CachingClient, HttpClient};
 use dropshot::ConfigLogging;
-use secrecy::ExposeSecret;
+
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -155,7 +155,7 @@ impl TestServer {
             .auth
             .reqwest_client()
             .post(format!("{}/research", self.auth.base_url()))
-            .bearer_auth(self.auth.token().expose_secret())
+            .bearer_auth(self.auth.token())
             .json(&serde_json::json!({"url": url}))
             .send()
             .await?;
@@ -186,7 +186,7 @@ impl TestServer {
             .auth
             .reqwest_client()
             .get(format!("{}/research/{}", self.auth.base_url(), url_id))
-            .bearer_auth(self.auth.token().expose_secret())
+            .bearer_auth(self.auth.token())
             .send()
             .await?;
 

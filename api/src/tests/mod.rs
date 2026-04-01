@@ -30,7 +30,7 @@ use dropshot::{
     HttpServerStarter, ResultsPage,
 };
 use reqwest::Response;
-use secrecy::ExposeSecret;
+
 use serde::Serialize;
 use url::Url;
 use webauthn_authenticator_rs::prelude::*;
@@ -250,7 +250,7 @@ impl TestContext {
         self.client
             .reqwest_client()
             .get(self.url(path))
-            .bearer_auth(auth.token().expose_secret())
+            .bearer_auth(auth.token())
             .send()
             .await
     }
@@ -264,7 +264,7 @@ impl TestContext {
         self.client
             .reqwest_client()
             .post(self.url(path))
-            .bearer_auth(auth.token().expose_secret())
+            .bearer_auth(auth.token())
             .json(body)
             .send()
             .await

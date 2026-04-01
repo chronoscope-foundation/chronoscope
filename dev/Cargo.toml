@@ -63,9 +63,6 @@ slog = "2"
 # API client (typed Client/AuthClient for integration tests)
 chronoscope-api-client = { path = "../api-client" }
 
-# Secret management (for AuthClient.token().expose_secret() in tests)
-secrecy.workspace = true
-
 # Testing
 tokio-test = "0.4"
 test-with = "0.14"
