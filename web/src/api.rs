@@ -3,6 +3,8 @@
 //! Uses the shared [`Client`] from `chronoscope-api-client` for typed
 //! API access. Handles runtime configuration discovery from `/config.json`.
 
+use wasm_bindgen::JsCast;
+
 pub use chronoscope_api_client::{Client, EntitySummary};
 
 // ==================== Runtime Configuration ====================
@@ -15,17 +17,35 @@ struct AppConfig {
 
 /// Discover the API URL from `/config.json` and create a client.
 ///
+/// Uses the browser's native fetch API (via `web_sys`) instead of reqwest,
+/// because reqwest's WASM backend requires runtime feature configuration
+/// that doesn't work reliably with `default-features = false`.
+///
 /// Returns `None` if the config fetch fails (e.g., no API server running).
 pub async fn client_from_config() -> Option<Client> {
-    let resp = reqwest::get("/config.json").await.ok()?;
-    if !resp.status().is_success() {
+    let window = web_sys::window()?;
+    let resp_value = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str("/config.json"))
+        .await
+        .map_err(|e| {
+            web_sys::console::warn_1(&format!("fetch /config.json failed: {e:?}").into());
+        })
+        .ok()?;
+    let resp: web_sys::Response = resp_value.dyn_into().ok()?;
+    if !resp.ok() {
         web_sys::console::warn_1(&"Failed to load /config.json — API features disabled".into());
         return None;
     }
-    let config: AppConfig = resp.json().await.ok().or_else(|| {
-        web_sys::console::warn_1(&"Failed to parse /config.json".into());
-        None
-    })?;
+    let json = wasm_bindgen_futures::JsFuture::from(resp.json().ok()?)
+        .await
+        .map_err(|e| {
+            web_sys::console::warn_1(&format!("Failed to read /config.json body: {e:?}").into());
+        })
+        .ok()?;
+    let config: AppConfig = serde_wasm_bindgen::from_value(json)
+        .map_err(|e| {
+            web_sys::console::warn_1(&format!("Failed to parse /config.json: {e}").into());
+        })
+        .ok()?;
     Some(Client::new(config.api_url))
 }
 

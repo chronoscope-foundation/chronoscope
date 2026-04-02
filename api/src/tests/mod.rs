@@ -243,7 +243,11 @@ impl TestContext {
     }
 
     async fn get(&self, path: &str) -> reqwest::Result<Response> {
-        self.client.reqwest_client().get(self.url(path)).send().await
+        self.client
+            .reqwest_client()
+            .get(self.url(path))
+            .send()
+            .await
     }
 
     async fn get_auth(&self, path: &str, auth: &AuthClient) -> reqwest::Result<Response> {
@@ -330,19 +334,15 @@ impl TestContext {
         authenticator: &mut Authenticator,
     ) -> Result<AuthClient, Box<dyn std::error::Error + Send + Sync>> {
         let origin = self.origin()?;
-        let auth = chronoscope_api_client::login(
-            &self.client,
-            identifier,
-            |options| async move {
-                let rcr: webauthn_rs::prelude::RequestChallengeResponse =
-                    serde_json::from_value(serde_json::to_value(&options)?)?;
-                let credential = authenticator
-                    .do_authentication(origin.clone(), rcr)
-                    .map_err(|e| format!("Authentication failed: {e:?}"))?;
-                let result = serde_json::from_value(serde_json::to_value(&credential)?)?;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(result)
-            },
-        )
+        let auth = chronoscope_api_client::login(&self.client, identifier, |options| async move {
+            let rcr: webauthn_rs::prelude::RequestChallengeResponse =
+                serde_json::from_value(serde_json::to_value(&options)?)?;
+            let credential = authenticator
+                .do_authentication(origin.clone(), rcr)
+                .map_err(|e| format!("Authentication failed: {e:?}"))?;
+            let result = serde_json::from_value(serde_json::to_value(&credential)?)?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(result)
+        })
         .await?;
         Ok(auth)
     }

@@ -14,7 +14,9 @@ async fn test_get_me() -> TestResult {
     let mut auth_passkey = TestContext::new_authenticator();
     let username = TestContext::unique_username();
 
-    let auth = ctx.register_with_username(&mut auth_passkey, &username).await?;
+    let auth = ctx
+        .register_with_username(&mut auth_passkey, &username)
+        .await?;
 
     let user = auth.get_me().await?;
     assert_eq!(user.username, username);
@@ -53,8 +55,12 @@ async fn test_update_username_conflict() -> TestResult {
     let username1 = TestContext::unique_username();
     let username2 = TestContext::unique_username();
 
-    let auth1 = ctx.register_with_username(&mut auth1_passkey, &username1).await?;
-    let _auth2 = ctx.register_with_username(&mut auth2_passkey, &username2).await?;
+    let auth1 = ctx
+        .register_with_username(&mut auth1_passkey, &username1)
+        .await?;
+    let _auth2 = ctx
+        .register_with_username(&mut auth2_passkey, &username2)
+        .await?;
 
     // User 1 tries to take user 2's username
     let req = UpdateUserRequest {
@@ -198,7 +204,10 @@ async fn test_username_valid_chars() -> TestResult {
             email: None,
         };
         let user = auth.update_me(&req).await?;
-        assert_eq!(user.username, *valid, "Expected username to be set to: {valid}");
+        assert_eq!(
+            user.username, *valid,
+            "Expected username to be set to: {valid}"
+        );
     }
     Ok(())
 }
@@ -223,7 +232,9 @@ async fn test_update_empty_request() -> TestResult {
     let mut auth_passkey = TestContext::new_authenticator();
     let username = TestContext::unique_username();
 
-    let auth = ctx.register_with_username(&mut auth_passkey, &username).await?;
+    let auth = ctx
+        .register_with_username(&mut auth_passkey, &username)
+        .await?;
 
     // Get current user state
     let original = auth.get_me().await?;
@@ -283,7 +294,9 @@ async fn test_db_update_credential_nonexistent_returns_error() -> TestResult {
     let username = TestContext::unique_username();
 
     // Register a real user to get a valid passkey
-    let auth = ctx.register_with_username(&mut auth_passkey, &username).await?;
+    let auth = ctx
+        .register_with_username(&mut auth_passkey, &username)
+        .await?;
 
     // Get the user's credentials
     let user = auth.get_me().await?;

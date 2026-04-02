@@ -4,6 +4,8 @@ mod components;
 mod maplibre;
 mod markdown;
 mod pages;
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
 
 use leptos::mount::mount_to_body;
 

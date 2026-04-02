@@ -101,7 +101,10 @@ in
         tailwindcss_4
         trunk
         wasm-bindgen-cli
-      ]);
+      ])
+      # Headless Chrome for browser tests (nixpkgs chromium is Linux-only;
+      # on macOS the test harness discovers a system-installed Chrome).
+      ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
     inherit (commonArgs) buildInputs;
     env = {
       inherit (commonArgs) PROTOC;

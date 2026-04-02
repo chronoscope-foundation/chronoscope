@@ -30,6 +30,22 @@ const ENTITY_SOURCE_ID: &str = "entities";
 /// Name of the circle layer for entity markers.
 const ENTITY_CIRCLES_LAYER: &str = "entity-circles";
 
+/// DOM event name signaling map mount completion (used by test hooks).
+#[cfg(feature = "test-hooks")]
+pub(crate) const MAP_READY_EVENT: &str = "chronoscope-map-ready";
+/// DOM event name signaling entity fetch completion (used by test hooks).
+#[cfg(feature = "test-hooks")]
+pub(crate) const FETCH_COMPLETE_EVENT: &str = "chronoscope-fetch-complete";
+
+#[cfg(feature = "test-hooks")]
+fn dispatch_window_event(name: &str) {
+    if let Some(window) = web_sys::window()
+        && let Ok(event) = web_sys::Event::new(name)
+    {
+        let _ = window.dispatch_event(&event);
+    }
+}
+
 // ==================== Public types ====================
 
 /// What the user has selected on the map.
@@ -342,6 +358,10 @@ async fn load_entities_for_viewport(
             signals.set_fetch_error.set(Some(format!("{e}")));
         }
     }
+
+    // Signal fetch completion (used by browser test hooks to avoid sleep-based waits).
+    #[cfg(feature = "test-hooks")]
+    dispatch_window_event(FETCH_COMPLETE_EVENT);
 }
 
 // ==================== Click handler helpers ====================
@@ -611,6 +631,10 @@ fn effect_mount_map(
 
         if let Some(map) = initialize_map(&el, &state, signals, set_selected) {
             *map_handle.borrow_mut() = Some(map);
+
+            // Signal that the map has mounted (used by test hooks).
+            #[cfg(feature = "test-hooks")]
+            dispatch_window_event(MAP_READY_EVENT);
         }
     });
 }
@@ -676,9 +700,15 @@ fn effect_retry_on_signal(
 // ==================== Component ====================
 
 #[component]
-pub fn MapView(api_client: Rc<RefCell<Option<api::Client>>>) -> impl IntoView {
+pub fn MapView(
+    api_client: Rc<RefCell<Option<api::Client>>>,
+    /// Shared map handle — populated when the map mounts. Allows external
+    /// code (e.g., test hooks) to access the live map instance.
+    #[prop(optional)]
+    map_handle: Option<Rc<RefCell<Option<maplibre::Map>>>>,
+) -> impl IntoView {
     let container = NodeRef::<leptos::html::Div>::new();
-    let map_handle: Rc<RefCell<Option<maplibre::Map>>> = Rc::new(RefCell::new(None));
+    let map_handle = map_handle.unwrap_or_else(|| Rc::new(RefCell::new(None)));
 
     // Selected entity signal — provided to parent via context
     let (selected, set_selected) = signal(None::<EntitySelection>);

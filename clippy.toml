@@ -10,6 +10,7 @@ doc-valid-idents = [
     "GeoJSON",
     "GeoNames",
     "IPv4",
+    "JsonSchema",
     "IPv6",
     "MapLibre",
     "MediaWiki",

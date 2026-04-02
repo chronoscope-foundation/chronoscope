@@ -126,8 +126,7 @@ async fn test_pagination_malformed_page_token() -> TestResult {
     let auth = ctx.register_and_get_auth().await?;
 
     // Add some research so pagination would normally work
-    ctx.add_research(&auth, "https://example.com/item1")
-        .await?;
+    ctx.add_research(&auth, "https://example.com/item1").await?;
 
     // Try with a malformed page_token
     let resp = ctx
@@ -187,8 +186,7 @@ async fn test_pagination_limit_zero_rejected() -> TestResult {
     let ctx = TestContext::new().await?;
     let auth = ctx.register_and_get_auth().await?;
 
-    ctx.add_research(&auth, "https://example.com/item1")
-        .await?;
+    ctx.add_research(&auth, "https://example.com/item1").await?;
 
     // limit=0 should be rejected by Dropshot's validation
     let resp = ctx.get_auth("/users/me/following?limit=0", &auth).await?;
@@ -201,8 +199,7 @@ async fn test_pagination_negative_limit_rejected() -> TestResult {
     let ctx = TestContext::new().await?;
     let auth = ctx.register_and_get_auth().await?;
 
-    ctx.add_research(&auth, "https://example.com/item1")
-        .await?;
+    ctx.add_research(&auth, "https://example.com/item1").await?;
 
     // Negative limit should be rejected
     let resp = ctx.get_auth("/users/me/following?limit=-1", &auth).await?;

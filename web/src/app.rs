@@ -10,6 +10,9 @@ use crate::pages::landing::Landing;
 
 #[component]
 pub fn App() -> impl IntoView {
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::register_base();
+
     view! {
         <Router>
             <ErrorBanner/>

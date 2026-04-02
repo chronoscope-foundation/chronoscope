@@ -148,10 +148,7 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
 
 /// Fetches and displays entity detail content.
 #[component]
-fn EntityDetailContent(
-    id: String,
-    api_client: Rc<RefCell<Option<api::Client>>>,
-) -> impl IntoView {
+fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>) -> impl IntoView {
     let id_clone = id.clone();
     let (retry_count, set_retry_count) = signal(0u32);
     let detail = LocalResource::new(move || {
@@ -284,10 +281,7 @@ use chronoscope_core::entity::EntityTransition;
 use chronoscope_core::links::{LinkTarget, LinkType};
 
 /// Fetch entity detail using the typed API client.
-async fn fetch_entity_detail(
-    id: &str,
-    client: &api::Client,
-) -> Result<EntityDetailView, String> {
+async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDetailView, String> {
     let entity_id = EntityId::new(id);
     let resp = client
         .get_entity(&entity_id)

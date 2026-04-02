@@ -77,3 +77,10 @@ chronoscope-ingestion = { path = "../ingestion" }
 oxilangtag = { version = "0.1", features = ["serde"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 url.workspace = true
+
+# Browser testing (headless Chrome via CDP)
+chromiumoxide = "0.9"
+futures = "0.3"
+# Static file serving for built web frontend
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs"] }

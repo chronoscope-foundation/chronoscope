@@ -19,13 +19,13 @@ use crate::auth::{
 };
 use crate::entities::{EntityResponse, EntitySummary};
 use crate::ids::{Email, EntityId, ResearchUrlId};
+use crate::pagination::{PageToken, ResultsPage};
+use crate::types::Bbox;
+use crate::users::{UpdateUserRequest, UserResponse};
 use crate::webauthn_types::{
     CredentialCreationOptions, CredentialRequestOptions, PublicKeyCredentialAssertion,
     PublicKeyCredentialAttestation,
 };
-use crate::pagination::{PageToken, ResultsPage};
-use crate::types::Bbox;
-use crate::users::{UpdateUserRequest, UserResponse};
 
 // Conditional `Send` bound for pagination return types. See `define_paginate!`
 // below for a detailed explanation of why this is needed.
@@ -318,6 +318,7 @@ impl AuthClient {
         check_status(resp).await?.json().await.map_err(Into::into)
     }
 
+    #[allow(dead_code)] // will be used when more authenticated endpoints are added
     async fn post_json_auth<T: serde::de::DeserializeOwned, B: serde::Serialize>(
         &self,
         url: &str,

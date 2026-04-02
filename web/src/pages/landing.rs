@@ -45,11 +45,21 @@ pub fn Landing() -> impl IntoView {
     // the map (entity list) and the detail panel (entity detail).
     let api_client: Rc<RefCell<Option<Client>>> = Rc::new(RefCell::new(None));
 
+    // Map handle — shared with MapView (which populates it on mount) and test
+    // hooks (which query/drive the map programmatically).
+    let map_handle: Rc<RefCell<Option<crate::maplibre::Map>>> = Rc::new(RefCell::new(None));
+
+    // Register browser test hooks when compiled with `--features test-hooks`.
+    // These live on `window.__test` and give the test harness typed access to
+    // the map and API client without exposing raw handles on the window.
+    #[cfg(feature = "test-hooks")]
+    crate::test_hooks::register_map_hooks(map_handle.clone(), api_client.clone());
+
     view! {
         // Map fills the entire main area — no scrolling.
         // Mobile: subtract the 3.5rem top bar. Desktop: full viewport (sidebar is flex, not stacked).
         <div class="h-[calc(100vh-3.5rem)] md:h-screen relative">
-            <MapView api_client=api_client.clone()/>
+            <MapView api_client=api_client.clone() map_handle=map_handle/>
 
             // Entity detail panel (slides in from right on marker click)
             <EntityDetailPanel api_client=api_client.clone()/>

@@ -12,10 +12,7 @@ async fn test_validation_empty_url() -> TestResult {
     let req = SubmitResearchRequest {
         url: "".to_string(),
     };
-    assert_eq!(
-        ctx.post_auth("/research", &auth, &req).await?.status(),
-        400
-    );
+    assert_eq!(ctx.post_auth("/research", &auth, &req).await?.status(), 400);
     Ok(())
 }
 
@@ -27,10 +24,7 @@ async fn test_validation_invalid_url_format() -> TestResult {
     let req = SubmitResearchRequest {
         url: "not a valid url".to_string(),
     };
-    assert_eq!(
-        ctx.post_auth("/research", &auth, &req).await?.status(),
-        400
-    );
+    assert_eq!(ctx.post_auth("/research", &auth, &req).await?.status(), 400);
     Ok(())
 }
 
@@ -65,18 +59,12 @@ async fn test_validation_http_schemes_accepted() -> TestResult {
     let req = SubmitResearchRequest {
         url: "http://example.com/article".to_string(),
     };
-    assert_eq!(
-        ctx.post_auth("/research", &auth, &req).await?.status(),
-        201
-    );
+    assert_eq!(ctx.post_auth("/research", &auth, &req).await?.status(), 201);
 
     let req = SubmitResearchRequest {
         url: "https://example.com/secure".to_string(),
     };
-    assert_eq!(
-        ctx.post_auth("/research", &auth, &req).await?.status(),
-        201
-    );
+    assert_eq!(ctx.post_auth("/research", &auth, &req).await?.status(), 201);
     Ok(())
 }
 
