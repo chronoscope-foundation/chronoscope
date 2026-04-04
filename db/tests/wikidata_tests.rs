@@ -158,10 +158,12 @@ async fn p18_images_as_pending_research_urls() -> Result<()> {
         .await?;
     assert_eq!(count.0, 17);
 
+    // Split entities (e.g., Chioggia Cathedral) only attach images to the
+    // latest entity, so the old cathedral no longer gets a duplicate annotation.
     let annotation_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM annotations")
         .fetch_one(db.pool_ref())
         .await?;
-    assert_eq!(annotation_count.0, 18);
+    assert_eq!(annotation_count.0, 17);
 
     Ok(())
 }

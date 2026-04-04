@@ -118,7 +118,7 @@ impl PartialEq<&str> for WikidataId {
 }
 
 /// A MediaWiki page revision identifier.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RevisionId(pub u64);
 
@@ -361,10 +361,55 @@ string_newtype! {
 // Entity
 // =============================================================================
 
-/// A Wikidata entity (item or property).
+/// Raw entity content without a revision ID.
 ///
-/// Parsed from the Wikidata Action API (`wbgetentities`) or dump format.
-/// Both produce the same entity-level JSON structure.
+/// This is what appears inside `action=query&rvprop=content` responses,
+/// where the revision ID lives in the enclosing API structure rather than
+/// in the entity JSON itself. Use [`with_revision`](Self::with_revision)
+/// to pair it with the externally-known revision ID.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WikidataEntityContent {
+    /// Entity ID (e.g., "Q42", "P31").
+    pub id: WikidataId,
+
+    /// Entity type: "item", "property", or "lexeme".
+    #[serde(rename = "type")]
+    pub entity_type: WikidataEntityType,
+
+    /// Labels keyed by language code (e.g., "en", "de").
+    #[serde(default)]
+    pub labels: HashMap<LanguageCode, Label>,
+
+    /// Claims keyed by property ID (e.g., "P31", "P571").
+    #[serde(default)]
+    pub claims: HashMap<PropertyId, Vec<Claim>>,
+
+    /// Sitelinks keyed by site ID (e.g., "enwiki", "commonswiki").
+    #[serde(default)]
+    pub sitelinks: HashMap<SiteId, Sitelink>,
+}
+
+impl WikidataEntityContent {
+    /// Pair with an externally-known revision ID to produce a full
+    /// [`WikidataEntity`].
+    pub fn with_revision(self, revision_id: RevisionId) -> WikidataEntity {
+        WikidataEntity {
+            id: self.id,
+            entity_type: self.entity_type,
+            lastrevid: revision_id,
+            labels: self.labels,
+            claims: self.claims,
+            sitelinks: self.sitelinks,
+        }
+    }
+}
+
+/// A Wikidata entity (item or property) with a guaranteed revision ID.
+///
+/// Deserialized from `wbgetentities` responses or NDJSON dumps where
+/// `lastrevid` is always present. For revision-content queries where the
+/// revision ID is external, deserialize as [`WikidataEntityContent`] and
+/// call [`with_revision`](WikidataEntityContent::with_revision).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WikidataEntity {
     /// Entity ID (e.g., "Q42", "P31").
@@ -374,10 +419,7 @@ pub struct WikidataEntity {
     #[serde(rename = "type")]
     pub entity_type: WikidataEntityType,
 
-    /// Revision ID of this entity snapshot. In API responses, this is the
-    /// revision that was fetched; in dumps, it is the latest revision at
-    /// dump time.
-    #[serde(default)]
+    /// Revision ID of this entity snapshot — always present.
     pub lastrevid: RevisionId,
 
     /// Labels keyed by language code (e.g., "en", "de").
@@ -969,13 +1011,29 @@ mod tests {
 
     #[test]
     fn test_entity_minimal_fields() -> TestResult {
-        let json = r#"{ "type": "item", "id": "Q1" }"#;
+        let json = r#"{ "type": "item", "id": "Q1", "lastrevid": 42 }"#;
         let entity: WikidataEntity = serde_json::from_str(json)?;
         assert_eq!(entity.id, "Q1");
         assert!(entity.labels.is_empty());
         assert!(entity.claims.is_empty());
         assert!(entity.sitelinks.is_empty());
-        assert_eq!(entity.lastrevid, RevisionId(0));
+        assert_eq!(entity.lastrevid, RevisionId(42));
+        Ok(())
+    }
+
+    #[test]
+    fn test_entity_missing_revision_id_is_error() {
+        let json = r#"{ "type": "item", "id": "Q1" }"#;
+        assert!(serde_json::from_str::<WikidataEntity>(json).is_err());
+    }
+
+    #[test]
+    fn test_entity_content_with_revision() -> TestResult {
+        let json = r#"{ "type": "item", "id": "Q1" }"#;
+        let content: WikidataEntityContent = serde_json::from_str(json)?;
+        assert_eq!(content.id, "Q1");
+        let entity = content.with_revision(RevisionId(99));
+        assert_eq!(entity.lastrevid, RevisionId(99));
         Ok(())
     }
 

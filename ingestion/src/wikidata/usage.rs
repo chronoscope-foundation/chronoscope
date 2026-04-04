@@ -190,7 +190,7 @@ mod tests {
         Ok(WikidataEntity {
             id: wikidata_id("Q1")?,
             entity_type: WikidataEntityType::Item,
-            lastrevid: RevisionId(0),
+            lastrevid: RevisionId(1),
             labels: HashMap::new(),
             claims,
             sitelinks: HashMap::new(),

@@ -161,8 +161,9 @@ mod entity_accumulator {
         /// Split into multiple results, one per lifecycle.
         ///
         /// Each lifecycle gets its own `Entity` with the given transitions.
-        /// Shared state (images, annotations, links, issues, names) is cloned
-        /// into each result.
+        /// Images and annotations are assigned only to the latest (last)
+        /// entity, since Wikidata images typically depict the current
+        /// structure. Links, issues, and names are shared across all.
         pub fn split_into_results(
             self,
             names: Vec<Cited<EntityName, SourceIdx>>,
@@ -173,9 +174,10 @@ mod entity_accumulator {
                 lifecycles.push(Vec::new());
             }
 
-            let mut results = Vec::with_capacity(lifecycles.len());
+            let lifecycle_count = lifecycles.len();
+            let mut results = Vec::with_capacity(lifecycle_count);
 
-            for transitions in lifecycles {
+            for (i, transitions) in lifecycles.into_iter().enumerate() {
                 let mut entity = Entity {
                     entity_type: self.entity_type,
                     names: names.clone(),
@@ -183,13 +185,23 @@ mod entity_accumulator {
                 };
                 crate::wikidata::usage::replace_unknown(&mut entity, inferred_usages);
 
+                let is_latest = i == lifecycle_count - 1;
+
                 results.push(EntityResult {
                     entity_idx: self.entity_idx,
                     wikidata_id: self.wikidata_id.clone(),
                     revision_id: self.revision_id,
                     entity,
-                    images: self.images.clone(),
-                    annotations: self.annotations.clone(),
+                    images: if is_latest {
+                        self.images.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    annotations: if is_latest {
+                        self.annotations.clone()
+                    } else {
+                        Vec::new()
+                    },
                     links: self.links.clone(),
                     issues: self.issues.clone(),
                 });

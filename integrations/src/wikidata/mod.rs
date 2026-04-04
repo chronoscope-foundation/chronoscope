@@ -25,8 +25,8 @@ pub use commons::url_for_filename;
 pub use entity::{
     Claim, CommonsFilename, CoordinateValue, DataValue, EntityRefValue, Label, LanguageCode,
     MonolingualTextValue, PageId, PropertyId, QuantityAmount, QuantityUnit, QuantityValue, Rank,
-    RevisionId, SiteId, Sitelink, Snak, TimeValue, WikidataEntity, WikidataEntityType, WikidataId,
-    WikidataPrecision, WikidataTimestamp,
+    RevisionId, SiteId, Sitelink, Snak, TimeValue, WikidataEntity, WikidataEntityContent,
+    WikidataEntityType, WikidataId, WikidataPrecision, WikidataTimestamp,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -375,7 +375,10 @@ impl<H: HttpClient> WikidataClient<H> {
             let rev_id = page_obj
                 .pointer("/revisions/0/revid")
                 .and_then(|v| v.as_u64())
-                .map(RevisionId);
+                .map(RevisionId)
+                .ok_or_else(|| WikidataError::Api {
+                    message: "no revision ID in response".to_string(),
+                })?;
 
             let content_str = page_obj
                 .pointer("/revisions/0/*")
@@ -384,22 +387,22 @@ impl<H: HttpClient> WikidataClient<H> {
                     message: "no revision content in response".to_string(),
                 })?;
 
-            let entity: WikidataEntity = serde_json::from_str(content_str)?;
+            let content: WikidataEntityContent = serde_json::from_str(content_str)?;
 
             // Validate entity ID matches what we expected for this revision
-            if let Some(rev) = rev_id
-                && let Some(&expected_id) = expected.get(&rev)
-                && entity.id != expected_id
+            if let Some(&expected_id) = expected.get(&rev_id)
+                && content.id != expected_id
             {
                 return Err(WikidataError::Api {
                     message: format!(
-                        "revision {rev} resolved to entity '{}', \
+                        "revision {rev_id} resolved to entity '{}', \
                          expected '{expected_id}'",
-                        entity.id
+                        content.id
                     ),
                 });
             }
 
+            let entity = content.with_revision(rev_id);
             out.insert(entity.id.clone(), entity);
         }
 
