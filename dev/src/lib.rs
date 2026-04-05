@@ -56,6 +56,9 @@ pub struct RunningDevServer {
     /// Database pool for direct access (e.g., loading ingestion bundles in tests)
     db: Arc<Database>,
 
+    /// Media store for seeding test images.
+    media_store: Arc<dyn MediaStore>,
+
     /// Send `true` to trigger graceful shutdown of workers
     shutdown_tx: watch::Sender<bool>,
 
@@ -71,6 +74,86 @@ impl RunningDevServer {
     #[must_use]
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// Seed test media by resolving all pending research URLs with placeholder images.
+    ///
+    /// For each pending URL that has an annotation, generates a small solid-color
+    /// JPEG, stores it in the media store, and marks the URL as resolved. This
+    /// makes image-dependent features (detail panel grid, map thumbnails,
+    /// lightbox) testable without running actual fetch workers.
+    ///
+    /// Returns the number of media items created.
+    pub async fn seed_test_media(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        use image::ImageEncoder;
+        use sha2::{Digest, Sha256};
+
+        // Generate a small placeholder JPEG (8x8 solid copper).
+        let (w, h) = (8u32, 8u32);
+        let rgb_data: Vec<u8> = [0x8Bu8, 0x5E, 0x3C].repeat((w * h) as usize);
+        let mut jpeg_buf = std::io::Cursor::new(Vec::new());
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg_buf).write_image(
+            &rgb_data,
+            w,
+            h,
+            image::ExtendedColorType::Rgb8,
+        )?;
+        let jpeg_bytes = bytes::Bytes::from(jpeg_buf.into_inner());
+
+        // Find all unresolved research URLs that have annotations.
+        // URLs may be 'pending' or 'processing' (workers can claim them
+        // before we seed, even with a long idle backoff).
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT r.id, r.url FROM research_urls r \
+             JOIN annotations a ON a.url_id = r.id \
+             WHERE r.media_id IS NULL \
+             GROUP BY r.id",
+        )
+        .fetch_all(self.db.pool_ref())
+        .await?;
+
+        let now = chrono::Utc::now().naive_utc();
+        let mut count = 0;
+
+        for (url_id, source_url) in &rows {
+            let exact_hash = Sha256::digest(source_url.as_bytes()).to_vec();
+            let url_id = chronoscope_db::ResearchUrlId::new(url_id.clone());
+            let storage_key = format!("media/{}.jpg", uuid::Uuid::now_v7());
+
+            // Store full image + thumbnail variant in the media store
+            self.media_store
+                .put(&storage_key, jpeg_bytes.clone(), "image/jpeg")
+                .await?;
+            self.media_store
+                .put(
+                    &storage_key.replace(".jpg", "_thumb.jpg"),
+                    jpeg_bytes.clone(),
+                    "image/jpeg",
+                )
+                .await?;
+
+            let media_data = chronoscope_db::MediaData {
+                exact_hash,
+                perceptual_hash: None,
+                storage_key,
+                media_type: chronoscope_db::MediaType::Image,
+                width: w as i32,
+                height: h as i32,
+                duration_seconds: None,
+                captured: None,
+                location: None,
+                source_metadata: None,
+                fetched_at: now,
+            };
+            let media_id = self.db.get_or_create_media(&media_data).await?;
+            self.db
+                .mark_url_resolved_to_media(&url_id, &media_id)
+                .await?;
+
+            count += 1;
+        }
+
+        Ok(count)
     }
 
     /// Gracefully shut down the server and wait for all workers to stop.
@@ -422,6 +505,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
     };
 
     // Create AppState with our shared database and media store
+    let media_store_for_server = media_store.clone();
     let app_state = AppState::new(
         db.as_ref().clone(),
         api_config,
@@ -462,6 +546,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         auth_token,
         test_user_id,
         db,
+        media_store: media_store_for_server,
         shutdown_tx,
         worker_handles,
     })

@@ -27,9 +27,9 @@ pub use chronoscope_core::entity::{EntityRelationType, EntityType};
 pub use chronoscope_core::links::LinkType;
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
-    Annotation, Coordinates, DateRange, Entity, EntityLink, FollowedUrl, Media, MediaData,
-    MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved, ResolvedContent,
-    ResolvedTarget, User,
+    Annotation, Coordinates, DateRange, Entity, EntityLink, EntityMedia, EntityThumbnail,
+    FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
+    ResolvedContent, ResolvedTarget, User,
 };
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use types::{
@@ -579,6 +579,34 @@ impl Database {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(|r| r.into_domain()).collect()
+    }
+
+    /// Get all resolved media for an entity (via annotations → `research_urls` → media).
+    ///
+    /// Returns media items that have been fully resolved (research URL → media).
+    /// Unresolved annotations (where the URL hasn't been fetched yet) are excluded.
+    pub async fn find_media_by_entity(&self, entity_id: &EntityId) -> DbResult<Vec<EntityMedia>> {
+        let rows: Vec<row::EntityMedia> = sqlx::query_as(queries::FIND_MEDIA_BY_ENTITY.sql)
+            .bind(entity_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.into_domain()).collect())
+    }
+
+    /// Get one representative thumbnail per entity for a batch of entity IDs.
+    ///
+    /// Entities without any resolved media are omitted from the result.
+    /// The parameter is a JSON-serialized array of entity ID strings.
+    pub async fn find_thumbnails_for_entities(
+        &self,
+        entity_ids_json: &str,
+    ) -> DbResult<Vec<EntityThumbnail>> {
+        let rows: Vec<row::EntityThumbnail> =
+            sqlx::query_as(queries::FIND_THUMBNAILS_FOR_ENTITIES.sql)
+                .bind(entity_ids_json)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|r| r.into_domain()).collect())
     }
 
     /// List entities within a geographic bounding box (keyset pagination).

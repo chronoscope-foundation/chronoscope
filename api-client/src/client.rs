@@ -17,7 +17,7 @@ use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-use crate::entities::{EntityResponse, EntitySummary};
+use crate::entities::{EntityResponse, EntitySummary, ThumbnailsResponse};
 use crate::ids::{Email, EntityId, ResearchUrlId};
 use crate::pagination::{PageToken, ResultsPage};
 use crate::types::Bbox;
@@ -143,6 +143,22 @@ impl Client {
     /// Fetch a single entity by ID.
     pub async fn get_entity(&self, id: &EntityId) -> Result<EntityResponse, ApiError> {
         let url = format!("{}/entities/{}", self.base_url, id);
+        self.get_json(&url).await
+    }
+
+    /// Fetch representative thumbnails for a batch of entity IDs.
+    ///
+    /// Entities without any resolved media are omitted from the response.
+    pub async fn get_entity_thumbnails(
+        &self,
+        ids: &[EntityId],
+    ) -> Result<ThumbnailsResponse, ApiError> {
+        let ids_param: String = ids
+            .iter()
+            .map(|id| id.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let url = format!("{}/entity-thumbnails?ids={}", self.base_url, ids_param);
         self.get_json(&url).await
     }
 

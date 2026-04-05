@@ -226,6 +226,34 @@ pub struct EntityLink {
     pub target: LinkTarget,
 }
 
+/// A media item associated with an entity (via annotation → `research_url` → media).
+///
+/// Lighter than `Media` — omits hashes, analysis, and source metadata.
+/// Used by the entity detail panel to show an image grid.
+#[derive(Debug, Clone)]
+pub struct EntityMedia {
+    pub id: MediaId,
+    pub storage_key: String,
+    pub media_type: MediaType,
+    pub width: i32,
+    pub height: i32,
+    pub captured: Option<UncertainDate>,
+    pub annotation_kind: AnnotationKind,
+    /// Original upstream URL where this media was found.
+    pub source_url: String,
+}
+
+/// A thumbnail reference for a single entity (one representative image).
+///
+/// Used by the batch thumbnails endpoint to provide map marker images.
+#[derive(Debug, Clone)]
+pub struct EntityThumbnail {
+    pub entity_id: EntityId,
+    pub storage_key: String,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// An annotation linking an entity to a source image region.
 #[derive(Debug, Clone)]
 pub struct Annotation {

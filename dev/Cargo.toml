@@ -59,6 +59,13 @@ tempfile = "3"
 # Logging
 slog = "2"
 
+# Used by seed_test_media to generate placeholder images + hash + DB inserts
+bytes = "1"
+chrono.workspace = true
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
 [dev-dependencies]
 # API client (typed Client/AuthClient for integration tests)
 chronoscope-api-client = { path = "../api-client" }
@@ -66,16 +73,11 @@ chronoscope-api-client = { path = "../api-client" }
 # Testing
 tokio-test = "0.4"
 test-with = "0.14"
-bytes = "1"
-chrono.workspace = true
 serde_json.workspace = true
-# Image validation
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 # For bundle loading e2e tests
 chronoscope-core = { path = "../core" }
 chronoscope-ingestion = { path = "../ingestion" }
 oxilangtag = { version = "0.1", features = ["serde"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 url.workspace = true
 
 # Browser testing (headless Chrome via CDP)

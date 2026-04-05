@@ -16,7 +16,7 @@ pub fn db_err(e: DbError) -> HttpError {
 }
 
 /// Standard CORS headers for cross-origin access.
-fn cors_builder() -> http::response::Builder {
+pub(crate) fn cors_builder() -> http::response::Builder {
     Response::builder()
         .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header(http::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS")

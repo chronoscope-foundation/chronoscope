@@ -15,6 +15,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::state::AppState;
+use crate::validation;
 
 /// Path parameters for media endpoint.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -66,7 +67,7 @@ pub async fn get_media(
             )
         })?;
 
-    Response::builder()
+    validation::cors_builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, media.metadata.content_type)
         .header(CACHE_CONTROL, "public, max-age=31536000, immutable") // 1 year

@@ -2,10 +2,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::api::Client;
 use crate::components::dismiss_button::DismissButton;
-use crate::components::entity_detail::EntityDetailPanel;
+use crate::components::entity_detail::{EntityDetailPanel, LightboxState};
 use crate::components::map::{MapStatus, MapView, SelectedEntity};
 
 const INFO_DISMISSED_KEY: &str = "chronoscope-info-dismissed";
@@ -54,6 +55,13 @@ pub fn Landing() -> impl IntoView {
     // the map and API client without exposing raw handles on the window.
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::register_map_hooks(map_handle.clone(), api_client.clone());
+
+    // Lightbox state — provided via context so the overlay renders here
+    // (outside the sidebar's CSS transform, which breaks `position: fixed`).
+    let (lightbox_content, set_lightbox_content) =
+        signal(None::<crate::components::entity_detail::LightboxContent>);
+    let lightbox = LightboxState(lightbox_content, set_lightbox_content);
+    provide_context(lightbox.clone());
 
     view! {
         // Map fills the entire main area — no scrolling.
@@ -110,7 +118,113 @@ pub fn Landing() -> impl IntoView {
                     }.into_any()
                 }}
             </div>
+
+            // Image lightbox overlay — rendered outside the sidebar so
+            // `position: fixed` is relative to the viewport, not the
+            // sidebar's CSS transform.
+            <ImageLightbox lightbox=lightbox/>
         </div>
+    }
+}
+
+/// Fullscreen image preview overlay, centered in the browser viewport.
+#[component]
+fn ImageLightbox(lightbox: LightboxState) -> impl IntoView {
+    let set_content = lightbox.1;
+    let close = move |_: leptos::ev::MouseEvent| set_content.set(None);
+    let close_key = move |ev: leptos::ev::KeyboardEvent| {
+        match ev.key().as_str() {
+            "Escape" => set_content.set(None),
+            "Tab" => {
+                // Trap focus within the dialog (close button + open-original link).
+                if let Some(dialog) = ev
+                    .current_target()
+                    .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
+                    && let Ok(focusables) = dialog.query_selector_all("button, a[href]")
+                {
+                    let len = focusables.length();
+                    if len > 0 {
+                        let active = web_sys::window()
+                            .and_then(|w| w.document())
+                            .and_then(|d| d.active_element());
+                        let first = focusables
+                            .item(0)
+                            .and_then(|n| n.dyn_into::<web_sys::Element>().ok());
+                        let last = focusables
+                            .item(len - 1)
+                            .and_then(|n| n.dyn_into::<web_sys::Element>().ok());
+                        if ev.shift_key() {
+                            if active == first {
+                                ev.prevent_default();
+                                if let Some(el) =
+                                    last.and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+                                {
+                                    let _ = el.focus();
+                                }
+                            }
+                        } else if active == last {
+                            ev.prevent_default();
+                            if let Some(el) =
+                                first.and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+                            {
+                                let _ = el.focus();
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+    let content = lightbox.0;
+
+    view! {
+        {move || content.get().map(|c| {
+            let backdrop_ref = NodeRef::<leptos::html::Div>::new();
+            Effect::new(move || {
+                if let Some(el) = backdrop_ref.get() {
+                    let _ = el.focus();
+                }
+            });
+            view! {
+                <div
+                    node_ref=backdrop_ref
+                    class="fixed inset-0 z-[100] bg-ink/90 flex items-center justify-center p-8 \
+                           animate-[fadeIn_150ms_ease-out]"
+                    on:click=close
+                    on:keydown=close_key
+                    tabindex="-1"
+                    role="dialog"
+                    aria-label="Image preview"
+                >
+                    <img
+                        src=c.url.clone()
+                        alt=c.alt.clone()
+                        class="max-w-full max-h-full object-contain rounded-lg \
+                               ring-1 ring-parchment/20"
+                        on:click=|ev: leptos::ev::MouseEvent| ev.stop_propagation()
+                    />
+                    <button
+                        class="absolute top-4 left-4 text-parchment/80 hover:text-parchment text-xl font-sans \
+                               bg-ink/60 rounded-full w-8 h-8 flex items-center justify-center cursor-pointer"
+                        on:click=close
+                        aria-label="Close preview"
+                    >
+                        "\u{00d7}"
+                    </button>
+                    <a
+                        href=c.source_url.clone()
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="absolute top-4 right-4 text-parchment/80 hover:text-parchment text-sm font-sans \
+                               bg-ink/60 rounded px-2 py-1"
+                        on:click=|ev: leptos::ev::MouseEvent| ev.stop_propagation()
+                    >
+                        "Open original \u{2197}"
+                    </a>
+                </div>
+            }
+        })}
     }
 }
 

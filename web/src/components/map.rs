@@ -28,7 +28,7 @@ const MOVEEND_DEBOUNCE_MS: i32 = 150;
 const ENTITY_SOURCE_ID: &str = "entities";
 
 /// Name of the circle layer for entity markers.
-const ENTITY_CIRCLES_LAYER: &str = "entity-circles";
+pub(crate) const ENTITY_CIRCLES_LAYER: &str = "entity-circles";
 
 /// DOM event name signaling map mount completion (used by test hooks).
 #[cfg(feature = "test-hooks")]
@@ -45,6 +45,21 @@ fn dispatch_window_event(name: &str) {
         let _ = window.dispatch_event(&event);
     }
 }
+
+/// Name of the symbol layer for thumbnail markers.
+pub(crate) const ENTITY_THUMBNAILS_LAYER: &str = "entity-thumbnails";
+
+/// DOM event name signaling thumbnail image loading completion (used by test hooks).
+#[cfg(feature = "test-hooks")]
+pub(crate) const THUMBNAILS_LOADED_EVENT: &str = "chronoscope-thumbnails-loaded";
+
+/// Maximum number of thumbnail images to request per viewport.
+const MAX_THUMBNAILS: usize = 30;
+
+/// Size (CSS px) of circular thumbnail images on the map.
+// TODO: Revisit for mobile — 96px may be too large on small screens.
+// Consider scaling down to ~64px based on viewport width.
+const THUMBNAIL_SIZE: u32 = 96;
 
 // ==================== Public types ====================
 
@@ -102,7 +117,11 @@ fn coord_key(lat: f64, lon: f64) -> (u64, u64) {
 }
 
 /// Build a GeoJSON `FeatureCollection` from entity data, grouping co-located entities.
-fn build_geojson(entities: &[api::EntitySummary], selected_id: Option<&str>) -> Option<JsValue> {
+fn build_geojson(
+    entities: &[api::EntitySummary],
+    selected_id: Option<&str>,
+    thumbnails: &ThumbnailMap,
+) -> Option<JsValue> {
     use geojson::{Feature, FeatureCollection, Geometry, Value};
 
     let mut groups: HashMap<(u64, u64), Vec<&api::EntitySummary>> = HashMap::new();
@@ -145,6 +164,10 @@ fn build_geojson(entities: &[api::EntitySummary], selected_id: Option<&str>) -> 
         if entries.len() == 1 {
             props.insert("id".into(), entries[0].id.clone().into());
             props.insert("entity_type".into(), entries[0].entity_type.clone().into());
+        }
+        // Attach a thumbnail if any entity at this location has one loaded.
+        if let Some(image_name) = entries.iter().find_map(|e| thumbnails.get(&e.id)) {
+            props.insert("thumbnail".into(), image_name.clone().into());
         }
         // Always set "group" — the click handler uses it for multi-entity pickers,
         // and having it on single entities is harmless.
@@ -218,11 +241,12 @@ fn init_source_and_layers(map: &maplibre::Map) {
     let get_count = json!(["get", "count"]);
     let get_selected = json!(["get", "selected"]);
 
-    // Circle layer for the marker dots
+    // Circle layer for the marker dots (hidden when a thumbnail is available)
     let circle = json!({
         "id": ENTITY_CIRCLES_LAYER,
         "type": "circle",
         "source": ENTITY_SOURCE_ID,
+        "filter": ["!", ["has", "thumbnail"]],
         "paint": {
             "circle-radius": ["interpolate", ["linear"], get_count, 1, 7, 5, 12, 20, 18],
             "circle-color": ["case", [">", get_count, 1], "#6B4226", "#8B5E3C"],
@@ -238,6 +262,31 @@ fn init_source_and_layers(map: &maplibre::Map) {
     if let Err(e) = map.add_layer(&circle_js) {
         web_sys::console::error_1(&format!("Failed to add circle layer: {e:?}").into());
         return;
+    }
+
+    // Symbol layer for thumbnail images (below count labels, above circles)
+    let thumbnails = json!({
+        "id": ENTITY_THUMBNAILS_LAYER,
+        "type": "symbol",
+        "source": ENTITY_SOURCE_ID,
+        "filter": ["has", "thumbnail"],
+        "layout": {
+            "icon-image": ["get", "thumbnail"],
+            "icon-size": 1.0,
+            "icon-allow-overlap": true,
+            "icon-ignore-placement": true,
+            "icon-anchor": "bottom"
+        },
+        "paint": {
+            "icon-opacity": 0.95
+        }
+    });
+    let Ok(thumbnails_js) = thumbnails.serialize(&serializer) else {
+        web_sys::console::error_1(&"Failed to serialize thumbnails layer spec".into());
+        return;
+    };
+    if let Err(e) = map.add_layer(&thumbnails_js) {
+        web_sys::console::error_1(&format!("Failed to add thumbnails layer: {e:?}").into());
     }
 
     // Symbol layer for count labels on co-located entities (rendered on top)
@@ -289,6 +338,9 @@ type SourceInitialized = Rc<Cell<bool>>;
 ///
 /// All fields are `Copy` (Leptos signals), so this struct is `Copy` too —
 /// it can be captured by closures without cloning.
+/// Map from entity ID → MapLibre image name for loaded thumbnails.
+type ThumbnailMap = HashMap<String, String>;
+
 #[derive(Clone, Copy)]
 struct ViewportSignals {
     set_loading: WriteSignal<bool>,
@@ -300,6 +352,9 @@ struct ViewportSignals {
     /// `load_entities_for_viewport`, read by the GeoJSON rebuild effect.
     cached_entities: ReadSignal<Vec<api::EntitySummary>>,
     set_cached_entities: WriteSignal<Vec<api::EntitySummary>>,
+    /// Map of entity ID → MapLibre image name for loaded thumbnails.
+    thumbnails: ReadSignal<ThumbnailMap>,
+    set_thumbnails: WriteSignal<ThumbnailMap>,
 }
 
 async fn load_entities_for_viewport(
@@ -348,10 +403,20 @@ async fn load_entities_for_viewport(
             signals.set_truncated.set(truncated);
             signals.set_fetch_error.set(None);
             signals.set_empty.set(entities.is_empty());
-            // Write entities to the signal — the GeoJSON rebuild effect
-            // (effect_rebuild_geojson_on_selection) tracks this and will
-            // rebuild the map layer automatically.
-            signals.set_cached_entities.set(entities);
+            // Set entities immediately so circles appear on the map,
+            // then load thumbnails progressively (the clone is needed because
+            // we set the signal before borrowing for thumbnail loading).
+            signals.set_cached_entities.set(entities.clone());
+
+            load_thumbnails_for_viewport(
+                map.clone(),
+                client,
+                &entities,
+                generation,
+                generation_counter,
+                signals,
+            )
+            .await;
         }
         Err(e) => {
             signals.set_loading.set(false);
@@ -362,6 +427,281 @@ async fn load_entities_for_viewport(
     // Signal fetch completion (used by browser test hooks to avoid sleep-based waits).
     #[cfg(feature = "test-hooks")]
     dispatch_window_event(FETCH_COMPLETE_EVENT);
+}
+
+// ==================== Thumbnail loading ====================
+//
+// Thumbnails use MapLibre's `addImage` + symbol layer, which is the intended
+// way to do custom icons — once registered, they're rendered by MapLibre's
+// WebGL pipeline alongside the circle and label layers, all driven by the
+// same GeoJSON source and filtered by properties.
+//
+// The canvas drawing below prepares the image data (circular photo + stem +
+// location dot) as a single raster icon. This is analogous to a sprite sheet
+// entry. An alternative would be to register just the circular photo, use
+// `icon-offset` to shift it up, and let the existing circle layer render the
+// location dot underneath. That would reduce canvas drawing and lean more on
+// MapLibre's compositing, but requires coordinating multiple layers and
+// doesn't give us the connecting stem.
+//
+// TODO: Consider minimizing canvas drawing by splitting the pin into
+// composited MapLibre layers (offset icon + circle + line) instead of
+// baking the full pin shape into one raster image. This would improve
+// zoom scaling behavior and reduce per-image canvas work.
+
+/// Radius of the small location dot at the bottom of a thumbnail pin.
+/// Matches the circle layer's base radius (7px at count=1) for visual continuity.
+const DOT_RADIUS: f64 = 7.0;
+/// Vertical gap between the thumbnail circle and the location dot.
+const STEM_LENGTH: f64 = 8.0;
+
+/// Draw a thumbnail "pin": a circular photo on top, a short stem, and a small
+/// dot at the bottom marking the actual geographic location.
+///
+/// The canvas is sized so the dot sits at the bottom center — use
+/// `icon-anchor: "bottom"` in MapLibre so the dot aligns with the coordinate.
+/// Get the device pixel ratio, defaulting to 1.0 if unavailable.
+fn device_pixel_ratio() -> f64 {
+    web_sys::window()
+        .map(|w| w.device_pixel_ratio())
+        .unwrap_or(1.0)
+}
+
+fn draw_circular_thumbnail(
+    img: &web_sys::HtmlImageElement,
+    dpr: f64,
+) -> Option<web_sys::ImageData> {
+    let document = web_sys::window()?.document()?;
+    let canvas = document
+        .create_element("canvas")
+        .ok()?
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .ok()?;
+    let thumb_r = f64::from(THUMBNAIL_SIZE) / 2.0 * dpr;
+    let border = 2.0 * dpr;
+    let stem_len = STEM_LENGTH * dpr;
+    let dot_r = DOT_RADIUS * dpr;
+    let canvas_w = (f64::from(THUMBNAIL_SIZE) * dpr) as u32;
+    // Extra space below dot for the drop shadow ellipse
+    let canvas_h = (f64::from(THUMBNAIL_SIZE) * dpr + stem_len + dot_r * 2.0 + dot_r) as u32;
+    canvas.set_width(canvas_w);
+    canvas.set_height(canvas_h);
+
+    let ctx = canvas
+        .get_context("2d")
+        .ok()??
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .ok()?;
+
+    let cx = f64::from(canvas_w) / 2.0; // horizontal center
+    let thumb_cy = thumb_r; // thumbnail circle center Y
+
+    // --- Thumbnail circle (center-cropped for non-square sources) ---
+    ctx.save();
+    ctx.begin_path();
+    ctx.arc(cx, thumb_cy, thumb_r - border, 0.0, std::f64::consts::TAU)
+        .ok()?;
+    ctx.clip();
+
+    let nw = f64::from(img.natural_width());
+    let nh = f64::from(img.natural_height());
+    let side = nw.min(nh);
+    let sx = (nw - side) / 2.0;
+    let sy = (nh - side) / 2.0;
+    ctx.draw_image_with_html_image_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+        img,
+        sx,
+        sy,
+        side,
+        side, // source: center square crop
+        0.0,
+        0.0,
+        thumb_r * 2.0,
+        thumb_r * 2.0, // dest: fill circle
+    )
+    .ok()?;
+    ctx.restore();
+
+    // Thumbnail border
+    ctx.set_stroke_style_str("#F5F0E8");
+    ctx.set_line_width(border);
+    ctx.begin_path();
+    ctx.arc(
+        cx,
+        thumb_cy,
+        thumb_r - border / 2.0,
+        0.0,
+        std::f64::consts::TAU,
+    )
+    .ok()?;
+    ctx.stroke();
+
+    // --- Stem line ---
+    let stem_top = thumb_cy + thumb_r;
+    let stem_bottom = stem_top + stem_len;
+    ctx.set_stroke_style_str("#8B5E3C"); // copper
+    ctx.set_line_width(2.0 * dpr);
+    ctx.begin_path();
+    ctx.move_to(cx, stem_top);
+    ctx.line_to(cx, stem_bottom);
+    ctx.stroke();
+
+    // --- Drop shadow (soft circle behind the dot, offset down) ---
+    let dot_cy = stem_bottom + dot_r;
+    ctx.save();
+    ctx.set_shadow_color("rgba(0, 0, 0, 0.4)");
+    ctx.set_shadow_blur(4.0 * dpr);
+    ctx.set_shadow_offset_y(2.0 * dpr);
+
+    // --- Location dot (matches circle marker style) ---
+    ctx.set_fill_style_str("#8B5E3C"); // copper fill
+    ctx.begin_path();
+    ctx.arc(cx, dot_cy, dot_r, 0.0, std::f64::consts::TAU)
+        .ok()?;
+    ctx.fill();
+    // Restore before stroke so the shadow only applies to the fill, not the border
+    ctx.restore();
+    ctx.set_stroke_style_str("#F5F0E8"); // parchment stroke
+    ctx.set_line_width(2.0 * dpr);
+    ctx.stroke();
+
+    ctx.get_image_data(0.0, 0.0, f64::from(canvas_w), f64::from(canvas_h))
+        .ok()
+}
+
+/// Load thumbnails for visible entities and register them as MapLibre images.
+///
+/// Fetches thumbnail URLs for a subset of entity IDs, loads images
+/// incrementally (each appears on the map as soon as it loads rather than
+/// waiting for the entire batch), and cleans up stale images that are no
+/// longer in the viewport.
+///
+/// Uses `generation` to detect stale loads — if the viewport has changed since
+/// this call started, the results are discarded.
+async fn load_thumbnails_for_viewport(
+    map: maplibre::Map,
+    client: &api::Client,
+    entities: &[api::EntitySummary],
+    generation: u64,
+    generation_counter: &Rc<Cell<u64>>,
+    signals: ViewportSignals,
+) {
+    use chronoscope_api_client::EntityId;
+    use futures_util::StreamExt;
+    use futures_util::stream::FuturesUnordered;
+
+    let ids: Vec<EntityId> = entities
+        .iter()
+        .take(MAX_THUMBNAILS)
+        .map(|e| e.id.clone())
+        .collect();
+
+    let new_entity_ids: std::collections::HashSet<String> =
+        ids.iter().map(|id| id.to_string()).collect();
+
+    // Remove only thumbnails that are no longer in the viewport (diff, not clear-all).
+    let old_thumbnails = signals.thumbnails.get_untracked();
+    let mut kept: ThumbnailMap = HashMap::new();
+    for (entity_id, image_name) in &old_thumbnails {
+        if new_entity_ids.contains(entity_id) {
+            kept.insert(entity_id.clone(), image_name.clone());
+        } else if map.has_image(image_name) {
+            let _ = map.remove_image(image_name);
+        }
+    }
+    signals.set_thumbnails.set(kept);
+
+    if ids.is_empty() {
+        return;
+    }
+
+    let response = match client.get_entity_thumbnails(&ids).await {
+        Ok(r) => r,
+        Err(e) => {
+            web_sys::console::warn_1(&format!("Failed to fetch entity thumbnails: {e}").into());
+            return;
+        }
+    };
+
+    if generation_counter.get() != generation {
+        return;
+    }
+
+    let dpr = device_pixel_ratio();
+    let opts = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&opts, &"pixelRatio".into(), &JsValue::from_f64(dpr));
+
+    // Capture current thumbnails once (not per-filter-iteration).
+    let current_thumbs = signals.thumbnails.get_untracked();
+
+    // Load images in parallel, skipping entities that already have thumbnails.
+    let mut futures: FuturesUnordered<_> = response
+        .thumbnails
+        .iter()
+        .filter(|(eid, _)| !current_thumbs.contains_key(&eid.to_string()))
+        .map(|(entity_id, thumb_info)| {
+            let entity_id = entity_id.to_string();
+            let url = thumb_info.url.clone();
+            async move { (entity_id, load_image(&url).await) }
+        })
+        .collect();
+
+    // Collect loaded thumbnails, then update the signal once (avoids
+    // triggering a GeoJSON rebuild per image).
+    let mut batch: ThumbnailMap = HashMap::new();
+
+    while let Some((entity_id, img_opt)) = futures.next().await {
+        if generation_counter.get() != generation {
+            return;
+        }
+
+        let Some(img) = img_opt else {
+            continue;
+        };
+
+        let image_name = format!("thumb-{entity_id}");
+
+        let Some(image_data) = draw_circular_thumbnail(&img, dpr) else {
+            continue;
+        };
+
+        if map
+            .add_image_with_options(&image_name, image_data.as_ref(), &opts)
+            .is_ok()
+        {
+            batch.insert(entity_id, image_name);
+        }
+    }
+
+    if !batch.is_empty() {
+        signals.set_thumbnails.update(|m| m.extend(batch));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    dispatch_window_event(THUMBNAILS_LOADED_EVENT);
+}
+
+/// Load an image from a URL, returning the `HtmlImageElement` when loaded.
+async fn load_image(url: &str) -> Option<web_sys::HtmlImageElement> {
+    let img = web_sys::HtmlImageElement::new().ok()?;
+    img.set_cross_origin(Some("anonymous"));
+
+    let img_for_handlers = img.clone();
+    let promise = js_sys::Promise::new(&mut move |resolve, reject| {
+        let resolve_cb = Closure::once_into_js(move || {
+            let _ = resolve.call0(&JsValue::NULL);
+        });
+        let reject_cb = Closure::once_into_js(move || {
+            let _ = reject.call0(&JsValue::NULL);
+        });
+        img_for_handlers.set_onload(Some(resolve_cb.unchecked_ref()));
+        img_for_handlers.set_onerror(Some(reject_cb.unchecked_ref()));
+    });
+
+    img.set_src(url);
+
+    wasm_bindgen_futures::JsFuture::from(promise).await.ok()?;
+    Some(img)
 }
 
 // ==================== Click handler helpers ====================
@@ -408,7 +748,10 @@ fn handle_background_click(
     let point = js_sys::Reflect::get(&event, &"point".into()).ok();
     if let Some(point) = point {
         let opts = js_sys::Object::new();
-        let layers = js_sys::Array::of1(&JsValue::from_str(ENTITY_CIRCLES_LAYER));
+        let layers = js_sys::Array::of2(
+            &JsValue::from_str(ENTITY_CIRCLES_LAYER),
+            &JsValue::from_str(ENTITY_THUMBNAILS_LAYER),
+        );
         let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
         let features = map.query_rendered_features(&point, &opts);
         if features.length() > 0 {
@@ -427,33 +770,45 @@ fn handle_background_click(
 /// Returns the closures that must be kept alive for the handlers to work.
 /// (`wasm_bindgen::Closure` is invalidated when dropped — the Vec keeps
 /// them alive for the map's lifetime, and they're cleared on cleanup/remount.)
-fn register_layer_handlers(
+/// Register click + hover handlers for a single entity layer.
+///
+/// Each layer needs its own `Closure` instances (MapLibre takes ownership),
+/// so this is called once per interactive layer.
+fn register_entity_layer(
     map: &maplibre::Map,
+    layer: &str,
     set_selected: WriteSignal<Option<EntitySelection>>,
-) -> Vec<Box<dyn std::any::Any>> {
-    let mut closures: Vec<Box<dyn std::any::Any>> = Vec::new();
-
-    // --- Layer click handler ---
+    closures: &mut Vec<Box<dyn std::any::Any>>,
+) {
     let click_cb = Closure::<dyn Fn(JsValue)>::new(move |event: JsValue| {
         handle_entity_click(event, set_selected);
     });
-    map.on_layer("click", ENTITY_CIRCLES_LAYER, click_cb.as_ref());
+    map.on_layer("click", layer, click_cb.as_ref());
     closures.push(Box::new(click_cb));
 
-    // --- Cursor styling on hover ---
     let map_for_enter = map.clone();
     let enter_cb = Closure::<dyn Fn()>::new(move || {
         maplibre::set_cursor(&map_for_enter, "pointer");
     });
-    map.on_layer("mouseenter", ENTITY_CIRCLES_LAYER, enter_cb.as_ref());
+    map.on_layer("mouseenter", layer, enter_cb.as_ref());
     closures.push(Box::new(enter_cb));
 
     let map_for_leave = map.clone();
     let leave_cb = Closure::<dyn Fn()>::new(move || {
         maplibre::set_cursor(&map_for_leave, "");
     });
-    map.on_layer("mouseleave", ENTITY_CIRCLES_LAYER, leave_cb.as_ref());
+    map.on_layer("mouseleave", layer, leave_cb.as_ref());
     closures.push(Box::new(leave_cb));
+}
+
+fn register_layer_handlers(
+    map: &maplibre::Map,
+    set_selected: WriteSignal<Option<EntitySelection>>,
+) -> Vec<Box<dyn std::any::Any>> {
+    let mut closures: Vec<Box<dyn std::any::Any>> = Vec::new();
+
+    register_entity_layer(map, ENTITY_CIRCLES_LAYER, set_selected, &mut closures);
+    register_entity_layer(map, ENTITY_THUMBNAILS_LAYER, set_selected, &mut closures);
 
     // --- Map background click: dismiss panel when clicking empty area ---
     let map_for_bg = map.clone();
@@ -653,12 +1008,13 @@ fn effect_rebuild_geojson(
             _ => None,
         };
 
-        // Tracked read: re-runs this effect when entities change.
+        // Tracked reads: re-runs this effect when entities or thumbnails change.
         let entities = signals.cached_entities.get();
+        let thumbs = signals.thumbnails.get();
 
         if source_initialized.get()
             && !entities.is_empty()
-            && let Some(geojson) = build_geojson(&entities, selected_id.as_deref())
+            && let Some(geojson) = build_geojson(&entities, selected_id.as_deref(), &thumbs)
             && let Some(map) = map_handle.borrow().as_ref()
         {
             update_source_data(map, &geojson);
@@ -729,6 +1085,7 @@ pub fn MapView(
     });
 
     let (cached_entities, set_cached_entities) = signal(Vec::<api::EntitySummary>::new());
+    let (thumbnails, set_thumbnails) = signal(ThumbnailMap::new());
 
     let signals = ViewportSignals {
         set_loading,
@@ -738,6 +1095,8 @@ pub fn MapView(
         selected,
         cached_entities,
         set_cached_entities,
+        thumbnails,
+        set_thumbnails,
     };
 
     // Shared state for JS closures. Grouped into a struct so we clone once

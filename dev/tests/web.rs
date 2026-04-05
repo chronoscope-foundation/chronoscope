@@ -221,6 +221,11 @@ impl WebTest {
         })
         .await?;
 
+        // Seed placeholder images for all annotated URLs so image tests
+        // have resolved media to work with.
+        let seeded = server.seed_test_media().await?;
+        eprintln!("Seeded {seeded} test media items");
+
         // Create temp dir with config.json + symlinks to dist/
         let tmp_dir = tempfile::tempdir()?;
         let config_json = format!(r#"{{"api_url":"{base_url}"}}"#);
@@ -374,6 +379,25 @@ impl WebTest {
         self.page.find_element(selector).await.map_err(|e| {
             format!("Element {selector} not found after MutationObserver resolved: {e}").into()
         })
+    }
+
+    /// Wait until an element matching `selector` is removed from the DOM.
+    async fn wait_for_removal(
+        &self,
+        selector: &str,
+        timeout: Duration,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let js = format!(
+            "new Promise(resolve => {{ \
+                if (!document.querySelector({sel})) {{ resolve(); return; }} \
+                var obs = new MutationObserver(() => {{ \
+                    if (!document.querySelector({sel})) {{ obs.disconnect(); resolve(); }} \
+                }}); \
+                obs.observe(document.body, {{childList: true, subtree: true}}); \
+            }})",
+            sel = serde_json::to_string(selector)?,
+        );
+        self.with_timeout(&js, timeout).await
     }
 
     /// Wait for text to appear anywhere in the page body.
@@ -620,6 +644,46 @@ impl WebTest {
         self.wait_for_map_idle().await?;
         self.pan_map_to(lng, lat, zoom).await
     }
+
+    /// Count rendered thumbnail markers (entities with photo pins).
+    async fn thumbnail_marker_count(
+        &self,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let count: f64 = self
+            .page
+            .evaluate("window.__test.thumbnailMarkerCount()")
+            .await?
+            .into_value()?;
+        Ok(count as usize)
+    }
+
+    /// Navigate to map, pan to coordinates, and wait for both entities and thumbnails.
+    async fn goto_map_with_thumbnails(
+        &self,
+        lng: f64,
+        lat: f64,
+        zoom: f64,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.goto("/").await?;
+        self.wait_for_map_idle().await?;
+        // Register thumbnail listener, pan, wait for fetch + idle, then await
+        // thumbnails — all inside one async IIFE so the listener is registered
+        // before any events can fire.
+        self.with_timeout(
+            &format!(
+                "(async function() {{ \
+                    var thumbs = window.__test.waitForThumbnailsLoaded(); \
+                    var fetch = window.__test.waitForFetchComplete(); \
+                    window.__test.jumpTo({lng}, {lat}, {zoom}); \
+                    await fetch; \
+                    await window.__test.waitForMapIdle(); \
+                    await thumbs; \
+                }})()"
+            ),
+            Duration::from_secs(30),
+        )
+        .await
+    }
 }
 
 /// Run a browser test with automatic setup, teardown, and diagnostics.
@@ -700,7 +764,7 @@ async fn test_landing_page_renders() -> TestResult {
 
         // Wordmark in sidebar
         t.wait_for_text("Chronoscope", TIMEOUT).await?;
-        t.wait_for_text("Connecting places through time", TIMEOUT)
+        t.wait_for_text("Explore places through time", TIMEOUT)
             .await?;
 
         Ok(())
@@ -1251,7 +1315,7 @@ async fn test_desktop_layout() -> TestResult {
 
         // Wordmark and tagline
         t.wait_for_text("Chronoscope", TIMEOUT).await?;
-        t.wait_for_text("Connecting places through time", TIMEOUT)
+        t.wait_for_text("Explore places through time", TIMEOUT)
             .await?;
 
         // Desktop sidebar should NOT have a hamburger toggle visible
@@ -1347,4 +1411,262 @@ async fn test_detail_panel_focus() -> TestResult {
 
         Ok(())
     }).await
+}
+
+// ==================== Image & Thumbnail Tests ====================
+//
+// These tests rely on seed_test_media() having resolved pending research URLs
+// with placeholder images during WebTest setup.
+
+/// Find an entity that has resolved media via the typed API client, returning its (lng, lat).
+///
+/// Uses the batch thumbnails endpoint to find entities with media in 2 API calls
+/// (list + batch thumbnails) instead of N+1 (list + `get_entity` for each).
+/// Then fetches the detail of the best candidate to get the exact media count.
+async fn find_entity_with_media(
+    t: &WebTest,
+) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
+    use chronoscope_api_client::{Bbox, Client};
+    use futures::StreamExt;
+
+    let client = Client::new(format!("http://127.0.0.1:{}", t.server.port));
+    let bbox = Bbox::new(-90.0, 90.0, -180.0, 180.0)?;
+
+    // 1. List all entities
+    let mut entities = Vec::new();
+    let mut pages = client.list_entities_pages(&bbox, 50);
+    while let Some(entity) = pages.next().await {
+        entities.push(entity?);
+    }
+
+    // 2. Batch-check which have thumbnails (single API call)
+    let ids: Vec<_> = entities.iter().map(|e| e.id.clone()).collect();
+    let thumbs = client.get_entity_thumbnails(&ids).await?;
+
+    // 3. Pick the entity with a thumbnail, then fetch its detail to get the full media count
+    // Prefer entities whose detail has the most media (avoids co-located neighbors).
+    let mut best: Option<(f64, f64, usize, String)> = None;
+    for entity in &entities {
+        if thumbs.thumbnails.contains_key(&entity.id) {
+            let detail = client.get_entity(&entity.id).await?;
+            let count = detail.media.len();
+            if best.as_ref().is_none_or(|b| count > b.2) {
+                best = Some((
+                    entity.longitude,
+                    entity.latitude,
+                    count,
+                    entity.id.to_string(),
+                ));
+            }
+        }
+    }
+
+    let (lng, lat, count, id) =
+        best.ok_or("No entity with resolved media found — did seed_test_media run?")?;
+    eprintln!("Found entity {id} with {count} media at ({lng}, {lat})");
+    Ok((lng, lat))
+}
+
+#[tokio::test]
+async fn test_detail_panel_shows_images() -> TestResult {
+    web_test(async |t| {
+        // Find an entity that actually has media via the API (coordinates vary per run)
+        let (lng, lat) = find_entity_with_media(t).await?;
+
+        t.goto_map_at(lng, lat, 14.0).await?;
+        t.click_map_at(lng, lat).await?;
+
+        // Wait for the image grid to appear (entity detail loads media async)
+        t.wait_for("[role='complementary'] ul[role='list']", TIMEOUT)
+            .await?;
+
+        let panel_text = t.text("[role='complementary']").await?;
+        check(
+            panel_text.contains("Images"),
+            format!("Panel should show Images section, got: {panel_text}"),
+        )?;
+
+        // Verify image elements exist
+        let img_count = t
+            .evaluate(
+                "document.querySelectorAll(\
+                    '[role=complementary] ul[role=list] li button img'\
+                ).length",
+            )
+            .await?
+            .as_f64()
+            .unwrap_or(0.0);
+        check(
+            img_count > 0.0,
+            format!("Should have image thumbnails in grid, got {img_count}"),
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_image_grid_accessibility() -> TestResult {
+    web_test(async |t| {
+        let (lng, lat) = find_entity_with_media(t).await?;
+        t.goto_map_at(lng, lat, 14.0).await?;
+        t.click_map_at(lng, lat).await?;
+        t.wait_for("[role='complementary'] ul[role='list']", TIMEOUT)
+            .await?;
+
+        let all_have_labels = t
+            .evaluate(
+                "Array.from(document.querySelectorAll(\
+                    '[role=complementary] ul[role=list] li button'\
+                )).every(b => b.getAttribute('aria-label')?.includes('view'))",
+            )
+            .await?
+            .as_bool()
+            .unwrap_or(false);
+        check(
+            all_have_labels,
+            "Every image button should have an aria-label containing 'view'",
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_lightbox_opens_and_shows_content() -> TestResult {
+    web_test(async |t| {
+        let (lng, lat) = find_entity_with_media(t).await?;
+        t.goto_map_at(lng, lat, 14.0).await?;
+        t.click_map_at(lng, lat).await?;
+        t.wait_for("[role='complementary'] ul[role='list'] li button", TIMEOUT)
+            .await?;
+
+        t.click("[role='complementary'] ul[role='list'] li button")
+            .await?;
+
+        t.wait_for("[role='dialog'][aria-label='Image preview']", TIMEOUT)
+            .await?;
+
+        let img_src = t
+            .eval_string("document.querySelector('[role=dialog] img')?.src || ''")
+            .await?;
+        check(!img_src.is_empty(), "Lightbox image should have a src")?;
+
+        check(
+            t.exists("[role='dialog'] button[aria-label='Close preview']")
+                .await?,
+            "Lightbox should have a close button",
+        )?;
+
+        let original_href = t
+            .eval_string("document.querySelector('[role=dialog] a[target=_blank]')?.href || ''")
+            .await?;
+        check(
+            original_href.starts_with("http"),
+            format!("'Open original' should link to upstream URL, got: {original_href}"),
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_lightbox_dismiss_escape() -> TestResult {
+    web_test(async |t| {
+        let (lng, lat) = find_entity_with_media(t).await?;
+        t.goto_map_at(lng, lat, 14.0).await?;
+        t.click_map_at(lng, lat).await?;
+        t.wait_for("[role='complementary'] ul[role='list'] li button", TIMEOUT)
+            .await?;
+
+        t.click("[role='complementary'] ul[role='list'] li button")
+            .await?;
+        t.wait_for("[role='dialog']", TIMEOUT).await?;
+
+        t.page
+            .evaluate(
+                "document.querySelector('[role=dialog]')\
+                 .dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))",
+            )
+            .await?;
+        // Wait for the dialog to disappear (reactive update after signal change).
+        t.wait_for_removal("[role='dialog']", TIMEOUT).await?;
+
+        check(
+            !t.exists("[role='dialog']").await?,
+            "Lightbox should close on Escape",
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_lightbox_dismiss_close_button() -> TestResult {
+    web_test(async |t| {
+        let (lng, lat) = find_entity_with_media(t).await?;
+        t.goto_map_at(lng, lat, 14.0).await?;
+        t.click_map_at(lng, lat).await?;
+        t.wait_for("[role='complementary'] ul[role='list'] li button", TIMEOUT)
+            .await?;
+
+        t.click("[role='complementary'] ul[role='list'] li button")
+            .await?;
+        t.wait_for("[role='dialog']", TIMEOUT).await?;
+
+        t.click("[role='dialog'] button[aria-label='Close preview']")
+            .await?;
+        // Wait for the dialog to disappear (reactive update after signal change).
+        t.wait_for_removal("[role='dialog']", TIMEOUT).await?;
+
+        check(
+            !t.exists("[role='dialog']").await?,
+            "Lightbox should close on close button click",
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_map_shows_thumbnail_markers() -> TestResult {
+    web_test(async |t| {
+        let (lng, lat) = find_entity_with_media(t).await?;
+        t.goto_map_with_thumbnails(lng, lat, 14.0).await?;
+
+        let thumb_count = t.thumbnail_marker_count().await?;
+        check(
+            thumb_count > 0,
+            format!("Should have thumbnail markers, got {thumb_count}"),
+        )?;
+
+        t.screenshot("test_map_shows_thumbnail_markers").await?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn test_thumbnail_click_opens_detail() -> TestResult {
+    web_test(async |t| {
+        let (lng, lat) = find_entity_with_media(t).await?;
+        t.goto_map_with_thumbnails(lng, lat, 14.0).await?;
+
+        t.click_map_at(lng, lat).await?;
+        t.wait_for("[role='complementary']", TIMEOUT).await?;
+
+        let panel_text = t.text("[role='complementary']").await?;
+        check(
+            panel_text.len() > 20,
+            format!("Panel should have content after clicking thumbnail, got: {panel_text}"),
+        )?;
+
+        Ok(())
+    })
+    .await
 }

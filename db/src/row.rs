@@ -211,6 +211,58 @@ impl PageMedia {
     }
 }
 
+// ==================== EntityMedia (annotation → media join) ====================
+
+#[derive(Debug, FromRow)]
+pub struct EntityMedia {
+    pub id: MediaId,
+    pub storage_key: String,
+    pub media_type: MediaType,
+    pub width: i32,
+    pub height: i32,
+    #[sqlx(json(nullable), rename = "captured_meta")]
+    pub captured: Option<UncertainDate>,
+    #[sqlx(json, rename = "kind_json")]
+    pub annotation_kind: chronoscope_core::annotation::AnnotationKind,
+    pub source_url: String,
+}
+
+impl EntityMedia {
+    pub fn into_domain(self) -> models::EntityMedia {
+        models::EntityMedia {
+            id: self.id,
+            storage_key: self.storage_key,
+            media_type: self.media_type,
+            width: self.width,
+            height: self.height,
+            captured: self.captured,
+            annotation_kind: self.annotation_kind,
+            source_url: self.source_url,
+        }
+    }
+}
+
+// ==================== EntityThumbnail (batch thumbnail lookup) ====================
+
+#[derive(Debug, FromRow)]
+pub struct EntityThumbnail {
+    pub entity_id: EntityId,
+    pub storage_key: String,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl EntityThumbnail {
+    pub fn into_domain(self) -> models::EntityThumbnail {
+        models::EntityThumbnail {
+            entity_id: self.entity_id,
+            storage_key: self.storage_key,
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
 // ==================== Entity ====================
 
 #[derive(Debug, FromRow)]

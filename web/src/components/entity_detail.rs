@@ -9,6 +9,35 @@ use crate::api;
 use crate::components::dismiss_button::DismissButton;
 use crate::components::map::{EntityPickerEntry, EntitySelection, SelectedEntity};
 
+/// Content currently displayed in the lightbox overlay.
+#[derive(Clone, Debug)]
+pub struct LightboxContent {
+    /// CDN URL for the full image.
+    pub url: String,
+    /// Alt text for accessibility.
+    pub alt: String,
+    /// Original upstream URL (for "Open original" link).
+    pub source_url: String,
+}
+
+/// Lightbox state provided via context so the overlay can render
+/// outside the sidebar's CSS transform (which breaks `position: fixed`).
+///
+/// A single `Option<LightboxContent>` signal avoids partial-update races
+/// that would occur with separate signals for `url`/`alt`/`source_url`.
+#[derive(Clone)]
+pub struct LightboxState(
+    pub ReadSignal<Option<LightboxContent>>,
+    pub(crate) WriteSignal<Option<LightboxContent>>,
+);
+
+impl LightboxState {
+    /// Open the lightbox with the given content.
+    pub fn open(&self, content: LightboxContent) {
+        self.1.set(Some(content));
+    }
+}
+
 /// Side panel showing entity details or a disambiguation picker.
 ///
 /// The panel is always rendered (for CSS transitions) but translated off-screen
@@ -182,9 +211,13 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                                 </p>
 
                                 // Timeline
-                                {(!entity.transitions.is_empty()).then(|| view! {
+                                {(!entity.transitions.is_empty()).then(|| {
+                                    let count = entity.transitions.len();
+                                    view! {
                                     <div class="mb-3">
-                                        <p class="text-xs font-sans text-copper font-semibold mb-1">"Timeline"</p>
+                                        <p class="text-xs font-sans text-copper font-semibold mb-1">
+                                            {format!("Timeline ({count})")}
+                                        </p>
                                         <ul class="text-sm text-sepia space-y-1.5">
                                             {entity.transitions.iter().map(|t| view! {
                                                 <li class="pl-2 border-l-2 border-copper/30">
@@ -196,12 +229,80 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                                             }).collect::<Vec<_>>()}
                                         </ul>
                                     </div>
+                                    }
+                                })}
+
+                                // Images
+                                {(!entity.media.is_empty()).then(|| {
+                                    let count = entity.media.len();
+                                    let lightbox = expect_context::<LightboxState>();
+
+                                    view! {
+                                        <div class="mb-3">
+                                            <p class="text-xs font-sans text-copper font-semibold mb-1">
+                                                {format!("Images ({count})")}
+                                            </p>
+                                            <ul class="grid grid-cols-2 gap-2" role="list">
+                                                {entity.media.iter().map(|m| {
+                                                    let alt = format!("{} view", m.kind_label);
+                                                    let aria = format!("{} — opens preview", alt);
+                                                    let content = LightboxContent {
+                                                        url: m.url.clone(),
+                                                        alt: alt.clone(),
+                                                        source_url: m.source_url.clone(),
+                                                    };
+                                                    let lb = lightbox.clone();
+                                                    let on_click = move |_: leptos::ev::MouseEvent| {
+                                                        lb.open(content.clone());
+                                                    };
+                                                    view! {
+                                                        <li>
+                                                            <button
+                                                                class="relative w-full rounded-md overflow-hidden shadow-sm \
+                                                                       ring-1 ring-sepia/10 cursor-pointer \
+                                                                       hover:scale-[1.02] transition-transform"
+                                                                on:click=on_click
+                                                                aria-label=aria
+                                                            >
+                                                                // Loading placeholder (visible until image loads)
+                                                                <div class="w-full aspect-square bg-sepia/10 animate-pulse absolute inset-0"/>
+                                                                <img
+                                                                    src={m.url.clone()}
+                                                                    alt=alt
+                                                                    loading="lazy"
+                                                                    class="w-full aspect-square object-cover relative"
+                                                                />
+                                                                // Date as primary badge (top-left pill)
+                                                                {m.date_label.as_ref().map(|d| view! {
+                                                                    <span class="absolute top-1 left-1 px-1.5 py-0.5 \
+                                                                                 bg-ink/70 text-white text-xs font-sans \
+                                                                                 rounded-full">
+                                                                        {d.clone()}
+                                                                    </span>
+                                                                })}
+                                                                // Kind badge (bottom-right pill)
+                                                                <span class="absolute bottom-1 right-1 px-1.5 py-0.5 \
+                                                                             bg-ink/70 text-white text-xs font-sans \
+                                                                             rounded-full">
+                                                                    {m.kind_label.clone()}
+                                                                </span>
+                                                            </button>
+                                                        </li>
+                                                    }
+                                                }).collect::<Vec<_>>()}
+                                            </ul>
+                                        </div>
+                                    }
                                 })}
 
                                 // Links
-                                {(!entity.links.is_empty()).then(|| view! {
+                                {(!entity.links.is_empty()).then(|| {
+                                    let count = entity.links.len();
+                                    view! {
                                     <div class="mb-3">
-                                        <p class="text-xs font-sans text-copper font-semibold mb-1">"Links"</p>
+                                        <p class="text-xs font-sans text-copper font-semibold mb-1">
+                                            {format!("Links ({count})")}
+                                        </p>
                                         <ul class="text-sm space-y-1">
                                             {entity.links.iter().map(|link| view! {
                                                 <li>
@@ -218,6 +319,7 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                                             }).collect::<Vec<_>>()}
                                         </ul>
                                     </div>
+                                    }
                                 })}
                             </div>
                         }.into_any(),
@@ -259,11 +361,20 @@ struct LinkInfo {
 }
 
 #[derive(Debug, Clone)]
+struct MediaInfo {
+    url: String,
+    source_url: String,
+    kind_label: String,
+    date_label: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct EntityDetailView {
     name: Option<String>,
     entity_type: String,
     transitions: Vec<TransitionSummary>,
     links: Vec<LinkInfo>,
+    media: Vec<MediaInfo>,
 }
 
 /// Return the browser's preferred language prefix (e.g. "en" from "en-US"),
@@ -276,6 +387,7 @@ fn browser_language_prefix() -> String {
 }
 
 use chronoscope_api_client::EntityId;
+use chronoscope_core::AnnotationKind;
 use chronoscope_core::date::{DatePrecision, UncertainDate};
 use chronoscope_core::entity::EntityTransition;
 use chronoscope_core::links::{LinkTarget, LinkType};
@@ -311,11 +423,23 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
         })
         .collect();
 
+    let media = resp
+        .media
+        .iter()
+        .map(|m| MediaInfo {
+            url: m.url.clone(),
+            source_url: m.source_url.clone(),
+            kind_label: format_annotation_kind(&m.annotation_kind),
+            date_label: m.captured.as_ref().map(format_uncertain_date),
+        })
+        .collect();
+
     Ok(EntityDetailView {
         name,
         entity_type,
         transitions,
         links,
+        media,
     })
 }
 
@@ -353,6 +477,16 @@ fn format_uncertain_date(date: &UncertainDate) -> String {
             let latest = date.latest();
             format!("{} \u{2013} {}", dt.format("%Y"), latest.format("%Y"))
         }
+    }
+}
+
+/// Format an annotation kind into a short display label.
+fn format_annotation_kind(kind: &AnnotationKind) -> String {
+    match kind {
+        AnnotationKind::SpatialTrace { .. } => "Spatial".to_string(),
+        AnnotationKind::ExteriorView { .. } => "Exterior".to_string(),
+        AnnotationKind::InteriorView { .. } => "Interior".to_string(),
+        AnnotationKind::TextualNote { .. } => "Note".to_string(),
     }
 }
 

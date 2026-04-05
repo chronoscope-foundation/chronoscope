@@ -13,12 +13,14 @@ pub fn Sidebar() -> impl IntoView {
         view! {
             <div class="flex flex-col h-full">
                 // Wordmark
-                <div class="px-5 pt-6 pb-8">
-                    <A href="/" attr:class="text-xl font-bold tracking-tight" on:click=close_mobile>
+                <div class="px-5 pt-6 pb-3 text-center">
+                    <A href="/" attr:class="font-display text-xl font-bold tracking-[0.12em] text-ink uppercase" on:click=close_mobile>
                         "Chronoscope"
                     </A>
-                    <p class="text-sepia text-xs mt-1 font-sans">"Connecting places through time"</p>
+                    <p class="text-sepia/50 text-[0.625rem] mt-1 font-sans tracking-[0.12em]">"Explore places through time"</p>
                 </div>
+
+                <p class="text-center text-sepia/15 text-[0.5rem] mb-3 tracking-[0.3em]">"\u{2014}\u{00a0}\u{25c6}\u{00a0}\u{2014}"</p>
 
                 // Navigation links
                 <nav class="flex-1 px-3">
@@ -65,7 +67,7 @@ pub fn Sidebar() -> impl IntoView {
                     {move || if mobile_open.get() { "\u{2715}" } else { "\u{2630}" }}
                 </span>
             </button>
-            <A href="/" attr:class="ml-2 text-lg font-bold tracking-tight">
+            <A href="/" attr:class="ml-2 font-display text-lg font-bold tracking-[0.15em] text-ink uppercase">
                 "Chronoscope"
             </A>
         </div>

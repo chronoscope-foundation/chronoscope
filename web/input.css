@@ -12,6 +12,7 @@
 
   --font-serif: "Source Serif 4", Georgia, serif;
   --font-sans: "DM Sans", system-ui, sans-serif;
+  --font-display: "Cormorant", Georgia, serif;
 }
 
 /*
@@ -71,6 +72,12 @@
 
 .prose-chronoscope a:hover {
   color: var(--color-body);
+}
+
+/* Lightbox fade-in animation */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 /* Outbound link indicator: added inline in Leptos templates as

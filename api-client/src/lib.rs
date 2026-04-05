@@ -18,7 +18,10 @@ pub use auth::{
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
 pub use client::{ApiError, AuthClient, AuthError, Client, login, paginate, register};
-pub use entities::{AnnotationSummary, EntityLinkSummary, EntityResponse, EntitySummary};
+pub use entities::{
+    AnnotationSummary, EntityLinkSummary, EntityResponse, EntitySummary, MediaSummary,
+    ThumbnailInfo, ThumbnailsResponse,
+};
 pub use ids::{
     AnnotationId, Email, EntityId, EntityLinkId, MediaId, ResearchUrlId, SourceId, UserId,
 };

@@ -254,6 +254,38 @@ define_queries! {
         LIMIT ?8
     ",
 
+    // All resolved media for a single entity (detail panel).
+    // Joins annotations → research_urls → media to get the full media chain.
+    // Ordered by annotation kind then media ID for stable display order.
+    FIND_MEDIA_BY_ENTITY: "
+        SELECT m.id, m.storage_key, m.media_type, m.width, m.height,
+               m.captured_meta, a.kind_json, r.url as source_url
+        FROM annotations a
+        JOIN research_urls r ON a.url_id = r.id
+        JOIN media m ON r.media_id = m.id
+        WHERE a.entity_id = ?
+        ORDER BY a.kind, m.id
+    ",
+
+    // First thumbnail per entity for a batch of entity IDs (map markers).
+    // Uses MIN(m.id) in a correlated subquery to deterministically pick
+    // one media per entity (the earliest-inserted media item).
+    // Parameter ?1 is a JSON array of entity ID strings.
+    FIND_THUMBNAILS_FOR_ENTITIES: "
+        SELECT a.entity_id, m.storage_key, m.width, m.height
+        FROM annotations a
+        JOIN research_urls r ON a.url_id = r.id
+        JOIN media m ON r.media_id = m.id
+        WHERE a.entity_id IN (SELECT value FROM json_each(?1))
+          AND m.id = (
+            SELECT MIN(m2.id)
+            FROM annotations a2
+            JOIN research_urls r2 ON a2.url_id = r2.id
+            JOIN media m2 ON r2.media_id = m2.id
+            WHERE a2.entity_id = a.entity_id
+          )
+    ",
+
 }
 
 #[cfg(test)]

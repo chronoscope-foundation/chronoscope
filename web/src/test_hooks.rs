@@ -119,6 +119,15 @@ pub fn register_map_hooks(
         Closure::<dyn Fn() -> f64>::new(move || with_map(&h, marker_count).unwrap_or(0.0)),
     );
 
+    let h = map_handle.clone();
+    register(
+        &obj,
+        "thumbnailMarkerCount",
+        Closure::<dyn Fn() -> f64>::new(move || {
+            with_map(&h, thumbnail_marker_count).unwrap_or(0.0)
+        }),
+    );
+
     // Map actions
     let h = map_handle.clone();
     register(
@@ -163,6 +172,12 @@ pub fn register_map_hooks(
         &obj,
         "waitForMapIdle",
         Closure::<dyn Fn() -> JsValue>::new(move || wait_for_map_idle(&h)),
+    );
+
+    register(
+        &obj,
+        "waitForThumbnailsLoaded",
+        Closure::<dyn Fn() -> JsValue>::new(move || wait_for_thumbnails_loaded()),
     );
 
     let _ = js_sys::Reflect::set(&window, &"__test".into(), &obj);
@@ -319,6 +334,15 @@ fn wait_for_fetch_complete() -> JsValue {
     .into()
 }
 
+/// Returns a Promise that resolves on the next `chronoscope-thumbnails-loaded`.
+fn wait_for_thumbnails_loaded() -> JsValue {
+    use crate::components::map::THUMBNAILS_LOADED_EVENT;
+    js_sys::Promise::new(&mut |resolve, _reject| {
+        listen_once_and_resolve(THUMBNAILS_LOADED_EVENT, resolve);
+    })
+    .into()
+}
+
 /// Returns a Promise that resolves when the map becomes idle.
 fn wait_for_map_idle(handle: &Rc<RefCell<Option<maplibre::Map>>>) -> JsValue {
     let mut map = handle.borrow().as_ref().cloned();
@@ -374,9 +398,21 @@ fn listen_once_and_resolve(event_name: &str, resolve: js_sys::Function) {
 // ==================== Map helpers ====================
 
 fn marker_count(map: &maplibre::Map) -> f64 {
+    use crate::components::map::{ENTITY_CIRCLES_LAYER, ENTITY_THUMBNAILS_LAYER};
     let opts = js_sys::Object::new();
     let layers = js_sys::Array::new();
-    layers.push(&"entity-circles".into());
+    layers.push(&ENTITY_CIRCLES_LAYER.into());
+    layers.push(&ENTITY_THUMBNAILS_LAYER.into());
+    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
+    map.query_rendered_features(&JsValue::UNDEFINED, &opts)
+        .length() as f64
+}
+
+fn thumbnail_marker_count(map: &maplibre::Map) -> f64 {
+    use crate::components::map::ENTITY_THUMBNAILS_LAYER;
+    let opts = js_sys::Object::new();
+    let layers = js_sys::Array::new();
+    layers.push(&ENTITY_THUMBNAILS_LAYER.into());
     let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
     map.query_rendered_features(&JsValue::UNDEFINED, &opts)
         .length() as f64

@@ -59,6 +59,28 @@ extern "C" {
     /// `options` is a JS object like `{ layers: ["entity-circles"] }`.
     #[wasm_bindgen(method, js_name = queryRenderedFeatures)]
     pub fn query_rendered_features(this: &Map, point: &JsValue, options: &JsValue) -> Array;
+
+    /// Add an image to the map's style for use as an icon in symbol layers.
+    /// `image` can be an `HTMLImageElement`, `ImageData`, or `ImageBitmap`.
+    #[wasm_bindgen(method, js_name = addImage, catch)]
+    pub fn add_image(this: &Map, id: &str, image: &JsValue) -> Result<(), JsValue>;
+
+    /// Add an image with options (e.g., `{ pixelRatio: 2 }` for Retina).
+    #[wasm_bindgen(method, js_name = addImage, catch)]
+    pub fn add_image_with_options(
+        this: &Map,
+        id: &str,
+        image: &JsValue,
+        options: &JsValue,
+    ) -> Result<(), JsValue>;
+
+    /// Check if an image with the given ID has been added to the map style.
+    #[wasm_bindgen(method, js_name = hasImage)]
+    pub fn has_image(this: &Map, id: &str) -> bool;
+
+    /// Remove a previously added image from the map style.
+    #[wasm_bindgen(method, js_name = removeImage, catch)]
+    pub fn remove_image(this: &Map, id: &str) -> Result<(), JsValue>;
 }
 
 #[wasm_bindgen]

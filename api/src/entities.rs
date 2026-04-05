@@ -1,5 +1,6 @@
 //! Entity API endpoints.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::NaiveDateTime;
@@ -117,7 +118,7 @@ pub async fn get_entity(
     let state = ctx.context();
     let id = &path.into_inner().id;
 
-    let (entity_opt, links, annotations) = tokio::try_join!(
+    let (entity_opt, links, annotations, media) = tokio::try_join!(
         async { state.db.find_entity_by_id(id).await.map_err(db_err) },
         async { state.db.find_entity_links(id).await.map_err(db_err) },
         async {
@@ -127,11 +128,13 @@ pub async fn get_entity(
                 .await
                 .map_err(db_err)
         },
+        async { state.db.find_media_by_entity(id).await.map_err(db_err) },
     )?;
 
     let entity =
         entity_opt.ok_or_else(|| HttpError::for_not_found(None, "Entity not found".to_string()))?;
 
+    let cdn_base = &state.config.cdn_base_url;
     let detail = EntityResponse {
         id: entity.id,
         created_at: entity.created_at,
@@ -145,10 +148,74 @@ pub async fn get_entity(
             .into_iter()
             .map(entity_types::annotation_summary)
             .collect(),
+        media: media
+            .into_iter()
+            .map(|m| entity_types::media_summary(m, cdn_base))
+            .collect(),
     };
 
     json_with_cors(&detail)
 }
+
+// ==================== Thumbnails ====================
+
+/// Query parameters for the batch thumbnails endpoint.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThumbnailsQuery {
+    /// Comma-separated entity IDs.
+    pub ids: String,
+}
+
+/// Get representative thumbnails for a batch of entities.
+///
+/// Returns one thumbnail per entity (the first resolved media found).
+/// Entities without any resolved media are omitted from the response.
+#[endpoint {
+    method = GET,
+    path = "/entity-thumbnails",
+}]
+pub async fn get_entity_thumbnails(
+    ctx: RequestContext<Arc<AppState>>,
+    query: Query<ThumbnailsQuery>,
+) -> Result<Response<Body>, HttpError> {
+    let state = ctx.context();
+    let ids_str = query.into_inner().ids;
+
+    let ids: Vec<&str> = ids_str.split(',').filter(|s| !s.is_empty()).collect();
+
+    if ids.len() > limits::ENTITY_LIST_MAX_PAGE_SIZE as usize {
+        return error_with_cors(
+            http::StatusCode::BAD_REQUEST,
+            &format!(
+                "Too many IDs ({}, max {})",
+                ids.len(),
+                limits::ENTITY_LIST_MAX_PAGE_SIZE
+            ),
+        );
+    }
+
+    let ids_json = serde_json::to_string(&ids)
+        .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize IDs: {e}")))?;
+
+    let thumbnails = state
+        .db
+        .find_thumbnails_for_entities(&ids_json)
+        .await
+        .map_err(db_err)?;
+
+    let cdn_base = &state.config.cdn_base_url;
+    let thumbnails_map: HashMap<EntityId, entity_types::ThumbnailInfo> = thumbnails
+        .into_iter()
+        .map(|t| entity_types::thumbnail_entry(t, cdn_base))
+        .collect();
+
+    let response = chronoscope_api_client::ThumbnailsResponse {
+        thumbnails: thumbnails_map,
+    };
+    json_with_cors(&response)
+}
+
+// ==================== CORS Preflight ====================
 
 /// CORS preflight for entity endpoints.
 #[endpoint {
@@ -169,6 +236,17 @@ pub async fn entities_options(
 pub async fn entity_options(
     _ctx: RequestContext<Arc<AppState>>,
     _path: dropshot::Path<EntityIdPath>,
+) -> Result<Response<Body>, HttpError> {
+    cors_preflight()
+}
+
+/// CORS preflight for thumbnails endpoint.
+#[endpoint {
+    method = OPTIONS,
+    path = "/entity-thumbnails",
+}]
+pub async fn thumbnails_options(
+    _ctx: RequestContext<Arc<AppState>>,
 ) -> Result<Response<Body>, HttpError> {
     cors_preflight()
 }
