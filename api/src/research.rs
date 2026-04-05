@@ -170,7 +170,8 @@ fn build_dossier(
         url: data.research_url.url,
         status: data.research_url.status,
         created_at: data.research_url.created_at,
-        analysis: UrlAnalysis::default(), // TODO: populate from analysis tables
+        // TODO: populate from analysis tables
+        analysis: UrlAnalysis::pending(),
         resolved,
     })
 }

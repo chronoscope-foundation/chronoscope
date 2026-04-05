@@ -11,7 +11,7 @@ use url::Url;
 /// Note: This struct intentionally does not include `source_type`. The source type
 /// is determined by which integration produced the content, not self-reported by
 /// the content itself. This prevents integrations from misrepresenting their origin.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FetchedContent {
     /// Title of the content (e.g., post title, page title).
     pub title: Option<String>,

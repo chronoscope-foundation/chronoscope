@@ -39,13 +39,10 @@ pub struct ImageSource<E> {
 }
 
 /// Metadata about the ingestion process.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct IngestionNotes {
-    #[serde(default)]
     pub conflicts_found: Vec<String>,
-    #[serde(default)]
     pub additional_research_needed: Vec<String>,
-    #[serde(default)]
     pub search_queries_used: Vec<String>,
 }
 
@@ -61,21 +58,16 @@ pub struct IngestionNotes {
 ))]
 pub struct IngestionBundle<E, S, L> {
     pub entities: BTreeMap<E, Entity<E, S>>,
-    #[serde(default)]
     pub images: BTreeMap<S, ImageSource<E>>,
-    #[serde(default)]
     pub external_links: BTreeMap<L, ExternalLink>,
 
     /// Maps entity key to link keys.
-    #[serde(default)]
     pub entity_links: BTreeMap<E, Vec<L>>,
 
     /// Relationships between entities.
-    #[serde(default)]
     pub entity_relations: Vec<EntityRelation<E, S>>,
 
     /// Annotations connecting entities to sources.
-    #[serde(default)]
     pub annotations: Vec<Annotation<S, E>>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,7 +75,8 @@ pub struct IngestionBundle<E, S, L> {
 }
 
 impl<E: Ord, S: Ord, L: Ord> IngestionBundle<E, S, L> {
-    /// Create an empty bundle.
+    /// Create an empty bundle for incremental population.
+    #[allow(clippy::new_without_default)] // Default omitted: empty collections are indistinguishable from missing data
     pub fn new() -> Self {
         Self {
             entities: BTreeMap::new(),
@@ -233,12 +226,6 @@ impl<E: Ord + Clone, S: Ord + Clone, L: Ord + Clone> IngestionBundle<E, S, L> {
         } else {
             Err(errors)
         }
-    }
-}
-
-impl<E: Ord, S: Ord, L: Ord> Default for IngestionBundle<E, S, L> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

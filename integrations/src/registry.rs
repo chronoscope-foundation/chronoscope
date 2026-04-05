@@ -136,7 +136,14 @@ mod tests {
             _http: &dyn HttpClient,
             _url: &Url,
         ) -> Result<FetchedContent, FetchError> {
-            Ok(FetchedContent::default())
+            Ok(FetchedContent {
+                title: None,
+                author: None,
+                published_at: None,
+                content: None,
+                media: Vec::new(),
+                discovered_urls: Vec::new(),
+            })
         }
     }
 

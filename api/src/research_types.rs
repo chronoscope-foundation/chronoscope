@@ -18,11 +18,10 @@ pub use chronoscope_analysis::AnalysisResult;
 // ==================== Analysis Outcome (Generic) ====================
 
 /// Outcome of an analysis stage.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AnalysisOutcome<T> {
     /// Analysis not yet attempted
-    #[default]
     Pending,
     /// Analysis currently running
     InProgress,
@@ -51,7 +50,7 @@ pub struct DeepResearchResults {}
 // ==================== Analysis Progress ====================
 
 /// Per-media analysis stages.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MediaAnalysis {
     /// Image analysis (segmentation + VLM + embeddings).
     pub analysis: AnalysisOutcome<AnalysisResult>,
@@ -59,7 +58,7 @@ pub struct MediaAnalysis {
 }
 
 /// Rollup counts across all media items for a URL.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MediaAnalysisCounts {
     /// Total media items referenced
     pub total: u32,
@@ -70,13 +69,37 @@ pub struct MediaAnalysisCounts {
     pub reverse_image_search: u32,
 }
 
+impl MediaAnalysisCounts {
+    /// All counters at zero — no media has been processed yet.
+    #[must_use]
+    pub const fn zeros() -> Self {
+        Self {
+            total: 0,
+            fetched: 0,
+            analyzed: 0,
+            reverse_image_search: 0,
+        }
+    }
+}
+
 /// URL-level analysis progress.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct UrlAnalysis {
     /// Rollup of per-media analysis stages
     pub media: MediaAnalysisCounts,
     /// Deep research results
     pub deep_research: AnalysisOutcome<DeepResearchResults>,
+}
+
+impl UrlAnalysis {
+    /// Initial state for a research URL before any analysis begins.
+    #[must_use]
+    pub const fn pending() -> Self {
+        Self {
+            media: MediaAnalysisCounts::zeros(),
+            deep_research: AnalysisOutcome::Pending,
+        }
+    }
 }
 
 // ==================== Summary Types (for list endpoints) ====================
@@ -120,7 +143,7 @@ impl From<ResearchUrl> for ResearchUrlSummary {
             url: u.url,
             status: u.status,
             thumbnail_url: None,
-            analysis: UrlAnalysis::default(),
+            analysis: UrlAnalysis::pending(),
             created_at: u.created_at,
         }
     }
