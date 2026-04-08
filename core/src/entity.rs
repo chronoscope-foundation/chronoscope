@@ -216,19 +216,65 @@ pub type DateRange<'a, S> = (
     Option<&'a Cited<UncertainDate, S>>,
 );
 
+/// The phase of an entity's lifecycle that a transition belongs to.
+///
+/// This defines the canonical order in which transitions should be presented
+/// to a user, *independent of dates*. Construction always precedes mid-life
+/// events, which always precede demolition — regardless of which dates the
+/// underlying data happens to know. This lets a timeline render in a sensible
+/// order even when key dates are missing (e.g. a building whose construction
+/// date is unknown but whose demolition date is recorded), and gives clients
+/// a single source of truth for "what phase is this transition in" instead of
+/// each client re-deriving it from variant names.
+///
+/// When the dates *do* contradict the phase ordering (e.g. a `UsageModified`
+/// dated earlier than a `Constructed`'s `completed_at`), that's a data
+/// inconsistency surfaced separately by
+/// [`crate::consistency::ConsistencyWarning::EventsOutOfOrder`] — the display
+/// still uses the canonical phase order rather than papering over it.
+///
+/// The numeric ordering is part of the contract: variants are declared in
+/// chronological lifecycle order so `derive(Ord)` produces the right sort.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LifecyclePhase {
+    /// The entity comes into existence: `Constructed`.
+    Construction,
+    /// The entity exists and undergoes change: `Modified`, `Repaired`,
+    /// `Damaged`, `Moved`, `UsageModified`, `Designated`.
+    Middle,
+    /// The entity ceases to exist: `Demolished`.
+    Demolition,
+}
+
 impl<E, S> EntityTransition<E, S> {
-    /// The primary event date (`started_at` for durational transitions, `occurred_at` for point events).
+    /// The earliest cited date known for this transition, across all of its
+    /// date fields. Returns `None` only when no dates are set at all.
+    ///
+    /// Relies on the domain invariant that `started_at ≤ completed_at` for
+    /// durational transitions; violations are surfaced separately by
+    /// [`crate::consistency::ConsistencyWarning::CompletionBeforeStart`].
     #[must_use]
-    pub fn event_date(&self) -> Option<&Cited<UncertainDate, S>> {
+    pub fn earliest_known_date(&self) -> Option<&Cited<UncertainDate, S>> {
+        let (start, end) = self.date_range();
+        start.or(end)
+    }
+
+    /// Which phase of the entity's lifecycle this transition belongs to.
+    ///
+    /// See [`LifecyclePhase`] for the rationale: this is the canonical
+    /// ordering primitive for presenting transitions to a user, independent
+    /// of any dates the data may or may not know.
+    #[must_use]
+    pub fn lifecycle_phase(&self) -> LifecyclePhase {
         match self {
-            Self::Constructed { started_at, .. }
-            | Self::Modified { started_at, .. }
-            | Self::Repaired { started_at, .. }
-            | Self::Demolished { started_at, .. } => started_at.as_ref(),
-            Self::Damaged { occurred_at, .. }
-            | Self::Moved { occurred_at, .. }
-            | Self::UsageModified { occurred_at, .. }
-            | Self::Designated { occurred_at, .. } => occurred_at.as_ref(),
+            Self::Constructed { .. } => LifecyclePhase::Construction,
+            Self::Modified { .. }
+            | Self::Repaired { .. }
+            | Self::Damaged { .. }
+            | Self::Moved { .. }
+            | Self::UsageModified { .. }
+            | Self::Designated { .. } => LifecyclePhase::Middle,
+            Self::Demolished { .. } => LifecyclePhase::Demolition,
         }
     }
 
@@ -295,4 +341,116 @@ pub struct EntityRelation<E, S> {
     pub to_entity: E,
     pub relation_type: EntityRelationType,
     pub evidence: Vec<crate::evidence::Evidence<S>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::evidence::Cited;
+    use chrono::NaiveDate;
+
+    type T = EntityTransition<(), ()>;
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn d(year: i32) -> Result<Cited<UncertainDate, ()>, Box<dyn std::error::Error>> {
+        let dt = NaiveDate::from_ymd_opt(year, 1, 1)
+            .ok_or("invalid date")?
+            .and_hms_opt(0, 0, 0)
+            .ok_or("invalid time")?;
+        Ok(Cited::uncited(UncertainDate::exact(dt)?))
+    }
+
+    /// Pin the four meaningful date-field combinations on a durational
+    /// variant (`Constructed` is representative) plus the present/absent pair
+    /// for a point variant. The lossy `event_date` predecessor returned
+    /// `started_at` only and silently dropped `(None, Some)` durational
+    /// cases — the regression guard is the `(None, Some)` row below.
+    #[test]
+    fn earliest_known_date() -> TestResult {
+        let cases: Vec<(&str, T, Option<i32>)> = vec![
+            (
+                "Constructed: both unknown",
+                T::Constructed {
+                    started_at: None,
+                    completed_at: None,
+                    location: None,
+                    trigger_event: None,
+                },
+                None,
+            ),
+            (
+                "Constructed: started only",
+                T::Constructed {
+                    started_at: Some(d(1900)?),
+                    completed_at: None,
+                    location: None,
+                    trigger_event: None,
+                },
+                Some(1900),
+            ),
+            (
+                "Constructed: completed only — regression case",
+                T::Constructed {
+                    started_at: None,
+                    completed_at: Some(d(1889)?),
+                    location: None,
+                    trigger_event: None,
+                },
+                Some(1889),
+            ),
+            (
+                "Constructed: both — started wins by domain invariant",
+                T::Constructed {
+                    started_at: Some(d(1880)?),
+                    completed_at: Some(d(1889)?),
+                    location: None,
+                    trigger_event: None,
+                },
+                Some(1880),
+            ),
+            (
+                "UsageModified: present",
+                T::UsageModified {
+                    occurred_at: Some(d(1888)?),
+                    new_usages: Default::default(),
+                    description: None,
+                    trigger_event: None,
+                },
+                Some(1888),
+            ),
+            (
+                "UsageModified: absent",
+                T::UsageModified {
+                    occurred_at: None,
+                    new_usages: Default::default(),
+                    description: None,
+                    trigger_event: None,
+                },
+                None,
+            ),
+        ];
+
+        for (desc, t, expected_year) in cases {
+            let got = t
+                .earliest_known_date()
+                .map(|c| c.value.earliest().date().format("%Y").to_string());
+            let want = expected_year.map(|y| y.to_string());
+            assert_eq!(got, want, "{desc}");
+        }
+        Ok(())
+    }
+
+    /// `LifecyclePhase`'s `Ord` impl is the contract that any client (web,
+    /// iOS, …) sorting by `lifecycle_phase()` depends on, so an accidental
+    /// reorder of the enum variants — which is what defines the order via
+    /// `derive(Ord)` — would silently break canonical timeline ordering
+    /// across every client. Pin it here. The per-variant mapping itself is
+    /// just a `match` and not worth restating in a test; the user-visible
+    /// behavior is exercised by the web tests in `dev/tests/web.rs`.
+    #[test]
+    fn lifecycle_phase_is_ordered_construction_then_middle_then_demolition() {
+        use LifecyclePhase::*;
+        assert!(Construction < Middle);
+        assert!(Middle < Demolition);
+    }
 }

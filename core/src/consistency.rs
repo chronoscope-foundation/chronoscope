@@ -109,7 +109,7 @@ fn check_date_ordering<S>(
 }
 
 fn get_event_date<E, S>(transition: &EntityTransition<E, S>) -> Option<NaiveDateTime> {
-    transition.event_date().map(|c| c.value.earliest())
+    transition.earliest_known_date().map(|c| c.value.earliest())
 }
 
 fn check_chronological_order<E, S>(
@@ -410,6 +410,45 @@ mod tests {
                 .iter()
                 .any(|w| matches!(w, ConsistencyWarning::EventsOutOfOrder { .. })),
             "Should detect events listed out of chronological order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn event_after_demolished_with_only_completed_at() -> TestResult {
+        // A `Modified` event whose only known date is `completed_at` (year
+        // 2010) listed after a `Demolished` at 2000 must trigger
+        // `EventAfterDemolished`. The previous `event_date()` helper returned
+        // `started_at` only and silently skipped this transition from the
+        // check, masking the violation.
+        let entity: TestEntity = Entity {
+            entity_type: EntityType::Building,
+            names: vec![],
+            transitions: vec![
+                EntityTransition::Demolished {
+                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2000, 1, 1)?)?)),
+                    completed_at: None,
+                    cause: None,
+                    trigger_event: None,
+                },
+                EntityTransition::Modified {
+                    started_at: None,
+                    completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(
+                        2010, 1, 1,
+                    )?)?)),
+                    description: None,
+                    trigger_event: None,
+                },
+            ],
+        };
+
+        let warnings = entity.check_consistency();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| matches!(w, ConsistencyWarning::EventAfterDemolished { .. })),
+            "modified completed_at=2010 after demolished=2000 should fire \
+             EventAfterDemolished"
         );
         Ok(())
     }

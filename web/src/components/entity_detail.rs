@@ -211,21 +211,36 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                                 </p>
 
                                 // Timeline
-                                {(!entity.transitions.is_empty()).then(|| {
-                                    let count = entity.transitions.len();
+                                {(!entity.timeline.is_empty()).then(|| {
+                                    let count = entity.timeline.len();
                                     view! {
                                     <div class="mb-3">
                                         <p class="text-xs font-sans text-copper font-semibold mb-1">
                                             {format!("Timeline ({count})")}
                                         </p>
                                         <ul class="text-sm text-sepia space-y-1.5">
-                                            {entity.transitions.iter().map(|t| view! {
-                                                <li class="pl-2 border-l-2 border-copper/30">
-                                                    <span class="font-semibold capitalize">{t.transition_type.clone()}</span>
-                                                    {t.date.as_ref().map(|d| view! {
-                                                        <span class="text-sepia/70">{format!(" \u{2014} {d}")}</span>
-                                                    })}
-                                                </li>
+                                            {entity.timeline.iter().map(|r| {
+                                                let date_view = match r.date.as_ref() {
+                                                    Some(d) => view! {
+                                                        <span class="text-sepia/70">
+                                                            {format!(" \u{2014} {}", format_uncertain_date(d))}
+                                                        </span>
+                                                    }.into_any(),
+                                                    None => view! {
+                                                        <span class="text-sepia/40 italic">
+                                                            " \u{2014} date unknown"
+                                                        </span>
+                                                    }.into_any(),
+                                                };
+                                                view! {
+                                                    <li class="pl-2 border-l-2 border-copper/30">
+                                                        <span class="font-semibold">{r.label}</span>
+                                                        {date_view}
+                                                        {r.description.as_ref().map(|desc| view! {
+                                                            <p class="text-xs text-sepia/70 mt-0.5">{desc.clone()}</p>
+                                                        })}
+                                                    </li>
+                                                }
                                             }).collect::<Vec<_>>()}
                                         </ul>
                                     </div>
@@ -348,10 +363,30 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
 
 // ==================== Lightweight detail types ====================
 
+/// One row in the rendered entity timeline.
+///
+/// A single `EntityTransition` may produce one or two rows: a `Constructed`
+/// with both `started_at` and `completed_at` becomes "Construction started"
+/// and "Construction completed" as distinct rows, each with its own date and
+/// sort position.
+///
+/// We hold an `UncertainDate` rather than a pre-formatted string so the
+/// renderer can decide presentation (precision, range collapsing) at the
+/// point of use, and so the sort key derives from the same value the
+/// renderer displays.
 #[derive(Debug, Clone)]
-struct TransitionSummary {
-    transition_type: String,
-    date: Option<String>,
+struct TimelineRow {
+    label: &'static str,
+    /// `None` when the date is unknown. Rendered as "date unknown".
+    date: Option<UncertainDate>,
+    /// Optional secondary text shown beneath the row (e.g. the description
+    /// on `UsageModified` or `Modified`).
+    description: Option<String>,
+    /// Canonical lifecycle phase, propagated from
+    /// [`EntityTransition::lifecycle_phase`]. The primary sort key for the
+    /// timeline so that, e.g., a `Constructed` with no known date still
+    /// renders before a dated `Demolished` for the same entity.
+    phase: LifecyclePhase,
 }
 
 #[derive(Debug, Clone)]
@@ -372,7 +407,7 @@ struct MediaInfo {
 struct EntityDetailView {
     name: Option<String>,
     entity_type: String,
-    transitions: Vec<TransitionSummary>,
+    timeline: Vec<TimelineRow>,
     links: Vec<LinkInfo>,
     media: Vec<MediaInfo>,
 }
@@ -388,8 +423,9 @@ fn browser_language_prefix() -> String {
 
 use chronoscope_api_client::EntityId;
 use chronoscope_core::AnnotationKind;
+use chronoscope_core::Cited;
 use chronoscope_core::date::{DatePrecision, UncertainDate};
-use chronoscope_core::entity::EntityTransition;
+use chronoscope_core::entity::{EntityTransition, LifecyclePhase};
 use chronoscope_core::links::{LinkTarget, LinkType};
 
 /// Fetch entity detail using the typed API client.
@@ -407,12 +443,19 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
 
     let entity_type = resp.entity.entity_type.to_string();
 
-    let transitions = resp
+    // Sort by lifecycle phase first, then by date within a phase (undated
+    // rows pinned to the end of their phase). Phase-first means a Constructed
+    // with no known date still renders before a dated Demolished.
+    let mut timeline: Vec<TimelineRow> = resp
         .entity
         .transitions
         .iter()
-        .map(format_transition)
+        .flat_map(decode_transition)
         .collect();
+    timeline.sort_by_key(|r| {
+        let earliest = r.date.as_ref().map(UncertainDate::earliest);
+        (r.phase, earliest.is_none(), earliest)
+    });
 
     let links = resp
         .links
@@ -437,24 +480,173 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
     Ok(EntityDetailView {
         name,
         entity_type,
-        transitions,
+        timeline,
         links,
         media,
     })
 }
 
-/// Extract a display-friendly transition type name from the enum variant.
-/// Format a typed transition into a display summary.
-fn format_transition(
+/// Decode a typed transition into one or two timeline rows.
+///
+/// Pattern-matches exhaustively on `EntityTransition` so that adding a new
+/// variant in core, or a new date field on an existing variant, is a compile
+/// error here rather than a silent display dropout. Durational variants
+/// (`Constructed`, `Modified`, `Repaired`, `Demolished`) emit two rows when
+/// both `started_at` and `completed_at` are present, one row when only one is
+/// present, and one dateless row when neither is. Point-event variants always
+/// emit a single row.
+fn decode_transition(
     t: &EntityTransition<EntityId, chronoscope_api_client::SourceId>,
-) -> TransitionSummary {
-    let transition_type = t.as_ref().replace('_', " ");
-    let date = t
-        .event_date()
-        .map(|cited| format_uncertain_date(&cited.value));
-    TransitionSummary {
-        transition_type,
-        date,
+) -> Vec<TimelineRow> {
+    let phase = t.lifecycle_phase();
+
+    fn d<S>(c: &Cited<UncertainDate, S>) -> UncertainDate {
+        c.value.clone()
+    }
+
+    /// Build the rows for a durational transition. Each known endpoint
+    /// produces its own row labeled for that endpoint; if neither is known we
+    /// fall back to a single dateless row labeled with the bare verb (there's
+    /// nothing to disambiguate).
+    fn durational<S>(
+        phase: LifecyclePhase,
+        bare: &'static str,
+        started: &'static str,
+        completed: &'static str,
+        started_at: Option<&Cited<UncertainDate, S>>,
+        completed_at: Option<&Cited<UncertainDate, S>>,
+        description: Option<String>,
+    ) -> Vec<TimelineRow> {
+        let endpoints: [(&'static str, Option<&Cited<UncertainDate, S>>); 2] =
+            [(started, started_at), (completed, completed_at)];
+        let rows: Vec<TimelineRow> = endpoints
+            .into_iter()
+            .filter_map(|(label, cited)| {
+                cited.map(|c| TimelineRow {
+                    label,
+                    date: Some(d(c)),
+                    description: description.clone(),
+                    phase,
+                })
+            })
+            .collect();
+        if rows.is_empty() {
+            vec![TimelineRow {
+                label: bare,
+                date: None,
+                description,
+                phase,
+            }]
+        } else {
+            rows
+        }
+    }
+
+    match t {
+        EntityTransition::Constructed {
+            started_at,
+            completed_at,
+            location: _,
+            trigger_event: _,
+        } => durational(
+            phase,
+            "Constructed",
+            "Construction started",
+            "Construction completed",
+            started_at.as_ref(),
+            completed_at.as_ref(),
+            None,
+        ),
+        EntityTransition::Modified {
+            started_at,
+            completed_at,
+            description,
+            trigger_event: _,
+        } => durational(
+            phase,
+            "Modified",
+            "Modification started",
+            "Modification completed",
+            started_at.as_ref(),
+            completed_at.as_ref(),
+            description.clone(),
+        ),
+        EntityTransition::Repaired {
+            started_at,
+            completed_at,
+            description,
+            trigger_event: _,
+        } => durational(
+            phase,
+            "Repaired",
+            "Repair started",
+            "Repair completed",
+            started_at.as_ref(),
+            completed_at.as_ref(),
+            description.clone(),
+        ),
+        EntityTransition::Demolished {
+            started_at,
+            completed_at,
+            cause,
+            trigger_event: _,
+        } => durational(
+            phase,
+            "Demolished",
+            "Demolition started",
+            "Demolition completed",
+            started_at.as_ref(),
+            completed_at.as_ref(),
+            cause.clone(),
+        ),
+        EntityTransition::Damaged {
+            occurred_at,
+            cause: _,
+            description,
+            trigger_event: _,
+        } => vec![TimelineRow {
+            label: "Damaged",
+            date: occurred_at.as_ref().map(d),
+            description: description.clone(),
+            phase,
+        }],
+        EntityTransition::Moved {
+            occurred_at,
+            location: _,
+            cause,
+            method: _,
+            trigger_event: _,
+        } => vec![TimelineRow {
+            label: "Moved",
+            date: occurred_at.as_ref().map(d),
+            description: cause.clone(),
+            phase,
+        }],
+        EntityTransition::UsageModified {
+            occurred_at,
+            new_usages: _,
+            description,
+            trigger_event: _,
+        } => vec![TimelineRow {
+            label: "Usage modified",
+            date: occurred_at.as_ref().map(d),
+            description: description.clone(),
+            phase,
+        }],
+        EntityTransition::Designated {
+            occurred_at,
+            designation,
+            description,
+            trigger_event: _,
+        } => vec![TimelineRow {
+            label: "Designated",
+            date: occurred_at.as_ref().map(d),
+            description: Some(match description {
+                Some(extra) => format!("{designation} \u{2014} {extra}"),
+                None => designation.clone(),
+            }),
+            phase,
+        }],
     }
 }
 

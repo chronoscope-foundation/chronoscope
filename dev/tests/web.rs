@@ -995,6 +995,23 @@ async fn test_entity_click_opens_detail() -> TestResult {
             format!("Panel should show timeline section, got: {panel_text}"),
         )?;
 
+        // Hagia Sophia's Constructed has only `completed_at` (year 0537).
+        // The year must reach the panel and be labeled as the completion
+        // endpoint, not the bare verb.
+        check(
+            panel_text.contains("537"),
+            format!(
+                "Panel should show Hagia Sophia's construction completion year 537, got: {panel_text}"
+            ),
+        )?;
+        check(
+            panel_text.contains("Construction completed"),
+            format!(
+                "Panel should label Hagia Sophia's dated construction row as \
+                 'Construction completed' (not the bare 'Constructed'), got: {panel_text}"
+            ),
+        )?;
+
         // Verify links section — entity has Wikidata links
         check(
             panel_text.contains("Links")
@@ -1047,6 +1064,35 @@ async fn test_disambiguation_picker() -> TestResult {
         check(
             !detail_text.contains("Multiple entities") && detail_text.len() > 20,
             format!("Should show entity detail after picker selection, got: {detail_text}"),
+        )?;
+
+        // The first picker entry is v1 Chioggia (earliest_date = 1623, the
+        // demolition year): a dateless `Constructed` plus `Demolished
+        // completed 1623-12-26`. The dateless Constructed must still render
+        // *before* the dated Demolished — lifecycle phase order, not date
+        // order.
+        check(
+            detail_text.contains("date unknown"),
+            format!(
+                "v1 Chioggia Cathedral should surface its dateless Constructed \
+                 row as 'date unknown', got: {detail_text}"
+            ),
+        )?;
+        let constructed_pos = detail_text.find("Constructed").ok_or_else(|| {
+            format!("Expected a Constructed row in v1 Chioggia detail, got: {detail_text}")
+        })?;
+        let demolition_pos = detail_text.find("Demolition completed").ok_or_else(|| {
+            format!(
+                "Expected a 'Demolition completed' row in v1 Chioggia detail, got: {detail_text}"
+            )
+        })?;
+        check(
+            constructed_pos < demolition_pos,
+            format!(
+                "v1 Chioggia Cathedral timeline should render 'Constructed' \
+                 (dateless) before 'Demolition completed 1623-12-26' — \
+                 lifecycle phase order, not date order. Got: {detail_text}"
+            ),
         )?;
 
         t.screenshot("test_disambiguation_picker_detail").await?;

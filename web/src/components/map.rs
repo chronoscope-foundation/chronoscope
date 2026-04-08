@@ -139,7 +139,13 @@ fn build_geojson(
 
         let geometry = Geometry::new(Value::Point(vec![first.longitude, first.latitude]));
 
-        let entries: Vec<EntityPickerEntry> = group
+        // Sort co-located entities by earliest_date (undated last) so the
+        // disambiguation picker is in temporal order, not the API's
+        // updated_at default.
+        let mut sorted_group: Vec<&api::EntitySummary> = group.clone();
+        sorted_group.sort_by_key(|e| (e.earliest_date.is_none(), e.earliest_date));
+
+        let entries: Vec<EntityPickerEntry> = sorted_group
             .iter()
             .map(|e| EntityPickerEntry {
                 id: e.id.to_string(),
