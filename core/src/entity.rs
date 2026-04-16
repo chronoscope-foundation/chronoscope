@@ -216,36 +216,6 @@ pub type DateRange<'a, S> = (
     Option<&'a Cited<UncertainDate, S>>,
 );
 
-/// The phase of an entity's lifecycle that a transition belongs to.
-///
-/// This defines the canonical order in which transitions should be presented
-/// to a user, *independent of dates*. Construction always precedes mid-life
-/// events, which always precede demolition — regardless of which dates the
-/// underlying data happens to know. This lets a timeline render in a sensible
-/// order even when key dates are missing (e.g. a building whose construction
-/// date is unknown but whose demolition date is recorded), and gives clients
-/// a single source of truth for "what phase is this transition in" instead of
-/// each client re-deriving it from variant names.
-///
-/// When the dates *do* contradict the phase ordering (e.g. a `UsageModified`
-/// dated earlier than a `Constructed`'s `completed_at`), that's a data
-/// inconsistency surfaced separately by
-/// [`crate::consistency::ConsistencyWarning::EventsOutOfOrder`] — the display
-/// still uses the canonical phase order rather than papering over it.
-///
-/// The numeric ordering is part of the contract: variants are declared in
-/// chronological lifecycle order so `derive(Ord)` produces the right sort.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum LifecyclePhase {
-    /// The entity comes into existence: `Constructed`.
-    Construction,
-    /// The entity exists and undergoes change: `Modified`, `Repaired`,
-    /// `Damaged`, `Moved`, `UsageModified`, `Designated`.
-    Middle,
-    /// The entity ceases to exist: `Demolished`.
-    Demolition,
-}
-
 impl<E, S> EntityTransition<E, S> {
     /// The earliest cited date known for this transition, across all of its
     /// date fields. Returns `None` only when no dates are set at all.
@@ -257,25 +227,6 @@ impl<E, S> EntityTransition<E, S> {
     pub fn earliest_known_date(&self) -> Option<&Cited<UncertainDate, S>> {
         let (start, end) = self.date_range();
         start.or(end)
-    }
-
-    /// Which phase of the entity's lifecycle this transition belongs to.
-    ///
-    /// See [`LifecyclePhase`] for the rationale: this is the canonical
-    /// ordering primitive for presenting transitions to a user, independent
-    /// of any dates the data may or may not know.
-    #[must_use]
-    pub fn lifecycle_phase(&self) -> LifecyclePhase {
-        match self {
-            Self::Constructed { .. } => LifecyclePhase::Construction,
-            Self::Modified { .. }
-            | Self::Repaired { .. }
-            | Self::Damaged { .. }
-            | Self::Moved { .. }
-            | Self::UsageModified { .. }
-            | Self::Designated { .. } => LifecyclePhase::Middle,
-            Self::Demolished { .. } => LifecyclePhase::Demolition,
-        }
     }
 
     /// The start/end date pair for transitions with duration.
@@ -438,19 +389,5 @@ mod tests {
             assert_eq!(got, want, "{desc}");
         }
         Ok(())
-    }
-
-    /// `LifecyclePhase`'s `Ord` impl is the contract that any client (web,
-    /// iOS, …) sorting by `lifecycle_phase()` depends on, so an accidental
-    /// reorder of the enum variants — which is what defines the order via
-    /// `derive(Ord)` — would silently break canonical timeline ordering
-    /// across every client. Pin it here. The per-variant mapping itself is
-    /// just a `match` and not worth restating in a test; the user-visible
-    /// behavior is exercised by the web tests in `dev/tests/web.rs`.
-    #[test]
-    fn lifecycle_phase_is_ordered_construction_then_middle_then_demolition() {
-        use LifecyclePhase::*;
-        assert!(Construction < Middle);
-        assert!(Middle < Demolition);
     }
 }

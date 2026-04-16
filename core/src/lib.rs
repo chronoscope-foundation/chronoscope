@@ -11,6 +11,7 @@ pub mod ids;
 pub mod ingestion;
 pub mod links;
 pub mod location;
+pub mod moment;
 
 pub use annotation::{Annotation, AnnotationKind};
 pub use consistency::ConsistencyWarning;
@@ -30,3 +31,4 @@ pub use ids::{
 pub use ingestion::{ImageSource, IngestionBundle, IngestionNotes, ReferenceError};
 pub use links::{ExternalLink, LinkTarget, LinkType};
 pub use location::{Distance, Elevation, LocationError, UncertainLocation};
+pub use moment::{Moment, TransitionRole, decompose, structural_edges, topological_order};

@@ -365,10 +365,11 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
 
 /// One row in the rendered entity timeline.
 ///
-/// A single `EntityTransition` may produce one or two rows: a `Constructed`
-/// with both `started_at` and `completed_at` becomes "Construction started"
-/// and "Construction completed" as distinct rows, each with its own date and
-/// sort position.
+/// Each row corresponds to one [`chronoscope_core::Moment`] — a per-endpoint
+/// projection of an `EntityTransition`. A `Constructed` with both
+/// `started_at` and `completed_at` becomes two rows ("Construction started"
+/// and "Construction completed"), each sortable independently by its own
+/// date.
 ///
 /// We hold an `UncertainDate` rather than a pre-formatted string so the
 /// renderer can decide presentation (precision, range collapsing) at the
@@ -377,16 +378,11 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
 #[derive(Debug, Clone)]
 struct TimelineRow {
     label: &'static str,
-    /// `None` when the date is unknown. Rendered as "date unknown".
+    /// `None` when the date for this endpoint is unknown.
     date: Option<UncertainDate>,
     /// Optional secondary text shown beneath the row (e.g. the description
     /// on `UsageModified` or `Modified`).
     description: Option<String>,
-    /// Canonical lifecycle phase, propagated from
-    /// [`EntityTransition::lifecycle_phase`]. The primary sort key for the
-    /// timeline so that, e.g., a `Constructed` with no known date still
-    /// renders before a dated `Demolished` for the same entity.
-    phase: LifecyclePhase,
 }
 
 #[derive(Debug, Clone)]
@@ -423,10 +419,10 @@ fn browser_language_prefix() -> String {
 
 use chronoscope_api_client::EntityId;
 use chronoscope_core::AnnotationKind;
-use chronoscope_core::Cited;
 use chronoscope_core::date::{DatePrecision, UncertainDate};
-use chronoscope_core::entity::{EntityTransition, LifecyclePhase};
+use chronoscope_core::entity::EntityTransition;
 use chronoscope_core::links::{LinkTarget, LinkType};
+use chronoscope_core::moment::{Moment, TransitionRole, decompose, topological_order};
 
 /// Fetch entity detail using the typed API client.
 async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDetailView, String> {
@@ -443,19 +439,14 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
 
     let entity_type = resp.entity.entity_type.to_string();
 
-    // Sort by lifecycle phase first, then by date within a phase (undated
-    // rows pinned to the end of their phase). Phase-first means a Constructed
-    // with no known date still renders before a dated Demolished.
-    let mut timeline: Vec<TimelineRow> = resp
-        .entity
-        .transitions
-        .iter()
-        .flat_map(decode_transition)
-        .collect();
-    timeline.sort_by_key(|r| {
-        let earliest = r.date.as_ref().map(UncertainDate::earliest);
-        (r.phase, earliest.is_none(), earliest)
-    });
+    // Decompose into per-endpoint moments and sort using core's topological
+    // order, then map each Moment to a display row. The sort respects both
+    // structural edges (construction-end before demolition-start) and date
+    // edges, so the Mole Antonelliana case (Construction completed 1889 +
+    // UsageModified 1888) renders the usage change between the unknown
+    // construction start and the dated construction completion.
+    let moments = topological_order(decompose(&resp.entity.transitions));
+    let timeline: Vec<TimelineRow> = moments.iter().map(moment_to_row).collect();
 
     let links = resp
         .links
@@ -486,167 +477,64 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
     })
 }
 
-/// Decode a typed transition into one or two timeline rows.
-///
-/// Pattern-matches exhaustively on `EntityTransition` so that adding a new
-/// variant in core, or a new date field on an existing variant, is a compile
-/// error here rather than a silent display dropout. Durational variants
-/// (`Constructed`, `Modified`, `Repaired`, `Demolished`) emit two rows when
-/// both `started_at` and `completed_at` are present, one row when only one is
-/// present, and one dateless row when neither is. Point-event variants always
-/// emit a single row.
-fn decode_transition(
-    t: &EntityTransition<EntityId, chronoscope_api_client::SourceId>,
-) -> Vec<TimelineRow> {
-    let phase = t.lifecycle_phase();
-
-    fn d<S>(c: &Cited<UncertainDate, S>) -> UncertainDate {
-        c.value.clone()
+/// Map a [`Moment`] to a display row.
+fn moment_to_row(m: &Moment<'_, EntityId, chronoscope_api_client::SourceId>) -> TimelineRow {
+    TimelineRow {
+        label: role_label(m.role, m.collapsed),
+        date: m.date.map(|c| c.value.clone()),
+        description: moment_description(m),
     }
+}
 
-    /// Build the rows for a durational transition. Each known endpoint
-    /// produces its own row labeled for that endpoint; if neither is known we
-    /// fall back to a single dateless row labeled with the bare verb (there's
-    /// nothing to disambiguate).
-    fn durational<S>(
-        phase: LifecyclePhase,
-        bare: &'static str,
-        started: &'static str,
-        completed: &'static str,
-        started_at: Option<&Cited<UncertainDate, S>>,
-        completed_at: Option<&Cited<UncertainDate, S>>,
-        description: Option<String>,
-    ) -> Vec<TimelineRow> {
-        let endpoints: [(&'static str, Option<&Cited<UncertainDate, S>>); 2] =
-            [(started, started_at), (completed, completed_at)];
-        let rows: Vec<TimelineRow> = endpoints
-            .into_iter()
-            .filter_map(|(label, cited)| {
-                cited.map(|c| TimelineRow {
-                    label,
-                    date: Some(d(c)),
-                    description: description.clone(),
-                    phase,
-                })
-            })
-            .collect();
-        if rows.is_empty() {
-            vec![TimelineRow {
-                label: bare,
-                date: None,
-                description,
-                phase,
-            }]
-        } else {
-            rows
+/// Human-readable label for a transition role. Uses the bare form
+/// ("Constructed") when the moment was collapsed from a both-undated
+/// durational, otherwise the endpoint-specific form ("Construction started").
+fn role_label(role: TransitionRole, collapsed: bool) -> &'static str {
+    if collapsed {
+        match role {
+            TransitionRole::ConstructionStart => "Constructed",
+            TransitionRole::ModificationStart => "Modified",
+            TransitionRole::RepairStart => "Repaired",
+            TransitionRole::DemolitionStart => "Demolished",
+            _ => role_label(role, false),
+        }
+    } else {
+        match role {
+            TransitionRole::ConstructionStart => "Construction started",
+            TransitionRole::ConstructionEnd => "Construction completed",
+            TransitionRole::ModificationStart => "Modification started",
+            TransitionRole::ModificationEnd => "Modification completed",
+            TransitionRole::RepairStart => "Repair started",
+            TransitionRole::RepairEnd => "Repair completed",
+            TransitionRole::Damaged => "Damaged",
+            TransitionRole::Moved => "Moved",
+            TransitionRole::UsageModified => "Usage modified",
+            TransitionRole::Designated => "Designated",
+            TransitionRole::DemolitionStart => "Demolition started",
+            TransitionRole::DemolitionEnd => "Demolition completed",
         }
     }
+}
 
-    match t {
-        EntityTransition::Constructed {
-            started_at,
-            completed_at,
-            location: _,
-            trigger_event: _,
-        } => durational(
-            phase,
-            "Constructed",
-            "Construction started",
-            "Construction completed",
-            started_at.as_ref(),
-            completed_at.as_ref(),
-            None,
-        ),
-        EntityTransition::Modified {
-            started_at,
-            completed_at,
-            description,
-            trigger_event: _,
-        } => durational(
-            phase,
-            "Modified",
-            "Modification started",
-            "Modification completed",
-            started_at.as_ref(),
-            completed_at.as_ref(),
-            description.clone(),
-        ),
-        EntityTransition::Repaired {
-            started_at,
-            completed_at,
-            description,
-            trigger_event: _,
-        } => durational(
-            phase,
-            "Repaired",
-            "Repair started",
-            "Repair completed",
-            started_at.as_ref(),
-            completed_at.as_ref(),
-            description.clone(),
-        ),
-        EntityTransition::Demolished {
-            started_at,
-            completed_at,
-            cause,
-            trigger_event: _,
-        } => durational(
-            phase,
-            "Demolished",
-            "Demolition started",
-            "Demolition completed",
-            started_at.as_ref(),
-            completed_at.as_ref(),
-            cause.clone(),
-        ),
-        EntityTransition::Damaged {
-            occurred_at,
-            cause: _,
-            description,
-            trigger_event: _,
-        } => vec![TimelineRow {
-            label: "Damaged",
-            date: occurred_at.as_ref().map(d),
-            description: description.clone(),
-            phase,
-        }],
-        EntityTransition::Moved {
-            occurred_at,
-            location: _,
-            cause,
-            method: _,
-            trigger_event: _,
-        } => vec![TimelineRow {
-            label: "Moved",
-            date: occurred_at.as_ref().map(d),
-            description: cause.clone(),
-            phase,
-        }],
-        EntityTransition::UsageModified {
-            occurred_at,
-            new_usages: _,
-            description,
-            trigger_event: _,
-        } => vec![TimelineRow {
-            label: "Usage modified",
-            date: occurred_at.as_ref().map(d),
-            description: description.clone(),
-            phase,
-        }],
+/// Secondary display text for a moment, extracted from the parent transition.
+fn moment_description<E, S>(m: &Moment<'_, E, S>) -> Option<String> {
+    match m.transition {
+        EntityTransition::Modified { description, .. }
+        | EntityTransition::Repaired { description, .. }
+        | EntityTransition::Damaged { description, .. }
+        | EntityTransition::UsageModified { description, .. } => description.clone(),
+        EntityTransition::Demolished { cause, .. } | EntityTransition::Moved { cause, .. } => {
+            cause.clone()
+        }
         EntityTransition::Designated {
-            occurred_at,
             designation,
             description,
-            trigger_event: _,
-        } => vec![TimelineRow {
-            label: "Designated",
-            date: occurred_at.as_ref().map(d),
-            description: Some(match description {
-                Some(extra) => format!("{designation} \u{2014} {extra}"),
-                None => designation.clone(),
-            }),
-            phase,
-        }],
+            ..
+        } => Some(match description {
+            Some(extra) => format!("{designation} \u{2014} {extra}"),
+            None => designation.clone(),
+        }),
+        EntityTransition::Constructed { .. } => None,
     }
 }
 

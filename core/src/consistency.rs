@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::date::UncertainDate;
 use crate::entity::{Entity, EntityTransition};
-use crate::evidence::Cited;
+use crate::moment::{Moment, decompose, structural_edges};
 
 // Consistency checking is generic over entity/source reference types — it only
 // inspects dates and names, never the reference types themselves.
@@ -46,18 +46,68 @@ pub enum ConsistencyWarning {
     },
 }
 
+/// Detect temporal violations by checking each structural edge against date
+/// evidence. A structural edge `from → to` is violated when
+/// `to.latest < from.earliest` — i.e. the dates say `to` comes strictly
+/// before `from`, contradicting the lifecycle rule.
+///
+/// Violations are classified by the kind of structural edge:
+/// - Same-transition start→end: [`ConsistencyWarning::CompletionBeforeStart`]
+/// - Non-demolition→demolition: [`ConsistencyWarning::EventAfterDemolished`]
+/// - Anything else: [`ConsistencyWarning::EventsOutOfOrder`]
+///
+/// TODO: this validates moment-level projections rather than the underlying
+/// transitions directly. Whether that's the right surface for validation is
+/// an open question — it may change when the spatiotemporal solver lands,
+/// which will need to reason about constraints more holistically.
+fn find_violations<E, S>(moments: &[Moment<'_, E, S>]) -> Vec<ConsistencyWarning> {
+    let edges = structural_edges(moments);
+    let mut warnings = Vec::new();
+
+    for &(from, to) in &edges {
+        let (from_m, to_m) = (&moments[from], &moments[to]);
+        let (Some(from_early), Some(to_late)) = (from_m.earliest(), to_m.latest()) else {
+            continue;
+        };
+        if to_late >= from_early {
+            continue;
+        }
+
+        // Dates contradict structural edge — classify the violation.
+        if from_m.transition_index == to_m.transition_index
+            && from_m.role.durational_end() == Some(to_m.role)
+        {
+            warnings.push(ConsistencyWarning::CompletionBeforeStart {
+                started_earliest: from_early,
+                completed_latest: to_late,
+            });
+        } else if !from_m.role.is_demolition() && to_m.role.is_demolition() {
+            warnings.push(ConsistencyWarning::EventAfterDemolished {
+                event_date: from_early,
+                demolished_date: to_late,
+            });
+        } else {
+            warnings.push(ConsistencyWarning::EventsOutOfOrder {
+                earlier_date: to_late,
+                later_date: from_early,
+            });
+        }
+    }
+
+    warnings
+}
+
 impl<E, S> Entity<E, S> {
     /// Check this entity for consistency issues.
+    ///
+    /// Temporal violations (`CompletionBeforeStart`, `EventsOutOfOrder`,
+    /// `EventAfterDemolished`) are detected by checking structural lifecycle
+    /// edges against date evidence — see [`find_violations`]. Non-temporal
+    /// checks (`MultipleConstructions`, `NameValidityInverted`) are handled
+    /// directly here.
     #[must_use]
     pub fn check_consistency(&self) -> Vec<ConsistencyWarning> {
-        let mut warnings = Vec::new();
-
-        for transition in &self.transitions {
-            let (started, completed) = transition.date_range();
-            if let Some(warning) = check_date_ordering(started, completed) {
-                warnings.push(warning);
-            }
-        }
+        let mut warnings = find_violations(&decompose(&self.transitions));
 
         let construction_count = self
             .transitions
@@ -69,9 +119,6 @@ impl<E, S> Entity<E, S> {
                 count: construction_count,
             });
         }
-
-        warnings.extend(check_chronological_order(&self.transitions));
-        warnings.extend(check_events_after_demolished(&self.transitions));
 
         for cited_name in &self.names {
             let name = &cited_name.value;
@@ -90,93 +137,12 @@ impl<E, S> Entity<E, S> {
     }
 }
 
-fn check_date_ordering<S>(
-    started: Option<&Cited<UncertainDate, S>>,
-    completed: Option<&Cited<UncertainDate, S>>,
-) -> Option<ConsistencyWarning> {
-    let start_earliest = started.map(|c| c.value.earliest());
-    let complete_latest = completed.map(|c| c.value.latest());
-
-    match (start_earliest, complete_latest) {
-        (Some(start), Some(complete)) if complete < start => {
-            Some(ConsistencyWarning::CompletionBeforeStart {
-                started_earliest: start,
-                completed_latest: complete,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn get_event_date<E, S>(transition: &EntityTransition<E, S>) -> Option<NaiveDateTime> {
-    transition.earliest_known_date().map(|c| c.value.earliest())
-}
-
-fn check_chronological_order<E, S>(
-    transitions: &[EntityTransition<E, S>],
-) -> Vec<ConsistencyWarning> {
-    let dated_events: Vec<_> = transitions.iter().filter_map(get_event_date).collect();
-
-    let mut warnings = Vec::new();
-    for i in 1..dated_events.len() {
-        let prev_date = &dated_events[i - 1];
-        let curr_date = &dated_events[i];
-        if curr_date < prev_date {
-            warnings.push(ConsistencyWarning::EventsOutOfOrder {
-                earlier_date: *curr_date,
-                later_date: *prev_date,
-            });
-        }
-    }
-    warnings
-}
-
-fn check_events_after_demolished<E, S>(
-    transitions: &[EntityTransition<E, S>],
-) -> Vec<ConsistencyWarning> {
-    let demolished_date = transitions.iter().find_map(|t| {
-        if let EntityTransition::Demolished {
-            started_at,
-            completed_at,
-            ..
-        } = t
-        {
-            started_at
-                .as_ref()
-                .map(|c| c.value.earliest())
-                .or_else(|| completed_at.as_ref().map(|c| c.value.earliest()))
-        } else {
-            None
-        }
-    });
-
-    let Some(demolished) = demolished_date else {
-        return Vec::new();
-    };
-
-    let mut warnings = Vec::new();
-    for transition in transitions {
-        if matches!(transition, EntityTransition::Demolished { .. }) {
-            continue;
-        }
-
-        if let Some(event_date) = get_event_date(transition)
-            && event_date > demolished
-        {
-            warnings.push(ConsistencyWarning::EventAfterDemolished {
-                event_date,
-                demolished_date: demolished,
-            });
-        }
-    }
-    warnings
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::date::DatePrecision;
     use crate::entity::EntityType;
+    use crate::evidence::Cited;
     use chrono::NaiveDate;
 
     // Tests use () for entity/source refs since consistency checking doesn't inspect them.
@@ -385,18 +351,21 @@ mod tests {
 
     #[test]
     fn events_out_of_order() -> TestResult {
+        // Structural vs. date contradiction: a Constructed dated 2000 with
+        // a UsageModified dated 1900 — structurally the construction must
+        // precede any usage change, but the dates say otherwise.
         let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
-                EntityTransition::Modified {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2000, 1, 1)?)?)),
-                    completed_at: None,
-                    description: Some("renovation".to_string()),
+                EntityTransition::UsageModified {
+                    occurred_at: Some(Cited::uncited(UncertainDate::exact(midnight(1900, 1, 1)?)?)),
+                    new_usages: Default::default(),
+                    description: None,
                     trigger_event: None,
                 },
                 EntityTransition::Constructed {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1900, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2000, 1, 1)?)?)),
                     completed_at: None,
                     location: None,
                     trigger_event: None,
@@ -416,11 +385,6 @@ mod tests {
 
     #[test]
     fn event_after_demolished_with_only_completed_at() -> TestResult {
-        // A `Modified` event whose only known date is `completed_at` (year
-        // 2010) listed after a `Demolished` at 2000 must trigger
-        // `EventAfterDemolished`. The previous `event_date()` helper returned
-        // `started_at` only and silently skipped this transition from the
-        // check, masking the violation.
         let entity: TestEntity = Entity {
             entity_type: EntityType::Building,
             names: vec![],
