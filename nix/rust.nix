@@ -23,11 +23,15 @@ let
     ];
 
     # openssl: webauthn-rs depends on openssl-sys unconditionally (all platforms).
+    # libspatialite: loaded at runtime via SELECT load_extension() for
+    # spatial queries (region assignment, point-in-polygon).
     buildInputs =
       with pkgs;
       [
         sqlite
         openssl
+        libspatialite
+        geos # cosmogony (region-builder dep) links against GEOS
       ]
       ++ lib.optionals stdenv.hostPlatform.isDarwin [
         libiconv
@@ -108,6 +112,7 @@ in
     inherit (commonArgs) buildInputs;
     env = {
       inherit (commonArgs) PROTOC;
+      SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
     };
   };
 }

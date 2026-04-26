@@ -327,7 +327,7 @@ async fn cmd_load(db_path: &Path, input: &Path) -> Result<()> {
     );
 
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let db = chronoscope_db::Database::new(&db_url)
+    let db = chronoscope_db::Database::new(&db_url, &chronoscope_db::resolve_regions_db()?)
         .await
         .context("Failed to open database")?;
 

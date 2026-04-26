@@ -156,7 +156,8 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
                 let select = move |_| {
                     set_selected.set(Some(EntitySelection::Single(id.clone(), Some((*back).clone()))));
                 };
-                let aria = format!("{} ({})", entry.name, entry.entity_type);
+                let display_name = entry.name.as_deref().unwrap_or("Unknown");
+                let aria = format!("{display_name} ({})", entry.entity_type);
                 view! {
                     <li>
                         <button
@@ -165,7 +166,7 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
                             on:click=select
                             aria-label=aria
                         >
-                            <span class="text-sm font-semibold text-ink">{entry.name.clone()}</span>
+                            <span class="text-sm font-semibold text-ink">{display_name.to_string()}</span>
                             <span class="text-xs text-sepia/70 ml-2 font-sans uppercase">{entry.entity_type.clone()}</span>
                         </button>
                     </li>

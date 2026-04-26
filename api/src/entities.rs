@@ -89,8 +89,9 @@ pub async fn list_entities(
     let items: Vec<EntitySummary> = entities
         .iter()
         .map(|e| {
-            entity_types::entity_summary_from_stored(e)
-                .map_err(|msg| HttpError::for_internal_error(msg.to_string()))
+            e.to_summary().ok_or_else(|| {
+                HttpError::for_internal_error("entity missing coordinates".to_string())
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -157,61 +158,145 @@ pub async fn get_entity(
     json_with_cors(&detail)
 }
 
-// ==================== Thumbnails ====================
+// ==================== Unified Markers ====================
 
-/// Query parameters for the batch thumbnails endpoint.
+/// Maximum number of individual entity markers before switching to clusters.
+/// Keep low during development (test corpus has 22 entities in ~13 Italian
+/// regions); tune upward with real data density.
+const ENTITY_MARKER_THRESHOLD: i64 = 10;
+
+/// Maximum number of clusters before trying a coarser zone type.
+const CLUSTER_MARKER_LIMIT: i64 = 50;
+
+/// Zone types ordered from coarsest to finest.
+const ZONE_TYPES: &[chronoscope_api_client::ZoneType] = &[
+    chronoscope_api_client::ZoneType::Country,
+    chronoscope_api_client::ZoneType::State,
+    chronoscope_api_client::ZoneType::StateDistrict,
+    chronoscope_api_client::ZoneType::City,
+];
+
+/// Query parameters for the unified markers endpoint.
+///
+/// Bbox fields are declared inline because Dropshot's query parameter
+/// deserializer doesn't support `serde(flatten)`.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ThumbnailsQuery {
-    /// Comma-separated entity IDs.
-    pub ids: String,
+pub struct MarkersQueryParams {
+    pub min_lat: f64,
+    pub max_lat: f64,
+    pub min_lon: f64,
+    pub max_lon: f64,
 }
 
-/// Get representative thumbnails for a batch of entities.
+/// Unified map markers endpoint (public, no authentication required).
 ///
-/// Returns one thumbnail per entity (the first resolved media found).
-/// Entities without any resolved media are omitted from the response.
+/// The server decides whether to return individual entities or region clusters
+/// based on data density in the requested bounding box:
+/// - If the bbox contains fewer than 10 entities, return them individually.
+/// - Otherwise, try cluster zone types from coarsest to finest until one
+///   fits under 50 clusters.
 #[endpoint {
     method = GET,
-    path = "/entity-thumbnails",
+    path = "/markers",
 }]
-pub async fn get_entity_thumbnails(
+pub async fn list_markers(
     ctx: RequestContext<Arc<AppState>>,
-    query: Query<ThumbnailsQuery>,
+    query: Query<MarkersQueryParams>,
 ) -> Result<Response<Body>, HttpError> {
     let state = ctx.context();
-    let ids_str = query.into_inner().ids;
+    let params = query.into_inner();
 
-    let ids: Vec<&str> = ids_str.split(',').filter(|s| !s.is_empty()).collect();
+    let bbox = match Bbox::new(
+        params.min_lat,
+        params.max_lat,
+        params.min_lon,
+        params.max_lon,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            return error_with_cors(http::StatusCode::BAD_REQUEST, &format!("Invalid bbox: {e}"));
+        }
+    };
 
-    if ids.len() > limits::ENTITY_LIST_MAX_PAGE_SIZE as usize {
-        return error_with_cors(
-            http::StatusCode::BAD_REQUEST,
-            &format!(
-                "Too many IDs ({}, max {})",
-                ids.len(),
-                limits::ENTITY_LIST_MAX_PAGE_SIZE
-            ),
-        );
-    }
-
-    let ids_json = serde_json::to_string(&ids)
-        .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize IDs: {e}")))?;
-
-    let thumbnails = state
+    // Check entity density with a cheap threshold count (no full rows).
+    let entity_count = state
         .db
-        .find_thumbnails_for_entities(&ids_json)
+        .count_entities_in_bbox(&bbox, ENTITY_MARKER_THRESHOLD)
         .await
         .map_err(db_err)?;
 
-    let cdn_base = &state.config.cdn_base_url;
-    let thumbnails_map: HashMap<EntityId, entity_types::ThumbnailInfo> = thumbnails
-        .into_iter()
-        .map(|t| entity_types::thumbnail_entry(t, cdn_base))
-        .collect();
+    let (mut markers, rep_map, truncated) = if entity_count < ENTITY_MARKER_THRESHOLD {
+        // Few enough — fetch the actual entities as markers.
+        let (markers, rep_map) = state
+            .db
+            .list_entities_as_markers(&bbox, ENTITY_MARKER_THRESHOLD)
+            .await
+            .map_err(db_err)?;
+        (markers, rep_map, false)
+    } else {
+        // Too many entities — find the finest cluster granularity that fits
+        // under the limit. Iterate coarse→fine, tracking the last level that
+        // fits. Stop when a level exceeds the limit (finer levels will only
+        // produce more clusters). This gives the finest useful granularity.
+        // TODO: this is up to 4 sequential count queries. Could be optimized
+        // with a single query that counts all zone types at once, or by
+        // caching zone type distributions per bbox.
+        let mut chosen: Option<chronoscope_api_client::ZoneType> = None;
+        for &zone_type in ZONE_TYPES {
+            let count = state
+                .db
+                .count_clusters_in_bbox(&zone_type, &bbox, CLUSTER_MARKER_LIMIT)
+                .await
+                .map_err(db_err)?;
+            if count < CLUSTER_MARKER_LIMIT {
+                chosen = Some(zone_type);
+            } else {
+                break;
+            }
+        }
 
-    let response = chronoscope_api_client::ThumbnailsResponse {
-        thumbnails: thumbnails_map,
+        // If no zone type fits (even country has too many clusters), use the
+        // coarsest level anyway — it'll be truncated but better than nothing.
+        let zone_type = chosen.unwrap_or(ZONE_TYPES[0]);
+        let (markers, rep_map) = state
+            .db
+            .list_clusters_as_markers(&zone_type, &bbox)
+            .await
+            .map_err(db_err)?;
+        let truncated = markers.len() as i64 >= CLUSTER_MARKER_LIMIT;
+        (markers, rep_map, truncated)
     };
+
+    // Resolve thumbnail URLs for all markers (entity and cluster alike).
+    let entity_ids: Vec<&str> = rep_map.values().map(|id| id.as_str()).collect();
+    if !entity_ids.is_empty() {
+        let ids_json = serde_json::to_string(&entity_ids)
+            .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize IDs: {e}")))?;
+
+        let thumbnails = state
+            .db
+            .find_thumbnails_for_entities(&ids_json)
+            .await
+            .map_err(db_err)?;
+
+        let cdn_base = &state.config.cdn_base_url;
+        let thumb_map: HashMap<String, String> = thumbnails
+            .into_iter()
+            .map(|t| {
+                let (eid, info) = entity_types::thumbnail_entry(t, cdn_base);
+                (eid.to_string(), info.url)
+            })
+            .collect();
+
+        // Assign thumbnail URLs to markers.
+        for marker in &mut markers {
+            if let Some(entity_id) = rep_map.get(&marker.id) {
+                marker.thumbnail_url = thumb_map.get(&entity_id.to_string()).cloned();
+            }
+        }
+    }
+
+    let response = chronoscope_api_client::MarkersResponse { markers, truncated };
     json_with_cors(&response)
 }
 
@@ -240,12 +325,12 @@ pub async fn entity_options(
     cors_preflight()
 }
 
-/// CORS preflight for thumbnails endpoint.
+/// CORS preflight for unified markers endpoint.
 #[endpoint {
     method = OPTIONS,
-    path = "/entity-thumbnails",
+    path = "/markers",
 }]
-pub async fn thumbnails_options(
+pub async fn markers_options(
     _ctx: RequestContext<Arc<AppState>>,
 ) -> Result<Response<Body>, HttpError> {
     cors_preflight()

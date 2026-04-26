@@ -33,7 +33,11 @@ async fn wikidata_db() -> Result<TestDb> {
         .map_err(|_| "WIKIDATA_TEST_DB not set — run tests inside `nix develop`")?;
     let tmp = NamedTempFile::new()?;
     std::fs::copy(format!("{store_path}/wikidata.db"), tmp.path())?;
-    let db = Database::new(&format!("sqlite:{}?mode=rwc", tmp.path().display())).await?;
+    let db = Database::new(
+        &format!("sqlite:{}?mode=rwc", tmp.path().display()),
+        &chronoscope_db::resolve_regions_db()?,
+    )
+    .await?;
     Ok(TestDb { db, _file: tmp })
 }
 
@@ -80,8 +84,9 @@ async fn entity_count() -> Result<()> {
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM entities")
         .fetch_one(db.pool_ref())
         .await?;
-    // 9 Q-IDs, but Chioggia Cathedral splits into 2 (demolished + rebuilt)
-    assert_eq!(count.0, 10);
+    // 21 Q-IDs (9 original + 12 Italian for cluster tests), but Chioggia
+    // Cathedral splits into 2 (demolished + rebuilt) so 22 entities total.
+    assert_eq!(count.0, 22);
     Ok(())
 }
 
@@ -156,14 +161,14 @@ async fn p18_images_as_pending_research_urls() -> Result<()> {
         .bind(ResearchUrlStatus::Pending)
         .fetch_one(db.pool_ref())
         .await?;
-    assert_eq!(count.0, 17);
+    assert_eq!(count.0, 52);
 
     // Split entities (e.g., Chioggia Cathedral) only attach images to the
     // latest entity, so the old cathedral no longer gets a duplicate annotation.
     let annotation_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM annotations")
         .fetch_one(db.pool_ref())
         .await?;
-    assert_eq!(annotation_count.0, 17);
+    assert_eq!(annotation_count.0, 52);
 
     Ok(())
 }

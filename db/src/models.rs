@@ -215,6 +215,22 @@ impl Entity {
     pub fn entity_type(&self) -> EntityType {
         self.entity.entity_type
     }
+
+    /// Convert to an API summary. Returns `None` if the entity has no coordinates.
+    #[must_use]
+    pub fn to_summary(&self) -> Option<chronoscope_api_client::EntitySummary> {
+        let coords = self.location?;
+        Some(chronoscope_api_client::EntitySummary {
+            id: self.id.clone(),
+            entity_type: self.entity_type(),
+            name: self.entity.best_name("en").map(String::from),
+            latitude: coords.lat,
+            longitude: coords.lon,
+            earliest_date: self.temporal_bounds.as_ref().map(|b| b.earliest),
+            latest_date: self.temporal_bounds.as_ref().map(|b| b.latest),
+            updated_at: self.updated_at,
+        })
+    }
 }
 
 /// An external link attached to an entity, with the full structured target.

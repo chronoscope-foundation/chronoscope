@@ -48,6 +48,20 @@ fetch-corpus:
     nix build .#corpus-images --no-link
     echo "Done. Corpus images will be pinned as GC roots on next shell entry."
 
+# Build administrative regions database (Italy extract).
+# Downloads ~2 GB PBF, filters boundaries, runs cosmogony, builds SpatiaLite DB.
+# Result is pinned as a GC root so it survives garbage collection.
+fetch-regions:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    echo "==> Building Italy regions database..."
+    REGIONS_DB=$(nix build .#regions-italy-db --no-link --print-out-paths)
+    _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
+    mkdir -p "$_gc_root_dir"
+    nix-store --realise "$REGIONS_DB" --add-root "$_gc_root_dir/regions-db" > /dev/null 2>&1
+    echo "Done. Regions DB at: $REGIONS_DB/regions.sqlite"
+
 # Fetch everything: model weights + corpus images.
 fetch-all: fetch-weights fetch-corpus
 

@@ -167,3 +167,32 @@ pub enum MediaType {
     Image,
     Video,
 }
+
+/// Administrative zone type for geographic clustering.
+///
+/// Ordered from coarsest to finest granularity. The DB column stores these
+/// as `snake_case` TEXT; the Rust code uses this enum for type safety.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    strum::Display,
+    strum::AsRefStr,
+    strum::EnumString,
+)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
+#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ZoneType {
+    Country,
+    State,
+    StateDistrict,
+    City,
+}

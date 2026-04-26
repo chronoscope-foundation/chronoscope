@@ -142,6 +142,16 @@ where
             .await?;
         result.entities_created += 1;
 
+        // Assign administrative regions via point-in-polygon.
+        if let Some((lat, lon)) = location {
+            sqlx::query(queries::ASSIGN_ENTITY_REGIONS.sql)
+                .bind(lon)
+                .bind(lat)
+                .bind(&new_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
         // Extract and insert all external IDs from links
         for ext_id in extract_external_ids(&links) {
             queries::INSERT_EXTERNAL_ID
@@ -401,7 +411,8 @@ mod tests {
     }
 
     async fn test_db() -> DbResult<Database> {
-        Database::new_without_plan_verification("sqlite::memory:").await
+        Database::new_without_plan_verification("sqlite::memory:", &crate::resolve_regions_db()?)
+            .await
     }
 
     #[tokio::test]

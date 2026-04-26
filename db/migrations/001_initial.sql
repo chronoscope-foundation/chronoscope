@@ -254,3 +254,35 @@ CREATE TABLE annotations (
 
 CREATE INDEX idx_annotations_entity ON annotations(entity_id);
 CREATE INDEX idx_annotations_url ON annotations(url_id);
+
+-- ==================== Entity Region Assignments ====================
+
+-- Precomputed mapping from entities to their containing administrative regions.
+-- Populated at entity ingestion time via point-in-polygon against the
+-- attached regions database. Used for efficient cluster queries.
+-- region_osm_id references regions_db.regions(osm_id) but can't FK across
+-- ATTACHed databases.
+--
+-- PK design: (entity_id, zone_type) intentionally limits each entity to ONE
+-- region per zone type. In reality an entity near a border could fall in two
+-- regions of the same zone_type. We accept this simplification because:
+--   1. Point-in-polygon assigns at most one match per zone_type (INSERT OR
+--      IGNORE picks the first), so the constraint matches actual ingestion.
+--   2. Cluster counts are approximate anyway (used for map marker density
+--      decisions, not exact analytics).
+--   3. It keeps the table small and avoids duplicating entities across
+--      overlapping border regions, which would inflate cluster counts.
+-- If exact multi-region membership is needed later, change the PK to
+-- (entity_id, zone_type, region_osm_id).
+CREATE TABLE entity_regions (
+    entity_id TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    region_osm_id INTEGER NOT NULL,
+    zone_type TEXT NOT NULL,
+    PRIMARY KEY (entity_id, zone_type)
+);
+
+-- Two composite indexes on the same columns in opposite order:
+-- (zone_type, region_osm_id) for cluster queries that filter zone_type first
+-- (region_osm_id, zone_type) for the JOIN on region_osm_id in the main SELECT
+CREATE INDEX idx_entity_regions_zone_region ON entity_regions(zone_type, region_osm_id);
+CREATE INDEX idx_entity_regions_region ON entity_regions(region_osm_id, zone_type);

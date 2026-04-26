@@ -3,12 +3,12 @@
 //! These are the wire-format types for entity endpoints. They're projections
 //! and summaries of core domain types, not domain types themselves.
 
-use std::collections::HashMap;
-
 use chrono::NaiveDateTime;
 use chronoscope_core::{AnnotationKind, Entity, EntityType, LinkTarget, LinkType, UncertainDate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use std::fmt;
 
 use crate::ids::{AnnotationId, EntityId, EntityLinkId, MediaId, SourceId};
 
@@ -91,8 +91,115 @@ pub struct ThumbnailInfo {
     pub height: i32,
 }
 
-/// Batch response mapping entity IDs to their representative thumbnails.
+// ==================== Unified Markers ====================
+
+/// Typed marker identifier — either an entity UUID or a cluster OSM ID.
+///
+/// Serializes to/from a string: entity UUIDs serialize as-is, cluster IDs
+/// as `"cluster-{osm_id}"`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MarkerId {
+    Entity(EntityId),
+    Cluster(i64),
+}
+
+const CLUSTER_ID_PREFIX: &str = "cluster-";
+
+impl fmt::Display for MarkerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Entity(id) => write!(f, "{id}"),
+            Self::Cluster(osm_id) => write!(f, "{CLUSTER_ID_PREFIX}{osm_id}"),
+        }
+    }
+}
+
+impl Serialize for MarkerId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for MarkerId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if let Some(osm_str) = s.strip_prefix(CLUSTER_ID_PREFIX) {
+            let osm_id = osm_str.parse::<i64>().map_err(serde::de::Error::custom)?;
+            Ok(Self::Cluster(osm_id))
+        } else {
+            Ok(Self::Entity(EntityId::new(s)))
+        }
+    }
+}
+
+impl JsonSchema for MarkerId {
+    fn schema_name() -> String {
+        "MarkerId".to_string()
+    }
+
+    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        schemars::schema::SchemaObject {
+            instance_type: Some(schemars::schema::InstanceType::String.into()),
+            ..Default::default()
+        }
+        .into()
+    }
+}
+
+/// A map marker — either an individual entity or a cluster of entities
+/// in an administrative region. The server decides which to return based
+/// on entity density in the requested bounding box.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ThumbnailsResponse {
-    pub thumbnails: HashMap<EntityId, ThumbnailInfo>,
+pub struct Marker {
+    /// Stable identifier. Entity UUID for individual entities,
+    /// `"cluster-{osm_id}"` for region clusters.
+    pub id: MarkerId,
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Display label (entity name or region name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Ready-to-use thumbnail URL, resolved server-side. `None` if the
+    /// entity (or cluster representative) has no resolved media.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    /// What happens when the user clicks this marker.
+    pub click_action: ClickAction,
+}
+
+/// What happens when a marker is clicked.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type")]
+pub enum ClickAction {
+    /// Zoom the map to this bounding box (cluster markers).
+    #[serde(rename = "zoom_to")]
+    ZoomTo {
+        #[serde(flatten)]
+        bbox: crate::types::Bbox,
+    },
+    /// Open the entity detail panel (individual entity markers).
+    #[serde(rename = "select")]
+    Select {
+        entity_id: EntityId,
+        entity_type: EntityType,
+    },
+    /// Show a disambiguation picker (co-located entities at the same coordinates).
+    #[serde(rename = "disambiguate")]
+    Disambiguate { entries: Vec<EntityPickerEntry> },
+}
+
+/// One entry in a co-located entity disambiguation picker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EntityPickerEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub entity_type: String,
+}
+
+/// Response for the unified markers endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MarkersResponse {
+    pub markers: Vec<Marker>,
+    /// True if results were truncated at the server limit.
+    pub truncated: bool,
 }

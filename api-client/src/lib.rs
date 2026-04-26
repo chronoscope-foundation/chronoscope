@@ -19,12 +19,12 @@ pub use auth::{
 };
 pub use client::{ApiError, AuthClient, AuthError, Client, login, paginate, register};
 pub use entities::{
-    AnnotationSummary, EntityLinkSummary, EntityResponse, EntitySummary, MediaSummary,
-    ThumbnailInfo, ThumbnailsResponse,
+    AnnotationSummary, ClickAction, EntityLinkSummary, EntityPickerEntry, EntityResponse,
+    EntitySummary, Marker, MarkerId, MarkersResponse, MediaSummary, ThumbnailInfo,
 };
 pub use ids::{
     AnnotationId, Email, EntityId, EntityLinkId, MediaId, ResearchUrlId, SourceId, UserId,
 };
 pub use pagination::{PageToken, ResultsPage};
-pub use types::{Bbox, MediaType, ResearchUrlStatus};
+pub use types::{Bbox, MediaType, ResearchUrlStatus, ZoneType};
 pub use users::{UpdateUserRequest, UserResponse};

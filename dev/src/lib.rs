@@ -390,9 +390,13 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
     // Create shared database (includes default integration registry)
     let db_url = config.database_url.as_deref().unwrap_or("sqlite::memory:");
     let db = Arc::new(
-        Database::new(db_url)
-            .await
-            .map_err(|e| format!("Failed to create database: {e}"))?,
+        Database::new(
+            db_url,
+            &chronoscope_db::resolve_regions_db()
+                .map_err(|e| format!("Failed to resolve regions DB path: {e}"))?,
+        )
+        .await
+        .map_err(|e| format!("Failed to create database: {e}"))?,
     );
 
     // Create shared media store

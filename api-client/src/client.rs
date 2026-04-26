@@ -17,7 +17,7 @@ use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-use crate::entities::{EntityResponse, EntitySummary, ThumbnailsResponse};
+use crate::entities::{EntityResponse, EntitySummary};
 use crate::ids::{Email, EntityId, ResearchUrlId};
 use crate::pagination::{PageToken, ResultsPage};
 use crate::types::Bbox;
@@ -146,19 +146,17 @@ impl Client {
         self.get_json(&url).await
     }
 
-    /// Fetch representative thumbnails for a batch of entity IDs.
-    ///
-    /// Entities without any resolved media are omitted from the response.
-    pub async fn get_entity_thumbnails(
-        &self,
-        ids: &[EntityId],
-    ) -> Result<ThumbnailsResponse, ApiError> {
-        let ids_param: String = ids
-            .iter()
-            .map(|id| id.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        let url = format!("{}/entity-thumbnails?ids={}", self.base_url, ids_param);
+    /// Fetch map markers for a bounding box. The server decides whether to
+    /// return individual entities or region clusters based on data density.
+    pub async fn list_markers(&self, bbox: &Bbox) -> Result<crate::MarkersResponse, ApiError> {
+        let url = format!(
+            "{}/markers?min_lat={}&max_lat={}&min_lon={}&max_lon={}",
+            self.base_url,
+            bbox.min_lat(),
+            bbox.max_lat(),
+            bbox.min_lon(),
+            bbox.max_lon(),
+        );
         self.get_json(&url).await
     }
 

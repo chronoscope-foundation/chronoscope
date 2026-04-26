@@ -36,9 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let log = config_logging.to_logger("web-dev")?;
 
-    // 1. Find an available port for the API server
+    // 1. Find available ports for the API server and Trunk
     let api_port = find_available_port()?;
+    let trunk_port = find_available_port()?;
     info!(log, "API server will bind to port {}", api_port);
+    info!(log, "Trunk will bind to port {}", trunk_port);
 
     // 2. Use Wikidata test DB if available (set by nix develop), else in-memory
     let web_dev_db = match std::env::var("WIKIDATA_TEST_DB") {
@@ -106,8 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok_or("no parent")?
         .join("web");
     info!(log, "Starting Trunk live-reload server...");
+    let trunk_port_str = trunk_port.to_string();
     let mut trunk = Command::new("trunk")
-        .args(["serve", "--port", "8080"])
+        .args(["serve", "--port", &trunk_port_str])
         .env("CHRONOSCOPE_API_URL", &server.base_url)
         .current_dir(&web_dir)
         .spawn()
@@ -117,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(log, "========================================");
     info!(log, "Web development server ready!");
     info!(log, "");
-    info!(log, "  Frontend: http://127.0.0.1:8080");
+    info!(log, "  Frontend: http://127.0.0.1:{}", trunk_port);
     info!(log, "  API:      {}", server.base_url);
     info!(log, "========================================");
     info!(log, "");

@@ -14,11 +14,14 @@ pub mod types;
 pub mod url;
 pub mod workers;
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{NaiveDateTime, Utc};
+use sqlx::Executor;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 use chronoscope_integrations::IntegrationRegistry;
@@ -43,6 +46,59 @@ pub use workers::MediaForAnalysis;
 /// Get the current UTC timestamp as `NaiveDateTime` for database storage.
 pub(crate) fn now() -> NaiveDateTime {
     Utc::now().naive_utc()
+}
+
+/// Environment variable name for the regions database path.
+///
+/// The regions DB is a SpatiaLite database built by Nix containing administrative
+/// boundaries from OpenStreetMap. The env var points directly to the `.sqlite` file.
+/// Callers should resolve this once at startup and pass the path to `Database::new`.
+pub const REGIONS_DB_ENV: &str = "REGIONS_DB";
+
+/// Resolve `REGIONS_DB` from the environment.
+///
+/// Intended to be called once at program startup, not on every request.
+///
+/// # Errors
+/// Returns `DbError::Config` if `REGIONS_DB` is not set.
+pub fn resolve_regions_db() -> DbResult<std::path::PathBuf> {
+    std::env::var(REGIONS_DB_ENV)
+        .map(std::path::PathBuf::from)
+        .map_err(|_| DbError::Config(format!("{REGIONS_DB_ENV} must be set")))
+}
+
+/// Split a bbox's longitude range for SQL binding.
+/// Returns `(min_lon_a, max_lon_a, min_lon_b, max_lon_b)` — identical ranges
+/// for non-crossing bboxes, split halves for antimeridian-crossing.
+fn bbox_lon_ranges(bbox: &chronoscope_api_client::Bbox) -> (f64, f64, f64, f64) {
+    if bbox.min_lon() > bbox.max_lon() {
+        (bbox.min_lon(), 180.0, -180.0, bbox.max_lon())
+    } else {
+        (
+            bbox.min_lon(),
+            bbox.max_lon(),
+            bbox.min_lon(),
+            bbox.max_lon(),
+        )
+    }
+}
+
+/// Bind a Bbox's 6 parameters to a `query_as` in canonical order:
+/// `min_lat`, `max_lat`, `min_lon_a`, `max_lon_a`, `min_lon_b`, `max_lon_b`.
+///
+/// SQL should use: `lat BETWEEN ?N AND ?N+1 AND (lon BETWEEN ?N+2 AND ?N+3 OR lon BETWEEN ?N+4 AND ?N+5)`.
+fn bind_bbox<'q, T>(
+    query: sqlx::query::QueryAs<'q, sqlx::Sqlite, T, sqlx::sqlite::SqliteArguments<'q>>,
+    bbox: &chronoscope_api_client::Bbox,
+) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, T, sqlx::sqlite::SqliteArguments<'q>> {
+    let (a_min, a_max, b_min, b_max) = bbox_lon_ranges(bbox);
+    query
+        .bind(bbox.min_lat())
+        .bind(bbox.max_lat())
+        .bind(a_min)
+        .bind(a_max)
+        .bind(b_min)
+        .bind(b_max)
 }
 
 // ==================== Database ====================
@@ -82,28 +138,38 @@ impl Database {
     }
 }
 
+/// Cap on cluster rows returned per `list_clusters_as_markers` call.
+///
+/// At low zoom the world has roughly ~250 countries; this is a generous
+/// upper bound that prevents pathological queries from streaming the
+/// entire `entity_regions` table back to a client.
+const MAX_CLUSTERS_PER_QUERY: i64 = 500;
+
+/// Typed row for the `LIST_CLUSTERS_IN_BBOX` query result.
+///
+/// Uses `sqlx::FromRow` instead of manual `.get("column_name")` calls.
+#[derive(sqlx::FromRow)]
+struct ClusterRow {
+    osm_id: i64,
+    region_name: String,
+    centroid_lon: f64,
+    centroid_lat: f64,
+    bbox_min_lat: f64,
+    bbox_max_lat: f64,
+    bbox_min_lon: f64,
+    bbox_max_lon: f64,
+    representative_id: Option<String>,
+}
+
 impl Database {
     /// Create a new database connection pool, run migrations, and verify query plans.
-    ///
-    /// Internally creates the default integration registry for URL normalization
-    /// and worker affinity computation.
     ///
     /// # Errors
     /// Returns `DbError::Sqlx` if connection fails, `DbError::Migrate` if migrations fail,
     /// or `DbError::QueryPlan` if any query would cause a full table scan.
-    pub async fn new(database_url: &str) -> DbResult<Self> {
+    pub async fn new(database_url: &str, regions_db_path: &Path) -> DbResult<Self> {
         let registry = chronoscope_integrations::create_registry(None)?;
-
-        let options = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await?;
+        let pool = Self::create_pool(database_url, regions_db_path).await?;
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -132,19 +198,12 @@ impl Database {
     /// Create a new database connection pool and run migrations, but skip query plan verification.
     ///
     /// This is used by tests that want to verify query plans themselves (to avoid circular dependency).
-    pub async fn new_without_plan_verification(database_url: &str) -> DbResult<Self> {
+    pub async fn new_without_plan_verification(
+        database_url: &str,
+        regions_db_path: &Path,
+    ) -> DbResult<Self> {
         let registry = chronoscope_integrations::create_registry(None)?;
-
-        let options = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .busy_timeout(Duration::from_secs(5));
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await?;
+        let pool = Self::create_pool(database_url, regions_db_path).await?;
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -163,6 +222,63 @@ impl Database {
             url_queue_generic,
             analysis_queue,
         })
+    }
+
+    /// Create the SQLite connection pool with SpatiaLite and attached regions DB.
+    async fn create_pool(database_url: &str, regions_db_path: &Path) -> DbResult<SqlitePool> {
+        let spatialite_dir = std::env::var("SPATIALITE_LIBRARY_PATH")
+            .map_err(|_| DbError::Config("SPATIALITE_LIBRARY_PATH must be set".to_string()))?;
+
+        // Avoid SqliteConnectOptions::from_str("sqlite::memory:") because it
+        // sets in_memory(true), which adds SQLITE_OPEN_MEMORY. That flag
+        // propagates to ATTACH DATABASE, causing file paths to be ignored
+        // (attached DBs become empty in-memory instead of opening the file).
+        //
+        // For in-memory DBs, we replicate from_str's naming scheme (a unique
+        // URI per pool) with ?mode=memory&cache=shared, which achieves shared
+        // in-memory behavior through the URI parameter rather than the open
+        // flag. For file-backed DBs, we use from_str normally.
+        let options = if database_url == "sqlite::memory:" {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let seqno = SEQ.fetch_add(1, Ordering::Relaxed);
+            SqliteConnectOptions::new().filename(format!(
+                "file:chronoscope-mem-{seqno}?mode=memory&cache=shared"
+            ))
+        } else {
+            SqliteConnectOptions::from_str(database_url)?
+        }
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_secs(5))
+        .extension(format!("{spatialite_dir}/mod_spatialite"));
+
+        // ATTACH the regions DB on each new connection. Uses a file: URI with
+        // immutable=1 since the DB lives in the read-only Nix store; without
+        // this, SQLite tries to acquire file locks on a read-only mount and
+        // can fail.
+        //
+        // Only `'` needs escaping (SQL-literal safety). Path separators must
+        // NOT be percent-encoded — SQLite expects a literal filesystem path
+        // after the `file:` prefix.
+        let regions_path = regions_db_path.display().to_string();
+        let escaped = regions_path.replace('\'', "''");
+        let attach_sql = format!("ATTACH DATABASE 'file:{escaped}?immutable=1' AS regions_db");
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .after_connect(move |conn, _meta| {
+                let sql = attach_sql.clone();
+                Box::pin(async move {
+                    conn.execute(sql.as_str()).await?;
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await?;
+
+        Ok(pool)
     }
 
     /// Verify all query plans (static queries + queue-generated queries).
@@ -611,9 +727,8 @@ impl Database {
 
     /// List entities within a geographic bounding box (keyset pagination).
     ///
-    /// Antimeridian-crossing viewports (where `min_lon > max_lon`, e.g., 170°
-    /// to -170°) are handled automatically: the query matches the union of
-    /// `[min_lon, 180] ∪ [-180, max_lon]`.
+    /// Antimeridian-crossing viewports are handled in SQL by OR'ing two
+    /// longitude ranges — no Rust-side splitting or dedup needed.
     ///
     /// # Errors
     /// Returns `DbError::Sqlx` if the database operation fails.
@@ -623,34 +738,243 @@ impl Database {
         limit: i64,
         cursor: Option<(NaiveDateTime, &EntityId)>,
     ) -> DbResult<Vec<Entity>> {
-        let crosses_antimeridian = bbox.min_lon() > bbox.max_lon();
         let rows: Vec<row::Entity> = match cursor {
             None => {
-                sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_FIRST.sql)
-                    .bind(bbox.min_lat())
-                    .bind(bbox.max_lat())
-                    .bind(bbox.min_lon())
-                    .bind(bbox.max_lon())
-                    .bind(crosses_antimeridian)
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await?
+                bind_bbox(
+                    sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_FIRST.sql),
+                    bbox,
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
             }
             Some((updated_at, id)) => {
-                sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_PAGE.sql)
-                    .bind(bbox.min_lat())
-                    .bind(bbox.max_lat())
-                    .bind(bbox.min_lon())
-                    .bind(bbox.max_lon())
-                    .bind(crosses_antimeridian)
-                    .bind(updated_at)
-                    .bind(id)
-                    .bind(limit)
-                    .fetch_all(&self.pool)
-                    .await?
+                bind_bbox(
+                    sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_PAGE.sql),
+                    bbox,
+                )
+                .bind(updated_at)
+                .bind(id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
             }
         };
         rows.into_iter().map(|r| r.into_domain()).collect()
+    }
+
+    /// Count entities in a bounding box, up to a threshold limit.
+    ///
+    /// Returns at most `limit` — useful for deciding whether to show
+    /// individual entities or clusters without fetching full rows.
+    pub async fn count_entities_in_bbox(
+        &self,
+        bbox: &chronoscope_api_client::Bbox,
+        limit: i64,
+    ) -> DbResult<i64> {
+        let (count,): (i64,) = bind_bbox(sqlx::query_as(queries::COUNT_ENTITIES_IN_BBOX.sql), bbox)
+            .bind(limit)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// Count clusters at a given zone type in a bounding box, up to a threshold limit.
+    pub async fn count_clusters_in_bbox(
+        &self,
+        zone_type: &chronoscope_api_client::ZoneType,
+        bbox: &chronoscope_api_client::Bbox,
+        limit: i64,
+    ) -> DbResult<i64> {
+        let zone_type = zone_type.as_ref();
+        let (count,): (i64,) = bind_bbox(
+            sqlx::query_as::<_, (i64,)>(queries::COUNT_CLUSTERS_IN_BBOX.sql).bind(zone_type),
+            bbox,
+        )
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// Convert entities from `list_entities_in_bbox` into `Vec<Marker>`,
+    /// returning the markers plus a map of `marker_id` → `entity_id` for
+    /// thumbnail resolution.
+    pub async fn list_entities_as_markers(
+        &self,
+        bbox: &chronoscope_api_client::Bbox,
+        limit: i64,
+    ) -> DbResult<(
+        Vec<chronoscope_api_client::Marker>,
+        HashMap<chronoscope_api_client::MarkerId, EntityId>,
+    )> {
+        use chronoscope_api_client::{ClickAction, EntityPickerEntry, Marker, MarkerId};
+
+        let entities = self.list_entities_in_bbox(bbox, limit, None).await?;
+
+        // Group by coordinate to detect co-located entities.
+        let mut coord_groups: HashMap<(u64, u64), Vec<chronoscope_api_client::EntitySummary>> =
+            HashMap::new();
+        for entity in entities {
+            if let Some(summary) = entity.to_summary() {
+                let key = (summary.latitude.to_bits(), summary.longitude.to_bits());
+                coord_groups.entry(key).or_default().push(summary);
+            }
+        }
+
+        let mut markers = Vec::with_capacity(coord_groups.len());
+        let mut rep_map = HashMap::new();
+
+        for group in coord_groups.into_values() {
+            let first = &group[0];
+            let marker_id = MarkerId::Entity(first.id.clone());
+            // Track first entity for thumbnail resolution.
+            rep_map.insert(marker_id.clone(), first.id.clone());
+
+            if group.len() == 1 {
+                markers.push(Marker {
+                    id: marker_id,
+                    latitude: first.latitude,
+                    longitude: first.longitude,
+                    label: first.name.clone(),
+                    thumbnail_url: None,
+                    click_action: ClickAction::Select {
+                        entity_id: first.id.clone(),
+                        entity_type: first.entity_type,
+                    },
+                });
+            } else {
+                // Co-located: build disambiguation picker entries sorted
+                // by earliest date (undated last) for temporal ordering.
+                let mut sorted = group;
+                sorted.sort_by_key(|e| (e.earliest_date.is_none(), e.earliest_date));
+                let entries: Vec<EntityPickerEntry> = sorted
+                    .iter()
+                    .map(|e| EntityPickerEntry {
+                        id: e.id.to_string(),
+                        name: e.name.clone(),
+                        entity_type: e.entity_type.to_string(),
+                    })
+                    .collect();
+                markers.push(Marker {
+                    id: marker_id,
+                    latitude: sorted[0].latitude,
+                    longitude: sorted[0].longitude,
+                    label: sorted[0].name.clone(),
+                    thumbnail_url: None,
+                    click_action: ClickAction::Disambiguate { entries },
+                });
+            }
+        }
+
+        Ok((markers, rep_map))
+    }
+
+    /// List clusters, returning markers plus a map of `marker_id` → representative
+    /// `entity_id` (so the API layer can resolve thumbnail URLs).
+    pub async fn list_clusters_as_markers(
+        &self,
+        zone_type: &chronoscope_api_client::ZoneType,
+        bbox: &chronoscope_api_client::Bbox,
+    ) -> DbResult<(
+        Vec<chronoscope_api_client::Marker>,
+        HashMap<chronoscope_api_client::MarkerId, EntityId>,
+    )> {
+        let zone_type = zone_type.as_ref();
+
+        let rows = self.query_clusters(zone_type, bbox).await?;
+
+        // Collect representative IDs (may be NULL if a region has no entities
+        // with coordinates, or if the correlated subquery found nothing).
+        let representative_ids: Vec<Option<&str>> = rows
+            .iter()
+            .map(|row| row.representative_id.as_deref())
+            .collect();
+
+        // Batch-fetch representative entities in one round-trip.
+        let non_null_ids: Vec<&str> = representative_ids.iter().filter_map(|id| *id).collect();
+        let mut representatives: HashMap<String, chronoscope_api_client::EntitySummary> =
+            if non_null_ids.is_empty() {
+                HashMap::new()
+            } else {
+                let ids_json = serde_json::to_string(&non_null_ids)
+                    .map_err(|e| DbError::InconsistentRow(format!("encode ids: {e}")))?;
+                let entity_rows: Vec<row::Entity> =
+                    sqlx::query_as(queries::FIND_ENTITIES_BY_IDS.sql)
+                        .bind(&ids_json)
+                        .fetch_all(&self.pool)
+                        .await?;
+
+                let mut map = HashMap::with_capacity(entity_rows.len());
+                for entity_row in entity_rows {
+                    match entity_row.into_domain() {
+                        Ok(entity) => {
+                            let id_str = entity.id.to_string();
+                            if let Some(summary) = entity.to_summary() {
+                                map.insert(id_str, summary);
+                            }
+                        }
+                        Err(e) => {
+                            // A bad representative row shouldn't take down the
+                            // entire cluster response — log and skip.
+                            eprintln!("warn: skipping bad representative entity: {e}");
+                        }
+                    }
+                }
+                map
+            };
+
+        let mut markers = Vec::with_capacity(rows.len());
+        let mut rep_map: HashMap<chronoscope_api_client::MarkerId, EntityId> = HashMap::new();
+        for (row, rep_id) in rows.iter().zip(representative_ids.iter()) {
+            let representative = rep_id.and_then(|id| representatives.remove(id));
+
+            let marker_id = chronoscope_api_client::MarkerId::Cluster(row.osm_id);
+
+            // Track representative for thumbnail resolution by the API layer.
+            if let Some(ref rep) = representative {
+                rep_map.insert(marker_id.clone(), rep.id.clone());
+            }
+
+            markers.push(chronoscope_api_client::Marker {
+                id: marker_id,
+                latitude: row.centroid_lat,
+                longitude: row.centroid_lon,
+                label: Some(row.region_name.clone()),
+                thumbnail_url: None, // resolved by the API layer using rep_map
+                click_action: chronoscope_api_client::ClickAction::ZoomTo {
+                    bbox: chronoscope_api_client::Bbox::new(
+                        row.bbox_min_lat,
+                        row.bbox_max_lat,
+                        row.bbox_min_lon,
+                        row.bbox_max_lon,
+                    )
+                    .map_err(|e| {
+                        DbError::InconsistentRow(format!(
+                            "invalid cluster bbox for osm_id {}: {e}",
+                            row.osm_id
+                        ))
+                    })?,
+                },
+            });
+        }
+
+        Ok((markers, rep_map))
+    }
+
+    /// Run the cluster query for a bounding box (handles antimeridian in SQL).
+    async fn query_clusters(
+        &self,
+        zone_type: &str,
+        bbox: &chronoscope_api_client::Bbox,
+    ) -> DbResult<Vec<ClusterRow>> {
+        Ok(bind_bbox(
+            sqlx::query_as::<_, ClusterRow>(queries::LIST_CLUSTERS_IN_BBOX.sql).bind(zone_type),
+            bbox,
+        )
+        .bind(MAX_CLUSTERS_PER_QUERY)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Get all annotations for a research URL.

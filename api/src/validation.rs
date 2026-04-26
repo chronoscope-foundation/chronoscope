@@ -10,18 +10,40 @@ pub use chronoscope_db::is_unique_violation;
 /// Convert a `DbError` to an `HttpError` for use in API handlers.
 ///
 /// This logs the detailed error internally (visible in Dropshot logs) while
-/// returning a generic "Internal Server Error" to clients.
+/// returning a generic "Internal Server Error" to clients. CORS headers are
+/// included so cross-origin clients can read the error response.
 pub fn db_err(e: DbError) -> HttpError {
-    HttpError::for_internal_error(e.to_string())
+    let mut err = HttpError::for_internal_error(e.to_string());
+    add_cors_headers(&mut err);
+    err
+}
+
+/// CORS headers applied to all cross-origin responses — defined once,
+/// used by both success responses (via `cors_builder`) and error
+/// responses (via `add_cors_headers`).
+const CORS_HEADERS: &[(http::HeaderName, &str)] = &[
+    (http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+    (http::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"),
+    (http::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type"),
+    (http::header::ACCESS_CONTROL_MAX_AGE, "86400"),
+];
+
+/// Add CORS headers to an `HttpError` so cross-origin clients can read it.
+fn add_cors_headers(err: &mut HttpError) {
+    for (name, value) in CORS_HEADERS {
+        if let Err(e) = err.add_header(name.clone(), http::HeaderValue::from_static(value)) {
+            eprintln!("warn: failed to add CORS header {name} to error response: {e}");
+        }
+    }
 }
 
 /// Standard CORS headers for cross-origin access.
 pub(crate) fn cors_builder() -> http::response::Builder {
-    Response::builder()
-        .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(http::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS")
-        .header(http::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type")
-        .header(http::header::ACCESS_CONTROL_MAX_AGE, "86400")
+    let mut builder = Response::builder();
+    for (name, value) in CORS_HEADERS {
+        builder = builder.header(name, *value);
+    }
+    builder
 }
 
 /// Wrap a serializable value in a JSON response with CORS headers.

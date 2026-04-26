@@ -49,8 +49,6 @@ impl QueryDef {
 /// # Errors
 /// Returns `QueryPlanError` if any query would cause a full table scan.
 pub async fn verify_all_query_plans(pool: &SqlitePool) -> Result<(), QueryPlanError> {
-    // TODO: When we add Postgres support, this will need to branch on DB type.
-    // Postgres uses `EXPLAIN` with different output format.
     for query_def in ALL {
         verify_query_plan_sql(pool, query_def.name, query_def.sql).await?;
     }
@@ -102,6 +100,16 @@ fn is_full_table_scan(detail: &str) -> bool {
         && !detail.contains("USING")
         && !detail.contains("(subquery")
         && !detail.contains("VIRTUAL TABLE")
+        // LEFT-JOIN scans are expected when joining a materialized CTE
+        // (e.g., ranked_reps) — the CTE is a small temp table without
+        // indexes, and scanning it is the correct plan.
+        //
+        // WARNING: This blanket exclusion could hide a real full-table LEFT-JOIN
+        // scan on a large table (not a CTE). If new LEFT JOINs are added against
+        // real tables, verify manually with EXPLAIN QUERY PLAN that the scan is
+        // bounded. Currently the only LEFT-JOIN scans in practice are on
+        // `ranked_reps` (small CTE) and `region_centroids` (small CTE).
+        && !detail.contains("LEFT-JOIN")
 }
 
 macro_rules! define_queries {
@@ -203,6 +211,14 @@ define_queries! {
                latitude, longitude, created_at, updated_at
         FROM entities WHERE id = ?
     ",
+    // Batch fetch entities by ID. Parameter ?1 is a JSON array of entity ID
+    // strings. Used to load cluster representatives in one round-trip instead
+    // of N+1 lookups.
+    FIND_ENTITIES_BY_IDS: "
+        SELECT id, entity_json, earliest_date, latest_date,
+               latitude, longitude, created_at, updated_at
+        FROM entities WHERE id IN (SELECT value FROM json_each(?1))
+    ",
     FIND_ENTITIES_BY_EXTERNAL_ID: "
         SELECT e.id, e.entity_json, e.earliest_date, e.latest_date,
                e.latitude, e.longitude, e.created_at, e.updated_at
@@ -229,29 +245,28 @@ define_queries! {
     // Entity listing (bounding box + keyset pagination).
     // Ordered by (updated_at DESC, id DESC) so recently-modified entities
     // appear first; both columns are part of the keyset cursor.
-    // ?5 = crosses_antimeridian (bool): when true, matches lon >= min OR lon <= max
-    // instead of lon BETWEEN min AND max. This handles viewports that wrap
-    // around the 180° meridian.
+    // Antimeridian-crossing viewports are handled by OR'ing two lon ranges
+    // (both identical for non-crossing bboxes, the two halves for crossing).
+    // Parameters: ?1=min_lat, ?2=max_lat, ?3=min_lon_a, ?4=max_lon_a, ?5=min_lon_b, ?6=max_lon_b, ?7=limit
     LIST_ENTITIES_IN_BBOX_FIRST: "
         SELECT id, entity_json, earliest_date, latest_date,
                latitude, longitude, created_at, updated_at
         FROM entities
         WHERE latitude BETWEEN ?1 AND ?2
-          AND CASE WHEN ?5 THEN (longitude >= ?3 OR longitude <= ?4)
-                   ELSE longitude BETWEEN ?3 AND ?4 END
+          AND (longitude BETWEEN ?3 AND ?4 OR longitude BETWEEN ?5 AND ?6)
         ORDER BY updated_at DESC, id DESC
-        LIMIT ?6
+        LIMIT ?7
     ",
+    // Parameters: ?1=min_lat, ?2=max_lat, ?3=min_lon_a, ?4=max_lon_a, ?5=min_lon_b, ?6=max_lon_b, ?7=cursor_updated_at, ?8=cursor_id, ?9=limit
     LIST_ENTITIES_IN_BBOX_PAGE: "
         SELECT id, entity_json, earliest_date, latest_date,
                latitude, longitude, created_at, updated_at
         FROM entities
         WHERE latitude BETWEEN ?1 AND ?2
-          AND CASE WHEN ?5 THEN (longitude >= ?3 OR longitude <= ?4)
-                   ELSE longitude BETWEEN ?3 AND ?4 END
-          AND (updated_at, id) < (?6, ?7)
+          AND (longitude BETWEEN ?3 AND ?4 OR longitude BETWEEN ?5 AND ?6)
+          AND (updated_at, id) < (?7, ?8)
         ORDER BY updated_at DESC, id DESC
-        LIMIT ?8
+        LIMIT ?9
     ",
 
     // All resolved media for a single entity (detail panel).
@@ -286,6 +301,151 @@ define_queries! {
           )
     ",
 
+    // Threshold count of entities in a bounding box (capped at N+1 to avoid full scans).
+    // Parameters: ?1=min_lat, ?2=max_lat, ?3=min_lon_a, ?4=max_lon_a, ?5=min_lon_b, ?6=max_lon_b, ?7=limit
+    COUNT_ENTITIES_IN_BBOX: "
+        SELECT COUNT(*) FROM (
+            SELECT 1 FROM entities
+            WHERE latitude BETWEEN ?1 AND ?2
+              AND (longitude BETWEEN ?3 AND ?4 OR longitude BETWEEN ?5 AND ?6)
+            LIMIT ?7
+        )
+    ",
+
+    // Threshold count of clusters in a bounding box at a given zone type.
+    // Uses a visible_regions CTE (same pattern as LIST_CLUSTERS_IN_BBOX) to
+    // avoid a redundant double-join on the regions table.
+    // Parameters: ?1=zone_type, ?2=min_lat, ?3=max_lat, ?4=min_lon_a, ?5=max_lon_a, ?6=min_lon_b, ?7=max_lon_b, ?8=limit
+    COUNT_CLUSTERS_IN_BBOX: "
+        WITH visible_regions AS (
+            SELECT osm_id
+            FROM regions_db.regions
+            WHERE zone_type = ?1
+              AND (
+                  ROWID IN (
+                      SELECT ROWID FROM regions_db.SpatialIndex
+                      WHERE f_table_name = 'regions'
+                        AND f_geometry_column = 'geometry'
+                        AND search_frame = BuildMbr(?4, ?2, ?5, ?3, 4326)
+                  )
+                  OR ROWID IN (
+                      SELECT ROWID FROM regions_db.SpatialIndex
+                      WHERE f_table_name = 'regions'
+                        AND f_geometry_column = 'geometry'
+                        AND search_frame = BuildMbr(?6, ?2, ?7, ?3, 4326)
+                  )
+              )
+        )
+        SELECT COUNT(*) FROM (
+            SELECT 1 FROM entity_regions er
+            WHERE er.zone_type = ?1
+              AND er.region_osm_id IN (SELECT osm_id FROM visible_regions)
+            GROUP BY er.region_osm_id
+            LIMIT ?8
+        )
+    ",
+
+    // Entity region assignments (entity_regions table, local DB only).
+    DELETE_ENTITY_REGIONS: "DELETE FROM entity_regions WHERE entity_id = ?",
+
+    // ==================== Spatial (regions_db) ====================
+    //
+    // These reference the attached regions_db. They're in the same macro
+    // (not a separate module) because the regions DB is always attached.
+
+    // Assign all containing regions to an entity by point-in-polygon.
+    // Uses ST_Intersects (not ST_Within) so points on boundaries still match.
+    // TODO: when two polygons of the same zone_type cover a point (border
+    // zones, enclaves), INSERT OR IGNORE picks an arbitrary winner.
+    // TODO: rebuilding the regions DB can leave orphaned entity_regions rows.
+    ASSIGN_ENTITY_REGIONS: "
+        INSERT OR IGNORE INTO entity_regions (entity_id, region_osm_id, zone_type)
+        SELECT ?3, r.osm_id, r.zone_type
+        FROM regions_db.regions r
+        WHERE r.ROWID IN (
+            SELECT ROWID FROM regions_db.SpatialIndex
+            WHERE f_table_name = 'regions'
+              AND f_geometry_column = 'geometry'
+              AND search_frame = MakePoint(?1, ?2, 4326)
+        )
+        AND ST_Intersects(MakePoint(?1, ?2, 4326), r.geometry)
+    ",
+
+    // List region clusters in a bounding box at a given zone type.
+    //
+    // `visible_regions` CTE: R-tree-filtered set of regions in the viewport.
+    // Used by both `ranked_reps` (to scope the window function) and the main
+    // SELECT (to filter results). The R-tree predicate appears exactly once.
+    //
+    // `ranked_reps` CTE: ranks entities per visible region by media presence,
+    // proximity to centroid (Manhattan distance), and entity_id tiebreaker.
+    // Only processes entities in viewport-visible regions (not all regions
+    // of the zone_type globally).
+    //
+    // Antimeridian-crossing viewports are handled by OR'ing two BuildMbr
+    // calls (both identical for non-crossing bboxes).
+    //
+    // Parameters: ?1=zone_type, ?2=min_lat, ?3=max_lat, ?4=min_lon_a, ?5=max_lon_a, ?6=min_lon_b, ?7=max_lon_b, ?8=limit
+    LIST_CLUSTERS_IN_BBOX: "
+        WITH visible_regions AS (
+            SELECT osm_id
+            FROM regions_db.regions
+            WHERE zone_type = ?1
+              AND (
+                  ROWID IN (
+                      SELECT ROWID FROM regions_db.SpatialIndex
+                      WHERE f_table_name = 'regions'
+                        AND f_geometry_column = 'geometry'
+                        AND search_frame = BuildMbr(?4, ?2, ?5, ?3, 4326)
+                  )
+                  OR ROWID IN (
+                      SELECT ROWID FROM regions_db.SpatialIndex
+                      WHERE f_table_name = 'regions'
+                        AND f_geometry_column = 'geometry'
+                        AND search_frame = BuildMbr(?6, ?2, ?7, ?3, 4326)
+                  )
+              )
+        ),
+        region_centroids AS (
+            SELECT osm_id, ST_X(ST_Centroid(geometry)) AS cx, ST_Y(ST_Centroid(geometry)) AS cy
+            FROM regions_db.regions
+            WHERE osm_id IN (SELECT osm_id FROM visible_regions)
+        ),
+        ranked_reps AS (
+            SELECT
+                er.region_osm_id,
+                e.id AS entity_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY er.region_osm_id
+                    ORDER BY
+                        EXISTS(SELECT 1 FROM annotations a JOIN research_urls ru ON a.url_id = ru.id WHERE a.entity_id = e.id AND ru.media_id IS NOT NULL) DESC,
+                        ABS(e.latitude - rc.cy) + ABS(e.longitude - rc.cx),
+                        e.id
+                ) AS rn
+            FROM entity_regions er
+            JOIN entities e ON e.id = er.entity_id
+            JOIN region_centroids rc ON rc.osm_id = er.region_osm_id
+            WHERE er.region_osm_id IN (SELECT osm_id FROM visible_regions)
+        )
+        SELECT
+            r.osm_id,
+            COALESCE(json_extract(r.international_names, '$.en'), r.name) AS region_name,
+            rc.cx AS centroid_lon,
+            rc.cy AS centroid_lat,
+            MbrMinY(r.geometry) AS bbox_min_lat,
+            MbrMaxY(r.geometry) AS bbox_max_lat,
+            MbrMinX(r.geometry) AS bbox_min_lon,
+            MbrMaxX(r.geometry) AS bbox_max_lon,
+            rr.entity_id AS representative_id
+        FROM entity_regions er
+        JOIN regions_db.regions r ON r.osm_id = er.region_osm_id
+        JOIN region_centroids rc ON rc.osm_id = r.osm_id
+        LEFT JOIN ranked_reps rr ON rr.region_osm_id = r.osm_id AND rr.rn = 1
+        WHERE er.zone_type = ?1
+          AND r.osm_id IN (SELECT osm_id FROM visible_regions)
+        GROUP BY r.osm_id
+        LIMIT ?8
+    ",
 }
 
 #[cfg(test)]
@@ -296,7 +456,11 @@ mod tests {
     #[tokio::test]
     async fn test_all_queries_use_indexes() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     {
-        let db = Database::new_without_plan_verification("sqlite::memory:").await?;
+        let db = Database::new_without_plan_verification(
+            "sqlite::memory:",
+            &crate::resolve_regions_db()?,
+        )
+        .await?;
         verify_all_query_plans(db.pool()).await?;
         Ok(())
     }

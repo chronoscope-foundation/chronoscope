@@ -5,7 +5,7 @@
 
 use wasm_bindgen::JsCast;
 
-pub use chronoscope_api_client::{Client, EntitySummary};
+pub use chronoscope_api_client::{ClickAction, Client};
 
 // ==================== Runtime Configuration ====================
 
@@ -67,8 +67,3 @@ pub async fn get_or_init_client(
 }
 
 // ==================== Constants ====================
-
-/// Maximum entities to display on the map at once.
-pub const MAX_ENTITIES: usize = 500;
-/// Entities fetched per API page.
-pub const PAGE_SIZE: u32 = 100;

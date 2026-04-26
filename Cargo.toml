@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["analysis", "api", "api-client", "core", "db", "dev", "ingestion", "integrations", "web", "workers"]
+members = ["analysis", "api", "api-client", "core", "db", "dev", "ingestion", "integrations", "tools/region-builder", "web", "workers"]
 default-members = ["analysis", "api", "api-client", "core", "db", "dev", "ingestion", "integrations", "workers"]
 
 [workspace.package]

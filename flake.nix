@@ -88,6 +88,17 @@
           rustCommonArgs = rust.commonArgs;
         };
 
+        # Phase 2b: Administrative region pipeline (OSM → SpatiaLite).
+        # Imported before wikidata because the ingest binary needs the regions DB.
+        regions = import ./nix/regions.nix {
+          inherit
+            pkgs
+            lib
+            craneLib
+            ;
+          rustCommonArgs = rust.commonArgs;
+        };
+
         wikidata = import ./nix/wikidata.nix {
           inherit
             pkgs
@@ -95,6 +106,7 @@
             craneLib
             ;
           rustCommonArgs = rust.commonArgs;
+          regionsDb = regions.regions.italy.db;
         };
 
         # Phase 3: Web frontend (WASM).
@@ -168,6 +180,8 @@
             wikidata-curated-entities = wikidata.bundles.curated.entities;
             wikidata-curated-bundle = wikidata.bundles.curated.ingestionBundle;
             wikidata-curated-db = wikidata.bundles.curated.testDb;
+            # Administrative regions pipeline.
+            regions-italy-db = regions.regions.italy.db;
           };
 
         # `nix fmt` — format Nix files.
@@ -204,6 +218,7 @@
               RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
               CORPUS_MANIFEST = corpus.corpusManifestJson;
               WIKIDATA_TEST_DB = wikidata.bundles.curated.testDb;
+              REGIONS_DB = "${regions.regions.italy.db}/regions.sqlite";
               PYTORCH_ENABLE_MPS_FALLBACK = "1";
               HF_HUB_OFFLINE = "1";
             };

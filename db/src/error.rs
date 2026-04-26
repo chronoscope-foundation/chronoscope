@@ -35,6 +35,9 @@ pub enum DbError {
 
     #[error("Inconsistent row data: {0}")]
     InconsistentRow(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;

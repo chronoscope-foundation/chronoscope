@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Initialize app state (includes database setup and migrations)
-    let db = Database::new(&config.database_url).await?;
+    let db = Database::new(&config.database_url, &chronoscope_db::resolve_regions_db()?).await?;
     let jwt = JwtConfig::from_env()?;
     let dns_resolver = default_dns_resolver()?;
 

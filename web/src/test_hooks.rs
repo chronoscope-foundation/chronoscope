@@ -20,6 +20,7 @@
 //! since we're just observing state, not driving behavior.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -29,14 +30,38 @@ use crate::api::Client;
 use crate::components::map::{FETCH_COMPLETE_EVENT, MAP_READY_EVENT};
 use crate::maplibre;
 
+// ==================== Hook storage ====================
+//
+// Closures registered on `window.__test` must outlive the registration call,
+// because JS holds the only reference to them. The previous version used
+// `mem::forget`, which is correct on the happy path but means re-registering
+// a hook (e.g., when `register_map_hooks` runs again after a hot-reload or
+// re-mount) leaks the prior closure forever and any in-flight call to it
+// targets a freed handler if the new registration replaces the JS-side ref.
+//
+// Storing closures in a `thread_local` map keyed by hook name lets a
+// re-registration deterministically drop the old `Closure` (which severs
+// its JS-side function reference). Even if the code path that triggers
+// re-registration changes in the future, hook lifetime stays sound.
+thread_local! {
+    static REGISTERED_HOOKS: RefCell<HashMap<&'static str, Box<dyn std::any::Any>>> =
+        RefCell::new(HashMap::new());
+}
+
 // ==================== Public API ====================
 
 /// Phase 1: register route-independent hooks on `window.__test`.
+///
+/// Idempotent: if `__test` already exists (e.g., re-mount during HMR),
+/// reuses the existing object so previously registered hooks aren't lost.
 pub fn register_base() {
     let Some(window) = web_sys::window() else {
         return;
     };
-    let obj = js_sys::Object::new();
+    let obj = js_sys::Reflect::get(&window, &"__test".into())
+        .ok()
+        .and_then(|v| v.dyn_into::<js_sys::Object>().ok())
+        .unwrap_or_else(js_sys::Object::new);
 
     // DOM interaction
     register(
@@ -128,6 +153,47 @@ pub fn register_map_hooks(
         }),
     );
 
+    let h = map_handle.clone();
+    register(
+        &obj,
+        "markerProperties",
+        Closure::<dyn Fn() -> JsValue>::new(move || {
+            with_map(&h, marker_properties).unwrap_or(JsValue::NULL)
+        }),
+    );
+
+    let h = map_handle.clone();
+    register(
+        &obj,
+        "layerOrder",
+        Closure::<dyn Fn() -> JsValue>::new(move || {
+            with_map(&h, layer_order).unwrap_or(JsValue::NULL)
+        }),
+    );
+
+    let h = map_handle.clone();
+    register(
+        &obj,
+        "getZoom",
+        Closure::<dyn Fn() -> f64>::new(move || with_map(&h, |m| m.get_zoom_raw()).unwrap_or(0.0)),
+    );
+
+    let h = map_handle.clone();
+    register(
+        &obj,
+        "getCenter",
+        Closure::<dyn Fn() -> JsValue>::new(move || {
+            with_map(&h, |m| {
+                let center = m.get_center();
+                let arr = js_sys::Array::new();
+                arr.push(&center.lng().into());
+                arr.push(&center.lat().into());
+                JsValue::from(arr)
+            })
+            .unwrap_or(JsValue::NULL)
+        }),
+    );
+
     // Map actions
     let h = map_handle.clone();
     register(
@@ -185,16 +251,24 @@ pub fn register_map_hooks(
 
 // ==================== Registration helper ====================
 
-/// Register a wasm_bindgen Closure on a JS object. Consumes the closure
-/// via `into_js_value()` which transfers ownership to JS GC — no `forget()`
-/// or manual leak management needed.
-fn register(obj: &js_sys::Object, name: &str, closure: impl AsRef<JsValue>) {
+/// Register a wasm_bindgen Closure on a JS object.
+///
+/// The closure is stored in `REGISTERED_HOOKS` keyed by `name`. Re-registering
+/// the same name drops the prior closure (deterministically severing its
+/// JS-side reference) before installing the new one — so HMR or re-mount
+/// can't leave dangling handlers.
+fn register<C>(obj: &js_sys::Object, name: &'static str, closure: C)
+where
+    C: AsRef<JsValue> + 'static,
+{
     if js_sys::Reflect::set(obj, &name.into(), closure.as_ref()).is_err() {
         web_sys::console::warn_1(&format!("failed to set test hook: {name}").into());
     }
-    // Intentionally leak — the closure must outlive this scope since JS holds
-    // a reference to it. This is the standard wasm-bindgen pattern.
-    std::mem::forget(closure);
+    REGISTERED_HOOKS.with(|hooks| {
+        // Inserting drops the prior Box<dyn Any> if one exists, which drops
+        // the inner Closure and frees its JS-side function reference.
+        hooks.borrow_mut().insert(name, Box::new(closure));
+    });
 }
 
 // ==================== Map access helper ====================
@@ -397,6 +471,12 @@ fn listen_once_and_resolve(event_name: &str, resolve: js_sys::Function) {
 
 // ==================== Map helpers ====================
 
+/// Count rendered markers across both the circle and thumbnail layers.
+///
+/// No dedup is needed here (unlike `marker_properties`) because the circle
+/// and thumbnail layers have mutually exclusive filters: circles use
+/// `["!", ["has", "thumbnail"]]` and thumbnails use `["has", "thumbnail"]`,
+/// so a given feature only appears in one layer at a time.
 fn marker_count(map: &maplibre::Map) -> f64 {
     use crate::components::map::{ENTITY_CIRCLES_LAYER, ENTITY_THUMBNAILS_LAYER};
     let opts = js_sys::Object::new();
@@ -416,6 +496,88 @@ fn thumbnail_marker_count(map: &maplibre::Map) -> f64 {
     let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
     map.query_rendered_features(&JsValue::UNDEFINED, &opts)
         .length() as f64
+}
+
+/// Return a JS array of marker descriptors for all rendered markers.
+/// Each entry contains the feature `properties` plus `_lng`/`_lat` from
+/// the feature geometry, so tests can both assert on properties and
+/// click on the actual rendered coordinates.
+fn marker_properties(map: &maplibre::Map) -> JsValue {
+    use crate::components::map::{ENTITY_CIRCLES_LAYER, ENTITY_THUMBNAILS_LAYER};
+    let opts = js_sys::Object::new();
+    let layers = js_sys::Array::new();
+    layers.push(&ENTITY_CIRCLES_LAYER.into());
+    layers.push(&ENTITY_THUMBNAILS_LAYER.into());
+    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
+    let features = map.query_rendered_features(&JsValue::UNDEFINED, &opts);
+
+    // Some markers (those with thumbnails) appear in both the circle and
+    // thumbnail layers — dedupe by `feature.id`. The source is configured
+    // with `promoteId: "feature_id"`, so MapLibre uses the stable string
+    // ID from the feature_id property (entity UUID or "cluster-{osm_id}").
+    // If it's ever missing, that's a bug worth surfacing.
+    let seen = js_sys::Set::new(&JsValue::UNDEFINED);
+    let result = js_sys::Array::new();
+    for i in 0..features.length() {
+        let feature = features.get(i);
+        let id = js_sys::Reflect::get(&feature, &"id".into()).unwrap_or(JsValue::UNDEFINED);
+        if id.is_undefined() || id.is_null() {
+            web_sys::console::warn_1(
+                &"marker_properties: feature missing id (generateId not set?)".into(),
+            );
+            continue;
+        }
+        if seen.has(&id) {
+            continue;
+        }
+        seen.add(&id);
+
+        // Build the descriptor: properties + _lng/_lat from geometry
+        let Ok(props) = js_sys::Reflect::get(&feature, &"properties".into()) else {
+            continue;
+        };
+        // Clone the properties object so we don't mutate MapLibre's internal state
+        let descriptor = js_sys::Object::new();
+        if let Ok(keys) = js_sys::Reflect::own_keys(&props) {
+            for j in 0..keys.length() {
+                let k = keys.get(j);
+                if let Ok(v) = js_sys::Reflect::get(&props, &k) {
+                    let _ = js_sys::Reflect::set(&descriptor, &k, &v);
+                }
+            }
+        }
+        if let Ok(geometry) = js_sys::Reflect::get(&feature, &"geometry".into())
+            && let Ok(coords) = js_sys::Reflect::get(&geometry, &"coordinates".into())
+            && let Some(coords_arr) = coords.dyn_ref::<js_sys::Array>()
+        {
+            let _ = js_sys::Reflect::set(&descriptor, &"_lng".into(), &coords_arr.get(0));
+            let _ = js_sys::Reflect::set(&descriptor, &"_lat".into(), &coords_arr.get(1));
+        }
+        result.push(&descriptor);
+    }
+    result.into()
+}
+
+/// Return a JS array of layer IDs in the order MapLibre will draw them
+/// (bottom to top). Used by the layer-order regression test to lock in
+/// the rule that thumbnails draw above labels (so labels for one
+/// region's centroid never occlude another region's thumbnail).
+fn layer_order(map: &maplibre::Map) -> JsValue {
+    let style = map.get_style();
+    let Ok(layers) = js_sys::Reflect::get(&style, &"layers".into()) else {
+        return JsValue::NULL;
+    };
+    let Ok(layers) = layers.dyn_into::<js_sys::Array>() else {
+        return JsValue::NULL;
+    };
+    let result = js_sys::Array::new();
+    for i in 0..layers.length() {
+        let layer = layers.get(i);
+        if let Ok(id) = js_sys::Reflect::get(&layer, &"id".into()) {
+            result.push(&id);
+        }
+    }
+    result.into()
 }
 
 fn jump_to(map: &maplibre::Map, lng: f64, lat: f64, zoom: f64) {
@@ -496,6 +658,6 @@ extern "C" {
     #[wasm_bindgen(method, js_class = "Map")]
     fn fire(this: &maplibre::Map, event_type: &str, data: &JsValue) -> JsValue;
 
-    #[wasm_bindgen(method, js_class = "Map")]
-    fn once(this: &maplibre::Map, event_type: &str, callback: &JsValue);
+    #[wasm_bindgen(method, js_class = "Map", js_name = getStyle)]
+    fn get_style(this: &maplibre::Map) -> JsValue;
 }

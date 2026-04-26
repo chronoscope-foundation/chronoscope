@@ -22,7 +22,7 @@ macro_rules! assert_approx_eq {
 
 /// Helper to create a database and test user.
 async fn setup() -> DbResult<(Database, UserId)> {
-    let db = Database::new("sqlite::memory:").await?;
+    let db = Database::new("sqlite::memory:", &crate::resolve_regions_db()?).await?;
     let user_id = UserId::generate();
     let email = Email::new("test@example.com");
     db.create_user(&user_id, "testuser", &email).await?;

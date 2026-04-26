@@ -1,14 +1,27 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::future::Future;
 use std::rc::Rc;
 
+use futures_util::future::{AbortHandle, AbortRegistration, Abortable};
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
+use serde::Serialize;
+use serde_json::json;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 use crate::api;
 use crate::maplibre;
+
+/// Serialize a value to a JS object using JSON-compatible mode.
+///
+/// `serde_wasm_bindgen`'s default serializer produces JS `Map` objects for
+/// Rust maps/structs. MapLibre (and most JS APIs) expect plain `Object`s
+/// with dot-accessible properties. This helper always uses `json_compatible()`
+/// to avoid that footgun.
+pub(crate) fn to_js<T: Serialize>(value: &T) -> Result<JsValue, serde_wasm_bindgen::Error> {
+    value.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+}
 
 // ==================== Constants ====================
 
@@ -53,9 +66,6 @@ pub(crate) const ENTITY_THUMBNAILS_LAYER: &str = "entity-thumbnails";
 #[cfg(feature = "test-hooks")]
 pub(crate) const THUMBNAILS_LOADED_EVENT: &str = "chronoscope-thumbnails-loaded";
 
-/// Maximum number of thumbnail images to request per viewport.
-const MAX_THUMBNAILS: usize = 30;
-
 /// Size (CSS px) of circular thumbnail images on the map.
 // TODO: Revisit for mobile — 96px may be too large on small screens.
 // Consider scaling down to ~64px based on viewport width.
@@ -74,12 +84,24 @@ pub enum EntitySelection {
     Multiple(Vec<EntityPickerEntry>),
 }
 
-/// Entry in the co-located entity picker.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct EntityPickerEntry {
-    pub id: String,
-    pub name: String,
-    pub entity_type: String,
+/// Re-export the picker entry type from the API client.
+pub use chronoscope_api_client::EntityPickerEntry;
+
+/// A map marker — the map component's uniform view of anything rendered
+/// on the map. The server decides whether to return individual entities or
+/// region clusters; the map just renders markers with positions, labels,
+/// counts, thumbnails, and click actions.
+#[derive(Clone, Debug)]
+struct MapMarker {
+    id: String,
+    /// Geographic position as `(latitude, longitude)`.
+    position: (f64, f64),
+    label: Option<String>,
+    click_action: api::ClickAction,
+    /// True if the server indicated a thumbnail exists (image may still be loading).
+    has_thumbnail: bool,
+    /// Dropping cancels any pending thumbnail load for this marker.
+    _thumbnail_abort: Option<AbortHandle>,
 }
 
 /// Signal carrying the current map selection.
@@ -108,90 +130,67 @@ pub struct MapStatus {
 
 /// Group entities by exact coordinate.
 ///
-/// Uses `f64::to_bits()` as the hash key. This is correct because these
-/// coordinates come directly from the database (stored as IEEE 754 doubles)
-/// with no arithmetic transformations — two entities at the "same place"
-/// will have bit-identical float values.
-fn coord_key(lat: f64, lon: f64) -> (u64, u64) {
-    (lat.to_bits(), lon.to_bits())
-}
+/// Build a GeoJSON `FeatureCollection` from a list of map markers.
+///
+/// One marker = one feature. The server handles co-location grouping,
+/// so there's no client-side coordinate dedup or entity/cluster branching.
+fn build_markers_geojson(markers: &[MapMarker]) -> Option<JsValue> {
+    use geojson::{Feature, FeatureCollection, Geometry, Value, feature};
 
-/// Build a GeoJSON `FeatureCollection` from entity data, grouping co-located entities.
-fn build_geojson(
-    entities: &[api::EntitySummary],
-    selected_id: Option<&str>,
-    thumbnails: &ThumbnailMap,
-) -> Option<JsValue> {
-    use geojson::{Feature, FeatureCollection, Geometry, Value};
-
-    let mut groups: HashMap<(u64, u64), Vec<&api::EntitySummary>> = HashMap::new();
-    for e in entities {
-        groups
-            .entry(coord_key(e.latitude, e.longitude))
-            .or_default()
-            .push(e);
-    }
-
-    let mut features = Vec::new();
-    for group in groups.values() {
-        let first = group[0];
-        let is_selected = group.iter().any(|e| selected_id == Some(e.id.as_str()));
-
-        let geometry = Geometry::new(Value::Point(vec![first.longitude, first.latitude]));
-
-        // Sort co-located entities by earliest_date (undated last) so the
-        // disambiguation picker is in temporal order, not the API's
-        // updated_at default.
-        let mut sorted_group: Vec<&api::EntitySummary> = group.clone();
-        sorted_group.sort_by_key(|e| (e.earliest_date.is_none(), e.earliest_date));
-
-        let entries: Vec<EntityPickerEntry> = sorted_group
-            .iter()
-            .map(|e| EntityPickerEntry {
-                id: e.id.to_string(),
-                name: e.name.clone().unwrap_or_else(|| "Unknown".to_string()),
-                entity_type: e.entity_type.to_string(),
-            })
-            .collect();
-
-        let mut props = serde_json::Map::new();
-        props.insert("count".into(), entries.len().into());
-        props.insert("selected".into(), is_selected.into());
-        props.insert(
-            "name".into(),
-            entries
-                .first()
-                .map(|e| e.name.as_str())
-                .unwrap_or("Unknown")
-                .into(),
-        );
-
-        // For single entities, set "id" so click handler can select directly.
-        if entries.len() == 1 {
-            props.insert("id".into(), entries[0].id.clone().into());
-            props.insert("entity_type".into(), entries[0].entity_type.clone().into());
-        }
-        // Attach a thumbnail if any entity at this location has one loaded.
-        if let Some(image_name) = entries.iter().find_map(|e| thumbnails.get(&e.id)) {
-            props.insert("thumbnail".into(), image_name.clone().into());
-        }
-        // Always set "group" — the click handler uses it for multi-entity pickers,
-        // and having it on single entities is harmless.
-        match serde_json::to_string(&entries) {
-            Ok(json) => {
-                props.insert("group".into(), json.into());
+    let features: Vec<Feature> = markers
+        .iter()
+        .map(|marker| {
+            // GeoJSON Point is [lon, lat]
+            let geometry = Geometry::new(Value::Point(vec![marker.position.1, marker.position.0]));
+            let mut props = serde_json::Map::new();
+            props.insert("feature_id".into(), marker.id.clone().into());
+            if let Some(ref label) = marker.label {
+                props.insert("name".into(), label.clone().into());
             }
-            Err(e) => {
-                web_sys::console::warn_1(&format!("Failed to serialize entity group: {e}").into());
-            }
-        }
 
-        features.push(Feature {
-            geometry: Some(geometry),
-            properties: Some(props),
-            ..Feature::default()
-        });
-    }
+            match &marker.click_action {
+                api::ClickAction::Select {
+                    entity_id,
+                    entity_type,
+                } => {
+                    props.insert("kind".into(), "entity".into());
+                    props.insert("id".into(), entity_id.to_string().into());
+                    props.insert("entity_type".into(), entity_type.to_string().into());
+                }
+                api::ClickAction::ZoomTo { bbox } => {
+                    props.insert("kind".into(), "cluster".into());
+                    props.insert("bbox_min_lat".into(), bbox.min_lat().into());
+                    props.insert("bbox_max_lat".into(), bbox.max_lat().into());
+                    props.insert("bbox_min_lon".into(), bbox.min_lon().into());
+                    props.insert("bbox_max_lon".into(), bbox.max_lon().into());
+                }
+                api::ClickAction::Disambiguate { entries } => {
+                    props.insert("kind".into(), "entity".into());
+                    if let Ok(json) = serde_json::to_string(entries) {
+                        props.insert("group".into(), json.into());
+                    }
+                }
+            }
+
+            // Mark features whose thumbnails are loading so the circle layer
+            // can show a distinct "pending" style. The `thumbnail` property
+            // (which triggers the symbol layer) is patched in via updateData
+            // once the image actually loads.
+            if marker.has_thumbnail {
+                props.insert("has_thumbnail".into(), true.into());
+            }
+
+            Feature {
+                // Set the GeoJSON-level id so MapLibre's updateData can
+                // match features by id. promoteId alone isn't sufficient —
+                // updateData resolves against the feature's own id field.
+                id: Some(feature::Id::String(marker.id.clone())),
+                geometry: Some(geometry),
+                properties: Some(props),
+                ..Feature::default()
+            }
+        })
+        .collect();
 
     let collection = FeatureCollection {
         features,
@@ -199,27 +198,23 @@ fn build_geojson(
         foreign_members: None,
     };
 
-    let serializer = serde_wasm_bindgen::Serializer::json_compatible();
-    collection.serialize(&serializer).ok()
+    to_js(&collection).ok()
 }
 
 // ==================== MapLibre source/layer setup ====================
 
-use serde::Serialize;
-use serde_json::json;
-
 /// Typed GeoJSON source specification for `map.addSource`.
+///
+/// `promote_id: "feature_id"` tells MapLibre to use the `feature_id`
+/// property as each feature's stable ID. This is required for
+/// `setFeatureState` (selection highlighting) and for deduplicating
+/// `queryRenderedFeatures` across layers.
 #[derive(Serialize)]
 struct GeoJsonSourceSpec {
     r#type: &'static str,
-    data: EmptyFeatureCollection,
-}
-
-/// An empty GeoJSON `FeatureCollection` (used as initial source data).
-#[derive(Serialize)]
-struct EmptyFeatureCollection {
-    r#type: &'static str,
-    features: [(); 0],
+    data: serde_json::Value,
+    #[serde(rename = "promoteId")]
+    promote_id: &'static str,
 }
 
 /// Initialize empty GeoJSON source and layers on the map.
@@ -229,13 +224,10 @@ struct EmptyFeatureCollection {
 fn init_source_and_layers(map: &maplibre::Map) {
     let source = GeoJsonSourceSpec {
         r#type: "geojson",
-        data: EmptyFeatureCollection {
-            r#type: "FeatureCollection",
-            features: [],
-        },
+        data: json!({"type": "FeatureCollection", "features": []}),
+        promote_id: "feature_id",
     };
-    let serializer = serde_wasm_bindgen::Serializer::json_compatible();
-    let Ok(source_js) = source.serialize(&serializer) else {
+    let Ok(source_js) = to_js(&source) else {
         web_sys::console::error_1(&"Failed to serialize GeoJSON source spec".into());
         return;
     };
@@ -244,24 +236,30 @@ fn init_source_and_layers(map: &maplibre::Map) {
         return;
     }
 
-    let get_count = json!(["get", "count"]);
-    let get_selected = json!(["get", "selected"]);
+    // Coalesce expressions: MapLibre evaluates paint expressions even
+    // during source initialization when properties/feature-state may be
+    // null. Wrap in ["coalesce", ..., default] to avoid type errors.
+    let get_selected = json!(["coalesce", ["feature-state", "selected"], false]);
+    let has_thumbnail = json!(["coalesce", ["get", "has_thumbnail"], false]);
 
-    // Circle layer for the marker dots (hidden when a thumbnail is available)
+    // Circle layer for the marker dots.
+    // - Hidden when a loaded thumbnail is displayed (symbol layer takes over).
+    // - Markers with a pending thumbnail show a larger, lighter placeholder
+    //   circle so the user knows an image is loading.
     let circle = json!({
         "id": ENTITY_CIRCLES_LAYER,
         "type": "circle",
         "source": ENTITY_SOURCE_ID,
         "filter": ["!", ["has", "thumbnail"]],
         "paint": {
-            "circle-radius": ["interpolate", ["linear"], get_count, 1, 7, 5, 12, 20, 18],
-            "circle-color": ["case", [">", get_count, 1], "#6B4226", "#8B5E3C"],
+            "circle-radius": ["case", has_thumbnail, 20, 10],
+            "circle-color": ["case", has_thumbnail, "#D5C4A1", "#8B5E3C"],
             "circle-stroke-width": ["case", get_selected, 4, 2],
             "circle-stroke-color": ["case", get_selected, "#FFFFFF", "#F5F0E8"],
-            "circle-opacity": 0.85
+            "circle-opacity": ["case", has_thumbnail, 0.5, 0.85]
         }
     });
-    let Ok(circle_js) = circle.serialize(&serializer) else {
+    let Ok(circle_js) = to_js(&circle) else {
         web_sys::console::error_1(&"Failed to serialize circle layer spec".into());
         return;
     };
@@ -270,7 +268,61 @@ fn init_source_and_layers(map: &maplibre::Map) {
         return;
     }
 
-    // Symbol layer for thumbnail images (below count labels, above circles)
+    // Symbol layer for marker labels — added BEFORE thumbnails so thumbnails
+    // render on top and aren't occluded by neighboring labels.
+    // - Co-located entity groups show the count.
+    // - Clusters show the region name and count.
+    // - Single entities show no label (the thumbnail or circle is enough).
+    // Read label styling from the basemap's city label layer so our markers
+    // match the basemap visually, regardless of which style is loaded.
+    let basemap = "label_city";
+    let labels = json!({
+        "id": "entity-labels",
+        "type": "symbol",
+        "source": ENTITY_SOURCE_ID,
+        "filter": ["has", "name"],
+        "layout": {
+            "text-field": ["get", "name"],
+            "text-size": 12,
+            "text-anchor": "top",
+            "text-offset": [0, 0.8],
+            "text-allow-overlap": false,
+            "text-ignore-placement": false,
+            "text-max-width": 8
+        }
+    });
+    let Ok(labels_js) = to_js(&labels) else {
+        web_sys::console::error_1(&"Failed to serialize labels layer spec".into());
+        return;
+    };
+    // Copy font and paint properties from the basemap label layer.
+    let Ok(layout) = js_sys::Reflect::get(&labels_js, &"layout".into()) else {
+        web_sys::console::error_1(&"Failed to read layout from labels spec".into());
+        return;
+    };
+    let font = map.get_layout_property(basemap, "text-font");
+    if !font.is_undefined() {
+        let _ = js_sys::Reflect::set(&layout, &"text-font".into(), &font);
+    }
+    let paint = js_sys::Object::new();
+    for prop in &[
+        "text-color",
+        "text-halo-color",
+        "text-halo-width",
+        "text-halo-blur",
+    ] {
+        let val = map.get_paint_property(basemap, prop);
+        if !val.is_undefined() {
+            let _ = js_sys::Reflect::set(&paint, &(*prop).into(), &val);
+        }
+    }
+    let _ = js_sys::Reflect::set(&labels_js, &"paint".into(), &paint);
+    if let Err(e) = map.add_layer(&labels_js) {
+        web_sys::console::error_1(&format!("Failed to add labels layer: {e:?}").into());
+    }
+
+    // Symbol layer for thumbnail images — added LAST so thumbnails render on
+    // top of all other marker layers (circles and labels).
     let thumbnails = json!({
         "id": ENTITY_THUMBNAILS_LAYER,
         "type": "symbol",
@@ -287,93 +339,74 @@ fn init_source_and_layers(map: &maplibre::Map) {
             "icon-opacity": 0.95
         }
     });
-    let Ok(thumbnails_js) = thumbnails.serialize(&serializer) else {
+    let Ok(thumbnails_js) = to_js(&thumbnails) else {
         web_sys::console::error_1(&"Failed to serialize thumbnails layer spec".into());
         return;
     };
     if let Err(e) = map.add_layer(&thumbnails_js) {
         web_sys::console::error_1(&format!("Failed to add thumbnails layer: {e:?}").into());
     }
-
-    // Symbol layer for count labels on co-located entities (rendered on top)
-    let labels = json!({
-        "id": "entity-labels",
-        "type": "symbol",
-        "source": ENTITY_SOURCE_ID,
-        "filter": [">", ["get", "count"], 1],
-        "layout": {
-            "text-field": ["to-string", get_count],
-            "text-font": ["Noto Sans Bold"],
-            "text-size": 11,
-            "text-allow-overlap": true,
-            "text-ignore-placement": true
-        },
-        "paint": {
-            "text-color": "#F5F0E8",
-            "text-halo-color": "rgba(0,0,0,0.3)",
-            "text-halo-width": 1
-        }
-    });
-    let Ok(labels_js) = labels.serialize(&serializer) else {
-        web_sys::console::error_1(&"Failed to serialize labels layer spec".into());
-        return;
-    };
-    if let Err(e) = map.add_layer(&labels_js) {
-        web_sys::console::error_1(&format!("Failed to add labels layer: {e:?}").into());
-    }
 }
 
-/// Update the existing GeoJSON source with new data.
-fn update_source_data(map: &maplibre::Map, geojson: &JsValue) {
-    match map.get_source(ENTITY_SOURCE_ID) {
+/// Update an existing GeoJSON source with new data.
+fn update_source_data(map: &maplibre::Map, source_id: &str, geojson: &JsValue) {
+    match map.get_source(source_id) {
         Some(source) => source.set_data(geojson),
         None => {
             web_sys::console::warn_1(
-                &format!("GeoJSON source '{ENTITY_SOURCE_ID}' not found on map — was init_source_and_layers called?").into(),
+                &format!("GeoJSON source '{source_id}' not found on map — was init_source_and_layers called?").into(),
             );
         }
+    }
+}
+
+/// Clear a GeoJSON source by setting it to an empty feature collection.
+fn clear_source_data(map: &maplibre::Map, source_id: &str) {
+    let empty = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": []
+    });
+    if let Ok(js) = to_js(&empty) {
+        update_source_data(map, source_id, &js);
     }
 }
 
 // ==================== Entity fetching ====================
 
 /// Track whether the GeoJSON source has been added to the map.
-type SourceInitialized = Rc<Cell<bool>>;
+///
+/// This is a Leptos signal so that effects (`effect_rebuild_geojson`,
+/// `effect_selection`) track it reactively rather than reading an untracked
+/// `Rc<Cell<bool>>` that wouldn't trigger re-runs.
+type SourceInitialized = RwSignal<bool>;
 
 /// Signals needed by viewport entity fetching and GeoJSON rebuilds.
 ///
 /// All fields are `Copy` (Leptos signals), so this struct is `Copy` too —
 /// it can be captured by closures without cloning.
-/// Map from entity ID → MapLibre image name for loaded thumbnails.
-type ThumbnailMap = HashMap<String, String>;
-
 #[derive(Clone, Copy)]
 struct ViewportSignals {
     set_loading: WriteSignal<bool>,
     set_truncated: WriteSignal<bool>,
     set_empty: WriteSignal<bool>,
     set_fetch_error: WriteSignal<Option<String>>,
+    set_map_error: WriteSignal<Option<String>>,
     selected: ReadSignal<Option<EntitySelection>>,
-    /// Fetched entities for the current viewport. Written by
-    /// `load_entities_for_viewport`, read by the GeoJSON rebuild effect.
-    cached_entities: ReadSignal<Vec<api::EntitySummary>>,
-    set_cached_entities: WriteSignal<Vec<api::EntitySummary>>,
-    /// Map of entity ID → MapLibre image name for loaded thumbnails.
-    thumbnails: ReadSignal<ThumbnailMap>,
-    set_thumbnails: WriteSignal<ThumbnailMap>,
+    /// All markers currently rendered on the map.
+    cached_markers: ReadSignal<Vec<MapMarker>>,
+    set_cached_markers: WriteSignal<Vec<MapMarker>>,
 }
 
 async fn load_entities_for_viewport(
     map: &maplibre::Map,
     client: &api::Client,
-    generation: u64,
-    generation_counter: &Rc<Cell<u64>>,
     signals: ViewportSignals,
 ) {
     let (min_lon, min_lat, max_lon, max_lat) = maplibre::get_viewport_bounds(map);
 
     signals.set_loading.set(true);
     signals.set_fetch_error.set(None);
+    signals.set_map_error.set(None);
 
     let bbox = match chronoscope_api_client::Bbox::new(min_lat, max_lat, min_lon, max_lon) {
         Ok(b) => b,
@@ -386,43 +419,131 @@ async fn load_entities_for_viewport(
         }
     };
 
-    // Fetch one extra to detect whether there are more results than we display.
-    use futures_util::{StreamExt, TryStreamExt};
-    let result: Result<Vec<_>, _> = client
-        .list_entities_pages(&bbox, api::PAGE_SIZE)
-        .take(api::MAX_ENTITIES + 1)
-        .try_collect()
-        .await;
-
-    // Discard stale response: when the user pans rapidly, multiple
-    // fetches fire concurrently. Without this check, a slow early
-    // response could overwrite a newer one.
-    if generation_counter.get() != generation {
-        return;
-    }
+    // Single call to /markers — the server decides granularity.
+    let result = client.list_markers(&bbox).await;
 
     match result {
-        Ok(mut entities) => {
-            let truncated = entities.len() > api::MAX_ENTITIES;
-            entities.truncate(api::MAX_ENTITIES);
+        Ok(response) => {
             signals.set_loading.set(false);
-            signals.set_truncated.set(truncated);
+            signals.set_truncated.set(response.truncated);
             signals.set_fetch_error.set(None);
-            signals.set_empty.set(entities.is_empty());
-            // Set entities immediately so circles appear on the map,
-            // then load thumbnails progressively (the clone is needed because
-            // we set the signal before borrowing for thumbnail loading).
-            signals.set_cached_entities.set(entities.clone());
+            signals.set_empty.set(response.markers.is_empty());
 
-            load_thumbnails_for_viewport(
-                map.clone(),
-                client,
-                &entities,
-                generation,
-                generation_counter,
-                signals,
-            )
-            .await;
+            // Collect thumbnail URLs before markers are moved into the signal.
+            let marker_thumbnail_urls: std::collections::HashMap<String, String> = response
+                .markers
+                .iter()
+                .filter_map(|m| {
+                    m.thumbnail_url
+                        .as_ref()
+                        .map(|url| (m.id.to_string(), url.clone()))
+                })
+                .collect();
+
+            // Convert API markers to MapMarkers. Thumbnail loads are spawned
+            // below — each marker just stores an AbortHandle for cancellation.
+            let mut new_markers: Vec<MapMarker> = response
+                .markers
+                .into_iter()
+                .map(|m| {
+                    let has_thumbnail = m.thumbnail_url.is_some();
+                    MapMarker {
+                        id: m.id.to_string(),
+                        position: (m.latitude, m.longitude),
+                        label: m.label,
+                        click_action: m.click_action,
+                        has_thumbnail,
+                        _thumbnail_abort: None,
+                    }
+                })
+                .collect();
+
+            // For each marker with a thumbnail URL, spawn an image load in
+            // the viewport scope. When the image loads: draw canvas → register
+            // with MapLibre → patch the single feature via updateData.
+            let dpr = device_pixel_ratio();
+            for marker in &mut new_markers {
+                if let Some(url) = marker_thumbnail_urls.get(&marker.id) {
+                    let map = map.clone();
+                    let marker_id = marker.id.clone();
+                    let url = url.to_string();
+                    let (abort_handle, abort_reg) = AbortHandle::new_pair();
+                    wasm_bindgen_futures::spawn_local({
+                        let fut = async move {
+                            let img = match load_image(&url).await {
+                                Ok(img) => img,
+                                Err(e) => {
+                                    web_sys::console::warn_1(
+                                        &format!("thumbnail load failed for {marker_id}: {e}")
+                                            .into(),
+                                    );
+                                    return;
+                                }
+                            };
+                            let image_data = match draw_circular_thumbnail(&img, dpr) {
+                                Ok(data) => data,
+                                Err(e) => {
+                                    web_sys::console::warn_1(
+                                        &format!("thumbnail draw failed for {marker_id}: {e}")
+                                            .into(),
+                                    );
+                                    return;
+                                }
+                            };
+                            let image_name = format!("thumb-{marker_id}");
+                            let opts = js_sys::Object::new();
+                            let _ = js_sys::Reflect::set(&opts, &"pixelRatio".into(), &dpr.into());
+                            // A prior fetch may have already registered this image
+                            // (duplicate fetches from moveend race). Skip add_image
+                            // but still updateData below to re-apply the property
+                            // that set_data wiped.
+                            if !map.has_image(&image_name)
+                                && let Err(e) = map.add_image_with_options(
+                                    &image_name,
+                                    image_data.as_ref(),
+                                    &opts,
+                                )
+                            {
+                                web_sys::console::warn_1(
+                                    &format!("add_image failed for {marker_id}: {e:?}").into(),
+                                );
+                                return;
+                            }
+                            // Patch this feature's thumbnail property via updateData
+                            if let Some(source) = map.get_source(ENTITY_SOURCE_ID) {
+                                let diff = serde_json::json!({
+                                    "update": [{
+                                        "id": marker_id,
+                                        "addOrUpdateProperties": [
+                                            {"key": "thumbnail", "value": image_name}
+                                        ]
+                                    }]
+                                });
+                                if let Ok(diff_js) = to_js(&diff) {
+                                    source.update_data(&diff_js);
+                                }
+                            }
+
+                            // Signal thumbnail readiness for test hooks.
+                            #[cfg(feature = "test-hooks")]
+                            dispatch_window_event(THUMBNAILS_LOADED_EVENT);
+                        };
+                        async move {
+                            let _ = Abortable::new(fut, abort_reg).await;
+                        }
+                    });
+                    marker._thumbnail_abort = Some(abort_handle);
+                }
+            }
+
+            // If no thumbnails to load, signal readiness immediately so
+            // test hooks don't hang waiting for an event that will never fire.
+            #[cfg(feature = "test-hooks")]
+            if marker_thumbnail_urls.is_empty() {
+                dispatch_window_event(THUMBNAILS_LOADED_EVENT);
+            }
+
+            signals.set_cached_markers.set(new_markers);
         }
         Err(e) => {
             signals.set_loading.set(false);
@@ -435,7 +556,7 @@ async fn load_entities_for_viewport(
     dispatch_window_event(FETCH_COMPLETE_EVENT);
 }
 
-// ==================== Thumbnail loading ====================
+// ==================== Thumbnail registration ====================
 //
 // Thumbnails use MapLibre's `addImage` + symbol layer, which is the intended
 // way to do custom icons — once registered, they're rendered by MapLibre's
@@ -476,28 +597,39 @@ fn device_pixel_ratio() -> f64 {
 fn draw_circular_thumbnail(
     img: &web_sys::HtmlImageElement,
     dpr: f64,
-) -> Option<web_sys::ImageData> {
-    let document = web_sys::window()?.document()?;
+) -> Result<web_sys::ImageData, String> {
+    let document = web_sys::window()
+        .and_then(|w| w.document())
+        .ok_or("no document")?;
     let canvas = document
         .create_element("canvas")
-        .ok()?
+        .map_err(|e| format!("create_element failed: {e:?}"))?
         .dyn_into::<web_sys::HtmlCanvasElement>()
-        .ok()?;
+        .map_err(|_| "cast to HtmlCanvasElement failed")?;
     let thumb_r = f64::from(THUMBNAIL_SIZE) / 2.0 * dpr;
     let border = 2.0 * dpr;
     let stem_len = STEM_LENGTH * dpr;
     let dot_r = DOT_RADIUS * dpr;
-    let canvas_w = (f64::from(THUMBNAIL_SIZE) * dpr) as u32;
-    // Extra space below dot for the drop shadow ellipse
-    let canvas_h = (f64::from(THUMBNAIL_SIZE) * dpr + stem_len + dot_r * 2.0 + dot_r) as u32;
+    // Use ceil() so non-integer device pixel ratios (1.5/1.75/2.625 on
+    // some Windows and Android devices) don't clip the bottom row of the
+    // drop shadow.
+    let canvas_w = (f64::from(THUMBNAIL_SIZE) * dpr).ceil() as u32;
+    // Extra space below dot for the drop shadow (blur + offset can extend
+    // further than `dot_r` alone, especially on Retina displays).
+    let shadow_blur = 4.0 * dpr;
+    let shadow_offset_y = 2.0 * dpr;
+    let bottom_pad = dot_r.max(shadow_blur + shadow_offset_y);
+    let canvas_h =
+        (f64::from(THUMBNAIL_SIZE) * dpr + stem_len + dot_r * 2.0 + bottom_pad).ceil() as u32;
     canvas.set_width(canvas_w);
     canvas.set_height(canvas_h);
 
     let ctx = canvas
         .get_context("2d")
-        .ok()??
+        .map_err(|e| format!("getContext failed: {e:?}"))?
+        .ok_or("getContext returned None")?
         .dyn_into::<web_sys::CanvasRenderingContext2d>()
-        .ok()?;
+        .map_err(|_| "cast to CanvasRenderingContext2d failed")?;
 
     let cx = f64::from(canvas_w) / 2.0; // horizontal center
     let thumb_cy = thumb_r; // thumbnail circle center Y
@@ -506,7 +638,7 @@ fn draw_circular_thumbnail(
     ctx.save();
     ctx.begin_path();
     ctx.arc(cx, thumb_cy, thumb_r - border, 0.0, std::f64::consts::TAU)
-        .ok()?;
+        .map_err(|e| format!("arc failed: {e:?}"))?;
     ctx.clip();
 
     let nw = f64::from(img.natural_width());
@@ -525,7 +657,7 @@ fn draw_circular_thumbnail(
         thumb_r * 2.0,
         thumb_r * 2.0, // dest: fill circle
     )
-    .ok()?;
+    .map_err(|e| format!("drawImage failed: {e:?}"))?;
     ctx.restore();
 
     // Thumbnail border
@@ -539,7 +671,7 @@ fn draw_circular_thumbnail(
         0.0,
         std::f64::consts::TAU,
     )
-    .ok()?;
+    .map_err(|e| format!("arc failed: {e:?}"))?;
     ctx.stroke();
 
     // --- Stem line ---
@@ -563,7 +695,7 @@ fn draw_circular_thumbnail(
     ctx.set_fill_style_str("#8B5E3C"); // copper fill
     ctx.begin_path();
     ctx.arc(cx, dot_cy, dot_r, 0.0, std::f64::consts::TAU)
-        .ok()?;
+        .map_err(|e| format!("arc failed: {e:?}"))?;
     ctx.fill();
     // Restore before stroke so the shadow only applies to the fill, not the border
     ctx.restore();
@@ -572,128 +704,24 @@ fn draw_circular_thumbnail(
     ctx.stroke();
 
     ctx.get_image_data(0.0, 0.0, f64::from(canvas_w), f64::from(canvas_h))
-        .ok()
-}
-
-/// Load thumbnails for visible entities and register them as MapLibre images.
-///
-/// Fetches thumbnail URLs for a subset of entity IDs, loads images
-/// incrementally (each appears on the map as soon as it loads rather than
-/// waiting for the entire batch), and cleans up stale images that are no
-/// longer in the viewport.
-///
-/// Uses `generation` to detect stale loads — if the viewport has changed since
-/// this call started, the results are discarded.
-async fn load_thumbnails_for_viewport(
-    map: maplibre::Map,
-    client: &api::Client,
-    entities: &[api::EntitySummary],
-    generation: u64,
-    generation_counter: &Rc<Cell<u64>>,
-    signals: ViewportSignals,
-) {
-    use chronoscope_api_client::EntityId;
-    use futures_util::StreamExt;
-    use futures_util::stream::FuturesUnordered;
-
-    let ids: Vec<EntityId> = entities
-        .iter()
-        .take(MAX_THUMBNAILS)
-        .map(|e| e.id.clone())
-        .collect();
-
-    let new_entity_ids: std::collections::HashSet<String> =
-        ids.iter().map(|id| id.to_string()).collect();
-
-    // Remove only thumbnails that are no longer in the viewport (diff, not clear-all).
-    let old_thumbnails = signals.thumbnails.get_untracked();
-    let mut kept: ThumbnailMap = HashMap::new();
-    for (entity_id, image_name) in &old_thumbnails {
-        if new_entity_ids.contains(entity_id) {
-            kept.insert(entity_id.clone(), image_name.clone());
-        } else if map.has_image(image_name) {
-            let _ = map.remove_image(image_name);
-        }
-    }
-    signals.set_thumbnails.set(kept);
-
-    if ids.is_empty() {
-        return;
-    }
-
-    let response = match client.get_entity_thumbnails(&ids).await {
-        Ok(r) => r,
-        Err(e) => {
-            web_sys::console::warn_1(&format!("Failed to fetch entity thumbnails: {e}").into());
-            return;
-        }
-    };
-
-    if generation_counter.get() != generation {
-        return;
-    }
-
-    let dpr = device_pixel_ratio();
-    let opts = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&opts, &"pixelRatio".into(), &JsValue::from_f64(dpr));
-
-    // Capture current thumbnails once (not per-filter-iteration).
-    let current_thumbs = signals.thumbnails.get_untracked();
-
-    // Load images in parallel, skipping entities that already have thumbnails.
-    let mut futures: FuturesUnordered<_> = response
-        .thumbnails
-        .iter()
-        .filter(|(eid, _)| !current_thumbs.contains_key(&eid.to_string()))
-        .map(|(entity_id, thumb_info)| {
-            let entity_id = entity_id.to_string();
-            let url = thumb_info.url.clone();
-            async move { (entity_id, load_image(&url).await) }
-        })
-        .collect();
-
-    // Collect loaded thumbnails, then update the signal once (avoids
-    // triggering a GeoJSON rebuild per image).
-    let mut batch: ThumbnailMap = HashMap::new();
-
-    while let Some((entity_id, img_opt)) = futures.next().await {
-        if generation_counter.get() != generation {
-            return;
-        }
-
-        let Some(img) = img_opt else {
-            continue;
-        };
-
-        let image_name = format!("thumb-{entity_id}");
-
-        let Some(image_data) = draw_circular_thumbnail(&img, dpr) else {
-            continue;
-        };
-
-        if map
-            .add_image_with_options(&image_name, image_data.as_ref(), &opts)
-            .is_ok()
-        {
-            batch.insert(entity_id, image_name);
-        }
-    }
-
-    if !batch.is_empty() {
-        signals.set_thumbnails.update(|m| m.extend(batch));
-    }
-
-    #[cfg(feature = "test-hooks")]
-    dispatch_window_event(THUMBNAILS_LOADED_EVENT);
+        .map_err(|e| format!("getImageData failed: {e:?}"))
 }
 
 /// Load an image from a URL, returning the `HtmlImageElement` when loaded.
-async fn load_image(url: &str) -> Option<web_sys::HtmlImageElement> {
-    let img = web_sys::HtmlImageElement::new().ok()?;
+///
+/// `crossOrigin = "anonymous"` is required so the resulting image can be
+/// drawn to a canvas and read back via `getImageData` without tainting it.
+/// The thumbnail server must respond with `Access-Control-Allow-Origin`
+/// — without it, every image silently fails to load.
+async fn load_image(url: &str) -> Result<web_sys::HtmlImageElement, String> {
+    let img = web_sys::HtmlImageElement::new()
+        .map_err(|e| format!("HtmlImageElement::new failed: {e:?}"))?;
     img.set_cross_origin(Some("anonymous"));
 
     let img_for_handlers = img.clone();
     let promise = js_sys::Promise::new(&mut move |resolve, reject| {
+        // TODO: on abort, the <img> may outlive the future, leaking
+        // these closures until the orphaned element is GC'd. Bounded leak.
         let resolve_cb = Closure::once_into_js(move || {
             let _ = resolve.call0(&JsValue::NULL);
         });
@@ -706,14 +734,83 @@ async fn load_image(url: &str) -> Option<web_sys::HtmlImageElement> {
 
     img.set_src(url);
 
-    wasm_bindgen_futures::JsFuture::from(promise).await.ok()?;
-    Some(img)
+    wasm_bindgen_futures::JsFuture::from(promise)
+        .await
+        .map_err(|_| format!("image load failed for {url}"))?;
+    Ok(img)
 }
 
 // ==================== Click handler helpers ====================
 
-/// Handle a click on the entity circles layer.
-fn handle_entity_click(event: JsValue, set_selected: WriteSignal<Option<EntitySelection>>) {
+/// What a click on a marker resolves to.
+///
+/// Parsed from the flat GeoJSON feature properties (set in
+/// `build_markers_geojson`) into a proper discriminated type.
+enum ClickTarget {
+    /// Zoom to a region bounding box (cluster click).
+    ZoomTo {
+        bbox_min_lat: f64,
+        bbox_max_lat: f64,
+        bbox_min_lon: f64,
+        bbox_max_lon: f64,
+    },
+    /// Select a single entity.
+    Select(String),
+    /// Disambiguate co-located entities.
+    Disambiguate(Vec<EntityPickerEntry>),
+}
+
+/// Raw deserialization target for GeoJSON feature properties.
+/// Immediately converted to [`ClickTarget`] — never used directly.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RawMarkerProps {
+    Entity {
+        id: Option<String>,
+        group: Option<String>,
+    },
+    Cluster {
+        bbox_min_lat: f64,
+        bbox_max_lat: f64,
+        bbox_min_lon: f64,
+        bbox_max_lon: f64,
+    },
+}
+
+impl RawMarkerProps {
+    fn into_click_target(self) -> Option<ClickTarget> {
+        match self {
+            Self::Cluster {
+                bbox_min_lat,
+                bbox_max_lat,
+                bbox_min_lon,
+                bbox_max_lon,
+            } => Some(ClickTarget::ZoomTo {
+                bbox_min_lat,
+                bbox_max_lat,
+                bbox_min_lon,
+                bbox_max_lon,
+            }),
+            Self::Entity {
+                group: Some(json), ..
+            } => serde_json::from_str::<Vec<EntityPickerEntry>>(&json)
+                .ok()
+                .map(ClickTarget::Disambiguate),
+            Self::Entity { id: Some(id), .. } => Some(ClickTarget::Select(id)),
+            Self::Entity {
+                id: None,
+                group: None,
+            } => None,
+        }
+    }
+}
+
+/// Handle a click on a marker (entity or cluster), dispatching on `kind`.
+fn handle_marker_click(
+    event: JsValue,
+    map: &maplibre::Map,
+    set_selected: WriteSignal<Option<EntitySelection>>,
+) {
     let features = js_sys::Reflect::get(&event, &"features".into()).ok();
     let features = features.and_then(|f| f.dyn_into::<js_sys::Array>().ok());
     let Some(features) = features else { return };
@@ -721,27 +818,49 @@ fn handle_entity_click(event: JsValue, set_selected: WriteSignal<Option<EntitySe
         return;
     }
     let feature = features.get(0);
-    let Some(props) = js_sys::Reflect::get(&feature, &"properties".into()).ok() else {
+    let Some(props_js) = js_sys::Reflect::get(&feature, &"properties".into()).ok() else {
         return;
     };
 
-    let count = js_sys::Reflect::get(&props, &"count".into())
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1.0) as u32;
+    let raw: RawMarkerProps = match serde_wasm_bindgen::from_value(props_js) {
+        Ok(p) => p,
+        Err(e) => {
+            web_sys::console::warn_1(&format!("Failed to deserialize marker props: {e}").into());
+            return;
+        }
+    };
 
-    if count > 1 {
-        // Co-located group — deserialize picker entries from JSON property
-        if let Ok(group_val) = js_sys::Reflect::get(&props, &"group".into())
-            && let Some(json) = group_val.as_string()
-            && let Ok(entries) = serde_json::from_str::<Vec<EntityPickerEntry>>(&json)
-        {
+    let Some(target) = raw.into_click_target() else {
+        return;
+    };
+
+    match target {
+        ClickTarget::ZoomTo {
+            bbox_min_lat,
+            bbox_max_lat,
+            bbox_min_lon,
+            bbox_max_lon,
+        } => {
+            let sw = js_sys::Array::new();
+            sw.push(&bbox_min_lon.into());
+            sw.push(&bbox_min_lat.into());
+            let ne = js_sys::Array::new();
+            ne.push(&bbox_max_lon.into());
+            ne.push(&bbox_max_lat.into());
+            let bounds = js_sys::Array::new();
+            bounds.push(&sw);
+            bounds.push(&ne);
+
+            let opts = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&opts, &"padding".into(), &50.into());
+            map.fit_bounds(&bounds, &opts);
+        }
+        ClickTarget::Select(id) => {
+            set_selected.set(Some(EntitySelection::Single(id, None)));
+        }
+        ClickTarget::Disambiguate(entries) => {
             set_selected.set(Some(EntitySelection::Multiple(entries)));
         }
-    } else if let Ok(id_val) = js_sys::Reflect::get(&props, &"id".into())
-        && let Some(id) = id_val.as_string()
-    {
-        set_selected.set(Some(EntitySelection::Single(id, None)));
     }
 }
 
@@ -776,18 +895,19 @@ fn handle_background_click(
 /// Returns the closures that must be kept alive for the handlers to work.
 /// (`wasm_bindgen::Closure` is invalidated when dropped — the Vec keeps
 /// them alive for the map's lifetime, and they're cleared on cleanup/remount.)
-/// Register click + hover handlers for a single entity layer.
+/// Register click + hover handlers for a single marker layer.
 ///
 /// Each layer needs its own `Closure` instances (MapLibre takes ownership),
 /// so this is called once per interactive layer.
-fn register_entity_layer(
+fn register_marker_layer(
     map: &maplibre::Map,
     layer: &str,
     set_selected: WriteSignal<Option<EntitySelection>>,
     closures: &mut Vec<Box<dyn std::any::Any>>,
 ) {
+    let map_for_click = map.clone();
     let click_cb = Closure::<dyn Fn(JsValue)>::new(move |event: JsValue| {
-        handle_entity_click(event, set_selected);
+        handle_marker_click(event, &map_for_click, set_selected);
     });
     map.on_layer("click", layer, click_cb.as_ref());
     closures.push(Box::new(click_cb));
@@ -813,8 +933,8 @@ fn register_layer_handlers(
 ) -> Vec<Box<dyn std::any::Any>> {
     let mut closures: Vec<Box<dyn std::any::Any>> = Vec::new();
 
-    register_entity_layer(map, ENTITY_CIRCLES_LAYER, set_selected, &mut closures);
-    register_entity_layer(map, ENTITY_THUMBNAILS_LAYER, set_selected, &mut closures);
+    register_marker_layer(map, ENTITY_CIRCLES_LAYER, set_selected, &mut closures);
+    register_marker_layer(map, ENTITY_THUMBNAILS_LAYER, set_selected, &mut closures);
 
     // --- Map background click: dismiss panel when clicking empty area ---
     let map_for_bg = map.clone();
@@ -832,43 +952,36 @@ fn register_layer_handlers(
 /// Returns the closure that must be kept alive.
 fn register_moveend_handler(
     map: &maplibre::Map,
-    api_client: &Rc<RefCell<Option<api::Client>>>,
-    generation: &Rc<Cell<u64>>,
-    debounce_timer: &Rc<Cell<Option<i32>>>,
+    state: &MapState,
     signals: ViewportSignals,
 ) -> Box<dyn std::any::Any> {
     let map_for_move = map.clone();
-    let api_for_move = Rc::clone(api_client);
-    let gen_for_move = Rc::clone(generation);
-    let debounce_for_move = Rc::clone(debounce_timer);
+    let state_for_move = state.clone();
 
     let move_cb = Closure::<dyn Fn()>::new(move || {
         // Clear any pending debounce timer
-        if let Some(timer_id) = debounce_for_move.get()
+        if let Some(timer_id) = state_for_move.debounce_timer.get()
             && let Some(w) = web_sys::window()
         {
             w.clear_timeout_with_handle(timer_id);
         }
 
         let map_ref = map_for_move.clone();
-        let gc = Rc::clone(&gen_for_move);
-        let debounce_ref = Rc::clone(&debounce_for_move);
+        let st = state_for_move.clone();
 
         // `once_into_js` transfers ownership to JS: the closure is freed by
         // the JS garbage collector after the timer fires.
-        let api_ref = Rc::clone(&api_for_move);
         let timeout_cb = Closure::once_into_js(move || {
-            debounce_ref.set(None);
-            let g = gc.get() + 1;
-            gc.set(g);
-            wasm_bindgen_futures::spawn_local(async move {
-                let Some(client) = api::get_or_init_client(&api_ref).await else {
+            st.debounce_timer.set(None);
+            let st2 = st.clone();
+            st.scope.spawn(async move {
+                let Some(client) = api::get_or_init_client(&st2.api_client).await else {
                     signals
                         .set_fetch_error
                         .set(Some("Failed to load API configuration".to_string()));
                     return;
                 };
-                load_entities_for_viewport(&map_ref, &client, g, &gc, signals).await;
+                load_entities_for_viewport(&map_ref, &client, signals).await;
             });
         });
 
@@ -878,11 +991,62 @@ fn register_moveend_handler(
                 MOVEEND_DEBOUNCE_MS,
             )
         {
-            debounce_for_move.set(Some(id));
+            state_for_move.debounce_timer.set(Some(id));
         }
     });
     map.on("moveend", move_cb.as_ref());
     Box::new(move_cb)
+}
+
+// ==================== Viewport-scoped task cancellation ====================
+
+/// Structured cancellation for viewport-scoped async work.
+///
+/// Each viewport change (pan/zoom debounce, retry, initial load) starts a
+/// new "epoch" that aborts the prior one. Tasks spawned via [`spawn`] are
+/// wrapped in [`Abortable`], so on the next [`reset`] (or next [`spawn`])
+/// they're dropped at their next `.await` — including any in-flight network
+/// requests, since reqwest/gloo-net both honor future-drop and propagate
+/// cancellation to the underlying browser `fetch()`.
+///
+/// This replaces a manual generation-counter pattern that required every
+/// `.await` site to check `if generation_counter.get() != my_generation
+/// { return }`. The counter approach was correct in principle but easy to
+/// forget; structured cancellation makes the check unforgeable because it
+/// happens automatically at the executor level.
+///
+/// [`spawn`]: ViewportScope::spawn
+/// [`reset`]: ViewportScope::reset
+#[derive(Clone, Default)]
+struct ViewportScope {
+    handle: Rc<Cell<Option<AbortHandle>>>,
+}
+
+impl ViewportScope {
+    /// Abort the current epoch and start a new one. Returns the registration
+    /// that should be paired with an [`Abortable`] for any future spawned in
+    /// this epoch.
+    fn reset(&self) -> AbortRegistration {
+        if let Some(h) = self.handle.take() {
+            h.abort();
+        }
+        let (handle, reg) = AbortHandle::new_pair();
+        self.handle.set(Some(handle));
+        reg
+    }
+
+    /// Spawn a future tied to a fresh epoch. Any previously spawned task is
+    /// aborted; the new task will itself be aborted by the next call to
+    /// `spawn` or `reset`.
+    fn spawn<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        let reg = self.reset();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = Abortable::new(fut, reg).await;
+        });
+    }
 }
 
 // ==================== Shared map state ====================
@@ -894,7 +1058,7 @@ fn register_moveend_handler(
 #[derive(Clone)]
 struct MapState {
     source_initialized: SourceInitialized,
-    generation: Rc<Cell<u64>>,
+    scope: ViewportScope,
     debounce_timer: Rc<Cell<Option<i32>>>,
     closures: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
     api_client: Rc<RefCell<Option<api::Client>>>,
@@ -910,6 +1074,7 @@ fn initialize_map(
     state: &MapState,
     signals: ViewportSignals,
     set_selected: WriteSignal<Option<EntitySelection>>,
+    set_map_error: WriteSignal<Option<String>>,
 ) -> Option<maplibre::Map> {
     let map = maplibre::create_map(
         el,
@@ -921,14 +1086,17 @@ fn initialize_map(
     )?;
 
     // --- On style load: add source/layers, register handlers, initial fetch ---
+    //
+    // We register via `map.once("load", ...)` unconditionally rather than
+    // branching on `is_style_loaded()`. MapLibre's `once` fires immediately
+    // (on the next tick) if the style is already loaded, and `is_style_loaded`
+    // is a known footgun: it can return true while glyph fetches are still
+    // outstanding, causing the initial fetch to race with style finalization.
     let st = state.clone();
     let map_for_load = map.clone();
     let load_cb = Closure::<dyn Fn()>::new(move || {
         let map_ref = map_for_load.clone();
-        let gc = Rc::clone(&st.generation);
-        let api_ref = Rc::clone(&st.api_client);
-        let g = gc.get() + 1;
-        gc.set(g);
+        let st2 = st.clone();
 
         init_source_and_layers(&map_ref);
         st.source_initialized.set(true);
@@ -936,33 +1104,42 @@ fn initialize_map(
         let handler_closures = register_layer_handlers(&map_ref, set_selected);
         st.closures.borrow_mut().extend(handler_closures);
 
-        wasm_bindgen_futures::spawn_local(async move {
-            let Some(client) = api::get_or_init_client(&api_ref).await else {
+        st.scope.spawn(async move {
+            let Some(client) = api::get_or_init_client(&st2.api_client).await else {
                 signals
                     .set_fetch_error
                     .set(Some("Failed to load API configuration".to_string()));
                 return;
             };
-            load_entities_for_viewport(&map_ref, &client, g, &gc, signals).await;
+            load_entities_for_viewport(&map_ref, &client, signals).await;
         });
     });
 
-    if map.is_style_loaded() {
-        let func: &js_sys::Function = load_cb.as_ref().unchecked_ref();
-        let _ = func.call0(&JsValue::NULL);
-    } else {
-        map.on("load", load_cb.as_ref());
-    }
+    map.once("load", load_cb.as_ref());
     state.closures.borrow_mut().push(Box::new(load_cb));
 
-    let moveend_closure = register_moveend_handler(
-        &map,
-        &state.api_client,
-        &state.generation,
-        &state.debounce_timer,
-        signals,
-    );
+    let moveend_closure = register_moveend_handler(&map, state, signals);
     state.closures.borrow_mut().push(moveend_closure);
+
+    // Surface MapLibre errors from our entity source in the UI. Errors
+    // from the basemap (tile loading, style evaluation) are logged but
+    // not surfaced since they're outside our control.
+    let error_cb = Closure::<dyn Fn(JsValue)>::new(move |event: JsValue| {
+        let msg = js_sys::Reflect::get(&event, &"message".into())
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_else(|| "Map style error".to_string());
+
+        let source_id = js_sys::Reflect::get(&event, &"sourceId".into())
+            .ok()
+            .and_then(|v| v.as_string());
+
+        if source_id.as_deref() == Some(ENTITY_SOURCE_ID) {
+            set_map_error.set(Some(msg));
+        }
+    });
+    map.on("error", error_cb.as_ref());
+    state.closures.borrow_mut().push(Box::new(error_cb));
 
     Some(map)
 }
@@ -980,6 +1157,7 @@ fn effect_mount_map(
     state: MapState,
     signals: ViewportSignals,
     set_selected: WriteSignal<Option<EntitySelection>>,
+    set_map_error: WriteSignal<Option<String>>,
 ) {
     Effect::new(move || {
         let Some(el) = container.get() else { return };
@@ -990,7 +1168,7 @@ fn effect_mount_map(
         state.closures.borrow_mut().clear();
         state.source_initialized.set(false);
 
-        if let Some(map) = initialize_map(&el, &state, signals, set_selected) {
+        if let Some(map) = initialize_map(&el, &state, signals, set_selected, set_map_error) {
             *map_handle.borrow_mut() = Some(map);
 
             // Signal that the map has mounted (used by test hooks).
@@ -1000,31 +1178,91 @@ fn effect_mount_map(
     });
 }
 
-/// Single choke point for all GeoJSON rebuilds. Tracks both the entity
-/// selection and the cached entity list — rebuilds whenever either changes
-/// (selection click, viewport fetch, or retry).
+/// Rebuilds the GeoJSON source when the marker list changes.
+///
+/// Thumbnails are patched incrementally via `updateData` in per-marker
+/// spawn closures (see `load_entities_for_viewport`), so this effect
+/// only needs to react to the marker list signal — not to individual
+/// thumbnail load completions.
+///
+/// Selection highlighting is handled separately via `setFeatureState` in
+/// `effect_selection` — this effect does not read `signals.selected`, so
+/// clicking an entity doesn't trigger a full GeoJSON rebuild+reserialize.
 fn effect_rebuild_geojson(
     signals: ViewportSignals,
     map_handle: Rc<RefCell<Option<maplibre::Map>>>,
     source_initialized: SourceInitialized,
 ) {
     Effect::new(move || {
-        let selected_id = match signals.selected.get() {
+        // Tracked read: re-runs when marker list changes.
+        let markers = signals.cached_markers.get();
+
+        if !source_initialized.get() {
+            return;
+        }
+        let Some(map) = map_handle.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        if markers.is_empty() {
+            clear_source_data(&map, ENTITY_SOURCE_ID);
+        } else if let Some(geojson) = build_markers_geojson(&markers) {
+            update_source_data(&map, ENTITY_SOURCE_ID, &geojson);
+        }
+    });
+}
+
+/// Apply selection highlighting via `setFeatureState` instead of rebuilding
+/// the entire GeoJSON. Tracks `signals.selected` — when the selection changes,
+/// clears the old feature state and sets the new one. Only entities (not
+/// clusters) can be selected.
+fn effect_selection(
+    signals: ViewportSignals,
+    map_handle: Rc<RefCell<Option<maplibre::Map>>>,
+    source_initialized: SourceInitialized,
+) {
+    // Track the previously-selected feature ID so we can clear its state.
+    let prev_id: Rc<Cell<Option<String>>> = Rc::new(Cell::new(None));
+
+    Effect::new(move || {
+        let new_id = match signals.selected.get() {
             Some(EntitySelection::Single(id, _)) => Some(id),
             _ => None,
         };
 
-        // Tracked reads: re-runs this effect when entities or thumbnails change.
-        let entities = signals.cached_entities.get();
-        let thumbs = signals.thumbnails.get();
-
-        if source_initialized.get()
-            && !entities.is_empty()
-            && let Some(geojson) = build_geojson(&entities, selected_id.as_deref(), &thumbs)
-            && let Some(map) = map_handle.borrow().as_ref()
-        {
-            update_source_data(map, &geojson);
+        if !source_initialized.get() {
+            return;
         }
+        let Some(map) = map_handle.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        // Clear previous selection
+        if let Some(old_id) = prev_id.take() {
+            let target = serde_json::json!({
+                "source": ENTITY_SOURCE_ID,
+                "id": old_id,
+            });
+            if let Ok(target_js) = to_js(&target) {
+                let _ = map.remove_feature_state(&target_js);
+            }
+        }
+
+        // Set new selection
+        if let Some(ref id) = new_id {
+            let target = serde_json::json!({
+                "source": ENTITY_SOURCE_ID,
+                "id": id,
+            });
+            let state = serde_json::json!({"selected": true});
+            if let Ok(target_js) = to_js(&target)
+                && let Ok(state_js) = to_js(&state)
+            {
+                let _ = map.set_feature_state(&target_js, &state_js);
+            }
+        }
+
+        prev_id.set(new_id);
     });
 }
 
@@ -1043,16 +1281,14 @@ fn effect_retry_on_signal(
             if let Some(map) = map_ref.as_ref() {
                 let map = map.clone();
                 let st = state.clone();
-                let g = st.generation.get() + 1;
-                st.generation.set(g);
-                wasm_bindgen_futures::spawn_local(async move {
+                st.scope.clone().spawn(async move {
                     let Some(client) = api::get_or_init_client(&st.api_client).await else {
                         signals
                             .set_fetch_error
                             .set(Some("Failed to load API configuration".to_string()));
                         return;
                     };
-                    load_entities_for_viewport(&map, &client, g, &st.generation, signals).await;
+                    load_entities_for_viewport(&map, &client, signals).await;
                 });
             }
         }
@@ -1090,26 +1326,26 @@ pub fn MapView(
         retry: set_retry,
     });
 
-    let (cached_entities, set_cached_entities) = signal(Vec::<api::EntitySummary>::new());
-    let (thumbnails, set_thumbnails) = signal(ThumbnailMap::new());
+    let (map_error, set_map_error) = signal(None::<String>);
+
+    let (cached_markers, set_cached_markers) = signal(Vec::<MapMarker>::new());
 
     let signals = ViewportSignals {
         set_loading,
         set_truncated,
         set_empty,
         set_fetch_error,
+        set_map_error,
         selected,
-        cached_entities,
-        set_cached_entities,
-        thumbnails,
-        set_thumbnails,
+        cached_markers,
+        set_cached_markers,
     };
 
     // Shared state for JS closures. Grouped into a struct so we clone once
     // instead of threading a dozen individual Rc::clone calls.
     let state = MapState {
-        source_initialized: Rc::new(Cell::new(false)),
-        generation: Rc::new(Cell::new(0)),
+        source_initialized: RwSignal::new(false),
+        scope: ViewportScope::default(),
         debounce_timer: Rc::new(Cell::new(None)),
         // wasm_bindgen::Closure must be kept alive as long as JS holds a reference
         // to the callback. Dropping a Closure invalidates the JS-side function
@@ -1124,12 +1360,10 @@ pub fn MapView(
         state.clone(),
         signals,
         set_selected,
+        set_map_error,
     );
-    effect_rebuild_geojson(
-        signals,
-        Rc::clone(&map_handle),
-        Rc::clone(&state.source_initialized),
-    );
+    effect_rebuild_geojson(signals, Rc::clone(&map_handle), state.source_initialized);
+    effect_selection(signals, Rc::clone(&map_handle), state.source_initialized);
     effect_retry_on_signal(
         retry_signal,
         set_retry,
@@ -1139,9 +1373,25 @@ pub fn MapView(
     );
 
     // Clean up on unmount: destroy the map and release JS closure references.
+    //
+    // `SendWrapper` is required because Leptos's `on_cleanup` wants `Send`
+    // closures even on single-threaded WASM targets. There are no other
+    // threads in browser WASM, so the wrapper's runtime panic-on-cross-
+    // thread-access can never fire here — it's purely a type-bound shim.
     let cleanup_handle = SendWrapper::new(Rc::clone(&map_handle));
     let cleanup_closures = SendWrapper::new(Rc::clone(&state.closures));
+    let cleanup_debounce = SendWrapper::new(Rc::clone(&state.debounce_timer));
+    let cleanup_scope = SendWrapper::new(state.scope.clone());
     on_cleanup(move || {
+        // Cancel any pending debounce timer so it doesn't fire after unmount.
+        if let Some(timer_id) = cleanup_debounce.get()
+            && let Some(w) = web_sys::window()
+        {
+            w.clear_timeout_with_handle(timer_id);
+        }
+        // Abort any in-flight viewport fetches so they don't mutate
+        // disposed signals or keep the map alive.
+        let _ = cleanup_scope.reset();
         if let Some(map) = cleanup_handle.borrow().as_ref() {
             map.remove();
         }
@@ -1149,6 +1399,23 @@ pub fn MapView(
     });
 
     view! {
-        <div node_ref=container class="w-full h-full"/>
+        <div class="relative w-full h-full">
+            <div
+                node_ref=container
+                class="w-full h-full"
+                role="region"
+                aria-label="Interactive map"
+            />
+            {move || {
+                map_error.get().map(|msg| view! {
+                    <div
+                        class="absolute bottom-2 left-2 right-2 bg-red-900/90 text-white text-xs px-3 py-2 rounded shadow"
+                        role="alert"
+                    >
+                        {msg}
+                    </div>
+                })
+            }}
+        </div>
     }
 }

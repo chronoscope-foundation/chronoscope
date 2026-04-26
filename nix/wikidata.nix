@@ -15,6 +15,7 @@
   lib,
   craneLib,
   rustCommonArgs,
+  regionsDb,
 }:
 
 let
@@ -23,10 +24,17 @@ let
   bundleDefs = {
     # Core test set: exercises different ingestion code paths and overlaps
     # with corpus images for future entity-analysis bridge testing.
+    #
+    # Italian entities are organized for region-clustering tests:
+    #   - Rome has 4 entities (city-level multi-entity clustering)
+    #   - Lombardy, Veneto, and Apulia each have 2 entities in different
+    #     cities (region-level clustering with count > 1)
+    #   - 8 distinct Italian regions total (state-level clustering)
     curated = {
       timestamp = "2022-01-03T00:00:00Z";
-      hash = "sha256-crO3zJaJAkpjsmJ+CdQdpnFFCaS9y4wcUCFmWDDE9BU=";
+      hash = "sha256-QK1HYjDZKokoItGF6vgAUb0658zmpYB5+NjNQr6liqM=";
       entities = {
+        # Original test set (non-Italian + Chioggia)
         "Q243" = "Eiffel Tower";
         "Q2981" = "Notre-Dame de Paris";
         "Q12506" = "Hagia Sophia";
@@ -36,6 +44,26 @@ let
         "Q5171466" = "Cornelius Vanderbilt II House";
         "Q5652831" = "William K. Vanderbilt House";
         "Q108584685" = "Vanderbilt Triple Palace";
+
+        # Rome (Lazio) — 4 entities for city-level multi-entity tests
+        "Q192784" = "Trajan's Column";
+        "Q10285" = "Colosseum";
+        "Q99309" = "Pantheon";
+        "Q486382" = "Castel Sant'Angelo";
+
+        # Lombardy — 2 cities (Bellagio, Certosa di Pavia)
+        "Q650088" = "Villa Melzi d'Eril";
+        "Q654443" = "Certosa di Pavia";
+
+        # Apulia — 2 buildings (Andria, Alberobello)
+        "Q215897" = "Castel del Monte";
+        "Q1324513" = "Trullo Sovrano";
+
+        # Single-entity regions
+        "Q201902" = "Mole Antonelliana"; # Piedmont / Turin
+        "Q189883" = "Doge's Palace"; # Veneto / Venice
+        "Q208633" = "Ponte Vecchio"; # Tuscany / Florence
+        "Q1799127" = "La Scarzuola"; # Umbria / Montegabbione
       };
     };
   };
@@ -48,11 +76,14 @@ let
     // {
       pname = "ingest";
       cargoExtraArgs = "-p chronoscope-ingestion --bin ingest";
+      # Vendor ALL workspace deps (not just ingestion's) because Cargo
+      # resolves the full workspace Cargo.lock even when building a single
+      # package. The cosmogony git dep from region-builder must be vendored
+      # even though ingest doesn't use it.
       cargoArtifacts = craneLib.buildDepsOnly (
         rustCommonArgs
         // {
           pname = "ingest-deps";
-          cargoExtraArgs = "-p chronoscope-ingestion";
         }
       );
       doCheck = false;
@@ -108,6 +139,8 @@ let
           ingestBin
           pkgs.sqlite
         ];
+        REGIONS_DB = "${regionsDb}/regions.sqlite";
+        SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
         buildCommand = ''
           mkdir -p $out
           ingest load \
