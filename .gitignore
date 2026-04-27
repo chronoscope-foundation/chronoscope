@@ -47,7 +47,9 @@ __pycache__/
 .hypothesis/
 
 # Trunk (web frontend build artifacts)
-web/dist/
+# NOTE: `web/dist/` is intentionally NOT ignored — `trunk serve` writes to
+# `target/web-dist/` (configured in `web/Trunk.toml`) and tests read from
+# `$WEB_DIST` (nix shell). If `web/dist/` ever appears, something regressed.
 web/result
 web/tailwind.css
 

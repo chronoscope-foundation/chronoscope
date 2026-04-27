@@ -1,6 +1,12 @@
 # Hermetic WASM build for chronoscope-web.
 #
 # Pipeline: crane (wasm32) → wasm-bindgen → wasm-opt → tailwindcss → assemble dist/
+#
+# Two outputs:
+#   - `web`      — production build (no test-hooks feature).
+#   - `web-test` — same pipeline with `--features test-hooks` for browser tests.
+# Both share `cargoArtifacts` because the test-hooks feature is purely additive
+# instrumentation that does not alter dependency resolution.
 {
   pkgs,
   lib,
@@ -60,23 +66,34 @@ let
 
   cargoArtifacts = wasmCraneLib.buildDepsOnly commonArgs;
 
-  wasmBuild = wasmCraneLib.buildPackage (
-    commonArgs
-    // {
-      inherit cargoArtifacts;
-      # crane tries to install binaries; WASM produces a .wasm, not an executable.
-      # Override install to just copy the target output.
-      installPhaseCommand = ''
-        mkdir -p $out/lib
-        cp target/wasm32-unknown-unknown/release/chronoscope_web.wasm $out/lib/ 2>/dev/null \
-          || cp target/wasm32-unknown-unknown/release/chronoscope-web.wasm $out/lib/chronoscope_web.wasm
-      '';
-    }
-  );
+  # Build the WASM binary, optionally with extra cargo features.
+  mkWasmBuild =
+    {
+      pname,
+      extraCargoArgs ? "",
+    }:
+    wasmCraneLib.buildPackage (
+      commonArgs
+      // {
+        inherit cargoArtifacts pname;
+        cargoExtraArgs = commonArgs.cargoExtraArgs + extraCargoArgs;
+        # crane tries to install binaries; WASM produces a .wasm, not an executable.
+        # Override install to just copy the target output.
+        installPhaseCommand = ''
+          mkdir -p $out/lib
+          cp target/wasm32-unknown-unknown/release/chronoscope_web.wasm $out/lib/ 2>/dev/null \
+            || cp target/wasm32-unknown-unknown/release/chronoscope-web.wasm $out/lib/chronoscope_web.wasm
+        '';
+      }
+    );
 
-  # Post-process and assemble the final dist/ output.
-  web =
-    pkgs.runCommand "chronoscope-web-dist"
+  # Post-process and assemble a final dist/ output from a wasm build.
+  mkDist =
+    {
+      name,
+      wasmBuild,
+    }:
+    pkgs.runCommand name
       {
         nativeBuildInputs = with pkgs; [
           wasm-bindgen-cli
@@ -121,9 +138,31 @@ let
           ${webSrc}/web/index.html > $out/index.html
       '';
 
+  wasmBuild = mkWasmBuild { pname = "chronoscope-web"; };
+  wasmBuildTest = mkWasmBuild {
+    pname = "chronoscope-web-test";
+    extraCargoArgs = " --features test-hooks";
+  };
+
+  web = mkDist {
+    name = "chronoscope-web-dist";
+    inherit wasmBuild;
+  };
+
+  webTest = mkDist {
+    name = "chronoscope-web-dist-test";
+    wasmBuild = wasmBuildTest;
+  };
+
 in
 {
-  packages.web = web;
+  packages = {
+    inherit web;
+    web-test = webTest;
+  };
 
-  checks.web-build = web;
+  checks = {
+    web-build = web;
+    web-test-build = webTest;
+  };
 }

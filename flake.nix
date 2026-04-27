@@ -218,6 +218,7 @@
               RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
               CORPUS_MANIFEST = corpus.corpusManifestJson;
               WIKIDATA_TEST_DB = wikidata.bundles.curated.testDb;
+              WEB_DIST = web.packages.web-test;
               REGIONS_DB = "${regions.regions.italy.db}/regions.sqlite";
               PYTORCH_ENABLE_MPS_FALLBACK = "1";
               HF_HUB_OFFLINE = "1";

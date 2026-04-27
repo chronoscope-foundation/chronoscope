@@ -4,6 +4,10 @@ port = 8080
 
 [build]
 target = "index.html"
+# Write build output into the workspace `target/` directory (gitignored)
+# instead of `web/dist/`, so it never lands in the working tree.
+# `target/web-dist/` is dev-only — tests use $WEB_DIST from the nix shell.
+dist = "../target/web-dist"
 
 [[hooks]]
 stage = "pre_build"

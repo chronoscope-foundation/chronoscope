@@ -104,13 +104,12 @@ check:
     pytest -v
 
 # Run browser tests against headless Chrome (requires Chrome/Chromium)
+# Test frontend dist is provided via $WEB_DIST from the nix shell.
 web-test:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _nix_reexec }}
     if [ -z "${IN_NIX_SHELL:-}" ]; then _nix_reexec web-test; fi
-    echo "==> Building web frontend (trunk build)"
-    (cd web && CHRONOSCOPE_API_URL=http://placeholder trunk build --features test-hooks)
     echo "==> Running browser tests"
     cargo test -p chronoscope-dev --test web
 

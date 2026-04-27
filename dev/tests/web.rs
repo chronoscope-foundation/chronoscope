@@ -7,7 +7,6 @@
 //! Run via: `just web-test` (builds frontend, then runs these tests)
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -27,39 +26,19 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
 // ==================== Frontend Build ====================
 
-/// Build the web frontend once per test binary invocation.
-/// Returns the path to the `dist/` directory, or an error if the build fails.
-fn ensure_web_built() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    static WEB_DIST: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    WEB_DIST
-        .get_or_init(|| {
-            let web_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .ok_or_else(|| "dev crate should have parent".to_string())?
-                .join("web");
-
-            let dist = web_dir.join("dist");
-
-            // If dist/ exists and has index.html, skip rebuild (just web-test already built it)
-            if dist.join("index.html").exists() {
-                eprintln!("web/dist/ already built, reusing");
-                return Ok(dist);
-            }
-
-            eprintln!("Building web frontend with trunk...");
-            let status = Command::new("trunk")
-                .args(["build", "--features", "test-hooks"])
-                .env("CHRONOSCOPE_API_URL", "http://placeholder")
-                .current_dir(&web_dir)
-                .status()
-                .map_err(|e| format!("failed to run trunk build: {e}"))?;
-            if !status.success() {
-                return Err(format!("trunk build failed with {status}"));
-            }
-            Ok(dist)
-        })
-        .clone()
-        .map_err(Into::into)
+/// Path to the prebuilt web frontend dist (with `test-hooks` feature).
+///
+/// Sourced from `$WEB_DIST` exported by the nix dev shell (see `flake.nix` ->
+/// `WEB_DIST = web.packages.web-test`). No fallback build: if the env var
+/// is missing, fail loudly so the cause is obvious.
+fn web_dist() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let path = std::env::var("WEB_DIST")
+        .map_err(|_| "WEB_DIST not set \u{2014} run inside nix develop")?;
+    let dist = PathBuf::from(&path);
+    if !dist.join("index.html").exists() {
+        return Err(format!("WEB_DIST is set to {path} but does not contain index.html").into());
+    }
+    Ok(dist)
 }
 
 // ==================== Test Harness ====================
@@ -174,7 +153,7 @@ impl WebTest {
 
     /// Create a new test backed by the Wikidata test database.
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let dist_dir = ensure_web_built()?;
+        let dist_dir = web_dist()?;
         let (browser, handler_handle, browser_data_dir) = launch_browser().await?;
 
         // Copy the Wikidata test DB to a writable temp dir (Nix store is read-only,
