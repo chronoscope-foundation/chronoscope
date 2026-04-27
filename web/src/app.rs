@@ -7,6 +7,7 @@ use crate::components::nav::Sidebar;
 use crate::pages::about::About;
 use crate::pages::faq::Faq;
 use crate::pages::landing::Landing;
+use crate::pages::related_work::RelatedWork;
 
 #[component]
 pub fn App() -> impl IntoView {
@@ -27,6 +28,7 @@ pub fn App() -> impl IntoView {
                         <Route path=path!("/") view=Landing/>
                         <Route path=path!("/about") view=About/>
                         <Route path=path!("/faq") view=Faq/>
+                        <Route path=path!("/related-work") view=RelatedWork/>
                     </Routes>
                 </main>
             </div>

@@ -16,6 +16,10 @@ AI models analyze images in a pipeline of focused steps. First, individual build
 
 Yes, and the system is designed around that assumption. Every AI-generated claim requires a citation to the source material it was derived from. Citations are verified in two ways: first, a simple check that the cited content actually exists at the linked source. Second, a separate AI model evaluates whether the evidence actually supports the claim. Human edits go through the same scrutiny. This makes it hard for errors, misinformation, or deliberate disinformation to spread unchecked. Hard doesn't mean impossible, which is why Chronoscope works like a wiki: if you see something wrong, flag it or fix it. The system is designed to make that easy and even fun.
 
+## How is Chronoscope different from OpenStreetMap, OpenHistoricalMap, Wikidata, Pleiades, and similar projects?
+
+Most existing projects are organized around a map, a gazetteer, or a structured fact base. Chronoscope is organized around **media and the things visible in it**: photographs, maps, drawings, and the buildings and places they depict over time. We use data and identifiers from projects like OpenStreetMap, Wikidata, and OpenHistoricalMap, and we intend to contribute data back as we build confidence in our results. See [Related work and where we fit](/related-work) for details on each project and how we integrate.
+
 # Safety and trust
 
 ## How does Chronoscope handle privacy and safety?
