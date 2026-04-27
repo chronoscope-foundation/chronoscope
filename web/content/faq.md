@@ -2,7 +2,7 @@
 
 ## Why was Chronoscope built?
 
-Buildings outlast the people who built them, and that persistence makes the built environment one of the most powerful ways to contextualize history. The interest in inhabiting the past through physical places is deeply common, from then-and-now photographs to urban exploration to millions traveling to walk through old cities. What's been missing is a way to explore it all at scale. Recent AI advances make it possible to build the knowledge base from existing open datasets without needing a community to manually annotate millions of images first. For the full story, see the [About page](/about).
+Buildings are some of the largest things humans build, and we take them for granted because they're everywhere. Hundreds of people, heavy machinery, structures hundreds of feet tall, expected to last decades or longer, with enormous variation in engineering, purpose, and architecture. They outlast the people who built them, and that persistence makes the built environment one of the most powerful ways to contextualize history. The interest in inhabiting the past through physical places is deeply common, from then-and-now photographs to urban exploration to millions traveling to walk through old cities. What's been missing is a way to explore it all at scale. Recent AI advances make it possible to build the knowledge base from existing open datasets without needing a community to manually annotate millions of images first. For the full story, see the [About page](/about).
 
 ## How does Chronoscope handle dates and locations that aren't precise?
 
