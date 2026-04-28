@@ -76,11 +76,9 @@ async fn launch_browser() -> Result<
     // paths (macOS /Applications, Linux /opt, Windows registry).
     let config = BrowserConfig::builder()
         .user_data_dir(user_data.path())
-        .arg("--headless=new")
-        .arg("--no-sandbox")
-        .arg("--disable-gpu")
-        .arg("--disable-dev-shm-usage")
-        .arg("--window-size=1280,800")
+        .new_headless_mode()
+        .no_sandbox()
+        .window_size(1280, 800)
         .build()
         .map_err(|e| format!("failed to build browser config: {e}"))?;
 

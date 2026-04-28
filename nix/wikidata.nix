@@ -15,6 +15,7 @@
   lib,
   craneLib,
   rustCommonArgs,
+  cargoArtifacts,
   regionsDb,
 }:
 
@@ -74,18 +75,9 @@ let
   ingestBin = craneLib.buildPackage (
     rustCommonArgs
     // {
+      inherit cargoArtifacts;
       pname = "ingest";
       cargoExtraArgs = "-p chronoscope-ingestion --bin ingest";
-      # Vendor ALL workspace deps (not just ingestion's) because Cargo
-      # resolves the full workspace Cargo.lock even when building a single
-      # package. The cosmogony git dep from region-builder must be vendored
-      # even though ingest doesn't use it.
-      cargoArtifacts = craneLib.buildDepsOnly (
-        rustCommonArgs
-        // {
-          pname = "ingest-deps";
-        }
-      );
       doCheck = false;
     }
   );

@@ -1,0 +1,69 @@
+# nix/
+
+Nix build infrastructure. One derivation module per project area;
+`flake.nix` composes them.
+
+## Layout
+
+| Module          | What it owns                                        |
+|-----------------|-----------------------------------------------------|
+| `rust.nix`      | Workspace `commonArgs`, native checks, `default` package |
+| `api.nix`       | `mkApi { regions }` function (one wrapper per regions variant) |
+| `web.nix`       | WASM build pipeline + `web-build`/`web-test-build`/`web-clippy` checks |
+| `python.nix`    | `analysisEnv`, model weight FODs, triton checks     |
+| `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |
+| `regions.nix`   | OSM PBF → SpatiaLite, italy + world variants        |
+| `wikidata.nix`  | Curated entity bundles → test SQLite databases      |
+
+Dev shell composition lives in `flake.nix`, not in any single component
+module — it has the visibility to compose across modules.
+
+## The function-with-named-instances pattern
+
+Where a derivation has variants that are interesting at the flake level
+(not just internal), expose:
+
+1. A function that takes the variant input (e.g. `mkApi { regions }`,
+   `mkRegions name pbf`).
+2. Named instances in `flake.nix`'s `packages` (e.g. `api-italy`,
+   `api-world`, `regions-italy-db`, `regions-world-db`).
+
+Adding a new variant is one entry in `flake.nix` — no new branches in
+the function itself.
+
+## Coverage rule for `just check`
+
+`just check` is hermetic and equivalent to `nix flake check` (or a
+focused subset). **Every gate the project commits behind must be a
+flake check.** If you add a new check (e.g. a new lint, a new build),
+expose it via `checks.<system>.<name>`, not just as a step in the
+justfile — otherwise it slips past the pre-commit gate.
+
+## GC root pinning
+
+Large derivations (model weights, corpus images, regions DBs, wikidata
+DB) get pinned as GC roots in `.nix-gc-roots/` (gitignored) so they
+survive `nix store gc`. Pinning happens in shell hooks:
+
+- `gcRootsPrelude` — creates `.nix-gc-roots/`
+- `pinWikidataRoot`, `pinRegionsItaly`, `pinWeights`, `pinCorpus`
+  — each pins its specific derivation
+
+Each shell composes only the pins it actually uses (e.g. `triton`
+pins weights, not corpus). If a derivation that takes time to build is
+not pinned and not in the store, it'll be silently re-fetched/rebuilt
+the next time the shell loads.
+
+## Lazy parameter passing
+
+`flake.nix` has a soft cycle: `regions` needs `rust.commonArgs`, but
+`rust.checks.test` needs `regions.italy.db` (via `testExtraEnv`). This
+works because Nix is lazy — `commonArgs` is forced when computing
+`regions`, but `testExtraEnv` (and through it `regions.italy.db`) is
+only forced when computing `checks.test` / `checks.llvm-cov`. As long
+as `commonArgs` itself doesn't reference `regions`, the cycle stays
+unresolved at the right moment.
+
+If you add similar test-time dependencies, follow the same pattern:
+keep them out of `commonArgs`, route them through optional parameters
+that are only consumed by check derivations.

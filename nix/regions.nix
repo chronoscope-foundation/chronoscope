@@ -48,19 +48,19 @@ let
 
   # ======================== OSM PBF extracts (FODs) ========================
 
-  # Italy extract for development iteration (~2 GB).
-  # Pinned to a dated snapshot for reproducibility. To update: change the
-  # date, set hash to "" and rebuild — Nix will report the correct hash.
+  # Italy extract for development iteration (~2 GB). Default for `api-italy`
+  # and the dev shell. To bump: change the date, set hash to lib.fakeHash,
+  # rebuild — Nix reports the correct hash.
   italyPbf = pkgs.fetchurl {
     url = "https://download.geofabrik.de/europe/italy-260425.osm.pbf";
     hash = "sha256-54WU7TsePWN0A0XNiwiP8frNJ3Vcv7bfZk7qm1dyD7I=";
   };
 
-  # Full planet PBF for production (~70 GB). Uncomment when ready.
-  # planetPbf = pkgs.fetchurl {
-  #   url = "https://download.geofabrik.de/planet-260404.osm.pbf";
-  #   hash = "sha256-...";
-  # };
+  # Full planet PBF for production (~86 GB). Powers `api-world`.
+  planetPbf = pkgs.fetchurl {
+    url = "https://planet.openstreetmap.org/pbf/planet-260420.osm.pbf";
+    hash = "sha256-JQLKwBNSd+GPvepmKnYArCQNYwbUrXwnz477o+2AN88=";
+  };
 
   # ======================== Derivation chain ========================
 
@@ -103,17 +103,17 @@ let
       };
     in
     {
-      inherit boundariesPbf db;
+      inherit name boundariesPbf db;
     };
 
   italy = mkRegions "italy" italyPbf;
+  world = mkRegions "world" planetPbf;
 
 in
 {
   inherit regionBuilderBin;
 
   regions = {
-    inherit italy;
-    # planet = mkRegions "planet" planetPbf;
+    inherit italy world;
   };
 }

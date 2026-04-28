@@ -1,11 +1,11 @@
-# Rust workspace builds via crane.
-#
-# Provides: checks (fmt, clippy, test, llvm-cov), packages, devShell inputs.
 {
   pkgs,
   craneLib,
   lib,
   src,
+  # Defaulting to {} keeps this module loadable before regions/wikidata exist
+  # — see flake.nix for how the lazy cycle resolves.
+  testExtraEnv ? { },
 }:
 
 let
@@ -38,8 +38,15 @@ let
       ];
   };
 
-  # Shared dependency artifacts — all check derivations reuse these.
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+  # Shared by every check derivation. The workspace [profile.release]
+  # (LTO + opt-level=z + codegen-units=1) makes test-binary linking take
+  # many minutes; the test-profile cache keeps `just check` snappy.
+  checkArgs = commonArgs // {
+    CARGO_PROFILE = "test";
+    cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { CARGO_PROFILE = "test"; });
+  };
 
 in
 {
@@ -51,24 +58,18 @@ in
     };
 
     clippy = craneLib.cargoClippy (
-      commonArgs
+      checkArgs
       // {
-        inherit cargoArtifacts;
         cargoClippyExtraArgs = "--all-targets -- -D warnings";
       }
     );
 
-    test = craneLib.cargoTest (
-      commonArgs
-      // {
-        inherit cargoArtifacts;
-      }
-    );
+    test = craneLib.cargoTest (checkArgs // testExtraEnv);
 
     llvm-cov = craneLib.cargoLlvmCov (
-      commonArgs
+      checkArgs
+      // testExtraEnv
       // {
-        inherit cargoArtifacts;
         # crane's cargoLlvmCov sets installPhaseCommand="" and expects the
         # coverage command to write $out directly. --output-path $out writes
         # the LCOV report as a file at $out (not a directory).
@@ -81,38 +82,14 @@ in
   };
 
   packages = {
-    # All workspace binaries (chronoscope-api, chronoscope-dev, analyze, etc.)
     default = craneLib.buildPackage (
       commonArgs
       // {
         inherit cargoArtifacts;
-        doCheck = false; # Tests run as a separate check derivation
+        doCheck = false;
       }
     );
   };
 
-  # Shared build args — reused by corpus.nix for corpus test derivations.
-  inherit commonArgs;
-
-  # Ingredients for the dev shell (merged in flake.nix).
-  devShell = {
-    nativeBuildInputs =
-      commonArgs.nativeBuildInputs
-      ++ (with pkgs; [
-        binaryen
-        cargo-llvm-cov
-        just
-        tailwindcss_4
-        trunk
-        wasm-bindgen-cli
-      ])
-      # Headless Chrome for browser tests (nixpkgs chromium is Linux-only;
-      # on macOS the test harness discovers a system-installed Chrome).
-      ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.chromium ];
-    inherit (commonArgs) buildInputs;
-    env = {
-      inherit (commonArgs) PROTOC;
-      SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
-    };
-  };
+  inherit commonArgs cargoArtifacts;
 }

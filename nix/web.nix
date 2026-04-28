@@ -17,11 +17,11 @@
 }:
 
 let
-  # WASM-only toolchain — no openssl/sqlite needed.
   wasmToolchain =
     with fenix.packages.${system};
     combine [
       stable.cargo
+      stable.clippy
       stable.rustc
       targets.wasm32-unknown-unknown.stable.rust-std
     ];
@@ -77,12 +77,12 @@ let
       // {
         inherit cargoArtifacts pname;
         cargoExtraArgs = commonArgs.cargoExtraArgs + extraCargoArgs;
-        # crane tries to install binaries; WASM produces a .wasm, not an executable.
-        # Override install to just copy the target output.
+        # Cargo emits chronoscope-web.wasm; downstream wasm-bindgen / JS glue
+        # expects snake_case. Rename rather than carry both names.
         installPhaseCommand = ''
           mkdir -p $out/lib
-          cp target/wasm32-unknown-unknown/release/chronoscope_web.wasm $out/lib/ 2>/dev/null \
-            || cp target/wasm32-unknown-unknown/release/chronoscope-web.wasm $out/lib/chronoscope_web.wasm
+          cp target/wasm32-unknown-unknown/release/chronoscope-web.wasm \
+            $out/lib/chronoscope_web.wasm
         '';
       }
     );
@@ -154,6 +154,17 @@ let
     wasmBuild = wasmBuildTest;
   };
 
+  # Clippy against the wasm32 target with -D warnings. The workspace-level
+  # `clippy` check uses default-members, which excludes chronoscope-web.
+  # Without this, web-side lint regressions slip past `nix flake check`.
+  webClippy = wasmCraneLib.cargoClippy (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      cargoClippyExtraArgs = "-- -D warnings";
+    }
+  );
+
 in
 {
   packages = {
@@ -164,5 +175,6 @@ in
   checks = {
     web-build = web;
     web-test-build = webTest;
+    web-clippy = webClippy;
   };
 }

@@ -10,6 +10,10 @@ target/
 
 # Claude Code
 .claude/worktrees/
+.claude/scheduled_tasks.lock
+# Marker file written by `just check` on success; consumed by the
+# pre-commit hook at .claude/hooks/precommit-check.sh
+.claude/last-check.json
 
 # macOS
 .DS_Store

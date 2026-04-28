@@ -34,8 +34,6 @@
         pkgs = nixpkgs.legacyPackages.${system};
         inherit (pkgs) lib;
 
-        # Rust toolchain from fenix stable channel.
-        # fenix pin (via flake.lock) determines the exact stable version.
         toolchain =
           with fenix.packages.${system};
           combine [
@@ -65,7 +63,6 @@
           name = "chronoscope-source";
         };
 
-        # Phase 1: Rust workspace builds and checks.
         rust = import ./nix/rust.nix {
           inherit
             pkgs
@@ -73,9 +70,11 @@
             lib
             src
             ;
+          # Lazy: only `test`/`llvm-cov` force these, so the regions/wikidata/
+          # web cycle stays unresolved at eval time.
+          testExtraEnv = apiRuntimeEnv // webEnv;
         };
 
-        # Phase 2: Python environments and corpus pipeline.
         pythonEnvs = import ./nix/python.nix { inherit pkgs lib; };
 
         corpus = import ./nix/corpus.nix {
@@ -88,8 +87,6 @@
           rustCommonArgs = rust.commonArgs;
         };
 
-        # Phase 2b: Administrative region pipeline (OSM → SpatiaLite).
-        # Imported before wikidata because the ingest binary needs the regions DB.
         regions = import ./nix/regions.nix {
           inherit
             pkgs
@@ -106,10 +103,10 @@
             craneLib
             ;
           rustCommonArgs = rust.commonArgs;
+          inherit (rust) cargoArtifacts;
           regionsDb = regions.regions.italy.db;
         };
 
-        # Phase 3: Web frontend (WASM).
         web = import ./nix/web.nix {
           inherit
             pkgs
@@ -121,20 +118,135 @@
             ;
         };
 
+        api = import ./nix/api.nix {
+          inherit pkgs craneLib;
+          rustCommonArgs = rust.commonArgs;
+          inherit (rust) cargoArtifacts;
+        };
+
         pythonChecks = pythonEnvs.checks {
           rustPackage = rust.packages.default;
         };
 
-        # Nix source for lint checks (only .nix files, excludes .git/).
+        # Nix source for lint check (excludes .git/).
         nixSrc = lib.cleanSourceWith {
-          # cleanSource strips .git/ (which would pass the type == "directory" filter below).
           src = lib.cleanSource ./.;
           filter = path: type: (type == "directory") || (lib.hasSuffix ".nix" path);
           name = "nix-source";
         };
+
+        # webauthn-rs links openssl-sys unconditionally; libspatialite is
+        # loaded at runtime via SELECT load_extension.
+        backendNativeBuildInputs = with pkgs; [ pkg-config ];
+        backendBuildInputs =
+          (with pkgs; [
+            sqlite
+            openssl
+            libspatialite
+            geos
+          ])
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
+        # Runtime env for the api/db/ingestion code paths (consumed by the
+        # backend/web dev shells AND by the hermetic test/llvm-cov checks).
+        apiRuntimeEnv = {
+          SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
+          WIKIDATA_TEST_DB = wikidata.bundles.curated.testDb;
+          REGIONS_DB = "${regions.regions.italy.db}/regions.sqlite";
+        };
+        backendEnv = apiRuntimeEnv // {
+          PROTOC = "${pkgs.protobuf}/bin/protoc";
+        };
+
+        # WASM frontend tooling (trunk, wasm-bindgen, tailwind).
+        webNativeBuildInputs = with pkgs; [
+          binaryen
+          tailwindcss_4
+          trunk
+          wasm-bindgen-cli
+        ];
+
+        # Full Chromium (not chrome-headless-shell): headless-shell only ships
+        # SwiftShader software WebGL, which contends in parallel maplibre tests.
+        # Wrapper is a script that exec's the absolute path — a symlink would
+        # break macOS chrome's data-file lookup (icudtl.dat), since
+        # _NSGetExecutablePath returns the symlink target dir, not the bundle.
+        chromeHeadless = pkgs.runCommand "chromium-wrapper" { } ''
+          mkdir -p $out/bin
+          # Exclude chromium_* (headless-shell sibling) — playwright has
+          # been inconsistent on the separator, so don't trust the dash alone.
+          chromium_root=$(find -L ${pkgs.playwright-driver.browsers} \
+            -maxdepth 1 -type d -name 'chromium-*' ! -name 'chromium_*' | head -n1)
+          if [ -z "$chromium_root" ]; then
+            echo "error: chromium- root not found inside playwright-driver.browsers" >&2
+            exit 1
+          fi
+          src=$(find -L "$chromium_root" \
+            \( -name 'Google Chrome for Testing' -o -name chrome \) \
+            -type f -perm -u+x | head -n1)
+          if [ -z "$src" ]; then
+            echo "error: chromium binary not found inside $chromium_root" >&2
+            exit 1
+          fi
+          cat > $out/bin/chromium <<EOF
+          #!/bin/sh
+          exec "$src" "\$@"
+          EOF
+          chmod +x $out/bin/chromium
+        '';
+        chromeHeadlessBin = "${chromeHeadless}/bin/chromium";
+
+        webEnv = {
+          WEB_DIST = web.packages.web-test;
+          # chromiumoxide picks up CHROME as the executable path.
+          CHROME = chromeHeadlessBin;
+        };
+
+        # Tools every shell wants on PATH.
+        commonTools = with pkgs; [
+          just
+          nixfmt
+          statix
+          deadnix
+          cargo-llvm-cov
+        ];
+
+        commonEnv = {
+          RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
+          PYTORCH_ENABLE_MPS_FALLBACK = "1";
+          HF_HUB_OFFLINE = "1";
+        };
+
+        # Pin commonly-resolved derivations as GC roots so they survive
+        # store collection. Each shell pins what it materially uses.
+        # Skips the daemon roundtrip when the symlink already points at the
+        # current store path (the eval pinned the path, so a match means the
+        # root is current).
+        gcRootsPrelude = ''
+          _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
+          mkdir -p "$_gc_root_dir"
+          _pin() {
+            if [ "$(readlink "$_gc_root_dir/$1" 2>/dev/null)" != "$2" ]; then
+              nix-store --realise "$2" --add-root "$_gc_root_dir/$1" > /dev/null 2>&1
+            fi
+          }
+        '';
+        pinWikidataRoot = "_pin wikidata-test-db ${wikidata.bundles.curated.testDb}";
+        pinRegionsItaly = "_pin regions-italy-db ${regions.regions.italy.db}";
+        pinWeights = ''
+          _pin dinov3-weights ${pythonEnvs.dinov3Repo}
+          _pin sam3-weights ${pythonEnvs.sam3Cache}
+        '';
+        pinCorpus = "_pin corpus-images ${corpus.corpusImages}";
+
+        mkBanner =
+          name: extras:
+          ''
+            echo "chronoscope dev shell (${name})"
+            echo "  rust: $(rustc --version 2>/dev/null || echo 'not in this shell')"
+          ''
+          + extras;
       in
       {
-        # `nix flake check` — all quality gates.
         checks =
           rust.checks
           // web.checks
@@ -161,123 +273,136 @@
             # dedicated CI runners via `nix build .#corpus-tests`).
           };
 
-        # `nix build` — workspace binaries.
-        # analysis-results requires torch (available on all eachDefaultSystem platforms
-        # in nixpkgs, but only with CUDA on x86_64-linux). Guard with a comment so
-        # future platform additions consider torch availability.
         packages =
           rust.packages
           // web.packages
           // {
+            api-italy = api.mkApi { regions = regions.regions.italy; };
+            api-world = api.mkApi { regions = regions.regions.world; };
+
             corpus-images = corpus.corpusImages;
             corpus-fetch = corpus.corpusFetchBin;
             corpus-tests = corpus.corpusTests;
             analysis-results = corpus.analysisResults;
-            # Model weights — build with --impure and HF_TOKEN to populate store.
+
+            # Model weights — built with --impure and HF_TOKEN to populate store.
             dinov3-weights = pythonEnvs.dinov3Repo;
             sam3-weights = pythonEnvs.sam3Cache;
-            # Wikidata entity pipeline.
+
             wikidata-curated-entities = wikidata.bundles.curated.entities;
             wikidata-curated-bundle = wikidata.bundles.curated.ingestionBundle;
             wikidata-curated-db = wikidata.bundles.curated.testDb;
-            # Administrative regions pipeline.
+
             regions-italy-db = regions.regions.italy.db;
+            regions-world-db = regions.regions.world.db;
           };
 
-        # `nix fmt` — format Nix files.
         formatter = pkgs.nixfmt;
 
-        # `nix develop` — three-tier interactive development shells.
-        #
-        # default:  Rust + Python + lint tools. No model weights or corpus images.
-        #           Good for web dev, API work, and most of the repo.
-        #
-        # analysis: default + model weights (DINOv3, SAM3). For running
-        #           analysis pipeline tests. Requires `just fetch-weights` first.
-        #
-        # corpus:   analysis + corpus images. For the full corpus test suite.
-        #           Requires `just fetch-corpus` (or `just fetch-all`) first.
-        #
-        # Model weights and corpus images are fetched on demand via just recipes
-        # rather than as Nix derivation dependencies, because they require network
-        # access to gated HF repos (which require an HF account and token) and
-        # external URLs that can be rate-limited.
+        devShells = {
+          # Minimum to enter the project: rust toolchain + just + nix lint
+          # tools. No backend native deps, no wasm tooling, no model weights.
+          # Most cargo invocations from here will fail to link — switch into
+          # a component shell, or use `just <recipe>` which re-execs.
+          default = pkgs.mkShell {
+            nativeBuildInputs = [ toolchain ] ++ commonTools;
+            env = commonEnv;
+            shellHook = ''
+              ${gcRootsPrelude}
+              ${mkBanner "default — minimal" ""}
+            '';
+          };
 
-        devShells =
-          let
-            # Shared inputs and env across all shell tiers.
-            baseNativeBuildInputs = rust.devShell.nativeBuildInputs ++ [
+          # Backend / API server work: full native deps for the workspace
+          # default-members. Default for crates that don't have a more
+          # specific shell (core, db, ingestion, workers, dev, api-client).
+          api = pkgs.mkShell {
+            nativeBuildInputs = [ toolchain ] ++ commonTools ++ backendNativeBuildInputs;
+            buildInputs = backendBuildInputs;
+            env = commonEnv // backendEnv;
+            shellHook = ''
+              ${gcRootsPrelude}
+              ${pinWikidataRoot}
+              ${pinRegionsItaly}
+              ${mkBanner "api" ""}
+            '';
+          };
+
+          # Web frontend work: backend stack (so `cargo run -p chronoscope-dev`
+          # and browser tests work) plus wasm toolchain, trunk, tailwind,
+          # chromium. WEB_DIST points at the prebuilt test bundle so
+          # browser tests don't depend on a clean local rebuild.
+          web = pkgs.mkShell {
+            nativeBuildInputs = [
+              toolchain
+            ]
+            ++ commonTools
+            ++ backendNativeBuildInputs
+            ++ webNativeBuildInputs;
+            buildInputs = backendBuildInputs;
+            env = commonEnv // backendEnv // webEnv;
+            shellHook = ''
+              ${gcRootsPrelude}
+              ${pinWikidataRoot}
+              ${pinRegionsItaly}
+              ${mkBanner "web" ""}
+            '';
+          };
+
+          # Analysis crate work: backend stack + Python analysis env +
+          # model weights + corpus images. Corpus is mandatory: iterating
+          # on analysis correctness without the corpus produces tests that
+          # don't catch real regressions.
+          analysis = pkgs.mkShell {
+            nativeBuildInputs = [
               toolchain
               pythonEnvs.analysisEnv
-              pkgs.nixfmt
-              pkgs.statix
-              pkgs.deadnix
-            ];
-
-            baseEnv = rust.devShell.env // {
-              RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
-              CORPUS_MANIFEST = corpus.corpusManifestJson;
-              WIKIDATA_TEST_DB = wikidata.bundles.curated.testDb;
-              WEB_DIST = web.packages.web-test;
-              REGIONS_DB = "${regions.regions.italy.db}/regions.sqlite";
-              PYTORCH_ENABLE_MPS_FALLBACK = "1";
-              HF_HUB_OFFLINE = "1";
-            };
-
-            # Common shell hook: GC root setup + wikidata test DB pinning.
-            baseShellHook = ''
-              _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
-              mkdir -p "$_gc_root_dir"
-              nix-store --realise ${wikidata.bundles.curated.testDb} --add-root "$_gc_root_dir/wikidata-test-db" > /dev/null 2>&1
-              echo "chronoscope dev shell"
-              echo "  rust: $(rustc --version)"
-              echo "  protoc: $($PROTOC --version)"
-              echo "  python: $(python3 --version)"
+            ]
+            ++ commonTools
+            ++ backendNativeBuildInputs;
+            buildInputs = backendBuildInputs;
+            env =
+              commonEnv
+              // backendEnv
+              // pythonEnvs.modelEnv
+              // {
+                CORPUS_IMAGES = corpus.corpusImages;
+              };
+            shellHook = ''
+              ${gcRootsPrelude}
+              ${pinWikidataRoot}
+              ${pinRegionsItaly}
+              ${pinWeights}
+              ${pinCorpus}
+              ${mkBanner "analysis" ''
+                echo "  python: $(python3 --version 2>/dev/null)"
+              ''}
             '';
-
-            pinWeightsAsRoots = ''
-              nix-store --realise ${pythonEnvs.dinov3Repo} --add-root "$_gc_root_dir/dinov3-weights" > /dev/null 2>&1
-              nix-store --realise ${pythonEnvs.sam3Cache} --add-root "$_gc_root_dir/sam3-weights" > /dev/null 2>&1
-            '';
-
-            pinCorpusAsRoots = ''
-              nix-store --realise ${corpus.corpusImages} --add-root "$_gc_root_dir/corpus-images" > /dev/null 2>&1
-            '';
-          in
-          {
-            default = pkgs.mkShell {
-              nativeBuildInputs = baseNativeBuildInputs;
-              inherit (rust.devShell) buildInputs;
-              env = baseEnv;
-              shellHook = baseShellHook;
-            };
-
-            analysis = pkgs.mkShell {
-              nativeBuildInputs = baseNativeBuildInputs;
-              inherit (rust.devShell) buildInputs;
-              env = baseEnv // pythonEnvs.modelEnv;
-              shellHook = ''
-                ${baseShellHook}
-                ${pinWeightsAsRoots}
-              '';
-            };
-
-            corpus = pkgs.mkShell {
-              nativeBuildInputs = baseNativeBuildInputs;
-              inherit (rust.devShell) buildInputs;
-              env =
-                baseEnv
-                // pythonEnvs.modelEnv
-                // {
-                  CORPUS_IMAGES = corpus.corpusImages;
-                };
-              shellHook = ''
-                ${baseShellHook}
-                ${pinWeightsAsRoots}
-                ${pinCorpusAsRoots}
-              '';
-            };
           };
+
+          # Triton serving / harness work: Python analysis env + model
+          # weights + the rust toolchain (for schematool, used by Python
+          # tests for cross-language schema validation). No corpus —
+          # corpus correctness lives in `analysis`. No backend native
+          # deps — schematool comes prebuilt from rust.packages.default.
+          triton = pkgs.mkShell {
+            nativeBuildInputs = [
+              toolchain
+              pythonEnvs.analysisEnv
+              rust.packages.default
+            ]
+            ++ commonTools;
+            env = commonEnv // pythonEnvs.modelEnv;
+            shellHook = ''
+              ${gcRootsPrelude}
+              ${pinWeights}
+              ${mkBanner "triton" ''
+                echo "  python: $(python3 --version 2>/dev/null)"
+                echo "  schematool: $(command -v schematool 2>/dev/null || echo 'not found')"
+              ''}
+            '';
+          };
+        };
       }
     );
 }

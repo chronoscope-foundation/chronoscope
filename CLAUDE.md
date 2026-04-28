@@ -25,80 +25,116 @@ See [docs/design.md](docs/design.md) for the full design philosophy. Key points:
 
 ## Development Environment
 
-All tooling comes from Nix. Install [Nix](https://nixos.org/download/) (Determinate Nix recommended), then either:
+All tooling comes from Nix. Install [Nix](https://nixos.org/download/)
+(Determinate Nix recommended), then either:
 
 - **direnv**: `direnv allow` (auto-activates on `cd`)
 - **Manual**: `nix develop`
 
-`just` commands auto-wrap with `nix develop` if you're not already in the shell.
+`just` recipes auto-wrap with the right `nix develop` when you're not
+already in a shell — pick the closest recipe and let it handle the
+shell selection.
 
-### Shell Tiers
+### Dev shells by component
 
-Three dev shells provide increasing levels of data, so the base shell starts fast without large downloads:
+The flake exposes one shell per project area, sized to what that area
+needs. Shells are derivations like everything else; no shells "depend on"
+each other beyond what they explicitly compose.
 
-| Shell | What it adds | Use case |
-|-------|-------------|----------|
-| `default` | Rust + Python + lint tools | Web dev, API work, most of the repo |
-| `analysis` | + model weights (DINOv3, SAM3) | Analysis pipeline tests |
-| `corpus` | + corpus images | Full corpus test suite |
+| Shell      | What's in it                                                     | When to use                                  |
+|------------|------------------------------------------------------------------|----------------------------------------------|
+| `default`  | rust toolchain + just + nix lint tools                           | Poking at the project, running `just <recipe>` |
+| `api`      | default + sqlite/openssl/spatialite/protobuf + WIKIDATA + REGIONS | Backend / API server work                    |
+| `web`      | api + wasm toolchain + trunk + tailwind + chromium + WEB_DIST    | Frontend; running `web-dev`; browser tests   |
+| `analysis` | api + Python analysis env + weights + corpus                     | Iterating on `chronoscope-analysis` correctness |
+| `triton`   | Python analysis env + weights + rust toolchain (for schematool)  | Triton harness / serving config              |
+
+`just` recipes pick the smallest shell that covers their target
+(e.g. `just clippy web` enters `web`, `just check triton` runs hermetically
+via Nix). The `default` shell is intentionally minimal; cargo invocations
+beyond toolchain queries will fail to link there.
+
+### Component-specific notes
+
+Sub-CLAUDE.md files at `web/`, `api/`, `analysis/`, `analysis/triton/`,
+and `nix/` carry area-specific knowledge that auto-loads when Claude
+touches files in those subtrees. Read them when you start working in a
+new area; they cover the non-obvious bits (wasm32 target gotcha,
+OpenAPI client regen, corpus FOD layout, HF cache layout, etc.).
+
+### Fetching data
 
 ```bash
-nix develop              # default — no large downloads
-nix develop .#analysis   # requires: just fetch-weights
-nix develop .#corpus     # requires: just fetch-weights + just fetch-corpus
+HF_TOKEN=hf_... just fetch-weights        # ~2GB model weights (gated repos; needs HF token)
+just fetch-corpus                          # corpus images from external URLs
+just fetch-regions [italy|world]           # OSM regions DB (italy default ~2GB; world ~70GB)
+just fetch-all                             # weights + corpus + italy regions
 ```
 
-`just` recipes automatically select the right shell tier (e.g., `just check` uses `analysis`, `just corpus-test` uses `corpus`).
+Fetched data is pinned as GC roots under `.nix-gc-roots/` (gitignored).
 
-### Fetching Data
+## Commit gate: `just check`
+
+`just check` is the hermetic ground-truth gate for commits. It is
+equivalent to `nix flake check` (or a focused subset for `just check
+<target>`) and writes `.claude/last-check.json` on success — a marker
+that records the working-tree state at the moment of the check.
+
+A pre-commit hook at `.claude/hooks/precommit-check.sh` (registered in
+`.claude/settings.json`) checks the marker against the current tree on
+every `git commit`. If the tree has changed since the last successful
+`just check`, the hook injects an advisory reminder for Claude to
+re-run. The hook is non-blocking — you can still commit through it
+deliberately, but the reminder is there.
+
+`just test`, `just clippy`, `just fmt` are the **fast inner loop**:
+cargo direct, dev shell, incremental compilation. They are deliberately
+**not** a substitute for `just check` — they don't write the marker, and
+the pre-commit hook only honors the marker.
+
+## Recipe inventory
 
 ```bash
-HF_TOKEN=hf_... just fetch-weights   # ~2GB model weights (one-time, needs HF token)
-just fetch-corpus                     # corpus images from external URLs
-just fetch-all                        # both of the above
+# Hermetic gate (writes .claude/last-check.json on success)
+just check                  # everything (nix flake check)
+just check rust             # workspace fmt + clippy + test + coverage
+just check web              # WASM build + browser-test build + wasm clippy
+just check triton           # Python ruff + mypy + pytest
+just check nix              # Nix lint (nixfmt + statix + deadnix)
+
+# Fast inner loop (cargo direct; do not satisfy the commit gate)
+just fmt   [target]         # apply formatting
+just test  [target]         # cargo test
+just clippy [target]        # cargo clippy
+
+# Per-crate target (test/clippy): core, db, api, api-client, ingestion,
+# workers, dev, integrations, web, triton, analysis
+#   e.g. just clippy core   → cargo clippy -p chronoscope-core -- -D warnings
+
+# Concrete actions
+just web-dev                # integrated dev server (API + Trunk live reload; auto-picks free ports)
+just openapi                # regenerate api/target/openapi.json
+just corpus-hash            # add hashes for new corpus URLs
+just corpus-test            # run Rust corpus test suite
+just corpus-test-vlm        # corpus tests + VLM (needs remote Triton)
 ```
 
-Fetched data is pinned as GC roots in `.nix-gc-roots/` so Nix garbage collection won't sweep it.
-
-## Commit Requirements
-
-Every commit must pass `just check`, which runs Nix linting (nixfmt, statix, deadnix), Rust checks (fmt, clippy, test, coverage), and Python checks (ruff, mypy, pytest). Line coverage must stay above 75%.
-
-## Quick Reference
+### Workflow examples
 
 ```bash
-# Run all checks (Nix + Rust + Python — needs analysis shell)
+# I'm editing the web crate; verify it still compiles cleanly
+just clippy web
+
+# I'm about to commit a backend change; run the hermetic gate
 just check
 
-# Auto-fix all formatting
-just fmt
+# I touched an API endpoint; need to regen and re-verify
+just openapi
+just check rust
 
-# Start web frontend dev server (Trunk live reload)
-just web-dev
-
-# Start dev server (ngrok + API + workers)
-cargo run -p chronoscope-dev
-
-# Generate OpenAPI spec
-cargo run --bin openapi -- api/target/openapi.json
-
-# Hermetic sandboxed checks (CI-style, no GPU required)
-nix flake check
-
-# Run individual Nix checks
-nix build .#checks.$(nix eval --impure --expr builtins.currentSystem --raw).triton-test
-
-# Corpus tests (needs corpus shell — builds GPU analysis results on demand)
-just corpus-test
+# I'm running the integrated dev server
+just web-dev      # picks free ports automatically; no port collision
 ```
-
-## Cross-Language Testing
-
-Python tests call `schematool` (a Rust binary from `analysis/src/bin/schematool.rs`) to validate that Python model output matches Rust schema expectations. This catches schema drift between the two languages.
-
-- **`nix flake check`**: schematool comes from `rust.packages.default` (the workspace build)
-- **`just check`**: schematool is built by `cargo build --bin schematool` and added to PATH
-- **Model weights**: SAM3 and DINOv3 weights are fetched via `just fetch-weights` into the Nix store as fixed-output derivations (`hf download` in a sandboxed FOD). `HF_HUB_OFFLINE=1` is set in the analysis/corpus shells — missing weights fail hard, never download silently.
 
 ## Code Standards
 
