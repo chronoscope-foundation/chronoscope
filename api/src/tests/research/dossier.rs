@@ -5,7 +5,6 @@ use super::*;
 // Test coordinates: Gary, Indiana - home of the Jackson 5
 const GARY_INDIANA_LAT: f64 = 41.5908;
 const GARY_INDIANA_LON: f64 = -87.3467;
-const GARY_INDIANA_ALT: f64 = 180.5;
 
 #[tokio::test]
 async fn test_dossier_pending_has_no_resolved_content() -> TestResult {
@@ -259,20 +258,13 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
         width: 1920,
         height: 1080,
         duration_seconds: None,
-        captured: Some(chronoscope_core::UncertainDate::exact(
-            chrono::NaiveDate::from_ymd_opt(1965, 8, 15)
-                .ok_or("valid date")?
-                .and_hms_opt(12, 0, 0)
-                .ok_or("valid time")?,
+        captured: Some(chronoscope_core::UncertainDate::with_precision(
+            chrono::NaiveDate::from_ymd_opt(1965, 8, 15).ok_or("valid date")?,
+            chronoscope_core::DatePrecision::Day,
         )?),
-        location: Some(chronoscope_core::UncertainLocation::coordinates(
-            GARY_INDIANA_LAT,
-            GARY_INDIANA_LON,
-            Some(chronoscope_core::Elevation::SeaLevelOffset {
-                meters: GARY_INDIANA_ALT as i32,
-            }),
-            None,
-        )?),
+        location: Some(chronoscope_core::UnresolvedLocation::Resolved(
+            chronoscope_core::Location::point(GARY_INDIANA_LAT, GARY_INDIANA_LON)?,
+        )),
         source_metadata: None,
         fetched_at: chrono::Utc::now().naive_utc(),
     };
@@ -294,23 +286,16 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
     assert!(media.captured.is_some());
 
     let location = media.location.as_ref().ok_or("should have GPS location")?;
-    if let chronoscope_core::UncertainLocation::Coordinates {
+    if let chronoscope_core::UnresolvedLocation::Resolved(chronoscope_core::Location::Circle {
         lat,
         lon,
-        elevation,
         ..
-    } = location
+    }) = location
     {
         assert_eq!(*lat, GARY_INDIANA_LAT);
         assert_eq!(*lon, GARY_INDIANA_LON);
-        assert_eq!(
-            *elevation,
-            Some(chronoscope_core::Elevation::SeaLevelOffset {
-                meters: GARY_INDIANA_ALT as i32,
-            })
-        );
     } else {
-        return Err("expected Coordinates location".into());
+        return Err("expected Resolved(Circle) location".into());
     }
     Ok(())
 }

@@ -63,7 +63,13 @@ pub async fn process(
         .published_time
         .as_ref()
         .and_then(|t| parse_published_time(t))
-        .and_then(|dt| chronoscope_core::UncertainDate::exact(dt).ok());
+        .and_then(|dt| {
+            chronoscope_core::UncertainDate::with_precision(
+                dt.date(),
+                chronoscope_core::DatePrecision::Day,
+            )
+            .ok()
+        });
 
     // Create page data
     let page_data = PageData {

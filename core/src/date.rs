@@ -1,11 +1,54 @@
 //! Date types with uncertainty support.
 //!
-//! Provides types for representing dates with various levels of precision,
-//! from exact seconds to millennia.
+//! [`UncertainDate`] models epistemic uncertainty about a single instant in time.
+//! "Built in the 1920s" means "construction started at some unknown instant within
+//! \[1920, 1929\]" — not "construction spanned the entire decade." Duration is modeled
+//! structurally by pairing two uncertain instants (`started_at` + `completed_at` in
+//! [`EntityTransition`](crate::entity::EntityTransition)), not by widening a single date.
+//!
+//! # Representation
+//!
+//! An `UncertainDate` is a pair of optional [`DateBound`] endpoints, where each bound
+//! carries a [`NaiveDate`] and a [`DatePrecision`] indicating the granularity of the
+//! boundary itself. Precision lives on bounds, not on values: "before 1950" has a
+//! year-granularity upper bound, distinct from "before January 1, 1950" which has a
+//! day-granularity bound.
+//!
+//! | Human expression | `earliest` | `latest` |
+//! |---|---|---|
+//! | "1927" | `DateBound(1927-01-01, Year)` | `DateBound(1927-01-01, Year)` |
+//! | "The 1920s" | `DateBound(1920-01-01, Decade)` | `DateBound(1920-01-01, Decade)` |
+//! | "Before 1950" | `None` | `DateBound(1950-01-01, Year)` |
+//! | "After 1800" | `DateBound(1800-01-01, Year)` | `None` |
+//! | Unknown | `None` | `None` |
+//!
+//! `(None, None)` is the identity element for meet (intersection).
+//!
+//! # Prior art and references
+//!
+//! - **EDTF / ISO 8601-2:2019**: Distinguishes unspecified digits (`192X`) from
+//!   intervals (`1920/1929`), plus uncertainty (`?`), approximation (`~`), and
+//!   combined (`%`). Every implementation collapses to `[lower, upper]` for computation.
+//!   See <https://www.loc.gov/standards/datetime/>.
+//!
+//! - **Dyreson & Snodgrass (TODS 1998)**: The "possible chronons" model. Temporal
+//!   granularity and indeterminacy are two sides of the same coin.
+//!   See <https://www2.cs.arizona.edu/~rts/pubs/TODS98.pdf>.
+//!
+//! - **OWL-Time (W3C 2017)**: A `DateTimeDescription` is "strictly always a description
+//!   of an interval." Found overly prescriptive for historical data by the `PeriodO`
+//!   project. See <https://www.w3.org/TR/owl-time/>.
+//!
+//! - **CIDOC-CRM**: Four boundary points (begin-of-begin, end-of-begin, begin-of-end,
+//!   end-of-end) for fuzzy time-spans. See <https://cidoc-crm.org/taxonomy/term/74>.
+//!
+//! - **Wikidata**: Numeric precision (0=billion years through 14=seconds). Documentation
+//!   says "an indicator of significant parts, not directly specifying an interval" — but
+//!   in practice it behaves as one. See <https://www.wikidata.org/wiki/Help:Dates>.
 
 use std::fmt;
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
+use chrono::{Datelike, NaiveDate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -34,13 +77,15 @@ impl fmt::Display for DateError {
 
 impl std::error::Error for DateError {}
 
-/// Precision level for dates
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// Precision level for date bounds.
+///
+/// Determines the granularity of a [`DateBound`]. A bound with `Year` precision
+/// represents a boundary at year granularity: "1927" spans Jan 1 – Dec 31.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DatePrecision {
-    Second,
-    Minute,
-    Hour,
     Day,
     Month,
     Year,
@@ -51,52 +96,52 @@ pub enum DatePrecision {
     Millennium,
 }
 
-/// A date/time with known precision.
+/// A date with known precision, used as a bound in [`UncertainDate`].
 ///
-/// The datetime is always snapped to the start of its precision period.
-/// For example, `Year` precision for 2020 stores `2020-01-01T00:00:00`.
+/// The date is always snapped to the start of its precision period.
+/// For example, `Year` precision for 2020 stores `2020-01-01`.
 ///
 /// Year 0 is rejected — use negative years for BCE dates (e.g., -1 for 1 BCE).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct PreciseDate {
-    datetime: NaiveDateTime,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct DateBound {
+    date: NaiveDate,
     precision: DatePrecision,
 }
 
-impl<'de> Deserialize<'de> for PreciseDate {
+impl<'de> Deserialize<'de> for DateBound {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
         struct Raw {
-            datetime: NaiveDateTime,
+            date: NaiveDate,
             precision: DatePrecision,
         }
         let raw = Raw::deserialize(deserializer)?;
-        PreciseDate::new(raw.datetime, raw.precision).map_err(serde::de::Error::custom)
+        DateBound::new(raw.date, raw.precision).map_err(serde::de::Error::custom)
     }
 }
 
-impl PreciseDate {
-    /// Create a new `PreciseDate`, snapping the datetime to its precision period start.
+impl DateBound {
+    /// Create a new `DateBound`, snapping the date to its precision period start.
     ///
-    /// Returns `Err(DateError::Year0)` if the datetime has year 0.
-    pub fn new(datetime: NaiveDateTime, precision: DatePrecision) -> Result<Self, DateError> {
-        if datetime.year() == 0 {
+    /// Returns `Err(DateError::Year0)` if the date has year 0.
+    pub fn new(date: NaiveDate, precision: DatePrecision) -> Result<Self, DateError> {
+        if date.year() == 0 {
             return Err(DateError::Year0);
         }
-        let snapped = snap_to_precision_start(datetime, precision);
+        let snapped = snap_to_precision_start(date, precision);
         Ok(Self {
-            datetime: snapped,
+            date: snapped,
             precision,
         })
     }
 
-    /// The snapped datetime (start of the precision period).
+    /// The snapped date (start of the precision period).
     #[must_use]
-    pub fn datetime(&self) -> NaiveDateTime {
-        self.datetime
+    pub fn date(&self) -> NaiveDate {
+        self.date
     }
 
     /// The precision level.
@@ -105,165 +150,206 @@ impl PreciseDate {
         self.precision
     }
 
-    /// The earliest possible moment (same as `datetime()`).
+    /// The last day of this bound's precision period.
     #[must_use]
-    pub fn earliest(&self) -> NaiveDateTime {
-        self.datetime
-    }
-
-    /// The latest possible moment within this precision period.
-    #[must_use]
-    pub fn latest(&self) -> NaiveDateTime {
-        precision_end(self.datetime, self.precision)
+    pub fn period_end(&self) -> NaiveDate {
+        precision_end(self.date, self.precision)
     }
 }
 
-/// Represents a date/time with uncertainty.
+/// A date with uncertainty, represented as a pair of optional bounds.
 ///
-/// Uses `chrono::NaiveDateTime` (proleptic Gregorian calendar) which supports dates
-/// from ±262K years and preserves sub-day precision for EXIF timestamps and similar sources.
+/// Each bound carries its own [`DatePrecision`]. `None` means unbounded
+/// in that direction (the entire past or future). `(None, None)` represents
+/// a completely unknown date.
 ///
-/// Construct via `exact()`, `with_precision()`, or `range()`. The `Precise` representation
-/// enforces that the datetime is always snapped to the start of its precision period — this
-/// invariant is maintained by construction and cannot be violated by external code.
+/// # Construction
 ///
-/// **Year 0 is rejected** in all constructors — use negative years for BCE dates
-/// (e.g., -1 for 1 BCE). There is no year 0 in historical convention.
+/// - [`UncertainDate::with_precision`] — symmetric bounds (e.g., "1927" or "the 1920s")
+/// - [`UncertainDate::bounded`] — asymmetric or one-sided (e.g., "before 1950")
+/// - [`UncertainDate::unknown`] — completely unknown `(None, None)`
 ///
-/// **Note**: There is no "Unknown" representation. Use `Option<UncertainDate>` when a date
-/// may be completely unknown. This allows `Cited<UncertainDate>` to always have a meaningful value.
-///
-/// **Convention**: Date ranges use half-open semantics conceptually — `earliest()` is the
-/// *terminus post quem* (earliest possible moment) and `latest()` is the *terminus ante quem*
-/// (latest possible moment, inclusive at second resolution).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
-pub struct UncertainDate(UncertainDateInner);
-
+/// Year 0 is rejected in all constructors.
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum UncertainDateInner {
-    /// A date with known precision (second through millennium).
-    Precise(PreciseDate),
-    /// A date range with independently precise endpoints.
-    ///
-    /// Represents source-asserted uncertainty about a single point in time,
-    /// e.g., "between 1850 and 1854" from a single source. Each endpoint
-    /// carries its own precision level.
-    Range {
-        earliest: PreciseDate,
-        latest: PreciseDate,
-    },
+pub struct UncertainDate {
+    earliest: Option<DateBound>,
+    latest: Option<DateBound>,
 }
 
-impl JsonSchema for UncertainDate {
-    fn schema_name() -> String {
-        "UncertainDate".to_string()
-    }
-
-    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        UncertainDateInner::json_schema(generator)
-    }
-}
-
-// Custom deserializer: PreciseDate's Deserialize handles year 0 rejection and snapping;
-// Range validation (earliest <= latest) is checked by UncertainDate::range().
 impl<'de> Deserialize<'de> for UncertainDate {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum UncertainDateRaw {
-            Precise(PreciseDate),
-            Range {
-                earliest: PreciseDate,
-                latest: PreciseDate,
-            },
+        struct Raw {
+            earliest: Option<DateBound>,
+            latest: Option<DateBound>,
         }
-
-        let raw = UncertainDateRaw::deserialize(deserializer)?;
-        match raw {
-            UncertainDateRaw::Precise(pd) => Ok(Self(UncertainDateInner::Precise(pd))),
-            UncertainDateRaw::Range { earliest, latest } => {
-                UncertainDate::range(earliest, latest).map_err(serde::de::Error::custom)
-            }
-        }
+        let raw = Raw::deserialize(deserializer)?;
+        UncertainDate::bounded(raw.earliest, raw.latest).map_err(serde::de::Error::custom)
     }
 }
 
 impl UncertainDate {
-    /// Create an `UncertainDate` for an exact known date/time (second precision).
+    /// Create an `UncertainDate` with symmetric bounds at the given precision.
     ///
-    /// Returns `Err(DateError::Year0)` if the datetime has year 0.
-    pub fn exact(datetime: NaiveDateTime) -> Result<Self, DateError> {
-        Ok(Self(UncertainDateInner::Precise(PreciseDate::new(
-            datetime,
-            DatePrecision::Second,
-        )?)))
+    /// For example, `with_precision(2020-06-15, Year)` produces bounds
+    /// where both earliest and latest are `DateBound(2020-01-01, Year)`.
+    ///
+    /// Returns `Err(DateError::Year0)` if the date has year 0.
+    pub fn with_precision(date: NaiveDate, precision: DatePrecision) -> Result<Self, DateError> {
+        let bound = DateBound::new(date, precision)?;
+        Ok(Self {
+            earliest: Some(bound),
+            latest: Some(bound),
+        })
     }
 
-    /// Create an `UncertainDate` with specific precision.
-    /// The datetime is snapped to the start of the precision period for canonical representation.
+    /// Create an `UncertainDate` with explicit earliest and latest bounds.
     ///
-    /// Returns `Err(DateError::Year0)` if the datetime has year 0.
-    pub fn with_precision(
-        datetime: NaiveDateTime,
-        precision: DatePrecision,
+    /// Either or both bounds may be `None` (unbounded).
+    ///
+    /// Returns `Err(DateError::InvertedRange)` if both bounds are present and
+    /// the earliest bound's period start is after the latest bound's period end.
+    pub fn bounded(
+        earliest: Option<DateBound>,
+        latest: Option<DateBound>,
     ) -> Result<Self, DateError> {
-        Ok(Self(UncertainDateInner::Precise(PreciseDate::new(
-            datetime, precision,
-        )?)))
-    }
-
-    /// Create an `UncertainDate` for a date range with independently precise endpoints.
-    ///
-    /// Each endpoint is a `PreciseDate` with its own precision level. For example,
-    /// "between the 1880s and 1899" would use decade precision for the earliest
-    /// endpoint and year precision for the latest.
-    ///
-    /// Returns `Err(DateError::InvertedRange)` if `earliest.earliest() > latest.latest()`.
-    pub fn range(earliest: PreciseDate, latest: PreciseDate) -> Result<Self, DateError> {
-        if earliest.earliest() > latest.latest() {
+        if let (Some(e), Some(l)) = (&earliest, &latest)
+            && e.date() > l.period_end()
+        {
             return Err(DateError::InvertedRange);
         }
-        Ok(Self(UncertainDateInner::Range { earliest, latest }))
+        Ok(Self { earliest, latest })
     }
 
-    /// Returns the precision level if this is a precise date, or `None` for ranges.
+    /// Create a completely unknown date `(None, None)`.
+    ///
+    /// This is the identity element for meet (intersection).
     #[must_use]
-    pub fn precision(&self) -> Option<DatePrecision> {
-        match &self.0 {
-            UncertainDateInner::Precise(pd) => Some(pd.precision()),
-            UncertainDateInner::Range { .. } => None,
+    pub fn unknown() -> Self {
+        Self {
+            earliest: None,
+            latest: None,
         }
     }
 
-    /// Get the earliest possible datetime for this uncertain date.
+    /// The earliest possible date, or `None` if unbounded.
     #[must_use]
-    pub fn earliest(&self) -> NaiveDateTime {
-        match &self.0 {
-            UncertainDateInner::Precise(pd) => pd.earliest(),
-            UncertainDateInner::Range { earliest, .. } => earliest.earliest(),
-        }
+    pub fn earliest(&self) -> Option<NaiveDate> {
+        self.earliest.as_ref().map(DateBound::date)
     }
 
-    /// Get the latest possible datetime for this uncertain date.
+    /// The latest possible date, or `None` if unbounded.
     #[must_use]
-    pub fn latest(&self) -> NaiveDateTime {
-        match &self.0 {
-            UncertainDateInner::Precise(pd) => pd.latest(),
-            UncertainDateInner::Range { latest, .. } => latest.latest(),
-        }
+    pub fn latest(&self) -> Option<NaiveDate> {
+        self.latest.as_ref().map(DateBound::period_end)
+    }
+
+    /// The earliest bound (with precision), if present.
+    #[must_use]
+    pub fn earliest_bound(&self) -> Option<&DateBound> {
+        self.earliest.as_ref()
+    }
+
+    /// The latest bound (with precision), if present.
+    #[must_use]
+    pub fn latest_bound(&self) -> Option<&DateBound> {
+        self.latest.as_ref()
     }
 
     /// Check if this date range overlaps with another.
     ///
     /// Two ranges overlap if there's any point in time that falls within both.
+    /// Unbounded endpoints overlap with everything.
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
-        self.earliest() <= other.latest() && other.earliest() <= self.latest()
+        self.meet(other).is_some()
+    }
+
+    /// Intersection of two uncertain dates (meet in the lattice).
+    ///
+    /// Returns the tightest range contained by both, or `None` if the ranges
+    /// are disjoint. Selects bounds from the inputs — never manufactures new
+    /// `DateBound` values.
+    ///
+    /// `unknown().meet(x) == Some(x)` — unknown is the identity.
+    #[must_use]
+    pub fn meet(&self, other: &Self) -> Option<Self> {
+        let earliest = tighten_earliest(&self.earliest, &other.earliest);
+        let latest = tighten_latest(&self.latest, &other.latest);
+
+        // Check for disjoint: if both bounds are present and earliest > latest
+        if let (Some(e), Some(l)) = (earliest.as_ref(), latest.as_ref())
+            && e.date() > l.period_end()
+        {
+            return None;
+        }
+
+        Some(Self { earliest, latest })
+    }
+
+    /// Bounding interval of two uncertain dates (join in the lattice).
+    ///
+    /// Returns the smallest range containing both. Always succeeds.
+    /// Selects bounds from the inputs — never manufactures new `DateBound` values.
+    ///
+    /// `unknown().join(x) == unknown()` — unknown absorbs everything.
+    #[must_use]
+    pub fn join(&self, other: &Self) -> Self {
+        Self {
+            earliest: widen_earliest(&self.earliest, &other.earliest),
+            latest: widen_latest(&self.latest, &other.latest),
+        }
+    }
+}
+
+/// For the earliest bound: the effective boundary is `date()` (period start).
+/// For the latest bound: the effective boundary is `period_end()` (period end).
+/// When boundaries are equal, precision tiebreaks for a total order.
+impl DateBound {
+    /// Ordering key for earliest-bound comparisons (lower bound of the interval).
+    fn earliest_key(&self) -> (NaiveDate, DatePrecision) {
+        (self.date, self.precision)
+    }
+
+    /// Ordering key for latest-bound comparisons (upper bound of the interval).
+    fn latest_key(&self) -> (NaiveDate, DatePrecision) {
+        (self.period_end(), self.precision)
+    }
+}
+
+/// Tighten (for meet): `Some` wins over `None`. Picks the more restrictive bound.
+fn tighten_earliest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBound> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(*std::cmp::max_by_key(a, b, |x| x.earliest_key())),
+        (Some(x), None) | (None, Some(x)) => Some(*x),
+        (None, None) => None,
+    }
+}
+
+fn tighten_latest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBound> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(*std::cmp::min_by_key(a, b, |x| x.latest_key())),
+        (Some(x), None) | (None, Some(x)) => Some(*x),
+        (None, None) => None,
+    }
+}
+
+/// Widen (for join): `None` wins over `Some`. Picks the less restrictive bound.
+fn widen_earliest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBound> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(*std::cmp::min_by_key(a, b, |x| x.earliest_key())),
+        _ => None,
+    }
+}
+
+fn widen_latest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBound> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(*std::cmp::max_by_key(a, b, |x| x.latest_key())),
+        _ => None,
     }
 }
 
@@ -276,25 +362,8 @@ impl UncertainDate {
 // returning the wrong date.
 
 #[allow(clippy::expect_used)]
-fn ymd_midnight(y: i32, m: u32, d: u32) -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(y, m, d)
-        .expect("precision arithmetic: valid date components")
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is always valid")
-}
-
-#[allow(clippy::expect_used)]
-fn ymd_end_of_day(y: i32, m: u32, d: u32) -> NaiveDateTime {
-    NaiveDate::from_ymd_opt(y, m, d)
-        .expect("precision arithmetic: valid date components")
-        .and_hms_opt(23, 59, 59)
-        .expect("23:59:59 is always valid")
-}
-
-#[allow(clippy::expect_used)]
-fn date_hms(d: NaiveDate, h: u32, m: u32, s: u32) -> NaiveDateTime {
-    d.and_hms_opt(h, m, s)
-        .expect("precision arithmetic: valid time components")
+fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(y, m, d).expect("precision arithmetic: valid date components")
 }
 
 /// Start year of a 1-based historical period (century, millennium).
@@ -320,66 +389,53 @@ fn period_end_year(year: i32, period: i32) -> i32 {
     }
 }
 
-/// Calculate the start of a precision period.
+/// Snap a date to the start of its precision period.
 ///
 /// Century and millennium use the historical convention (1-based).
 /// Decades use the common convention (0-based): 1980s = 1980–1989.
-fn snap_to_precision_start(dt: NaiveDateTime, precision: DatePrecision) -> NaiveDateTime {
+fn snap_to_precision_start(date: NaiveDate, precision: DatePrecision) -> NaiveDate {
     match precision {
-        DatePrecision::Second => dt,
-        DatePrecision::Minute => date_hms(dt.date(), dt.hour(), dt.minute(), 0),
-        DatePrecision::Hour => date_hms(dt.date(), dt.hour(), 0, 0),
-        DatePrecision::Day => date_hms(dt.date(), 0, 0, 0),
-        DatePrecision::Month => ymd_midnight(dt.year(), dt.month(), 1),
-        DatePrecision::Year => ymd_midnight(dt.year(), 1, 1),
+        DatePrecision::Day => date,
+        DatePrecision::Month => ymd(date.year(), date.month(), 1),
+        DatePrecision::Year => ymd(date.year(), 1, 1),
         DatePrecision::Decade => {
-            let mut decade_start = dt.year().div_euclid(10) * 10;
+            let mut decade_start = date.year().div_euclid(10) * 10;
             // Decades are 0-based (1980s = 1980–1989), so years 1-9 CE snap to
             // "decade 0" — but year 0 doesn't exist historically, so clamp to 1.
-            // Century/millennium don't need this because their 1-based convention
-            // naturally avoids year 0.
             if decade_start == 0 {
                 decade_start = 1;
             }
-            ymd_midnight(decade_start, 1, 1)
+            ymd(decade_start, 1, 1)
         }
-        DatePrecision::Century => ymd_midnight(period_start_year(dt.year(), 100), 1, 1),
-        DatePrecision::Millennium => ymd_midnight(period_start_year(dt.year(), 1000), 1, 1),
+        DatePrecision::Century => ymd(period_start_year(date.year(), 100), 1, 1),
+        DatePrecision::Millennium => ymd(period_start_year(date.year(), 1000), 1, 1),
     }
 }
 
-/// Calculate the end of a precision period.
-///
-/// See [`snap_to_precision_start`] for the century/millennium convention.
-fn precision_end(dt: NaiveDateTime, precision: DatePrecision) -> NaiveDateTime {
+/// Calculate the last day of a precision period.
+fn precision_end(date: NaiveDate, precision: DatePrecision) -> NaiveDate {
     match precision {
-        DatePrecision::Second => dt,
-        DatePrecision::Minute => date_hms(dt.date(), dt.hour(), dt.minute(), 59),
-        DatePrecision::Hour => date_hms(dt.date(), dt.hour(), 59, 59),
-        DatePrecision::Day => date_hms(dt.date(), 23, 59, 59),
+        DatePrecision::Day => date,
         DatePrecision::Month => {
-            let (next_year, next_month) = if dt.month() == 12 {
-                (dt.year() + 1, 1)
+            let (next_year, next_month) = if date.month() == 12 {
+                (date.year() + 1, 1)
             } else {
-                (dt.year(), dt.month() + 1)
+                (date.year(), date.month() + 1)
             };
             // Last day of current month = day before first of next month.
-            // Note: chrono supports year 0 internally, so December of year -1
-            // correctly rolls to Jan 1 of year 0 (chrono) for the subtraction.
             #[allow(clippy::expect_used)]
-            let last_day = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+            NaiveDate::from_ymd_opt(next_year, next_month, 1)
                 .expect("precision arithmetic: valid next-month date")
                 .pred_opt()
-                .expect("precision arithmetic: predecessor of valid date");
-            date_hms(last_day, 23, 59, 59)
+                .expect("precision arithmetic: predecessor of valid date")
         }
-        DatePrecision::Year => ymd_end_of_day(dt.year(), 12, 31),
+        DatePrecision::Year => ymd(date.year(), 12, 31),
         DatePrecision::Decade => {
-            let decade_end = dt.year().div_euclid(10) * 10 + 9;
-            ymd_end_of_day(decade_end, 12, 31)
+            let decade_end = date.year().div_euclid(10) * 10 + 9;
+            ymd(decade_end, 12, 31)
         }
-        DatePrecision::Century => ymd_end_of_day(period_end_year(dt.year(), 100), 12, 31),
-        DatePrecision::Millennium => ymd_end_of_day(period_end_year(dt.year(), 1000), 12, 31),
+        DatePrecision::Century => ymd(period_end_year(date.year(), 100), 12, 31),
+        DatePrecision::Millennium => ymd(period_end_year(date.year(), 1000), 12, 31),
     }
 }
 
@@ -390,141 +446,154 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn dt(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> Result<NaiveDateTime, &'static str> {
-        NaiveDate::from_ymd_opt(y, m, d)
-            .ok_or("invalid date")?
-            .and_hms_opt(h, min, s)
-            .ok_or("invalid time")
+    fn d(y: i32, m: u32, d: u32) -> Result<NaiveDate, &'static str> {
+        NaiveDate::from_ymd_opt(y, m, d).ok_or("invalid date")
     }
 
-    fn midnight(y: i32, m: u32, d: u32) -> Result<NaiveDateTime, &'static str> {
-        dt(y, m, d, 0, 0, 0)
-    }
-
-    fn end_of_day(y: i32, m: u32, d: u32) -> Result<NaiveDateTime, &'static str> {
-        dt(y, m, d, 23, 59, 59)
-    }
-
-    // --- PreciseDate tests ---
+    // --- DateBound tests ---
 
     #[test]
-    fn precise_date_snaps_to_precision() -> TestResult {
-        let pd = PreciseDate::new(dt(2020, 6, 15, 14, 30, 45)?, DatePrecision::Year)?;
-        assert_eq!(pd.datetime(), midnight(2020, 1, 1)?);
-        assert_eq!(pd.earliest(), midnight(2020, 1, 1)?);
-        assert_eq!(pd.latest(), end_of_day(2020, 12, 31)?);
-        assert_eq!(pd.precision(), DatePrecision::Year);
+    fn date_bound_snaps_to_precision() -> TestResult {
+        let db = DateBound::new(d(2020, 6, 15)?, DatePrecision::Year)?;
+        assert_eq!(db.date(), d(2020, 1, 1)?);
+        assert_eq!(db.period_end(), d(2020, 12, 31)?);
+        assert_eq!(db.precision(), DatePrecision::Year);
         Ok(())
     }
 
     #[test]
-    fn precise_date_rejects_year_0() -> TestResult {
+    fn date_bound_rejects_year_0() -> TestResult {
         assert_eq!(
-            PreciseDate::new(midnight(0, 1, 1)?, DatePrecision::Year),
+            DateBound::new(d(0, 1, 1)?, DatePrecision::Year),
             Err(DateError::Year0),
         );
         Ok(())
     }
 
     #[test]
-    fn precise_date_serde_roundtrip() -> TestResult {
-        let pd = PreciseDate::new(midnight(1850, 6, 15)?, DatePrecision::Year)?;
-        let json = serde_json::to_string(&pd)?;
-        let deserialized: PreciseDate = serde_json::from_str(&json)?;
-        assert_eq!(pd, deserialized);
+    fn date_bound_serde_roundtrip() -> TestResult {
+        let db = DateBound::new(d(1850, 6, 15)?, DatePrecision::Year)?;
+        let json = serde_json::to_string(&db)?;
+        let deserialized: DateBound = serde_json::from_str(&json)?;
+        assert_eq!(db, deserialized);
         Ok(())
     }
 
     #[test]
-    fn precise_date_deserialize_rejects_year_0() {
-        let json = r#"{"datetime":"0000-01-01T00:00:00","precision":"year"}"#;
-        assert!(serde_json::from_str::<PreciseDate>(json).is_err());
+    fn date_bound_deserialize_rejects_year_0() {
+        let json = r#"{"date":"0000-01-01","precision":"year"}"#;
+        assert!(serde_json::from_str::<DateBound>(json).is_err());
     }
 
     // --- BCE/boundary edge cases ---
-    //
-    // These verify specific expected values at period boundaries where the
-    // 0-based (decade) and 1-based (century, millennium) conventions interact
-    // with the nonexistent year 0. The general properties (earliest <= input
-    // <= latest, idempotence, etc.) are covered by proptests below.
 
     #[test]
     fn bce_decade_boundary() -> TestResult {
-        // Year -10 should be in the [-10, -1] decade
-        let ud = UncertainDate::with_precision(midnight(-10, 1, 1)?, DatePrecision::Decade)?;
-        assert_eq!(ud.earliest(), midnight(-10, 1, 1)?);
-        assert_eq!(ud.latest(), end_of_day(-1, 12, 31)?);
+        let ud = UncertainDate::with_precision(d(-10, 1, 1)?, DatePrecision::Decade)?;
+        assert_eq!(ud.earliest(), Some(d(-10, 1, 1)?));
+        assert_eq!(ud.latest(), Some(d(-1, 12, 31)?));
         Ok(())
     }
 
     #[test]
     fn bce_century_boundary() -> TestResult {
         // Year -100 (100 BCE) is still in the 1st century BCE
-        let ud = UncertainDate::with_precision(midnight(-100, 1, 1)?, DatePrecision::Century)?;
-        assert_eq!(ud.earliest(), midnight(-100, 1, 1)?);
-        assert_eq!(ud.latest(), end_of_day(-1, 12, 31)?);
+        let ud = UncertainDate::with_precision(d(-100, 1, 1)?, DatePrecision::Century)?;
+        assert_eq!(ud.earliest(), Some(d(-100, 1, 1)?));
+        assert_eq!(ud.latest(), Some(d(-1, 12, 31)?));
 
         // Year -101 (101 BCE) is in the 2nd century BCE: -200 to -101
-        let ud = UncertainDate::with_precision(midnight(-101, 1, 1)?, DatePrecision::Century)?;
-        assert_eq!(ud.earliest(), midnight(-200, 1, 1)?);
-        assert_eq!(ud.latest(), end_of_day(-101, 12, 31)?);
+        let ud = UncertainDate::with_precision(d(-101, 1, 1)?, DatePrecision::Century)?;
+        assert_eq!(ud.earliest(), Some(d(-200, 1, 1)?));
+        assert_eq!(ud.latest(), Some(d(-101, 12, 31)?));
         Ok(())
     }
 
     #[test]
     fn bce_millennium_boundary() -> TestResult {
         // Year -1000 is still in the 1st millennium BCE
-        let ud = UncertainDate::with_precision(midnight(-1000, 1, 1)?, DatePrecision::Millennium)?;
-        assert_eq!(ud.earliest(), midnight(-1000, 1, 1)?);
-        assert_eq!(ud.latest(), end_of_day(-1, 12, 31)?);
+        let ud = UncertainDate::with_precision(d(-1000, 1, 1)?, DatePrecision::Millennium)?;
+        assert_eq!(ud.earliest(), Some(d(-1000, 1, 1)?));
+        assert_eq!(ud.latest(), Some(d(-1, 12, 31)?));
 
         // Year -1001 is in the 2nd millennium BCE: -2000 to -1001
-        let ud = UncertainDate::with_precision(midnight(-1001, 1, 1)?, DatePrecision::Millennium)?;
-        assert_eq!(ud.earliest(), midnight(-2000, 1, 1)?);
-        assert_eq!(ud.latest(), end_of_day(-1001, 12, 31)?);
+        let ud = UncertainDate::with_precision(d(-1001, 1, 1)?, DatePrecision::Millennium)?;
+        assert_eq!(ud.earliest(), Some(d(-2000, 1, 1)?));
+        assert_eq!(ud.latest(), Some(d(-1001, 12, 31)?));
         Ok(())
     }
 
     #[test]
     fn february_end_of_month() -> TestResult {
         // Non-leap year
-        let ud = UncertainDate::with_precision(midnight(2019, 2, 15)?, DatePrecision::Month)?;
-        assert_eq!(ud.latest(), end_of_day(2019, 2, 28)?);
+        let ud = UncertainDate::with_precision(d(2019, 2, 15)?, DatePrecision::Month)?;
+        assert_eq!(ud.latest(), Some(d(2019, 2, 28)?));
 
         // Leap year
-        let ud = UncertainDate::with_precision(midnight(2020, 2, 15)?, DatePrecision::Month)?;
-        assert_eq!(ud.latest(), end_of_day(2020, 2, 29)?);
+        let ud = UncertainDate::with_precision(d(2020, 2, 15)?, DatePrecision::Month)?;
+        assert_eq!(ud.latest(), Some(d(2020, 2, 29)?));
         Ok(())
     }
 
     #[test]
     fn december_end_of_month() -> TestResult {
-        let ud = UncertainDate::with_precision(midnight(2020, 12, 15)?, DatePrecision::Month)?;
-        assert_eq!(ud.earliest(), midnight(2020, 12, 1)?);
-        assert_eq!(ud.latest(), end_of_day(2020, 12, 31)?);
+        let ud = UncertainDate::with_precision(d(2020, 12, 15)?, DatePrecision::Month)?;
+        assert_eq!(ud.earliest(), Some(d(2020, 12, 1)?));
+        assert_eq!(ud.latest(), Some(d(2020, 12, 31)?));
         Ok(())
     }
 
     // --- Range tests ---
 
     #[test]
-    fn range_with_independent_precision() -> TestResult {
+    fn bounded_with_independent_precision() -> TestResult {
         // "sometime between the 1880s and 1899"
-        let ud = UncertainDate::range(
-            PreciseDate::new(midnight(1880, 1, 1)?, DatePrecision::Decade)?,
-            PreciseDate::new(midnight(1899, 1, 1)?, DatePrecision::Year)?,
+        let ud = UncertainDate::bounded(
+            Some(DateBound::new(d(1880, 1, 1)?, DatePrecision::Decade)?),
+            Some(DateBound::new(d(1899, 1, 1)?, DatePrecision::Year)?),
         )?;
-        assert_eq!(ud.earliest(), midnight(1880, 1, 1)?);
-        assert_eq!(ud.latest(), end_of_day(1899, 12, 31)?);
+        assert_eq!(ud.earliest(), Some(d(1880, 1, 1)?));
+        assert_eq!(ud.latest(), Some(d(1899, 12, 31)?));
         Ok(())
+    }
+
+    #[test]
+    fn one_sided_before() -> TestResult {
+        // "before 1950"
+        let ud = UncertainDate::bounded(
+            None,
+            Some(DateBound::new(d(1950, 1, 1)?, DatePrecision::Year)?),
+        )?;
+        assert_eq!(ud.earliest(), None);
+        assert_eq!(ud.latest(), Some(d(1950, 12, 31)?));
+        Ok(())
+    }
+
+    #[test]
+    fn one_sided_after() -> TestResult {
+        // "after 1800"
+        let ud = UncertainDate::bounded(
+            Some(DateBound::new(d(1800, 1, 1)?, DatePrecision::Year)?),
+            None,
+        )?;
+        assert_eq!(ud.earliest(), Some(d(1800, 1, 1)?));
+        assert_eq!(ud.latest(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_date() {
+        let ud = UncertainDate::unknown();
+        assert_eq!(ud.earliest(), None);
+        assert_eq!(ud.latest(), None);
     }
 
     // --- Overlap tests ---
 
     #[test]
     fn overlaps_year_contains_day() -> TestResult {
-        let day = UncertainDate::with_precision(midnight(2020, 6, 15)?, DatePrecision::Day)?;
-        let year = UncertainDate::with_precision(midnight(2020, 1, 1)?, DatePrecision::Year)?;
+        let day = UncertainDate::with_precision(d(2020, 6, 15)?, DatePrecision::Day)?;
+        let year = UncertainDate::with_precision(d(2020, 1, 1)?, DatePrecision::Year)?;
         assert!(day.overlaps(&year));
         assert!(year.overlaps(&day));
         Ok(())
@@ -532,20 +601,30 @@ mod tests {
 
     #[test]
     fn adjacent_years_no_overlap() -> TestResult {
-        let y2019 = UncertainDate::with_precision(midnight(2019, 6, 15)?, DatePrecision::Year)?;
-        let y2020 = UncertainDate::with_precision(midnight(2020, 6, 15)?, DatePrecision::Year)?;
+        let y2019 = UncertainDate::with_precision(d(2019, 6, 15)?, DatePrecision::Year)?;
+        let y2020 = UncertainDate::with_precision(d(2020, 6, 15)?, DatePrecision::Year)?;
         assert!(!y2019.overlaps(&y2020));
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_overlaps_everything() -> TestResult {
+        let unknown = UncertainDate::unknown();
+        let year = UncertainDate::with_precision(d(2020, 1, 1)?, DatePrecision::Year)?;
+        assert!(unknown.overlaps(&year));
+        assert!(year.overlaps(&unknown));
+        assert!(unknown.overlaps(&unknown));
         Ok(())
     }
 
     // --- Validation tests ---
 
     #[test]
-    fn range_rejects_inverted() -> TestResult {
+    fn bounded_rejects_inverted() -> TestResult {
         assert_eq!(
-            UncertainDate::range(
-                PreciseDate::new(midnight(2000, 1, 1)?, DatePrecision::Year)?,
-                PreciseDate::new(midnight(1990, 1, 1)?, DatePrecision::Year)?,
+            UncertainDate::bounded(
+                Some(DateBound::new(d(2000, 1, 1)?, DatePrecision::Year)?),
+                Some(DateBound::new(d(1990, 1, 1)?, DatePrecision::Year)?),
             ),
             Err(DateError::InvertedRange),
         );
@@ -553,31 +632,19 @@ mod tests {
     }
 
     #[test]
-    fn exact_rejects_year_0() -> TestResult {
+    fn with_precision_rejects_year_0() -> TestResult {
         assert_eq!(
-            UncertainDate::exact(midnight(0, 1, 1)?),
+            UncertainDate::with_precision(d(0, 1, 1)?, DatePrecision::Year),
             Err(DateError::Year0),
         );
         Ok(())
     }
 
-    #[test]
-    fn deserialize_rejects_year_0_precise() {
-        let json = r#"{"type":"precise","datetime":"0000-01-01T00:00:00","precision":"year"}"#;
-        assert!(serde_json::from_str::<UncertainDate>(json).is_err());
-    }
-
-    #[test]
-    fn deserialize_rejects_inverted_range() {
-        let json = r#"{"type":"range","earliest":{"datetime":"1990-01-01T00:00:00","precision":"year"},"latest":{"datetime":"1980-01-01T00:00:00","precision":"year"}}"#;
-        assert!(serde_json::from_str::<UncertainDate>(json).is_err());
-    }
-
     // --- Serde round-trip ---
 
     #[test]
-    fn serde_roundtrip_precise() -> TestResult {
-        let ud = UncertainDate::with_precision(dt(2020, 6, 15, 14, 30, 0)?, DatePrecision::Day)?;
+    fn serde_roundtrip_symmetric() -> TestResult {
+        let ud = UncertainDate::with_precision(d(2020, 6, 15)?, DatePrecision::Day)?;
         let json = serde_json::to_string(&ud)?;
         let deserialized: UncertainDate = serde_json::from_str(&json)?;
         assert_eq!(ud, deserialized);
@@ -585,10 +652,10 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_range() -> TestResult {
-        let ud = UncertainDate::range(
-            PreciseDate::new(midnight(1920, 1, 1)?, DatePrecision::Year)?,
-            PreciseDate::new(midnight(1925, 1, 1)?, DatePrecision::Year)?,
+    fn serde_roundtrip_bounded() -> TestResult {
+        let ud = UncertainDate::bounded(
+            Some(DateBound::new(d(1920, 1, 1)?, DatePrecision::Year)?),
+            Some(DateBound::new(d(1925, 1, 1)?, DatePrecision::Year)?),
         )?;
         let json = serde_json::to_string(&ud)?;
         let deserialized: UncertainDate = serde_json::from_str(&json)?;
@@ -597,20 +664,127 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_snaps_precise_to_precision_start() -> TestResult {
-        let json = r#"{"type":"precise","datetime":"2020-06-15T14:30:00","precision":"year"}"#;
-        let ud: UncertainDate = serde_json::from_str(json)?;
-        assert_eq!(ud.earliest(), midnight(2020, 1, 1)?);
-        assert_eq!(ud.latest(), end_of_day(2020, 12, 31)?);
+    fn serde_roundtrip_one_sided() -> TestResult {
+        let ud = UncertainDate::bounded(
+            None,
+            Some(DateBound::new(d(1950, 1, 1)?, DatePrecision::Year)?),
+        )?;
+        let json = serde_json::to_string(&ud)?;
+        let deserialized: UncertainDate = serde_json::from_str(&json)?;
+        assert_eq!(ud, deserialized);
         Ok(())
+    }
+
+    #[test]
+    fn serde_roundtrip_unknown() -> TestResult {
+        let ud = UncertainDate::unknown();
+        let json = serde_json::to_string(&ud)?;
+        let deserialized: UncertainDate = serde_json::from_str(&json)?;
+        assert_eq!(ud, deserialized);
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_snaps_to_precision_start() -> TestResult {
+        let json = r#"{"earliest":{"date":"2020-06-15","precision":"year"},"latest":{"date":"2020-06-15","precision":"year"}}"#;
+        let ud: UncertainDate = serde_json::from_str(json)?;
+        assert_eq!(ud.earliest(), Some(d(2020, 1, 1)?));
+        assert_eq!(ud.latest(), Some(d(2020, 12, 31)?));
+        Ok(())
+    }
+
+    // --- Lattice unit tests ---
+
+    #[test]
+    fn meet_disjoint_returns_none() -> TestResult {
+        let a = UncertainDate::with_precision(d(1920, 1, 1)?, DatePrecision::Year)?;
+        let b = UncertainDate::with_precision(d(1950, 1, 1)?, DatePrecision::Year)?;
+        assert_eq!(a.meet(&b), None);
+        Ok(())
+    }
+
+    #[test]
+    fn meet_overlapping_returns_intersection() -> TestResult {
+        let decade = UncertainDate::with_precision(d(1920, 1, 1)?, DatePrecision::Decade)?;
+        let year = UncertainDate::with_precision(d(1925, 1, 1)?, DatePrecision::Year)?;
+        let result = decade.meet(&year);
+        assert!(result.is_some());
+        let result = result.ok_or("expected Some")?;
+        assert_eq!(result.earliest(), Some(d(1925, 1, 1)?));
+        assert_eq!(result.latest(), Some(d(1925, 12, 31)?));
+        Ok(())
+    }
+
+    #[test]
+    fn meet_one_sided_overlapping() -> TestResult {
+        // "before 1950" ∩ "after 1940" = 1940–1950
+        let before = UncertainDate::bounded(
+            None,
+            Some(DateBound::new(d(1950, 1, 1)?, DatePrecision::Year)?),
+        )?;
+        let after = UncertainDate::bounded(
+            Some(DateBound::new(d(1940, 1, 1)?, DatePrecision::Year)?),
+            None,
+        )?;
+        let result = before.meet(&after).ok_or("expected overlap")?;
+        assert_eq!(result.earliest(), Some(d(1940, 1, 1)?));
+        assert_eq!(result.latest(), Some(d(1950, 12, 31)?));
+        Ok(())
+    }
+
+    #[test]
+    fn meet_one_sided_disjoint() -> TestResult {
+        // "before 1940" ∩ "after 1950" = empty
+        let before = UncertainDate::bounded(
+            None,
+            Some(DateBound::new(d(1940, 1, 1)?, DatePrecision::Year)?),
+        )?;
+        let after = UncertainDate::bounded(
+            Some(DateBound::new(d(1950, 1, 1)?, DatePrecision::Year)?),
+            None,
+        )?;
+        assert_eq!(before.meet(&after), None);
+        Ok(())
+    }
+
+    #[test]
+    fn join_widens_to_bounding_interval() -> TestResult {
+        let a = UncertainDate::with_precision(d(1920, 1, 1)?, DatePrecision::Year)?;
+        let b = UncertainDate::with_precision(d(1950, 1, 1)?, DatePrecision::Year)?;
+        let result = a.join(&b);
+        assert_eq!(result.earliest(), Some(d(1920, 1, 1)?));
+        assert_eq!(result.latest(), Some(d(1950, 12, 31)?));
+        Ok(())
+    }
+
+    #[test]
+    fn join_unknown_absorbs() -> TestResult {
+        let a = UncertainDate::with_precision(d(1920, 1, 1)?, DatePrecision::Year)?;
+        let result = a.join(&UncertainDate::unknown());
+        assert_eq!(result, UncertainDate::unknown());
+        Ok(())
+    }
+
+    // --- Serde ---
+
+    #[test]
+    fn deserialize_rejects_year_0() {
+        let json = r#"{"earliest":{"date":"0000-01-01","precision":"year"}}"#;
+        assert!(serde_json::from_str::<UncertainDate>(json).is_err());
+    }
+
+    #[test]
+    fn deserialize_rejects_inverted_range() {
+        let json = r#"{"earliest":{"date":"1990-01-01","precision":"year"},"latest":{"date":"1980-01-01","precision":"year"}}"#;
+        assert!(serde_json::from_str::<UncertainDate>(json).is_err());
     }
 
     // --- Property-based tests ---
     //
-    // The datetime generator biases toward edge cases: period boundaries,
+    // The date generator biases toward edge cases: period boundaries,
     // BCE/CE transition, and year 0 (which should always be rejected).
 
-    fn arb_naive_datetime() -> impl Strategy<Value = NaiveDateTime> {
+    fn arb_naive_date() -> impl Strategy<Value = NaiveDate> {
         let edge_years = prop_oneof![
             Just(0),     // year 0 — should always be rejected
             Just(1),     // first CE year
@@ -632,17 +806,12 @@ mod tests {
         // ~30% edge cases, ~70% random exploration
         let years = prop_oneof![3 => edge_years, 7 => random_years];
 
-        (years, 1u32..=12, 1u32..=28, 0u32..=23, 0u32..=59, 0u32..=59)
-            .prop_filter_map("valid datetime", |(y, m, d, h, min, s)| {
-                NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(h, min, s)
-            })
+        (years, 1u32..=12, 1u32..=28)
+            .prop_filter_map("valid date", |(y, m, d)| NaiveDate::from_ymd_opt(y, m, d))
     }
 
     fn arb_precision() -> impl Strategy<Value = DatePrecision> {
         prop_oneof![
-            Just(DatePrecision::Second),
-            Just(DatePrecision::Minute),
-            Just(DatePrecision::Hour),
             Just(DatePrecision::Day),
             Just(DatePrecision::Month),
             Just(DatePrecision::Year),
@@ -652,67 +821,148 @@ mod tests {
         ]
     }
 
+    fn symmetric(opt: Option<NaiveDate>) -> Result<NaiveDate, TestCaseError> {
+        opt.ok_or_else(|| TestCaseError::fail("symmetric bounds should always be Some"))
+    }
+
+    /// Generate an arbitrary `UncertainDate`: ~20% unknown, ~20% one-sided, ~60% symmetric.
+    fn arb_uncertain_date() -> impl Strategy<Value = UncertainDate> {
+        let unknown = Just(UncertainDate::unknown());
+        let symmetric = (arb_naive_date(), arb_precision())
+            .prop_filter_map("valid symmetric date", |(date, prec)| {
+                UncertainDate::with_precision(date, prec).ok()
+            });
+        let one_sided_before = (arb_naive_date(), arb_precision()).prop_filter_map(
+            "valid before date",
+            |(date, prec)| {
+                let bound = DateBound::new(date, prec).ok()?;
+                UncertainDate::bounded(None, Some(bound)).ok()
+            },
+        );
+        let one_sided_after = (arb_naive_date(), arb_precision()).prop_filter_map(
+            "valid after date",
+            |(date, prec)| {
+                let bound = DateBound::new(date, prec).ok()?;
+                UncertainDate::bounded(Some(bound), None).ok()
+            },
+        );
+        prop_oneof![
+            2 => unknown,
+            2 => one_sided_before,
+            2 => one_sided_after,
+            6 => symmetric,
+        ]
+    }
+
     proptest! {
         #[test]
-        fn prop_earliest_lte_latest(datetime in arb_naive_datetime(), precision in arb_precision()) {
-            if datetime.year() == 0 {
+        fn prop_earliest_lte_latest(date in arb_naive_date(), precision in arb_precision()) {
+            if date.year() == 0 {
                 prop_assert_eq!(
-                    UncertainDate::with_precision(datetime, precision),
+                    UncertainDate::with_precision(date, precision),
                     Err(DateError::Year0),
                 );
             } else {
-                let ud = UncertainDate::with_precision(datetime, precision)
+                let ud = UncertainDate::with_precision(date, precision)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                prop_assert!(ud.earliest() <= ud.latest(),
+                let e = symmetric(ud.earliest())?;
+                let l = symmetric(ud.latest())?;
+                prop_assert!(e <= l,
                     "earliest ({}) should be <= latest ({}) for {:?}",
-                    ud.earliest(), ud.latest(), precision);
+                    e, l, precision);
             }
         }
 
         #[test]
-        fn prop_exact_date_earliest_equals_latest(datetime in arb_naive_datetime()) {
-            if datetime.year() == 0 {
+        fn prop_date_within_precision_bounds(date in arb_naive_date(), precision in arb_precision()) {
+            if date.year() == 0 {
                 prop_assert_eq!(
-                    UncertainDate::exact(datetime),
+                    UncertainDate::with_precision(date, precision),
                     Err(DateError::Year0),
                 );
             } else {
-                let ud = UncertainDate::exact(datetime)
+                let ud = UncertainDate::with_precision(date, precision)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                prop_assert_eq!(ud.earliest(), ud.latest());
+                let e = symmetric(ud.earliest())?;
+                let l = symmetric(ud.latest())?;
+                prop_assert!(e <= date);
+                prop_assert!(date <= l);
             }
         }
 
         #[test]
-        fn prop_date_within_precision_bounds(datetime in arb_naive_datetime(), precision in arb_precision()) {
-            if datetime.year() == 0 {
+        fn prop_with_precision_is_idempotent(date in arb_naive_date(), precision in arb_precision()) {
+            if date.year() == 0 {
                 prop_assert_eq!(
-                    UncertainDate::with_precision(datetime, precision),
+                    UncertainDate::with_precision(date, precision),
                     Err(DateError::Year0),
                 );
             } else {
-                let ud = UncertainDate::with_precision(datetime, precision)
+                let ud1 = UncertainDate::with_precision(date, precision)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                prop_assert!(ud.earliest() <= datetime);
-                prop_assert!(datetime <= ud.latest());
-            }
-        }
-
-        #[test]
-        fn prop_with_precision_is_idempotent(datetime in arb_naive_datetime(), precision in arb_precision()) {
-            if datetime.year() == 0 {
-                prop_assert_eq!(
-                    UncertainDate::with_precision(datetime, precision),
-                    Err(DateError::Year0),
-                );
-            } else {
-                let ud1 = UncertainDate::with_precision(datetime, precision)
-                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                let ud2 = UncertainDate::with_precision(ud1.earliest(), precision)
+                let e1 = symmetric(ud1.earliest())?;
+                let ud2 = UncertainDate::with_precision(e1, precision)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 prop_assert_eq!(ud1.earliest(), ud2.earliest());
                 prop_assert_eq!(ud1.latest(), ud2.latest());
             }
+        }
+
+        // --- Lattice property tests ---
+
+        #[test]
+        fn prop_meet_commutative(a in arb_uncertain_date(), b in arb_uncertain_date()) {
+            prop_assert_eq!(a.meet(&b), b.meet(&a));
+        }
+
+        #[test]
+        fn prop_meet_associative(
+            a in arb_uncertain_date(),
+            b in arb_uncertain_date(),
+            c in arb_uncertain_date(),
+        ) {
+            let ab_c = a.meet(&b).and_then(|ab| ab.meet(&c));
+            let a_bc = b.meet(&c).and_then(|bc| a.meet(&bc));
+            prop_assert_eq!(ab_c, a_bc);
+        }
+
+        #[test]
+        fn prop_meet_identity(a in arb_uncertain_date()) {
+            let unknown = UncertainDate::unknown();
+            prop_assert_eq!(a.meet(&unknown), Some(a.clone()));
+            prop_assert_eq!(unknown.meet(&a), Some(a));
+        }
+
+        #[test]
+        fn prop_join_commutative(a in arb_uncertain_date(), b in arb_uncertain_date()) {
+            prop_assert_eq!(a.join(&b), b.join(&a));
+        }
+
+        #[test]
+        fn prop_join_associative(
+            a in arb_uncertain_date(),
+            b in arb_uncertain_date(),
+            c in arb_uncertain_date(),
+        ) {
+            prop_assert_eq!(a.join(&b).join(&c), a.join(&b.join(&c)));
+        }
+
+        #[test]
+        fn prop_meet_idempotent(a in arb_uncertain_date()) {
+            prop_assert_eq!(a.meet(&a), Some(a));
+        }
+
+        #[test]
+        fn prop_join_idempotent(a in arb_uncertain_date()) {
+            prop_assert_eq!(a.join(&a), a);
+        }
+
+        #[test]
+        fn prop_overlaps_consistent_with_meet(
+            a in arb_uncertain_date(),
+            b in arb_uncertain_date(),
+        ) {
+            prop_assert_eq!(a.overlaps(&b), a.meet(&b).is_some());
         }
     }
 }

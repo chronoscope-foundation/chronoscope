@@ -3,8 +3,8 @@
 //! These are the wire-format types for entity endpoints. They're projections
 //! and summaries of core domain types, not domain types themselves.
 
-use chrono::NaiveDateTime;
-use chronoscope_core::{AnnotationKind, Entity, EntityType, LinkTarget, LinkType, UncertainDate};
+use chrono::{NaiveDate, NaiveDateTime};
+use chronoscope_core::{AnnotationKind, Entity, LinkTarget, LinkType, UncertainDate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +16,6 @@ use crate::ids::{AnnotationId, EntityId, EntityLinkId, MediaId, SourceId};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntitySummary {
     pub id: EntityId,
-    pub entity_type: EntityType,
     /// Best available name (English preferred, then first available).
     pub name: Option<String>,
     /// Latitude of the entity. Non-optional because this type is only returned
@@ -26,10 +25,10 @@ pub struct EntitySummary {
     pub longitude: f64,
     /// Earliest known date across all transitions.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub earliest_date: Option<NaiveDateTime>,
+    pub earliest_date: Option<NaiveDate>,
     /// Latest known date across all transitions.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_date: Option<NaiveDateTime>,
+    pub latest_date: Option<NaiveDate>,
     pub updated_at: NaiveDateTime,
 }
 
@@ -179,10 +178,7 @@ pub enum ClickAction {
     },
     /// Open the entity detail panel (individual entity markers).
     #[serde(rename = "select")]
-    Select {
-        entity_id: EntityId,
-        entity_type: EntityType,
-    },
+    Select { entity_id: EntityId },
     /// Show a disambiguation picker (co-located entities at the same coordinates).
     #[serde(rename = "disambiguate")]
     Disambiguate { entries: Vec<EntityPickerEntry> },
@@ -193,7 +189,6 @@ pub enum ClickAction {
 pub struct EntityPickerEntry {
     pub id: String,
     pub name: Option<String>,
-    pub entity_type: String,
 }
 
 /// Response for the unified markers endpoint.

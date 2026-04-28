@@ -500,11 +500,10 @@ mod tests {
     #[test]
     fn entity_accumulator_lifecycle() -> TestResult {
         use crate::wikidata::ingest::EntityAccumulator;
-        use chronoscope_core::EntityType;
 
         let wid = WikidataId::try_from("Q100".to_string())?;
         use chronoscope_integrations::wikidata::RevisionId;
-        let mut acc = EntityAccumulator::new(0, wid, RevisionId(42), EntityType::Building);
+        let mut acc = EntityAccumulator::new(0, wid, RevisionId(42));
         assert_eq!(acc.wikidata_id(), "Q100");
 
         // Add image

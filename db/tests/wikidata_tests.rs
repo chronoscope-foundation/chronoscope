@@ -96,8 +96,8 @@ async fn eiffel_tower() -> Result<()> {
     let eiffel = lookup_one(&db, "Q243", "Eiffel Tower").await?;
 
     let b = bounds(&eiffel)?;
-    assert_eq!(b.earliest.and_utc().year(), 1887);
-    assert_eq!(b.latest.and_utc().year(), 1889);
+    assert_eq!(b.earliest.year(), 1887);
+    assert_eq!(b.latest.year(), 1889);
 
     let loc = location(&eiffel)?;
     assert_coord(loc.lat, 48.858296);
@@ -118,8 +118,8 @@ async fn brooklyn_bridge() -> Result<()> {
     let bridge = lookup_one(&db, "Q125006", "Brooklyn Bridge").await?;
 
     let b = bounds(&bridge)?;
-    assert_eq!(b.earliest.and_utc().year(), 1869);
-    assert_eq!(b.latest.and_utc().year(), 1883);
+    assert_eq!(b.earliest.year(), 1869);
+    assert_eq!(b.latest.year(), 1883);
 
     let loc = location(&bridge)?;
     assert_coord(loc.lat, 40.7057);
@@ -140,8 +140,8 @@ async fn hagia_sophia() -> Result<()> {
     let sophia = lookup_one(&db, "Q12506", "Hagia Sophia").await?;
 
     let b = bounds(&sophia)?;
-    assert_eq!(b.earliest.and_utc().year(), 537);
-    assert_eq!(b.latest.and_utc().year(), 1054);
+    assert_eq!(b.earliest.year(), 537);
+    assert_eq!(b.latest.year(), 1054);
 
     let links = db.find_entity_links(&sophia.id).await?;
     assert_eq!(links.len(), 117);
@@ -190,11 +190,11 @@ async fn chioggia_cathedral_splits_on_rebuild() -> Result<()> {
 
     let old = &sorted[0];
     let old_bounds = bounds(old)?;
-    assert_eq!(old_bounds.earliest.and_utc().year(), 1623);
+    assert_eq!(old_bounds.earliest.year(), 1623);
 
     let new = &sorted[1];
     let new_bounds = bounds(new)?;
-    assert_eq!(new_bounds.earliest.and_utc().year(), 1633);
+    assert_eq!(new_bounds.earliest.year(), 1633);
 
     // Both should have distinct DB IDs
     assert_ne!(old.id, new.id);
@@ -222,7 +222,7 @@ async fn saint_thomas_church() -> Result<()> {
     let church = lookup_one(&db, "Q4356655", "Saint Thomas Church").await?;
 
     let b = bounds(&church)?;
-    assert_eq!(b.earliest.and_utc().year(), 1913);
+    assert_eq!(b.earliest.year(), 1913);
 
     let loc = location(&church)?;
     assert_coord(loc.lat, 40.7608);
@@ -236,7 +236,7 @@ async fn vanderbilt_entities() -> Result<()> {
 
     let cornelius = lookup_one(&db, "Q5171466", "Cornelius Vanderbilt II House").await?;
     let b = bounds(&cornelius)?;
-    assert_eq!(b.earliest.and_utc().year(), 1883);
+    assert_eq!(b.earliest.year(), 1883);
 
     let _william = lookup_one(&db, "Q5652831", "William K. Vanderbilt House").await?;
 

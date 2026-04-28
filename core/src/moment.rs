@@ -38,7 +38,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use chrono::NaiveDateTime;
+use chrono::NaiveDate;
 
 use crate::date::UncertainDate;
 use crate::entity::EntityTransition;
@@ -129,14 +129,14 @@ pub struct Moment<'a, E, S> {
 impl<E, S> Moment<'_, E, S> {
     /// Earliest possible date for this moment.
     #[must_use]
-    pub fn earliest(&self) -> Option<NaiveDateTime> {
-        self.date.map(|c| c.value.earliest())
+    pub fn earliest(&self) -> Option<NaiveDate> {
+        self.date.and_then(|c| c.value.earliest())
     }
 
     /// Latest possible date for this moment.
     #[must_use]
-    pub fn latest(&self) -> Option<NaiveDateTime> {
-        self.date.map(|c| c.value.latest())
+    pub fn latest(&self) -> Option<NaiveDate> {
+        self.date.and_then(|c| c.value.latest())
     }
 }
 
@@ -387,7 +387,7 @@ pub fn topological_order<'a, E, S>(mut moments: Vec<Moment<'a, E, S>>) -> Vec<Mo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::date::UncertainDate;
+    use crate::date::{DatePrecision, UncertainDate};
     use crate::evidence::Cited;
     use chrono::NaiveDate;
 
@@ -395,19 +395,19 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn d(year: i32) -> Result<Cited<UncertainDate, ()>, Box<dyn std::error::Error>> {
-        let dt = NaiveDate::from_ymd_opt(year, 1, 1)
-            .ok_or("invalid date")?
-            .and_hms_opt(0, 0, 0)
-            .ok_or("invalid time")?;
-        Ok(Cited::uncited(UncertainDate::exact(dt)?))
+        let dt = NaiveDate::from_ymd_opt(year, 1, 1).ok_or("invalid date")?;
+        Ok(Cited::uncited(UncertainDate::with_precision(
+            dt,
+            DatePrecision::Day,
+        )?))
     }
 
     fn d_ym(year: i32, month: u32) -> Result<Cited<UncertainDate, ()>, Box<dyn std::error::Error>> {
-        let dt = NaiveDate::from_ymd_opt(year, month, 1)
-            .ok_or("invalid date")?
-            .and_hms_opt(0, 0, 0)
-            .ok_or("invalid time")?;
-        Ok(Cited::uncited(UncertainDate::exact(dt)?))
+        let dt = NaiveDate::from_ymd_opt(year, month, 1).ok_or("invalid date")?;
+        Ok(Cited::uncited(UncertainDate::with_precision(
+            dt,
+            DatePrecision::Day,
+        )?))
     }
 
     /// Mole Antonelliana: a `Constructed` with only `completed_at = 1889`

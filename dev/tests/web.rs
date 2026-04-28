@@ -1085,12 +1085,6 @@ async fn test_entity_click_opens_detail() -> TestResult {
 
         let panel_text = t.text("[role='complementary']").await?;
 
-        // Verify entity type is displayed (the DB has entity_type = "building")
-        check(
-            panel_text.to_lowercase().contains("building"),
-            format!("Panel should show entity type 'building', got: {panel_text}"),
-        )?;
-
         // Panel should have substantial content (names, timeline, links, etc.)
         check(
             panel_text.len() > 20,
@@ -1162,11 +1156,12 @@ async fn test_disambiguation_picker() -> TestResult {
         t.screenshot("test_disambiguation_picker").await?;
 
         // Click the first picker entry (not the dismiss button). Picker
-        // buttons have aria-labels containing the entity name and type.
+        // buttons have aria-labels containing the entity name.
         t.click("[role='complementary'] button[aria-label*='Cathedral']")
             .await?;
-        // Wait for entity detail to load (async API fetch)
-        t.wait_for_text("building", TIMEOUT).await?;
+        // Wait for entity detail to load (async API fetch) — the timeline
+        // section only appears in the detail view, not the picker.
+        t.wait_for_text("Timeline", TIMEOUT).await?;
 
         let detail_text = t.text("[role='complementary']").await?;
         check(
@@ -1545,10 +1540,9 @@ async fn test_detail_panel_focus() -> TestResult {
         t.click("[role='complementary'] button[aria-label='Close']").await?;
 
         // The panel div stays in DOM but becomes translated off-screen when
-        // selection is None. Check that the selection was cleared by verifying
-        // the entity type is no longer visible (building type from Hagia Sophia).
-        // Verify the panel content is gone by checking that the entity-specific
-        // "Timeline" or "Links" headings are no longer in the body text.
+        // selection is None. Verify the panel content is gone by checking
+        // that the entity-specific "Timeline" or "Links" headings are no
+        // longer in the body text.
         let body = t.eval_string("document.body?.innerText || ''").await?;
         check(
             !body.contains("Timeline") && !body.contains("Links"),

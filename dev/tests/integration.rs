@@ -766,7 +766,7 @@ async fn test_bundle_loaded_images_flow_through_worker_pipeline() -> TestResult 
     use std::collections::BTreeMap;
 
     use chronoscope_core::annotation::{Annotation, AnnotationKind};
-    use chronoscope_core::entity::{Entity, EntityType};
+    use chronoscope_core::entity::Entity;
     use chronoscope_core::ids::WikidataEntityId;
     use chronoscope_core::ingestion::ImageSource;
     use chronoscope_core::links::{ExternalLink, LinkTarget, LinkType};
@@ -787,7 +787,6 @@ async fn test_bundle_loaded_images_flow_through_worker_pipeline() -> TestResult 
         entities: BTreeMap::from([(
             e0,
             Entity {
-                entity_type: EntityType::Building,
                 names: vec![Cited::uncited(EntityName {
                     name: "Test Building".to_string(),
                     name_type: NameType::Official,

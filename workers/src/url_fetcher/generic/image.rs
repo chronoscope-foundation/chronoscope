@@ -7,7 +7,7 @@ use std::io::Cursor;
 
 use bytes::Bytes;
 use chrono::Utc;
-use chronoscope_core::{UncertainDate, UncertainLocation};
+use chronoscope_core::{Location, UncertainDate, UnresolvedLocation};
 use chronoscope_db::{EntityId, MediaData, MediaType, ResearchUrl};
 use image::{GenericImageView, ImageEncoder};
 use image_hasher::{HashAlg, HasherConfig};
@@ -157,8 +157,8 @@ fn generate_thumbnail(img: &image::DynamicImage) -> Result<Bytes, String> {
 /// Extract EXIF data from image bytes.
 ///
 /// Returns captured timestamp (as `UncertainDate` with second precision)
-/// and GPS location (as `UncertainLocation::Coordinates`) if available.
-pub fn extract_exif(body: &Bytes) -> (Option<UncertainDate>, Option<UncertainLocation<EntityId>>) {
+/// and GPS location (as `UnresolvedLocation::Resolved(Location::Circle)`) if available.
+pub fn extract_exif(body: &Bytes) -> (Option<UncertainDate>, Option<UnresolvedLocation<EntityId>>) {
     let cursor = Cursor::new(body.as_ref());
     let exif_reader = exif::Reader::new();
 
@@ -172,7 +172,7 @@ pub fn extract_exif(body: &Bytes) -> (Option<UncertainDate>, Option<UncertainLoc
     (captured, location)
 }
 
-/// Extract capture time from EXIF data as `UncertainDate` (second precision).
+/// Extract capture time from EXIF data as `UncertainDate` (day precision).
 fn extract_capture_time(exif: &exif::Exif) -> Option<UncertainDate> {
     exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
         .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))
@@ -183,15 +183,21 @@ fn extract_capture_time(exif: &exif::Exif) -> Option<UncertainDate> {
                     .and_then(|s| {
                         chrono::NaiveDateTime::parse_from_str(s, "%Y:%m:%d %H:%M:%S").ok()
                     })
-                    .and_then(|dt| UncertainDate::exact(dt).ok())
+                    .and_then(|dt| {
+                        UncertainDate::with_precision(
+                            dt.date(),
+                            chronoscope_core::DatePrecision::Day,
+                        )
+                        .ok()
+                    })
             } else {
                 None
             }
         })
 }
 
-/// Extract GPS location from EXIF data as `UncertainLocation::Coordinates`.
-fn extract_gps_location(exif: &exif::Exif) -> Option<UncertainLocation<EntityId>> {
+/// Extract GPS location from EXIF data as `UnresolvedLocation::Resolved(Location::Circle)`.
+fn extract_gps_location(exif: &exif::Exif) -> Option<UnresolvedLocation<EntityId>> {
     let lat = exif.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)?;
     let lat_ref = exif.get_field(exif::Tag::GPSLatitudeRef, exif::In::PRIMARY)?;
     let lon = exif.get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)?;
@@ -204,27 +210,12 @@ fn extract_gps_location(exif: &exif::Exif) -> Option<UncertainLocation<EntityId>
     let latitude = apply_gps_sign(latitude, &lat_ref.value, b"S");
     let longitude = apply_gps_sign(longitude, &lon_ref.value, b"W");
 
-    // Extract altitude if available, checking GPSAltitudeRef for sign.
-    // Per EXIF spec: GPSAltitudeRef 0 = above sea level (default), 1 = below sea level.
-    let elevation = exif
-        .get_field(exif::Tag::GPSAltitude, exif::In::PRIMARY)
-        .and_then(|field| parse_gps_altitude(&field.value))
-        .map(|alt| {
-            let below_sea_level = exif
-                .get_field(exif::Tag::GPSAltitudeRef, exif::In::PRIMARY)
-                .is_some_and(|ref_field| {
-                    matches!(&ref_field.value, exif::Value::Byte(v) if v.first() == Some(&1))
-                });
-            let rounded = alt.round();
-            let meters = if below_sea_level {
-                i32::try_from(-(rounded as i64)).unwrap_or(i32::MIN)
-            } else {
-                i32::try_from(rounded as i64).unwrap_or(i32::MAX)
-            };
-            chronoscope_core::Elevation::SeaLevelOffset { meters }
-        });
+    // Elevation is not embedded in location types; drop it.
+    // TODO: Store elevation separately if needed.
 
-    UncertainLocation::coordinates(latitude, longitude, elevation, None).ok()
+    Location::point(latitude, longitude)
+        .map(UnresolvedLocation::Resolved)
+        .ok()
 }
 
 /// Apply sign to GPS coordinate based on reference (S/W are negative).
@@ -247,15 +238,6 @@ fn parse_gps_coordinate(value: &exif::Value) -> Option<f64> {
         return Some(degrees + minutes / 60.0 + seconds / 3600.0);
     }
     None
-}
-
-/// Parse GPS altitude from EXIF rational value.
-fn parse_gps_altitude(value: &exif::Value) -> Option<f64> {
-    if let exif::Value::Rational(rationals) = value {
-        rationals.first().map(exif::Rational::to_f64)
-    } else {
-        None
-    }
 }
 
 /// Check if an EXIF value matches a reference byte (e.g., "N", "S", "E", "W").

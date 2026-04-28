@@ -26,7 +26,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 use chronoscope_integrations::IntegrationRegistry;
 
-pub use chronoscope_core::entity::{EntityRelationType, EntityType};
+pub use chronoscope_core::entity::EntityRelationType;
 pub use chronoscope_core::links::LinkType;
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
@@ -840,7 +840,6 @@ impl Database {
                     thumbnail_url: None,
                     click_action: ClickAction::Select {
                         entity_id: first.id.clone(),
-                        entity_type: first.entity_type,
                     },
                 });
             } else {
@@ -853,7 +852,6 @@ impl Database {
                     .map(|e| EntityPickerEntry {
                         id: e.id.to_string(),
                         name: e.name.clone(),
-                        entity_type: e.entity_type.to_string(),
                     })
                     .collect();
                 markers.push(Marker {

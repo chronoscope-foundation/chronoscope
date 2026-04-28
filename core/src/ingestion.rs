@@ -13,12 +13,12 @@ use crate::annotation::Annotation;
 use crate::date::UncertainDate;
 use crate::entity::{Entity, EntityRelation};
 use crate::links::ExternalLink;
-use crate::location::UncertainLocation;
+use crate::location::UnresolvedLocation;
 
 /// An image/media source for an entity.
 ///
 /// Generic over `E` (entity reference type) because the location may contain
-/// `UncertainLocation::NearEntity` references.
+/// `UnresolvedLocation::NearEntity` references.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(deserialize = "E: serde::de::DeserializeOwned"))]
 pub struct ImageSource<E> {
@@ -35,7 +35,7 @@ pub struct ImageSource<E> {
     /// coordinates. Will be enriched with geocoding, cross-referencing, and
     /// uncertainty modeling as the ingestion pipeline matures.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<UncertainLocation<E>>,
+    pub location: Option<UnresolvedLocation<E>>,
 }
 
 /// Metadata about the ingestion process.
@@ -238,14 +238,13 @@ mod tests {
 
     use super::*;
     use crate::annotation::{Annotation, AnnotationKind};
-    use crate::entity::{Entity, EntityRelation, EntityRelationType, EntityType};
+    use crate::entity::{Entity, EntityRelation, EntityRelationType};
     use crate::links::{ExternalLink, LinkTarget, LinkType};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn test_entity() -> Entity<&'static str, &'static str> {
         Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![],
         }

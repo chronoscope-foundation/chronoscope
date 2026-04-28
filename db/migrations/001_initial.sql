@@ -179,8 +179,6 @@ CREATE INDEX idx_follows_url ON follows(url_id);
 -- project queryable fields for indexing.
 CREATE TABLE entities (
     id TEXT PRIMARY KEY,
-    entity_type TEXT GENERATED ALWAYS AS (json_extract(entity_json, '$.entity_type')) STORED NOT NULL
-        CHECK (entity_type IN ('area', 'building', 'infrastructure', 'monument', 'natural_feature')),
     entity_json TEXT NOT NULL,
 
     -- Temporal shadow columns: min/max across all transitions
@@ -201,7 +199,7 @@ CREATE INDEX idx_entities_temporal ON entities(earliest_date, latest_date)
     WHERE earliest_date IS NOT NULL;
 CREATE INDEX idx_entities_spatial ON entities(latitude, longitude)
     WHERE latitude IS NOT NULL;
-CREATE INDEX idx_entities_type_updated ON entities(entity_type, updated_at DESC);
+CREATE INDEX idx_entities_updated ON entities(updated_at DESC);
 
 -- External ID dedup lookup (e.g., "does Q12345 exist?")
 CREATE TABLE entity_external_ids (

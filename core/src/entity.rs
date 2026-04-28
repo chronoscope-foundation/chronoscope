@@ -10,17 +10,16 @@ use serde::{Deserialize, Serialize};
 use crate::date::UncertainDate;
 use crate::evidence::Cited;
 use crate::ids::TriggerEventId;
-use crate::location::UncertainLocation;
+use crate::location::UnresolvedLocation;
 
 /// Core entity representing a building, infrastructure, natural feature, or area.
 ///
 /// Generic over:
 /// - `E` — entity reference type (e.g., `EntityId` for stored data, `EntityIdx` for ingestion)
 /// - `S` — source reference type (e.g., `SourceId` for stored data, `SourceIdx` for ingestion)
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(deserialize = "E: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
 pub struct Entity<E, S> {
-    pub entity_type: EntityType,
     pub names: Vec<Cited<EntityName, S>>,
     pub transitions: Vec<EntityTransition<E, S>>,
 }
@@ -40,24 +39,9 @@ impl<E, S> Entity<E, S> {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, strum::Display,
-)]
-#[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
-#[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum EntityType {
-    Area,
-    Building,
-    Infrastructure,
-    Monument,
-    NaturalFeature,
-}
-
 /// A name for an entity with temporal validity.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct EntityName {
     pub name: String,
     pub name_type: NameType,
@@ -69,7 +53,9 @@ pub struct EntityName {
     pub valid_to: Option<UncertainDate>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum NameType {
     Official,
@@ -151,10 +137,12 @@ pub enum MoveMethod {
 /// - `Some(Cited { value, evidence })` = known value with optional supporting evidence
 ///
 /// Generic over:
-/// - `E` — entity reference type (used by `UncertainLocation<E>::NearEntity`)
+/// - `E` — entity reference type (used by `UnresolvedLocation<E>::NearEntity`)
 /// - `S` — source reference type (used by `Cited<T, S>` for evidence)
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, strum::Display, strum::AsRefStr)]
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, strum::Display, strum::AsRefStr,
+)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 #[serde(bound(deserialize = "E: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
@@ -162,7 +150,7 @@ pub enum EntityTransition<E, S> {
     Constructed {
         started_at: Option<Cited<UncertainDate, S>>,
         completed_at: Option<Cited<UncertainDate, S>>,
-        location: Option<Cited<UncertainLocation<E>, S>>,
+        location: Option<Cited<UnresolvedLocation<E>, S>>,
         trigger_event: Option<TriggerEventId>,
     },
     Modified {
@@ -185,7 +173,7 @@ pub enum EntityTransition<E, S> {
     },
     Moved {
         occurred_at: Option<Cited<UncertainDate, S>>,
-        location: Option<Cited<UncertainLocation<E>, S>>,
+        location: Option<Cited<UnresolvedLocation<E>, S>>,
         cause: Option<String>,
         method: Option<MoveMethod>,
         trigger_event: Option<TriggerEventId>,
@@ -304,11 +292,11 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn d(year: i32) -> Result<Cited<UncertainDate, ()>, Box<dyn std::error::Error>> {
-        let dt = NaiveDate::from_ymd_opt(year, 1, 1)
-            .ok_or("invalid date")?
-            .and_hms_opt(0, 0, 0)
-            .ok_or("invalid time")?;
-        Ok(Cited::uncited(UncertainDate::exact(dt)?))
+        let date = NaiveDate::from_ymd_opt(year, 1, 1).ok_or("invalid date")?;
+        Ok(Cited::uncited(UncertainDate::with_precision(
+            date,
+            crate::date::DatePrecision::Year,
+        )?))
     }
 
     /// Pin the four meaningful date-field combinations on a durational
@@ -384,7 +372,8 @@ mod tests {
         for (desc, t, expected_year) in cases {
             let got = t
                 .earliest_known_date()
-                .map(|c| c.value.earliest().date().format("%Y").to_string());
+                .and_then(|c| c.value.earliest())
+                .map(|d| d.format("%Y").to_string());
             let want = expected_year.map(|y| y.to_string());
             assert_eq!(got, want, "{desc}");
         }

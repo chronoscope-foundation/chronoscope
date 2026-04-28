@@ -241,9 +241,13 @@ impl UrlFetcherWorker {
             source_type: integration_name.unwrap_or(IntegrationName::Generic),
             title: content.title,
             author: content.author,
-            published: content
-                .published_at
-                .and_then(|dt| chronoscope_core::UncertainDate::exact(dt).ok()),
+            published: content.published_at.and_then(|dt| {
+                chronoscope_core::UncertainDate::with_precision(
+                    dt.date(),
+                    chronoscope_core::DatePrecision::Day,
+                )
+                .ok()
+            }),
             content: content.content,
             fetched_at: now,
             media: media_slots,

@@ -6,7 +6,8 @@
 use crate::{EntityIdx, IngestionOutput, SourceIdx};
 use chrono::Datelike;
 use chronoscope_core::{
-    ConsistencyWarning, Entity, EntityTransition, LinkTarget, UncertainDate, UncertainLocation,
+    ConsistencyWarning, Entity, EntityTransition, LinkTarget, Location, UncertainDate,
+    UnresolvedLocation,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,7 +17,7 @@ type IngestionEntity = Entity<EntityIdx, SourceIdx>;
 /// Entity transition type specialized for ingestion output.
 type IngestionTransition = EntityTransition<EntityIdx, SourceIdx>;
 /// Uncertain location type specialized for ingestion output.
-type IngestionLocation = UncertainLocation<EntityIdx>;
+type IngestionLocation = UnresolvedLocation<EntityIdx>;
 
 // =============================================================================
 // OUTPUT STRUCTURES
@@ -162,20 +163,20 @@ fn compute_distributions(output: &IngestionOutput) -> Distributions {
                 let precision = get_date_precision(date);
                 *date_precisions.entry(precision).or_default() += 1;
 
-                let decade = (date.earliest().year() / 10) * 10;
-                let decade_str = format!("{decade}s");
-                *date_decades.entry(decade_str).or_default() += 1;
+                if let Some(earliest) = date.earliest() {
+                    let decade = (earliest.year() / 10) * 10;
+                    let decade_str = format!("{decade}s");
+                    *date_decades.entry(decade_str).or_default() += 1;
+                }
             }
 
             if let Some(loc) = extract_location(transition) {
                 let loc_type = match loc {
-                    UncertainLocation::Coordinates { .. } => "Coordinates",
-                    UncertainLocation::OsmReference { .. } => "OsmReference",
-                    UncertainLocation::OhmReference { .. } => "OhmReference",
-                    UncertainLocation::NamedLocation { .. } => "NamedLocation",
-                    UncertainLocation::Address { .. } => "Address",
-                    UncertainLocation::NearEntity { .. } => "NearEntity",
-                    UncertainLocation::MultipleConstraints { .. } => "MultipleConstraints",
+                    UnresolvedLocation::Resolved(Location::Circle { .. }) => "Circle",
+                    UnresolvedLocation::Resolved(Location::UnionOf(_)) => "UnionOf",
+                    UnresolvedLocation::Resolved(Location::Unbounded) => "Unbounded",
+                    UnresolvedLocation::Reference(_) => "Reference",
+                    UnresolvedLocation::OneOf(_) => "OneOf",
                 };
                 *location_types.entry(loc_type.to_string()).or_default() += 1;
             }
@@ -297,7 +298,7 @@ fn find_interesting_entities(output: &IngestionOutput) -> Vec<InterestingEntity>
                     } = t
                     {
                         Some(serde_json::json!({
-                            "date": occurred_at.as_ref().map(|d| d.value.earliest().to_string()),
+                            "date": occurred_at.as_ref().and_then(|d| d.value.earliest()).map(|e| e.to_string()),
                             "cause": cause.as_ref().map(|c| format!("{c:?}"))
                         }))
                     } else {
@@ -326,7 +327,10 @@ fn find_interesting_entities(output: &IngestionOutput) -> Vec<InterestingEntity>
         {
             let demolished = entity.transitions.iter().find_map(|t| {
                 if let EntityTransition::Demolished { started_at, .. } = t {
-                    started_at.as_ref().map(|d| d.value.earliest().to_string())
+                    started_at
+                        .as_ref()
+                        .and_then(|d| d.value.earliest())
+                        .map(|e| e.to_string())
                 } else {
                     None
                 }
@@ -344,14 +348,14 @@ fn find_interesting_entities(output: &IngestionOutput) -> Vec<InterestingEntity>
         // Very old entities (before 1500)
         'outer: for transition in &entity.transitions {
             for date in extract_dates(transition) {
-                if date.earliest().year() < 1500 && interesting.len() < 50 {
+                if date.earliest().is_some_and(|e| e.year() < 1500) && interesting.len() < 50 {
                     interesting.push(InterestingEntity {
                         reason: "Very old (pre-1500)".to_string(),
                         name: name.clone(),
                         wikidata_id: wikidata_id.clone(),
                         entity_index: *entity_key,
                         details: serde_json::json!({
-                            "earliest_date": date.earliest().to_string()
+                            "earliest_date": date.earliest().map(|e| e.to_string())
                         }),
                     });
                     break 'outer;
@@ -489,9 +493,11 @@ fn get_wikidata_id(output: &IngestionOutput, entity_key: &EntityIdx) -> Option<S
 }
 
 fn get_date_precision(date: &UncertainDate) -> String {
-    match date.precision() {
-        Some(precision) => format!("{precision:?}"),
-        None => "Range".to_string(),
+    // Use the earliest bound's precision; fall back to latest bound; if neither, "Unknown"
+    let bound = date.earliest_bound().or(date.latest_bound());
+    match bound {
+        Some(b) => format!("{:?}", b.precision()),
+        None => "Unknown".to_string(),
     }
 }
 
@@ -511,17 +517,14 @@ mod tests {
     use crate::{EntityIdx, LinkIdx, SourceIdx};
     use chrono::NaiveDate;
     use chronoscope_core::{
-        Annotation, AnnotationKind, Cited, DamageCause, DatePrecision, Entity, EntityType,
-        ExternalLink, ImageSource, LinkTarget, LinkType, UncertainDate, Usage, WikidataEntityId,
+        Annotation, AnnotationKind, Cited, DamageCause, DatePrecision, Entity, ExternalLink,
+        ImageSource, LinkTarget, LinkType, UncertainDate, Usage, WikidataEntityId,
     };
     use oxilangtag::LanguageTag;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn midnight(y: i32, m: u32, d: u32) -> Result<chrono::NaiveDateTime, &'static str> {
-        NaiveDate::from_ymd_opt(y, m, d)
-            .ok_or("invalid date")?
-            .and_hms_opt(0, 0, 0)
-            .ok_or("invalid time")
+    fn ymd(y: i32, m: u32, d: u32) -> Result<NaiveDate, &'static str> {
+        NaiveDate::from_ymd_opt(y, m, d).ok_or("invalid date")
     }
 
     fn make_name(name: &str, lang: &str) -> Cited<chronoscope_core::EntityName, SourceIdx> {
@@ -537,7 +540,6 @@ mod tests {
 
     fn simple_entity(name: &str) -> IngestionEntity {
         Entity {
-            entity_type: EntityType::Building,
             names: vec![make_name(name, "en")],
             transitions: vec![],
         }
@@ -547,9 +549,8 @@ mod tests {
         name: &str,
         year: i32,
     ) -> Result<IngestionEntity, Box<dyn std::error::Error>> {
-        let date = UncertainDate::with_precision(midnight(year, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(year, 1, 1)?, DatePrecision::Year)?;
         Ok(Entity {
-            entity_type: EntityType::Building,
             names: vec![make_name(name, "en")],
             transitions: vec![EntityTransition::Constructed {
                 started_at: None,
@@ -659,7 +660,7 @@ mod tests {
     #[test]
     fn analyze_transition_type_distribution() -> TestResult {
         let mut output = empty_output();
-        let date = UncertainDate::with_precision(midnight(1900, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(1900, 1, 1)?, DatePrecision::Year)?;
         let mut entity = simple_entity("Test");
         entity.transitions.push(EntityTransition::Constructed {
             started_at: None,
@@ -690,8 +691,8 @@ mod tests {
     #[test]
     fn analyze_date_precision_distribution() -> TestResult {
         let mut output = empty_output();
-        let day_date = UncertainDate::with_precision(midnight(1920, 6, 15)?, DatePrecision::Day)?;
-        let year_date = UncertainDate::with_precision(midnight(1950, 1, 1)?, DatePrecision::Year)?;
+        let day_date = UncertainDate::with_precision(ymd(1920, 6, 15)?, DatePrecision::Day)?;
+        let year_date = UncertainDate::with_precision(ymd(1950, 1, 1)?, DatePrecision::Year)?;
         let mut entity = simple_entity("Test");
         entity.transitions.push(EntityTransition::Constructed {
             started_at: Some(Cited::uncited(day_date)),
@@ -710,7 +711,7 @@ mod tests {
     #[test]
     fn analyze_date_decades_distribution() -> TestResult {
         let mut output = empty_output();
-        let date = UncertainDate::with_precision(midnight(1925, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(1925, 1, 1)?, DatePrecision::Year)?;
         let mut entity = simple_entity("Test");
         entity.transitions.push(EntityTransition::Constructed {
             started_at: None,
@@ -804,7 +805,7 @@ mod tests {
     #[test]
     fn analyze_finds_demolished_entities() -> TestResult {
         let mut output = empty_output();
-        let date = UncertainDate::with_precision(midnight(1960, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(1960, 1, 1)?, DatePrecision::Year)?;
         let mut entity = simple_entity("Demolished Building");
         entity.transitions.push(EntityTransition::Demolished {
             started_at: Some(Cited::uncited(date)),
@@ -828,7 +829,7 @@ mod tests {
     #[test]
     fn analyze_finds_damaged_entities() -> TestResult {
         let mut output = empty_output();
-        let date = UncertainDate::with_precision(midnight(1906, 4, 18)?, DatePrecision::Day)?;
+        let date = UncertainDate::with_precision(ymd(1906, 4, 18)?, DatePrecision::Day)?;
         let mut entity = simple_entity("Damaged Building");
         entity.transitions.push(EntityTransition::Damaged {
             occurred_at: Some(Cited::uncited(date)),
@@ -852,7 +853,7 @@ mod tests {
     #[test]
     fn analyze_finds_very_old_entities() -> TestResult {
         let mut output = empty_output();
-        let date = UncertainDate::with_precision(midnight(500, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(500, 1, 1)?, DatePrecision::Year)?;
         let mut entity = simple_entity("Ancient Structure");
         entity.transitions.push(EntityTransition::Constructed {
             started_at: None,
@@ -879,7 +880,7 @@ mod tests {
         let mut entity = simple_entity("Complex Building");
         // Add 5+ transitions to trigger "Many transitions" interesting entity
         for year in 1900..1906 {
-            let date = UncertainDate::with_precision(midnight(year, 1, 1)?, DatePrecision::Year)?;
+            let date = UncertainDate::with_precision(ymd(year, 1, 1)?, DatePrecision::Year)?;
             entity.transitions.push(EntityTransition::Modified {
                 started_at: Some(Cited::uncited(date)),
                 completed_at: None,
@@ -907,7 +908,7 @@ mod tests {
     #[test]
     fn analyze_interesting_entity_includes_wikidata_id() -> TestResult {
         let mut output = empty_output();
-        let date = UncertainDate::with_precision(midnight(1960, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(1960, 1, 1)?, DatePrecision::Year)?;
         let mut entity = simple_entity("Linked Building");
         entity.transitions.push(EntityTransition::Demolished {
             started_at: Some(Cited::uncited(date)),
@@ -949,7 +950,6 @@ mod tests {
     #[test]
     fn get_entity_name_prefers_english() -> TestResult {
         let entity = Entity {
-            entity_type: EntityType::Building,
             names: vec![make_name("Maison", "fr"), make_name("House", "en")],
             transitions: vec![],
         };
@@ -960,7 +960,6 @@ mod tests {
     #[test]
     fn get_entity_name_falls_back_to_first() -> TestResult {
         let entity = Entity {
-            entity_type: EntityType::Building,
             names: vec![make_name("Maison", "fr"), make_name("Haus", "de")],
             transitions: vec![],
         };
@@ -971,7 +970,6 @@ mod tests {
     #[test]
     fn get_entity_name_returns_unknown_for_empty() -> TestResult {
         let entity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![],
         };
@@ -981,24 +979,30 @@ mod tests {
 
     #[test]
     fn get_date_precision_precise() -> TestResult {
-        let date = UncertainDate::with_precision(midnight(2020, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(2020, 1, 1)?, DatePrecision::Year)?;
         assert_eq!(get_date_precision(&date), "Year");
         Ok(())
     }
 
     #[test]
     fn get_date_precision_range() -> TestResult {
-        let date = UncertainDate::range(
-            chronoscope_core::PreciseDate::new(midnight(1900, 1, 1)?, DatePrecision::Year)?,
-            chronoscope_core::PreciseDate::new(midnight(1910, 1, 1)?, DatePrecision::Year)?,
+        let date = UncertainDate::bounded(
+            Some(chronoscope_core::DateBound::new(
+                ymd(1900, 1, 1)?,
+                DatePrecision::Year,
+            )?),
+            Some(chronoscope_core::DateBound::new(
+                ymd(1910, 1, 1)?,
+                DatePrecision::Year,
+            )?),
         )?;
-        assert_eq!(get_date_precision(&date), "Range");
+        assert_eq!(get_date_precision(&date), "Year");
         Ok(())
     }
 
     #[test]
     fn extract_dates_from_constructed() -> TestResult {
-        let date = UncertainDate::with_precision(midnight(1900, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(1900, 1, 1)?, DatePrecision::Year)?;
         let transition = EntityTransition::Constructed {
             started_at: Some(Cited::uncited(date.clone())),
             completed_at: Some(Cited::uncited(date)),
@@ -1012,7 +1016,7 @@ mod tests {
 
     #[test]
     fn extract_dates_from_damaged() -> TestResult {
-        let date = UncertainDate::with_precision(midnight(1906, 4, 18)?, DatePrecision::Day)?;
+        let date = UncertainDate::with_precision(ymd(1906, 4, 18)?, DatePrecision::Day)?;
         let transition = EntityTransition::Damaged {
             occurred_at: Some(Cited::uncited(date)),
             cause: None,
@@ -1026,7 +1030,7 @@ mod tests {
 
     #[test]
     fn extract_dates_from_designated() -> TestResult {
-        let date = UncertainDate::with_precision(midnight(1978, 1, 1)?, DatePrecision::Year)?;
+        let date = UncertainDate::with_precision(ymd(1978, 1, 1)?, DatePrecision::Year)?;
         let transition = EntityTransition::Designated {
             occurred_at: Some(Cited::uncited(date)),
             designation: "National Historic Landmark".to_string(),
@@ -1040,9 +1044,9 @@ mod tests {
 
     #[test]
     fn extract_location_from_constructed() -> TestResult {
-        let loc = UncertainLocation::NamedLocation {
+        let loc = UnresolvedLocation::Reference(chronoscope_core::LocationReference::NamedPlace {
             name: "Paris".to_string(),
-        };
+        });
         let transition = EntityTransition::Constructed {
             started_at: None,
             completed_at: None,
@@ -1082,9 +1086,9 @@ mod tests {
     #[test]
     fn analyze_location_type_distribution() -> TestResult {
         let mut output = empty_output();
-        let loc = UncertainLocation::NamedLocation {
+        let loc = UnresolvedLocation::Reference(chronoscope_core::LocationReference::NamedPlace {
             name: "Paris".to_string(),
-        };
+        });
         let mut entity = simple_entity("Test");
         entity.transitions.push(EntityTransition::Constructed {
             started_at: None,
@@ -1096,7 +1100,7 @@ mod tests {
 
         let report = analyze(&output);
         assert_eq!(
-            report.distributions.location_types.get("NamedLocation"),
+            report.distributions.location_types.get("Reference"),
             Some(&1)
         );
         assert_eq!(report.summary.entities_with_location, 1);

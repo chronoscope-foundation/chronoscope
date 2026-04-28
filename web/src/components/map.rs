@@ -149,13 +149,9 @@ fn build_markers_geojson(markers: &[MapMarker]) -> Option<JsValue> {
             }
 
             match &marker.click_action {
-                api::ClickAction::Select {
-                    entity_id,
-                    entity_type,
-                } => {
+                api::ClickAction::Select { entity_id } => {
                     props.insert("kind".into(), "entity".into());
                     props.insert("id".into(), entity_id.to_string().into());
-                    props.insert("entity_type".into(), entity_type.to_string().into());
                 }
                 api::ClickAction::ZoomTo { bbox } => {
                     props.insert("kind".into(), "cluster".into());

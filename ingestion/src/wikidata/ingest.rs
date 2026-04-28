@@ -5,8 +5,8 @@
 use crate::{EntityIdx, IngestionOutput, LinkIdx, SourceIdx};
 use anyhow::{Context, Result};
 use chronoscope_core::{
-    Annotation, AnnotationKind, EntityRelationType, EntityType, Evidence, ExternalLink,
-    ImageSource, LinkTarget, LinkType, WikidataEntityId, WikidataPropertyId,
+    Annotation, AnnotationKind, EntityRelationType, Evidence, ExternalLink, ImageSource,
+    LinkTarget, LinkType, WikidataEntityId, WikidataPropertyId,
 };
 use chronoscope_integrations::wikidata::WikidataEntity;
 use futures::stream::{self, StreamExt};
@@ -32,8 +32,8 @@ mod entity_accumulator {
 
     use crate::{EntityIdx, SourceIdx};
     use chronoscope_core::{
-        AnnotationKind, Cited, Entity, EntityName, EntityTransition, EntityType, Evidence,
-        ExternalLink, ImageSource, Usage, WikidataEntityId, WikidataPropertyId,
+        AnnotationKind, Cited, Entity, EntityName, EntityTransition, Evidence, ExternalLink,
+        ImageSource, Usage, WikidataEntityId, WikidataPropertyId,
     };
     use chronoscope_integrations::wikidata::{RevisionId, WikidataId};
 
@@ -64,7 +64,6 @@ mod entity_accumulator {
         entity_idx: usize,
         wikidata_id: WikidataId,
         revision_id: RevisionId,
-        entity_type: EntityType,
         images: Vec<ImageSource<EntityIdx>>,
         annotations: Vec<LocalAnnotation>,
         links: Vec<ExternalLink>,
@@ -74,17 +73,11 @@ mod entity_accumulator {
     impl EntityAccumulator {
         /// Create a new accumulator for an entity.
         #[must_use]
-        pub fn new(
-            entity_idx: usize,
-            wikidata_id: WikidataId,
-            revision_id: RevisionId,
-            entity_type: EntityType,
-        ) -> Self {
+        pub fn new(entity_idx: usize, wikidata_id: WikidataId, revision_id: RevisionId) -> Self {
             Self {
                 entity_idx,
                 wikidata_id,
                 revision_id,
-                entity_type,
                 images: Vec::new(),
                 annotations: Vec::new(),
                 links: Vec::new(),
@@ -147,7 +140,6 @@ mod entity_accumulator {
                 wikidata_id: self.wikidata_id,
                 revision_id: self.revision_id,
                 entity: Entity {
-                    entity_type: self.entity_type,
                     names,
                     transitions: Vec::new(),
                 },
@@ -179,7 +171,6 @@ mod entity_accumulator {
 
             for (i, transitions) in lifecycles.into_iter().enumerate() {
                 let mut entity = Entity {
-                    entity_type: self.entity_type,
                     names: names.clone(),
                     transitions,
                 };
@@ -609,12 +600,7 @@ fn process_entity(
 
     let names = extract_names(&wd_entity, wikidata_id.as_str(), revision_id.0);
 
-    let mut acc = EntityAccumulator::new(
-        entity_idx,
-        wikidata_id.clone(),
-        revision_id,
-        EntityType::Building,
-    );
+    let mut acc = EntityAccumulator::new(entity_idx, wikidata_id.clone(), revision_id);
 
     // Build lifecycle transitions
     let lifecycle_ctx = PropertyContext::new(wikidata_id.as_str(), revision_id.0, "lifecycle");

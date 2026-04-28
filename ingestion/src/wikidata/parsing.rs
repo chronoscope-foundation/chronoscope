@@ -15,8 +15,8 @@ use oxilangtag::LanguageTag;
 
 /// Build an `UncertainDate` at year granularity or coarser.
 fn coarse_date(year: i32, precision: DatePrecision) -> Option<UncertainDate> {
-    let datetime = NaiveDate::from_ymd_opt(year, 1, 1)?.and_hms_opt(0, 0, 0)?;
-    UncertainDate::with_precision(datetime, precision).ok()
+    let date = NaiveDate::from_ymd_opt(year, 1, 1)?;
+    UncertainDate::with_precision(date, precision).ok()
 }
 
 /// Parse Wikidata time format to `UncertainDate`.
@@ -40,13 +40,13 @@ pub fn parse_wikidata_time(time_str: &str, precision: WikidataPrecision) -> Opti
         WikidataPrecision::Day => {
             let month: u32 = parts.get(1).and_then(|m| m.parse().ok()).unwrap_or(1);
             let day: u32 = parts.get(2).and_then(|d| d.parse().ok()).unwrap_or(1);
-            let datetime = NaiveDate::from_ymd_opt(year, month, day)?.and_hms_opt(0, 0, 0)?;
-            UncertainDate::with_precision(datetime, DatePrecision::Day).ok()
+            let date = NaiveDate::from_ymd_opt(year, month, day)?;
+            UncertainDate::with_precision(date, DatePrecision::Day).ok()
         }
         WikidataPrecision::Month => {
             let month: u32 = parts.get(1).and_then(|m| m.parse().ok()).unwrap_or(1);
-            let datetime = NaiveDate::from_ymd_opt(year, month, 1)?.and_hms_opt(0, 0, 0)?;
-            UncertainDate::with_precision(datetime, DatePrecision::Month).ok()
+            let date = NaiveDate::from_ymd_opt(year, month, 1)?;
+            UncertainDate::with_precision(date, DatePrecision::Month).ok()
         }
         WikidataPrecision::Year => coarse_date(year, DatePrecision::Year),
         WikidataPrecision::Decade => coarse_date(year, DatePrecision::Decade),
@@ -152,7 +152,7 @@ pub fn parse_sitelink(site: &str, title: &str) -> Option<ExternalLink> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, NaiveDateTime};
+    use chrono::Datelike;
     use chronoscope_integrations::wikidata::{
         Claim, Label, LanguageCode, MonolingualTextValue, PropertyId, Rank, RevisionId, Snak,
         WikidataEntityType, WikidataId,
@@ -165,8 +165,8 @@ mod tests {
         WikidataId::try_from(s.to_string())
     }
 
-    fn midnight(y: i32, m: u32, d: u32) -> Option<NaiveDateTime> {
-        NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(0, 0, 0)
+    fn ymd(y: i32, m: u32, d: u32) -> Option<NaiveDate> {
+        NaiveDate::from_ymd_opt(y, m, d)
     }
 
     // =============================================================================
@@ -177,15 +177,9 @@ mod tests {
     fn test_parse_day_precision() -> TestResult {
         let date = parse_wikidata_time("+1920-06-15T00:00:00Z", WikidataPrecision::Day)
             .ok_or("should parse")?;
-        let expected = midnight(1920, 6, 15).ok_or("invalid date")?;
-        assert_eq!(date.earliest(), expected);
-        assert_eq!(
-            date.latest(),
-            expected
-                .date()
-                .and_hms_opt(23, 59, 59)
-                .ok_or("invalid time")?
-        );
+        let expected = ymd(1920, 6, 15).ok_or("invalid date")?;
+        assert_eq!(date.earliest(), Some(expected));
+        assert_eq!(date.latest(), Some(expected));
         Ok(())
     }
 
@@ -193,13 +187,13 @@ mod tests {
     fn test_parse_month_precision() -> TestResult {
         let date = parse_wikidata_time("+1920-06-01T00:00:00Z", WikidataPrecision::Month)
             .ok_or("should parse")?;
-        assert_eq!(date.earliest(), midnight(1920, 6, 1).ok_or("invalid date")?);
+        assert_eq!(
+            date.earliest(),
+            Some(ymd(1920, 6, 1).ok_or("invalid date")?)
+        );
         assert_eq!(
             date.latest(),
-            NaiveDate::from_ymd_opt(1920, 6, 30)
-                .ok_or("invalid date")?
-                .and_hms_opt(23, 59, 59)
-                .ok_or("invalid time")?
+            Some(NaiveDate::from_ymd_opt(1920, 6, 30).ok_or("invalid date")?)
         );
         Ok(())
     }
@@ -208,13 +202,13 @@ mod tests {
     fn test_parse_year_precision() -> TestResult {
         let date = parse_wikidata_time("+1920-01-01T00:00:00Z", WikidataPrecision::Year)
             .ok_or("should parse")?;
-        assert_eq!(date.earliest(), midnight(1920, 1, 1).ok_or("invalid date")?);
+        assert_eq!(
+            date.earliest(),
+            Some(ymd(1920, 1, 1).ok_or("invalid date")?)
+        );
         assert_eq!(
             date.latest(),
-            NaiveDate::from_ymd_opt(1920, 12, 31)
-                .ok_or("invalid date")?
-                .and_hms_opt(23, 59, 59)
-                .ok_or("invalid time")?
+            Some(NaiveDate::from_ymd_opt(1920, 12, 31).ok_or("invalid date")?)
         );
         Ok(())
     }
@@ -223,13 +217,13 @@ mod tests {
     fn test_parse_decade_precision() -> TestResult {
         let date = parse_wikidata_time("+1920-01-01T00:00:00Z", WikidataPrecision::Decade)
             .ok_or("should parse")?;
-        assert_eq!(date.earliest(), midnight(1920, 1, 1).ok_or("invalid date")?);
+        assert_eq!(
+            date.earliest(),
+            Some(ymd(1920, 1, 1).ok_or("invalid date")?)
+        );
         assert_eq!(
             date.latest(),
-            NaiveDate::from_ymd_opt(1929, 12, 31)
-                .ok_or("invalid date")?
-                .and_hms_opt(23, 59, 59)
-                .ok_or("invalid time")?
+            Some(NaiveDate::from_ymd_opt(1929, 12, 31).ok_or("invalid date")?)
         );
         Ok(())
     }
@@ -239,13 +233,13 @@ mod tests {
         let date = parse_wikidata_time("+1850-01-01T00:00:00Z", WikidataPrecision::Century)
             .ok_or("should parse")?;
         // 1850 is in 19th century (1801-1900)
-        assert_eq!(date.earliest(), midnight(1801, 1, 1).ok_or("invalid date")?);
+        assert_eq!(
+            date.earliest(),
+            Some(ymd(1801, 1, 1).ok_or("invalid date")?)
+        );
         assert_eq!(
             date.latest(),
-            NaiveDate::from_ymd_opt(1900, 12, 31)
-                .ok_or("invalid date")?
-                .and_hms_opt(23, 59, 59)
-                .ok_or("invalid time")?
+            Some(NaiveDate::from_ymd_opt(1900, 12, 31).ok_or("invalid date")?)
         );
         Ok(())
     }
@@ -255,13 +249,13 @@ mod tests {
         let date = parse_wikidata_time("+1500-01-01T00:00:00Z", WikidataPrecision::Millennium)
             .ok_or("should parse")?;
         // 1500 is in 2nd millennium (1001-2000)
-        assert_eq!(date.earliest(), midnight(1001, 1, 1).ok_or("invalid date")?);
+        assert_eq!(
+            date.earliest(),
+            Some(ymd(1001, 1, 1).ok_or("invalid date")?)
+        );
         assert_eq!(
             date.latest(),
-            NaiveDate::from_ymd_opt(2000, 12, 31)
-                .ok_or("invalid date")?
-                .and_hms_opt(23, 59, 59)
-                .ok_or("invalid time")?
+            Some(NaiveDate::from_ymd_opt(2000, 12, 31).ok_or("invalid date")?)
         );
         Ok(())
     }
@@ -271,7 +265,7 @@ mod tests {
         // BCE dates have negative years — chrono supports years down to ~-262145
         let date = parse_wikidata_time("-0500-01-01T00:00:00Z", WikidataPrecision::Year)
             .ok_or("500 BCE should be within chrono's year range")?;
-        assert_eq!(date.earliest().year(), -500);
+        assert_eq!(date.earliest().ok_or("expected earliest")?.year(), -500);
         Ok(())
     }
 
@@ -319,7 +313,7 @@ mod tests {
         // Feb 29 on a leap year should parse at day precision
         let date = parse_wikidata_time("+2000-02-29T00:00:00Z", WikidataPrecision::Day)
             .ok_or("should parse Feb 29 in leap year")?;
-        assert_eq!(date.earliest(), midnight(2000, 2, 29).ok_or("invalid")?);
+        assert_eq!(date.earliest(), Some(ymd(2000, 2, 29).ok_or("invalid")?));
         Ok(())
     }
 
@@ -337,10 +331,7 @@ mod tests {
             .ok_or("should parse")?;
         assert_eq!(
             date.latest(),
-            NaiveDate::from_ymd_opt(2001, 2, 28)
-                .ok_or("invalid date")?
-                .and_hms_opt(23, 59, 59)
-                .ok_or("invalid time")?
+            Some(NaiveDate::from_ymd_opt(2001, 2, 28).ok_or("invalid date")?)
         );
         Ok(())
     }

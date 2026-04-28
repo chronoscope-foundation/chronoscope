@@ -305,7 +305,7 @@ mod tests {
     use crate::cdn::tests::TEST_CDN_BASE_URL;
     use crate::research_types::AnalysisOutcome;
     use chrono::{NaiveDate, NaiveDateTime};
-    use chronoscope_db::{EntityId, MediaData, MediaId, MediaType};
+    use chronoscope_db::{MediaData, MediaId, MediaType};
 
     #[allow(clippy::expect_used)]
     fn test_timestamp() -> NaiveDateTime {
@@ -354,12 +354,10 @@ mod tests {
     #[test]
     fn test_convert_media_with_location() -> TestResult {
         let mut media = minimal_media();
-        media.data.location = Some(
-            chronoscope_core::UncertainLocation::<EntityId>::coordinates(
-                41.5908, -87.3467, None, None,
-            )
-            .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
-        );
+        media.data.location = Some(chronoscope_core::UnresolvedLocation::Resolved(
+            chronoscope_core::Location::point(41.5908, -87.3467)
+                .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
+        ));
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
 
@@ -367,14 +365,16 @@ mod tests {
             .location
             .ok_or_else(|| HttpError::for_bad_request(None, "should have location".to_string()))?;
         match location {
-            chronoscope_core::UncertainLocation::Coordinates { lat, lon, .. } => {
+            chronoscope_core::UnresolvedLocation::Resolved(
+                chronoscope_core::Location::Circle { lat, lon, .. },
+            ) => {
                 assert_eq!(lat, 41.5908);
                 assert_eq!(lon, -87.3467);
             }
             _ => {
                 return Err(HttpError::for_bad_request(
                     None,
-                    "expected Coordinates".to_string(),
+                    "expected Resolved(Circle)".to_string(),
                 ));
             }
         }
@@ -384,15 +384,10 @@ mod tests {
     #[test]
     fn test_convert_media_with_elevation() -> TestResult {
         let mut media = minimal_media();
-        media.data.location = Some(
-            chronoscope_core::UncertainLocation::<EntityId>::coordinates(
-                41.5908,
-                -87.3467,
-                Some(chronoscope_core::Elevation::SeaLevelOffset { meters: 180 }),
-                None,
-            )
-            .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
-        );
+        media.data.location = Some(chronoscope_core::UnresolvedLocation::Resolved(
+            chronoscope_core::Location::point(41.5908, -87.3467)
+                .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
+        ));
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
 

@@ -6,7 +6,7 @@ use chronoscope_integrations::IntegrationName;
 
 use crate::types::{Email, MediaAnalysisState, MediaType, ResearchUrlStatus, UserId};
 use chrono::{Duration, Utc};
-use chronoscope_core::UncertainLocation;
+use chronoscope_core::{Location, UnresolvedLocation};
 
 macro_rules! assert_approx_eq {
     ($left:expr, $right:expr, $epsilon:expr) => {
@@ -566,10 +566,10 @@ async fn test_get_or_create_media_with_location() -> DbResult<()> {
         height: 480,
         duration_seconds: None,
         captured: None,
-        location: Some(
-            UncertainLocation::coordinates(37.7749, -122.4194, None, None)
+        location: Some(UnresolvedLocation::Resolved(
+            Location::point(37.7749, -122.4194)
                 .map_err(|e| DbError::InvalidArgument(e.to_string()))?,
-        ),
+        )),
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
     };
@@ -596,16 +596,16 @@ async fn test_get_or_create_media_with_location() -> DbResult<()> {
             .await?;
     let (meta_json,) =
         meta_row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
-    let loc: UncertainLocation<EntityId> = serde_json::from_str(&meta_json)
+    let loc: UnresolvedLocation<EntityId> = serde_json::from_str(&meta_json)
         .map_err(|e| DbError::InvalidArgument(format!("bad json: {e}")))?;
     match loc {
-        UncertainLocation::Coordinates { lat, lon, .. } => {
+        UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) => {
             assert_approx_eq!(lat, 37.7749, 1e-4);
             assert_approx_eq!(lon, -122.4194, 1e-4);
         }
         other => {
             return Err(DbError::InvalidArgument(format!(
-                "expected Coordinates, got {other:?}"
+                "expected Resolved(Circle), got {other:?}"
             )));
         }
     }

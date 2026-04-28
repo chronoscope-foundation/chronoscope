@@ -4,7 +4,7 @@
 //! They never escape the crate; every `Database` method converts them
 //! into domain types via `into_domain()` before returning.
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use chronoscope_core::UncertainDate;
 use chronoscope_core::links::LinkType;
 use sqlx::FromRow;
@@ -101,7 +101,7 @@ pub struct Media {
     #[sqlx(json(nullable), rename = "captured_meta")]
     pub captured: Option<UncertainDate>,
     #[sqlx(json(nullable), rename = "location_meta")]
-    pub location: Option<chronoscope_core::UncertainLocation<EntityId>>,
+    pub location: Option<chronoscope_core::UnresolvedLocation<EntityId>>,
     pub source_metadata: Option<String>,
     pub fetched_at: NaiveDateTime,
     pub created_at: NaiveDateTime,
@@ -156,7 +156,7 @@ pub struct PageMedia {
     #[sqlx(json(nullable), rename = "captured_meta")]
     pub captured: Option<UncertainDate>,
     #[sqlx(json(nullable), rename = "location_meta")]
-    pub location: Option<chronoscope_core::UncertainLocation<EntityId>>,
+    pub location: Option<chronoscope_core::UnresolvedLocation<EntityId>>,
     pub source_metadata: Option<String>,
     pub fetched_at: Option<NaiveDateTime>,
     pub created_at: Option<NaiveDateTime>,
@@ -269,8 +269,8 @@ impl EntityThumbnail {
 pub struct Entity {
     pub id: EntityId,
     pub entity_json: String,
-    pub earliest_date: Option<NaiveDateTime>,
-    pub latest_date: Option<NaiveDateTime>,
+    pub earliest_date: Option<NaiveDate>,
+    pub latest_date: Option<NaiveDate>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub created_at: NaiveDateTime,

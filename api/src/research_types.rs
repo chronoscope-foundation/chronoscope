@@ -223,7 +223,7 @@ pub struct MediaDossier {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub captured: Option<UncertainDate>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<chronoscope_core::UncertainLocation<EntityId>>,
+    pub location: Option<chronoscope_core::UnresolvedLocation<EntityId>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_metadata: Option<serde_json::Value>,
     pub fetched_at: NaiveDateTime,

@@ -7,9 +7,10 @@
 use std::collections::HashMap;
 
 use crate::{EntityIdx, SourceIdx};
-use chrono::NaiveDateTime;
+use chrono::NaiveDate;
 use chronoscope_core::{
-    Cited, DamageCause, EntityTransition, TriggerEventId, UncertainDate, UncertainLocation, Usage,
+    Cited, DamageCause, EntityTransition, Location, TriggerEventId, UncertainDate,
+    UnresolvedLocation, Usage,
 };
 use chronoscope_integrations::wikidata::{Claim, PropertyId};
 
@@ -21,7 +22,7 @@ use crate::wikidata::ingest::PropertyContext;
 
 mod extract {
     use crate::EntityIdx;
-    use chronoscope_core::{UncertainDate, UncertainLocation};
+    use chronoscope_core::{Location, UncertainDate, UnresolvedLocation};
     use chronoscope_integrations::wikidata::{Claim, DataValue, Snak};
 
     use crate::wikidata::parsing::parse_wikidata_time;
@@ -51,7 +52,7 @@ mod extract {
     /// Extract coordinates from claim's mainsnak.
     pub fn mainsnak_coordinates(
         claim: &Claim,
-    ) -> (Option<UncertainLocation<EntityIdx>>, Vec<String>) {
+    ) -> (Option<UnresolvedLocation<EntityIdx>>, Vec<String>) {
         let mut warnings = Vec::new();
 
         let coord = match &claim.mainsnak {
@@ -66,16 +67,21 @@ mod extract {
         // Convert coordinate precision from degrees to meters using Haversine distance.
         // This accounts for longitude convergence at higher latitudes, unlike the
         // equator-only approximation (deg * 111_000).
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let precision_m = coord.precision.map(|deg| {
+        let radius_m = coord.precision.map(|deg| {
             use geo::{Distance, Haversine};
             let center = geo::Point::new(coord.longitude, coord.latitude);
             let offset = geo::Point::new(coord.longitude + deg.abs(), coord.latitude);
-            Haversine::distance(center, offset) as u32
+            Haversine::distance(center, offset)
         });
 
-        match UncertainLocation::coordinates(coord.latitude, coord.longitude, None, precision_m) {
-            Ok(location) => (Some(location), warnings),
+        let result = if let Some(r) = radius_m {
+            Location::circle(coord.latitude, coord.longitude, r)
+        } else {
+            Location::point(coord.latitude, coord.longitude)
+        };
+
+        match result {
+            Ok(location) => (Some(UnresolvedLocation::Resolved(location)), warnings),
             Err(e) => {
                 warnings.push(format!(
                     "invalid coordinates ({}, {}): {e}",
@@ -205,7 +211,7 @@ fn extract_property_location(
     claims: &HashMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext<'_>,
 ) -> (
-    Option<Cited<UncertainLocation<EntityIdx>, SourceIdx>>,
+    Option<Cited<UnresolvedLocation<EntityIdx>, SourceIdx>>,
     Vec<String>,
 ) {
     let mut warnings = Vec::new();
@@ -225,8 +231,8 @@ fn extract_property_location(
     warnings.extend(w);
 
     let cited = location.map(|loc| {
-        // mainsnak_coordinates always returns Coordinates variant
-        let raw = if let UncertainLocation::Coordinates { lat, lon, .. } = &loc {
+        // mainsnak_coordinates always returns Resolved(Circle) variant
+        let raw = if let UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) = &loc {
             format!("{lat},{lon}")
         } else {
             "location".to_string()
@@ -244,7 +250,7 @@ fn extract_property_location(
 /// A transition with its sort key for chronological ordering.
 struct DatedTransition {
     transition: EntityTransition<EntityIdx, SourceIdx>,
-    sort_key: Option<NaiveDateTime>,
+    sort_key: Option<NaiveDate>,
 }
 
 /// Process one P793 claim. May return multiple transitions for point-in-time events.
@@ -284,7 +290,7 @@ fn process_p793_claim(
         .first()
         .or(p582.first())
         .or(p585.first())
-        .map(|(d, _)| d.earliest());
+        .and_then(|(d, _)| d.earliest());
 
     let transitions: Vec<EntityTransition<EntityIdx, SourceIdx>> = match qid.as_str() {
         // =================================================================
@@ -561,7 +567,7 @@ pub fn build_lifecycles(
     if p793_constructions.is_empty() {
         // No P793 construction events - create from P571 + P625
         if inception.is_some() || location.is_some() {
-            let sort_key = inception.as_ref().map(|c| c.value.earliest());
+            let sort_key = inception.as_ref().and_then(|c| c.value.earliest());
             dated_transitions.push(DatedTransition {
                 transition: EntityTransition::Constructed {
                     started_at: None,
@@ -616,7 +622,7 @@ pub fn build_lifecycles(
 
     // 5. Add P576 demolished
     if let Some(demolished) = demolished_date {
-        let sort_key = Some(demolished.value.earliest());
+        let sort_key = demolished.value.earliest();
         dated_transitions.push(DatedTransition {
             transition: EntityTransition::Demolished {
                 started_at: None,
@@ -630,7 +636,7 @@ pub fn build_lifecycles(
 
     // 6. Add usage-related transitions
     if let Some(opened) = opening {
-        let sort_key = Some(opened.value.earliest());
+        let sort_key = opened.value.earliest();
         dated_transitions.push(DatedTransition {
             transition: EntityTransition::UsageModified {
                 occurred_at: Some(opened),
@@ -643,7 +649,7 @@ pub fn build_lifecycles(
     }
 
     if let Some(closed) = closure {
-        let sort_key = Some(closed.value.earliest());
+        let sort_key = closed.value.earliest();
         dated_transitions.push(DatedTransition {
             transition: EntityTransition::UsageModified {
                 occurred_at: Some(closed),
@@ -656,7 +662,7 @@ pub fn build_lifecycles(
     }
 
     if let Some(entry) = service_entry {
-        let sort_key = Some(entry.value.earliest());
+        let sort_key = entry.value.earliest();
         dated_transitions.push(DatedTransition {
             transition: EntityTransition::UsageModified {
                 occurred_at: Some(entry),
@@ -669,7 +675,7 @@ pub fn build_lifecycles(
     }
 
     if let Some(retirement) = service_retirement {
-        let sort_key = Some(retirement.value.earliest());
+        let sort_key = retirement.value.earliest();
         dated_transitions.push(DatedTransition {
             transition: EntityTransition::UsageModified {
                 occurred_at: Some(retirement),
@@ -760,7 +766,7 @@ fn split_on_rebuild(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, NaiveDate};
+    use chrono::Datelike;
     use chronoscope_integrations::wikidata::{
         CoordinateValue, DataValue, EntityRefValue, PropertyId, Rank, Snak, TimeValue, WikidataId,
         WikidataPrecision, WikidataTimestamp,
@@ -776,8 +782,8 @@ mod tests {
         PropertyId::try_from(s.to_string())
     }
 
-    fn midnight(y: i32, m: u32, d: u32) -> Option<NaiveDateTime> {
-        NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(0, 0, 0)
+    fn ymd(y: i32, m: u32, d: u32) -> Option<NaiveDate> {
+        NaiveDate::from_ymd_opt(y, m, d)
     }
 
     fn time_claim(time_str: &str, precision: WikidataPrecision) -> Result<Claim, String> {
@@ -862,7 +868,7 @@ mod tests {
 
         let (date, raw) = result.ok_or("expected Some")?;
         assert_eq!(raw, "+1920-01-01T00:00:00Z");
-        assert_eq!(date.earliest().year(), 1920);
+        assert_eq!(date.earliest().ok_or("expected earliest")?.year(), 1920);
         Ok(())
     }
 
@@ -873,11 +879,11 @@ mod tests {
         assert!(warnings.is_empty());
         let result = result.ok_or("expected Some")?;
 
-        if let UncertainLocation::Coordinates { lat, lon, .. } = result {
+        if let UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) = result {
             assert!((lat - 40.7128).abs() < 0.0001);
             assert!((lon - (-74.0060)).abs() < 0.0001);
         } else {
-            return Err("expected Coordinates".into());
+            return Err("expected Resolved(Circle)".into());
         }
         Ok(())
     }
@@ -899,19 +905,18 @@ mod tests {
         assert!(warnings.is_empty());
         let loc = loc.ok_or("expected Some")?;
 
-        if let UncertainLocation::Coordinates { precision_m, .. } = loc {
-            let p = precision_m.ok_or("expected precision")?;
+        if let UnresolvedLocation::Resolved(Location::Circle { radius_m, .. }) = loc {
             // At 60°N, 1 degree longitude ≈ 55,800m (not 111,000m)
             assert!(
-                p < 70_000,
-                "precision at 60°N should be well under 70km, got {p}m"
+                radius_m < 70_000.0,
+                "precision at 60°N should be well under 70km, got {radius_m}m"
             );
             assert!(
-                p > 40_000,
-                "precision at 60°N should be over 40km, got {p}m"
+                radius_m > 40_000.0,
+                "precision at 60°N should be over 40km, got {radius_m}m"
             );
         } else {
-            return Err("expected Coordinates".into());
+            return Err("expected Resolved(Circle)".into());
         }
         Ok(())
     }
@@ -928,8 +933,14 @@ mod tests {
         assert!(w2.is_empty());
         assert_eq!(p580.len(), 1);
         assert_eq!(p582.len(), 1);
-        assert_eq!(p580[0].0.earliest().year(), 1918);
-        assert_eq!(p582[0].0.earliest().year(), 1920);
+        assert_eq!(
+            p580[0].0.earliest().ok_or("expected earliest")?.year(),
+            1918
+        );
+        assert_eq!(
+            p582[0].0.earliest().ok_or("expected earliest")?.year(),
+            1920
+        );
         Ok(())
     }
 
@@ -944,7 +955,7 @@ mod tests {
                     location: None,
                     trigger_event: None,
                 },
-                sort_key: midnight(1920, 1, 1),
+                sort_key: ymd(1920, 1, 1),
             },
             DatedTransition {
                 transition: EntityTransition::Demolished {
@@ -953,7 +964,7 @@ mod tests {
                     cause: None,
                     trigger_event: None,
                 },
-                sort_key: midnight(1950, 1, 1),
+                sort_key: ymd(1950, 1, 1),
             },
             DatedTransition {
                 transition: EntityTransition::Constructed {
@@ -962,7 +973,7 @@ mod tests {
                     location: None,
                     trigger_event: None,
                 },
-                sort_key: midnight(1960, 1, 1),
+                sort_key: ymd(1960, 1, 1),
             },
         ];
 
@@ -976,7 +987,7 @@ mod tests {
     fn test_split_on_rebuild_propagates_location() -> TestResult {
         // Predecessor has no location; successor was constructed at a known location.
         // The predecessor should get a synthetic Constructed with the inherited location.
-        let loc = UncertainLocation::coordinates(45.217, 12.277, None, None)?;
+        let loc = UnresolvedLocation::Resolved(Location::point(45.217, 12.277)?);
         let transitions = vec![
             DatedTransition {
                 transition: EntityTransition::Demolished {
@@ -985,7 +996,7 @@ mod tests {
                     cause: None,
                     trigger_event: None,
                 },
-                sort_key: midnight(1623, 1, 1),
+                sort_key: ymd(1623, 1, 1),
             },
             DatedTransition {
                 transition: EntityTransition::Constructed {
@@ -994,7 +1005,7 @@ mod tests {
                     location: Some(Cited::uncited(loc)),
                     trigger_event: None,
                 },
-                sort_key: midnight(1633, 1, 1),
+                sort_key: ymd(1633, 1, 1),
             },
         ];
 
@@ -1067,7 +1078,10 @@ mod tests {
         {
             // P571 becomes completed_at (inception = completion date)
             let date = completed_at.as_ref().ok_or("expected completed_at")?;
-            assert_eq!(date.value.earliest().year(), 1920);
+            assert_eq!(
+                date.value.earliest().ok_or("expected earliest")?.year(),
+                1920
+            );
             assert!(started_at.is_none());
             assert!(location.is_none());
         } else {
@@ -1100,7 +1114,7 @@ mod tests {
         {
             assert!(completed_at.is_some());
             let loc = location.as_ref().ok_or("expected location")?;
-            if let UncertainLocation::Coordinates { lat, lon, .. } = &loc.value {
+            if let UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) = &loc.value {
                 assert!((lat - 48.8584).abs() < 0.001);
                 assert!((lon - 2.2945).abs() < 0.001);
             } else {
@@ -1174,8 +1188,14 @@ mod tests {
         {
             let start = started_at.as_ref().ok_or("expected started_at")?;
             let end = completed_at.as_ref().ok_or("expected completed_at")?;
-            assert_eq!(start.value.earliest().year(), 1887);
-            assert_eq!(end.value.earliest().year(), 1889);
+            assert_eq!(
+                start.value.earliest().ok_or("expected earliest")?.year(),
+                1887
+            );
+            assert_eq!(
+                end.value.earliest().ok_or("expected earliest")?.year(),
+                1889
+            );
         } else {
             return Err("expected Constructed".into());
         }
@@ -1343,7 +1363,7 @@ mod tests {
             let loc = location
                 .as_ref()
                 .ok_or("P625 should be merged into P793 construction")?;
-            if let UncertainLocation::Coordinates { lat, lon, .. } = &loc.value {
+            if let UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) = &loc.value {
                 assert!((lat - 51.5074).abs() < 0.001);
                 assert!((lon - (-0.1278)).abs() < 0.001);
             } else {

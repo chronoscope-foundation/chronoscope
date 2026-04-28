@@ -294,13 +294,11 @@ mod tests {
 
     use chrono::{Datelike, NaiveDate};
     use chronoscope_core::annotation::{Annotation, AnnotationKind};
-    use chronoscope_core::entity::{
-        Entity, EntityRelation, EntityRelationType, EntityTransition, EntityType,
-    };
+    use chronoscope_core::entity::{Entity, EntityRelation, EntityRelationType, EntityTransition};
     use chronoscope_core::ids::WikidataEntityId;
     use chronoscope_core::ingestion::{ImageSource, TestBundle};
     use chronoscope_core::links::{ExternalLink, LinkTarget, LinkType};
-    use chronoscope_core::{Cited, DatePrecision, UncertainDate, UncertainLocation};
+    use chronoscope_core::{Cited, DatePrecision, Location, UncertainDate, UnresolvedLocation};
     use oxilangtag::LanguageTag;
 
     use super::*;
@@ -311,7 +309,6 @@ mod tests {
     fn test_entity(name: &str) -> Entity<&'static str, &'static str> {
         #[allow(clippy::expect_used)]
         Entity {
-            entity_type: EntityType::Building,
             names: vec![Cited::uncited(chronoscope_core::entity::EntityName {
                 name: name.to_string(),
                 name_type: chronoscope_core::entity::NameType::Official,
@@ -326,10 +323,7 @@ mod tests {
     fn test_entity_with_date(name: &str, year: i32) -> Entity<&'static str, &'static str> {
         #[allow(clippy::expect_used)]
         let date = UncertainDate::with_precision(
-            NaiveDate::from_ymd_opt(year, 1, 1)
-                .expect("valid date")
-                .and_hms_opt(0, 0, 0)
-                .expect("valid time"),
+            NaiveDate::from_ymd_opt(year, 1, 1).expect("valid date"),
             DatePrecision::Year,
         )
         .expect("valid precision");
@@ -430,7 +424,6 @@ mod tests {
             .fetch_optional(db.pool_ref())
             .await?;
         let stored = row.ok_or("entity not found")?.into_domain()?;
-        assert_eq!(stored.entity_type(), EntityType::Building);
         assert_eq!(stored.entity.names.len(), 1);
         assert_eq!(stored.entity.names[0].value.name, "Eiffel Tower");
         Ok(())
@@ -534,7 +527,7 @@ mod tests {
         let row = row.ok_or("entity not found")?;
         // completed_at (year 1889) should populate latest_date
         let latest = row.latest_date.ok_or("no latest")?;
-        assert_eq!(latest.and_utc().year(), 1889);
+        assert_eq!(latest.year(), 1889);
         Ok(())
     }
 
@@ -544,7 +537,7 @@ mod tests {
         let db = test_db().await?;
 
         let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
-        let loc = UncertainLocation::coordinates(48.8584, 2.2945, None, None)?;
+        let loc = UnresolvedLocation::Resolved(Location::point(48.8584, 2.2945)?);
         bundle
             .entities
             .get_mut(&eidxs[0])
@@ -625,19 +618,11 @@ mod tests {
         let db = test_db().await?;
         let timestamp = crate::now();
 
-        // --- EntityType: insert one entity per variant ---
-        let entity_types = [
-            EntityType::Area,
-            EntityType::Building,
-            EntityType::Infrastructure,
-            EntityType::Monument,
-            EntityType::NaturalFeature,
-        ];
+        // --- Insert two entities for relation tests ---
         let mut entity_ids = Vec::new();
-        for (i, &et) in entity_types.iter().enumerate() {
+        for _ in 0..2 {
             let id = EntityId::generate();
             let entity: Entity<EntityId, crate::types::SourceId> = Entity {
-                entity_type: et,
                 names: vec![],
                 transitions: vec![],
             };
@@ -654,14 +639,6 @@ mod tests {
                 .bind(timestamp)
                 .execute(db.pool_ref())
                 .await?;
-
-            // Verify the generated column round-trips the type
-            let (stored_type,): (EntityType,) =
-                sqlx::query_as("SELECT entity_type FROM entities WHERE id = ?")
-                    .bind(&id)
-                    .fetch_one(db.pool_ref())
-                    .await?;
-            assert_eq!(stored_type, et, "entity_type mismatch for variant {i}");
 
             entity_ids.push(id);
         }
@@ -924,8 +901,8 @@ mod tests {
             .ok_or("entity not found")?;
 
         let bounds = stored.temporal_bounds.ok_or("no temporal_bounds")?;
-        assert_eq!(bounds.latest.and_utc().year(), 1889);
-        assert_eq!(bounds.earliest.and_utc().year(), 1889);
+        assert_eq!(bounds.latest.year(), 1889);
+        assert_eq!(bounds.earliest.year(), 1889);
         // The deserialized Entity should also have the transition
         assert_eq!(stored.entity.transitions.len(), 1);
         Ok(())

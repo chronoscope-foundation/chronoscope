@@ -14,52 +14,44 @@ use oxilangtag::LanguageTag;
 
 use chronoscope_core::ingestion::TestBundle;
 use chronoscope_core::{
-    Cited, DatePrecision, Elevation, Entity, EntityName, EntityRelation, EntityRelationType,
-    EntityTransition, EntityType, MoveMethod, NameType, PreciseDate, UncertainDate,
-    UncertainLocation, Usage,
+    Cited, DateBound, DatePrecision, Entity, EntityName, EntityRelation, EntityRelationType,
+    EntityTransition, Location, MoveMethod, NameType, UncertainDate, UnresolvedLocation, Usage,
 };
 
 type FixtureEntity = Entity<&'static str, &'static str>;
 
 fn year(y: i32) -> UncertainDate {
     UncertainDate::with_precision(
-        NaiveDate::from_ymd_opt(y, 1, 1)
-            .expect("fixture month/day always valid")
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid"),
+        NaiveDate::from_ymd_opt(y, 1, 1).expect("fixture month/day always valid"),
         DatePrecision::Year,
     )
     .expect("year precision is always valid")
 }
 
 fn exact(y: i32, m: u32, d: u32) -> UncertainDate {
-    UncertainDate::exact(
-        NaiveDate::from_ymd_opt(y, m, d)
-            .expect("fixture date always valid")
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is always valid"),
+    UncertainDate::with_precision(
+        NaiveDate::from_ymd_opt(y, m, d).expect("fixture date always valid"),
+        DatePrecision::Day,
     )
-    .expect("exact date is always valid")
+    .expect("day precision is always valid")
 }
 
 fn range(y1: i32, y2: i32) -> UncertainDate {
-    UncertainDate::range(
-        PreciseDate::new(
-            NaiveDate::from_ymd_opt(y1, 1, 1)
-                .expect("fixture month/day always valid")
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid"),
-            DatePrecision::Year,
-        )
-        .expect("year precision is always valid"),
-        PreciseDate::new(
-            NaiveDate::from_ymd_opt(y2, 1, 1)
-                .expect("fixture month/day always valid")
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid"),
-            DatePrecision::Year,
-        )
-        .expect("year precision is always valid"),
+    UncertainDate::bounded(
+        Some(
+            DateBound::new(
+                NaiveDate::from_ymd_opt(y1, 1, 1).expect("fixture month/day always valid"),
+                DatePrecision::Year,
+            )
+            .expect("year precision is always valid"),
+        ),
+        Some(
+            DateBound::new(
+                NaiveDate::from_ymd_opt(y2, 1, 1).expect("fixture month/day always valid"),
+                DatePrecision::Year,
+            )
+            .expect("year precision is always valid"),
+        ),
     )
     .expect("fixture date range is always valid")
 }
@@ -73,14 +65,13 @@ fn lang(tag: &str) -> LanguageTag<String> {
     LanguageTag::parse(tag.to_string()).expect("hardcoded BCP 47 tag is valid")
 }
 
-fn coords(
-    lat: f64,
-    lon: f64,
-    elevation: Option<Elevation>,
-    precision_m: Option<u32>,
-) -> UncertainLocation<&'static str> {
-    UncertainLocation::coordinates(lat, lon, elevation, precision_m)
-        .expect("fixture coordinates always valid")
+fn coords(lat: f64, lon: f64, radius_m: Option<f64>) -> UnresolvedLocation<&'static str> {
+    let location = if let Some(r) = radius_m {
+        Location::circle(lat, lon, r).expect("fixture coordinates always valid")
+    } else {
+        Location::point(lat, lon).expect("fixture coordinates always valid")
+    };
+    UnresolvedLocation::Resolved(location)
 }
 
 fn en_name(name: &str, name_type: NameType) -> Cited<EntityName, &'static str> {
@@ -111,13 +102,12 @@ fn name_with_validity(
 
 fn penn_station_original() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Building,
         names: vec![en_name("Pennsylvania Station", NameType::Official)],
         transitions: vec![
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1904))),
                 completed_at: Some(uncited(year(1910))),
-                location: Some(uncited(coords(40.7505, -73.9934, None, Some(10)))),
+                location: Some(uncited(coords(40.7505, -73.9934, Some(10.0)))),
                 trigger_event: None,
             },
             EntityTransition::Modified {
@@ -134,17 +124,11 @@ fn penn_station_original() -> FixtureEntity {
 
 fn madison_square_garden() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Building,
         names: vec![en_name("Madison Square Garden", NameType::Official)],
         transitions: vec![EntityTransition::Constructed {
             started_at: Some(uncited(year(1964))),
             completed_at: Some(uncited(year(1968))),
-            location: Some(uncited(coords(
-                40.7505,
-                -73.9934,
-                Some(Elevation::CurrentGroundOffset { meters: 0 }),
-                Some(10),
-            ))),
+            location: Some(uncited(coords(40.7505, -73.9934, Some(10.0)))),
             trigger_event: None,
         }],
     }
@@ -152,13 +136,12 @@ fn madison_square_garden() -> FixtureEntity {
 
 fn palace_of_fine_arts_original() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Building,
         names: vec![en_name("Palace of Fine Arts", NameType::Official)],
         transitions: vec![
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1914))),
                 completed_at: Some(uncited(year(1915))),
-                location: Some(uncited(coords(37.8029, -122.4484, None, Some(20)))),
+                location: Some(uncited(coords(37.8029, -122.4484, Some(20.0)))),
                 trigger_event: None,
             },
             EntityTransition::Demolished {
@@ -173,12 +156,11 @@ fn palace_of_fine_arts_original() -> FixtureEntity {
 
 fn palace_of_fine_arts_rebuilt() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Building,
         names: vec![en_name("Palace of Fine Arts", NameType::Official)],
         transitions: vec![EntityTransition::Constructed {
             started_at: Some(uncited(year(1964))),
             completed_at: Some(uncited(year(1967))),
-            location: Some(uncited(coords(37.8029, -122.4484, None, Some(20)))),
+            location: Some(uncited(coords(37.8029, -122.4484, Some(20.0)))),
             trigger_event: None,
         }],
     }
@@ -186,7 +168,6 @@ fn palace_of_fine_arts_rebuilt() -> FixtureEntity {
 
 fn statue_of_liberty() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Monument,
         names: vec![
             en_name("Statue of Liberty", NameType::Common),
             en_name("Liberty Enlightening the World", NameType::Official),
@@ -195,12 +176,12 @@ fn statue_of_liberty() -> FixtureEntity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1876))),
                 completed_at: Some(uncited(year(1884))),
-                location: Some(uncited(coords(48.8566, 2.3522, None, Some(100)))),
+                location: Some(uncited(coords(48.8566, 2.3522, Some(100.0)))),
                 trigger_event: None,
             },
             EntityTransition::Moved {
                 occurred_at: Some(uncited(range(1885, 1886))),
-                location: Some(uncited(coords(40.6892, -74.0445, None, Some(10)))),
+                location: Some(uncited(coords(40.6892, -74.0445, Some(10.0)))),
                 cause: Some("gift from France to United States".to_string()),
                 method: Some(MoveMethod::Disassembled),
                 trigger_event: None,
@@ -219,7 +200,6 @@ fn statue_of_liberty() -> FixtureEntity {
 
 fn route_66() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name("U.S. Route 66", NameType::Official)],
         transitions: vec![
             EntityTransition::Constructed {
@@ -240,7 +220,6 @@ fn route_66() -> FixtureEntity {
 
 fn route_66_illinois_segment() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name("Route 66 Illinois segment", NameType::Common)],
         transitions: vec![EntityTransition::Modified {
             started_at: Some(uncited(year(1990))),
@@ -253,7 +232,6 @@ fn route_66_illinois_segment() -> FixtureEntity {
 
 fn route_66_arizona_segment() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name("Route 66 Arizona segment", NameType::Common)],
         transitions: vec![EntityTransition::Modified {
             started_at: Some(uncited(year(1984))),
@@ -266,7 +244,6 @@ fn route_66_arizona_segment() -> FixtureEntity {
 
 fn high_line() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![
             en_name("High Line", NameType::Common),
             name_with_validity(
@@ -314,7 +291,6 @@ fn high_line() -> FixtureEntity {
 
 fn berlin_wall() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![
             en_name("Berlin Wall", NameType::Common),
             uncited(EntityName {
@@ -346,7 +322,6 @@ fn berlin_wall() -> FixtureEntity {
 
 fn east_side_gallery() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![
             en_name("East Side Gallery", NameType::Common),
             uncited(EntityName {
@@ -368,13 +343,12 @@ fn east_side_gallery() -> FixtureEntity {
 
 fn burning_man_2023() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Area,
         names: vec![en_name("Black Rock City 2023", NameType::Official)],
         transitions: vec![
             EntityTransition::Constructed {
                 started_at: Some(uncited(exact(2023, 8, 20))),
                 completed_at: Some(uncited(exact(2023, 8, 27))),
-                location: Some(uncited(coords(40.7864, -119.2065, None, Some(100)))),
+                location: Some(uncited(coords(40.7864, -119.2065, Some(100.0)))),
                 trigger_event: None,
             },
             EntityTransition::Demolished {
@@ -389,7 +363,6 @@ fn burning_man_2023() -> FixtureEntity {
 
 fn hagia_sophia() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Building,
         names: vec![
             en_name("Hagia Sophia", NameType::Common),
             uncited(EntityName {
@@ -404,7 +377,7 @@ fn hagia_sophia() -> FixtureEntity {
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(532))),
                 completed_at: Some(uncited(year(537))),
-                location: Some(uncited(coords(41.0086, 28.9802, None, Some(20)))),
+                location: Some(uncited(coords(41.0086, 28.9802, Some(20.0)))),
                 trigger_event: None,
             },
             EntityTransition::UsageModified {
@@ -443,13 +416,12 @@ fn hagia_sophia() -> FixtureEntity {
 
 fn pioneer_building_seattle() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Building,
         names: vec![en_name("Pioneer Building", NameType::Official)],
         transitions: vec![
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1889))),
                 completed_at: Some(uncited(year(1892))),
-                location: Some(uncited(coords(47.6021, -122.3319, None, Some(10)))),
+                location: Some(uncited(coords(47.6021, -122.3319, Some(10.0)))),
                 trigger_event: None,
             },
             EntityTransition::Modified {
@@ -466,13 +438,12 @@ fn pioneer_building_seattle() -> FixtureEntity {
 
 fn kowloon_walled_city() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Area,
         names: vec![en_name("Kowloon Walled City", NameType::Common)],
         transitions: vec![
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1847))),
                 completed_at: Some(uncited(year(1847))),
-                location: Some(uncited(coords(22.3321, 114.1907, None, Some(50)))),
+                location: Some(uncited(coords(22.3321, 114.1907, Some(50.0)))),
                 trigger_event: None,
             },
             EntityTransition::Modified {
@@ -497,7 +468,6 @@ fn kowloon_walled_city() -> FixtureEntity {
 
 fn jrk_canal() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name("James River and Kanawha Canal", NameType::Official)],
         transitions: vec![
             EntityTransition::Constructed {
@@ -519,7 +489,6 @@ fn jrk_canal() -> FixtureEntity {
 /// Bosher Dam to Pump House Park — still an active waterway feeding city water supply.
 fn jrk_canal_bosher_dam_segment() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name(
             "Bosher Dam to Pump House segment",
             NameType::Common,
@@ -536,7 +505,6 @@ fn jrk_canal_bosher_dam_segment() -> FixtureEntity {
 /// Tidewater Connection Locks 1-3 — destroyed by I-195 expressway construction in 1976.
 fn jrk_canal_tidewater_locks_1_3() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name("Tidewater Connection Locks 1-3", NameType::Common)],
         transitions: vec![
             EntityTransition::Constructed {
@@ -558,7 +526,6 @@ fn jrk_canal_tidewater_locks_1_3() -> FixtureEntity {
 /// Tidewater Connection Locks 4-5 — preserved in situ by Reynolds Metals.
 fn jrk_canal_tidewater_locks_4_5() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name("Tidewater Connection Locks 4-5", NameType::Common)],
         transitions: vec![
             EntityTransition::Constructed {
@@ -580,7 +547,6 @@ fn jrk_canal_tidewater_locks_4_5() -> FixtureEntity {
 /// Great Basin — progressively covered by railroad yards (1880s) then development (by 1920s).
 fn jrk_canal_great_basin() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name("Great Basin", NameType::Common)],
         transitions: vec![
             EntityTransition::Constructed {
@@ -608,7 +574,6 @@ fn jrk_canal_great_basin() -> FixtureEntity {
 /// Canal Walk segment — buried in late 19th century, restored 1995-1999.
 fn jrk_canal_canal_walk() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![
             en_name("Canal Walk", NameType::Common),
             name_with_validity(
@@ -648,13 +613,12 @@ fn jrk_canal_canal_walk() -> FixtureEntity {
 /// Great Ship Lock — intact and operational since 1854, renovated 2013.
 fn jrk_canal_great_ship_lock() -> FixtureEntity {
     Entity {
-        entity_type: EntityType::Infrastructure,
         names: vec![en_name("Great Ship Lock", NameType::Common)],
         transitions: vec![
             EntityTransition::Constructed {
                 started_at: Some(uncited(year(1850))),
                 completed_at: Some(uncited(year(1854))),
-                location: Some(uncited(coords(37.5295, -77.4175, None, Some(30)))),
+                location: Some(uncited(coords(37.5295, -77.4175, Some(30.0)))),
                 trigger_event: None,
             },
             EntityTransition::Repaired {

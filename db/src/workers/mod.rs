@@ -237,23 +237,25 @@ impl Database {
 /// Format a date's earliest bound as an ISO 8601 TEXT shadow column value.
 fn date_earliest(date: &Option<UncertainDate>) -> Option<String> {
     date.as_ref()
-        .map(|d| d.earliest().format("%Y-%m-%dT%H:%M:%S").to_string())
+        .and_then(|d| d.earliest())
+        .map(|d| d.format("%Y-%m-%d").to_string())
 }
 
 /// Format a date's latest bound as an ISO 8601 TEXT shadow column value.
 fn date_latest(date: &Option<UncertainDate>) -> Option<String> {
     date.as_ref()
-        .map(|d| d.latest().format("%Y-%m-%dT%H:%M:%S").to_string())
+        .and_then(|d| d.latest())
+        .map(|d| d.format("%Y-%m-%d").to_string())
 }
 
 /// Extract lat/lon shadow columns from an optional location.
 fn location_coords(
-    loc: &Option<chronoscope_core::UncertainLocation<EntityId>>,
+    loc: &Option<chronoscope_core::UnresolvedLocation<EntityId>>,
 ) -> (Option<f64>, Option<f64>) {
     match loc {
-        Some(chronoscope_core::UncertainLocation::Coordinates { lat, lon, .. }) => {
-            (Some(*lat), Some(*lon))
-        }
+        Some(chronoscope_core::UnresolvedLocation::Resolved(
+            chronoscope_core::Location::Circle { lat, lon, .. },
+        )) => (Some(*lat), Some(*lon)),
         _ => (None, None), // TODO: geocode non-coordinate location variants
     }
 }

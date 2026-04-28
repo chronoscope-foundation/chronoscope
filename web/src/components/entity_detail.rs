@@ -157,7 +157,7 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
                     set_selected.set(Some(EntitySelection::Single(id.clone(), Some((*back).clone()))));
                 };
                 let display_name = entry.name.as_deref().unwrap_or("Unknown");
-                let aria = format!("{display_name} ({})", entry.entity_type);
+                let aria = display_name.to_string();
                 view! {
                     <li>
                         <button
@@ -167,7 +167,6 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
                             aria-label=aria
                         >
                             <span class="text-sm font-semibold text-ink">{display_name.to_string()}</span>
-                            <span class="text-xs text-sepia/70 ml-2 font-sans uppercase">{entry.entity_type.clone()}</span>
                         </button>
                     </li>
                 }
@@ -204,12 +203,9 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                     match result {
                         Ok(entity) => view! {
                             <div>
-                                <h3 class="text-base font-semibold text-ink mb-1">
+                                <h3 class="text-base font-semibold text-ink mb-3">
                                     {entity.name.unwrap_or_else(|| "Unnamed entity".to_string())}
                                 </h3>
-                                <p class="text-xs text-sepia/70 mb-3 font-sans uppercase tracking-wide">
-                                    {entity.entity_type}
-                                </p>
 
                                 // Timeline
                                 {(!entity.timeline.is_empty()).then(|| {
@@ -403,7 +399,6 @@ struct MediaInfo {
 #[derive(Debug, Clone)]
 struct EntityDetailView {
     name: Option<String>,
-    entity_type: String,
     timeline: Vec<TimelineRow>,
     links: Vec<LinkInfo>,
     media: Vec<MediaInfo>,
@@ -420,7 +415,7 @@ fn browser_language_prefix() -> String {
 
 use chronoscope_api_client::EntityId;
 use chronoscope_core::AnnotationKind;
-use chronoscope_core::date::{DatePrecision, UncertainDate};
+use chronoscope_core::date::{DateBound, DatePrecision, UncertainDate};
 use chronoscope_core::entity::EntityTransition;
 use chronoscope_core::links::{LinkTarget, LinkType};
 use chronoscope_core::moment::{Moment, TransitionRole, decompose, topological_order};
@@ -437,8 +432,6 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
         .entity
         .best_name(&browser_language_prefix())
         .map(String::from);
-
-    let entity_type = resp.entity.entity_type.to_string();
 
     // Decompose into per-endpoint moments and sort using core's topological
     // order, then map each Moment to a display row. The sort respects both
@@ -471,7 +464,6 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
 
     Ok(EntityDetailView {
         name,
-        entity_type,
         timeline,
         links,
         media,
@@ -539,25 +531,38 @@ fn moment_description<E, S>(m: &Moment<'_, E, S>) -> Option<String> {
     }
 }
 
+/// Format a [`DateBound`] for display, truncating to the appropriate precision.
+fn format_date_bound(bound: &DateBound) -> String {
+    match bound.precision() {
+        DatePrecision::Year
+        | DatePrecision::Decade
+        | DatePrecision::Century
+        | DatePrecision::Millennium => {
+            format!("{}", bound.date().format("%Y"))
+        }
+        DatePrecision::Month => format!("{}", bound.date().format("%Y-%m")),
+        DatePrecision::Day => format!("{}", bound.date().format("%Y-%m-%d")),
+    }
+}
+
 /// Format an `UncertainDate` for display, truncating to the appropriate precision.
 fn format_uncertain_date(date: &UncertainDate) -> String {
-    let dt = date.earliest();
-    match date.precision() {
-        Some(
-            DatePrecision::Year
-            | DatePrecision::Decade
-            | DatePrecision::Century
-            | DatePrecision::Millennium,
-        ) => {
-            format!("{}", dt.format("%Y"))
+    match (date.earliest_bound(), date.latest_bound()) {
+        (Some(earliest), Some(latest)) if earliest == latest => {
+            // Symmetric / exact: format by precision
+            format_date_bound(earliest)
         }
-        Some(DatePrecision::Month) => format!("{}", dt.format("%Y-%m")),
-        Some(_) => format!("{}", dt.format("%Y-%m-%d")),
-        // Range: show "earliest - latest"
-        None => {
-            let latest = date.latest();
-            format!("{} \u{2013} {}", dt.format("%Y"), latest.format("%Y"))
+        (Some(earliest), Some(latest)) => {
+            // Asymmetric range
+            format!(
+                "{} \u{2013} {}",
+                format_date_bound(earliest),
+                format_date_bound(latest)
+            )
         }
+        (Some(earliest), None) => format!("after {}", format_date_bound(earliest)),
+        (None, Some(latest)) => format!("before {}", format_date_bound(latest)),
+        (None, None) => "date unknown".to_string(),
     }
 }
 

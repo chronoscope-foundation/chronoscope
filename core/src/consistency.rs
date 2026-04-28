@@ -3,7 +3,7 @@
 //! Checks for logical inconsistencies in entity data. Inconsistencies are reported
 //! but don't prevent data from being accepted.
 
-use chrono::NaiveDateTime;
+use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -23,18 +23,18 @@ use crate::moment::{Moment, decompose, structural_edges};
 pub enum ConsistencyWarning {
     /// A transition's completion date is before its start date.
     CompletionBeforeStart {
-        started_earliest: NaiveDateTime,
-        completed_latest: NaiveDateTime,
+        started_earliest: NaiveDate,
+        completed_latest: NaiveDate,
     },
     /// Transitions are not in chronological order as listed.
     EventsOutOfOrder {
-        earlier_date: NaiveDateTime,
-        later_date: NaiveDateTime,
+        earlier_date: NaiveDate,
+        later_date: NaiveDate,
     },
     /// A non-demolition event occurs after the entity was demolished.
     EventAfterDemolished {
-        event_date: NaiveDateTime,
-        demolished_date: NaiveDateTime,
+        event_date: NaiveDate,
+        demolished_date: NaiveDate,
     },
     /// Multiple construction events exist (may indicate data merge issue or reconstruction).
     MultipleConstructions { count: usize },
@@ -123,7 +123,8 @@ impl<E, S> Entity<E, S> {
         for cited_name in &self.names {
             let name = &cited_name.value;
             if let (Some(from), Some(to)) = (&name.valid_from, &name.valid_to)
-                && from.earliest() > to.latest()
+                && let (Some(from_earliest), Some(to_latest)) = (from.earliest(), to.latest())
+                && from_earliest > to_latest
             {
                 warnings.push(ConsistencyWarning::NameValidityInverted {
                     name: name.name.clone(),
@@ -141,7 +142,6 @@ impl<E, S> Entity<E, S> {
 mod tests {
     use super::*;
     use crate::date::DatePrecision;
-    use crate::entity::EntityType;
     use crate::evidence::Cited;
     use chrono::NaiveDate;
 
@@ -150,28 +150,31 @@ mod tests {
     type TestTransition = EntityTransition<(), ()>;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn midnight(y: i32, m: u32, d: u32) -> Result<NaiveDateTime, &'static str> {
-        NaiveDate::from_ymd_opt(y, m, d)
-            .ok_or("invalid date")?
-            .and_hms_opt(0, 0, 0)
-            .ok_or("invalid time")
+    fn d(y: i32, m: u32, day: u32) -> Result<NaiveDate, &'static str> {
+        NaiveDate::from_ymd_opt(y, m, day).ok_or("invalid date")
     }
 
     fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
         Ok(UncertainDate::with_precision(
-            midnight(y, 1, 1)?,
+            d(y, 1, 1)?,
             DatePrecision::Year,
+        )?)
+    }
+
+    fn day(y: i32, m: u32, day: u32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+        Ok(UncertainDate::with_precision(
+            d(y, m, day)?,
+            DatePrecision::Day,
         )?)
     }
 
     #[test]
     fn completion_before_start() -> TestResult {
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![TestTransition::Constructed {
-                started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1950, 1, 1)?)?)),
-                completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(1940, 1, 1)?)?)),
+                started_at: Some(Cited::uncited(day(1950, 1, 1)?)),
+                completed_at: Some(Cited::uncited(day(1940, 1, 1)?)),
                 location: None,
                 trigger_event: None,
             }],
@@ -189,11 +192,10 @@ mod tests {
     #[test]
     fn completion_before_start_on_demolition() -> TestResult {
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![TestTransition::Demolished {
-                started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1950, 1, 1)?)?)),
-                completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(1940, 1, 1)?)?)),
+                started_at: Some(Cited::uncited(day(1950, 1, 1)?)),
+                completed_at: Some(Cited::uncited(day(1940, 1, 1)?)),
                 cause: None,
                 trigger_event: None,
             }],
@@ -211,11 +213,10 @@ mod tests {
     #[test]
     fn valid_construction() -> TestResult {
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![TestTransition::Constructed {
-                started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1940, 1, 1)?)?)),
-                completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(1950, 1, 1)?)?)),
+                started_at: Some(Cited::uncited(day(1940, 1, 1)?)),
+                completed_at: Some(Cited::uncited(day(1950, 1, 1)?)),
                 location: None,
                 trigger_event: None,
             }],
@@ -228,15 +229,14 @@ mod tests {
     #[test]
     fn same_year_is_ok() -> TestResult {
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![TestTransition::Constructed {
                 started_at: Some(Cited::uncited(UncertainDate::with_precision(
-                    midnight(1830, 6, 15)?,
+                    d(1830, 6, 15)?,
                     DatePrecision::Year,
                 )?)),
                 completed_at: Some(Cited::uncited(UncertainDate::with_precision(
-                    midnight(1830, 9, 20)?,
+                    d(1830, 9, 20)?,
                     DatePrecision::Year,
                 )?)),
                 location: None,
@@ -254,20 +254,17 @@ mod tests {
     #[test]
     fn demolished_completed_at_fallback() -> TestResult {
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
                 EntityTransition::Modified {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2010, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(day(2010, 1, 1)?)),
                     completed_at: None,
                     description: None,
                     trigger_event: None,
                 },
                 EntityTransition::Demolished {
                     started_at: None,
-                    completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(
-                        2000, 1, 1,
-                    )?)?)),
+                    completed_at: Some(Cited::uncited(day(2000, 1, 1)?)),
                     cause: None,
                     trigger_event: None,
                 },
@@ -287,23 +284,22 @@ mod tests {
     #[test]
     fn reports_all_post_demolition_events() -> TestResult {
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
                 EntityTransition::Demolished {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2000, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(day(2000, 1, 1)?)),
                     completed_at: None,
                     cause: None,
                     trigger_event: None,
                 },
                 EntityTransition::Modified {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2005, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(day(2005, 1, 1)?)),
                     completed_at: None,
                     description: None,
                     trigger_event: None,
                 },
                 EntityTransition::Repaired {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2010, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(day(2010, 1, 1)?)),
                     completed_at: None,
                     description: None,
                     trigger_event: None,
@@ -329,7 +325,6 @@ mod tests {
         use oxilangtag::LanguageTag;
 
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![Cited::uncited(EntityName {
                 name: "Old Name".to_string(),
                 name_type: NameType::Historical,
@@ -355,17 +350,16 @@ mod tests {
         // a UsageModified dated 1900 — structurally the construction must
         // precede any usage change, but the dates say otherwise.
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
                 EntityTransition::UsageModified {
-                    occurred_at: Some(Cited::uncited(UncertainDate::exact(midnight(1900, 1, 1)?)?)),
+                    occurred_at: Some(Cited::uncited(day(1900, 1, 1)?)),
                     new_usages: Default::default(),
                     description: None,
                     trigger_event: None,
                 },
                 EntityTransition::Constructed {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2000, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(day(2000, 1, 1)?)),
                     completed_at: None,
                     location: None,
                     trigger_event: None,
@@ -386,20 +380,17 @@ mod tests {
     #[test]
     fn event_after_demolished_with_only_completed_at() -> TestResult {
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
                 EntityTransition::Demolished {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(2000, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(day(2000, 1, 1)?)),
                     completed_at: None,
                     cause: None,
                     trigger_event: None,
                 },
                 EntityTransition::Modified {
                     started_at: None,
-                    completed_at: Some(Cited::uncited(UncertainDate::exact(midnight(
-                        2010, 1, 1,
-                    )?)?)),
+                    completed_at: Some(Cited::uncited(day(2010, 1, 1)?)),
                     description: None,
                     trigger_event: None,
                 },
@@ -420,17 +411,16 @@ mod tests {
     #[test]
     fn multiple_constructions() -> TestResult {
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![
                 EntityTransition::Constructed {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1900, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(day(1900, 1, 1)?)),
                     completed_at: None,
                     location: None,
                     trigger_event: None,
                 },
                 EntityTransition::Constructed {
-                    started_at: Some(Cited::uncited(UncertainDate::exact(midnight(1950, 1, 1)?)?)),
+                    started_at: Some(Cited::uncited(day(1950, 1, 1)?)),
                     completed_at: None,
                     location: None,
                     trigger_event: None,
@@ -449,12 +439,37 @@ mod tests {
     }
 
     #[test]
+    fn all_unknown_dates_produces_no_warnings() {
+        let entity: TestEntity = Entity {
+            names: vec![],
+            transitions: vec![
+                EntityTransition::Constructed {
+                    started_at: Some(Cited::uncited(UncertainDate::unknown())),
+                    completed_at: Some(Cited::uncited(UncertainDate::unknown())),
+                    location: None,
+                    trigger_event: None,
+                },
+                EntityTransition::Modified {
+                    started_at: Some(Cited::uncited(UncertainDate::unknown())),
+                    completed_at: None,
+                    description: None,
+                    trigger_event: None,
+                },
+            ],
+        };
+
+        assert!(
+            entity.check_consistency().is_empty(),
+            "Unknown dates should not trigger any consistency warnings"
+        );
+    }
+
+    #[test]
     fn name_validity_normal_is_ok() -> TestResult {
         use crate::entity::{EntityName, NameType};
         use oxilangtag::LanguageTag;
 
         let entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![Cited::uncited(EntityName {
                 name: "Current Name".to_string(),
                 name_type: NameType::Official,

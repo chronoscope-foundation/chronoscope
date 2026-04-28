@@ -165,7 +165,6 @@ pub fn replace_unknown(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronoscope_core::EntityType;
 
     type TestEntity = Entity<EntityIdx, SourceIdx>;
 
@@ -347,7 +346,6 @@ mod tests {
     #[test]
     fn replace_unknown_replaces_placeholder() -> TestResult {
         let mut entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![EntityTransition::UsageModified {
                 occurred_at: None,
@@ -372,7 +370,6 @@ mod tests {
     #[test]
     fn replace_unknown_preserves_known_usages() -> TestResult {
         let mut entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![EntityTransition::UsageModified {
                 occurred_at: None,
@@ -398,7 +395,6 @@ mod tests {
     fn replace_unknown_preserves_multi_usage() -> TestResult {
         // If there are multiple usages including Unknown, don't replace
         let mut entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![EntityTransition::UsageModified {
                 occurred_at: None,
@@ -424,7 +420,6 @@ mod tests {
     #[test]
     fn replace_unknown_ignores_non_usage_transitions() -> TestResult {
         let mut entity: TestEntity = Entity {
-            entity_type: EntityType::Building,
             names: vec![],
             transitions: vec![EntityTransition::Constructed {
                 started_at: None,
