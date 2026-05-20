@@ -10,6 +10,15 @@ repository.workspace = true
 name = "web-dev"
 path = "src/bin/web_dev.rs"
 
+# Browser tests are gated so the workspace-wide `cargo test` doesn't pull
+# them in. They each launch a Chrome and starve cores when scheduled
+# alongside every other test binary. Enabled by `just test web` and the
+# dedicated `web-test` flake check.
+[[test]]
+name = "web"
+path = "tests/web.rs"
+required-features = ["browser-tests"]
+
 [lints]
 workspace = true
 
@@ -17,6 +26,7 @@ workspace = true
 default = []
 # Enable to record VCR fixtures instead of reading from cache
 record-fixtures = []
+browser-tests = []
 
 [dependencies]
 # API crate (provides AppState, Config, JwtConfig, register_api)
@@ -69,6 +79,10 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 [dev-dependencies]
 # API client (typed Client/AuthClient for integration tests)
 chronoscope-api-client = { path = "../api-client" }
+
+# Test builds want `Database::worker_progress`. Cargo unions this with the
+# regular dep above so the feature only applies to test targets.
+chronoscope-db = { path = "../db", features = ["test-support"] }
 
 # Testing
 tokio-test = "0.4"

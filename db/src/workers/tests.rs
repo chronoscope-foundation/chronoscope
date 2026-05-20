@@ -1,7 +1,6 @@
 use super::*;
 use crate::error::DbError;
 use crate::models::MediaSlot;
-use crate::queue::{Queue, url_queue_config};
 use chronoscope_integrations::IntegrationName;
 
 use crate::types::{Email, MediaAnalysisState, MediaType, ResearchUrlStatus, UserId};
@@ -703,8 +702,6 @@ async fn test_mark_url_resolved_to_media() -> DbResult<()> {
 
 // ==================== Affinity-Based Claiming Tests ====================
 
-use crate::models::ResearchUrl;
-
 #[tokio::test]
 async fn test_claim_urls_with_affinity_only_claims_matching() -> DbResult<()> {
     let (db, user_id) = setup().await?;
@@ -717,14 +714,8 @@ async fn test_claim_urls_with_affinity_only_claims_matching() -> DbResult<()> {
     let stale = Utc::now().naive_utc() - Duration::hours(1);
 
     // Create affinity-specific queues for testing
-    let instagram_queue: Queue<ResearchUrl> = Queue::new(
-        db.pool.clone(),
-        url_queue_config(Some(IntegrationName::Instagram)),
-    );
-    let reddit_queue: Queue<ResearchUrl> = Queue::new(
-        db.pool.clone(),
-        url_queue_config(Some(IntegrationName::Reddit)),
-    );
+    let instagram_queue = db.make_url_queue(IntegrationName::Instagram);
+    let reddit_queue = db.make_url_queue(IntegrationName::Reddit);
 
     // Claim with Instagram affinity - should get nothing
     let claimed = instagram_queue.claim("worker-1", 1, stale).await?;
@@ -850,10 +841,7 @@ async fn test_claim_urls_affinity_ignores_generic_urls() -> DbResult<()> {
     let stale = Utc::now().naive_utc() - Duration::hours(1);
 
     // Create Reddit queue
-    let reddit_queue: Queue<ResearchUrl> = Queue::new(
-        db.pool.clone(),
-        url_queue_config(Some(IntegrationName::Reddit)),
-    );
+    let reddit_queue = db.make_url_queue(IntegrationName::Reddit);
 
     // Reddit worker should not claim generic URLs
     let claimed = reddit_queue.claim("worker-1", 10, stale).await?;

@@ -64,7 +64,28 @@ in
       }
     );
 
+    # Workspace test run. The `chronoscope-dev::tests/web.rs` target is
+    # gated behind a `required-features = ["browser-tests"]` entry in
+    # `dev/Cargo.toml`, so this run silently skips it — the dedicated
+    # `web-test` check below picks it up with capped parallelism. Keeping
+    # the heavy Chrome-driven tests out of this derivation lets the rest
+    # of the workspace's tests run at full cargo parallelism without
+    # Chrome processes co-contending for the cores.
     test = craneLib.cargoTest (checkArgs // testExtraEnv);
+
+    # Dedicated check for the browser test suite, with `--test-threads=4`.
+    # More concurrent Chromes than that starve `chromiumoxide`'s CDP-response
+    # budget under the Nix sandbox and tests fail with "Error: Timeout"
+    # rather than an actual assertion. Four is the empirical sweet spot —
+    # single-digit Chromes per box, still ~4× faster than --test-threads=1.
+    web-test = craneLib.cargoTest (
+      checkArgs
+      // testExtraEnv
+      // {
+        pname = "chronoscope-web-tests";
+        cargoTestExtraArgs = "-p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4";
+      }
+    );
 
     llvm-cov = craneLib.cargoLlvmCov (
       checkArgs

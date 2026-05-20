@@ -191,7 +191,7 @@ impl Database {
             .bind(url_id)
             .execute(&self.pool)
             .await?;
-
+        self.notify_worker_progress();
         Ok(())
     }
 
@@ -210,7 +210,7 @@ impl Database {
             .bind(url_id)
             .execute(&self.pool)
             .await?;
-
+        self.notify_worker_progress();
         Ok(())
     }
 
@@ -229,7 +229,7 @@ impl Database {
             .bind(analysis_result)
             .execute(&self.pool)
             .await?;
-
+        self.notify_worker_progress();
         Ok(())
     }
 }

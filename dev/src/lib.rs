@@ -16,7 +16,7 @@ use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
-use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId, url_queue_config};
+use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId};
 use chronoscope_workers::analysis::AnalysisWorker;
 use chronoscope_workers::url_fetcher::{FetcherConfig, UrlFetcherWorker};
 use chronoscope_workers::{
@@ -273,14 +273,9 @@ fn spawn_url_fetcher_worker(
 
     let worker_id = name.to_string();
 
-    // Create queue based on affinity
     let queue: Arc<Queue<ResearchUrl>> = match affinity {
         None => ctx.db.url_queue_generic.clone(),
-        Some(integration) => {
-            // Create a queue for this specific integration
-            let config = url_queue_config(Some(integration));
-            Arc::new(Queue::new(ctx.db.pool_ref().clone(), config))
-        }
+        Some(integration) => ctx.db.make_url_queue(integration),
     };
 
     let fetch_ctx = Arc::new(FetchContext {
@@ -530,17 +525,15 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         .map_err(|e| format!("Failed to start server: {e}"))?
         .start();
 
-    // Spawn the server task to run in background
+    // `HttpServerStarter::new` already bound the listener synchronously, so
+    // the kernel's listen backlog is accepting connections from this point
+    // on — clients can connect even before this spawned task is scheduled
+    // to call `accept`. No readiness sleep is needed.
     tokio::spawn(async move {
         if let Err(e) = server.await {
             eprintln!("Server error: {e}");
         }
     });
-
-    // Give the server a moment to start listening before returning.
-    // This avoids races where callers try to connect before the socket is bound.
-    #[allow(clippy::disallowed_methods)]
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     info!(log, "Dev server ready"; "base_url" => &base_url);
 

@@ -75,13 +75,31 @@ pub struct Queue<T> {
     pool: SqlitePool,
     claim_sql: String,
     mark_failed_sql: String,
+    /// In-process worker-progress sender, mirrored from the owning `Database`
+    /// so `mark_failed` can tick alongside the success-side `mark_url_resolved_*`
+    /// methods. Gated behind `test-support` (see `Database::worker_progress`
+    /// for the multi-instance caveat).
+    #[cfg(any(test, feature = "test-support"))]
+    worker_progress_tx: tokio::sync::watch::Sender<u64>,
     _phantom: PhantomData<T>,
 }
 
 impl<T> Queue<T> {
-    /// Create a new queue with generated SQL.
+    /// Create a new queue with generated SQL. Under `test-support`, the
+    /// caller passes the owning `Database`'s worker-progress sender so
+    /// `mark_failed` can tick alongside the success-side notifications.
+    ///
+    /// `pub(crate)` so external callers must go through `Database::new` /
+    /// `Database::make_url_queue` — that's the only path that wires the pool
+    /// and worker-progress sender consistently.
     #[must_use]
-    pub fn new(pool: SqlitePool, config: &QueueConfig) -> Self {
+    pub(crate) fn new(
+        pool: SqlitePool,
+        config: &QueueConfig,
+        #[cfg(any(test, feature = "test-support"))] worker_progress_tx: tokio::sync::watch::Sender<
+            u64,
+        >,
+    ) -> Self {
         let claim_sql = Self::generate_claim_sql(config);
         let mark_failed_sql = Self::generate_mark_failed_sql(config);
 
@@ -90,6 +108,8 @@ impl<T> Queue<T> {
             pool,
             claim_sql,
             mark_failed_sql,
+            #[cfg(any(test, feature = "test-support"))]
+            worker_progress_tx,
             _phantom: PhantomData,
         }
     }
@@ -197,7 +217,17 @@ impl<T: QueueItem> Queue<T> {
             .bind(retry_after) // ?3
             .execute(&self.pool)
             .await?;
+        self.notify_worker_progress();
         Ok(())
+    }
+
+    /// Bump the in-process worker-progress counter. No-op without `test-support`.
+    fn notify_worker_progress(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        // wrapping: subscribers only care about changedness, not the value;
+        // u64 won't realistically wrap in a test process anyway.
+        self.worker_progress_tx
+            .send_modify(|n| *n = n.wrapping_add(1));
     }
 }
 

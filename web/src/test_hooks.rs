@@ -27,7 +27,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 use crate::api::Client;
-use crate::components::map::{FETCH_COMPLETE_EVENT, MAP_READY_EVENT};
+use crate::components::map::{FETCH_COMPLETE_EVENT, MAP_READY_EVENT, current_fetch_settled};
 use crate::maplibre;
 
 // ==================== Hook storage ====================
@@ -67,7 +67,7 @@ pub fn register_base() {
     register(
         &obj,
         "clickVisible",
-        Closure::<dyn Fn(String) -> JsValue>::new(click_visible),
+        Closure::<dyn Fn(String) -> js_sys::Promise>::new(click_visible),
     );
     register(
         &obj,
@@ -79,12 +79,22 @@ pub fn register_base() {
     register(
         &obj,
         "waitForMapExists",
-        Closure::<dyn Fn() -> JsValue>::new(wait_for_map_exists),
+        Closure::<dyn Fn() -> js_sys::Promise>::new(wait_for_map_exists),
+    );
+    // Fetch readiness: tests sample `currentFetchSettled()` before triggering
+    // an action, then await `waitForFetchSettledAfter(prev)` to wake on the
+    // fetch they just caused (not an unrelated in-flight one).
+    register(
+        &obj,
+        "currentFetchSettled",
+        Closure::<dyn Fn() -> f64>::new(|| current_fetch_settled() as f64),
     );
     register(
         &obj,
-        "waitForFetchComplete",
-        Closure::<dyn Fn() -> JsValue>::new(wait_for_fetch_complete),
+        "waitForFetchSettledAfter",
+        Closure::<dyn Fn(f64) -> js_sys::Promise>::new(|min| {
+            wait_for_fetch_settled_after(min as u64)
+        }),
     );
 
     let _ = js_sys::Reflect::set(&window, &"__test".into(), &obj);
@@ -237,13 +247,13 @@ pub fn register_map_hooks(
     register(
         &obj,
         "waitForMapIdle",
-        Closure::<dyn Fn() -> JsValue>::new(move || wait_for_map_idle(&h)),
+        Closure::<dyn Fn() -> js_sys::Promise>::new(move || wait_for_map_idle(&h)),
     );
 
     register(
         &obj,
         "waitForThumbnailsLoaded",
-        Closure::<dyn Fn() -> JsValue>::new(move || wait_for_thumbnails_loaded()),
+        Closure::<dyn Fn() -> js_sys::Promise>::new(wait_for_thumbnails_loaded),
     );
 
     let _ = js_sys::Reflect::set(&window, &"__test".into(), &obj);
@@ -291,7 +301,7 @@ fn with_map<R>(
 /// Uses `offsetParent` to skip hidden elements (e.g., desktop sidebar links
 /// at mobile viewport) and a 250ms fallback timeout to handle clicks that
 /// don't trigger CSS transitions.
-fn click_visible(selector: String) -> JsValue {
+fn click_visible(selector: String) -> js_sys::Promise {
     let mut selector = Some(selector);
     js_sys::Promise::new(&mut |resolve, reject| {
         let Some(selector) = selector.take() else {
@@ -359,7 +369,6 @@ fn click_visible(selector: String) -> JsValue {
         }
         on_timeout.forget();
     })
-    .into()
 }
 
 /// Dispatch a `chronoscope-error` CustomEvent on the window.
@@ -378,7 +387,7 @@ fn dispatch_error(msg: String) {
 // ==================== Wait hooks ====================
 
 /// Returns a Promise that resolves when `chronoscope-map-ready` fires.
-fn wait_for_map_exists() -> JsValue {
+fn wait_for_map_exists() -> js_sys::Promise {
     js_sys::Promise::new(&mut |resolve, _reject| {
         // Check if map hooks are already registered
         if let Some(window) = web_sys::window() {
@@ -397,28 +406,67 @@ fn wait_for_map_exists() -> JsValue {
         }
         listen_once_and_resolve(MAP_READY_EVENT, resolve);
     })
-    .into()
 }
 
-/// Returns a Promise that resolves on the next `chronoscope-fetch-complete`.
-fn wait_for_fetch_complete() -> JsValue {
+/// Resolves a Promise once `FETCH_SETTLED` has advanced past `min` — i.e. at
+/// least one fetch has settled since the caller sampled the counter. Resolves
+/// immediately if the counter has already advanced.
+///
+/// The listener handles its own detach: it keeps the JS-side `Function`
+/// reference (a thin `JsValue` handle) rather than the owning `Closure`, then
+/// calls `remove_event_listener` with that reference once a matching event
+/// arrives. The `Closure` itself is `forget`'d so JS owns it for the listener's
+/// lifetime; after detach JS GC can free it. This avoids the
+/// drop-the-closure-from-inside-itself UAF that an `Rc<Cell<Option<Closure>>>`
+/// self-capture would invite.
+fn wait_for_fetch_settled_after(min: u64) -> js_sys::Promise {
     js_sys::Promise::new(&mut |resolve, _reject| {
-        listen_once_and_resolve(FETCH_COMPLETE_EVENT, resolve);
+        if current_fetch_settled() > min {
+            let _ = resolve.call0(&JsValue::NULL);
+            return;
+        }
+        let Some(window) = web_sys::window() else {
+            let _ = resolve.call0(&JsValue::NULL);
+            return;
+        };
+        let resolve_cell: Rc<Cell<Option<js_sys::Function>>> = Rc::new(Cell::new(Some(resolve)));
+        let listener_fn: Rc<Cell<Option<js_sys::Function>>> = Rc::new(Cell::new(None));
+        let r = resolve_cell.clone();
+        let f = listener_fn.clone();
+        let window_for_cb = window.clone();
+        let cb = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+            let detail_ok = event
+                .dyn_ref::<web_sys::CustomEvent>()
+                .and_then(|ce| ce.detail().as_f64())
+                .is_some_and(|d| (d as u64) > min);
+            if !detail_ok {
+                return;
+            }
+            if let Some(func) = f.take() {
+                let _ =
+                    window_for_cb.remove_event_listener_with_callback(FETCH_COMPLETE_EVENT, &func);
+            }
+            if let Some(resolve_fn) = r.take() {
+                let _ = resolve_fn.call0(&JsValue::NULL);
+            }
+        });
+        let func: js_sys::Function = cb.as_ref().clone().unchecked_into();
+        let _ = window.add_event_listener_with_callback(FETCH_COMPLETE_EVENT, &func);
+        listener_fn.set(Some(func));
+        cb.forget();
     })
-    .into()
 }
 
 /// Returns a Promise that resolves on the next `chronoscope-thumbnails-loaded`.
-fn wait_for_thumbnails_loaded() -> JsValue {
+fn wait_for_thumbnails_loaded() -> js_sys::Promise {
     use crate::components::map::THUMBNAILS_LOADED_EVENT;
     js_sys::Promise::new(&mut |resolve, _reject| {
         listen_once_and_resolve(THUMBNAILS_LOADED_EVENT, resolve);
     })
-    .into()
 }
 
 /// Returns a Promise that resolves when the map becomes idle.
-fn wait_for_map_idle(handle: &Rc<RefCell<Option<maplibre::Map>>>) -> JsValue {
+fn wait_for_map_idle(handle: &Rc<RefCell<Option<maplibre::Map>>>) -> js_sys::Promise {
     let mut map = handle.borrow().as_ref().cloned();
     js_sys::Promise::new(&mut |resolve, _reject| {
         let Some(map) = map.take() else {
@@ -447,7 +495,6 @@ fn wait_for_map_idle(handle: &Rc<RefCell<Option<maplibre::Map>>>) -> JsValue {
             let _ = resolve.call0(&JsValue::NULL);
         }
     })
-    .into()
 }
 
 /// Helper: register a one-shot DOM event listener that resolves a Promise.
@@ -597,6 +644,17 @@ fn project_lnglat(map: &maplibre::Map, lng: f64, lat: f64) -> JsValue {
     map.project(&arr)
 }
 
+/// Synchronously fire a `click` event on the map at the given lng/lat.
+///
+/// Callers that drive this from a test must first ensure the map's render
+/// pipeline is settled (`window.__test.waitForMapIdle()` plus two
+/// `requestAnimationFrame` calls). MapLibre's `Map.fire("click")` calls
+/// `queryRenderedFeatures` internally to dispatch layer-specific click
+/// events, and that path will throw "feature index out of bounds" if a
+/// recent `setData`/`updateData` hasn't been fully indexed yet. The wait
+/// chain is expressed JS-side in `click_map_at` rather than baked into
+/// this hook so the read-after-mutate guarantees stay visible at the call
+/// site.
 fn fire_map_click(map: &maplibre::Map, lng: f64, lat: f64) {
     let point = project_lnglat(map, lng, lat);
 

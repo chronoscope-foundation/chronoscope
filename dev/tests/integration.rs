@@ -40,13 +40,11 @@ fn init_tracing() {
         .try_init();
 }
 
-/// Polling interval for async operations in tests.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// Default timeout for most operations (15 seconds).
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Extended timeout for external API calls (30 seconds).
-const EXTERNAL_API_TIMEOUT: Duration = Duration::from_secs(30);
-/// Timeout for analysis operations. Triton inference can be slow
+/// "No worker progress at all" safety net. Tests drive their waits on
+/// `Database::worker_progress`, so a worker making forward progress
+/// never hits this; only a genuinely stuck pipeline does.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Analysis can be slow (Triton inference); separate ceiling.
 const ANALYSIS_TIMEOUT: Duration = Duration::from_mins(5);
 
 fn http_fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
@@ -193,29 +191,23 @@ impl TestServer {
     }
 
     /// Wait until a condition on the page's media is satisfied.
-    ///
-    /// Polls until the dossier has a resolved page and the condition returns true
-    /// for that page's media items.
-    // Polling is appropriate for integration tests waiting on async worker completion.
-    #[allow(clippy::disallowed_methods)]
     async fn wait_for_media_condition(
         &self,
         url_id: &str,
         condition: impl Fn(&[MediaReference]) -> bool,
         timeout: Duration,
     ) -> Result<ResearchUrlDossier, Box<dyn std::error::Error + Send + Sync>> {
-        let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
-            tokio::time::sleep(POLL_INTERVAL).await;
+        await_on_worker_progress(self.server.db(), timeout, || async {
             let dossier = self.get_dossier(url_id).await?;
-
             if let Some(ResolvedContent::Page(page)) = &dossier.resolved
                 && condition(&page.media)
             {
-                return Ok(dossier);
+                Ok(Some(dossier))
+            } else {
+                Ok(None)
             }
-        }
-        Err(format!("timeout waiting for media condition after {timeout:?}").into())
+        })
+        .await
     }
 
     /// Fetch raw bytes from a URL (for media verification).
@@ -272,6 +264,42 @@ fn fetched_media(media: &[MediaReference]) -> Vec<&chronoscope_api::research_typ
             MediaReference::Pending { .. } => None,
         })
         .collect()
+}
+
+/// Drive a poll loop on `Database::worker_progress` rather than wallclock
+/// ticks. `check` runs on entry and after every progress event; return
+/// `Ok(Some(t))` to break with `t`, `Ok(None)` to keep waiting, or `Err`
+/// to bail. `timeout` is a true "no progress at all" safety net — a worker
+/// making forward progress will never hit it.
+async fn await_on_worker_progress<F, Fut, T>(
+    db: &chronoscope_db::Database,
+    timeout: Duration,
+    mut check: F,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, Box<dyn std::error::Error + Send + Sync>>>,
+{
+    let mut progress = db.worker_progress();
+    let deadline = tokio::time::Instant::now() + timeout;
+    // Intentionally never call `borrow_and_update` / `mark_unchanged` on
+    // `progress` — we want `changed()` to fire once per `send_modify` from
+    // subscribe time onward, not just on value transitions.
+    loop {
+        if let Some(value) = check().await? {
+            return Ok(value);
+        }
+        tokio::select! {
+            res = progress.changed() => {
+                res.map_err(|e| format!("worker_progress sender dropped: {e}"))?;
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(format!(
+                    "timeout after {timeout:?} (no worker progress)"
+                ).into());
+            }
+        }
+    }
 }
 
 // ==================== Tests ====================
@@ -466,8 +494,6 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
 ///
 /// This verifies the system handles complete fetch failures without panicking,
 /// demonstrating the "graceful degradation" principle from the project vision.
-// Polling is appropriate for integration tests waiting on async worker completion.
-#[allow(clippy::disallowed_methods)]
 #[tokio::test]
 async fn test_url_with_no_fixtures_fails_gracefully() -> TestResult {
     let server = TestServer::start().await?;
@@ -478,27 +504,18 @@ async fn test_url_with_no_fixtures_fails_gracefully() -> TestResult {
         .submit_url("https://example.com/no-fixture-exists")
         .await?;
 
-    // Wait for resolution attempt (will fail due to missing fixture)
-    let start = std::time::Instant::now();
-    #[allow(clippy::disallowed_methods)]
-    while start.elapsed() < DEFAULT_TIMEOUT {
-        tokio::time::sleep(POLL_INTERVAL).await;
+    // Failure ticks worker_progress via Queue::mark_failed, so we use the
+    // same event-driven wait as success-path tests.
+    await_on_worker_progress(server.server.db(), DEFAULT_TIMEOUT, || async {
         let dossier = server.get_dossier(&url_id).await?;
-
-        // The URL should eventually be marked as failed
-        if dossier.status == ResearchUrlStatus::Failed {
-            // Success: the system handled the failure gracefully
-            server.shutdown().await;
-            return Ok(());
-        }
-
-        // If it somehow resolved successfully, that's unexpected
         if dossier.resolved.is_some() {
             return Err("expected fetch failure, but URL resolved successfully".into());
         }
-    }
-
-    Err("timeout waiting for URL to fail (expected failure due to missing fixture)".into())
+        Ok((dossier.status == ResearchUrlStatus::Failed).then_some(()))
+    })
+    .await?;
+    server.shutdown().await;
+    Ok(())
 }
 
 /// Test that invalid URLs are rejected at submission time.
@@ -575,7 +592,7 @@ async fn test_instagram_post_end_to_end() -> TestResult {
                     .iter()
                     .any(|m| matches!(m, MediaReference::Fetched(_)))
             },
-            EXTERNAL_API_TIMEOUT,
+            DEFAULT_TIMEOUT,
         )
         .await?;
 
@@ -681,7 +698,7 @@ async fn test_instagram_reel_end_to_end() -> TestResult {
                     .count()
                     >= 2
             },
-            EXTERNAL_API_TIMEOUT,
+            DEFAULT_TIMEOUT,
         )
         .await?;
 
@@ -759,8 +776,6 @@ async fn test_instagram_reel_end_to_end() -> TestResult {
 /// This test reuses the same image fixture as `test_reddit_gallery_end_to_end`,
 /// proving that entity-ingested images flow through the same pipeline as
 /// user-submitted URLs.
-// Polling is appropriate for integration tests waiting on async worker completion.
-#[allow(clippy::disallowed_methods)]
 #[tokio::test]
 async fn test_bundle_loaded_images_flow_through_worker_pipeline() -> TestResult {
     use std::collections::BTreeMap;
@@ -833,29 +848,16 @@ async fn test_bundle_loaded_images_flow_through_worker_pipeline() -> TestResult 
     assert_eq!(load_result.images_created, 1);
     assert_eq!(load_result.annotations_created, 1);
 
-    // Poll until the research URL is resolved to media (worker fetched the image)
-    let start = std::time::Instant::now();
-    let mut resolved = false;
-    while start.elapsed() < DEFAULT_TIMEOUT {
-        tokio::time::sleep(POLL_INTERVAL).await;
+    await_on_worker_progress(server.server.db(), DEFAULT_TIMEOUT, || async {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT status FROM research_urls WHERE url = ?")
                 .bind(image_url)
                 .fetch_optional(server.server.db().pool_ref())
                 .await?;
-        if let Some((status,)) = row
-            && status == "complete"
-        {
-            resolved = true;
-            break;
-        }
-    }
-    assert!(
-        resolved,
-        "image URL should be resolved by worker within timeout"
-    );
+        Ok(matches!(&row, Some((s,)) if s == "complete").then_some(()))
+    })
+    .await?;
 
-    // Verify the image was stored as media with correct dimensions
     let media_row: Option<(i32, i32)> = sqlx::query_as(
         "SELECT m.width, m.height FROM media m JOIN research_urls r ON r.media_id = m.id WHERE r.url = ?",
     )
@@ -867,25 +869,16 @@ async fn test_bundle_loaded_images_flow_through_worker_pipeline() -> TestResult 
     assert_eq!(width, 3504, "media width should match fixture");
     assert_eq!(height, 2336, "media height should match fixture");
 
-    // Wait for analysis to complete on this media
-    let start = std::time::Instant::now();
-    let mut analyzed = false;
-    while start.elapsed() < ANALYSIS_TIMEOUT {
-        tokio::time::sleep(POLL_INTERVAL).await;
+    await_on_worker_progress(server.server.db(), ANALYSIS_TIMEOUT, || async {
         let row: Option<(String,)> = sqlx::query_as(
             "SELECT m.analysis_status FROM media m JOIN research_urls r ON r.media_id = m.id WHERE r.url = ?",
         )
         .bind(image_url)
         .fetch_optional(server.server.db().pool_ref())
         .await?;
-        if let Some((status,)) = row
-            && status == "complete"
-        {
-            analyzed = true;
-            break;
-        }
-    }
-    assert!(analyzed, "image should be analyzed within timeout");
+        Ok(matches!(&row, Some((s,)) if s == "complete").then_some(()))
+    })
+    .await?;
 
     server.shutdown().await;
     Ok(())

@@ -50,12 +50,48 @@ pub(crate) const MAP_READY_EVENT: &str = "chronoscope-map-ready";
 #[cfg(feature = "test-hooks")]
 pub(crate) const FETCH_COMPLETE_EVENT: &str = "chronoscope-fetch-complete";
 
+/// Monotonic count of fetches that have *settled* (returned a result, success
+/// or failure). Aborted fetches do not bump it because the future is dropped
+/// before the settle point. Tests sample this counter before triggering an
+/// action, then wait for it to advance — that's how "wait for the fetch
+/// that follows my action" is expressed without a generation race.
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static FETCH_SETTLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn current_fetch_settled() -> u64 {
+    FETCH_SETTLED.with(std::cell::Cell::get)
+}
+
 #[cfg(feature = "test-hooks")]
 fn dispatch_window_event(name: &str) {
     if let Some(window) = web_sys::window()
         && let Ok(event) = web_sys::Event::new(name)
     {
         let _ = window.dispatch_event(&event);
+    }
+}
+
+/// Bump `FETCH_SETTLED` and fire the fetch-complete event with the post-bump
+/// count as `event.detail`, so listeners can identify which completion they
+/// are seeing.
+#[cfg(feature = "test-hooks")]
+fn record_fetch_settled() {
+    let count = FETCH_SETTLED.with(|c| {
+        let next = c.get() + 1;
+        c.set(next);
+        next
+    });
+    if let Some(window) = web_sys::window() {
+        let init = web_sys::CustomEventInit::new();
+        init.set_detail(&JsValue::from_f64(count as f64));
+        if let Ok(event) =
+            web_sys::CustomEvent::new_with_event_init_dict(FETCH_COMPLETE_EVENT, &init)
+        {
+            let _ = window.dispatch_event(&event);
+        }
     }
 }
 
@@ -547,9 +583,8 @@ async fn load_entities_for_viewport(
         }
     }
 
-    // Signal fetch completion (used by browser test hooks to avoid sleep-based waits).
     #[cfg(feature = "test-hooks")]
-    dispatch_window_event(FETCH_COMPLETE_EVENT);
+    record_fetch_settled();
 }
 
 // ==================== Thumbnail registration ====================

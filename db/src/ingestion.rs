@@ -303,7 +303,6 @@ mod tests {
 
     use super::*;
     use crate::Database;
-    use crate::queue::{Queue, url_queue_config};
     use crate::row;
 
     fn test_entity(name: &str) -> Entity<&'static str, &'static str> {
@@ -579,10 +578,8 @@ mod tests {
         load_bundle(db.pool_ref(), &bundle).await?;
 
         // The generic URL queue should be able to claim both images
-        let queue: Queue<crate::ResearchUrl> =
-            Queue::new(db.pool_ref().clone(), url_queue_config(None));
         let stale = chrono::Utc::now().naive_utc() - chrono::Duration::hours(1);
-        let claimed = queue.claim("test-worker", 10, stale).await?;
+        let claimed = db.url_queue_generic.claim("test-worker", 10, stale).await?;
 
         assert_eq!(claimed.len(), 2, "queue should claim both loaded images");
         let urls: Vec<&str> = claimed.iter().map(|r| r.url.as_str()).collect();

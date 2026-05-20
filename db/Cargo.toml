@@ -9,6 +9,14 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# In-process worker-progress notifications for integration tests. NOT for
+# production: a `watch::Sender` only reaches same-process subscribers, so
+# multi-instance deployments would need a cross-host signal
+# (LISTEN/NOTIFY, a bus, etc.). The gate prevents prod code from
+# depending on it.
+test-support = []
+
 [dependencies]
 # Internal crates
 chronoscope-api-client = { path = "../api-client", features = ["sqlx"] }

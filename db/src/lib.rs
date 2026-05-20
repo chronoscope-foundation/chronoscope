@@ -23,6 +23,8 @@ use std::time::Duration;
 use chrono::{NaiveDateTime, Utc};
 use sqlx::Executor;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+#[cfg(any(test, feature = "test-support"))]
+use tokio::sync::watch;
 
 use chronoscope_integrations::IntegrationRegistry;
 
@@ -116,6 +118,11 @@ pub struct Database {
     pub url_queue_generic: Arc<Queue<ResearchUrl>>,
     /// Queue for image analysis.
     pub analysis_queue: Arc<Queue<MediaForAnalysis>>,
+
+    /// In-process worker-progress signal. See `worker_progress()` for the
+    /// subscriber-side semantics and the multi-instance caveat.
+    #[cfg(any(test, feature = "test-support"))]
+    worker_progress_tx: watch::Sender<u64>,
 }
 
 impl Database {
@@ -136,6 +143,70 @@ impl Database {
     pub fn registry(&self) -> &IntegrationRegistry {
         &self.registry
     }
+
+    /// Build a fresh URL queue with the given integration affinity, wired
+    /// into this database's pool and worker-progress sender. Used by
+    /// dev/test integration code that needs per-integration affinity queues
+    /// (e.g., the Instagram or Reddit workers in `chronoscope-dev`) — the
+    /// generic queue is exposed directly via `url_queue_generic`.
+    #[must_use]
+    pub fn make_url_queue(
+        &self,
+        affinity: chronoscope_integrations::IntegrationName,
+    ) -> Arc<Queue<ResearchUrl>> {
+        build_queue(
+            self.pool.clone(),
+            url_queue_config(Some(affinity)),
+            #[cfg(any(test, feature = "test-support"))]
+            &self.worker_progress_tx,
+        )
+    }
+
+    /// Subscribe to in-process worker-progress notifications.
+    ///
+    /// Returns a `watch::Receiver<u64>` that ticks whenever a status-flip
+    /// method on this `Database` runs (URL → page, URL → media, media →
+    /// analyzed). Use `Receiver::changed().await` to drive a polling loop
+    /// that wakes on real worker progress instead of a wallclock interval.
+    ///
+    /// **In-process only.** Gated behind `test-support` so prod code can't
+    /// take a dependency on a mechanism that doesn't work across hosts.
+    /// See the field docs on `worker_progress_tx` for the multi-instance
+    /// caveat.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn worker_progress(&self) -> watch::Receiver<u64> {
+        self.worker_progress_tx.subscribe()
+    }
+
+    /// Bump the in-process worker-progress counter. No-op without
+    /// `test-support`. Called by the success-side status-flip methods so
+    /// `Database::worker_progress` subscribers can drive an event-driven
+    /// wait instead of wallclock polling.
+    pub(crate) fn notify_worker_progress(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        // wrapping: subscribers only care about changedness, not the value;
+        // u64 won't realistically wrap in a test process anyway.
+        self.worker_progress_tx
+            .send_modify(|n| *n = n.wrapping_add(1));
+    }
+}
+
+/// Construct an `Arc<Queue<T>>` from a pool + config, attaching the
+/// worker-progress sender when `test-support` is enabled. The cfg-on-parameter
+/// keeps the sender out of prod signatures entirely while the two `Database`
+/// constructors and `make_url_queue` share one implementation.
+fn build_queue<T>(
+    pool: SqlitePool,
+    config: &'static QueueConfig,
+    #[cfg(any(test, feature = "test-support"))] tx: &watch::Sender<u64>,
+) -> Arc<Queue<T>> {
+    Arc::new(Queue::new(
+        pool,
+        config,
+        #[cfg(any(test, feature = "test-support"))]
+        tx.clone(),
+    ))
 }
 
 /// Cap on cluster rows returned per `list_clusters_as_markers` call.
@@ -168,30 +239,8 @@ impl Database {
     /// Returns `DbError::Sqlx` if connection fails, `DbError::Migrate` if migrations fail,
     /// or `DbError::QueryPlan` if any query would cause a full table scan.
     pub async fn new(database_url: &str, regions_db_path: &Path) -> DbResult<Self> {
-        let registry = chronoscope_integrations::create_registry(None)?;
-        let pool = Self::create_pool(database_url, regions_db_path).await?;
-
-        sqlx::migrate!("./migrations").run(&pool).await?;
-
-        // Create queues
-        let url_queue_generic = Arc::new(Queue::new(pool.clone(), url_queue_config(None)));
-        let analysis_queue = Arc::new(Queue::new(pool.clone(), &ANALYSIS_QUEUE));
-
-        // Collect for verification (same Arc, different view)
-        let all_queues: Vec<Arc<dyn QueueQueries>> =
-            vec![url_queue_generic.clone(), analysis_queue.clone()];
-
-        let db = Self {
-            pool,
-            registry,
-            all_queues,
-            url_queue_generic,
-            analysis_queue,
-        };
-
-        // Verify all query plans (static + queue-generated)
+        let db = Self::new_without_plan_verification(database_url, regions_db_path).await?;
         db.verify_all_query_plans().await?;
-
         Ok(db)
     }
 
@@ -207,11 +256,22 @@ impl Database {
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
-        // Create queues
-        let url_queue_generic = Arc::new(Queue::new(pool.clone(), url_queue_config(None)));
-        let analysis_queue = Arc::new(Queue::new(pool.clone(), &ANALYSIS_QUEUE));
+        #[cfg(any(test, feature = "test-support"))]
+        let worker_progress_tx = watch::channel(0).0;
 
-        // Collect for verification
+        let url_queue_generic = build_queue(
+            pool.clone(),
+            url_queue_config(None),
+            #[cfg(any(test, feature = "test-support"))]
+            &worker_progress_tx,
+        );
+        let analysis_queue = build_queue(
+            pool.clone(),
+            &ANALYSIS_QUEUE,
+            #[cfg(any(test, feature = "test-support"))]
+            &worker_progress_tx,
+        );
+
         let all_queues: Vec<Arc<dyn QueueQueries>> =
             vec![url_queue_generic.clone(), analysis_queue.clone()];
 
@@ -221,6 +281,8 @@ impl Database {
             all_queues,
             url_queue_generic,
             analysis_queue,
+            #[cfg(any(test, feature = "test-support"))]
+            worker_progress_tx,
         })
     }
 

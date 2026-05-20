@@ -317,13 +317,15 @@ impl WebTest {
     }
 
     /// Navigate to a path and wait for WASM test hooks to register.
+    ///
+    /// Deliberately skips `wait_for_navigation` — that's an untimed CDP wait
+    /// that can hang on a stuck renderer. `window.__test` is a strictly
+    /// stronger readiness signal (hooks register only after WASM loads and
+    /// Leptos starts mounting), and the `TIMEOUT`-bounded wait below gives
+    /// us a deterministic ceiling.
     async fn goto(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}{}", self.frontend_url, path);
-        self.page.goto(&url).await?.wait_for_navigation().await?;
-        // Wait for WASM to boot and register test hooks (`window.__test`).
-        // MutationObserver fires when Leptos modifies the DOM during mount.
-        // The immediate check handles the case where WASM loaded before we
-        // got here; the observer handles the case where it hasn't yet.
+        self.page.goto(&url).await?;
         self.with_timeout(
             "new Promise(resolve => { \
                 if (window.__test) { resolve(); return; } \
@@ -555,19 +557,23 @@ impl WebTest {
     }
 
     /// Pan the map to coordinates and wait for entity fetch + map idle.
+    ///
+    /// Caller must ensure no fetch is in flight at entry; otherwise the
+    /// sample-then-wait pattern below could resolve on the in-flight fetch
+    /// instead of the one this call triggers. `goto_map_at` drains the
+    /// mount fetch; later `pan_map_to` calls inherit a settled state.
     async fn pan_map_to(
         &self,
         lng: f64,
         lat: f64,
         zoom: f64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Register fetch listener BEFORE triggering the jump to avoid missing the event
         self.with_timeout(
             &format!(
                 "(async function() {{ \
-                    var p = window.__test.waitForFetchComplete(); \
+                    var prev = window.__test.currentFetchSettled(); \
                     window.__test.jumpTo({lng}, {lat}, {zoom}); \
-                    await p; \
+                    await window.__test.waitForFetchSettledAfter(prev); \
                 }})()"
             ),
             TIMEOUT,
@@ -578,7 +584,6 @@ impl WebTest {
     }
 
     /// Click an element and wait for entity fetch to complete.
-    /// Registers the fetch listener before clicking to avoid missing the event.
     async fn click_and_wait_for_fetch(
         &self,
         selector: &str,
@@ -587,9 +592,9 @@ impl WebTest {
         self.with_timeout(
             &format!(
                 "(async function() {{ \
-                    var p = window.__test.waitForFetchComplete(); \
+                    var prev = window.__test.currentFetchSettled(); \
                     window.__test.clickVisible({sel}); \
-                    await p; \
+                    await window.__test.waitForFetchSettledAfter(prev); \
                 }})()"
             ),
             TIMEOUT,
@@ -608,19 +613,39 @@ impl WebTest {
     }
 
     /// Fire a MapLibre click event at map coordinates programmatically.
+    ///
+    /// Waits for the map to be idle and yields two animation frames before
+    /// firing so MapLibre's internal `queryRenderedFeatures` (called by its
+    /// click dispatcher) sees a settled feature index. Without this, a
+    /// click landing while a `setData`/`updateData` is still being indexed
+    /// throws "feature index out of bounds" inside MapLibre and aborts the
+    /// test. Same two-RAF pattern that `marker_properties` uses for reads.
     async fn click_map_at(
         &self,
         lng: f64,
         lat: f64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.page
-            .evaluate(format!("window.__test.fireMapClick({lng}, {lat})"))
-            .await?;
-
-        Ok(())
+        self.with_timeout(
+            &format!(
+                "(async function() {{ \
+                    await window.__test.waitForMapIdle(); \
+                    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); \
+                    window.__test.fireMapClick({lng}, {lat}); \
+                }})()"
+            ),
+            TIMEOUT,
+        )
+        .await
     }
 
     /// Navigate to the map page, wait for idle, and pan to coordinates.
+    ///
+    /// Drains the map's initial mount fetch (the load callback kicks one off
+    /// for `INITIAL_CENTER` at `INITIAL_ZOOM`) before delegating to
+    /// `pan_map_to`. Without this, `pan_map_to`'s sample/wait pattern could
+    /// race the mount fetch — sampling 0 while mount was still in flight,
+    /// then resolving on mount's completion event before the pan-triggered
+    /// fetch ever ran.
     async fn goto_map_at(
         &self,
         lng: f64,
@@ -629,6 +654,8 @@ impl WebTest {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.goto("/").await?;
         self.wait_for_map_idle().await?;
+        self.with_timeout("window.__test.waitForFetchSettledAfter(0)", TIMEOUT)
+            .await?;
         self.pan_map_to(lng, lat, zoom).await
     }
 
@@ -719,16 +746,19 @@ impl WebTest {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.goto("/").await?;
         self.wait_for_map_idle().await?;
-        // Register thumbnail listener, pan, wait for fetch + idle, then await
-        // thumbnails — all inside one async IIFE so the listener is registered
-        // before any events can fire.
+        // Drain the mount fetch so the sample below isn't racing it.
+        self.with_timeout("window.__test.waitForFetchSettledAfter(0)", TIMEOUT)
+            .await?;
+        // Register thumbnail listener, sample fetch counter, pan, await
+        // fetch settle + idle + thumbnails. The whole sequence lives in one
+        // async IIFE so listeners are registered before any events can fire.
         self.with_timeout(
             &format!(
                 "(async function() {{ \
                     var thumbs = window.__test.waitForThumbnailsLoaded(); \
-                    var fetch = window.__test.waitForFetchComplete(); \
+                    var prev = window.__test.currentFetchSettled(); \
                     window.__test.jumpTo({lng}, {lat}, {zoom}); \
-                    await fetch; \
+                    await window.__test.waitForFetchSettledAfter(prev); \
                     await window.__test.waitForMapIdle(); \
                     await thumbs; \
                 }})()"
@@ -1889,15 +1919,12 @@ async fn test_cluster_click_zooms_in() -> TestResult {
             .and_then(|v| v.as_f64())
             .ok_or("cluster has no _lat")?;
 
-        // Register a fetch-complete listener BEFORE triggering the click,
-        // so we don't miss the event the moveend debounce dispatches after
-        // the flyTo. Then wait for both the fetch and the post-flyTo idle.
         t.with_timeout(
             &format!(
                 "(async function() {{ \
-                    var p = window.__test.waitForFetchComplete(); \
+                    var prev = window.__test.currentFetchSettled(); \
                     window.__test.fireMapClick({lng}, {lat}); \
-                    await p; \
+                    await window.__test.waitForFetchSettledAfter(prev); \
                 }})()"
             ),
             TIMEOUT,
