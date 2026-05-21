@@ -30,4 +30,9 @@ doc-valid-idents = [
 disallowed-methods = [
     { path = "std::thread::sleep", reason = "Use tokio::time::sleep instead, and only where truly needed" },
     { path = "tokio::time::sleep", reason = "Sleep is banned by default; add #[allow(clippy::disallowed_methods)] if truly needed" },
+    # Direct JS evaluation against the browser is confined to the
+    # `dev/tests/harness` module — every other site should interact with
+    # the page via the typed WebTest methods. The harness annotates its
+    # ~4 evaluate calls with #[allow(clippy::disallowed_methods, reason = ...)].
+    { path = "chromiumoxide::page::Page::evaluate", reason = "Browser test JS lives only in dev/tests/harness; everywhere else use the typed WebTest methods" },
 ]

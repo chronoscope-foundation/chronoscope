@@ -74,12 +74,16 @@ fn dispatch_window_event(name: &str) {
     }
 }
 
-/// Bump `FETCH_SETTLED` and fire the fetch-complete event with the post-bump
-/// count as `event.detail`, so listeners can identify which completion they
-/// are seeing.
+/// Bump a settled-counter and dispatch a `CustomEvent` carrying the post-bump
+/// count as `event.detail`. Used for both the fetch-settled and
+/// thumbnails-loaded counters — listeners use the detail to identify which
+/// completion they observed.
 #[cfg(feature = "test-hooks")]
-fn record_fetch_settled() {
-    let count = FETCH_SETTLED.with(|c| {
+fn bump_and_dispatch(
+    counter: &'static std::thread::LocalKey<std::cell::Cell<u64>>,
+    event_name: &str,
+) {
+    let count = counter.with(|c| {
         let next = c.get() + 1;
         c.set(next);
         next
@@ -87,12 +91,15 @@ fn record_fetch_settled() {
     if let Some(window) = web_sys::window() {
         let init = web_sys::CustomEventInit::new();
         init.set_detail(&JsValue::from_f64(count as f64));
-        if let Ok(event) =
-            web_sys::CustomEvent::new_with_event_init_dict(FETCH_COMPLETE_EVENT, &init)
-        {
+        if let Ok(event) = web_sys::CustomEvent::new_with_event_init_dict(event_name, &init) {
             let _ = window.dispatch_event(&event);
         }
     }
+}
+
+#[cfg(feature = "test-hooks")]
+fn record_fetch_settled() {
+    bump_and_dispatch(&FETCH_SETTLED, FETCH_COMPLETE_EVENT);
 }
 
 /// Name of the symbol layer for thumbnail markers.
@@ -101,6 +108,25 @@ pub(crate) const ENTITY_THUMBNAILS_LAYER: &str = "entity-thumbnails";
 /// DOM event name signaling thumbnail image loading completion (used by test hooks).
 #[cfg(feature = "test-hooks")]
 pub(crate) const THUMBNAILS_LOADED_EVENT: &str = "chronoscope-thumbnails-loaded";
+
+/// Counter mirroring `FETCH_SETTLED` for thumbnails-loaded events. Lets tests
+/// sample-then-await: `prev = currentThumbnailsLoaded(); pan(); waitForThumbnailsLoadedAfter(prev)`.
+/// Closes the listener-attach race that any one-shot "wait for next event"
+/// hook would have.
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static THUMBNAILS_LOADED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn current_thumbnails_loaded() -> u64 {
+    THUMBNAILS_LOADED.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "test-hooks")]
+fn record_thumbnails_loaded() {
+    bump_and_dispatch(&THUMBNAILS_LOADED, THUMBNAILS_LOADED_EVENT);
+}
 
 /// Size (CSS px) of circular thumbnail images on the map.
 // TODO: Revisit for mobile — 96px may be too large on small screens.
@@ -558,7 +584,7 @@ async fn load_entities_for_viewport(
 
                             // Signal thumbnail readiness for test hooks.
                             #[cfg(feature = "test-hooks")]
-                            dispatch_window_event(THUMBNAILS_LOADED_EVENT);
+                            record_thumbnails_loaded();
                         };
                         async move {
                             let _ = Abortable::new(fut, abort_reg).await;
@@ -572,7 +598,7 @@ async fn load_entities_for_viewport(
             // test hooks don't hang waiting for an event that will never fire.
             #[cfg(feature = "test-hooks")]
             if marker_thumbnail_urls.is_empty() {
-                dispatch_window_event(THUMBNAILS_LOADED_EVENT);
+                record_thumbnails_loaded();
             }
 
             signals.set_cached_markers.set(new_markers);

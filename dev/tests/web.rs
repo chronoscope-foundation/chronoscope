@@ -4,809 +4,12 @@
 //! verifying interactive workflows end-to-end: navigation, map interaction,
 //! entity detail panels, responsive layouts, accessibility, and error recovery.
 //!
-//! Run via: `just web-test` (builds frontend, then runs these tests)
+//! All JS construction lives in `harness::`; tests below interact only with
+//! typed `WebTest` methods. Run via: `just web-test`.
 
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+mod harness;
 
-use chromiumoxide::Page;
-use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
-use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
-use chromiumoxide::page::ScreenshotParams;
-use chronoscope_dev::{DevServerConfig, RunningDevServer, find_available_port, start_dev_server};
-use chronoscope_workers::RetryConfig;
-use dropshot::ConfigLogging;
-use futures::StreamExt;
-use tokio::sync::Mutex;
-
-type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-// ==================== Frontend Build ====================
-
-/// Path to the prebuilt web frontend dist (with `test-hooks` feature).
-///
-/// Sourced from `$WEB_DIST` exported by the nix dev shell (see `flake.nix` ->
-/// `WEB_DIST = web.packages.web-test`). No fallback build: if the env var
-/// is missing, fail loudly so the cause is obvious.
-fn web_dist() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let path = std::env::var("WEB_DIST")
-        .map_err(|_| "WEB_DIST not set \u{2014} run inside nix develop")?;
-    let dist = PathBuf::from(&path);
-    if !dist.join("index.html").exists() {
-        return Err(format!("WEB_DIST is set to {path} but does not contain index.html").into());
-    }
-    Ok(dist)
-}
-
-// ==================== Test Harness ====================
-
-fn screenshot_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    static DIR: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    DIR.get_or_init(|| {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or_else(|| "dev crate has no parent".to_string())?
-            .join("target/web-test-screenshots");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("create screenshot dir: {e}"))?;
-        Ok(dir)
-    })
-    .clone()
-    .map_err(Into::into)
-}
-
-/// Launch a headless Chrome browser for a single test.
-///
-/// Following chromiumoxide's own test pattern: each test gets its own browser
-/// instance. The handler is spawned on the test's tokio runtime. The caller
-/// must call `browser.close().await` when done — this kills Chrome cleanly.
-async fn launch_browser() -> Result<
-    (Browser, tokio::task::JoinHandle<()>, tempfile::TempDir),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    // Each test gets a unique user-data-dir so multiple Chrome instances
-    // can run concurrently without fighting over a SingletonLock file.
-    let user_data =
-        tempfile::tempdir().map_err(|e| format!("failed to create browser temp dir: {e}"))?;
-
-    // chromiumoxide's built-in detection finds Chrome/Chromium via the CHROME
-    // env var, PATH lookup (using the `which` crate), and platform-specific
-    // paths (macOS /Applications, Linux /opt, Windows registry).
-    let config = BrowserConfig::builder()
-        .user_data_dir(user_data.path())
-        .new_headless_mode()
-        .no_sandbox()
-        .window_size(1280, 800)
-        .build()
-        .map_err(|e| format!("failed to build browser config: {e}"))?;
-
-    let (browser, mut handler) = Browser::launch(config)
-        .await
-        .map_err(|e| format!("failed to launch browser: {e}"))?;
-
-    let handle = tokio::spawn(async move {
-        while let Some(h) = handler.next().await {
-            if h.is_err() {
-                break;
-            }
-        }
-    });
-
-    Ok((browser, handle, user_data))
-}
-
-/// Return an error if a condition is false (like `assert!` but non-panicking).
-fn check(condition: bool, msg: impl std::fmt::Display) -> TestResult {
-    if condition {
-        Ok(())
-    } else {
-        Err(msg.to_string().into())
-    }
-}
-
-/// Per-test context: API server + frontend file server + browser.
-///
-/// Each test gets its own Chrome instance (following chromiumoxide's own test
-/// pattern). Call `close()` when done to kill Chrome cleanly and await the
-/// handler task.
-struct WebTest {
-    browser: Browser,
-    handler_handle: tokio::task::JoinHandle<()>,
-    page: Page,
-    frontend_url: String,
-    console_logs: Arc<Mutex<Vec<ConsoleEntry>>>,
-    screenshot_dir: PathBuf,
-    #[allow(dead_code)]
-    server: RunningDevServer,
-    // Keep temp dirs alive for the duration of the test
-    #[allow(dead_code)]
-    tmp_dir: tempfile::TempDir,
-    #[allow(dead_code)]
-    browser_data_dir: tempfile::TempDir,
-    #[allow(dead_code)]
-    db_tmp: tempfile::TempDir,
-}
-
-#[derive(Debug, Clone)]
-struct ConsoleEntry {
-    level: String,
-    text: String,
-}
-
-impl WebTest {
-    /// Close the browser and await the handler task.
-    /// Called by `web_test()` after each test — not called directly by tests.
-    async fn close(mut self) -> TestResult {
-        self.browser
-            .close()
-            .await
-            .map_err(|e| format!("browser close: {e}"))?;
-        self.handler_handle
-            .await
-            .map_err(|e| format!("handler join: {e}"))?;
-        Ok(())
-    }
-
-    /// Create a new test backed by the Wikidata test database.
-    async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let dist_dir = web_dist()?;
-        let (browser, handler_handle, browser_data_dir) = launch_browser().await?;
-
-        // Copy the Wikidata test DB to a writable temp dir (Nix store is read-only,
-        // SQLite needs write access for WAL).
-        let db_tmp = tempfile::tempdir()?;
-        let wikidata_db = std::env::var("WIKIDATA_TEST_DB")
-            .map_err(|_| "WIKIDATA_TEST_DB not set \u{2014} run inside nix develop")?;
-        let src_db = PathBuf::from(&wikidata_db).join("wikidata.db");
-        let dst_db = db_tmp.path().join("wikidata.db");
-        std::fs::copy(&src_db, &dst_db)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dst_db, std::fs::Permissions::from_mode(0o644))?;
-        }
-        let database_url = Some(format!("sqlite:{}", dst_db.display()));
-
-        // Start API server
-        let port = find_available_port()?;
-        let base_url = format!("http://127.0.0.1:{port}");
-
-        let log = ConfigLogging::StderrTerminal {
-            level: dropshot::ConfigLoggingLevel::Warn,
-        }
-        .to_logger("web-test")?;
-
-        let http_client: Arc<dyn chronoscope_workers::HttpClient> =
-            Arc::new(chronoscope_workers::ReqwestClient::new()?);
-
-        let server = start_dev_server(DevServerConfig {
-            database_url,
-            http_client,
-            worker_idle_backoff: Duration::from_secs(60), // Workers not needed for frontend tests
-            retry_config: RetryConfig::default(),
-            log,
-            port,
-            cdn_base_url: base_url.clone(),
-            rp_id: None,
-            rp_origin: None,
-            ios_app_id: None,
-            apify_config: None,
-            triton: None,
-            dns_resolver: chronoscope_api::state::permissive_dns_resolver(),
-        })
-        .await?;
-
-        // Seed placeholder images for all annotated URLs so image tests
-        // have resolved media to work with.
-        let seeded = server.seed_test_media().await?;
-        eprintln!("Seeded {seeded} test media items");
-
-        // Create temp dir with config.json + symlinks to dist/
-        let tmp_dir = tempfile::tempdir()?;
-        let config_json = format!(r#"{{"api_url":"{base_url}"}}"#);
-        std::fs::write(tmp_dir.path().join("config.json"), config_json)?;
-
-        // Symlink all dist files except config.json
-        for entry in std::fs::read_dir(dist_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name != "config.json" {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(entry.path(), tmp_dir.path().join(&name))?;
-            }
-        }
-
-        // Start static file server with SPA fallback (serve index.html for
-        // any path that doesn't match a file, so client-side routing works).
-        let frontend_port = find_available_port()?;
-        let serve_dir = tmp_dir.path().to_path_buf();
-        let index_html = serve_dir.join("index.html");
-        let app = axum::Router::new().fallback_service(
-            tower_http::services::ServeDir::new(serve_dir)
-                .append_index_html_on_directories(true)
-                .fallback(tower_http::services::ServeFile::new(index_html)),
-        );
-        let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{frontend_port}")).await?;
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.ok();
-        });
-
-        let frontend_url = format!("http://127.0.0.1:{frontend_port}");
-
-        // Wait for the static file server to be ready by probing it.
-        // Generous deadline because the whole test suite spins up dozens of
-        // these in parallel and axum's `serve` future can starve under load.
-        // Sleep between probes (rather than busy-yielding) so we don't burn
-        // CPU racing other tests that are already saturating the runtime.
-        // The TCP listener is already bound, but until axum's `serve` future
-        // is scheduled there's no signal we can wait on — only polling.
-        let config_url = format!("{frontend_url}/config.json");
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                if reqwest::get(&config_url).await.is_ok() {
-                    return;
-                }
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "polling external service readiness; no sync signal available"
-                )]
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .map_err(|_| "static file server did not become ready within 30s")?;
-
-        let page = browser.new_page("about:blank").await?;
-
-        // Set up console log capture
-        let console_logs: Arc<Mutex<Vec<ConsoleEntry>>> = Arc::new(Mutex::new(Vec::new()));
-        let logs_clone = console_logs.clone();
-        let mut console_events = page.event_listener::<EventConsoleApiCalled>().await?;
-        tokio::spawn(async move {
-            while let Some(event) = console_events.next().await {
-                let text = event
-                    .args
-                    .iter()
-                    .map(|arg| {
-                        arg.value
-                            .as_ref()
-                            .map(|v| v.to_string())
-                            .or_else(|| arg.description.clone())
-                            .unwrap_or_default()
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let level = format!("{:?}", event.r#type);
-                logs_clone.lock().await.push(ConsoleEntry { level, text });
-            }
-        });
-
-        Ok(Self {
-            browser,
-            handler_handle,
-            page,
-            frontend_url,
-            console_logs,
-            screenshot_dir: screenshot_dir()?,
-            server,
-            tmp_dir,
-            browser_data_dir,
-            db_tmp,
-        })
-    }
-
-    // ---- Timing helpers ----
-
-    /// Evaluate a JS expression that returns a Promise, with a timeout.
-    ///
-    /// chromiumoxide's `evaluate()` automatically awaits JS Promises (via
-    /// CDP's `awaitPromise`). This wraps that with a `tokio::time::timeout`
-    /// so the test fails cleanly instead of hanging.
-    async fn with_timeout(
-        &self,
-        js: &str,
-        timeout: Duration,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        tokio::time::timeout(timeout, async { self.page.evaluate(js).await })
-            .await
-            .map_err(|_| format!("Timeout after {timeout:?} waiting for: {js}"))?
-            .map_err(|e| format!("JS error in {js}: {e}"))?;
-        Ok(())
-    }
-
-    /// Navigate to a path and wait for WASM test hooks to register.
-    ///
-    /// Deliberately skips `wait_for_navigation` — that's an untimed CDP wait
-    /// that can hang on a stuck renderer. `window.__test` is a strictly
-    /// stronger readiness signal (hooks register only after WASM loads and
-    /// Leptos starts mounting), and the `TIMEOUT`-bounded wait below gives
-    /// us a deterministic ceiling.
-    async fn goto(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{}{}", self.frontend_url, path);
-        self.page.goto(&url).await?;
-        self.with_timeout(
-            "new Promise(resolve => { \
-                if (window.__test) { resolve(); return; } \
-                var obs = new MutationObserver(() => { \
-                    if (window.__test) { obs.disconnect(); resolve(); } \
-                }); \
-                obs.observe(document.documentElement || document.body, \
-                    {childList: true, subtree: true}); \
-            })",
-            TIMEOUT,
-        )
-        .await
-    }
-
-    /// Wait for a CSS selector to appear in the DOM.
-    ///
-    /// Uses a `MutationObserver` to detect when the element is added, avoiding
-    /// poll-based sleeping.
-    async fn wait_for(
-        &self,
-        selector: &str,
-        timeout: Duration,
-    ) -> Result<chromiumoxide::element::Element, Box<dyn std::error::Error + Send + Sync>> {
-        // The JS Promise below checks document.querySelector immediately, then
-        // falls back to a MutationObserver — no need for a separate find_element.
-        let js = format!(
-            "new Promise(resolve => {{ \
-                var el = document.querySelector({sel}); \
-                if (el) {{ resolve(true); return; }} \
-                var obs = new MutationObserver(() => {{ \
-                    el = document.querySelector({sel}); \
-                    if (el) {{ obs.disconnect(); resolve(true); }} \
-                }}); \
-                obs.observe(document.body, {{childList: true, subtree: true}}); \
-            }})",
-            sel = serde_json::to_string(selector)?,
-        );
-        self.with_timeout(&js, timeout).await?;
-        // Element should exist now
-        self.page.find_element(selector).await.map_err(|e| {
-            format!("Element {selector} not found after MutationObserver resolved: {e}").into()
-        })
-    }
-
-    /// Wait until an element matching `selector` is removed from the DOM.
-    async fn wait_for_removal(
-        &self,
-        selector: &str,
-        timeout: Duration,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let js = format!(
-            "new Promise(resolve => {{ \
-                if (!document.querySelector({sel})) {{ resolve(); return; }} \
-                var obs = new MutationObserver(() => {{ \
-                    if (!document.querySelector({sel})) {{ obs.disconnect(); resolve(); }} \
-                }}); \
-                obs.observe(document.body, {{childList: true, subtree: true}}); \
-            }})",
-            sel = serde_json::to_string(selector)?,
-        );
-        self.with_timeout(&js, timeout).await
-    }
-
-    /// Wait for text to appear anywhere in the page body.
-    ///
-    /// Uses a `MutationObserver` to detect DOM changes, checking the body text
-    /// after each mutation.
-    async fn wait_for_text(
-        &self,
-        text: &str,
-        timeout: Duration,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let js = format!(
-            "new Promise(resolve => {{ \
-                var target = {text}; \
-                if ((document.body?.innerText || '').includes(target)) {{ resolve(); return; }} \
-                var obs = new MutationObserver(() => {{ \
-                    if ((document.body?.innerText || '').includes(target)) {{ \
-                        obs.disconnect(); resolve(); \
-                    }} \
-                }}); \
-                obs.observe(document.body, {{childList: true, subtree: true, characterData: true}}); \
-            }})",
-            text = serde_json::to_string(text)?,
-        );
-        self.with_timeout(&js, timeout).await
-    }
-
-    /// Check if text is present in the page body right now.
-    async fn has_text(&self, text: &str) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let body_text: String = self
-            .page
-            .evaluate("document.body?.innerText || ''")
-            .await?
-            .into_value()?;
-        Ok(body_text.contains(text))
-    }
-
-    /// Click an element matching a CSS selector, waiting for any transition to complete.
-    async fn click(&self, selector: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.wait_for(selector, Duration::from_secs(5)).await?;
-        let js = format!(
-            "window.__test.clickVisible({})",
-            serde_json::to_string(selector)?,
-        );
-        self.with_timeout(&js, TIMEOUT).await
-    }
-
-    /// Get the text content of an element.
-    async fn text(
-        &self,
-        selector: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let el = self.wait_for(selector, Duration::from_secs(5)).await?;
-        let text = el.inner_text().await?.unwrap_or_default();
-        Ok(text)
-    }
-
-    /// Check if an element exists in the DOM.
-    async fn exists(
-        &self,
-        selector: &str,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(self.page.find_element(selector).await.is_ok())
-    }
-
-    /// Get an attribute value from an element.
-    async fn attr(
-        &self,
-        selector: &str,
-        attribute: &str,
-    ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let el = self.wait_for(selector, Duration::from_secs(5)).await?;
-        el.attribute(attribute).await.map_err(Into::into)
-    }
-
-    /// Execute JS and return the result as a `serde_json::Value`.
-    async fn evaluate(
-        &self,
-        js: &str,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let result = self.page.evaluate(js).await?;
-        Ok(result.into_value()?)
-    }
-
-    /// Execute JS and return the result as a `String`.
-    async fn eval_string(
-        &self,
-        js: &str,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let val = self.page.evaluate(js).await?;
-        let s: String = val.into_value()?;
-        Ok(s)
-    }
-
-    /// Set the viewport size for responsive testing.
-    async fn set_viewport(
-        &self,
-        width: u32,
-        height: u32,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.page
-            .execute(
-                SetDeviceMetricsOverrideParams::builder()
-                    .width(width)
-                    .height(height)
-                    .device_scale_factor(1.0)
-                    .mobile(width < 768)
-                    .build()
-                    .map_err(|e| format!("viewport build: {e}"))?,
-            )
-            .await?;
-
-        Ok(())
-    }
-
-    /// Capture a screenshot, saving to the screenshots dir.
-    async fn screenshot(
-        &self,
-        name: &str,
-    ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-        let bytes = self
-            .page
-            .screenshot(
-                ScreenshotParams::builder()
-                    .format(CaptureScreenshotFormat::Png)
-                    .full_page(true)
-                    .build(),
-            )
-            .await?;
-        let path = self.screenshot_dir.join(format!("{name}.png"));
-        std::fs::write(&path, &bytes)?;
-        eprintln!("Screenshot saved: {}", path.display());
-        Ok(path)
-    }
-
-    /// Get all console log entries captured so far.
-    async fn console_logs(&self) -> Vec<ConsoleEntry> {
-        self.console_logs.lock().await.clone()
-    }
-
-    /// Dump console logs to stderr (for debugging).
-    async fn dump_console_logs(&self) {
-        let logs = self.console_logs().await;
-        if logs.is_empty() {
-            eprintln!("  (no console logs)");
-        } else {
-            for entry in &logs {
-                eprintln!("  [{}] {}", entry.level, entry.text);
-            }
-        }
-    }
-
-    // ---- Test hook wrappers ----
-    // These call functions on `window.__test` registered by the WASM-side
-    // test_hooks module. No inline JS strings — the logic lives in Rust
-    // compiled to WASM, sharing types with the app.
-
-    /// Wait for the MapLibre map to mount and become idle.
-    async fn wait_for_map_idle(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // waitForMapExists is registered in register_base (available immediately).
-        // waitForMapIdle is registered in register_map_hooks (available after
-        // Landing mounts). We chain them: first wait for the map to exist (which
-        // implies Landing mounted and map hooks are registered), then wait for idle.
-        self.with_timeout("window.__test.waitForMapExists()", TIMEOUT)
-            .await?;
-        self.with_timeout("window.__test.waitForMapIdle()", TIMEOUT)
-            .await
-    }
-
-    /// Pan the map to coordinates and wait for entity fetch + map idle.
-    ///
-    /// Caller must ensure no fetch is in flight at entry; otherwise the
-    /// sample-then-wait pattern below could resolve on the in-flight fetch
-    /// instead of the one this call triggers. `goto_map_at` drains the
-    /// mount fetch; later `pan_map_to` calls inherit a settled state.
-    async fn pan_map_to(
-        &self,
-        lng: f64,
-        lat: f64,
-        zoom: f64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.with_timeout(
-            &format!(
-                "(async function() {{ \
-                    var prev = window.__test.currentFetchSettled(); \
-                    window.__test.jumpTo({lng}, {lat}, {zoom}); \
-                    await window.__test.waitForFetchSettledAfter(prev); \
-                }})()"
-            ),
-            TIMEOUT,
-        )
-        .await?;
-        self.with_timeout("window.__test.waitForMapIdle()", TIMEOUT)
-            .await
-    }
-
-    /// Click an element and wait for entity fetch to complete.
-    async fn click_and_wait_for_fetch(
-        &self,
-        selector: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let sel = serde_json::to_string(selector)?;
-        self.with_timeout(
-            &format!(
-                "(async function() {{ \
-                    var prev = window.__test.currentFetchSettled(); \
-                    window.__test.clickVisible({sel}); \
-                    await window.__test.waitForFetchSettledAfter(prev); \
-                }})()"
-            ),
-            TIMEOUT,
-        )
-        .await
-    }
-
-    /// Get the number of rendered entity markers on the map.
-    async fn marker_count(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let count: f64 = self
-            .page
-            .evaluate("window.__test.markerCount()")
-            .await?
-            .into_value()?;
-        Ok(count as usize)
-    }
-
-    /// Fire a MapLibre click event at map coordinates programmatically.
-    ///
-    /// Waits for the map to be idle and yields two animation frames before
-    /// firing so MapLibre's internal `queryRenderedFeatures` (called by its
-    /// click dispatcher) sees a settled feature index. Without this, a
-    /// click landing while a `setData`/`updateData` is still being indexed
-    /// throws "feature index out of bounds" inside MapLibre and aborts the
-    /// test. Same two-RAF pattern that `marker_properties` uses for reads.
-    async fn click_map_at(
-        &self,
-        lng: f64,
-        lat: f64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.with_timeout(
-            &format!(
-                "(async function() {{ \
-                    await window.__test.waitForMapIdle(); \
-                    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))); \
-                    window.__test.fireMapClick({lng}, {lat}); \
-                }})()"
-            ),
-            TIMEOUT,
-        )
-        .await
-    }
-
-    /// Navigate to the map page, wait for idle, and pan to coordinates.
-    ///
-    /// Drains the map's initial mount fetch (the load callback kicks one off
-    /// for `INITIAL_CENTER` at `INITIAL_ZOOM`) before delegating to
-    /// `pan_map_to`. Without this, `pan_map_to`'s sample/wait pattern could
-    /// race the mount fetch — sampling 0 while mount was still in flight,
-    /// then resolving on mount's completion event before the pan-triggered
-    /// fetch ever ran.
-    async fn goto_map_at(
-        &self,
-        lng: f64,
-        lat: f64,
-        zoom: f64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.goto("/").await?;
-        self.wait_for_map_idle().await?;
-        self.with_timeout("window.__test.waitForFetchSettledAfter(0)", TIMEOUT)
-            .await?;
-        self.pan_map_to(lng, lat, zoom).await
-    }
-
-    /// Count rendered thumbnail markers (entities with photo pins).
-    async fn thumbnail_marker_count(
-        &self,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let count: f64 = self
-            .page
-            .evaluate("window.__test.thumbnailMarkerCount()")
-            .await?
-            .into_value()?;
-        Ok(count as usize)
-    }
-
-    /// Get rendered marker properties as JSON. Each entry corresponds to one
-    /// marker on the map (entity or cluster), with feature properties like
-    /// `kind`, `name`, `id`, `thumbnail`.
-    ///
-    /// Waits two animation frames before querying to ensure MapLibre has
-    /// flushed its render pipeline after the most recent setData / idle
-    /// cycle. Under concurrent test load, MapLibre may fire "idle" before
-    /// all features are queryable via `queryRenderedFeatures`.
-    async fn marker_properties(
-        &self,
-    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-        self.page
-            .evaluate("new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
-            .await?;
-
-        let value: serde_json::Value = self
-            .page
-            .evaluate("window.__test.markerProperties()")
-            .await?
-            .into_value()?;
-        let arr = value
-            .as_array()
-            .ok_or("markerProperties did not return an array")?
-            .clone();
-        Ok(arr)
-    }
-
-    /// Return the map's layer IDs in draw order (bottom → top).
-    async fn layer_order(&self) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        let value: serde_json::Value = self
-            .page
-            .evaluate("window.__test.layerOrder()")
-            .await?
-            .into_value()?;
-        let arr = value
-            .as_array()
-            .ok_or("layerOrder did not return an array")?
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-        Ok(arr)
-    }
-
-    /// Get the map's current zoom level.
-    async fn zoom(&self) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        let z: f64 = self
-            .page
-            .evaluate("window.__test.getZoom()")
-            .await?
-            .into_value()?;
-        Ok(z)
-    }
-
-    /// Get the map's current center as (lng, lat).
-    async fn center(&self) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
-        let arr: Vec<f64> = self
-            .page
-            .evaluate("window.__test.getCenter()")
-            .await?
-            .into_value()?;
-        if arr.len() != 2 {
-            return Err(format!("expected [lng, lat], got {arr:?}").into());
-        }
-        Ok((arr[0], arr[1]))
-    }
-
-    /// Navigate to map, pan to coordinates, and wait for both entities and thumbnails.
-    async fn goto_map_with_thumbnails(
-        &self,
-        lng: f64,
-        lat: f64,
-        zoom: f64,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.goto("/").await?;
-        self.wait_for_map_idle().await?;
-        // Drain the mount fetch so the sample below isn't racing it.
-        self.with_timeout("window.__test.waitForFetchSettledAfter(0)", TIMEOUT)
-            .await?;
-        // Register thumbnail listener, sample fetch counter, pan, await
-        // fetch settle + idle + thumbnails. The whole sequence lives in one
-        // async IIFE so listeners are registered before any events can fire.
-        self.with_timeout(
-            &format!(
-                "(async function() {{ \
-                    var thumbs = window.__test.waitForThumbnailsLoaded(); \
-                    var prev = window.__test.currentFetchSettled(); \
-                    window.__test.jumpTo({lng}, {lat}, {zoom}); \
-                    await window.__test.waitForFetchSettledAfter(prev); \
-                    await window.__test.waitForMapIdle(); \
-                    await thumbs; \
-                }})()"
-            ),
-            Duration::from_secs(30),
-        )
-        .await
-    }
-}
-
-/// Run a browser test with automatic setup, teardown, and diagnostics.
-///
-/// Follows chromiumoxide's own test pattern: launches a fresh Chrome, runs the
-/// test closure, captures diagnostics on failure, then closes Chrome and awaits
-/// the handler.
-async fn web_test(test: impl AsyncFnOnce(&WebTest) -> TestResult) -> TestResult {
-    let t = WebTest::new().await?;
-    let result = test(&t).await;
-
-    // Capture diagnostics before closing if the test failed
-    if result.is_err() {
-        let test_name = std::thread::current()
-            .name()
-            .unwrap_or("unknown")
-            .to_string();
-        eprintln!("--- Test {test_name} failed — capturing diagnostics ---");
-        t.dump_console_logs().await;
-        match t.screenshot(&format!("{test_name}_FAILED")).await {
-            Ok(path) => eprintln!("  Failure screenshot: {}", path.display()),
-            Err(e) => eprintln!("  Failed to capture screenshot: {e}"),
-        }
-        eprintln!("--- End diagnostics ---");
-    }
-
-    let close_result = t.close().await;
-    // Prefer the test error over the close error
-    result.and(close_result)
-}
-
-// ==================== Helper ====================
-
-/// Wait timeout for test-hook async helpers.
-///
-/// Sized for the worst case: `cargo llvm-cov` instrumentation under
-/// parallel test load on a saturated machine. Wait helpers short-circuit
-/// as soon as their condition is met, so this only affects the failure
-/// path — the happy path is still fast.
-const TIMEOUT: Duration = Duration::from_secs(60);
+use harness::{TestResult, WebTest, check, web_test};
 
 /// Hagia Sophia, Istanbul — single entity, good for detail panel tests (lng, lat).
 const HAGIA_SOPHIA: (f64, f64) = (28.979917, 41.008528);
@@ -846,15 +49,14 @@ async fn test_landing_page_renders() -> TestResult {
         )?;
 
         // Info card with "About Chronoscope" should be visible on first load
-        t.wait_for_text("About Chronoscope", TIMEOUT).await?;
+        t.wait_for_body_text("About Chronoscope").await?;
 
         // Sidebar navigation links
         check_nav_links(t).await?;
 
         // Wordmark in sidebar
-        t.wait_for_text("Chronoscope", TIMEOUT).await?;
-        t.wait_for_text("Explore places through time", TIMEOUT)
-            .await?;
+        t.wait_for_body_text("Chronoscope").await?;
+        t.wait_for_body_text("Explore places through time").await?;
 
         Ok(())
     })
@@ -869,7 +71,7 @@ async fn test_navigation_between_pages() -> TestResult {
         // Navigate to About via sidebar link
         t.click("a[href='/about']").await?;
 
-        let url = t.page.url().await?.ok_or("no URL")?;
+        let url = t.url().await?.ok_or("no URL")?;
         check(
             url.ends_with("/about"),
             format!("URL should end with /about, got: {url}"),
@@ -885,7 +87,7 @@ async fn test_navigation_between_pages() -> TestResult {
         // Navigate to FAQ
         t.click("a[href='/faq']").await?;
 
-        let url = t.page.url().await?.ok_or("no URL")?;
+        let url = t.url().await?.ok_or("no URL")?;
         check(
             url.ends_with("/faq"),
             format!("URL should end with /faq, got: {url}"),
@@ -901,7 +103,7 @@ async fn test_navigation_between_pages() -> TestResult {
         // Navigate back to Explore
         t.click("a[href='/']").await?;
 
-        let url = t.page.url().await?.ok_or("no URL")?;
+        let url = t.url().await?.ok_or("no URL")?;
         check(
             url.ends_with('/') && !url.ends_with("/faq") && !url.ends_with("/about"),
             format!("URL should be root, got: {url}"),
@@ -931,9 +133,7 @@ async fn test_about_page_content() -> TestResult {
         )?;
 
         // Should have rendered markdown content (prose container) with substance
-        let article_text = t
-            .eval_string("document.querySelector('article, .prose-chronoscope')?.innerText || ''")
-            .await?;
+        let article_text = t.text("article, .prose-chronoscope").await?;
         check(
             !article_text.is_empty(),
             "Should have article or prose container with content",
@@ -957,7 +157,7 @@ async fn test_faq_accordion() -> TestResult {
         t.goto("/faq").await?;
 
         // Wait for FAQ content to render
-        t.wait_for("h2", TIMEOUT).await?;
+        t.wait_for_selector("h2").await?;
 
         t.screenshot("test_faq_accordion_loaded").await?;
 
@@ -966,8 +166,6 @@ async fn test_faq_accordion() -> TestResult {
         check(!category.is_empty(), "FAQ should have category headings")?;
 
         // First FAQ button should have a question as its text
-        t.wait_for("#main-content button[aria-expanded]", TIMEOUT)
-            .await?;
         let question_text = t.text("#main-content button[aria-expanded]").await?;
         check(
             !question_text.is_empty(),
@@ -995,26 +193,15 @@ async fn test_faq_accordion() -> TestResult {
         )?;
 
         // The answer uses a CSS grid transition: grid-template-rows 0fr → 1fr.
-        // Dump the DOM around the expanded button for debugging, then check the
-        // grid container's style.
-        let grid_rows = t
-            .eval_string(
-                "(function() { \
-                    var btn = document.querySelector('#main-content button[aria-expanded=\"true\"]'); \
-                    if (!btn) return 'no-button'; \
-                    var parent = btn.closest('div'); \
-                    if (!parent) return 'no-parent'; \
-                    var divs = parent.querySelectorAll('div[style]'); \
-                    for (var d of divs) { \
-                        if (d.style.gridTemplateRows) return d.style.gridTemplateRows; \
-                    } \
-                    return 'no-grid-found:' + parent.innerHTML.substring(0, 200); \
-                })()",
-            )
-            .await?;
+        // The animation container is the next element-sibling of the expanded
+        // button (see `FaqItem` in web/src/pages/faq.rs).
+        let style = t
+            .attr("#main-content button[aria-expanded='true'] + div", "style")
+            .await?
+            .unwrap_or_default();
         check(
-            grid_rows.contains("1fr"),
-            format!("Grid should have 1fr rows when expanded, got: {grid_rows}"),
+            style.contains("1fr"),
+            format!("Grid should have 1fr rows when expanded, got style: {style}"),
         )?;
 
         // Click again to collapse
@@ -1030,7 +217,8 @@ async fn test_faq_accordion() -> TestResult {
         )?;
 
         Ok(())
-    }).await
+    })
+    .await
 }
 
 // ==================== Map & Entity Tests ====================
@@ -1094,24 +282,13 @@ async fn test_entity_click_opens_detail() -> TestResult {
         t.click_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1).await?;
 
         // Detail panel should appear — Hagia Sophia is a single entity at these coords
-        t.wait_for("[role='complementary']", TIMEOUT).await?;
+        t.wait_for_selector("[role='complementary']").await?;
 
         // The panel renders "Loading..." while fetching the entity detail.
-        // Under parallel test load (cargo llvm-cov etc.) this would otherwise
-        // race the assertions below. Wait for the content to populate.
-        t.with_timeout(
-            "(async function() { \
-                var deadline = Date.now() + 30000; \
-                while (Date.now() < deadline) { \
-                    var el = document.querySelector(\"[role='complementary']\"); \
-                    if (el && !el.textContent.includes('Loading...')) return true; \
-                    await new Promise(r => setTimeout(r, 50)); \
-                } \
-                throw new Error('panel still loading after 30s'); \
-            })()",
-            TIMEOUT,
-        )
-        .await?;
+        // Wait for a loaded-state token instead of polling for absence of
+        // "Loading..." — "Construction completed" is asserted on below, so
+        // its presence proves the fetch settled and rendered.
+        t.wait_for_body_text("Construction completed").await?;
 
         let panel_text = t.text("[role='complementary']").await?;
 
@@ -1165,11 +342,9 @@ async fn test_disambiguation_picker() -> TestResult {
         t.click_map_at(TORCELLO.0, TORCELLO.1).await?;
 
         // Wait for the panel
-        t.wait_for("[role='complementary']", TIMEOUT).await?;
+        t.wait_for_selector("[role='complementary']").await?;
 
-        let panel_text = t
-            .eval_string("document.querySelector('[role=complementary]')?.innerText || ''")
-            .await?;
+        let panel_text = t.text("[role='complementary']").await?;
 
         // Torcello has two co-located entities — should get disambiguation picker
         check(
@@ -1191,7 +366,7 @@ async fn test_disambiguation_picker() -> TestResult {
             .await?;
         // Wait for entity detail to load (async API fetch) — the timeline
         // section only appears in the detail view, not the picker.
-        t.wait_for_text("Timeline", TIMEOUT).await?;
+        t.wait_for_body_text("Timeline").await?;
 
         let detail_text = t.text("[role='complementary']").await?;
         check(
@@ -1227,7 +402,7 @@ async fn test_disambiguation_picker() -> TestResult {
             t.click("button[aria-label*='Back']").await?;
 
             // Should be back at the picker
-            t.wait_for_text("Multiple entities", TIMEOUT).await?;
+            t.wait_for_body_text("Multiple entities").await?;
         }
 
         Ok(())
@@ -1242,7 +417,7 @@ async fn test_map_empty_state() -> TestResult {
         t.goto_map_at(0.0, 0.0, 10.0).await?;
 
         // Wait for loading to complete and empty state to appear
-        t.wait_for_text("No entities in this area", TIMEOUT).await?;
+        t.wait_for_body_text("No entities in this area").await?;
 
         Ok(())
     })
@@ -1254,27 +429,20 @@ async fn test_map_hover_cursor() -> TestResult {
     web_test(async |t| {
         t.goto_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1, 14.0).await?;
 
-        // Fire a mousemove at entity coordinates via WASM test hook.
-        t.page
-            .evaluate(format!(
-                "window.__test.fireCanvasMousemove({}, {})",
-                HAGIA_SOPHIA.0, HAGIA_SOPHIA.1
-            ))
+        // Fire a mousemove at entity coordinates.
+        t.fire_canvas_mousemove(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1)
             .await?;
 
-        // Check cursor style
-        let cursor = t.eval_string("window.__test.mapCursor()").await?;
+        let cursor = t.map_cursor().await?;
         check(
             cursor == "pointer",
             format!("Cursor should be pointer over markers, got: {cursor}"),
         )?;
 
         // Fire mousemove at a point far from markers
-        t.page
-            .evaluate("window.__test.fireCanvasMousemove(28.97, 41.00)")
-            .await?;
+        t.fire_canvas_mousemove(28.97, 41.00).await?;
 
-        let cursor = t.eval_string("window.__test.mapCursor()").await?;
+        let cursor = t.map_cursor().await?;
         check(cursor != "pointer", "Cursor should reset after moving away")?;
 
         Ok(())
@@ -1290,7 +458,7 @@ async fn test_info_card_dismiss_restore() -> TestResult {
         t.goto("/").await?;
 
         // Info card should be visible
-        t.wait_for_text("Every place has layers", TIMEOUT).await?;
+        t.wait_for_body_text("Every place has layers").await?;
 
         // Find and click the dismiss button (DismissButton defaults to aria-label="Close")
         t.click("button[aria-label='Close']").await?;
@@ -1320,12 +488,10 @@ async fn test_info_card_dismiss_restore() -> TestResult {
 
         // Click restore button via WASM test hook (Leptos event handlers may
         // not fire via CDP's native click)
-        t.page
-            .evaluate("window.__test.clickVisible('button[aria-label=\"About Chronoscope\"]')")
-            .await?;
+        t.click("button[aria-label='About Chronoscope']").await?;
 
         // Info card should reappear with its content
-        t.wait_for_text("Every place has layers", TIMEOUT).await?;
+        t.wait_for_body_text("Every place has layers").await?;
 
         Ok(())
     })
@@ -1338,22 +504,19 @@ async fn test_error_banner_custom_event() -> TestResult {
         t.goto("/").await?;
 
         // Dispatch a custom error event via WASM test hook
-        t.page
-            .evaluate("window.__test.dispatchError('Test error message from browser test')")
+        t.dispatch_error("Test error message from browser test")
             .await?;
 
         // Error banner should appear with role=alert
-        t.wait_for("[role='alert']", TIMEOUT).await?;
-        t.wait_for_text("Test error message from browser test", TIMEOUT)
+        t.wait_for_selector("[role='alert']").await?;
+        t.wait_for_body_text("Test error message from browser test")
             .await?;
 
         t.screenshot("test_error_banner_visible").await?;
 
         // Click dismiss via WASM test hook (the error banner's container has
         // pointer-events-none which blocks chromiumoxide's native click)
-        t.page
-            .evaluate("window.__test.clickVisible('[role=alert] button[aria-label=Dismiss]')")
-            .await?;
+        t.click("[role=alert] button[aria-label=Dismiss]").await?;
 
         // Banner should be gone
         check(
@@ -1387,23 +550,19 @@ async fn test_fetch_error_retry_button() -> TestResult {
         // re-fetch at the SAME viewport (where entities exist) via the retry
         // signal. This way we don't change the viewport — we stay right where
         // the entities are, but the fetch fails because the URL is wrong.
-        t.page
-            .evaluate("window.__test.setApiUrl('http://127.0.0.1:1')")
-            .await?;
+        t.set_api_url("http://127.0.0.1:1").await?;
 
         // Nudge the map to trigger a fetch that will fail against the bogus URL.
-        t.page
-            .evaluate("window.__test.jumpTo(28.9800, 41.0086, 14)")
-            .await?;
-        t.wait_for_text("Retry", TIMEOUT).await?;
+        // `pan_map_to` works for failing fetches too — the fetch-settled
+        // counter advances on both success and failure paths.
+        t.pan_map_to(28.9800, 41.0086, 14.0).await?;
+        t.wait_for_body_text("Retry").await?;
 
         t.screenshot("test_retry_step2_error").await?;
 
         // Step 3: Restore the real API URL
-        let real_url = format!("http://127.0.0.1:{}", t.server.port);
-        t.page
-            .evaluate(format!("window.__test.setApiUrl('{real_url}')"))
-            .await?;
+        let real_url = t.api_base_url();
+        t.set_api_url(&real_url).await?;
 
         // Step 4: Click retry and wait for fetch to complete.
         t.click_and_wait_for_fetch("button[aria-label*=\"Retry\"]")
@@ -1457,9 +616,7 @@ async fn test_mobile_layout() -> TestResult {
         t.screenshot("test_mobile_layout_drawer_open").await?;
 
         // Click a visible nav link (the drawer's, not the hidden desktop sidebar's)
-        t.page
-            .evaluate("window.__test.clickVisible('a[href=\"/about\"]')")
-            .await?;
+        t.click("a[href='/about']").await?;
 
         let expanded = t
             .attr("button[aria-label='Toggle menu']", "aria-expanded")
@@ -1485,23 +642,12 @@ async fn test_desktop_layout() -> TestResult {
         check_nav_links(t).await?;
 
         // Wordmark and tagline
-        t.wait_for_text("Chronoscope", TIMEOUT).await?;
-        t.wait_for_text("Explore places through time", TIMEOUT)
-            .await?;
+        t.wait_for_body_text("Chronoscope").await?;
+        t.wait_for_body_text("Explore places through time").await?;
 
         // Desktop sidebar should NOT have a hamburger toggle visible
         // (it exists in DOM but is hidden via md:hidden)
-        let toggle_visible: bool = t
-            .evaluate(
-                "(function() { \
-                    var btn = document.querySelector('button[aria-label=\"Toggle menu\"]'); \
-                    if (!btn) return false; \
-                    return btn.offsetParent !== null; \
-                })()",
-            )
-            .await?
-            .as_bool()
-            .unwrap_or(true);
+        let toggle_visible = t.is_visible("button[aria-label='Toggle menu']").await?;
         check(
             !toggle_visible,
             "Hamburger toggle should be hidden on desktop",
@@ -1526,16 +672,12 @@ async fn test_skip_link() -> TestResult {
         )?;
 
         // Simulate Tab key press to focus the skip link
-        t.page
-            .evaluate("document.querySelector('a[href=\"#main-content\"]').focus()")
-            .await?;
+        t.focus_element("a[href='#main-content']").await?;
 
         // Verify focus is on the skip link
-        let focused_href: serde_json::Value = t
-            .evaluate("document.activeElement?.getAttribute('href')")
-            .await?;
+        let focused_href = t.active_element_attribute("href").await?;
         check(
-            focused_href.as_str() == Some("#main-content"),
+            focused_href.as_deref() == Some("#main-content"),
             "Skip link should be focusable",
         )?;
 
@@ -1552,35 +694,28 @@ async fn test_detail_panel_focus() -> TestResult {
         t.click_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1).await?;
 
         // Panel should open — wait for it to appear in the DOM
-        t.wait_for("[role='complementary']", TIMEOUT).await?;
+        t.wait_for_selector("[role='complementary']").await?;
 
         // Check that the panel or an element within it has focus
-        let active_in_panel: bool = t
-            .evaluate(
-                "document.querySelector('[role=complementary]')?.contains(document.activeElement) || \
-                 document.activeElement === document.querySelector('[role=complementary]')",
-            )
-            .await?
-            .as_bool()
-            .unwrap_or(false);
-
+        let active_in_panel = t.is_active_inside("[role='complementary']").await?;
         check(active_in_panel, "Panel should capture focus when opened")?;
 
         // Close the panel via its dismiss button
-        t.click("[role='complementary'] button[aria-label='Close']").await?;
+        t.click("[role='complementary'] button[aria-label='Close']")
+            .await?;
 
         // The panel div stays in DOM but becomes translated off-screen when
         // selection is None. Verify the panel content is gone by checking
         // that the entity-specific "Timeline" or "Links" headings are no
         // longer in the body text.
-        let body = t.eval_string("document.body?.innerText || ''").await?;
         check(
-            !body.contains("Timeline") && !body.contains("Links"),
-            format!("Panel content should be gone after dismiss, body: {body}"),
+            !t.has_text("Timeline").await? && !t.has_text("Links").await?,
+            "Panel content should be gone after dismiss",
         )?;
 
         Ok(())
-    }).await
+    })
+    .await
 }
 
 // ==================== Image & Thumbnail Tests ====================
@@ -1597,7 +732,7 @@ async fn find_entity_with_media(
 ) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
     use chronoscope_api_client::{Bbox, Client};
 
-    let client = Client::new(format!("http://127.0.0.1:{}", t.server.port));
+    let client = Client::new(t.api_base_url());
     // Use a bbox small enough that the server returns individual entity
     // markers (not clusters). Centered on Rome where we have 4 entities
     // — well below the ENTITY_MARKER_THRESHOLD.
@@ -1642,7 +777,7 @@ async fn test_detail_panel_shows_images() -> TestResult {
         t.click_map_at(lng, lat).await?;
 
         // Wait for the image grid to appear (entity detail loads media async)
-        t.wait_for("[role='complementary'] ul[role='list']", TIMEOUT)
+        t.wait_for_selector("[role='complementary'] ul[role='list']")
             .await?;
 
         let panel_text = t.text("[role='complementary']").await?;
@@ -1653,16 +788,10 @@ async fn test_detail_panel_shows_images() -> TestResult {
 
         // Verify image elements exist
         let img_count = t
-            .evaluate(
-                "document.querySelectorAll(\
-                    '[role=complementary] ul[role=list] li button img'\
-                ).length",
-            )
-            .await?
-            .as_f64()
-            .unwrap_or(0.0);
+            .count("[role=complementary] ul[role=list] li button img")
+            .await?;
         check(
-            img_count > 0.0,
+            img_count > 0,
             format!("Should have image thumbnails in grid, got {img_count}"),
         )?;
 
@@ -1677,21 +806,21 @@ async fn test_image_grid_accessibility() -> TestResult {
         let (lng, lat) = find_entity_with_media(t).await?;
         t.goto_map_at(lng, lat, 14.0).await?;
         t.click_map_at(lng, lat).await?;
-        t.wait_for("[role='complementary'] ul[role='list']", TIMEOUT)
+        t.wait_for_selector("[role='complementary'] ul[role='list']")
             .await?;
 
-        let all_have_labels = t
-            .evaluate(
-                "Array.from(document.querySelectorAll(\
-                    '[role=complementary] ul[role=list] li button'\
-                )).every(b => b.getAttribute('aria-label')?.includes('view'))",
-            )
-            .await?
-            .as_bool()
-            .unwrap_or(false);
+        let labels = t
+            .attributes("[role=complementary] ul[role=list] li button", "aria-label")
+            .await?;
+        let all_have_labels = !labels.is_empty()
+            && labels
+                .iter()
+                .all(|l| l.as_deref().is_some_and(|s| s.contains("view")));
         check(
             all_have_labels,
-            "Every image button should have an aria-label containing 'view'",
+            format!(
+                "Every image button should have an aria-label containing 'view', got {labels:?}"
+            ),
         )?;
 
         Ok(())
@@ -1705,18 +834,15 @@ async fn test_lightbox_opens_and_shows_content() -> TestResult {
         let (lng, lat) = find_entity_with_media(t).await?;
         t.goto_map_at(lng, lat, 14.0).await?;
         t.click_map_at(lng, lat).await?;
-        t.wait_for("[role='complementary'] ul[role='list'] li button", TIMEOUT)
-            .await?;
-
         t.click("[role='complementary'] ul[role='list'] li button")
             .await?;
-
-        t.wait_for("[role='dialog'][aria-label='Image preview']", TIMEOUT)
+        t.wait_for_selector("[role='dialog'][aria-label='Image preview']")
             .await?;
 
         let img_src = t
-            .eval_string("document.querySelector('[role=dialog] img')?.src || ''")
-            .await?;
+            .attr("[role=dialog] img", "src")
+            .await?
+            .unwrap_or_default();
         check(!img_src.is_empty(), "Lightbox image should have a src")?;
 
         check(
@@ -1726,8 +852,9 @@ async fn test_lightbox_opens_and_shows_content() -> TestResult {
         )?;
 
         let original_href = t
-            .eval_string("document.querySelector('[role=dialog] a[target=_blank]')?.href || ''")
-            .await?;
+            .attr("[role=dialog] a[target=_blank]", "href")
+            .await?
+            .unwrap_or_default();
         check(
             original_href.starts_with("http"),
             format!("'Open original' should link to upstream URL, got: {original_href}"),
@@ -1744,21 +871,14 @@ async fn test_lightbox_dismiss_escape() -> TestResult {
         let (lng, lat) = find_entity_with_media(t).await?;
         t.goto_map_at(lng, lat, 14.0).await?;
         t.click_map_at(lng, lat).await?;
-        t.wait_for("[role='complementary'] ul[role='list'] li button", TIMEOUT)
-            .await?;
 
         t.click("[role='complementary'] ul[role='list'] li button")
             .await?;
-        t.wait_for("[role='dialog']", TIMEOUT).await?;
+        t.wait_for_selector("[role='dialog']").await?;
 
-        t.page
-            .evaluate(
-                "document.querySelector('[role=dialog]')\
-                 .dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}))",
-            )
-            .await?;
+        t.press_key("[role=dialog]", "Escape").await?;
         // Wait for the dialog to disappear (reactive update after signal change).
-        t.wait_for_removal("[role='dialog']", TIMEOUT).await?;
+        t.wait_for_selector_removal("[role='dialog']").await?;
 
         check(
             !t.exists("[role='dialog']").await?,
@@ -1776,17 +896,15 @@ async fn test_lightbox_dismiss_close_button() -> TestResult {
         let (lng, lat) = find_entity_with_media(t).await?;
         t.goto_map_at(lng, lat, 14.0).await?;
         t.click_map_at(lng, lat).await?;
-        t.wait_for("[role='complementary'] ul[role='list'] li button", TIMEOUT)
-            .await?;
 
         t.click("[role='complementary'] ul[role='list'] li button")
             .await?;
-        t.wait_for("[role='dialog']", TIMEOUT).await?;
+        t.wait_for_selector("[role='dialog']").await?;
 
         t.click("[role='dialog'] button[aria-label='Close preview']")
             .await?;
         // Wait for the dialog to disappear (reactive update after signal change).
-        t.wait_for_removal("[role='dialog']", TIMEOUT).await?;
+        t.wait_for_selector_removal("[role='dialog']").await?;
 
         check(
             !t.exists("[role='dialog']").await?,
@@ -1823,7 +941,7 @@ async fn test_thumbnail_click_opens_detail() -> TestResult {
         t.goto_map_with_thumbnails(lng, lat, 14.0).await?;
 
         t.click_map_at(lng, lat).await?;
-        t.wait_for("[role='complementary']", TIMEOUT).await?;
+        t.wait_for_selector("[role='complementary']").await?;
 
         let panel_text = t.text("[role='complementary']").await?;
         check(
@@ -1919,17 +1037,8 @@ async fn test_cluster_click_zooms_in() -> TestResult {
             .and_then(|v| v.as_f64())
             .ok_or("cluster has no _lat")?;
 
-        t.with_timeout(
-            &format!(
-                "(async function() {{ \
-                    var prev = window.__test.currentFetchSettled(); \
-                    window.__test.fireMapClick({lng}, {lat}); \
-                    await window.__test.waitForFetchSettledAfter(prev); \
-                }})()"
-            ),
-            TIMEOUT,
-        )
-        .await?;
+        t.fetch_around(async |t| t.click_map_at(lng, lat).await)
+            .await?;
         t.wait_for_map_idle().await?;
 
         let zoom_after = t.zoom().await?;
