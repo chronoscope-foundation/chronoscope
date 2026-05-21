@@ -13,11 +13,11 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Entity type specialized for ingestion output.
-type IngestionEntity = Entity<EntityIdx, SourceIdx>;
+type IngestionEntity = Entity<SourceIdx>;
 /// Entity transition type specialized for ingestion output.
-type IngestionTransition = EntityTransition<EntityIdx, SourceIdx>;
+type IngestionTransition = EntityTransition<SourceIdx>;
 /// Uncertain location type specialized for ingestion output.
-type IngestionLocation = UnresolvedLocation<EntityIdx>;
+type IngestionLocation = UnresolvedLocation;
 
 // =============================================================================
 // OUTPUT STRUCTURES
@@ -485,7 +485,7 @@ fn get_wikidata_id(output: &IngestionOutput, entity_key: &EntityIdx) -> Option<S
             if let Some(link) = output.external_links.get(link_key)
                 && let LinkTarget::Wikidata { entity_id } = &link.target
             {
-                return Some(entity_id.0.clone());
+                return Some(entity_id.as_str().to_owned());
             }
         }
         None
@@ -923,7 +923,7 @@ mod tests {
             LinkIdx::new(0),
             ExternalLink {
                 target: LinkTarget::Wikidata {
-                    entity_id: WikidataEntityId("Q12345".to_string()),
+                    entity_id: WikidataEntityId::new("Q12345"),
                 },
                 link_type: LinkType::SameAs,
             },

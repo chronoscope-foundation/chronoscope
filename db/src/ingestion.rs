@@ -261,7 +261,9 @@ fn extract_external_ids(
 /// Map a single `LinkTarget` to an `(ExternalIdType, id_string)` pair, if applicable.
 fn link_target_to_external_id(target: &LinkTarget) -> Option<(ExternalIdType, String)> {
     match target {
-        LinkTarget::Wikidata { entity_id } => Some((ExternalIdType::Wikidata, entity_id.0.clone())),
+        LinkTarget::Wikidata { entity_id } => {
+            Some((ExternalIdType::Wikidata, entity_id.as_str().to_owned()))
+        }
         LinkTarget::OpenStreetMap {
             element_type,
             element_id,
@@ -271,11 +273,11 @@ fn link_target_to_external_id(target: &LinkTarget) -> Option<(ExternalIdType, St
                 chronoscope_core::ids::OsmElementType::Way => ExternalIdType::OsmWay,
                 chronoscope_core::ids::OsmElementType::Relation => ExternalIdType::OsmRelation,
             };
-            Some((id_type, element_id.0.to_string()))
+            Some((id_type, element_id.get().to_string()))
         }
         LinkTarget::Pleiades { place_id } => Some((ExternalIdType::Pleiades, place_id.clone())),
-        LinkTarget::GeoNames { id } => Some((ExternalIdType::GeoNames, id.0.to_string())),
-        LinkTarget::GettyTgn { id } => Some((ExternalIdType::GettyTgn, id.0.to_string())),
+        LinkTarget::GeoNames { id } => Some((ExternalIdType::GeoNames, id.get().to_string())),
+        LinkTarget::GettyTgn { id } => Some((ExternalIdType::GettyTgn, id.get().to_string())),
         LinkTarget::Nrhp { reference_number } => {
             Some((ExternalIdType::Nrhp, reference_number.clone()))
         }
@@ -305,7 +307,7 @@ mod tests {
     use crate::Database;
     use crate::row;
 
-    fn test_entity(name: &str) -> Entity<&'static str, &'static str> {
+    fn test_entity(name: &str) -> Entity<&'static str> {
         #[allow(clippy::expect_used)]
         Entity {
             names: vec![Cited::uncited(chronoscope_core::entity::EntityName {
@@ -319,7 +321,7 @@ mod tests {
         }
     }
 
-    fn test_entity_with_date(name: &str, year: i32) -> Entity<&'static str, &'static str> {
+    fn test_entity_with_date(name: &str, year: i32) -> Entity<&'static str> {
         #[allow(clippy::expect_used)]
         let date = UncertainDate::with_precision(
             NaiveDate::from_ymd_opt(year, 1, 1).expect("valid date"),
@@ -340,7 +342,7 @@ mod tests {
     fn wikidata_link(qid: &str) -> ExternalLink {
         ExternalLink {
             target: LinkTarget::Wikidata {
-                entity_id: WikidataEntityId(qid.to_string()),
+                entity_id: WikidataEntityId::new(qid),
             },
             link_type: LinkType::SameAs,
         }
@@ -619,7 +621,7 @@ mod tests {
         let mut entity_ids = Vec::new();
         for _ in 0..2 {
             let id = EntityId::generate();
-            let entity: Entity<EntityId, crate::types::SourceId> = Entity {
+            let entity: Entity<crate::types::SourceId> = Entity {
                 names: vec![],
                 transitions: vec![],
             };

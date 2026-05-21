@@ -101,7 +101,7 @@ pub struct Media {
     #[sqlx(json(nullable), rename = "captured_meta")]
     pub captured: Option<UncertainDate>,
     #[sqlx(json(nullable), rename = "location_meta")]
-    pub location: Option<chronoscope_core::UnresolvedLocation<EntityId>>,
+    pub location: Option<chronoscope_core::UnresolvedLocation>,
     pub source_metadata: Option<String>,
     pub fetched_at: NaiveDateTime,
     pub created_at: NaiveDateTime,
@@ -156,7 +156,7 @@ pub struct PageMedia {
     #[sqlx(json(nullable), rename = "captured_meta")]
     pub captured: Option<UncertainDate>,
     #[sqlx(json(nullable), rename = "location_meta")]
-    pub location: Option<chronoscope_core::UnresolvedLocation<EntityId>>,
+    pub location: Option<chronoscope_core::UnresolvedLocation>,
     pub source_metadata: Option<String>,
     pub fetched_at: Option<NaiveDateTime>,
     pub created_at: Option<NaiveDateTime>,
@@ -279,7 +279,7 @@ pub struct Entity {
 
 impl Entity {
     pub fn into_domain(self) -> Result<models::Entity, DbError> {
-        let entity: chronoscope_core::entity::Entity<EntityId, SourceId> =
+        let entity: chronoscope_core::entity::Entity<SourceId> =
             serde_json::from_str(&self.entity_json)?;
 
         let id = self.id;

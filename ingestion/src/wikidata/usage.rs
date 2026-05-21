@@ -2,7 +2,7 @@
 //!
 //! Maps Wikidata Q-IDs to Chronoscope Usage types.
 
-use crate::{EntityIdx, SourceIdx};
+use crate::SourceIdx;
 use chronoscope_core::{Entity, EntityTransition, Usage};
 use chronoscope_integrations::wikidata::WikidataEntity;
 use std::collections::{BTreeSet, HashMap};
@@ -148,10 +148,7 @@ pub fn infer(wd_entity: &WikidataEntity) -> BTreeSet<Usage> {
 }
 
 /// Replace `Usage::Unknown` in `UsageModified` transitions with inferred usages.
-pub fn replace_unknown(
-    entity: &mut Entity<EntityIdx, SourceIdx>,
-    inferred_usages: &BTreeSet<Usage>,
-) {
+pub fn replace_unknown(entity: &mut Entity<SourceIdx>, inferred_usages: &BTreeSet<Usage>) {
     for transition in &mut entity.transitions {
         if let EntityTransition::UsageModified { new_usages, .. } = transition {
             // Only replace if there's exactly one Unknown usage (the placeholder)
@@ -166,7 +163,7 @@ pub fn replace_unknown(
 mod tests {
     use super::*;
 
-    type TestEntity = Entity<EntityIdx, SourceIdx>;
+    type TestEntity = Entity<SourceIdx>;
 
     use chronoscope_integrations::wikidata::{
         Claim, DataValue, EntityRefValue, PropertyId, RevisionId, Snak, WikidataEntityType,

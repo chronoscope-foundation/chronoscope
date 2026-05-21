@@ -11,7 +11,7 @@ use chronoscope_core::UncertainDate;
 
 use crate::error::{DbError, DbResult};
 use crate::models::{MediaData, PageData};
-use crate::types::{EntityId, MediaId, PageId, ResearchUrlId};
+use crate::types::{MediaId, PageId, ResearchUrlId};
 use crate::{Database, now, queries};
 
 /// Media item claimed for analysis.
@@ -250,7 +250,7 @@ fn date_latest(date: &Option<UncertainDate>) -> Option<String> {
 
 /// Extract lat/lon shadow columns from an optional location.
 fn location_coords(
-    loc: &Option<chronoscope_core::UnresolvedLocation<EntityId>>,
+    loc: &Option<chronoscope_core::UnresolvedLocation>,
 ) -> (Option<f64>, Option<f64>) {
     match loc {
         Some(chronoscope_core::UnresolvedLocation::Resolved(

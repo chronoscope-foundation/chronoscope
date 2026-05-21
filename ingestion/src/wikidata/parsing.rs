@@ -65,6 +65,10 @@ pub fn extract_names(
 ) -> Vec<Cited<EntityName, SourceIdx>> {
     let mut names = Vec::new();
 
+    let entity_id = WikidataEntityId::new(wikidata_id);
+    let label_marker = WikidataPropertyId::new("label");
+    let p1448 = WikidataPropertyId::new("P1448");
+
     for (lang, label) in &wd.labels {
         if let Ok(language_tag) = LanguageTag::parse(lang.0.clone()) {
             names.push(Cited::new(
@@ -76,8 +80,8 @@ pub fn extract_names(
                     valid_to: None,
                 },
                 vec![Evidence::Wikidata {
-                    entity_id: WikidataEntityId(wikidata_id.to_string()),
-                    property_id: WikidataPropertyId("label".to_string()),
+                    entity_id: entity_id.clone(),
+                    property_id: label_marker.clone(),
                     property_value: format!("{}:{}", lang, label.value),
                     revision_id,
                 }],
@@ -100,8 +104,8 @@ pub fn extract_names(
                         valid_to: None,
                     },
                     vec![Evidence::Wikidata {
-                        entity_id: WikidataEntityId(wikidata_id.to_string()),
-                        property_id: WikidataPropertyId("P1448".to_string()),
+                        entity_id: entity_id.clone(),
+                        property_id: p1448.clone(),
                         property_value: format!("{}:{}", mono.language, mono.text),
                         revision_id,
                     }],

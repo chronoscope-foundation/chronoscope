@@ -20,7 +20,7 @@ use crate::ids::{WikidataEntityId, WikidataPropertyId};
 /// - `Some(Cited { value, evidence: [...] })` = we claim X with supporting evidence
 ///
 /// Generic over `S` (source reference type), following the same parametricity pattern
-/// as `Annotation<S, E>` and `Entity<E, S>`.
+/// as `Annotation<S, E>` and `Entity<S>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(deserialize = "T: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
 pub struct Cited<T, S> {

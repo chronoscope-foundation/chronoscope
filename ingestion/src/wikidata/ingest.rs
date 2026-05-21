@@ -30,7 +30,7 @@ pub use self::entity_accumulator::*;
 mod entity_accumulator {
     use std::collections::BTreeSet;
 
-    use crate::{EntityIdx, SourceIdx};
+    use crate::SourceIdx;
     use chronoscope_core::{
         AnnotationKind, Cited, Entity, EntityName, EntityTransition, Evidence, ExternalLink,
         ImageSource, Usage, WikidataEntityId, WikidataPropertyId,
@@ -43,8 +43,8 @@ mod entity_accumulator {
         pub entity_idx: usize,
         pub wikidata_id: WikidataId,
         pub revision_id: RevisionId,
-        pub entity: Entity<EntityIdx, SourceIdx>,
-        pub images: Vec<ImageSource<EntityIdx>>,
+        pub entity: Entity<SourceIdx>,
+        pub images: Vec<ImageSource>,
         pub annotations: Vec<LocalAnnotation>,
         pub links: Vec<ExternalLink>,
         pub issues: Vec<(String, String)>,
@@ -64,7 +64,7 @@ mod entity_accumulator {
         entity_idx: usize,
         wikidata_id: WikidataId,
         revision_id: RevisionId,
-        images: Vec<ImageSource<EntityIdx>>,
+        images: Vec<ImageSource>,
         annotations: Vec<LocalAnnotation>,
         links: Vec<ExternalLink>,
         issues: Vec<(String, String)>,
@@ -92,7 +92,7 @@ mod entity_accumulator {
         }
 
         /// Add an image with an annotation linking it to this entity.
-        pub fn add_image(&mut self, image: ImageSource<EntityIdx>, kind: AnnotationKind) {
+        pub fn add_image(&mut self, image: ImageSource, kind: AnnotationKind) {
             let local_idx = self.images.len();
             self.images.push(image);
             self.annotations.push(LocalAnnotation {
@@ -159,7 +159,7 @@ mod entity_accumulator {
         pub fn split_into_results(
             self,
             names: Vec<Cited<EntityName, SourceIdx>>,
-            mut lifecycles: Vec<Vec<EntityTransition<EntityIdx, SourceIdx>>>,
+            mut lifecycles: Vec<Vec<EntityTransition<SourceIdx>>>,
             inferred_usages: &BTreeSet<Usage>,
         ) -> Vec<EntityResult> {
             if lifecycles.is_empty() {
@@ -228,8 +228,8 @@ mod entity_accumulator {
             Cited::new(
                 value,
                 vec![Evidence::Wikidata {
-                    entity_id: WikidataEntityId(self.wikidata_id.to_string()),
-                    property_id: WikidataPropertyId(self.property.to_string()),
+                    entity_id: WikidataEntityId::new(self.wikidata_id),
+                    property_id: WikidataPropertyId::new(self.property),
                     property_value: raw.into(),
                     revision_id: self.revision_id,
                 }],
@@ -254,7 +254,7 @@ mod entity_accumulator {
     /// Handlers are pure functions that return what they want to add.
     #[derive(Default)]
     pub struct HandlerOutput {
-        pub images: Vec<(ImageSource<EntityIdx>, AnnotationKind)>,
+        pub images: Vec<(ImageSource, AnnotationKind)>,
         pub links: Vec<ExternalLink>,
         pub issues: Vec<String>,
     }
@@ -267,7 +267,7 @@ mod entity_accumulator {
         }
 
         /// Add an image with annotation kind.
-        pub fn add_image(&mut self, image: ImageSource<EntityIdx>, kind: AnnotationKind) {
+        pub fn add_image(&mut self, image: ImageSource, kind: AnnotationKind) {
             self.images.push((image, kind));
         }
 
@@ -497,6 +497,8 @@ fn merge_results(results: &[Vec<EntityResult>]) -> IngestionOutput {
             let wikidata_id = &result_group[0].wikidata_id;
             let revision_id = result_group[0].revision_id.0;
 
+            let entity_id = WikidataEntityId::new(wikidata_id.as_str());
+            let property_id = WikidataPropertyId::new("lifecycle");
             for window in group_entity_keys.windows(2) {
                 let older_key = window[0];
                 let newer_key = window[1];
@@ -505,8 +507,8 @@ fn merge_results(results: &[Vec<EntityResult>]) -> IngestionOutput {
                     to_entity: older_key,
                     relation_type: EntityRelationType::Replaces,
                     evidence: vec![Evidence::Wikidata {
-                        entity_id: WikidataEntityId(wikidata_id.to_string()),
-                        property_id: WikidataPropertyId("lifecycle".to_string()),
+                        entity_id: entity_id.clone(),
+                        property_id: property_id.clone(),
                         property_value: "demolish->rebuild pattern".to_string(),
                         revision_id,
                     }],
@@ -649,7 +651,7 @@ fn process_entity(
     // Add Wikidata link
     acc.add_link(ExternalLink {
         target: LinkTarget::Wikidata {
-            entity_id: WikidataEntityId(wikidata_id.to_string()),
+            entity_id: WikidataEntityId::new(wikidata_id.as_str()),
         },
         link_type: LinkType::SameAs,
     });

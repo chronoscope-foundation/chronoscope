@@ -6,7 +6,7 @@
 use chrono::NaiveDateTime;
 use chronoscope_core::UncertainDate;
 use chronoscope_db::{
-    EntityId, FollowedUrl, MediaId, MediaType, ResearchUrl, ResearchUrlId, ResearchUrlStatus,
+    FollowedUrl, MediaId, MediaType, ResearchUrl, ResearchUrlId, ResearchUrlStatus,
 };
 use chronoscope_integrations::IntegrationName;
 use schemars::JsonSchema;
@@ -223,7 +223,7 @@ pub struct MediaDossier {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub captured: Option<UncertainDate>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<chronoscope_core::UnresolvedLocation<EntityId>>,
+    pub location: Option<chronoscope_core::UnresolvedLocation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_metadata: Option<serde_json::Value>,
     pub fetched_at: NaiveDateTime,

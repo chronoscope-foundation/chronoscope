@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::{EntityIdx, SourceIdx};
+use crate::SourceIdx;
 use chrono::NaiveDate;
 use chronoscope_core::{
     Cited, DamageCause, EntityTransition, Location, TriggerEventId, UncertainDate,
@@ -21,7 +21,6 @@ use crate::wikidata::ingest::PropertyContext;
 // =============================================================================
 
 mod extract {
-    use crate::EntityIdx;
     use chronoscope_core::{Location, UncertainDate, UnresolvedLocation};
     use chronoscope_integrations::wikidata::{Claim, DataValue, Snak};
 
@@ -50,9 +49,7 @@ mod extract {
     }
 
     /// Extract coordinates from claim's mainsnak.
-    pub fn mainsnak_coordinates(
-        claim: &Claim,
-    ) -> (Option<UnresolvedLocation<EntityIdx>>, Vec<String>) {
+    pub fn mainsnak_coordinates(claim: &Claim) -> (Option<UnresolvedLocation>, Vec<String>) {
         let mut warnings = Vec::new();
 
         let coord = match &claim.mainsnak {
@@ -210,10 +207,7 @@ fn extract_property_time(
 fn extract_property_location(
     claims: &HashMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext<'_>,
-) -> (
-    Option<Cited<UnresolvedLocation<EntityIdx>, SourceIdx>>,
-    Vec<String>,
-) {
+) -> (Option<Cited<UnresolvedLocation, SourceIdx>>, Vec<String>) {
     let mut warnings = Vec::new();
 
     let Some(prop_claims) = claims.get("P625") else {
@@ -249,7 +243,7 @@ fn extract_property_location(
 
 /// A transition with its sort key for chronological ordering.
 struct DatedTransition {
-    transition: EntityTransition<EntityIdx, SourceIdx>,
+    transition: EntityTransition<SourceIdx>,
     sort_key: Option<NaiveDate>,
 }
 
@@ -292,7 +286,7 @@ fn process_p793_claim(
         .or(p585.first())
         .and_then(|(d, _)| d.earliest());
 
-    let transitions: Vec<EntityTransition<EntityIdx, SourceIdx>> = match qid.as_str() {
+    let transitions: Vec<EntityTransition<SourceIdx>> = match qid.as_str() {
         // =================================================================
         // CONSTRUCTION EVENTS
         // =================================================================
@@ -516,10 +510,7 @@ fn process_p793_claim(
 pub fn build_lifecycles(
     claims: &HashMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext<'_>,
-) -> (
-    Vec<Vec<EntityTransition<EntityIdx, SourceIdx>>>,
-    Vec<String>,
-) {
+) -> (Vec<Vec<EntityTransition<SourceIdx>>>, Vec<String>) {
     let mut warnings = Vec::new();
     let mut dated_transitions: Vec<DatedTransition> = Vec::new();
 
@@ -701,14 +692,12 @@ pub fn build_lifecycles(
 /// When splitting, if the construction that triggers the split has a location, the
 /// predecessor gets a synthetic `Constructed` with that same location and no dates —
 /// the previous building occupied the same site, we just don't know when it was built.
-fn split_on_rebuild(
-    transitions: Vec<DatedTransition>,
-) -> Vec<Vec<EntityTransition<EntityIdx, SourceIdx>>> {
+fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransition<SourceIdx>>> {
     if transitions.is_empty() {
         return vec![];
     }
 
-    let mut entities: Vec<Vec<EntityTransition<EntityIdx, SourceIdx>>> = vec![vec![]];
+    let mut entities: Vec<Vec<EntityTransition<SourceIdx>>> = vec![vec![]];
     let mut saw_demolition = false;
 
     for dt in transitions {

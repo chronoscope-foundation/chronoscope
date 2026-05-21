@@ -7,11 +7,30 @@
 //! - [`UnresolvedLocation`] — may contain symbolic [`LocationReference`]s that
 //!   need external resolution (geocoding, OSM lookup, etc.).
 //! - [`LocationReference`] — a symbolic pointer to a location in an external
-//!   system (OSM, OHM, named place, address, entity, or "near" any of these).
+//!   system (OSM, OHM, named place, address, or "near" any of these).
 //!
 //! Merge operates on `UnresolvedLocation` (pure bag union / `OneOf` construction).
 //! Resolution maps `LocationReference` → `Location` via a caller-provided closure.
 //! The lattice operates on `Location` only.
+//!
+//! # Entity vs. region scope
+//!
+//! Entity-scale things — individual buildings, the Forbidden City as a
+//! complex, a fortress, a citadel — are first-class entities with their
+//! own [`crate::facts::ids::EntityId`]. Containment between such entities
+//! is expressed by
+//! [`crate::facts::attribute::Fact::Relationship`] with
+//! [`crate::facts::attribute::EntityRelationType::Contains`], not by a
+//! location reference.
+//!
+//! Region-scale things — cities, neighborhoods, contested geographical
+//! areas like "Manhattan" or "Newark" — are *not* entities in the
+//! fact-store grammar. They live as opaque names inside
+//! [`LocationReference::NamedPlace`], to be resolved against an external
+//! gazetteer at projection time. The grammar does not enforce this split
+//! structurally; it is a convention the submission layer follows, and
+//! the projection layer relies on the same convention when deciding how
+//! to interpret a location claim.
 
 use std::fmt;
 
@@ -21,12 +40,23 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{OhmId, OsmElementType, OsmId};
 
 /// Errors from location construction or validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Eq` is not derived because the f64-carrying variants reach
+/// non-`Eq` values.
+#[derive(Debug, Clone, PartialEq)]
 pub enum LocationError {
     /// `OneOf` / `UnionOf` requires at least 2 entries.
     TooFewEntries { count: usize },
-    /// Coordinate values are out of range or non-finite.
-    InvalidCoordinates { reason: String },
+    /// Latitude is outside `[-90, 90]`.
+    LatitudeOutOfRange { lat: f64 },
+    /// Longitude is outside `[-180, 180]`.
+    LongitudeOutOfRange { lon: f64 },
+    /// `lat` or `lon` was `NaN` or infinite.
+    NonFiniteCoordinate { lat: f64, lon: f64 },
+    /// Radius was negative.
+    NegativeRadius { radius_m: f64 },
+    /// Radius was `NaN` or infinite.
+    NonFiniteRadius { radius_m: f64 },
 }
 
 impl fmt::Display for LocationError {
@@ -35,8 +65,20 @@ impl fmt::Display for LocationError {
             Self::TooFewEntries { count } => {
                 write!(f, "OneOf/UnionOf requires at least 2 entries, got {count}")
             }
-            Self::InvalidCoordinates { reason } => {
-                write!(f, "invalid coordinates: {reason}")
+            Self::LatitudeOutOfRange { lat } => {
+                write!(f, "latitude {lat} out of range [-90, 90]")
+            }
+            Self::LongitudeOutOfRange { lon } => {
+                write!(f, "longitude {lon} out of range [-180, 180]")
+            }
+            Self::NonFiniteCoordinate { lat, lon } => {
+                write!(f, "lat/lon must be finite (got lat={lat}, lon={lon})")
+            }
+            Self::NegativeRadius { radius_m } => {
+                write!(f, "radius_m must be non-negative, got {radius_m}")
+            }
+            Self::NonFiniteRadius { radius_m } => {
+                write!(f, "radius_m must be finite, got {radius_m}")
             }
         }
     }
@@ -107,10 +149,11 @@ impl Location {
     /// neither value is `NaN` or infinite, and radius is non-negative and finite.
     pub fn circle(lat: f64, lon: f64, radius_m: f64) -> Result<Self, LocationError> {
         validate_coordinates(lat, lon)?;
-        if !radius_m.is_finite() || radius_m < 0.0 {
-            return Err(LocationError::InvalidCoordinates {
-                reason: format!("radius_m must be non-negative and finite, got {radius_m}"),
-            });
+        if !radius_m.is_finite() {
+            return Err(LocationError::NonFiniteRadius { radius_m });
+        }
+        if radius_m < 0.0 {
+            return Err(LocationError::NegativeRadius { radius_m });
         }
         Ok(Self::Circle { lat, lon, radius_m })
     }
@@ -212,21 +255,15 @@ fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS_M * c
 }
 
-fn validate_coordinates(lat: f64, lon: f64) -> Result<(), LocationError> {
+pub(crate) fn validate_coordinates(lat: f64, lon: f64) -> Result<(), LocationError> {
     if !lat.is_finite() || !lon.is_finite() {
-        return Err(LocationError::InvalidCoordinates {
-            reason: "lat/lon must be finite".to_string(),
-        });
+        return Err(LocationError::NonFiniteCoordinate { lat, lon });
     }
     if !(-90.0..=90.0).contains(&lat) {
-        return Err(LocationError::InvalidCoordinates {
-            reason: format!("latitude {lat} out of range [-90, 90]"),
-        });
+        return Err(LocationError::LatitudeOutOfRange { lat });
     }
     if !(-180.0..=180.0).contains(&lon) {
-        return Err(LocationError::InvalidCoordinates {
-            reason: format!("longitude {lon} out of range [-180, 180]"),
-        });
+        return Err(LocationError::LongitudeOutOfRange { lon });
     }
     Ok(())
 }
@@ -235,29 +272,26 @@ fn validate_coordinates(lat: f64, lon: f64) -> Result<(), LocationError> {
 
 /// A location that may contain unresolved symbolic references.
 ///
-/// Generic over `E` (entity reference type) for the `Near { Entity(E) }` variant.
-///
 /// Uses adjacently-tagged serde (`tag` + `content`) because `Resolved` wraps
 /// a [`Location`] which has its own internal `type` tag — internal tagging
 /// on both levels would produce duplicate `type` fields.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
-#[serde(bound(serialize = "E: Serialize"))]
-pub enum UnresolvedLocation<E> {
+pub enum UnresolvedLocation {
     /// Already resolved to geometry.
     Resolved(Location),
     /// Symbolic reference needing external resolution.
-    Reference(LocationReference<E>),
+    Reference(LocationReference),
     /// One of these, don't know which (conflicting sources).
     /// Flattened when nested. Requires ≥2 entries.
     ///
     /// Construct via [`UnresolvedLocation::one_of`] to enforce the minimum.
-    OneOf(Vec<UnresolvedLocation<E>>),
+    OneOf(Vec<UnresolvedLocation>),
 }
 
-impl<E> UnresolvedLocation<E> {
+impl UnresolvedLocation {
     /// Create a validated `OneOf` with at least 2 entries.
-    pub fn one_of(entries: Vec<UnresolvedLocation<E>>) -> Result<Self, LocationError> {
+    pub fn one_of(entries: Vec<UnresolvedLocation>) -> Result<Self, LocationError> {
         if entries.len() < 2 {
             return Err(LocationError::TooFewEntries {
                 count: entries.len(),
@@ -267,18 +301,17 @@ impl<E> UnresolvedLocation<E> {
     }
 }
 
-impl<'de, E: serde::de::DeserializeOwned> Deserialize<'de> for UnresolvedLocation<E> {
+impl<'de> Deserialize<'de> for UnresolvedLocation {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
         #[serde(tag = "type", content = "value", rename_all = "snake_case")]
-        #[serde(bound(deserialize = "E: serde::de::DeserializeOwned"))]
-        enum Raw<E> {
+        enum Raw {
             Resolved(Location),
-            Reference(LocationReference<E>),
-            OneOf(Vec<UnresolvedLocation<E>>),
+            Reference(LocationReference),
+            OneOf(Vec<UnresolvedLocation>),
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -302,15 +335,14 @@ impl<'de, E: serde::de::DeserializeOwned> Deserialize<'de> for UnresolvedLocatio
 /// A symbolic reference to a location in an external system.
 ///
 /// These need external resolution (geocoding, OSM/OHM lookup, etc.) to
-/// produce a [`Location`]. Generic over `E` for entity references.
+/// produce a [`Location`]. References are deliberately region-scale:
+/// entity-scale containment lives on
+/// [`crate::facts::attribute::Fact::Relationship`], not here. See the
+/// module-level "Entity vs. region scope" note.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[serde(bound(
-    serialize = "E: Serialize",
-    deserialize = "E: serde::de::DeserializeOwned"
-))]
-pub enum LocationReference<E> {
+pub enum LocationReference {
     /// OpenStreetMap element reference.
     #[serde(rename = "osm_reference")]
     Osm {
@@ -324,12 +356,10 @@ pub enum LocationReference<E> {
     NamedPlace { name: String },
     /// Street address (e.g., "123 Main St, Springfield").
     Address { address_text: String },
-    /// Reference to another entity's location.
-    Entity(E),
     /// Near some other reference, with optional qualitative distance.
-    /// "Near Paris", "near entity X", "near 1600 Penn Ave" all use this.
+    /// "Near Paris", "near 1600 Penn Ave" all use this.
     Near {
-        reference: Box<LocationReference<E>>,
+        reference: Box<LocationReference>,
         distance: Option<Distance>,
     },
 }
@@ -385,31 +415,40 @@ mod tests {
     #[test]
     fn circle_rejects_out_of_range_lat() {
         let loc = Location::circle(91.0, 0.0, 10.0);
-        assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
+        assert!(matches!(loc, Err(LocationError::LatitudeOutOfRange { .. })));
     }
 
     #[test]
     fn circle_rejects_out_of_range_lon() {
         let loc = Location::circle(0.0, 181.0, 10.0);
-        assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
+        assert!(matches!(
+            loc,
+            Err(LocationError::LongitudeOutOfRange { .. })
+        ));
     }
 
     #[test]
     fn circle_rejects_nan() {
         let loc = Location::circle(f64::NAN, 0.0, 10.0);
-        assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
+        assert!(matches!(
+            loc,
+            Err(LocationError::NonFiniteCoordinate { .. })
+        ));
     }
 
     #[test]
     fn circle_rejects_infinity() {
         let loc = Location::circle(0.0, f64::INFINITY, 10.0);
-        assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
+        assert!(matches!(
+            loc,
+            Err(LocationError::NonFiniteCoordinate { .. })
+        ));
     }
 
     #[test]
     fn circle_rejects_negative_radius() {
         let loc = Location::circle(0.0, 0.0, -1.0);
-        assert!(matches!(loc, Err(LocationError::InvalidCoordinates { .. })));
+        assert!(matches!(loc, Err(LocationError::NegativeRadius { .. })));
     }
 
     #[test]
@@ -422,56 +461,51 @@ mod tests {
 
     #[test]
     fn one_of_serde_roundtrip() {
-        type TestLoc = UnresolvedLocation<()>;
-
-        let loc = TestLoc::OneOf(vec![
-            TestLoc::Reference(LocationReference::NamedPlace {
+        let loc = UnresolvedLocation::OneOf(vec![
+            UnresolvedLocation::Reference(LocationReference::NamedPlace {
                 name: "Paris".to_string(),
             }),
-            TestLoc::Reference(LocationReference::Address {
+            UnresolvedLocation::Reference(LocationReference::Address {
                 address_text: "123 Main St".to_string(),
             }),
         ]);
 
         let json = serde_json::to_string(&loc).unwrap();
-        let deserialized: TestLoc = serde_json::from_str(&json).unwrap();
+        let deserialized: UnresolvedLocation = serde_json::from_str(&json).unwrap();
         assert_eq!(loc, deserialized);
     }
 
     #[test]
     fn one_of_rejects_single_entry() {
-        type TestLoc = UnresolvedLocation<()>;
         // Construct a single-entry OneOf — serialization succeeds but
         // deserialization must reject it (minimum 2 entries).
-        let loc = TestLoc::OneOf(vec![TestLoc::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
-        })]);
+        let loc = UnresolvedLocation::OneOf(vec![UnresolvedLocation::Reference(
+            LocationReference::NamedPlace {
+                name: "Paris".to_string(),
+            },
+        )]);
         let json = serde_json::to_string(&loc).unwrap();
-        assert!(serde_json::from_str::<TestLoc>(&json).is_err());
+        assert!(serde_json::from_str::<UnresolvedLocation>(&json).is_err());
     }
 
     #[test]
     fn resolved_serde_roundtrip() {
-        type TestLoc = UnresolvedLocation<()>;
-
-        let loc = TestLoc::Resolved(Location::circle(48.8584, 2.2945, 10.0).unwrap());
+        let loc = UnresolvedLocation::Resolved(Location::circle(48.8584, 2.2945, 10.0).unwrap());
         let json = serde_json::to_string(&loc).unwrap();
-        let deserialized: TestLoc = serde_json::from_str(&json).unwrap();
+        let deserialized: UnresolvedLocation = serde_json::from_str(&json).unwrap();
         assert_eq!(loc, deserialized);
     }
 
     #[test]
     fn near_reference_serde_roundtrip() {
-        type TestLoc = UnresolvedLocation<String>;
-
-        let loc = TestLoc::Reference(LocationReference::Near {
+        let loc = UnresolvedLocation::Reference(LocationReference::Near {
             reference: Box::new(LocationReference::NamedPlace {
                 name: "Paris".to_string(),
             }),
             distance: Some(Distance::WalkingDistance),
         });
         let json = serde_json::to_string(&loc).unwrap();
-        let deserialized: TestLoc = serde_json::from_str(&json).unwrap();
+        let deserialized: UnresolvedLocation = serde_json::from_str(&json).unwrap();
         assert_eq!(loc, deserialized);
     }
 

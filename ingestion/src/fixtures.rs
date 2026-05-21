@@ -18,7 +18,7 @@ use chronoscope_core::{
     EntityTransition, Location, MoveMethod, NameType, UncertainDate, UnresolvedLocation, Usage,
 };
 
-type FixtureEntity = Entity<&'static str, &'static str>;
+type FixtureEntity = Entity<&'static str>;
 
 fn year(y: i32) -> UncertainDate {
     UncertainDate::with_precision(
@@ -65,7 +65,7 @@ fn lang(tag: &str) -> LanguageTag<String> {
     LanguageTag::parse(tag.to_string()).expect("hardcoded BCP 47 tag is valid")
 }
 
-fn coords(lat: f64, lon: f64, radius_m: Option<f64>) -> UnresolvedLocation<&'static str> {
+fn coords(lat: f64, lon: f64, radius_m: Option<f64>) -> UnresolvedLocation {
     let location = if let Some(r) = radius_m {
         Location::circle(lat, lon, r).expect("fixture coordinates always valid")
     } else {

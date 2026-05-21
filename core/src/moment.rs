@@ -113,11 +113,11 @@ impl TransitionRole {
 /// Borrows from the source transition list, so consumers that need access to
 /// shared metadata (description, location, cause) reach through `transition`.
 #[derive(Debug)]
-pub struct Moment<'a, E, S> {
+pub struct Moment<'a, S> {
     /// Index of the source transition in the entity's transition list.
     pub transition_index: usize,
     /// The source transition this moment was projected from.
-    pub transition: &'a EntityTransition<E, S>,
+    pub transition: &'a EntityTransition<S>,
     pub role: TransitionRole,
     /// The date for this specific endpoint. `None` when unknown.
     pub date: Option<&'a Cited<UncertainDate, S>>,
@@ -126,7 +126,7 @@ pub struct Moment<'a, E, S> {
     pub collapsed: bool,
 }
 
-impl<E, S> Moment<'_, E, S> {
+impl<S> Moment<'_, S> {
     /// Earliest possible date for this moment.
     #[must_use]
     pub fn earliest(&self) -> Option<NaiveDate> {
@@ -140,10 +140,10 @@ impl<E, S> Moment<'_, E, S> {
     }
 }
 
-fn push_point<'a, E, S>(
-    out: &mut Vec<Moment<'a, E, S>>,
+fn push_point<'a, S>(
+    out: &mut Vec<Moment<'a, S>>,
     transition_index: usize,
-    transition: &'a EntityTransition<E, S>,
+    transition: &'a EntityTransition<S>,
     role: TransitionRole,
     date: Option<&'a Cited<UncertainDate, S>>,
 ) {
@@ -164,8 +164,8 @@ fn push_point<'a, E, S>(
 /// the input order — sorting is the caller's responsibility via
 /// [`topological_order`].
 #[must_use]
-pub fn decompose<E, S>(transitions: &[EntityTransition<E, S>]) -> Vec<Moment<'_, E, S>> {
-    let mut out: Vec<Moment<'_, E, S>> = Vec::with_capacity(transitions.len() * 2);
+pub fn decompose<S>(transitions: &[EntityTransition<S>]) -> Vec<Moment<'_, S>> {
+    let mut out: Vec<Moment<'_, S>> = Vec::with_capacity(transitions.len() * 2);
     for (i, t) in transitions.iter().enumerate() {
         let (start_role, end_role, started, completed) = match t {
             EntityTransition::Constructed {
@@ -275,7 +275,7 @@ pub fn decompose<E, S>(transitions: &[EntityTransition<E, S>]) -> Vec<Moment<'_,
 ///
 /// Mid-life events have no structural ordering relative to each other.
 #[must_use]
-pub fn structural_edges<E, S>(moments: &[Moment<'_, E, S>]) -> Vec<(usize, usize)> {
+pub fn structural_edges<S>(moments: &[Moment<'_, S>]) -> Vec<(usize, usize)> {
     let mut edges = Vec::new();
     for (i, a) in moments.iter().enumerate() {
         for (j, b) in moments.iter().enumerate() {
@@ -314,7 +314,7 @@ pub fn structural_edges<E, S>(moments: &[Moment<'_, E, S>]) -> Vec<(usize, usize
 /// mid-life events), ties are broken by `(role, transition_index)` for
 /// determinism.
 #[must_use]
-pub fn topological_order<'a, E, S>(mut moments: Vec<Moment<'a, E, S>>) -> Vec<Moment<'a, E, S>> {
+pub fn topological_order<'a, S>(mut moments: Vec<Moment<'a, S>>) -> Vec<Moment<'a, S>> {
     let n = moments.len();
     if n == 0 {
         return moments;
@@ -380,7 +380,7 @@ pub fn topological_order<'a, E, S>(mut moments: Vec<Moment<'a, E, S>>) -> Vec<Mo
     }
 
     // Permute moments into the computed order.
-    let mut slots: Vec<Option<Moment<'a, E, S>>> = moments.drain(..).map(Some).collect();
+    let mut slots: Vec<Option<Moment<'a, S>>> = moments.drain(..).map(Some).collect();
     order.into_iter().filter_map(|i| slots[i].take()).collect()
 }
 
@@ -391,7 +391,7 @@ mod tests {
     use crate::evidence::Cited;
     use chrono::NaiveDate;
 
-    type T = EntityTransition<(), ()>;
+    type T = EntityTransition<()>;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn d(year: i32) -> Result<Cited<UncertainDate, ()>, Box<dyn std::error::Error>> {

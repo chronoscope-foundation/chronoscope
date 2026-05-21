@@ -7,12 +7,14 @@ pub mod consistency;
 pub mod date;
 pub mod entity;
 pub mod evidence;
+pub mod facts;
 pub mod ids;
 pub mod ingestion;
 pub mod links;
 pub mod location;
 pub mod merge;
 pub mod moment;
+pub mod nonempty;
 
 pub use annotation::{Annotation, AnnotationKind};
 pub use consistency::ConsistencyWarning;

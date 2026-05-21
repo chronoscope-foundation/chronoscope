@@ -19,7 +19,7 @@
 //! # Provenance
 //!
 //! Merge provenance lives alongside the entity, not inside it (option C from
-//! the design doc). The `Entity<E, S>` type stays clean. Merge output is shaped
+//! the design doc). The `Entity<S>` type stays clean. Merge output is shaped
 //! as a typed diff that a future versioning/edit-log system can store.
 
 use crate::entity::{Entity, EntityName, NameType};
@@ -38,10 +38,7 @@ fn name_sort_key(name: &EntityName) -> (&str, NameType, &str) {
 ///
 /// Names with identical `EntityName` values have their evidence merged.
 /// Transitions are bag-unioned without deduplication.
-pub fn merge_entities<E: Clone, S: Clone + PartialEq>(
-    a: Entity<E, S>,
-    b: Entity<E, S>,
-) -> Entity<E, S> {
+pub fn merge_entities<S: Clone + PartialEq>(a: Entity<S>, b: Entity<S>) -> Entity<S> {
     Entity {
         names: merge_cited_names(a.names, b.names),
         transitions: merge_transitions(a.transitions, b.transitions),
@@ -84,11 +81,11 @@ fn merge_evidence<S: Clone + PartialEq>(target: &mut Vec<Evidence<S>>, source: V
 ///
 /// Used by both `merge_transitions` and the `arb_clean_entity` proptest generator
 /// to ensure merge identity holds (`merge(a, empty) == a`).
-fn transition_cmp<E, S>(
-    x: &crate::entity::EntityTransition<E, S>,
-    y: &crate::entity::EntityTransition<E, S>,
+fn transition_cmp<S>(
+    x: &crate::entity::EntityTransition<S>,
+    y: &crate::entity::EntityTransition<S>,
 ) -> std::cmp::Ordering {
-    fn phase_key<E, S>(t: &crate::entity::EntityTransition<E, S>) -> u8 {
+    fn phase_key<S>(t: &crate::entity::EntityTransition<S>) -> u8 {
         match t {
             crate::entity::EntityTransition::Constructed { .. } => 0,
             crate::entity::EntityTransition::Demolished { .. } => 2,
@@ -111,10 +108,10 @@ fn transition_cmp<E, S>(
 ///
 /// Sorted for deterministic ordering. Since `EntityTransition` doesn't implement
 /// `Ord` (contains floats), we sort by a derived key.
-fn merge_transitions<E: Clone, S: Clone>(
-    mut a: Vec<crate::entity::EntityTransition<E, S>>,
-    b: Vec<crate::entity::EntityTransition<E, S>>,
-) -> Vec<crate::entity::EntityTransition<E, S>> {
+fn merge_transitions<S: Clone>(
+    mut a: Vec<crate::entity::EntityTransition<S>>,
+    b: Vec<crate::entity::EntityTransition<S>>,
+) -> Vec<crate::entity::EntityTransition<S>> {
     a.extend(b);
     a.sort_by(transition_cmp);
     a
@@ -139,14 +136,14 @@ mod tests {
         })
     }
 
-    fn empty_entity() -> Entity<(), ()> {
+    fn empty_entity() -> Entity<()> {
         Entity {
             names: vec![],
             transitions: vec![],
         }
     }
 
-    fn entity_with_name(name: &str) -> Entity<(), ()> {
+    fn entity_with_name(name: &str) -> Entity<()> {
         Entity {
             names: vec![make_name(name)],
             transitions: vec![],
@@ -216,11 +213,11 @@ mod tests {
             valid_to: None,
         };
 
-        let a: Entity<(), ()> = Entity {
+        let a: Entity<()> = Entity {
             names: vec![Cited::new(name.clone(), vec![ev_a.clone()])],
             transitions: vec![],
         };
-        let b: Entity<(), ()> = Entity {
+        let b: Entity<()> = Entity {
             names: vec![Cited::new(name, vec![ev_b.clone()])],
             transitions: vec![],
         };
@@ -242,7 +239,7 @@ mod tests {
             crate::date::DatePrecision::Year,
         )?;
 
-        let a: Entity<(), ()> = Entity {
+        let a: Entity<()> = Entity {
             names: vec![],
             transitions: vec![EntityTransition::Constructed {
                 started_at: Some(Cited::uncited(date_a)),
@@ -251,7 +248,7 @@ mod tests {
                 trigger_event: None,
             }],
         };
-        let b: Entity<(), ()> = Entity {
+        let b: Entity<()> = Entity {
             names: vec![],
             transitions: vec![EntityTransition::Damaged {
                 occurred_at: Some(Cited::uncited(date_b)),
@@ -294,7 +291,7 @@ mod tests {
             })
     }
 
-    fn arb_transition() -> impl Strategy<Value = EntityTransition<(), ()>> {
+    fn arb_transition() -> impl Strategy<Value = EntityTransition<()>> {
         let year_range = 1800i32..2100;
         prop_oneof![
             year_range
@@ -344,7 +341,7 @@ mod tests {
         ]
     }
 
-    fn arb_clean_entity() -> impl Strategy<Value = Entity<(), ()>> {
+    fn arb_clean_entity() -> impl Strategy<Value = Entity<()>> {
         (
             prop::collection::vec(arb_name(), 0..5),
             prop::collection::vec(arb_transition(), 0..4),

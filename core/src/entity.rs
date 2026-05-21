@@ -15,16 +15,15 @@ use crate::location::UnresolvedLocation;
 /// Core entity representing a building, infrastructure, natural feature, or area.
 ///
 /// Generic over:
-/// - `E` — entity reference type (e.g., `EntityId` for stored data, `EntityIdx` for ingestion)
 /// - `S` — source reference type (e.g., `SourceId` for stored data, `SourceIdx` for ingestion)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(bound(deserialize = "E: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
-pub struct Entity<E, S> {
+#[serde(bound(deserialize = "S: serde::de::DeserializeOwned"))]
+pub struct Entity<S> {
     pub names: Vec<Cited<EntityName, S>>,
-    pub transitions: Vec<EntityTransition<E, S>>,
+    pub transitions: Vec<EntityTransition<S>>,
 }
 
-impl<E, S> Entity<E, S> {
+impl<S> Entity<S> {
     /// Pick the best display name: prefer names whose language tag starts with `lang_prefix`,
     /// fall back to first available.
     #[must_use]
@@ -137,7 +136,6 @@ pub enum MoveMethod {
 /// - `Some(Cited { value, evidence })` = known value with optional supporting evidence
 ///
 /// Generic over:
-/// - `E` — entity reference type (used by `UnresolvedLocation<E>::NearEntity`)
 /// - `S` — source reference type (used by `Cited<T, S>` for evidence)
 #[serde_with::skip_serializing_none]
 #[derive(
@@ -145,12 +143,12 @@ pub enum MoveMethod {
 )]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
-#[serde(bound(deserialize = "E: serde::de::DeserializeOwned, S: serde::de::DeserializeOwned"))]
-pub enum EntityTransition<E, S> {
+#[serde(bound(deserialize = "S: serde::de::DeserializeOwned"))]
+pub enum EntityTransition<S> {
     Constructed {
         started_at: Option<Cited<UncertainDate, S>>,
         completed_at: Option<Cited<UncertainDate, S>>,
-        location: Option<Cited<UnresolvedLocation<E>, S>>,
+        location: Option<Cited<UnresolvedLocation, S>>,
         trigger_event: Option<TriggerEventId>,
     },
     Modified {
@@ -173,7 +171,7 @@ pub enum EntityTransition<E, S> {
     },
     Moved {
         occurred_at: Option<Cited<UncertainDate, S>>,
-        location: Option<Cited<UnresolvedLocation<E>, S>>,
+        location: Option<Cited<UnresolvedLocation, S>>,
         cause: Option<String>,
         method: Option<MoveMethod>,
         trigger_event: Option<TriggerEventId>,
@@ -204,7 +202,7 @@ pub type DateRange<'a, S> = (
     Option<&'a Cited<UncertainDate, S>>,
 );
 
-impl<E, S> EntityTransition<E, S> {
+impl<S> EntityTransition<S> {
     /// The earliest cited date known for this transition, across all of its
     /// date fields. Returns `None` only when no dates are set at all.
     ///
@@ -288,7 +286,7 @@ mod tests {
     use crate::evidence::Cited;
     use chrono::NaiveDate;
 
-    type T = EntityTransition<(), ()>;
+    type T = EntityTransition<()>;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn d(year: i32) -> Result<Cited<UncertainDate, ()>, Box<dyn std::error::Error>> {

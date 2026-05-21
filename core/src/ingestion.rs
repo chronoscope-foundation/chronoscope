@@ -16,12 +16,8 @@ use crate::links::ExternalLink;
 use crate::location::UnresolvedLocation;
 
 /// An image/media source for an entity.
-///
-/// Generic over `E` (entity reference type) because the location may contain
-/// `UnresolvedLocation::NearEntity` references.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(bound(deserialize = "E: serde::de::DeserializeOwned"))]
-pub struct ImageSource<E> {
+pub struct ImageSource {
     #[schemars(with = "String")]
     pub url: Url,
 
@@ -35,7 +31,7 @@ pub struct ImageSource<E> {
     /// coordinates. Will be enriched with geocoding, cross-referencing, and
     /// uncertainty modeling as the ingestion pipeline matures.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<UnresolvedLocation<E>>,
+    pub location: Option<UnresolvedLocation>,
 }
 
 /// Metadata about the ingestion process.
@@ -57,8 +53,8 @@ pub struct IngestionNotes {
     deserialize = "E: serde::de::DeserializeOwned + Ord, S: serde::de::DeserializeOwned + Ord, L: serde::de::DeserializeOwned + Ord"
 ))]
 pub struct IngestionBundle<E, S, L> {
-    pub entities: BTreeMap<E, Entity<E, S>>,
-    pub images: BTreeMap<S, ImageSource<E>>,
+    pub entities: BTreeMap<E, Entity<S>>,
+    pub images: BTreeMap<S, ImageSource>,
     pub external_links: BTreeMap<L, ExternalLink>,
 
     /// Maps entity key to link keys.
@@ -91,7 +87,7 @@ impl<E: Ord, S: Ord, L: Ord> IngestionBundle<E, S, L> {
 
     /// Create a bundle containing a single entity with no relations or sources.
     #[must_use]
-    pub fn single(key: E, entity: Entity<E, S>) -> Self {
+    pub fn single(key: E, entity: Entity<S>) -> Self {
         Self {
             entities: BTreeMap::from([(key, entity)]),
             ..Self::new()
@@ -243,7 +239,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn test_entity() -> Entity<&'static str, &'static str> {
+    fn test_entity() -> Entity<&'static str> {
         Entity {
             names: vec![],
             transitions: vec![],

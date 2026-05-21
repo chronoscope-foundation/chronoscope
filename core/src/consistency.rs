@@ -11,8 +11,8 @@ use crate::date::UncertainDate;
 use crate::entity::{Entity, EntityTransition};
 use crate::moment::{Moment, decompose, structural_edges};
 
-// Consistency checking is generic over entity/source reference types — it only
-// inspects dates and names, never the reference types themselves.
+// Consistency checking is generic over the source reference type — it only
+// inspects dates and names, never the reference type itself.
 
 /// A consistency warning carrying structured data.
 ///
@@ -60,7 +60,7 @@ pub enum ConsistencyWarning {
 /// transitions directly. Whether that's the right surface for validation is
 /// an open question — it may change when the spatiotemporal solver lands,
 /// which will need to reason about constraints more holistically.
-fn find_violations<E, S>(moments: &[Moment<'_, E, S>]) -> Vec<ConsistencyWarning> {
+fn find_violations<S>(moments: &[Moment<'_, S>]) -> Vec<ConsistencyWarning> {
     let edges = structural_edges(moments);
     let mut warnings = Vec::new();
 
@@ -97,7 +97,7 @@ fn find_violations<E, S>(moments: &[Moment<'_, E, S>]) -> Vec<ConsistencyWarning
     warnings
 }
 
-impl<E, S> Entity<E, S> {
+impl<S> Entity<S> {
     /// Check this entity for consistency issues.
     ///
     /// Temporal violations (`CompletionBeforeStart`, `EventsOutOfOrder`,
@@ -145,9 +145,9 @@ mod tests {
     use crate::evidence::Cited;
     use chrono::NaiveDate;
 
-    // Tests use () for entity/source refs since consistency checking doesn't inspect them.
-    type TestEntity = Entity<(), ()>;
-    type TestTransition = EntityTransition<(), ()>;
+    // Tests use () for the source ref since consistency checking doesn't inspect it.
+    type TestEntity = Entity<()>;
+    type TestTransition = EntityTransition<()>;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn d(y: i32, m: u32, day: u32) -> Result<NaiveDate, &'static str> {

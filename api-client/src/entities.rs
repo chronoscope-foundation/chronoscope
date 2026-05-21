@@ -39,7 +39,7 @@ pub struct EntitySummary {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntityResponse {
     pub id: EntityId,
-    pub entity: Entity<EntityId, SourceId>,
+    pub entity: Entity<SourceId>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
     pub links: Vec<EntityLinkSummary>,

@@ -595,7 +595,7 @@ async fn test_get_or_create_media_with_location() -> DbResult<()> {
             .await?;
     let (meta_json,) =
         meta_row.ok_or_else(|| DbError::InvalidArgument("media should exist".to_string()))?;
-    let loc: UnresolvedLocation<EntityId> = serde_json::from_str(&meta_json)
+    let loc: UnresolvedLocation = serde_json::from_str(&meta_json)
         .map_err(|e| DbError::InvalidArgument(format!("bad json: {e}")))?;
     match loc {
         UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) => {

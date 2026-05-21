@@ -140,20 +140,19 @@ fn url_link(link_type: LinkType) -> PropertyHandler {
 fn handle_osm_relation(claims: &[Claim], _ctx: &PropertyContext<'_>) -> HandlerOutput {
     let mut out = HandlerOutput::new();
     for claim in claims {
-        match claim.mainsnak.string_value() {
-            Some(id_str) => match id_str.parse::<i64>() {
-                Ok(element_id) => {
-                    out.add_link(ExternalLink {
-                        target: LinkTarget::OpenStreetMap {
-                            element_type: OsmElementType::Relation,
-                            element_id: OsmId(element_id),
-                        },
-                        link_type: LinkType::SameAs,
-                    });
-                }
-                Err(e) => out.issue(format!("invalid OSM relation ID '{id_str}': {e}")),
-            },
-            None => out.issue("claim has no string value"),
+        let Some(id_str) = claim.mainsnak.string_value() else {
+            out.issue("claim has no string value");
+            continue;
+        };
+        match id_str.parse::<u64>() {
+            Ok(element_id) => out.add_link(ExternalLink {
+                target: LinkTarget::OpenStreetMap {
+                    element_type: OsmElementType::Relation,
+                    element_id: OsmId::new(element_id),
+                },
+                link_type: LinkType::SameAs,
+            }),
+            Err(e) => out.issue(format!("invalid OSM relation ID '{id_str}': {e}")),
         }
     }
     out
@@ -417,13 +416,15 @@ mod tests {
         let output = handler(&claims, &ctx)?;
 
         assert_eq!(output.links.len(), 1);
-        assert!(matches!(
-            &output.links[0].target,
-            LinkTarget::OpenStreetMap {
-                element_type: OsmElementType::Relation,
-                element_id: OsmId(12345),
-            }
-        ));
+        let LinkTarget::OpenStreetMap {
+            element_type,
+            element_id,
+        } = &output.links[0].target
+        else {
+            return Err("expected OpenStreetMap target".into());
+        };
+        assert_eq!(*element_type, OsmElementType::Relation);
+        assert_eq!(element_id.get(), 12345);
         assert_eq!(output.links[0].link_type, LinkType::SameAs);
         Ok(())
     }
@@ -562,8 +563,8 @@ mod tests {
             revision_id,
         } = &cited.evidence[0]
         {
-            assert_eq!(entity_id.0, "Q100");
-            assert_eq!(property_id.0, "P571");
+            assert_eq!(entity_id.as_str(), "Q100");
+            assert_eq!(property_id.as_str(), "P571");
             assert_eq!(property_value, "test_raw");
             assert_eq!(*revision_id, 42);
         } else {

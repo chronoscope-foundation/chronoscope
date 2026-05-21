@@ -146,7 +146,7 @@ pub struct MediaData {
     pub height: i32,
     pub duration_seconds: Option<f32>,
     pub captured: Option<UncertainDate>,
-    pub location: Option<chronoscope_core::UnresolvedLocation<EntityId>>,
+    pub location: Option<chronoscope_core::UnresolvedLocation>,
     pub source_metadata: Option<String>, // JSON stored as text
     pub fetched_at: NaiveDateTime,
 }
@@ -196,12 +196,12 @@ pub struct Coordinates {
 
 /// An entity as stored in the database.
 ///
-/// Wraps `chronoscope_core::entity::Entity<EntityId, SourceId>` (the domain model) with
+/// Wraps `chronoscope_core::entity::Entity<SourceId>` (the domain model) with
 /// database metadata: ID, timestamps, and cached shadow columns.
 #[derive(Debug, Clone)]
 pub struct Entity {
     pub id: EntityId,
-    pub entity: chronoscope_core::entity::Entity<EntityId, SourceId>,
+    pub entity: chronoscope_core::entity::Entity<SourceId>,
     pub temporal_bounds: Option<DateRange>,
     pub location: Option<Coordinates>,
     pub created_at: NaiveDateTime,
@@ -278,8 +278,8 @@ pub struct Annotation {
 ///
 /// Scans all transitions for the earliest and latest dates across all
 /// date fields (`started_at`, `completed_at`, `occurred_at`).
-pub fn extract_temporal_bounds<E, S>(
-    entity: &chronoscope_core::entity::Entity<E, S>,
+pub fn extract_temporal_bounds<S>(
+    entity: &chronoscope_core::entity::Entity<S>,
 ) -> (Option<NaiveDate>, Option<NaiveDate>) {
     let mut earliest: Option<NaiveDate> = None;
     let mut latest: Option<NaiveDate> = None;
@@ -303,9 +303,7 @@ pub fn extract_temporal_bounds<E, S>(
 ///
 /// Returns the last coordinate found scanning transitions, so that entities
 /// which moved reflect their most recent location.
-pub fn extract_location<E, S>(
-    entity: &chronoscope_core::entity::Entity<E, S>,
-) -> Option<(f64, f64)> {
+pub fn extract_location<S>(entity: &chronoscope_core::entity::Entity<S>) -> Option<(f64, f64)> {
     let mut result = None;
 
     for transition in &entity.transitions {
@@ -346,11 +344,10 @@ mod tests {
 
     #[test]
     fn extract_temporal_bounds_empty() {
-        let entity: chronoscope_core::entity::Entity<EntityId, SourceId> =
-            chronoscope_core::entity::Entity {
-                names: vec![],
-                transitions: vec![],
-            };
+        let entity: chronoscope_core::entity::Entity<SourceId> = chronoscope_core::entity::Entity {
+            names: vec![],
+            transitions: vec![],
+        };
         let (earliest, latest) = extract_temporal_bounds(&entity);
         assert!(earliest.is_none());
         assert!(latest.is_none());
@@ -363,16 +360,15 @@ mod tests {
             chrono::NaiveDate::from_ymd_opt(1889, 1, 1).ok_or("bad date")?,
             DatePrecision::Year,
         )?;
-        let entity: chronoscope_core::entity::Entity<EntityId, SourceId> =
-            chronoscope_core::entity::Entity {
-                names: vec![],
-                transitions: vec![chronoscope_core::entity::EntityTransition::Constructed {
-                    started_at: None,
-                    completed_at: Some(Cited::uncited(date)),
-                    location: None,
-                    trigger_event: None,
-                }],
-            };
+        let entity: chronoscope_core::entity::Entity<SourceId> = chronoscope_core::entity::Entity {
+            names: vec![],
+            transitions: vec![chronoscope_core::entity::EntityTransition::Constructed {
+                started_at: None,
+                completed_at: Some(Cited::uncited(date)),
+                location: None,
+                trigger_event: None,
+            }],
+        };
         let (earliest, latest) = extract_temporal_bounds(&entity);
         // completed_at populates both earliest and latest
         let earliest_d = earliest.ok_or("no earliest")?;
@@ -384,18 +380,17 @@ mod tests {
     #[test]
     fn extract_location_from_constructed() -> Result<(), Box<dyn std::error::Error>> {
         use chronoscope_core::{Cited, Location, UnresolvedLocation};
-        let loc: UnresolvedLocation<EntityId> =
+        let loc: UnresolvedLocation =
             UnresolvedLocation::Resolved(Location::point(48.8584, 2.2945)?);
-        let entity: chronoscope_core::entity::Entity<EntityId, SourceId> =
-            chronoscope_core::entity::Entity {
-                names: vec![],
-                transitions: vec![chronoscope_core::entity::EntityTransition::Constructed {
-                    started_at: None,
-                    completed_at: None,
-                    location: Some(Cited::uncited(loc)),
-                    trigger_event: None,
-                }],
-            };
+        let entity: chronoscope_core::entity::Entity<SourceId> = chronoscope_core::entity::Entity {
+            names: vec![],
+            transitions: vec![chronoscope_core::entity::EntityTransition::Constructed {
+                started_at: None,
+                completed_at: None,
+                location: Some(Cited::uncited(loc)),
+                trigger_event: None,
+            }],
+        };
         let (lat, lon) = extract_location(&entity).ok_or("no location")?;
         assert!((lat - 48.8584).abs() < f64::EPSILON);
         assert!((lon - 2.2945).abs() < f64::EPSILON);

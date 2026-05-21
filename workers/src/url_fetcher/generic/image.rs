@@ -8,7 +8,7 @@ use std::io::Cursor;
 use bytes::Bytes;
 use chrono::Utc;
 use chronoscope_core::{Location, UncertainDate, UnresolvedLocation};
-use chronoscope_db::{EntityId, MediaData, MediaType, ResearchUrl};
+use chronoscope_db::{MediaData, MediaType, ResearchUrl};
 use image::{GenericImageView, ImageEncoder};
 use image_hasher::{HashAlg, HasherConfig};
 use tracing::instrument;
@@ -158,7 +158,7 @@ fn generate_thumbnail(img: &image::DynamicImage) -> Result<Bytes, String> {
 ///
 /// Returns captured timestamp (as `UncertainDate` with second precision)
 /// and GPS location (as `UnresolvedLocation::Resolved(Location::Circle)`) if available.
-pub fn extract_exif(body: &Bytes) -> (Option<UncertainDate>, Option<UnresolvedLocation<EntityId>>) {
+pub fn extract_exif(body: &Bytes) -> (Option<UncertainDate>, Option<UnresolvedLocation>) {
     let cursor = Cursor::new(body.as_ref());
     let exif_reader = exif::Reader::new();
 
@@ -197,7 +197,7 @@ fn extract_capture_time(exif: &exif::Exif) -> Option<UncertainDate> {
 }
 
 /// Extract GPS location from EXIF data as `UnresolvedLocation::Resolved(Location::Circle)`.
-fn extract_gps_location(exif: &exif::Exif) -> Option<UnresolvedLocation<EntityId>> {
+fn extract_gps_location(exif: &exif::Exif) -> Option<UnresolvedLocation> {
     let lat = exif.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY)?;
     let lat_ref = exif.get_field(exif::Tag::GPSLatitudeRef, exif::In::PRIMARY)?;
     let lon = exif.get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY)?;

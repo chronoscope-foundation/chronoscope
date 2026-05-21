@@ -89,7 +89,10 @@ impl LinkTarget {
         match self {
             Self::Wikidata { entity_id } => {
                 let mut url = base("https://www.wikidata.org");
-                url.set_path(&format!("/wiki/{}", urlencoding::encode(&entity_id.0)));
+                url.set_path(&format!(
+                    "/wiki/{}",
+                    urlencoding::encode(entity_id.as_str())
+                ));
                 url
             }
             Self::OpenStreetMap {
@@ -102,7 +105,7 @@ impl LinkTarget {
                     OsmElementType::Relation => "relation",
                 };
                 let mut url = base("https://www.openstreetmap.org");
-                url.set_path(&format!("/{type_str}/{}", element_id.0));
+                url.set_path(&format!("/{type_str}/{}", element_id.get()));
                 url
             }
             Self::Pleiades { place_id } => {
@@ -133,12 +136,12 @@ impl LinkTarget {
             }
             Self::GeoNames { id } => {
                 let mut url = base("https://www.geonames.org");
-                url.set_path(&format!("/{}", id.0));
+                url.set_path(&format!("/{}", id.get()));
                 url
             }
             Self::GettyTgn { id } => {
                 let mut url = base("https://vocab.getty.edu");
-                url.set_path(&format!("/page/tgn/{}", id.0));
+                url.set_path(&format!("/page/tgn/{}", id.get()));
                 url
             }
             Self::Sanborn { item_id, panel } => {

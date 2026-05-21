@@ -21,6 +21,9 @@ schemars.workspace = true
 url.workspace = true
 oxilangtag.workspace = true
 strum.workspace = true
+sha2.workspace = true
+hex.workspace = true
+serde_jcs.workspace = true
 urlencoding = "2.1"
 sqlx = { version = "0.8", default-features = false, features = ["derive"], optional = true }
 

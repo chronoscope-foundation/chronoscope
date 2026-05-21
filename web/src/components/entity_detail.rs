@@ -471,7 +471,7 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
 }
 
 /// Map a [`Moment`] to a display row.
-fn moment_to_row(m: &Moment<'_, EntityId, chronoscope_api_client::SourceId>) -> TimelineRow {
+fn moment_to_row(m: &Moment<'_, chronoscope_api_client::SourceId>) -> TimelineRow {
     TimelineRow {
         label: role_label(m.role, m.collapsed),
         date: m.date.map(|c| c.value.clone()),
@@ -510,7 +510,7 @@ fn role_label(role: TransitionRole, collapsed: bool) -> &'static str {
 }
 
 /// Secondary display text for a moment, extracted from the parent transition.
-fn moment_description<E, S>(m: &Moment<'_, E, S>) -> Option<String> {
+fn moment_description<S>(m: &Moment<'_, S>) -> Option<String> {
     match m.transition {
         EntityTransition::Modified { description, .. }
         | EntityTransition::Repaired { description, .. }
