@@ -92,7 +92,7 @@ use crate::location::UnresolvedLocation;
 ///
 /// Generic over the entity reference type `EntId`. See the module-level
 /// "Error states" section for the `Demolition::Location` rejection rule.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "EntId: Serialize",

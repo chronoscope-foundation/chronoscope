@@ -504,7 +504,7 @@ pub enum ExternalSource {
 /// flavors of warrant: an external citation, the researcher's personal
 /// knowledge, a chain of reasoning over existing facts, or a direct
 /// image observation with optional region attribution.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum JudgmentSource {
     /// External evidence wrapping any [`ExternalSource`]. Preferred when

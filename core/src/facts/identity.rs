@@ -38,8 +38,7 @@ use serde::{Deserialize, Serialize};
 /// Identity-cluster fact.
 ///
 /// Generic over the three reference kinds carried by the equivalence
-/// variants. `Eq` is derivable here — none of the variants reach `f64`
-/// coordinates; they hold pairs of opaque identifiers.
+/// variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(bound(

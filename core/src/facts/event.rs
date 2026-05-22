@@ -177,7 +177,7 @@ use crate::location::UnresolvedLocation;
 ///
 /// Generic over the entity reference type `EntId` and the lifetime-event
 /// reference type `EvtId`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "EntId: Serialize, EvtId: Serialize",
@@ -332,7 +332,7 @@ impl std::ops::Sub for Days {
 /// lifetime event by reference (anywhere inside the entity's lifetime),
 /// the *completion* of construction (the first moment the entity
 /// existed), and the *start* of demolition (the last moment it existed).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "EntId: Serialize, EvtId: Serialize",
@@ -374,7 +374,7 @@ pub enum OrderableEvent<EntId, EvtId> {
 /// - When both are present, `min_days <= max_days`.
 ///
 /// Non-negativity is structural — [`Days`] is a `u64` newtype.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(
     serialize = "EntId: Serialize, EvtId: Serialize",
     deserialize = "EntId: serde::de::DeserializeOwned, EvtId: serde::de::DeserializeOwned"

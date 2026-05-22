@@ -71,7 +71,7 @@ pub enum Perspective {
 /// Depiction-cluster fact.
 ///
 /// Generic over the entity and image (image) reference types.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "EntId: Serialize, ImgId: Serialize",

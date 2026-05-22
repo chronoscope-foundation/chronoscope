@@ -46,7 +46,7 @@ use crate::facts::spatial::TopologicalRel;
 /// Observation-cluster fact.
 ///
 /// Generic only over the entity reference type.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "EntId: Serialize",

@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 /// every involved entity already has a minted id (either previously
 /// known or freshly minted at submission for newly-mentioned entities);
 /// the relation never carries a description-shaped reference.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "EntId: Serialize",

@@ -41,8 +41,10 @@ use crate::ids::{OhmId, OsmElementType, OsmId};
 
 /// Errors from location construction or validation.
 ///
-/// `Eq` is not derived because the f64-carrying variants reach
-/// non-`Eq` values.
+/// `Eq` is not derived because this is the one place the f64 fields
+/// genuinely carry non-`Eq` values — the rejected input being echoed
+/// back may be `NaN` or infinite. Constructed `Location` / `GeoPoint`
+/// values, which route through the smart constructors, do derive `Eq`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocationError {
     /// `OneOf` / `UnionOf` requires at least 2 entries.
@@ -92,6 +94,10 @@ impl std::error::Error for LocationError {}
 ///
 /// No external references — purely geometric. The lattice (merge via subsumption
 /// + union) is defined on this type.
+///
+/// `Eq` is sound here because every reachable `Circle` routes through
+/// [`Location::circle`], which rejects `NaN` and infinity. The derive
+/// macro can't see that, so `Eq` is implemented manually.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Location {
@@ -105,6 +111,8 @@ pub enum Location {
     /// No geometric information (resolution failed, or genuinely unknown).
     Unbounded,
 }
+
+impl Eq for Location {}
 
 impl<'de> Deserialize<'de> for Location {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -275,7 +283,7 @@ pub(crate) fn validate_coordinates(lat: f64, lon: f64) -> Result<(), LocationErr
 /// Uses adjacently-tagged serde (`tag` + `content`) because `Resolved` wraps
 /// a [`Location`] which has its own internal `type` tag — internal tagging
 /// on both levels would produce duplicate `type` fields.
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum UnresolvedLocation {
     /// Already resolved to geometry.
@@ -340,7 +348,7 @@ impl<'de> Deserialize<'de> for UnresolvedLocation {
 /// [`crate::facts::attribute::Fact::Relationship`], not here. See the
 /// module-level "Entity vs. region scope" note.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LocationReference {
     /// OpenStreetMap element reference.
@@ -379,7 +387,7 @@ pub enum Elevation {
 }
 
 /// Qualitative distance descriptions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Distance {
     Adjacent,

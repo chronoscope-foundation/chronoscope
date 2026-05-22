@@ -57,7 +57,7 @@ use crate::facts::{
 /// life-stage information attaches to a
 /// [`LifetimeEventId`](crate::facts::ids::LifetimeEventId) via the
 /// event-relative cluster.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "category", content = "fact", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "attribute::Fact<EntId>: Serialize, bookend::Fact<EntId>: Serialize, event::Fact<EntId, EvtId>: Serialize, image::Fact<ImgId>: Serialize, picture::Fact<ImgId>: Serialize, map::Fact<ImgId>: Serialize",
@@ -91,7 +91,7 @@ pub enum FactualAssertion<EntId, EvtId, ImgId> {
 /// X appears in medium M" is interpretive even when supported by a
 /// caption: the researcher or model interprets the visual or textual
 /// content rather than recording a directly-observed external fact.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "category", content = "fact", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "identity::Fact<EntId, EvtId, ImgId>: Serialize, depiction::Fact<EntId, ImgId>: Serialize, observation::Fact<EntId>: Serialize, composites::Fact<ImgId>: Serialize",

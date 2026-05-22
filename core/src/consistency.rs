@@ -18,7 +18,7 @@ use crate::moment::{Moment, decompose, structural_edges};
 ///
 /// Presentation-layer code is responsible for formatting these into human-readable
 /// messages (enabling multilingual UIs and machine reasoning over warnings).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConsistencyWarning {
     /// A transition's completion date is before its start date.

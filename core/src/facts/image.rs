@@ -50,7 +50,7 @@ use crate::date::UncertainDate;
 /// underlying artifact those bytes represent.
 ///
 /// Generic over the image reference type `ImgId`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "ImgId: Serialize",

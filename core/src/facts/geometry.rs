@@ -230,14 +230,17 @@ impl std::error::Error for ProportionalRectError {}
 /// `lon` ∈ `[-180, 180]`). Deserialization routes through it so wire-
 /// invalid points fail at the boundary.
 ///
-/// `Eq` is not derivable because the type carries `f64`, but the smart
-/// constructor's NaN/Inf rejection means the constructed values do have
-/// well-defined `PartialEq`.
+/// `Eq` is sound because the constructor refuses `NaN` and infinity, so
+/// reflexive equality holds for every constructed value. The derive
+/// macro can't see the validation, so `Eq` is implemented manually
+/// (same pattern as [`ProportionalRect`]).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema)]
 pub struct GeoPoint {
     lat: f64,
     lon: f64,
 }
+
+impl Eq for GeoPoint {}
 
 impl GeoPoint {
     /// Construct a geo-point. `lat` must lie in `[-90, 90]`, `lon` in
@@ -321,7 +324,7 @@ impl std::error::Error for GeoPointError {}
 /// boundaries) where a region mask is the wrong shape. The smart
 /// constructor [`Polyline::new`] enforces the minimum-point invariant at
 /// the parse boundary; the typed interior trusts the value.
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Polyline {
     points: Vec<GeoPoint>,
 }
@@ -387,7 +390,7 @@ impl std::error::Error for PolylineError {}
 /// Either an image region (mask or bbox) or a polyline trace.
 /// Region is typical for areal features; polyline is typical for linear
 /// features traced from the sheet.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SpatialGeometry {
     /// Image region — mask or bbox.

@@ -71,8 +71,7 @@ use crate::facts::citations::ExternalReference;
 
 /// Attribute-cluster fact.
 ///
-/// Generic over the entity reference type `EntId`. `Eq` is derivable here —
-/// none of the variants reach `f64` coordinates.
+/// Generic over the entity reference type `EntId`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(bound(

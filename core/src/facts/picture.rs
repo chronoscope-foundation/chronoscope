@@ -46,7 +46,7 @@ use crate::location::UnresolvedLocation;
 /// [`UnresolvedLocation`] whose entity-scale containment is expressed
 /// via [`crate::facts::attribute::Fact::Relationship`] on the relevant
 /// entities, not embedded in the location reference.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[serde(bound(
     serialize = "ImgId: Serialize",

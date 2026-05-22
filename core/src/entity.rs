@@ -16,7 +16,7 @@ use crate::location::UnresolvedLocation;
 ///
 /// Generic over:
 /// - `S` — source reference type (e.g., `SourceId` for stored data, `SourceIdx` for ingestion)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(deserialize = "S: serde::de::DeserializeOwned"))]
 pub struct Entity<S> {
     pub names: Vec<Cited<EntityName, S>>,
@@ -139,7 +139,7 @@ pub enum MoveMethod {
 /// - `S` — source reference type (used by `Cited<T, S>` for evidence)
 #[serde_with::skip_serializing_none]
 #[derive(
-    Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, strum::Display, strum::AsRefStr,
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, strum::Display, strum::AsRefStr,
 )]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
