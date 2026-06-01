@@ -222,6 +222,13 @@ impl<T: QueueItem> Queue<T> {
     }
 
     /// Bump the in-process worker-progress counter. No-op without `test-support`.
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(
+            clippy::unused_self,
+            reason = "self carries worker_progress_tx, used under test/test-support; &self keeps one uniform signature across cfgs (callers do self.notify_worker_progress())"
+        )
+    )]
     fn notify_worker_progress(&self) {
         #[cfg(any(test, feature = "test-support"))]
         // wrapping: subscribers only care about changedness, not the value;

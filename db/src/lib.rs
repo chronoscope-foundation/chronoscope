@@ -183,6 +183,13 @@ impl Database {
     /// `test-support`. Called by the success-side status-flip methods so
     /// `Database::worker_progress` subscribers can drive an event-driven
     /// wait instead of wallclock polling.
+    #[cfg_attr(
+        not(any(test, feature = "test-support")),
+        expect(
+            clippy::unused_self,
+            reason = "self carries worker_progress_tx, used under test/test-support; &self keeps one uniform signature across cfgs (callers do self.notify_worker_progress())"
+        )
+    )]
     pub(crate) fn notify_worker_progress(&self) {
         #[cfg(any(test, feature = "test-support"))]
         // wrapping: subscribers only care about changedness, not the value;
