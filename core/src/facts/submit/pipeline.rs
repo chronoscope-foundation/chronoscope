@@ -10,8 +10,9 @@
 //! - [`match_entities`] / [`match_images`] — resolve each [`Decl::Local`]
 //!   against the unified view, returning [`MatchOutcome::Matched`] for a
 //!   single hit or [`MatchOutcome::Mint`] otherwise.
-//! - [`validate_submit`] — runs the submit-rule checks (today,
-//!   retraction/supersession target existence) over the in-flight commit.
+//! - [`validate_submit`] — runs the submit-rule checks (meta-fact target
+//!   existence and the same-commit / self-replacement guards) over the
+//!   in-flight commit.
 //!
 //! Commit-id derivation lives on [`Commit::id`](super::Commit::id); backends
 //! call `bundle.id()?`.
@@ -36,7 +37,7 @@ use super::result::{
 use super::{Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use crate::facts::identity::{IdMapError, SelfLoop};
-use crate::facts::ids::SubjectKind;
+use crate::facts::ids::{FactId, SubjectKind};
 use crate::facts::store::{
     FactStore, FactView, StoredFactOf, SubmitCommitError, SubmitCommitInput, SubmitCommitOutput,
 };
@@ -171,58 +172,59 @@ pub async fn match_images<S: FactStore, V: FactView<S>>(
 
 /// Run the submit-rule checks over the in-flight commit.
 ///
-/// The only rule today is retraction/supersession target existence. A
-/// meta-assertion may not target a fact or commit in the same commit (see the
-/// [`MetaAssertion`] doc), so each target resolves against `view` (the
-/// committed snapshot), never against `candidates`:
+/// Each [`MetaAssertion`] target resolves against `view` (the committed
+/// snapshot unioned with this commit's already-pushed facts), and
+/// `first_in_commit_fact_id` (the committed fact count at lock time) is the
+/// boundary that classifies a fact target as pre-existing or same-commit:
 ///
-/// - [`MetaAssertion::RetractFact`] and [`MetaAssertion::SupersedeFact`] name
-///   a `target` [`FactId`](crate::facts::ids::FactId), resolved via
-///   [`FactView::fact`]. [`FactLookup::Unknown`] or [`FactLookup::Future`]
-///   means no such target — [`SubmitError::FactNotFound`].
-///   [`FactLookup::Active`] and [`FactLookup::Retracted`] both denote an
-///   existing fact (re-retracting a retracted one is legitimate).
-/// - [`MetaAssertion::RetractCommit`] names a target
+/// - [`MetaAssertion::RetractFact`] / [`MetaAssertion::SupersedeFact`] name a
+///   `target` [`FactId`]. A target resolving to [`FactLookup::Unknown`] /
+///   [`FactLookup::Future`] doesn't exist ([`SubmitError::FactNotFound`]); one
+///   at-or-above the boundary is a fact in this commit
+///   ([`SubmitError::MetaTargetInSameCommit`]); a pre-existing one passes.
+///   `SupersedeFact` also rejects `target == replacement`
+///   ([`SubmitError::SupersedeReplacementEqualsTarget`]) and requires
+///   `replacement` to name an existing fact — prior or minted in this commit —
+///   else [`SubmitError::FactNotFound`].
+/// - [`MetaAssertion::RetractCommit`] names a `target`
 ///   [`CommitId`](crate::facts::ids::CommitId), resolved via
 ///   [`FactView::commit_known`]. An unrecorded commit is
-///   [`SubmitError::CommitNotFound`]; a recorded one (even
-///   previously-retracted) passes.
+///   [`SubmitError::CommitNotFound`]; a recorded one passes.
 ///
-/// `SupersedeFact::replacement` is not checked: it may live in the same
-/// commit, so it isn't visible through `view` yet.
+/// Async: target lookups go through `view.fact(...)` / `view.commit_known(...)`,
+/// served from memory here and from the open transaction in a SQL backend.
 ///
-/// Async: target lookups go through `view.fact(...)` / `view.commit_known(...)`.
-/// The in-memory backend's `Send` mutex guard lets those reads run inside the
-/// held-lock region, while a SQL backend issues them inside its transaction.
-///
-/// Returns `Result<(), SubmitCommitError<S::Error, …>>` to express both rule
-/// rejections (`Submit` arm) and backend read failures (`Backend` arm).
+/// Returns `Result<(), SubmitCommitError<…>>` — rule rejections in the `Submit`
+/// arm, backend read failures in the `Backend` arm.
 pub async fn validate_submit<S: FactStore, V: FactView<S>>(
     candidates: &[StoredFactOf<S>],
     view: &V,
+    first_in_commit_fact_id: FactId,
 ) -> Result<(), SubmitCommitError<S::Error, S::EntityId, S::EventId, S::ImageId>> {
     for fact in candidates {
         let StoredFact::Meta(meta) = fact else {
             continue;
         };
-        // Each meta target resolves against `view`, not `candidates`.
-        // FactId targets go through `view.fact`, the CommitId target through
-        // `view.commit_known`. Exhaustive so a new variant forces a decision.
+        // Exhaustive so a new MetaAssertion variant forces a decision here.
         match &meta.assertion {
-            MetaAssertion::RetractFact { target, .. }
-            | MetaAssertion::SupersedeFact { target, .. } => {
-                let lookup = view
-                    .fact(*target)
-                    .await
-                    .map_err(SubmitCommitError::Backend)?;
-                match lookup {
-                    // Minted at-or-before the snapshot, so it exists as a target.
-                    FactLookup::Active(_) | FactLookup::Retracted { .. } => {}
-                    // Never minted, or not yet visible: no such target.
-                    FactLookup::Unknown | FactLookup::Future => {
-                        return Err(SubmitError::FactNotFound { id: *target }.into());
-                    }
+            MetaAssertion::RetractFact { target, .. } => {
+                check_meta_fact_target(view, *target, first_in_commit_fact_id).await?;
+            }
+            MetaAssertion::SupersedeFact {
+                target,
+                replacement,
+                ..
+            } => {
+                if target == replacement {
+                    return Err(
+                        SubmitError::SupersedeReplacementEqualsTarget { target: *target }.into(),
+                    );
                 }
+                check_meta_fact_target(view, *target, first_in_commit_fact_id).await?;
+                // The replacement is the corrected fact; require only that it
+                // names a real fact — a prior one, or one minted in this commit
+                // (already visible through `view`).
+                require_existing_fact(view, *replacement).await?;
             }
             MetaAssertion::RetractCommit { target, .. } => {
                 let known = view
@@ -236,6 +238,37 @@ pub async fn validate_submit<S: FactStore, V: FactView<S>>(
         }
     }
     Ok(())
+}
+
+/// Resolve a retract/supersede fact-target against the committed view.
+///
+/// A target must already exist (`Active` or `Retracted`) and predate this
+/// commit. A target minted in this commit is
+/// [`SubmitError::MetaTargetInSameCommit`]; a never-minted id is
+/// [`SubmitError::FactNotFound`].
+async fn check_meta_fact_target<S: FactStore, V: FactView<S>>(
+    view: &V,
+    target: FactId,
+    first_in_commit_fact_id: FactId,
+) -> Result<(), SubmitCommitError<S::Error, S::EntityId, S::EventId, S::ImageId>> {
+    require_existing_fact(view, target).await?;
+    if target.get() >= first_in_commit_fact_id.get() {
+        return Err(SubmitError::MetaTargetInSameCommit { target }.into());
+    }
+    Ok(())
+}
+
+/// Error unless `id` resolves to an existing fact (`Active` or `Retracted`).
+/// A never-minted or not-yet-visible id is [`SubmitError::FactNotFound`].
+async fn require_existing_fact<S: FactStore, V: FactView<S>>(
+    view: &V,
+    id: FactId,
+) -> Result<(), SubmitCommitError<S::Error, S::EntityId, S::EventId, S::ImageId>> {
+    let lookup = view.fact(id).await.map_err(SubmitCommitError::Backend)?;
+    match lookup {
+        FactLookup::Active(_) | FactLookup::Retracted { .. } => Ok(()),
+        FactLookup::Unknown | FactLookup::Future => Err(SubmitError::FactNotFound { id }.into()),
+    }
 }
 
 // ============================================================================

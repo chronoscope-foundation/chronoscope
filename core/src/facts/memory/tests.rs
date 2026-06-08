@@ -154,6 +154,80 @@ fn retract_commit_fact(
     })
 }
 
+/// A `RetractFact` meta-fact targeting `target`. Declares no subjects (the
+/// target is a `FactId`), mirroring [`retract_commit_fact`].
+fn retract_fact(
+    target: crate::facts::ids::FactId,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Meta {
+        assertion: crate::facts::assertions::MetaAssertion::RetractFact {
+            target,
+            reason: crate::facts::assertions::RetractionReason::FactualError,
+        },
+        citation: crate::facts::citations::MetaSource::PersonalKnowledge {
+            user: UserId::new("alice"),
+            justification: Justification::new("The targeted fact is wrong.")?,
+        },
+    })
+}
+
+/// A `SupersedeFact` meta-fact replacing `target` with `replacement`.
+fn supersede_fact(
+    target: crate::facts::ids::FactId,
+    replacement: crate::facts::ids::FactId,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Meta {
+        assertion: crate::facts::assertions::MetaAssertion::SupersedeFact {
+            target,
+            replacement,
+            reason: crate::facts::assertions::RetractionReason::FactualError,
+        },
+        citation: crate::facts::citations::MetaSource::PersonalKnowledge {
+            user: UserId::new("alice"),
+            justification: Justification::new("The targeted fact is superseded.")?,
+        },
+    })
+}
+
+/// Commit one `Name` fact on a fresh entity and return its `SubmitResult`.
+async fn commit_name(
+    store: &MemoryFactStore,
+    name: &str,
+) -> Result<MemSubmitResult, Box<dyn std::error::Error>> {
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, name)?].into_iter().collect(),
+    };
+    Ok(commit_facts(store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?)
+}
+
+/// Commit a single `RetractFact` targeting `target`; `secs` offsets the commit
+/// time so repeated retractions of one target hash distinctly. Returns its
+/// `SubmitResult`.
+async fn commit_retract(
+    store: &MemoryFactStore,
+    target: crate::facts::ids::FactId,
+    secs: i64,
+) -> Result<MemSubmitResult, Box<dyn std::error::Error>> {
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(secs),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(target)?].into_iter().collect(),
+    };
+    Ok(commit_facts(store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ExpectedKind {
     Entity,
@@ -1426,5 +1500,353 @@ async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult 
         assert_eq!(guard.next_image_id, next_image_before + 1);
     }
 
+    Ok(())
+}
+
+// --- self-referential meta rules + retraction visibility ---
+
+/// A `RetractFact` whose target is a fact in the same commit (its own
+/// meta-fact id) is rejected with `MetaTargetInSameCommit`.
+#[tokio::test]
+async fn retract_fact_targeting_same_commit_fact_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_name(&store, "prior").await?;
+    // The id this retraction's own meta-fact will take — an in-commit target.
+    let in_commit = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(in_commit)?].into_iter().collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected MetaTargetInSameCommit".into()),
+        Err(e) => e,
+    };
+    let SubmitCommitError::Submit(SubmitError::MetaTargetInSameCommit { target }) = err else {
+        return Err(format!("expected MetaTargetInSameCommit, got {err:?}").into());
+    };
+    assert_eq!(target, in_commit);
+    Ok(())
+}
+
+/// A `RetractFact` targeting a prior committed fact is accepted.
+#[tokio::test]
+async fn retract_fact_targeting_prior_fact_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let prior = commit_name(&store, "to-retract").await?;
+    let target = *prior.fact_ids.first().ok_or("no prior fact id")?;
+
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(target)?].into_iter().collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        result.fact_ids.len(),
+        1,
+        "the retraction meta-fact must be recorded"
+    );
+    Ok(())
+}
+
+/// A `SupersedeFact` whose target is in the same commit (with a prior
+/// replacement) is rejected with `MetaTargetInSameCommit`.
+#[tokio::test]
+async fn supersede_fact_targeting_same_commit_fact_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let prior = commit_name(&store, "replacement").await?;
+    let replacement = *prior.fact_ids.first().ok_or("no prior fact id")?;
+    let in_commit = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [supersede_fact(in_commit, replacement)?]
+            .into_iter()
+            .collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected MetaTargetInSameCommit".into()),
+        Err(e) => e,
+    };
+    let SubmitCommitError::Submit(SubmitError::MetaTargetInSameCommit { target }) = err else {
+        return Err(format!("expected MetaTargetInSameCommit, got {err:?}").into());
+    };
+    assert_eq!(target, in_commit);
+    Ok(())
+}
+
+/// A `SupersedeFact` whose target equals its replacement is rejected with
+/// `SupersedeReplacementEqualsTarget`, before any target existence lookup.
+#[tokio::test]
+async fn supersede_fact_with_equal_target_and_replacement_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let prior = commit_name(&store, "self-target").await?;
+    let fact_id = *prior.fact_ids.first().ok_or("no prior fact id")?;
+
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [supersede_fact(fact_id, fact_id)?].into_iter().collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected SupersedeReplacementEqualsTarget".into()),
+        Err(e) => e,
+    };
+    let SubmitCommitError::Submit(SubmitError::SupersedeReplacementEqualsTarget { target }) = err
+    else {
+        return Err(format!("expected SupersedeReplacementEqualsTarget, got {err:?}").into());
+    };
+    assert_eq!(target, fact_id);
+    Ok(())
+}
+
+/// A retracted fact reads `Active` at a snapshot before the retraction and
+/// `Retracted` by it once the retraction is visible.
+#[tokio::test]
+async fn retract_fact_hides_target_only_after_its_commit() -> TestResult {
+    let store = MemoryFactStore::new();
+    let original = commit_name(&store, "fact-x").await?;
+    let target = *original.fact_ids.first().ok_or("no original fact id")?;
+
+    let retraction_bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(target)?].into_iter().collect(),
+    };
+    let retraction = commit_facts(&store, retraction_bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let retractor = *retraction.fact_ids.first().ok_or("no retractor fact id")?;
+
+    let before = store.no_later_than(retractor);
+    let lookup = before.fact(target).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(_) = lookup else {
+        return Err(format!("expected Active before retraction, got {lookup:?}").into());
+    };
+
+    let after = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = after.fact(target).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = lookup else {
+        return Err(format!("expected Retracted after retraction, got {lookup:?}").into());
+    };
+    assert_eq!(by, retractor);
+    Ok(())
+}
+
+/// A `RetractCommit` hides every fact of its target commit.
+#[tokio::test]
+async fn retract_commit_hides_every_fact_of_target() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "Pantheon")?, construction_started_fact(0)?]
+            .into_iter()
+            .collect(),
+    };
+    let original = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(original.fact_ids.len(), 2);
+    let target_commit = original.commit_id.clone();
+
+    let retraction_bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_commit_fact(target_commit)?].into_iter().collect(),
+    };
+    let retraction = commit_facts(&store, retraction_bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let retractor = *retraction.fact_ids.first().ok_or("no retractor fact id")?;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    for fact_id in &original.fact_ids {
+        let lookup = view.fact(*fact_id).await.map_err(|e| format!("{e:?}"))?;
+        let FactLookup::Retracted { by } = lookup else {
+            return Err(format!("expected Retracted for {fact_id:?}, got {lookup:?}").into());
+        };
+        assert_eq!(by, retractor);
+    }
+    Ok(())
+}
+
+/// A `SupersedeFact` hides its target but leaves the replacement `Active`.
+#[tokio::test]
+async fn supersede_fact_hides_target_and_keeps_replacement() -> TestResult {
+    let store = MemoryFactStore::new();
+    let original = commit_name(&store, "old-value").await?;
+    let target = *original.fact_ids.first().ok_or("no target fact id")?;
+    let replacement_result = commit_name(&store, "new-value").await?;
+    let replacement = *replacement_result
+        .fact_ids
+        .first()
+        .ok_or("no replacement fact id")?;
+
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [supersede_fact(target, replacement)?].into_iter().collect(),
+    };
+    let supersession = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let supersede_id = *supersession
+        .fact_ids
+        .first()
+        .ok_or("no supersede fact id")?;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let target_lookup = view.fact(target).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = target_lookup else {
+        return Err(format!("expected superseded target Retracted, got {target_lookup:?}").into());
+    };
+    assert_eq!(by, supersede_id);
+
+    let replacement_lookup = view.fact(replacement).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(_) = replacement_lookup else {
+        return Err(format!("expected replacement Active, got {replacement_lookup:?}").into());
+    };
+    Ok(())
+}
+
+/// Retracting a retraction restores the original fact's visibility. F1 is
+/// active at a C1-era snapshot, retracted at a C2-era snapshot, and active
+/// again at a C3-era snapshot once the retraction is itself retracted.
+#[tokio::test]
+async fn retraction_of_retraction_restores_visibility() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_name(&store, "f1").await?;
+    let f1 = *c1.fact_ids.first().ok_or("no f1 id")?;
+
+    let c2_bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(f1)?].into_iter().collect(),
+    };
+    let c2 = commit_facts(&store, c2_bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let r1 = *c2.fact_ids.first().ok_or("no r1 id")?;
+
+    let c3_bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(r1)?].into_iter().collect(),
+    };
+    let c3 = commit_facts(&store, c3_bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let r2 = *c3.fact_ids.first().ok_or("no r2 id")?;
+
+    let era1 = store.no_later_than(r1);
+    let lookup = era1.fact(f1).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(_) = lookup else {
+        return Err(format!("C1-era: expected Active, got {lookup:?}").into());
+    };
+
+    let era2 = store.no_later_than(r2);
+    let lookup = era2.fact(f1).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = lookup else {
+        return Err(format!("C2-era: expected Retracted, got {lookup:?}").into());
+    };
+    assert_eq!(by, r1);
+
+    let era3 = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = era3.fact(f1).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(_) = lookup else {
+        return Err(format!("C3-era: expected Active again, got {lookup:?}").into());
+    };
+    Ok(())
+}
+
+/// A `SupersedeFact` naming a never-minted replacement is rejected with
+/// `FactNotFound` for the dangling replacement id.
+#[tokio::test]
+async fn supersede_fact_with_unminted_replacement_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let prior = commit_name(&store, "supersede-target").await?;
+    let target = *prior.fact_ids.first().ok_or("no prior fact id")?;
+    let phantom = FactId::new(999_999);
+
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [supersede_fact(target, phantom)?].into_iter().collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected FactNotFound for replacement".into()),
+        Err(e) => e,
+    };
+    let SubmitCommitError::Submit(SubmitError::FactNotFound { id }) = err else {
+        return Err(format!("expected FactNotFound, got {err:?}").into());
+    };
+    assert_eq!(id, phantom);
+    Ok(())
+}
+
+/// When a fact has several retractors and the lowest-id one is itself
+/// retracted, `fact()` reports the lowest STILL-effective retractor.
+#[tokio::test]
+async fn retracted_by_reports_lowest_still_effective_retractor() -> TestResult {
+    let store = MemoryFactStore::new();
+    let original = commit_name(&store, "multiply-retracted").await?;
+    let f = *original.fact_ids.first().ok_or("no original fact id")?;
+
+    // Two independent retractions of F (ra has the lower id).
+    let first = commit_retract(&store, f, 10).await?;
+    let ra = *first.fact_ids.first().ok_or("no ra id")?;
+    let second = commit_retract(&store, f, 20).await?;
+    let rb = *second.fact_ids.first().ok_or("no rb id")?;
+    // Retract ra, cancelling it.
+    commit_retract(&store, ra, 30).await?;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = view.fact(f).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = lookup else {
+        return Err(format!("expected Retracted, got {lookup:?}").into());
+    };
+    assert_eq!(
+        by, rb,
+        "ra is cancelled, so rb is the lowest still-effective retractor"
+    );
     Ok(())
 }

@@ -115,6 +115,22 @@ pub enum SubmitError<E, V, I> {
         /// The missing commit id.
         id: CommitId,
     },
+    /// A retraction or supersession targets a fact minted in the same commit.
+    /// The corrected fact is submitted on its own, so a same-commit target is
+    /// rejected.
+    #[error(
+        "a retraction or supersession targets a fact in the same commit: {target}; submit the corrected fact directly"
+    )]
+    MetaTargetInSameCommit {
+        /// The same-commit target fact id.
+        target: FactId,
+    },
+    /// A supersession names one fact as both its target and its replacement.
+    #[error("supersession replacement equals its target: {target}")]
+    SupersedeReplacementEqualsTarget {
+        /// The fact named as both target and replacement.
+        target: FactId,
+    },
     /// An `attribute::Fact::Relationship` resolved to a self-loop after
     /// substitution — `from` and `to` mapped to one persistent id. The
     /// literal-self case is caught earlier by

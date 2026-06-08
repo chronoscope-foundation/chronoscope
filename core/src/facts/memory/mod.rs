@@ -7,9 +7,9 @@
 //!
 //! - `submit_commit` resolves [`Decl::Local`] via match-or-mint and passes
 //!   [`Decl::Existing`] through.
-//! - `fact()` returns `Active` / `Future` / `Unknown`. It applies no
-//!   retraction filtering, so it never yields [`FactLookup::Retracted`];
-//!   retraction visibility layers on top of the raw slot lookup.
+//! - `fact()` returns `Active` / `Retracted` / `Future` / `Unknown`. A
+//!   resolved slot reads `Retracted` when an effective retractor exists at the
+//!   view's snapshot, resolved by scanning the fact bag.
 //! - `next_fact_id` / `no_later_than` / `now` clock surface.
 //! - The per-subject view methods (`walk_*`, `*_representative`, `*_class`,
 //!   `*_subgraph`) return valid stubs — an empty page, the subject as its own
@@ -45,7 +45,7 @@
 //! rejection, an early return, a panic — leaves `Inner` untouched, with no
 //! rollback path because nothing was mutated.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::marker::PhantomData;
 
@@ -54,6 +54,7 @@ use async_lock::{Mutex, MutexGuard};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::facts::assertions::MetaAssertion;
 use crate::facts::ids::{CommitId, FactId};
 use crate::facts::schema::{
     EdgeSubgraph, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
@@ -160,6 +161,10 @@ struct Inner {
     /// Which commit each fact belongs to. Parallel to [`Self::facts`].
     fact_commits: Vec<CommitId>,
     commits: HashMap<CommitId, StoredCommit>,
+    /// Reverse retraction index: each retracted fact's id → the ids of the
+    /// meta-facts retracting it. Grown as facts land in [`apply_pending`], so a
+    /// read consults it without rebuilding; resolution filters by snapshot.
+    retractors: HashMap<FactId, Vec<FactId>>,
     /// Content-addressed dedup cache: the `SubmitResult` from the first
     /// successful submit of a `CommitId`. A re-submit returns this with
     /// `previously_committed: true` and does no mints or inserts.
@@ -233,6 +238,10 @@ struct ReadCore<'a> {
     /// commit metadata doesn't exist until apply. Mirrors how a `FactId`
     /// retraction target resolves against the committed snapshot.
     committed_commits: &'a HashMap<CommitId, StoredCommit>,
+    /// Reverse retraction index over committed facts (see
+    /// [`Inner::retractors`]), borrowed for the lookup; resolution filters its
+    /// entries by snapshot.
+    retractors: &'a HashMap<FactId, Vec<FactId>>,
     /// Exclusive upper bound: ids `>= snapshot` read as [`FactLookup::Future`].
     snapshot: FactId,
 }
@@ -244,9 +253,10 @@ impl<'a> ReadCore<'a> {
     /// - `fact_id < committed.len()` → `committed`.
     /// - otherwise → `pending` at offset `fact_id - committed.len()`.
     ///
-    /// No retraction filtering: a hit is `Active`, a missing-but-expected slot
-    /// is `Unknown` (a shape bug, not a domain outcome). Retraction visibility
-    /// layers on top.
+    /// A resolved slot reads `Retracted` when an effective retractor exists at
+    /// this snapshot (see [`Self::retracted_by`]), else `Active`. A
+    /// missing-but-expected slot is `Unknown` (a shape bug, not a domain
+    /// outcome).
     fn fact_at(&self, fact_id: FactId) -> MemFactLookup {
         if fact_id.get() >= self.snapshot.get() {
             return FactLookup::Future;
@@ -257,7 +267,7 @@ impl<'a> ReadCore<'a> {
                 return FactLookup::Unknown;
             };
             return match self.committed.get(idx) {
-                Some(fact) => FactLookup::Active(Box::new(fact.clone())),
+                Some(fact) => self.resolve_active_or_retracted(fact_id, fact),
                 None => FactLookup::Unknown,
             };
         }
@@ -265,9 +275,68 @@ impl<'a> ReadCore<'a> {
             return FactLookup::Unknown;
         };
         match self.pending.get(offset) {
-            Some(fact) => FactLookup::Active(Box::new(fact.clone())),
+            Some(fact) => self.resolve_active_or_retracted(fact_id, fact),
             None => FactLookup::Unknown,
         }
+    }
+
+    /// A resolved slot: `Retracted` if an effective retractor exists at this
+    /// snapshot, else `Active`.
+    fn resolve_active_or_retracted(&self, fact_id: FactId, fact: &MemStoredFact) -> MemFactLookup {
+        match self.retracted_by(fact_id) {
+            Some(by) => FactLookup::Retracted { by },
+            None => FactLookup::Active(Box::new(fact.clone())),
+        }
+    }
+
+    /// The lowest [`FactId`] effectively retracting `fact_id` at this snapshot,
+    /// or `None`.
+    ///
+    /// Walks only the subgraph bearing on `fact_id` — the meta-facts retracting
+    /// it, the ones retracting those, and so on — not the whole index. Submit
+    /// validation forces every retractor's id above its target's, so the walk
+    /// climbs strictly (no cycle) and resolves high-to-low, each retractor's
+    /// status known before the fact it retracts. A fact is retracted by the
+    /// lowest of its retractors that is visible at this snapshot and not itself
+    /// effectively retracted.
+    fn retracted_by(&self, fact_id: FactId) -> Option<FactId> {
+        // No retractor edge → active; the common path allocates nothing.
+        if !self.retractors.contains_key(&fact_id) {
+            return None;
+        }
+        // Collect the facts reachable upward from `fact_id` through visible
+        // retractor edges. Edges climb in id, so the frontier drains and a
+        // shared retractor is collected once.
+        let mut subgraph: BTreeSet<FactId> = BTreeSet::new();
+        let mut frontier = vec![fact_id];
+        while let Some(id) = frontier.pop() {
+            if !subgraph.insert(id) {
+                continue;
+            }
+            if let Some(retractor_ids) = self.retractors.get(&id) {
+                frontier.extend(
+                    retractor_ids
+                        .iter()
+                        .copied()
+                        .filter(|candidate| candidate.get() < self.snapshot.get()),
+                );
+            }
+        }
+        // Resolve the subgraph high-to-low: each retractor resolves before the
+        // fact it retracts.
+        let mut retracted: HashMap<FactId, Option<FactId>> = HashMap::new();
+        for &id in subgraph.iter().rev() {
+            let by = self.retractors.get(&id).and_then(|candidate_ids| {
+                candidate_ids
+                    .iter()
+                    .copied()
+                    .filter(|candidate| candidate.get() < self.snapshot.get())
+                    .filter(|candidate| retracted.get(candidate).copied().flatten().is_none())
+                    .min()
+            });
+            retracted.insert(id, by);
+        }
+        retracted.get(&fact_id).copied().flatten()
     }
 
     /// Whether `id` names a committed commit; see [`Self::committed_commits`].
@@ -318,6 +387,7 @@ impl CoreSource for MemorySource<'_> {
             committed: &inner.facts,
             pending: &[],
             committed_commits: &inner.commits,
+            retractors: &inner.retractors,
             snapshot: self.snapshot,
         })
     }
@@ -440,6 +510,7 @@ impl CoreSource for UnionSource<'_> {
             committed: &self.committed.facts,
             pending: &self.pending.facts,
             committed_commits: &self.committed.commits,
+            retractors: &self.committed.retractors,
             snapshot: CoreSource::snapshot(self),
         })
     }
@@ -640,6 +711,9 @@ fn apply_pending(inner: &mut Inner, pending: Pending, commit_id: CommitId) -> Ve
     let mut assigned = Vec::with_capacity(pending.facts.len());
     for fact in pending.facts {
         let id = FactId::new(inner.facts.len() as u64);
+        if let StoredFact::Meta(meta) = &fact {
+            record_retractors(inner, &meta.assertion, id);
+        }
         inner.facts.push(fact);
         inner.fact_commits.push(commit_id.clone());
         assigned.push(id);
@@ -648,6 +722,33 @@ fn apply_pending(inner: &mut Inner, pending: Pending, commit_id: CommitId) -> Ve
     inner.next_event_id = pending.next_event_id;
     inner.next_image_id = pending.next_image_id;
     assigned
+}
+
+/// Record the reverse-retraction edges a meta-fact at `retractor_id`
+/// contributes to [`Inner::retractors`]: a fact target maps to `retractor_id`;
+/// a commit target expands across the committed commit's fact ids. Called as
+/// each meta-fact lands, so reads consult the index without rebuilding it.
+fn record_retractors(inner: &mut Inner, assertion: &MetaAssertion, retractor_id: FactId) {
+    match assertion {
+        MetaAssertion::RetractFact { target, .. } | MetaAssertion::SupersedeFact { target, .. } => {
+            inner
+                .retractors
+                .entry(*target)
+                .or_default()
+                .push(retractor_id);
+        }
+        MetaAssertion::RetractCommit { target, .. } => {
+            if let Some(commit) = inner.commits.get(target) {
+                for retracted in &commit.fact_ids {
+                    inner
+                        .retractors
+                        .entry(*retracted)
+                        .or_default()
+                        .push(retractor_id);
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -753,6 +854,10 @@ impl FactStore for MemoryFactStore {
         //    mints / pushes go through it, so `Inner` is touched only at apply.
         //    Trait reads borrow `&source`, ending before the `&mut source` mint
         //    phase.
+        // First in-commit FactId: the committed count, captured before any
+        // pending push. A retract/supersede target at-or-above it names a fact
+        // in this commit.
+        let first_in_commit_fact_id = inner_guard.next_fact_id();
         let mut source = UnionSource::from_inner(&inner_guard);
 
         // 6. Reject any Decl::Existing id unknown to the source, before any
@@ -867,7 +972,7 @@ impl FactStore for MemoryFactStore {
 
         // 10. Run the rule validator over the source. On rejection, drop the
         //     source without applying — counter rollback is implicit.
-        validate_submit(&stored_facts, &source).await?;
+        validate_submit(&stored_facts, &source, first_in_commit_fact_id).await?;
 
         // 11. Drain into `Inner`. `apply_pending` is the sole assigner of the
         //     FactIds, returning them in push order.
