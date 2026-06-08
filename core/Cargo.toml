@@ -13,6 +13,7 @@ workspace = true
 sqlx = ["dep:sqlx"]
 
 [dependencies]
+async-lock.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,7 +26,10 @@ sha2.workspace = true
 hex.workspace = true
 serde_jcs.workspace = true
 urlencoding = "2.1"
+thiserror.workspace = true
+chronoscope-macros = { path = "../chronoscope-macros" }
 sqlx = { version = "0.8", default-features = false, features = ["derive"], optional = true }
 
 [dev-dependencies]
 proptest = "1.4"
+tokio = { version = "1", features = ["macros", "rt"] }

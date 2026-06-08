@@ -21,7 +21,7 @@ use crate::wikidata::ingest::PropertyContext;
 // =============================================================================
 
 mod extract {
-    use chronoscope_core::{Location, UncertainDate, UnresolvedLocation};
+    use chronoscope_core::{GeoPoint, Location, UncertainDate, UnresolvedLocation};
     use chronoscope_integrations::wikidata::{Claim, DataValue, Snak};
 
     use crate::wikidata::parsing::parse_wikidata_time;
@@ -71,14 +71,22 @@ mod extract {
             Haversine::distance(center, offset)
         });
 
-        let result = if let Some(r) = radius_m {
-            Location::circle(coord.latitude, coord.longitude, r)
-        } else {
-            Location::point(coord.latitude, coord.longitude)
-        };
+        let result = GeoPoint::new(coord.latitude, coord.longitude).map(|center| match radius_m {
+            Some(r) => Location::circle(center, r),
+            None => Ok(Location::point(center)),
+        });
 
         match result {
-            Ok(location) => (Some(UnresolvedLocation::Resolved(location)), warnings),
+            // Outer `Ok` is a valid center; inner `Ok`/`Err` is the radius
+            // check (`point` is infallible, so its arm is always `Ok`).
+            Ok(Ok(location)) => (Some(UnresolvedLocation::Resolved(location)), warnings),
+            Ok(Err(e)) => {
+                warnings.push(format!(
+                    "invalid radius for ({}, {}): {e}",
+                    coord.latitude, coord.longitude
+                ));
+                (None, warnings)
+            }
             Err(e) => {
                 warnings.push(format!(
                     "invalid coordinates ({}, {}): {e}",
@@ -154,7 +162,7 @@ mod extract {
 fn cite_first(
     dates: &[(UncertainDate, String)],
     prop: &str,
-    ctx: &PropertyContext<'_>,
+    ctx: &PropertyContext,
 ) -> Option<Cited<UncertainDate, SourceIdx>> {
     dates
         .first()
@@ -165,7 +173,7 @@ fn cite_first(
 fn cite_all(
     dates: &[(UncertainDate, String)],
     prop: &str,
-    ctx: &PropertyContext<'_>,
+    ctx: &PropertyContext,
 ) -> Vec<Cited<UncertainDate, SourceIdx>> {
     dates
         .iter()
@@ -181,7 +189,7 @@ fn cite_all(
 fn extract_property_time(
     claims: &HashMap<PropertyId, Vec<Claim>>,
     prop: &str,
-    ctx: &PropertyContext<'_>,
+    ctx: &PropertyContext,
 ) -> (Option<Cited<UncertainDate, SourceIdx>>, Vec<String>) {
     let mut warnings = Vec::new();
 
@@ -206,7 +214,7 @@ fn extract_property_time(
 /// Extract location from P625.
 fn extract_property_location(
     claims: &HashMap<PropertyId, Vec<Claim>>,
-    ctx: &PropertyContext<'_>,
+    ctx: &PropertyContext,
 ) -> (Option<Cited<UnresolvedLocation, SourceIdx>>, Vec<String>) {
     let mut warnings = Vec::new();
 
@@ -226,8 +234,8 @@ fn extract_property_location(
 
     let cited = location.map(|loc| {
         // mainsnak_coordinates always returns Resolved(Circle) variant
-        let raw = if let UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) = &loc {
-            format!("{lat},{lon}")
+        let raw = if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &loc {
+            format!("{},{}", center.lat(), center.lon())
         } else {
             "location".to_string()
         };
@@ -248,10 +256,7 @@ struct DatedTransition {
 }
 
 /// Process one P793 claim. May return multiple transitions for point-in-time events.
-fn process_p793_claim(
-    claim: &Claim,
-    ctx: &PropertyContext<'_>,
-) -> (Vec<DatedTransition>, Vec<String>) {
+fn process_p793_claim(claim: &Claim, ctx: &PropertyContext) -> (Vec<DatedTransition>, Vec<String>) {
     let mut warnings = Vec::new();
 
     // Extract Q-ID
@@ -509,7 +514,7 @@ fn process_p793_claim(
 /// indicates entity splitting. Caller creates `EntityRelation::Replaces` between them.
 pub fn build_lifecycles(
     claims: &HashMap<PropertyId, Vec<Claim>>,
-    ctx: &PropertyContext<'_>,
+    ctx: &PropertyContext,
 ) -> (Vec<Vec<EntityTransition<SourceIdx>>>, Vec<String>) {
     let mut warnings = Vec::new();
     let mut dated_transitions: Vec<DatedTransition> = Vec::new();
@@ -756,6 +761,7 @@ fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransiti
 mod tests {
     use super::*;
     use chrono::Datelike;
+    use chronoscope_core::{GeoPoint, WikidataEntityId, WikidataPropertyId};
     use chronoscope_integrations::wikidata::{
         CoordinateValue, DataValue, EntityRefValue, PropertyId, Rank, Snak, TimeValue, WikidataId,
         WikidataPrecision, WikidataTimestamp,
@@ -868,9 +874,9 @@ mod tests {
         assert!(warnings.is_empty());
         let result = result.ok_or("expected Some")?;
 
-        if let UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) = result {
-            assert!((lat - 40.7128).abs() < 0.0001);
-            assert!((lon - (-74.0060)).abs() < 0.0001);
+        if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = result {
+            assert!((center.lat() - 40.7128).abs() < 0.0001);
+            assert!((center.lon() - (-74.0060)).abs() < 0.0001);
         } else {
             return Err("expected Resolved(Circle)".into());
         }
@@ -976,7 +982,7 @@ mod tests {
     fn test_split_on_rebuild_propagates_location() -> TestResult {
         // Predecessor has no location; successor was constructed at a known location.
         // The predecessor should get a synthetic Constructed with the inherited location.
-        let loc = UnresolvedLocation::Resolved(Location::point(45.217, 12.277)?);
+        let loc = UnresolvedLocation::Resolved(Location::point(GeoPoint::new(45.217, 12.277)?));
         let transitions = vec![
             DatedTransition {
                 transition: EntityTransition::Demolished {
@@ -1037,8 +1043,14 @@ mod tests {
     // build_lifecycles integration tests
     // =========================================================================
 
-    fn ctx() -> PropertyContext<'static> {
-        PropertyContext::new("Q12345", 100, "lifecycle")
+    fn ctx() -> PropertyContext {
+        // Mirrors production: lifecycle evidence is attributed to P793
+        // (significant event), the property that drives transitions.
+        PropertyContext::with_property(
+            WikidataEntityId::new(12345),
+            100,
+            WikidataPropertyId::new(793),
+        )
     }
 
     /// P571 inception date only -> single Constructed transition
@@ -1103,9 +1115,9 @@ mod tests {
         {
             assert!(completed_at.is_some());
             let loc = location.as_ref().ok_or("expected location")?;
-            if let UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) = &loc.value {
-                assert!((lat - 48.8584).abs() < 0.001);
-                assert!((lon - 2.2945).abs() < 0.001);
+            if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &loc.value {
+                assert!((center.lat() - 48.8584).abs() < 0.001);
+                assert!((center.lon() - 2.2945).abs() < 0.001);
             } else {
                 return Err("expected Coordinates".into());
             }
@@ -1352,9 +1364,9 @@ mod tests {
             let loc = location
                 .as_ref()
                 .ok_or("P625 should be merged into P793 construction")?;
-            if let UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) = &loc.value {
-                assert!((lat - 51.5074).abs() < 0.001);
-                assert!((lon - (-0.1278)).abs() < 0.001);
+            if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &loc.value {
+                assert!((center.lat() - 51.5074).abs() < 0.001);
+                assert!((center.lon() - (-0.1278)).abs() < 0.001);
             } else {
                 return Err("expected Coordinates".into());
             }

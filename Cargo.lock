@@ -803,7 +803,9 @@ dependencies = [
 name = "chronoscope-core"
 version = "0.1.0"
 dependencies = [
+ "async-lock",
  "chrono",
+ "chronoscope-macros",
  "hex",
  "oxilangtag",
  "proptest",
@@ -815,6 +817,8 @@ dependencies = [
  "sha2",
  "sqlx",
  "strum",
+ "thiserror 2.0.18",
+ "tokio",
  "url",
  "urlencoding",
 ]
@@ -927,6 +931,14 @@ dependencies = [
  "tracing",
  "url",
  "urlencoding",
+]
+
+[[package]]
+name = "chronoscope-macros"
+version = "0.1.0"
+dependencies = [
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

@@ -1,27 +1,20 @@
 //! Citations and source vocabularies for fact assertions.
 //!
-//! Every assertion in the fact store is paired with a citation:
+//! Every assertion is paired with a citation:
 //!
-//! - **Factual** assertions pair with a [`FactualCitation`] — an
-//!   [`ExternalSource`] plus one or more verbatim [`Excerpt`]s. The
-//!   excerpt list is type-level non-empty so every factual claim
-//!   carries a quoted passage.
-//! - **Judgment** assertions pair with a [`JudgmentSource`] directly.
-//!   Each judgment variant carries its own warrant inline — a
-//!   [`Justification`] for `PersonalKnowledge` / `Analysis`, an
-//!   [`Observer`] for `ImageObservation`, an embedded [`ExternalSource`]
-//!   for `External` — so the source enum is the citation.
-//! - **Meta** assertions pair with a [`MetaSource`] directly, same
-//!   pattern: per-variant `justification` / `source` field.
+//! - **Factual** — a [`FactualCitation`]: an [`ExternalSource`] plus one or
+//!   more verbatim [`Excerpt`]s (the list is type-level non-empty).
+//! - **Judgment** — a [`JudgmentSource`], whose every variant carries its own
+//!   warrant inline ([`Justification`], [`Observer`], or an embedded
+//!   [`ExternalSource`]).
+//! - **Meta** — a [`MetaSource`], same per-variant pattern.
 //!
-//! [`ExternalReference`] lives in this module too — it's distinct from
-//! [`ExternalSource`] (it names *which external system* an entity has an
-//! ID in, rather than *where a particular claim came from*) but the two
-//! types sit close together so the doc-comments can cross-reference each
-//! other. Every [`ExternalSource`] translates to one of these — the
-//! [`ExternalReference::from_url`] constructor makes that mapping explicit
-//! for URL-only sources.
+//! [`ExternalReference`] also lives here. It's distinct from [`ExternalSource`]
+//! — it names which external system an entity has an ID in, rather than where a
+//! claim came from — but sits nearby for the cross-references.
+//! [`ExternalReference::from_url`] maps a URL source to one.
 
+use chronoscope_macros::grammar_type;
 use oxilangtag::LanguageTag;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -40,19 +33,17 @@ use crate::nonempty::NonEmptyVec;
 // Excerpt
 // ============================================================================
 
-/// A verbatim snippet of source material backing an assertion.
-///
-/// Excerpts are the wire-level proof that a fact's source actually said
-/// what the fact claims. The smart constructor [`Excerpt::new`] enforces
+/// A verbatim snippet of source material backing an assertion — the wire-level
+/// proof the source said what the fact claims. [`Excerpt::new`] enforces
 /// non-emptiness and a length cap at the boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Excerpt {
     inner: String,
 }
 
-/// Maximum length for an [`Excerpt`] in characters. Sized to fit a long
-/// paragraph of prose while preventing pathological dumps.
+/// Maximum length for an [`Excerpt`] in characters. Fits a long paragraph of
+/// prose while preventing pathological dumps.
 pub const EXCERPT_MAX_LEN: usize = 4096;
 
 impl Excerpt {
@@ -73,8 +64,6 @@ impl Excerpt {
         Ok(Self { inner: s })
     }
 
-    /// The underlying string slice.
-    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.inner
     }
@@ -130,11 +119,8 @@ impl std::error::Error for ExcerptError {}
 
 crate::validated_string_newtype! {
     /// A Wikimedia Commons category title (the part after `Category:`).
-    ///
-    /// Wire shape: a transparent string. Empty strings fail at the wire
-    /// boundary via the shared
-    /// [`crate::facts::ids::ValidatedStringError`] — a category page
-    /// with no name is a malformed reference.
+    /// Wire shape: a transparent string; empty fails at the boundary via
+    /// [`crate::facts::ids::ValidatedStringError`].
     WikimediaCategoryName, min = 1
 }
 
@@ -144,12 +130,10 @@ crate::validated_string_newtype! {
 
 /// Validated ISBN-10 or ISBN-13 identifier.
 ///
-/// Wire shape: a transparent string. The smart constructor strips
-/// hyphens and spaces, verifies length (10 or 13), digit-shape, and
-/// check digit, and stores the canonical digit-only form. The stored
-/// form round-trips as a hyphen-free string; if a source supplied
-/// hyphens they're discarded.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+/// Wire shape: a transparent string. The constructor strips hyphens and
+/// spaces, verifies length, digit-shape, and check digit, and stores the
+/// canonical digit-only form (so the round-trip is hyphen-free).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct Isbn {
     inner: String,
@@ -173,7 +157,6 @@ impl Isbn {
     }
 
     /// The canonical (digit-only) ISBN as a string slice.
-    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.inner
     }
@@ -278,22 +261,16 @@ impl std::error::Error for IsbnError {}
 
 /// Minimum trimmed character count for a [`Justification`].
 ///
-/// Sized to reject placeholder strings while keeping the requirement
-/// achievable in a short sentence. Downstream review steps can require
-/// stricter substance separately.
+/// Rejects placeholder strings while staying achievable in a short sentence.
+/// Downstream review steps can require stricter substance separately.
 pub const JUSTIFICATION_MIN_LEN: usize = 10;
 
 crate::validated_string_newtype! {
-    /// A researcher's written rationale, attached to judgment- and
-    /// meta-side citations that don't quote an external source.
-    ///
-    /// Justifications back claims like "I judge that A and B are the
-    /// same entity" or "I'm retracting this fact because the source
-    /// turned out to be fabricated" — situations where the warrant for
-    /// the claim is the researcher's own reasoning. The smart constructor
-    /// trims whitespace and enforces [`JUSTIFICATION_MIN_LEN`] so
-    /// downstream review (human or LLM-assisted) has substantive prose
-    /// to work with.
+    /// A researcher's written rationale, on judgment- and meta-side
+    /// citations that don't quote an external source — the warrant is the
+    /// researcher's own reasoning ("I judge A and B the same entity").
+    /// The constructor trims whitespace and enforces
+    /// [`JUSTIFICATION_MIN_LEN`] so review has substantive prose.
     Justification, min = JUSTIFICATION_MIN_LEN, trim = true
 }
 
@@ -301,24 +278,20 @@ crate::validated_string_newtype! {
 // FactualCitation
 // ============================================================================
 
-/// Citation paired with an [`ExternalSource`] — backs every
-/// [`crate::facts::assertions::FactualAssertion`].
+/// Citation backing a [`crate::facts::assertions::FactualAssertion`]: an
+/// [`ExternalSource`] plus one or more verbatim excerpts.
 ///
-/// Carries the source plus one or more verbatim excerpts. The excerpt
-/// list is [`NonEmptyVec`]-typed: every factual citation must carry at
-/// least one quoted passage from the source, even when the source is
-/// re-fetchable (a URL's content can change; a Wikidata revision can be
-/// reverted). The constructor enforces this at the wire boundary so the
-/// typed interior never has to defend against zero-excerpt citations.
+/// The excerpt list is [`NonEmptyVec`]-typed — every factual citation carries
+/// at least one quoted passage even when the source is re-fetchable (URL
+/// content drifts, a Wikidata revision can be reverted). The constructor
+/// enforces this at the boundary.
 ///
-/// Judgment and meta citations carry the source enum directly (with
-/// per-variant `Justification` fields where appropriate); they don't
-/// share this shape because their warrant isn't always a quoted
-/// passage. See [`JudgmentSource`] and [`MetaSource`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// Judgment and meta citations carry the source enum directly; their warrant
+/// isn't always a quoted passage. See [`JudgmentSource`] and [`MetaSource`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 pub struct FactualCitation {
-    source: ExternalSource,
-    excerpts: NonEmptyVec<Excerpt>,
+    pub source: ExternalSource,
+    pub excerpts: NonEmptyVec<Excerpt>,
 }
 
 impl FactualCitation {
@@ -328,18 +301,6 @@ impl FactualCitation {
             NonEmptyVec::try_from(excerpts).map_err(|_| CitationError::ExcerptRequired)?;
         Ok(Self { source, excerpts })
     }
-
-    /// The source the claim came from.
-    #[must_use]
-    pub fn source(&self) -> &ExternalSource {
-        &self.source
-    }
-
-    /// The verbatim excerpts backing the claim.
-    #[must_use]
-    pub fn excerpts(&self) -> &NonEmptyVec<Excerpt> {
-        &self.excerpts
-    }
 }
 
 impl<'de> Deserialize<'de> for FactualCitation {
@@ -348,6 +309,7 @@ impl<'de> Deserialize<'de> for FactualCitation {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Wire {
             source: ExternalSource,
             excerpts: Vec<Excerpt>,
@@ -379,63 +341,42 @@ impl std::error::Error for CitationError {}
 // ExternalSource
 // ============================================================================
 
-/// An independently checkable source for a factual claim.
+/// An independently checkable source for a factual claim — where the assertion
+/// came from. Distinct from [`ExternalReference`], which names where an entity
+/// can be looked up.
 ///
-/// `ExternalSource` answers the question "where did this assertion come
-/// from?". It's distinct from [`ExternalReference`], which answers "which
-/// external knowledge base can this entity be looked up in?" — see the
-/// doc-comment on [`ExternalReference`] for the contrast.
+/// Variants split on re-fetchability: [`ExternalSource::Url`],
+/// [`ExternalSource::Wikidata`], and [`ExternalSource::Dbpedia`] can be
+/// re-fetched and machine-compared against the ingest-time `value`;
+/// [`ExternalSource::Book`] and [`ExternalSource::Archive`] are
+/// human-verifiable only, so the citation must carry an [`Excerpt`].
 ///
-/// Variants split along re-fetchability: [`ExternalSource::Url`],
-/// [`ExternalSource::Wikidata`], and [`ExternalSource::Dbpedia`] point at
-/// resources that can be re-fetched and machine-compared against the
-/// ingest-time `value` field; [`ExternalSource::Book`] and
-/// [`ExternalSource::Archive`] point at physical artifacts that can only
-/// be verified by a human consulting the source, so the citation must
-/// carry at least one [`Excerpt`].
+/// Each non-structured variant carries a date for when the material was
+/// authored or produced, not retrieved — named for the act (`published` for
+/// `Url`/`Book`, `created` for `Archive`). It carries the
+/// temporal-distance-from-events signal a historian weighs (a 1923 photo of a
+/// 1923 fire vs a 1975 memoir of it). The structured variants pin the version
+/// via `revision_id` / `version`, so a separate date would be redundant.
 ///
-/// Each non-structured variant carries a per-variant date field that
-/// records **when the cited material was authored or produced**, not
-/// when it was retrieved. The field is named for what the act actually
-/// is in that context: [`ExternalSource::Url`] and [`ExternalSource::Book`]
-/// use `published`; [`ExternalSource::Archive`] uses `created`
-/// (publication isn't the right word for a photograph or a manuscript).
-/// The field carries the temporal-distance-from-events signal a historian
-/// uses to weigh evidence (a 1923 newspaper photo of a 1923 fire is
-/// differently evidential from a 1975 memoir describing the same fire).
-/// For the structured variants [`ExternalSource::Wikidata`] and
-/// [`ExternalSource::Dbpedia`], the existing `revision_id` / `version`
-/// fields already pin which version of the source is being cited, so a
-/// separate publication date would be redundant noise; those variants
-/// don't carry one.
-///
-/// Retrieval-time / "accessed-at" semantics are deliberately not
-/// captured here. The durable answer for that concern is to submit the
-/// page to a web-archive service (archive.is, archive.org) at ingest
-/// time and cite the resulting permalink as the canonical URL — the
-/// archived snapshot pins both the content and the retrieval moment,
-/// and the citation that lands in the fact bag points at the archive.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Retrieval-time / "accessed-at" isn't captured: the durable answer is to
+/// archive the page (archive.is, archive.org) at ingest and cite the permalink,
+/// which pins both content and retrieval moment.
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExternalSource {
     /// A URL crawled at ingest time or pointed at by another source.
     Url {
-        /// The fetched URL.
         #[schemars(with = "String")]
         url: Url,
-        /// When the page was published, when extractable from page
-        /// metadata (`<meta property="article:published_time">`, a
-        /// visible dateline, the structured-data block on a news
-        /// article). Not the retrieval date and not inferred from
-        /// surrounding content. `None` when the page carries no honest
-        /// publication-date signal.
+        /// When the page was published, when extractable from page metadata
+        /// (a `published_time` meta tag, a dateline). Not the retrieval date,
+        /// not inferred from content. `None` when the page carries no honest
+        /// signal.
         published: Option<UncertainDate>,
     },
-    /// A specific Wikidata statement pinned to a revision id. Allows
-    /// re-fetching the original statement to verify it still says what
-    /// we recorded. The `value` field carries the property value as it
-    /// appeared in Wikidata at ingest time so verification can run
-    /// without a network round-trip.
+    /// A Wikidata statement pinned to a revision id, re-fetchable for
+    /// verification. `value` carries the property value at ingest time so a
+    /// check needs no network round-trip.
     Wikidata {
         /// The Wikidata entity that bears the statement.
         entity_id: WikidataEntityId,
@@ -464,31 +405,25 @@ pub enum ExternalSource {
     /// A physical publication — machine-unverifiable but human-checkable.
     /// The citation must carry at least one excerpt.
     Book {
-        /// The book's title.
         title: String,
         /// ISBN, when known.
         isbn: Option<Isbn>,
         /// Page reference (free-form, e.g. `"p. 142"` or `"pp. 12-15"`).
         page: Option<String>,
-        /// Publication date of the cited edition (the date on its
-        /// copyright page), when known. The edition's date, not the
-        /// date of the underlying work — a 1995 reprint of an 1820
-        /// memoir is `published: 1995` (the edition) with the 1820
-        /// authorship date carried in the excerpts or surrounding
-        /// material rather than this field.
+        /// Publication date of the cited edition (its copyright page), when
+        /// known — the edition's date, not the underlying work's. A 1995
+        /// reprint of an 1820 memoir is `published: 1995`, with 1820 in the
+        /// excerpts.
         published: Option<UncertainDate>,
     },
     /// An archival or museum-collection item. The citation must carry
     /// at least one excerpt.
     Archive {
-        /// The collection's name.
         collection: String,
         /// Catalog or accession identifier, when known.
         catalog_id: Option<String>,
-        /// Date the artifact itself was created — when the photograph
-        /// was taken, the letter written, the manuscript inscribed.
-        /// Not the date the archive accessioned the artifact, and not
-        /// the date the artifact was digitized.
+        /// When the artifact was created — the photograph taken, the letter
+        /// written. Not when the archive accessioned or digitized it.
         created: Option<UncertainDate>,
     },
 }
@@ -499,20 +434,15 @@ pub enum ExternalSource {
 
 /// Source for a [`crate::facts::assertions::JudgmentAssertion`].
 ///
-/// Judgment assertions are interpretive — same-entity claims, depiction
-/// claims, feature observations, spatial relations — and accept four
-/// flavors of warrant: an external citation, the researcher's personal
-/// knowledge, a chain of reasoning over existing facts, or a direct
-/// image observation with optional region attribution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Four warrant flavors: an external citation, the researcher's personal
+/// knowledge, reasoning over existing facts, or a direct image observation
+/// with optional region.
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum JudgmentSource {
     /// External evidence wrapping any [`ExternalSource`]. Preferred when
     /// available.
-    External {
-        /// The wrapped external source.
-        source: ExternalSource,
-    },
+    External { source: ExternalSource },
     /// Researcher's analytical judgment, with required free-text
     /// justification.
     PersonalKnowledge {
@@ -521,37 +451,26 @@ pub enum JudgmentSource {
         /// Why the researcher believes the judgment holds.
         justification: Justification,
     },
-    /// A judgment derived from comparing existing facts in the bag,
-    /// without any external source. Trivially-inferrable combinations
-    /// are typically caught by solver rules
-    /// (`SameEntity` closure, depiction propagation, etc.) — `Analysis`
-    /// is the human-judgment fallback for chains the solvers don't
-    /// model. A growing population of `Analysis` judgments with a
-    /// recognizable pattern is a useful signal that a new solver rule
-    /// may pay for itself.
+    /// A judgment derived by comparing existing facts, with no external
+    /// source. Trivially-inferrable combinations are caught by solver rules;
+    /// `Analysis` is the fallback for chains the solvers don't model. A growing
+    /// pattern of them signals a solver rule may pay for itself.
     Analysis {
-        /// The specific facts the analysis compared.
+        /// The facts the analysis compared.
         input_facts: Vec<FactId>,
-        /// The researcher's reasoning — preserves the rationale so
-        /// future reviewers can dispute the conclusion or propose a
-        /// generalization.
+        /// The researcher's reasoning, preserved so reviewers can dispute or
+        /// generalize the conclusion.
         reasoning: Justification,
     },
-    /// A direct image observation. Backs feature observations, spatial
-    /// relations, and depiction-equivalence judgments that were made by
-    /// looking at a specific image (often at a specific region within
-    /// it). The [`Observer`] field records whether the looker was a
-    /// human user or an automated pipeline — material per-fact
-    /// information that the commit-level
-    /// [`crate::facts::assertions::FactualAssertion`] ingester
-    /// attribution doesn't capture finely enough.
+    /// A direct image observation, backing feature observations, spatial
+    /// relations, and depiction judgments made by looking at an image (often a
+    /// region within it). The [`Observer`] field records human vs pipeline —
+    /// finer than the commit-level ingester attribution.
     ImageObservation {
         /// The image the observer looked at.
         image: ImageId,
-        /// Where in the image the observer focused, when known.
-        /// `None` is honest for observations that don't point at a
-        /// specific region (a whole-building condition impression made
-        /// without bounding the entity).
+        /// Where in the image the observer focused, when known. `None` for a
+        /// whole-image observation that doesn't bound a region.
         region: Option<ImageRegion>,
         /// Who or what made the observation.
         observer: Observer,
@@ -560,26 +479,23 @@ pub enum JudgmentSource {
 
 /// Who made an image observation.
 ///
-/// Per-citation observer attribution distinct from the commit-level
-/// `IngestedBy`: a single commit can mix human-curator and
-/// pipeline-derived observations, and downstream trust/QA needs the
+/// Per-citation, distinct from the commit-level `IngestedBy`: one commit
+/// can mix human-curator and pipeline observations, and trust/QA needs the
 /// per-fact distinction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Observer {
     /// A human user looked at the image and asserted the observation.
     User {
         /// The user who made the observation.
         user: UserId,
-        /// Optional free-text justification. The bbox plus image often
-        /// suffice on their own; users opt in to a justification for
-        /// contested or non-obvious claims.
+        /// Optional free-text justification — the bbox plus image often
+        /// suffice; users opt in for contested claims.
         justification: Option<Justification>,
     },
-    /// An automated pipeline run made the observation. The run record
-    /// carries the model name, version, prompt template, and run
-    /// timestamp; the citation only carries the run id so per-citation
-    /// payload stays small.
+    /// An automated pipeline run made the observation. The run record holds
+    /// the model, version, prompt, and timestamp; the citation carries only
+    /// the run id.
     Pipeline {
         /// The pipeline run that produced the observation.
         ingester_run: IngesterRunId,
@@ -594,15 +510,12 @@ pub enum Observer {
 ///
 /// Meta-assertions are facts about facts (retractions, supersedings); the
 /// citation explains *why* the meta-action was taken.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MetaSource {
     /// External evidence that the underlying fact is wrong, fabricated,
     /// or otherwise warrants the meta-action.
-    External {
-        /// The wrapped external source.
-        source: ExternalSource,
-    },
+    External { source: ExternalSource },
     /// Moderator or researcher judgment, with required justification.
     PersonalKnowledge {
         /// The author of the meta-action.
@@ -618,45 +531,40 @@ pub enum MetaSource {
 
 /// A typed reference to an entity in an external knowledge system.
 ///
-/// Each variant carries the system-specific identifier inline as a typed
-/// field rather than a free-form string. Wire-level ingesters that
-/// already have the structured id construct the matching variant
-/// directly; URL-only ingesters use [`ExternalReference::from_url`] for
-/// best-effort dispatch — every [`ExternalSource`] that arrives as a URL
-/// translates to one of these variants (or to
-/// [`ExternalReference::UnmodeledUrl`] when the host isn't recognized).
+/// Each variant carries the system-specific identifier inline as a typed field
+/// rather than a free-form string. Ingesters that already have the structured
+/// id construct the matching variant directly; URL-only ingesters use
+/// [`ExternalReference::from_url`] for best-effort dispatch — every
+/// [`ExternalSource`] that arrives as a URL translates to one of these variants
+/// (or to [`ExternalReference::UnmodeledUrl`] when the host isn't recognized).
 ///
-/// `ExternalReference` is **distinct from** [`ExternalSource`]:
+/// `ExternalReference` is distinct from [`ExternalSource`]:
 ///
-/// - [`ExternalReference`] names a *destination* for entity lookups —
-///   description-shaped records about the entity in an external
-///   knowledge graph. An entity can have multiple `ExternalReference`
-///   facts pointing at different reference systems.
-/// - [`ExternalSource`] names the *origin* of a specific claim. Every
-///   fact (including an `ExternalReference` itself) has exactly one
-///   external source backing it via the citation.
+/// - [`ExternalReference`] names a destination for entity lookups —
+///   description-shaped records about the entity in an external knowledge
+///   graph. An entity can have multiple `ExternalReference` facts pointing at
+///   different reference systems.
+/// - [`ExternalSource`] names the origin of a specific claim. Every fact
+///   (including an `ExternalReference` itself) has one external source backing
+///   it via the citation.
 ///
-/// A Wikidata QID fact, for example, points at a `Wikidata` reference
-/// and is itself cited from an `ExternalSource::Wikidata` source.
+/// A Wikidata QID fact, for example, points at a `Wikidata` reference and is
+/// itself cited from an `ExternalSource::Wikidata` source.
 ///
-/// Media-as-identifier cases (Sanborn map panels, Wikimedia Commons file
-/// pages) deliberately do **not** live here. The honest claim "entity X
-/// is depicted on Sanborn LOC-xyz panel 7" is a depiction fact attached
-/// to the ingested map/image, not a flattened identifier. See
-/// [`crate::facts::depiction`] for the depiction grammar.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Media-as-identifier cases (Sanborn map panels, Wikimedia Commons file pages)
+/// do not live here. The honest claim "entity X is depicted on Sanborn LOC-xyz
+/// panel 7" is a depiction fact attached to the ingested map/image, not a
+/// flattened identifier. See [`crate::facts::depiction`] for the depiction
+/// grammar.
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExternalReference {
     /// Wikidata entity (e.g. `Q243`).
-    Wikidata {
-        /// The Wikidata QID.
-        qid: WikidataEntityId,
-    },
+    Wikidata { qid: WikidataEntityId },
     /// `OpenStreetMap` element.
     OpenStreetMap {
         /// Whether the element is a node, way, or relation.
         element_type: OsmElementType,
-        /// The OSM element id.
         id: OsmId,
     },
     /// `OpenHistoricalMap` element. OHM is a fork of OSM with the same
@@ -664,7 +572,6 @@ pub enum ExternalReference {
     OpenHistoricalMap {
         /// Whether the element is a node, way, or relation.
         element_type: OsmElementType,
-        /// The OHM element id.
         id: OhmId,
     },
     /// Wikipedia article in a specific language edition.
@@ -676,23 +583,13 @@ pub enum ExternalReference {
         title: String,
     },
     /// `GeoNames` feature.
-    GeoNames {
-        /// The GeoNames feature id.
-        id: GeoNamesId,
-    },
+    GeoNames { id: GeoNamesId },
     /// Getty Thesaurus of Geographic Names entry.
-    GettyTgn {
-        /// The TGN entry id.
-        id: GettyTgnId,
-    },
+    GettyTgn { id: GettyTgnId },
     /// Pleiades gazetteer entry for an ancient place.
-    Pleiades {
-        /// The Pleiades place id.
-        place_id: PleiadesPlaceId,
-    },
+    Pleiades { place_id: PleiadesPlaceId },
     /// United States National Register of Historic Places entry.
     Nrhp {
-        /// The NRHP reference number.
         reference_number: NrhpReferenceNumber,
     },
     /// Wikimedia Commons *category* page — a description-shaped
@@ -705,25 +602,27 @@ pub enum ExternalReference {
     },
     /// Generic fallback for an arbitrary URL whose host isn't
     /// recognized by [`ExternalReference::from_url`].
-    UnmodeledUrl(#[schemars(with = "String")] Url),
+    UnmodeledUrl {
+        #[schemars(with = "String")]
+        url: Url,
+    },
 }
 
 impl ExternalReference {
-    /// Dispatch a URL to the structured variant matching its host *and*
-    /// path shape. Falls through to [`ExternalReference::UnmodeledUrl`]
-    /// whenever any expected component is missing or malformed —
-    /// including Commons `File:` pages (which are not modeled here; they
-    /// get ingested as images) and any host that isn't on the recognized
-    /// list.
+    /// Dispatch a URL to the structured variant matching its host and path
+    /// shape. Falls through to [`ExternalReference::UnmodeledUrl`] whenever any
+    /// expected component is missing or malformed — including Commons `File:`
+    /// pages (which are ingested as images) and any host that isn't on the
+    /// recognized list.
     ///
-    /// Defensively: each known host has its full path shape encoded in
-    /// the match arm, so a URL like `https://wikidata.org/wiki/foo` (no
-    /// QID-shaped segment) falls through rather than being silently
-    /// adopted with garbage data. Ingesters that already hold the
-    /// structured id should construct the matching variant directly.
-    #[must_use]
+    /// Each known host has its full path shape encoded in the match arm, so
+    /// only a URL whose segments match that shape produces a structured
+    /// variant; a URL like `https://wikidata.org/wiki/foo` (no QID-shaped
+    /// segment) falls through to [`ExternalReference::UnmodeledUrl`]. Ingesters
+    /// that already hold the structured id should construct the matching variant
+    /// directly.
     pub fn from_url(url: &Url) -> Self {
-        parse_recognized_url(url).unwrap_or_else(|| Self::UnmodeledUrl(url.clone()))
+        parse_recognized_url(url).unwrap_or_else(|| Self::UnmodeledUrl { url: url.clone() })
     }
 }
 
@@ -747,14 +646,11 @@ fn parse_recognized_url(url: &Url) -> Option<ExternalReference> {
             })
         }
         ("wikidata.org", ["wiki" | "entity", qid, ..]) => {
-            // Reject property pages (P-prefix), lexemes (L-prefix), and
-            // anything else that isn't a canonical QID. The constructor
-            // is infallible; the format check lives on the type.
-            let candidate = WikidataEntityId::new(*qid);
-            if !candidate.is_well_formed() {
-                return None;
-            }
-            Some(ExternalReference::Wikidata { qid: candidate })
+            // The parser accepts only `Q<digits>`, so property pages (P-prefix),
+            // lexemes (L-prefix), and other non-QIDs yield the None arm.
+            Some(ExternalReference::Wikidata {
+                qid: WikidataEntityId::parse(qid).ok()?,
+            })
         }
         ("openstreetmap.org", [ty, id, ..]) => Some(ExternalReference::OpenStreetMap {
             element_type: parse_osm_element_type(ty)?,
@@ -771,10 +667,13 @@ fn parse_recognized_url(url: &Url) -> Option<ExternalReference> {
             id: GettyTgnId::new(id.parse().ok()?),
         }),
         // Wikipedia is a wildcard-subdomain match (en.wikipedia.org,
-        // fr.wikipedia.org, ...). Handled after the exact-host arms so
-        // explicit hosts can't be hijacked by a misparsed
-        // `.wikipedia.org` suffix.
-        _ => parse_wikipedia(host, &segments),
+        // fr.wikipedia.org, ...). Handled after the exact-host arms so explicit
+        // hosts can't be hijacked by a misparsed `.wikipedia.org` suffix.
+        // Receives the www-stripped host like every other arm, so
+        // `www.wikipedia.org` collapses to the bare `wikipedia.org` (no language
+        // subdomain) and falls through rather than minting a bogus `www`
+        // language tag.
+        _ => parse_wikipedia(canonical_host, &segments),
     }
 }
 
@@ -977,7 +876,7 @@ mod tests {
         assert_eq!(
             ExternalReference::from_url(&url),
             ExternalReference::Wikidata {
-                qid: WikidataEntityId::new("Q243"),
+                qid: WikidataEntityId::new(243),
             }
         );
         Ok(())
@@ -1014,7 +913,7 @@ mod tests {
         let url = Url::parse("https://commons.wikimedia.org/wiki/File:Pantheon.jpg")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }
@@ -1023,7 +922,7 @@ mod tests {
     fn external_reference_from_url_falls_through_to_unmodeled() -> TestResult {
         let url = Url::parse("https://example.com/some/path")?;
         match ExternalReference::from_url(&url) {
-            ExternalReference::UnmodeledUrl(u) => assert_eq!(u, url),
+            ExternalReference::UnmodeledUrl { url: u } => assert_eq!(u, url),
             other => return Err(format!("expected UnmodeledUrl, got {other:?}").into()),
         }
         Ok(())
@@ -1034,8 +933,38 @@ mod tests {
         let url = Url::parse("https://wikipedia.org/")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn external_reference_from_url_treats_www_wikipedia_org_as_unmodeled() -> TestResult {
+        // `www` is not a language subdomain: after www-stripping the host
+        // is the bare `wikipedia.org`, which has no language label, so the
+        // article-shaped URL must fall through to UnmodeledUrl rather than
+        // minting a `Wikipedia { language: "www" }` reference.
+        let url = Url::parse("https://www.wikipedia.org/wiki/Pantheon")?;
+        match ExternalReference::from_url(&url) {
+            ExternalReference::UnmodeledUrl { url: u } => assert_eq!(u, url),
+            other => return Err(format!("expected UnmodeledUrl, got {other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_reference_from_url_keeps_language_subdomain_after_www_handling() -> TestResult {
+        // Guards against an over-broad www fix swallowing the language
+        // label: `en.wikipedia.org` does not start with `www.`, so the
+        // language subdomain survives normalization and resolves to "en".
+        let url = Url::parse("https://en.wikipedia.org/wiki/Pantheon")?;
+        match ExternalReference::from_url(&url) {
+            ExternalReference::Wikipedia { language, title } => {
+                assert_eq!(language.as_str(), "en");
+                assert_eq!(title, "Pantheon");
+            }
+            other => return Err(format!("expected Wikipedia variant, got {other:?}").into()),
+        }
         Ok(())
     }
 
@@ -1045,7 +974,7 @@ mod tests {
         let url = Url::parse("https://www.wikidata.org/wiki/Property:P571")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }
@@ -1056,7 +985,7 @@ mod tests {
         let url = Url::parse("https://www.wikidata.org/wiki/Qfoo")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }
@@ -1067,7 +996,7 @@ mod tests {
         let url = Url::parse("https://www.wikidata.org/Q243")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }
@@ -1078,7 +1007,7 @@ mod tests {
         let url = Url::parse("https://www.openstreetmap.org/user/foo")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }
@@ -1088,7 +1017,7 @@ mod tests {
         let url = Url::parse("https://www.openstreetmap.org/way/notanumber")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }
@@ -1098,7 +1027,7 @@ mod tests {
         let url = Url::parse("https://www.geonames.org/about.html")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }
@@ -1110,7 +1039,7 @@ mod tests {
         let url = Url::parse("https://vocab.getty.edu/aat/300004979")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }
@@ -1121,7 +1050,7 @@ mod tests {
         let url = Url::parse("https://pleiades.stoa.org/help/")?;
         assert!(matches!(
             ExternalReference::from_url(&url),
-            ExternalReference::UnmodeledUrl(_)
+            ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
     }

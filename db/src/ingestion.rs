@@ -262,7 +262,7 @@ fn extract_external_ids(
 fn link_target_to_external_id(target: &LinkTarget) -> Option<(ExternalIdType, String)> {
     match target {
         LinkTarget::Wikidata { entity_id } => {
-            Some((ExternalIdType::Wikidata, entity_id.as_str().to_owned()))
+            Some((ExternalIdType::Wikidata, entity_id.to_string()))
         }
         LinkTarget::OpenStreetMap {
             element_type,
@@ -300,7 +300,9 @@ mod tests {
     use chronoscope_core::ids::WikidataEntityId;
     use chronoscope_core::ingestion::{ImageSource, TestBundle};
     use chronoscope_core::links::{ExternalLink, LinkTarget, LinkType};
-    use chronoscope_core::{Cited, DatePrecision, Location, UncertainDate, UnresolvedLocation};
+    use chronoscope_core::{
+        Cited, DatePrecision, GeoPoint, Location, UncertainDate, UnresolvedLocation,
+    };
     use oxilangtag::LanguageTag;
 
     use super::*;
@@ -339,11 +341,9 @@ mod tests {
         entity
     }
 
-    fn wikidata_link(qid: &str) -> ExternalLink {
+    fn wikidata_link(entity_id: WikidataEntityId) -> ExternalLink {
         ExternalLink {
-            target: LinkTarget::Wikidata {
-                entity_id: WikidataEntityId::new(qid),
-            },
+            target: LinkTarget::Wikidata { entity_id },
             link_type: LinkType::SameAs,
         }
     }
@@ -351,7 +351,7 @@ mod tests {
     /// Build a bundle with one entity per (name, qid) pair, each with a Wikidata link.
     /// Returns the bundle plus the entity and link key vectors for further customization.
     fn bundle_with_entities(
-        entries: &[(&str, &str)],
+        entries: &[(&str, WikidataEntityId)],
     ) -> (TestBundle, Vec<&'static str>, Vec<&'static str>) {
         // Leak string keys for 'static lifetime in tests (small, bounded set).
         static ENTITY_KEYS: &[&str] = &["e0", "e1", "e2", "e3", "e4"];
@@ -367,7 +367,7 @@ mod tests {
             let ei = ENTITY_KEYS[i];
             let li = LINK_KEYS[i];
             entities.insert(ei, test_entity(name));
-            external_links.insert(li, wikidata_link(qid));
+            external_links.insert(li, wikidata_link(*qid));
             entity_links.insert(ei, vec![li]);
             eidxs.push(ei);
             lidxs.push(li);
@@ -402,7 +402,7 @@ mod tests {
     }
 
     fn test_bundle() -> TestBundle {
-        bundle_with_entities(&[("Eiffel Tower", "Q243")]).0
+        bundle_with_entities(&[("Eiffel Tower", WikidataEntityId::new(243))]).0
     }
 
     async fn test_db() -> DbResult<Database> {
@@ -452,7 +452,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = test_db().await?;
 
-        let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
+        let (mut bundle, eidxs, _) =
+            bundle_with_entities(&[("Eiffel Tower", WikidataEntityId::new(243))]);
         let s0 = add_image(&mut bundle, "https://example.com/eiffel.jpg");
         bundle.annotations.push(Annotation {
             source: s0,
@@ -486,8 +487,10 @@ mod tests {
     {
         let db = test_db().await?;
 
-        let (mut bundle, eidxs, _) =
-            bundle_with_entities(&[("Old Penn Station", "Q761847"), ("MSG", "Q186")]);
+        let (mut bundle, eidxs, _) = bundle_with_entities(&[
+            ("Old Penn Station", WikidataEntityId::new(761847)),
+            ("MSG", WikidataEntityId::new(186)),
+        ]);
         bundle.entity_relations.push(EntityRelation {
             from_entity: eidxs[1],
             to_entity: eidxs[0],
@@ -513,7 +516,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = test_db().await?;
 
-        let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
+        let (mut bundle, eidxs, _) =
+            bundle_with_entities(&[("Eiffel Tower", WikidataEntityId::new(243))]);
         bundle
             .entities
             .insert(eidxs[0], test_entity_with_date("Eiffel Tower", 1889));
@@ -537,8 +541,9 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = test_db().await?;
 
-        let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
-        let loc = UnresolvedLocation::Resolved(Location::point(48.8584, 2.2945)?);
+        let (mut bundle, eidxs, _) =
+            bundle_with_entities(&[("Eiffel Tower", WikidataEntityId::new(243))]);
+        let loc = UnresolvedLocation::Resolved(Location::point(GeoPoint::new(48.8584, 2.2945)?));
         bundle
             .entities
             .get_mut(&eidxs[0])
@@ -573,7 +578,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = test_db().await?;
 
-        let (mut bundle, _, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
+        let (mut bundle, _, _) =
+            bundle_with_entities(&[("Eiffel Tower", WikidataEntityId::new(243))]);
         add_image(&mut bundle, "https://example.com/photo1.jpg");
         add_image(&mut bundle, "https://example.com/photo2.jpg");
 
@@ -595,7 +601,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = test_db().await?;
 
-        let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
+        let (mut bundle, eidxs, _) =
+            bundle_with_entities(&[("Eiffel Tower", WikidataEntityId::new(243))]);
         bundle.entity_relations.push(EntityRelation {
             from_entity: eidxs[0],
             to_entity: "e_missing",
@@ -780,7 +787,7 @@ mod tests {
                 ("e1", test_entity("Saint Thomas Church (1914)")),
             ]),
             images: BTreeMap::new(),
-            external_links: BTreeMap::from([("l0", wikidata_link("Q4356655"))]),
+            external_links: BTreeMap::from([("l0", wikidata_link(WikidataEntityId::new(4356655)))]),
             entity_links: BTreeMap::from([("e0", vec!["l0"]), ("e1", vec!["l0"])]),
             entity_relations: vec![],
             annotations: vec![],
@@ -845,7 +852,8 @@ mod tests {
     async fn find_annotations_round_trip() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = test_db().await?;
 
-        let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
+        let (mut bundle, eidxs, _) =
+            bundle_with_entities(&[("Eiffel Tower", WikidataEntityId::new(243))]);
         let s0 = add_image(&mut bundle, "https://example.com/eiffel.jpg");
         bundle.annotations.push(Annotation {
             source: s0,
@@ -885,7 +893,8 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = test_db().await?;
 
-        let (mut bundle, eidxs, _) = bundle_with_entities(&[("Eiffel Tower", "Q243")]);
+        let (mut bundle, eidxs, _) =
+            bundle_with_entities(&[("Eiffel Tower", WikidataEntityId::new(243))]);
         bundle
             .entities
             .insert(eidxs[0], test_entity_with_date("Eiffel Tower", 1889));

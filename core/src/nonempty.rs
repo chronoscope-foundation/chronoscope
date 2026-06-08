@@ -33,7 +33,7 @@ impl std::error::Error for NonEmptyVecError {}
 /// `TryFrom<Vec<T>>` or [`NonEmptyVec::try_from_vec`] from an
 /// unvalidated `Vec`. Deserialization routes through the same
 /// fallible path so empty wire input is rejected at the boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct NonEmptyVec<T> {
     inner: Vec<T>,
@@ -41,7 +41,6 @@ pub struct NonEmptyVec<T> {
 
 impl<T> NonEmptyVec<T> {
     /// Build a `NonEmptyVec` containing exactly one element.
-    #[must_use]
     pub fn singleton(value: T) -> Self {
         Self { inner: vec![value] }
     }
@@ -55,7 +54,6 @@ impl<T> NonEmptyVec<T> {
     }
 
     /// The first element. Always present by construction.
-    #[must_use]
     pub fn first(&self) -> &T {
         // The inner vector is non-empty by construction.
         #[allow(
@@ -66,7 +64,6 @@ impl<T> NonEmptyVec<T> {
     }
 
     /// Borrow the inner slice.
-    #[must_use]
     pub fn as_slice(&self) -> &[T] {
         &self.inner
     }
@@ -77,7 +74,6 @@ impl<T> NonEmptyVec<T> {
     }
 
     /// Number of elements, guaranteed non-zero by construction.
-    #[must_use]
     pub fn len(&self) -> NonZeroUsize {
         // The inner vector is non-empty by construction; `unwrap_or`
         // returns `MIN` (= 1) in the impossible case so the type-level
@@ -91,7 +87,6 @@ impl<T> NonEmptyVec<T> {
     }
 
     /// Convert into the underlying `Vec`.
-    #[must_use]
     pub fn into_vec(self) -> Vec<T> {
         self.inner
     }

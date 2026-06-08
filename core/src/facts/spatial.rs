@@ -1,48 +1,40 @@
 //! Topological relation vocabulary for spatial claims about entity pairs.
 //!
-//! Spatial relations are claims about reality — that two buildings touch,
-//! that one is mereologically part of another, that they sit on opposite
-//! sides of a street. The vocabulary covers the topological structure
-//! observers reliably report: adjacency, mereological part-of, surrounds,
-//! and the ternary separator-anchored relations (`AcrossFrom`,
-//! `SameSide`, `LinedAlong`) that anchor a pair to a shared third party.
+//! Spatial relations are claims about reality — two buildings touch, one is
+//! part of another, they sit on opposite sides of a street. The vocabulary
+//! covers what observers reliably report: adjacency, mereological part-of,
+//! surrounds, and the ternary separator-anchored relations (`AcrossFrom`,
+//! `SameSide`, `LinedAlong`).
 //!
-//! Variants are viewpoint-independent: each relation makes a claim about
-//! the entities in reality, not about how they look from a particular
-//! vantage. The same claim can be supported by an image observation, a
-//! text source, a KB topology link, or a researcher's personal walk-by
-//! — the evidence lives in the citation, not the fact. See
-//! [`crate::facts::observation::Fact::Spatial`] for the fact shape and
-//! [`crate::facts::citations::JudgmentSource`] for the citation flavors.
+//! Variants are viewpoint-independent: each is a claim about the entities, not
+//! about how they look from a vantage. The supporting evidence — an image
+//! observation, a text source, a KB topology link, a walk-by — lives in the
+//! citation. See [`crate::facts::observation::Fact::Spatial`] for the fact
+//! shape and [`crate::facts::citations::JudgmentSource`] for the citation
+//! flavors.
 //!
-//! Two notable omissions: bare co-presence ("both visible in the same
-//! image, no further structure observed") is derivable from two
-//! [`crate::facts::depiction::Fact::InImage`] facts sharing an image;
-//! viewpoint-dependent occlusion claims aren't in this vocabulary
-//! either, deferred until a use case demands them — when they arrive,
-//! their natural home is a separate observation-cluster variant whose
-//! image is part of the claim's meaning.
+//! Two omissions: bare co-presence ("both visible in the same image") is
+//! derivable from two [`crate::facts::depiction::Fact::InPicture`] /
+//! [`crate::facts::depiction::Fact::OnMap`] facts sharing an image; and
+//! viewpoint-dependent occlusion is deferred until a use case demands it (its
+//! home would be a separate observation variant carrying the image).
 //!
-//! Metric reasoning (distance bounds, coordinates) is not in this
-//! vocabulary. Topology comes from observers; metric calibration comes
-//! from external knowledge in a later layer.
+//! Metric reasoning (distances, coordinates) isn't here — topology comes from
+//! observers, metric calibration from external knowledge in a later layer.
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use chronoscope_macros::grammar_type;
 
 /// A qualitative topological relation between two entities.
 ///
-/// Generic over the entity reference type `EntId` so the ternary variants
-/// (`AcrossFrom`, `SameSide`, `LinedAlong`) carry an `EntId` for their
-/// separator or axis. By the time a topological observation is recorded,
-/// every involved entity already has a minted id (either previously
-/// known or freshly minted at submission for newly-mentioned entities);
-/// the relation never carries a description-shaped reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Generic over `EntId` so the ternary variants (`AcrossFrom`, `SameSide`,
+/// `LinedAlong`) carry an `EntId` separator or axis. Every involved entity has
+/// a minted id by the time a topological observation is recorded, so the
+/// relation never carries a description-shaped reference.
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(bound(
-    serialize = "EntId: Serialize",
-    deserialize = "EntId: serde::de::DeserializeOwned"
+    serialize = "EntId: ::serde::Serialize",
+    deserialize = "EntId: ::serde::de::DeserializeOwned"
 ))]
 pub enum TopologicalRel<EntId> {
     /// The two entities share a boundary, or sit boundary-to-boundary,
@@ -73,4 +65,39 @@ pub enum TopologicalRel<EntId> {
     /// (`b` on the wrapper) on multiple sides — containment-flavored,
     /// without making a strict mereological claim.
     Surrounds,
+}
+
+impl<EntId> TopologicalRel<EntId> {
+    /// Visit the separator / axis entity id this relation carries, if any.
+    ///
+    /// `AcrossFrom` / `SameSide` carry a `separator`, `LinedAlong` an `axis`;
+    /// `Adjacent` / `PartOf` / `Surrounds` carry none. Takes only the entity
+    /// closure — the relation carries no other id kind.
+    pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId)) {
+        match self {
+            Self::Adjacent | Self::PartOf | Self::Surrounds => {}
+            Self::AcrossFrom { separator } | Self::SameSide { separator } => fe(separator),
+            Self::LinedAlong { axis } => fe(axis),
+        }
+    }
+
+    /// Relabel the separator / axis entity id (if any) through the fallible
+    /// closure, producing a `TopologicalRel<E2>`.
+    pub fn try_map_ids<E2, Err>(
+        &self,
+        fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
+    ) -> Result<TopologicalRel<E2>, Err> {
+        match self {
+            Self::Adjacent => Ok(TopologicalRel::Adjacent),
+            Self::PartOf => Ok(TopologicalRel::PartOf),
+            Self::Surrounds => Ok(TopologicalRel::Surrounds),
+            Self::AcrossFrom { separator } => Ok(TopologicalRel::AcrossFrom {
+                separator: fe(separator)?,
+            }),
+            Self::SameSide { separator } => Ok(TopologicalRel::SameSide {
+                separator: fe(separator)?,
+            }),
+            Self::LinedAlong { axis } => Ok(TopologicalRel::LinedAlong { axis: fe(axis)? }),
+        }
+    }
 }

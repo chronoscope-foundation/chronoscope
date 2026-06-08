@@ -825,7 +825,7 @@ async fn test_bundle_loaded_images_flow_through_worker_pipeline() -> TestResult 
             l0,
             ExternalLink {
                 target: LinkTarget::Wikidata {
-                    entity_id: WikidataEntityId::new("Q99999"),
+                    entity_id: WikidataEntityId::new(99999),
                 },
                 link_type: LinkType::SameAs,
             },

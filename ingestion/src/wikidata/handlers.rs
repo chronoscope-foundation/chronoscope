@@ -32,7 +32,7 @@ const MAX_URL_LENGTH: usize = 2048;
 /// and return what they want to add. Issues are automatically tagged with
 /// the property by the caller.
 pub type PropertyHandler =
-    Box<dyn Fn(&[Claim], &PropertyContext<'_>) -> Result<HandlerOutput> + Send + Sync>;
+    Box<dyn Fn(&[Claim], &PropertyContext) -> Result<HandlerOutput> + Send + Sync>;
 
 // =============================================================================
 // PROPERTY HANDLER REGISTRY
@@ -45,7 +45,7 @@ pub type PropertyHandler =
 pub static PROPERTY_HANDLERS: LazyLock<HashMap<&'static str, PropertyHandler>> =
     LazyLock::new(|| {
         // Wrapper for infallible handlers
-        let h = |f: fn(&[Claim], &PropertyContext<'_>) -> HandlerOutput| -> PropertyHandler {
+        let h = |f: fn(&[Claim], &PropertyContext) -> HandlerOutput| -> PropertyHandler {
             Box::new(move |claims, ctx| Ok(f(claims, ctx)))
         };
         HashMap::from([
@@ -137,7 +137,7 @@ fn url_link(link_type: LinkType) -> PropertyHandler {
 // CUSTOM HANDLERS
 // =============================================================================
 
-fn handle_osm_relation(claims: &[Claim], _ctx: &PropertyContext<'_>) -> HandlerOutput {
+fn handle_osm_relation(claims: &[Claim], _ctx: &PropertyContext) -> HandlerOutput {
     let mut out = HandlerOutput::new();
     for claim in claims {
         let Some(id_str) = claim.mainsnak.string_value() else {
@@ -158,7 +158,7 @@ fn handle_osm_relation(claims: &[Claim], _ctx: &PropertyContext<'_>) -> HandlerO
     out
 }
 
-fn handle_pleiades(claims: &[Claim], _ctx: &PropertyContext<'_>) -> HandlerOutput {
+fn handle_pleiades(claims: &[Claim], _ctx: &PropertyContext) -> HandlerOutput {
     let mut out = HandlerOutput::new();
     for claim in claims {
         match claim.mainsnak.string_value() {
@@ -179,14 +179,19 @@ fn handle_pleiades(claims: &[Claim], _ctx: &PropertyContext<'_>) -> HandlerOutpu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chronoscope_core::{WikidataEntityId, WikidataPropertyId};
     use chronoscope_integrations::wikidata::{
         DataValue, QuantityAmount, QuantityUnit, QuantityValue, Snak, WikidataId,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn test_ctx() -> PropertyContext<'static> {
-        PropertyContext::new("Q12345", 100, "P18")
+    fn test_ctx() -> PropertyContext {
+        PropertyContext::with_property(
+            WikidataEntityId::new(12345),
+            100,
+            WikidataPropertyId::new(18),
+        )
     }
 
     fn claim_with_string(value: &str) -> Claim {
@@ -529,9 +534,9 @@ mod tests {
         acc.add_issue("P18", "test issue");
 
         // Create property context
-        let ctx = acc.property_context("P18");
-        assert_eq!(ctx.property(), "P18");
-        assert_eq!(ctx.wikidata_id(), "Q100");
+        let ctx = acc.property_context("P18")?;
+        assert_eq!(ctx.property(), WikidataPropertyId::new(18));
+        assert_eq!(ctx.wikidata_id(), WikidataEntityId::new(100));
 
         // Merge handler output
         let mut output = HandlerOutput::new();
@@ -551,7 +556,7 @@ mod tests {
 
     #[test]
     fn property_context_creates_cited_evidence() -> TestResult {
-        let ctx = PropertyContext::new("Q100", 42, "P571");
+        let ctx = PropertyContext::new("Q100", 42, "P571")?;
         let cited = ctx.cited("test_raw", 123);
 
         assert_eq!(cited.value, 123);
@@ -563,8 +568,8 @@ mod tests {
             revision_id,
         } = &cited.evidence[0]
         {
-            assert_eq!(entity_id.as_str(), "Q100");
-            assert_eq!(property_id.as_str(), "P571");
+            assert_eq!(*entity_id, WikidataEntityId::new(100));
+            assert_eq!(*property_id, WikidataPropertyId::new(571));
             assert_eq!(property_value, "test_raw");
             assert_eq!(*revision_id, 42);
         } else {

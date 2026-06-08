@@ -1,18 +1,20 @@
 //! Date types with uncertainty support.
 //!
-//! [`UncertainDate`] models epistemic uncertainty about a single instant in time.
-//! "Built in the 1920s" means "construction started at some unknown instant within
-//! \[1920, 1929\]" — not "construction spanned the entire decade." Duration is modeled
-//! structurally by pairing two uncertain instants (`started_at` + `completed_at` in
-//! [`EntityTransition`](crate::entity::EntityTransition)), not by widening a single date.
+//! [`UncertainDate`] models epistemic uncertainty about a single instant in
+//! time. "Built in the 1920s" means "construction started at some unknown
+//! instant within \[1920, 1929\]", not "construction spanned the entire
+//! decade." Duration is modeled by pairing two uncertain instants
+//! (`started_at` and `completed_at` in
+//! [`EntityTransition`](crate::entity::EntityTransition)), not by widening a
+//! single date.
 //!
 //! # Representation
 //!
-//! An `UncertainDate` is a pair of optional [`DateBound`] endpoints, where each bound
-//! carries a [`NaiveDate`] and a [`DatePrecision`] indicating the granularity of the
-//! boundary itself. Precision lives on bounds, not on values: "before 1950" has a
-//! year-granularity upper bound, distinct from "before January 1, 1950" which has a
-//! day-granularity bound.
+//! An `UncertainDate` is a pair of optional [`DateBound`] endpoints, each
+//! carrying a [`NaiveDate`] and a [`DatePrecision`] for the granularity of the
+//! boundary itself. Precision lives on bounds, not on values: "before 1950" has
+//! a year-granularity upper bound, distinct from "before January 1, 1950" with
+//! a day-granularity bound.
 //!
 //! | Human expression | `earliest` | `latest` |
 //! |---|---|---|
@@ -44,7 +46,7 @@
 //!
 //! - **Wikidata**: Numeric precision (0=billion years through 14=seconds). Documentation
 //!   says "an indicator of significant parts, not directly specifying an interval" — but
-//!   in practice it behaves as one. See <https://www.wikidata.org/wiki/Help:Dates>.
+//!   consumers treat it as one. See <https://www.wikidata.org/wiki/Help:Dates>.
 
 use std::fmt;
 
@@ -102,7 +104,7 @@ pub enum DatePrecision {
 /// For example, `Year` precision for 2020 stores `2020-01-01`.
 ///
 /// Year 0 is rejected — use negative years for BCE dates (e.g., -1 for 1 BCE).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 pub struct DateBound {
     date: NaiveDate,
     precision: DatePrecision,
@@ -114,6 +116,7 @@ impl<'de> Deserialize<'de> for DateBound {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
             date: NaiveDate,
             precision: DatePrecision,
@@ -139,144 +142,144 @@ impl DateBound {
     }
 
     /// The snapped date (start of the precision period).
-    #[must_use]
     pub fn date(&self) -> NaiveDate {
         self.date
     }
 
     /// The precision level.
-    #[must_use]
     pub fn precision(&self) -> DatePrecision {
         self.precision
     }
 
     /// The last day of this bound's precision period.
-    #[must_use]
     pub fn period_end(&self) -> NaiveDate {
         precision_end(self.date, self.precision)
     }
 }
 
-/// A date with uncertainty, represented as a pair of optional bounds.
+/// A bounded interval over [`DateBound`] endpoints — the primitive interval
+/// type. Both endpoints are optional; `None` denotes "open" on that side.
+/// `(None, None)` is the empty constraint (the entire timeline).
 ///
-/// Each bound carries its own [`DatePrecision`]. `None` means unbounded
-/// in that direction (the entire past or future). `(None, None)` represents
-/// a completely unknown date.
+/// [`TimeRange::new`] enforces `earliest.date() <= latest.period_end()` when
+/// both ends are present, so a constructed `TimeRange` is never inverted.
 ///
-/// # Construction
-///
-/// - [`UncertainDate::with_precision`] — symmetric bounds (e.g., "1927" or "the 1920s")
-/// - [`UncertainDate::bounded`] — asymmetric or one-sided (e.g., "before 1950")
-/// - [`UncertainDate::unknown`] — completely unknown `(None, None)`
-///
-/// Year 0 is rejected in all constructors.
+/// Wire shape: `{ "earliest": Option<DateBound>, "latest": Option<DateBound> }`
+/// with `null` fields suppressed via [`serde_with::skip_serializing_none`].
+/// [`UncertainDate`] wraps `TimeRange` transparently — same serialized form.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
-pub struct UncertainDate {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+pub struct TimeRange {
     earliest: Option<DateBound>,
     latest: Option<DateBound>,
 }
 
-impl<'de> Deserialize<'de> for UncertainDate {
+impl<'de> Deserialize<'de> for TimeRange {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Raw {
             earliest: Option<DateBound>,
             latest: Option<DateBound>,
         }
         let raw = Raw::deserialize(deserializer)?;
-        UncertainDate::bounded(raw.earliest, raw.latest).map_err(serde::de::Error::custom)
+        TimeRange::new(raw.earliest, raw.latest).map_err(serde::de::Error::custom)
     }
 }
 
-impl UncertainDate {
-    /// Create an `UncertainDate` with symmetric bounds at the given precision.
-    ///
-    /// For example, `with_precision(2020-06-15, Year)` produces bounds
-    /// where both earliest and latest are `DateBound(2020-01-01, Year)`.
-    ///
-    /// Returns `Err(DateError::Year0)` if the date has year 0.
-    pub fn with_precision(date: NaiveDate, precision: DatePrecision) -> Result<Self, DateError> {
-        let bound = DateBound::new(date, precision)?;
-        Ok(Self {
-            earliest: Some(bound),
-            latest: Some(bound),
-        })
-    }
+/// Errors from [`TimeRange::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeRangeError {
+    /// `earliest`'s period start is after `latest`'s period end — endpoints
+    /// crossed.
+    EndpointsInverted {
+        /// The earliest endpoint, as supplied.
+        earliest: DateBound,
+        /// The latest endpoint, as supplied.
+        latest: DateBound,
+    },
+}
 
-    /// Create an `UncertainDate` with explicit earliest and latest bounds.
-    ///
-    /// Either or both bounds may be `None` (unbounded).
-    ///
-    /// Returns `Err(DateError::InvertedRange)` if both bounds are present and
-    /// the earliest bound's period start is after the latest bound's period end.
-    pub fn bounded(
+impl fmt::Display for TimeRangeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EndpointsInverted { earliest, latest } => write!(
+                f,
+                "time range earliest ({earliest:?}) must be <= latest ({latest:?})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TimeRangeError {}
+
+// TimeRange::new and UncertainDate::bounded enforce the same "earliest <=
+// latest" predicate; this conversion collapses the TimeRange error onto
+// UncertainDate's InvertedRange so UncertainDate's constructors route through
+// TimeRange without a new error surface.
+impl From<TimeRangeError> for DateError {
+    fn from(err: TimeRangeError) -> Self {
+        match err {
+            TimeRangeError::EndpointsInverted { .. } => Self::InvertedRange,
+        }
+    }
+}
+
+impl TimeRange {
+    /// Construct a time range from optional endpoints. When both are
+    /// present, `earliest`'s snapped period-start day must be `<=`
+    /// `latest`'s period-end day. `None` denotes "open" on that side.
+    pub fn new(
         earliest: Option<DateBound>,
         latest: Option<DateBound>,
-    ) -> Result<Self, DateError> {
+    ) -> Result<Self, TimeRangeError> {
         if let (Some(e), Some(l)) = (&earliest, &latest)
             && e.date() > l.period_end()
         {
-            return Err(DateError::InvertedRange);
+            return Err(TimeRangeError::EndpointsInverted {
+                earliest: *e,
+                latest: *l,
+            });
         }
         Ok(Self { earliest, latest })
     }
 
-    /// Create a completely unknown date `(None, None)`.
-    ///
-    /// This is the identity element for meet (intersection).
-    #[must_use]
-    pub fn unknown() -> Self {
+    /// The empty constraint `(None, None)` — open on both ends.
+    pub fn unbounded() -> Self {
         Self {
             earliest: None,
             latest: None,
         }
     }
 
-    /// The earliest possible date, or `None` if unbounded.
-    #[must_use]
-    pub fn earliest(&self) -> Option<NaiveDate> {
-        self.earliest.as_ref().map(DateBound::date)
-    }
-
-    /// The latest possible date, or `None` if unbounded.
-    #[must_use]
-    pub fn latest(&self) -> Option<NaiveDate> {
-        self.latest.as_ref().map(DateBound::period_end)
-    }
-
-    /// The earliest bound (with precision), if present.
-    #[must_use]
-    pub fn earliest_bound(&self) -> Option<&DateBound> {
+    /// The earliest-bound endpoint, when set.
+    pub fn earliest(&self) -> Option<&DateBound> {
         self.earliest.as_ref()
     }
 
-    /// The latest bound (with precision), if present.
-    #[must_use]
-    pub fn latest_bound(&self) -> Option<&DateBound> {
+    /// The latest-bound endpoint, when set.
+    pub fn latest(&self) -> Option<&DateBound> {
         self.latest.as_ref()
     }
 
-    /// Check if this date range overlaps with another.
-    ///
-    /// Two ranges overlap if there's any point in time that falls within both.
-    /// Unbounded endpoints overlap with everything.
-    #[must_use]
-    pub fn overlaps(&self, other: &Self) -> bool {
-        self.meet(other).is_some()
+    /// True if `date` falls within this time range, inclusive of both
+    /// endpoint precision-extent corners.
+    pub fn contains(&self, date: NaiveDate) -> bool {
+        let lower_ok = self.earliest.as_ref().is_none_or(|b| b.date() <= date);
+        let upper_ok = self.latest.as_ref().is_none_or(|b| date <= b.period_end());
+        lower_ok && upper_ok
     }
 
-    /// Intersection of two uncertain dates (meet in the lattice).
+    /// Intersection of two ranges (meet in the lattice).
     ///
-    /// Returns the tightest range contained by both, or `None` if the ranges
-    /// are disjoint. Selects bounds from the inputs — never manufactures new
-    /// `DateBound` values.
+    /// Returns the tightest range contained by both, or `None` if the
+    /// ranges are disjoint. Selects bounds from the inputs — never
+    /// manufactures new [`DateBound`] values.
     ///
-    /// `unknown().meet(x) == Some(x)` — unknown is the identity.
-    #[must_use]
+    /// `unbounded().meet(x) == Some(x)` — unbounded is the identity.
     pub fn meet(&self, other: &Self) -> Option<Self> {
         let earliest = tighten_earliest(&self.earliest, &other.earliest);
         let latest = tighten_latest(&self.latest, &other.latest);
@@ -291,18 +294,132 @@ impl UncertainDate {
         Some(Self { earliest, latest })
     }
 
+    /// Bounding interval of two ranges (join in the lattice).
+    ///
+    /// Returns the smallest range containing both. Always succeeds.
+    /// Selects bounds from the inputs — never manufactures new
+    /// [`DateBound`] values.
+    ///
+    /// `unbounded().join(x) == unbounded()` — unbounded absorbs everything.
+    pub fn join(&self, other: &Self) -> Self {
+        Self {
+            earliest: widen_earliest(&self.earliest, &other.earliest),
+            latest: widen_latest(&self.latest, &other.latest),
+        }
+    }
+}
+
+/// A date with uncertainty: a [`TimeRange`] interpreted as "an unknown instant
+/// in time lies somewhere in this interval".
+///
+/// A thin wrapper around [`TimeRange`] — same wire shape
+/// (`#[serde(transparent)]`) and validity invariant. The wrap distinguishes "an
+/// interval constraint over a single instant" from "an interval used as a query
+/// filter": same primitive, different intent.
+///
+/// Each endpoint carries its own [`DatePrecision`]. `None` means unbounded in
+/// that direction. `(None, None)` is a completely unknown date.
+///
+/// # Construction
+///
+/// - [`UncertainDate::with_precision`] — symmetric bounds (e.g., "1927" or "the 1920s")
+/// - [`UncertainDate::bounded`] — asymmetric or one-sided (e.g., "before 1950")
+/// - [`UncertainDate::unknown`] — completely unknown `(None, None)`
+///
+/// Year 0 is rejected in all constructors.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(transparent)]
+pub struct UncertainDate(TimeRange);
+
+impl UncertainDate {
+    /// Create an `UncertainDate` with symmetric bounds at the given precision.
+    ///
+    /// For example, `with_precision(2020-06-15, Year)` produces bounds
+    /// where both earliest and latest are `DateBound(2020-01-01, Year)`.
+    ///
+    /// Returns `Err(DateError::Year0)` if the date has year 0.
+    pub fn with_precision(date: NaiveDate, precision: DatePrecision) -> Result<Self, DateError> {
+        let bound = DateBound::new(date, precision)?;
+        // Symmetric bounds (earliest == latest) can't fail TimeRange::new's
+        // ordering check; routing through `?` keeps the construction path
+        // uniform.
+        Ok(Self(TimeRange::new(Some(bound), Some(bound))?))
+    }
+
+    /// Create an `UncertainDate` with explicit earliest and latest bounds.
+    ///
+    /// Either or both bounds may be `None` (unbounded).
+    ///
+    /// Returns `Err(DateError::InvertedRange)` if both bounds are present and
+    /// the earliest bound's period start is after the latest bound's period end.
+    pub fn bounded(
+        earliest: Option<DateBound>,
+        latest: Option<DateBound>,
+    ) -> Result<Self, DateError> {
+        Ok(Self(TimeRange::new(earliest, latest)?))
+    }
+
+    /// Create a completely unknown date `(None, None)`.
+    ///
+    /// This is the identity element for meet (intersection).
+    pub fn unknown() -> Self {
+        Self(TimeRange::unbounded())
+    }
+
+    /// The underlying [`TimeRange`].
+    pub fn range(&self) -> &TimeRange {
+        &self.0
+    }
+
+    /// The earliest possible date, or `None` if unbounded.
+    pub fn earliest(&self) -> Option<NaiveDate> {
+        self.0.earliest().map(DateBound::date)
+    }
+
+    /// The latest possible date, or `None` if unbounded.
+    pub fn latest(&self) -> Option<NaiveDate> {
+        self.0.latest().map(DateBound::period_end)
+    }
+
+    /// The earliest bound (with precision), if present.
+    pub fn earliest_bound(&self) -> Option<&DateBound> {
+        self.0.earliest()
+    }
+
+    /// The latest bound (with precision), if present.
+    pub fn latest_bound(&self) -> Option<&DateBound> {
+        self.0.latest()
+    }
+
+    /// Check if this date range overlaps with another.
+    ///
+    /// Two ranges overlap if there's any point in time that falls within both.
+    /// Unbounded endpoints overlap with everything.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.meet(other).is_some()
+    }
+
+    /// Intersection of two uncertain dates (meet in the lattice).
+    ///
+    /// Returns the tightest range contained by both, or `None` if the ranges
+    /// are disjoint. Selects bounds from the inputs — never manufactures new
+    /// `DateBound` values.
+    ///
+    /// `unknown().meet(x) == Some(x)` — unknown is the identity.
+    pub fn meet(&self, other: &Self) -> Option<Self> {
+        self.0.meet(&other.0).map(Self)
+    }
+
     /// Bounding interval of two uncertain dates (join in the lattice).
     ///
     /// Returns the smallest range containing both. Always succeeds.
     /// Selects bounds from the inputs — never manufactures new `DateBound` values.
     ///
     /// `unknown().join(x) == unknown()` — unknown absorbs everything.
-    #[must_use]
     pub fn join(&self, other: &Self) -> Self {
-        Self {
-            earliest: widen_earliest(&self.earliest, &other.earliest),
-            latest: widen_latest(&self.latest, &other.latest),
-        }
+        Self(self.0.join(&other.0))
     }
 }
 
@@ -361,7 +478,10 @@ fn widen_latest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBoun
 // `.unwrap_or()` so bugs in the formulas surface loudly instead of silently
 // returning the wrong date.
 
-#[allow(clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "components come from precision-boundary formulas / chrono accessors that only yield valid year/month/day triples"
+)]
 fn ymd(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).expect("precision arithmetic: valid date components")
 }
@@ -423,7 +543,10 @@ fn precision_end(date: NaiveDate, precision: DatePrecision) -> NaiveDate {
                 (date.year(), date.month() + 1)
             };
             // Last day of current month = day before first of next month.
-            #[allow(clippy::expect_used)]
+            #[expect(
+                clippy::expect_used,
+                reason = "first-of-next-month and its predecessor are valid by construction"
+            )]
             NaiveDate::from_ymd_opt(next_year, next_month, 1)
                 .expect("precision arithmetic: valid next-month date")
                 .pred_opt()

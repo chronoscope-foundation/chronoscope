@@ -254,8 +254,8 @@ fn location_coords(
 ) -> (Option<f64>, Option<f64>) {
     match loc {
         Some(chronoscope_core::UnresolvedLocation::Resolved(
-            chronoscope_core::Location::Circle { lat, lon, .. },
-        )) => (Some(*lat), Some(*lon)),
+            chronoscope_core::Location::Circle { center, .. },
+        )) => (Some(center.lat()), Some(center.lon())),
         _ => (None, None), // TODO: geocode non-coordinate location variants
     }
 }

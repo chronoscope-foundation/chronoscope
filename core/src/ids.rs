@@ -2,9 +2,13 @@
 //!
 //! Type-safe wrappers around identifiers from external knowledge bases
 //! (`OpenStreetMap`, `OpenHistoricalMap`, Wikidata, `GeoNames`, Getty TGN,
-//! Pleiades, NRHP). Each carries a smart constructor that rejects
-//! malformed values at the boundary and a manual `Deserialize` that
-//! routes wire input through that same constructor.
+//! Pleiades, NRHP). Construction-from-untrusted-input is a validating
+//! parser that rejects malformed values at the boundary, and a manual
+//! `Deserialize` routes wire input through that same parser. The
+//! Wikidata IDs are `u64`-backed (the numeric part of `Q<n>`/`P<n>`),
+//! so a malformed id is unrepresentable; `NrhpReferenceNumber` stays a
+//! string because its leading zeros and letter suffixes are part of its
+//! identity.
 //!
 //! Internal infrastructure IDs (`EntityId`, `LifetimeEventId`,
 //! `ImageId`, etc.) live in [`crate::facts::ids`] and follow the same
@@ -18,13 +22,11 @@ use serde::{Deserialize, Serialize};
 // Errors
 // ============================================================================
 
-/// Error returned by the wire-boundary `Deserialize` impls for the
-/// string-shaped external IDs (`WikidataEntityId`, `WikidataPropertyId`,
-/// `NrhpReferenceNumber`).
+/// Error returned by the wire-boundary `Deserialize` impl for the
+/// remaining string-shaped external ID (`NrhpReferenceNumber`).
 ///
-/// In-process constructors (`Self::new`) are infallible — the
-/// non-empty invariant is enforced only at the wire boundary, where
-/// untrusted input enters.
+/// `NrhpReferenceNumber::new` is infallible — the non-empty invariant
+/// is enforced only at the wire boundary, where untrusted input enters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExternalStringIdError {
     /// The supplied string was empty.
@@ -40,6 +42,52 @@ impl std::fmt::Display for ExternalStringIdError {
 }
 
 impl std::error::Error for ExternalStringIdError {}
+
+/// Error returned when parsing a Wikidata ID from its string form
+/// (`<prefix><digits>`, e.g. `"Q12345"` / `"P1448"`).
+///
+/// Carries enough context to diagnose a rejection at the boundary: the
+/// offending input and which prefix was expected. Surfaced by
+/// [`WikidataEntityId`]'s and [`WikidataPropertyId`]'s `FromStr` /
+/// `Deserialize` impls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WikidataIdParseError {
+    /// The input was empty.
+    Empty,
+    /// The first byte was not the expected prefix (`'Q'` for entities,
+    /// `'P'` for properties). Holds the expected prefix and the input.
+    WrongPrefix { expected: char, found: String },
+    /// The prefix was present but no digits followed it.
+    MissingDigits { expected: char, found: String },
+    /// A byte after the prefix was not an ASCII digit.
+    NonDigitTail { expected: char, found: String },
+    /// The digits parsed but overflowed `u64`.
+    Overflow { found: String },
+}
+
+impl std::fmt::Display for WikidataIdParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => write!(f, "wikidata id must not be empty"),
+            Self::WrongPrefix { expected, found } => {
+                write!(f, "wikidata id {found:?} must start with {expected:?}")
+            }
+            Self::MissingDigits { expected, found } => write!(
+                f,
+                "wikidata id {found:?} must have digits after the {expected:?} prefix"
+            ),
+            Self::NonDigitTail { expected, found } => write!(
+                f,
+                "wikidata id {found:?} must be {expected:?} followed only by ASCII digits"
+            ),
+            Self::Overflow { found } => {
+                write!(f, "wikidata id {found:?} numeric part overflows u64")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WikidataIdParseError {}
 
 // ============================================================================
 // Numeric-ID macro
@@ -77,13 +125,11 @@ macro_rules! numeric_id_newtype {
 
         impl $name {
             #[doc = "Wrap a raw `u64` external identifier."]
-            #[must_use]
             pub fn new(id: u64) -> Self {
                 Self { inner: id }
             }
 
             #[doc = "The underlying integer."]
-            #[must_use]
             pub fn get(self) -> u64 {
                 self.inner
             }
@@ -128,11 +174,13 @@ numeric_id_newtype! {
 }
 
 // ============================================================================
-// OSM element type enum (untouched by smart-constructor work)
+// OSM element type enum
 // ============================================================================
 
 /// `OpenStreetMap` element types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[cfg_attr(feature = "sqlx", derive(sqlx::Type))]
 #[cfg_attr(feature = "sqlx", sqlx(type_name = "TEXT", rename_all = "snake_case"))]
 #[serde(rename_all = "snake_case")]
@@ -146,50 +194,119 @@ pub enum OsmElementType {
 // Wikidata IDs
 // ============================================================================
 
-/// Wikidata entity ID (e.g., `"Q12345"`).
+/// Parser core shared by the two Wikidata ID newtypes: validate that
+/// `s` is `<prefix><digits>` and return the numeric part as `u64`.
 ///
-/// The smart constructor enforces non-empty input but not the full
-/// `Q`-prefix-plus-digits format. Format-strict callers should use
-/// [`WikidataEntityId::is_well_formed`] to check, or call the
-/// URL-parser in [`crate::facts::citations::ExternalReference::from_url`]
-/// which validates format before constructing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
-#[serde(transparent)]
+/// Rejects empty input, a wrong/missing prefix, a missing or non-digit
+/// tail, and `u64` overflow — each with a context-carrying
+/// [`WikidataIdParseError`]. This is the single boundary parse; the
+/// newtypes' `FromStr`/`Deserialize` impls delegate here so a value of
+/// either type is proof the format is valid.
+fn parse_wikidata_id(s: &str, prefix: u8) -> Result<u64, WikidataIdParseError> {
+    let expected = prefix as char;
+    let bytes = s.as_bytes();
+    match bytes {
+        [] => Err(WikidataIdParseError::Empty),
+        [head, rest @ ..] if *head == prefix => {
+            if rest.is_empty() {
+                return Err(WikidataIdParseError::MissingDigits {
+                    expected,
+                    found: s.to_owned(),
+                });
+            }
+            if !rest.iter().all(u8::is_ascii_digit) {
+                return Err(WikidataIdParseError::NonDigitTail {
+                    expected,
+                    found: s.to_owned(),
+                });
+            }
+            // `rest` is all ASCII digits, so it is valid UTF-8 and the
+            // only way `parse` fails here is u64 overflow.
+            let digits = &s[1..];
+            digits
+                .parse::<u64>()
+                .map_err(|_| WikidataIdParseError::Overflow {
+                    found: s.to_owned(),
+                })
+        }
+        _ => Err(WikidataIdParseError::WrongPrefix {
+            expected,
+            found: s.to_owned(),
+        }),
+    }
+}
+
+/// Build a `JsonSchema` describing the JSON **string** wire form of a
+/// Wikidata ID. The in-memory representation is a `u64`, but the
+/// serialized shape — and therefore the OpenAPI contract — is a string
+/// (`"Q12345"`), so we delegate to `String`'s schema rather than
+/// describing the integer.
+fn wikidata_id_schema(
+    generator: &mut schemars::r#gen::SchemaGenerator,
+) -> schemars::schema::Schema {
+    String::json_schema(generator)
+}
+
+/// Wikidata entity ID (e.g., `"Q12345"`), stored as the numeric part.
+///
+/// Construction-from-string validates the full `Q`-prefix-plus-digits
+/// format: [`FromStr`](std::str::FromStr) (and the inherent
+/// [`WikidataEntityId::parse`]) reject empty input, a wrong/missing
+/// prefix, a non-digit tail, and `u64` overflow, so a value of this type
+/// is proof the format is valid. [`WikidataEntityId::new`] wraps an
+/// already-numeric id (e.g. from a typed source or a test). The wire
+/// form is the canonical string `"Q<n>"`; `Deserialize` routes wire
+/// input through the same parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WikidataEntityId {
-    inner: String,
+    inner: u64,
 }
 
 impl WikidataEntityId {
-    /// Wrap an in-process string. Infallible — non-empty validation
-    /// only fires at the wire boundary via `Deserialize`.
-    #[must_use]
-    pub fn new(qid: impl Into<String>) -> Self {
-        Self { inner: qid.into() }
+    /// Wrap an already-numeric entity id (the `n` in `Q<n>`). Infallible
+    /// — for callers that hold the numeric id directly; string input
+    /// must instead go through [`FromStr`](std::str::FromStr) /
+    /// [`WikidataEntityId::parse`], which validate the format.
+    pub fn new(n: u64) -> Self {
+        Self { inner: n }
     }
 
-    /// The underlying string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.inner
+    /// Parse the canonical `Q<digits>` string form, validating the
+    /// prefix and digits at the boundary.
+    ///
+    /// # Errors
+    /// Returns [`WikidataIdParseError`] for empty input, a wrong/missing
+    /// `Q` prefix, a non-digit tail, or `u64` overflow.
+    pub fn parse(s: &str) -> Result<Self, WikidataIdParseError> {
+        parse_wikidata_id(s, b'Q').map(|inner| Self { inner })
     }
 
-    /// Whether this id matches the canonical Wikidata QID shape:
-    /// uppercase `Q` followed by one or more ASCII digits.
-    #[must_use]
-    pub fn is_well_formed(&self) -> bool {
-        is_wikidata_id(&self.inner, b'Q')
+    /// The numeric part (the `n` in `Q<n>`).
+    pub fn get(self) -> u64 {
+        self.inner
+    }
+}
+
+impl std::str::FromStr for WikidataEntityId {
+    type Err = WikidataIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
     }
 }
 
 impl std::fmt::Display for WikidataEntityId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.inner, f)
+        write!(f, "Q{}", self.inner)
     }
 }
 
-impl AsRef<str> for WikidataEntityId {
-    fn as_ref(&self) -> &str {
-        &self.inner
+impl Serialize for WikidataEntityId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("Q{}", self.inner))
     }
 }
 
@@ -199,55 +316,82 @@ impl<'de> Deserialize<'de> for WikidataEntityId {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        if s.is_empty() {
-            return Err(serde::de::Error::custom(ExternalStringIdError::Empty));
-        }
-        Ok(Self { inner: s })
+        Self::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
-/// Wikidata property ID (e.g., `"P571"` for inception).
+impl JsonSchema for WikidataEntityId {
+    fn schema_name() -> String {
+        "WikidataEntityId".to_string()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        wikidata_id_schema(generator)
+    }
+}
+
+/// Wikidata property ID (e.g., `"P571"` for inception), stored as the
+/// numeric part.
 ///
-/// The smart constructor enforces non-empty input but not the full
-/// `P`-prefix-plus-digits format. Format-strict callers should use
-/// [`WikidataPropertyId::is_well_formed`] to check.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
-#[serde(transparent)]
+/// Construction-from-string validates the full `P`-prefix-plus-digits
+/// format: [`FromStr`](std::str::FromStr) (and the inherent
+/// [`WikidataPropertyId::parse`]) reject empty input, a wrong/missing
+/// prefix, a non-digit tail, and `u64` overflow, so a value of this type
+/// is proof the format is valid. [`WikidataPropertyId::new`] wraps an
+/// already-numeric id (e.g. the constant `P1448`). The wire form is the
+/// canonical string `"P<n>"`; `Deserialize` routes wire input through
+/// the same parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WikidataPropertyId {
-    inner: String,
+    inner: u64,
 }
 
 impl WikidataPropertyId {
-    /// Wrap an in-process string. Infallible — non-empty validation
-    /// only fires at the wire boundary via `Deserialize`.
-    #[must_use]
-    pub fn new(pid: impl Into<String>) -> Self {
-        Self { inner: pid.into() }
+    /// Wrap an already-numeric property id (the `n` in `P<n>`).
+    /// Infallible — for callers that hold the numeric id directly (e.g.
+    /// a hardcoded property constant); string input must instead go
+    /// through [`FromStr`](std::str::FromStr) /
+    /// [`WikidataPropertyId::parse`], which validate the format.
+    pub fn new(n: u64) -> Self {
+        Self { inner: n }
     }
 
-    /// The underlying string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.inner
+    /// Parse the canonical `P<digits>` string form, validating the
+    /// prefix and digits at the boundary.
+    ///
+    /// # Errors
+    /// Returns [`WikidataIdParseError`] for empty input, a wrong/missing
+    /// `P` prefix, a non-digit tail, or `u64` overflow.
+    pub fn parse(s: &str) -> Result<Self, WikidataIdParseError> {
+        parse_wikidata_id(s, b'P').map(|inner| Self { inner })
     }
 
-    /// Whether this id matches the canonical Wikidata property shape:
-    /// uppercase `P` followed by one or more ASCII digits.
-    #[must_use]
-    pub fn is_well_formed(&self) -> bool {
-        is_wikidata_id(&self.inner, b'P')
+    /// The numeric part (the `n` in `P<n>`).
+    pub fn get(self) -> u64 {
+        self.inner
+    }
+}
+
+impl std::str::FromStr for WikidataPropertyId {
+    type Err = WikidataIdParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
     }
 }
 
 impl std::fmt::Display for WikidataPropertyId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.inner, f)
+        write!(f, "P{}", self.inner)
     }
 }
 
-impl AsRef<str> for WikidataPropertyId {
-    fn as_ref(&self) -> &str {
-        &self.inner
+impl Serialize for WikidataPropertyId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("P{}", self.inner))
     }
 }
 
@@ -257,23 +401,17 @@ impl<'de> Deserialize<'de> for WikidataPropertyId {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        if s.is_empty() {
-            return Err(serde::de::Error::custom(ExternalStringIdError::Empty));
-        }
-        Ok(Self { inner: s })
+        Self::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
-/// Shape check shared by [`WikidataEntityId::is_well_formed`] and
-/// [`WikidataPropertyId::is_well_formed`]: a single-byte ASCII prefix
-/// (`b'Q'` or `b'P'`) followed by one or more ASCII digits.
-fn is_wikidata_id(s: &str, prefix: u8) -> bool {
-    let bytes = s.as_bytes();
-    match bytes {
-        [head, rest @ ..] if *head == prefix && !rest.is_empty() => {
-            rest.iter().all(u8::is_ascii_digit)
-        }
-        _ => false,
+impl JsonSchema for WikidataPropertyId {
+    fn schema_name() -> String {
+        "WikidataPropertyId".to_string()
+    }
+
+    fn json_schema(generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+        wikidata_id_schema(generator)
     }
 }
 
@@ -285,7 +423,7 @@ fn is_wikidata_id(s: &str, prefix: u8) -> bool {
 /// an 8-digit string, occasionally with letter suffixes for amendments).
 /// Wrapped as a string rather than an integer because the leading zeros
 /// are part of the identity and the letter suffix is legitimate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(transparent)]
 pub struct NrhpReferenceNumber {
     inner: String,
@@ -294,7 +432,6 @@ pub struct NrhpReferenceNumber {
 impl NrhpReferenceNumber {
     /// Wrap an in-process string. Infallible — non-empty validation
     /// only fires at the wire boundary via `Deserialize`.
-    #[must_use]
     pub fn new(number: impl Into<String>) -> Self {
         Self {
             inner: number.into(),
@@ -302,7 +439,6 @@ impl NrhpReferenceNumber {
     }
 
     /// The underlying string slice.
-    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.inner
     }
@@ -356,6 +492,8 @@ pub struct TriggerEventId(pub String);
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
     fn osm_id_deserialize_rejects_negative_wire_input() {
         let result: Result<OsmId, _> = serde_json::from_str("-5");
@@ -363,21 +501,32 @@ mod tests {
     }
 
     #[test]
-    fn wikidata_entity_id_well_formed_rejects_p_prefix() {
-        let id = WikidataEntityId::new("P571");
-        assert!(!id.is_well_formed(), "P-prefixed value is not a QID");
+    fn wikidata_entity_id_parse_rejects_p_prefix() {
+        assert!(
+            "P571".parse::<WikidataEntityId>().is_err(),
+            "P-prefixed value is not a QID"
+        );
     }
 
     #[test]
-    fn wikidata_entity_id_well_formed_rejects_letter_in_digits() {
-        let id = WikidataEntityId::new("Q1a3");
-        assert!(!id.is_well_formed());
+    fn wikidata_entity_id_parse_rejects_letter_in_digits() {
+        assert!("Q1a3".parse::<WikidataEntityId>().is_err());
     }
 
     #[test]
-    fn wikidata_entity_id_well_formed_rejects_q_only() {
-        let id = WikidataEntityId::new("Q");
-        assert!(!id.is_well_formed(), "Q alone is not a QID");
+    fn wikidata_entity_id_parse_rejects_q_only() {
+        assert!(
+            "Q".parse::<WikidataEntityId>().is_err(),
+            "Q alone is not a QID"
+        );
+    }
+
+    #[test]
+    fn wikidata_entity_id_parse_rejects_empty() {
+        assert!(
+            "".parse::<WikidataEntityId>().is_err(),
+            "empty is not a QID"
+        );
     }
 
     #[test]
@@ -387,11 +536,52 @@ mod tests {
     }
 
     #[test]
-    fn wikidata_property_id_well_formed() {
-        let id = WikidataPropertyId::new("P571");
-        assert!(id.is_well_formed());
-        let mismatch = WikidataPropertyId::new("Q571");
-        assert!(!mismatch.is_well_formed(), "Q-prefixed value is not a PID");
+    fn wikidata_entity_id_parse_rejects_u64_overflow() {
+        // u64::MAX is 18446744073709551615; append a digit to overflow.
+        assert!(
+            "Q184467440737095516150"
+                .parse::<WikidataEntityId>()
+                .is_err(),
+            "value past u64::MAX must be rejected"
+        );
+    }
+
+    #[test]
+    fn wikidata_entity_id_new_displays_canonical_string() {
+        assert_eq!(WikidataEntityId::new(12345).to_string(), "Q12345");
+    }
+
+    #[test]
+    fn wikidata_entity_id_parse_preserves_numeric_part() -> TestResult {
+        let id: WikidataEntityId = "Q12345".parse()?;
+        assert_eq!(id.get(), 12345);
+        Ok(())
+    }
+
+    #[test]
+    fn wikidata_entity_id_serde_round_trips_wire_string() -> TestResult {
+        let id: WikidataEntityId = serde_json::from_str("\"Q12345\"")?;
+        assert_eq!(id, WikidataEntityId::new(12345));
+        // Serialization re-emits the canonical string, not a bare number.
+        assert_eq!(serde_json::to_string(&id)?, "\"Q12345\"");
+        Ok(())
+    }
+
+    #[test]
+    fn wikidata_property_id_parse_accepts_p_rejects_q() {
+        assert!("P571".parse::<WikidataPropertyId>().is_ok());
+        assert!(
+            "Q571".parse::<WikidataPropertyId>().is_err(),
+            "Q-prefixed value is not a PID"
+        );
+    }
+
+    #[test]
+    fn wikidata_property_id_serde_round_trips_wire_string() -> TestResult {
+        let id: WikidataPropertyId = serde_json::from_str("\"P1448\"")?;
+        assert_eq!(id, WikidataPropertyId::new(1448));
+        assert_eq!(serde_json::to_string(&id)?, "\"P1448\"");
+        Ok(())
     }
 
     #[test]

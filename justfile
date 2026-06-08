@@ -238,7 +238,7 @@ clippy target="all":
             cd analysis/triton && ruff check .
             ;;
         *)
-            cargo clippy -p chronoscope-{{ target }} -- -D warnings
+            cargo clippy -p chronoscope-{{ target }} --all-targets -- -D warnings
             ;;
     esac
 

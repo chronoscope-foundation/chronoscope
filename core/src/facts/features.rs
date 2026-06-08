@@ -1,49 +1,64 @@
 //! Feature vocabulary for building observations.
 //!
-//! A [`Feature`] is one observed attribute of a building — a roof shape,
-//! a facade material, a story count, an overall condition impression, a
+//! A [`Feature`] is one observed attribute of a building — a roof shape, a
+//! facade material, a story count, an overall condition impression, a
 //! transcribed sign. Feature claims live on
-//! [`crate::facts::observation::Fact::Feature`]; the evidential basis
-//! (which image, which region, who observed it) lives in the citation
-//! rather than in the fact, via
+//! [`crate::facts::observation::Fact::Feature`]; the evidential basis (which
+//! image, which region, who observed it) lives in the citation, via
 //! [`crate::facts::citations::JudgmentSource::ImageObservation`].
 //!
-//! Feature facts are per-observation singular: a building with both a
-//! gabled wing and a dome produces two `RoofShape` facts. No
-//! exhaustiveness claim is built into the fact-shape; whether absence of
-//! a feature variant from a particular source means "not present" or
-//! "not reported" is a property of the source, not of the grammar.
+//! Feature facts are per-observation singular: a building with both a gabled
+//! wing and a dome produces two `RoofShape` facts. No exhaustiveness claim is
+//! built into the fact-shape; whether absence of a feature variant from a
+//! source means "not present" or "not reported" is a property of the source,
+//! not the grammar.
 
+use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// One observed feature on a building.
 ///
-/// Tuple-form variants — the value IS the feature claim. Localization
-/// (which image, where in the image) lives on the citation that backs
-/// the fact, not on the fact itself.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// Each variant wraps its claim in a single named field, serialized as
+/// `{"type": "...", "<field>": ...}` under internal `"type"` tagging.
+/// Localization (which image, where in the image) lives on the citation
+/// that backs the fact, not on the fact itself.
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Feature {
     /// Number of visible stories on the section being observed.
-    StoryCount(u32),
+    StoryCount {
+        /// Count of visible stories.
+        stories: u32,
+    },
     /// A roof structure observed on the building.
-    RoofShape(RoofShape),
+    RoofShape {
+        /// The observed roof shape.
+        shape: RoofShape,
+    },
     /// A facade material observed on the building.
-    FacadeMaterial(FacadeMaterial),
+    FacadeMaterial {
+        /// The observed facade material.
+        material: FacadeMaterial,
+    },
     /// Overall observed condition of the building.
-    Condition(Condition),
+    Condition {
+        /// The observed overall condition.
+        condition: Condition,
+    },
     /// Transcribed text from a sign, plaque, or inscription visible on
     /// the building.
-    Sign(SignText),
+    Sign {
+        /// The transcribed sign text.
+        text: SignText,
+    },
 }
 
 /// Roof structures the analysis pipeline distinguishes.
 ///
-/// Closed enum — extending the vocabulary is a deliberate code change.
-/// The cost of comparison ambiguity is too high to allow an open
-/// `Other { name: String }` variant; conflict detection needs cheap
-/// structural equality between observations.
+/// Closed enum: no open `Other { name: String }` variant, because conflict
+/// detection needs cheap structural equality between observations. Extending
+/// the vocabulary is a code change.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]

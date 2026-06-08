@@ -151,6 +151,35 @@ just web-dev      # picks free ports automatically; no port collision
 - `APIProtocol` abstraction for swapping real/mock implementations
 - Mock clients for previews and UI tests
 
+## Wire stability conventions
+
+The fact-store grammar's serialized form is content-addressed via JCS +
+SHA-256: a `CommitId` is the hash of the producer-form `submit::Commit` —
+author, `recorded_at`, the declaration lists, and the facts. Any change to
+the serialize shape of a type reachable from `submit::Commit` changes
+every commit's `CommitId`.
+
+This is greenfield — no deployed store, no other readers, no
+backward-compatibility constraint. Change wire shapes when the right shape
+calls for it and regenerate the goldens in the same commit. The golden
+tests in `core/src/facts/wire_goldens.rs` catch *unintentional* shape
+changes — a failing golden is the "did you mean to change this?" signal.
+Each golden byte-pins the JCS form and round-trips the value through
+`serde_json` (the streaming serializer catches tagged-enum shapes JCS
+tolerates).
+
+Declare every grammar sum/product with `#[grammar_type]` (from the
+`chronoscope-macros` crate). It is the one source of the grammar's serde
+conventions: a single `"type"` internal tag, `snake_case` variant names,
+`deny_unknown_fields`, and derived `Serialize`/`Deserialize`/`JsonSchema`.
+Variants and structs must use named fields — a tuple/newtype variant is a
+compile error, since internal tagging flattens an unnamed payload beside
+the tag and collides. Add the comparison/`Debug`/`Clone` derives yourself
+in a `#[derive(..)]` alongside (float-bearing types carry hand-written
+`Eq`/`Hash`/`Ord`). Exemptions: `Location`/`UnresolvedLocation` keep
+hand-written `Deserialize`; the transparent leaf newtypes (ids, validated
+strings) use the `*_newtype!` macros.
+
 ## Architecture Overview
 
 See [docs/architecture.md](docs/architecture.md) for details.

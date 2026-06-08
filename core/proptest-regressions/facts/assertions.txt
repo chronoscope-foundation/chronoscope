@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bea982b34828e761dd0deab94faa1ffe0b75cbfb2862ab8e4d6b0827d6310286 # shrinks to a = Observation(Feature { entity: MemoryEntityId(0), feature: StoryCount(2) })
+cc 9aa96dcd82f6084fc5a4df53aa750a4f92f906dab10f748d7bbd3d32292cdea5 # shrinks to a = Depiction(OnMap { entity: MemoryEntityId(0), image: MemoryImageId(0), geometry: Some(Region(BBox(ProportionalRect { x: 0.0, y: 0.0, width: 0.5, height: 0.5 }))) })

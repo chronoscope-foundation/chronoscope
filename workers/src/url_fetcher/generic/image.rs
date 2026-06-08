@@ -7,7 +7,7 @@ use std::io::Cursor;
 
 use bytes::Bytes;
 use chrono::Utc;
-use chronoscope_core::{Location, UncertainDate, UnresolvedLocation};
+use chronoscope_core::{GeoPoint, Location, UncertainDate, UnresolvedLocation};
 use chronoscope_db::{MediaData, MediaType, ResearchUrl};
 use image::{GenericImageView, ImageEncoder};
 use image_hasher::{HashAlg, HasherConfig};
@@ -213,9 +213,11 @@ fn extract_gps_location(exif: &exif::Exif) -> Option<UnresolvedLocation> {
     // Elevation is not embedded in location types; drop it.
     // TODO: Store elevation separately if needed.
 
-    Location::point(latitude, longitude)
-        .map(UnresolvedLocation::Resolved)
-        .ok()
+    // A GPS coordinate outside the valid lat/lon range is dropped (the
+    // whole extractor returns None) rather than surfaced as an error —
+    // EXIF GPS data is best-effort.
+    let center = GeoPoint::new(latitude, longitude).ok()?;
+    Some(UnresolvedLocation::Resolved(Location::point(center)))
 }
 
 /// Apply sign to GPS coordinate based on reference (S/W are negative).

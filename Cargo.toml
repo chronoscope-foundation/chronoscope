@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["analysis", "api", "api-client", "core", "db", "dev", "ingestion", "integrations", "tools/region-builder", "web", "workers"]
-default-members = ["analysis", "api", "api-client", "core", "db", "dev", "ingestion", "integrations", "workers"]
+members = ["analysis", "api", "api-client", "chronoscope-macros", "core", "db", "dev", "ingestion", "integrations", "tools/region-builder", "web", "workers"]
+default-members = ["analysis", "api", "api-client", "chronoscope-macros", "core", "db", "dev", "ingestion", "integrations", "workers"]
 
 [workspace.package]
 edition = "2024"
@@ -28,6 +28,7 @@ doc_markdown = "deny"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
+async-lock = "3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -50,6 +51,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
 hex = "0.4"
 serde_jcs = "0.2"
+parking_lot = { version = "0.12", features = ["send_guard"] }
+
+# Proc-macro authoring (chronoscope-macros)
+syn = "2"
+quote = "1"
 
 # WASM size optimizations — applied to all release builds but the savings
 # primarily matter for the wasm32 target. LTO and codegen-units=1 let LLVM

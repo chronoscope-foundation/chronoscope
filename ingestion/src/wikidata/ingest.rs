@@ -5,8 +5,8 @@
 use crate::{EntityIdx, IngestionOutput, LinkIdx, SourceIdx};
 use anyhow::{Context, Result};
 use chronoscope_core::{
-    Annotation, AnnotationKind, EntityRelationType, Evidence, ExternalLink, ImageSource,
-    LinkTarget, LinkType, WikidataEntityId, WikidataPropertyId,
+    Annotation, AnnotationKind, ExternalLink, ImageSource, LinkTarget, LinkType, WikidataEntityId,
+    WikidataPropertyId,
 };
 use chronoscope_integrations::wikidata::WikidataEntity;
 use futures::stream::{self, StreamExt};
@@ -33,7 +33,7 @@ mod entity_accumulator {
     use crate::SourceIdx;
     use chronoscope_core::{
         AnnotationKind, Cited, Entity, EntityName, EntityTransition, Evidence, ExternalLink,
-        ImageSource, Usage, WikidataEntityId, WikidataPropertyId,
+        ImageSource, Usage, WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
     };
     use chronoscope_integrations::wikidata::{RevisionId, WikidataId};
 
@@ -107,13 +107,15 @@ mod entity_accumulator {
         }
 
         /// Create a context for a specific property handler.
-        #[must_use]
-        pub fn property_context<'a>(&'a self, property: &'a str) -> PropertyContext<'a> {
-            PropertyContext {
-                wikidata_id: self.wikidata_id.as_str(),
-                revision_id: self.revision_id.0,
-                property,
-            }
+        ///
+        /// # Errors
+        /// Returns [`WikidataIdParseError`] if this entity's id or
+        /// `property` is not a well-formed Wikidata id.
+        pub fn property_context(
+            &self,
+            property: &str,
+        ) -> Result<PropertyContext, WikidataIdParseError> {
+            PropertyContext::new(self.wikidata_id.as_str(), self.revision_id.0, property)
         }
 
         /// Merge handler output into the accumulator, tagging issues with property.
@@ -204,21 +206,50 @@ mod entity_accumulator {
 
     /// Immutable context for a property handler.
     ///
-    /// Contains everything a handler needs to create citations.
-    pub struct PropertyContext<'a> {
-        wikidata_id: &'a str,
+    /// Contains everything a handler needs to create citations. The
+    /// Wikidata entity and property ids are parsed once at construction,
+    /// so `cited()` can stamp evidence with validated ids without
+    /// re-parsing or risking a malformed id.
+    #[derive(Clone, Copy)]
+    pub struct PropertyContext {
+        entity_id: WikidataEntityId,
         revision_id: u64,
-        property: &'a str,
+        property_id: WikidataPropertyId,
     }
 
-    impl<'a> PropertyContext<'a> {
-        /// Create a new `PropertyContext`.
-        #[must_use]
-        pub fn new(wikidata_id: &'a str, revision_id: u64, property: &'a str) -> Self {
-            Self {
-                wikidata_id,
+    impl PropertyContext {
+        /// Create a new `PropertyContext`, parsing the entity and
+        /// property ids at the boundary.
+        ///
+        /// # Errors
+        /// Returns [`WikidataIdParseError`] if `wikidata_id` is not a
+        /// well-formed entity id (`Q<digits>`) or `property` is not a
+        /// well-formed property id (`P<digits>`).
+        pub fn new(
+            wikidata_id: &str,
+            revision_id: u64,
+            property: &str,
+        ) -> Result<Self, WikidataIdParseError> {
+            Ok(Self::with_property(
+                WikidataEntityId::parse(wikidata_id)?,
                 revision_id,
-                property,
+                WikidataPropertyId::parse(property)?,
+            ))
+        }
+
+        /// Build a context from already-parsed ids (no re-parsing or
+        /// fallibility). For callers that have validated the ids at an
+        /// earlier boundary.
+        #[must_use]
+        pub fn with_property(
+            entity_id: WikidataEntityId,
+            revision_id: u64,
+            property_id: WikidataPropertyId,
+        ) -> Self {
+            Self {
+                entity_id,
+                revision_id,
+                property_id,
             }
         }
 
@@ -228,8 +259,8 @@ mod entity_accumulator {
             Cited::new(
                 value,
                 vec![Evidence::Wikidata {
-                    entity_id: WikidataEntityId::new(self.wikidata_id),
-                    property_id: WikidataPropertyId::new(self.property),
+                    entity_id: self.entity_id,
+                    property_id: self.property_id,
                     property_value: raw.into(),
                     revision_id: self.revision_id,
                 }],
@@ -238,14 +269,14 @@ mod entity_accumulator {
 
         /// Get the current property ID.
         #[must_use]
-        pub fn property(&self) -> &str {
-            self.property
+        pub fn property(&self) -> WikidataPropertyId {
+            self.property_id
         }
 
         /// Get the Wikidata entity ID.
         #[must_use]
-        pub fn wikidata_id(&self) -> &str {
-            self.wikidata_id
+        pub fn wikidata_id(&self) -> WikidataEntityId {
+            self.entity_id
         }
     }
 
@@ -448,13 +479,9 @@ fn merge_results(results: &[Vec<EntityResult>]) -> IngestionOutput {
     let mut next_link: usize = 0;
 
     for result_group in results {
-        // Track entity keys for this group (for creating Replaces relationships)
-        let mut group_entity_keys: Vec<EntityIdx> = Vec::new();
-
         for result in result_group {
             let entity_key = EntityIdx::new(next_entity);
             next_entity += 1;
-            group_entity_keys.push(entity_key);
 
             let source_base = next_source;
             let link_base = next_link;
@@ -488,31 +515,6 @@ fn merge_results(results: &[Vec<EntityResult>]) -> IngestionOutput {
             if link_base < next_link {
                 let link_keys: Vec<LinkIdx> = (link_base..next_link).map(LinkIdx::new).collect();
                 output.entity_links.insert(entity_key, link_keys);
-            }
-        }
-
-        // Create Replaces relationships for split entities
-        // Entities are ordered chronologically, so each replaces the previous
-        if group_entity_keys.len() > 1 {
-            let wikidata_id = &result_group[0].wikidata_id;
-            let revision_id = result_group[0].revision_id.0;
-
-            let entity_id = WikidataEntityId::new(wikidata_id.as_str());
-            let property_id = WikidataPropertyId::new("lifecycle");
-            for window in group_entity_keys.windows(2) {
-                let older_key = window[0];
-                let newer_key = window[1];
-                output.entity_relations.push(crate::IngestionRelation {
-                    from_entity: newer_key,
-                    to_entity: older_key,
-                    relation_type: EntityRelationType::Replaces,
-                    evidence: vec![Evidence::Wikidata {
-                        entity_id: entity_id.clone(),
-                        property_id: property_id.clone(),
-                        property_value: "demolish->rebuild pattern".to_string(),
-                        revision_id,
-                    }],
-                });
             }
         }
     }
@@ -600,12 +602,32 @@ fn process_entity(
     let wikidata_id = &wd_entity.id;
     let revision_id = wd_entity.lastrevid;
 
+    // Parse the entity id once at the boundary. Building entities are
+    // always Q-form; a non-entity id (e.g. an L-prefixed lexeme) can't
+    // carry Chronoscope facts, so skip it rather than fabricate evidence.
+    let Ok(entity_id) = WikidataEntityId::parse(wikidata_id.as_str()) else {
+        eprintln!(
+            "skipping entity with non-entity Wikidata id: {}",
+            wikidata_id.as_str()
+        );
+        return Vec::new();
+    };
+
     let names = extract_names(&wd_entity, wikidata_id.as_str(), revision_id.0);
 
     let mut acc = EntityAccumulator::new(entity_idx, wikidata_id.clone(), revision_id);
 
-    // Build lifecycle transitions
-    let lifecycle_ctx = PropertyContext::new(wikidata_id.as_str(), revision_id.0, "lifecycle");
+    // Build lifecycle transitions.
+    // FIXME(old-model): KNOWN-WRONG — this attributes ALL lifecycle-transition
+    // evidence to P793 (significant event), but transitions sourced from
+    // P571/P576/P625/P1619 are NOT P793; their real property survives only in
+    // each evidence's `property_value`. This over-claims provenance. Tolerated
+    // only because this old-model path is slated for deletion. Do not trust
+    // lifecycle `property_id`; before relying on it or deleting this code, thread
+    // the real per-transition property through `build_lifecycles` (or drop the
+    // lifecycle evidence as the Replaces block was dropped).
+    let lifecycle_ctx =
+        PropertyContext::with_property(entity_id, revision_id.0, WikidataPropertyId::new(793));
     let (entity_lifecycles, lifecycle_warnings) =
         build_lifecycles(&wd_entity.claims, &lifecycle_ctx);
 
@@ -616,7 +638,14 @@ fn process_entity(
     // Run property handlers for non-lifecycle claims
     for (property, claims) in &wd_entity.claims {
         if let Some(handler) = PROPERTY_HANDLERS.get(property.as_str()) {
-            let ctx = PropertyContext::new(wikidata_id.as_str(), revision_id.0, property.as_str());
+            let property_id = match WikidataPropertyId::parse(property.as_str()) {
+                Ok(id) => id,
+                Err(e) => {
+                    acc.add_issue(property.as_str(), format!("invalid property id: {e}"));
+                    continue;
+                }
+            };
+            let ctx = PropertyContext::with_property(entity_id, revision_id.0, property_id);
             match handler(claims, &ctx) {
                 Ok(output) => acc.merge_output(property.as_str(), output),
                 Err(e) => acc.add_issue(property.as_str(), format!("handler failed: {e}")),
@@ -650,9 +679,7 @@ fn process_entity(
 
     // Add Wikidata link
     acc.add_link(ExternalLink {
-        target: LinkTarget::Wikidata {
-            entity_id: WikidataEntityId::new(wikidata_id.as_str()),
-        },
+        target: LinkTarget::Wikidata { entity_id },
         link_type: LinkType::SameAs,
     });
 

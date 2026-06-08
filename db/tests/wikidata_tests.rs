@@ -42,7 +42,12 @@ async fn wikidata_db() -> Result<TestDb> {
 }
 
 /// Look up exactly one entity by Wikidata Q-ID.
-/// The `name` parameter is a self-documenting label validated against the entity's names.
+///
+/// The `name` parameter is a human-readable label for diagnostics only.
+/// Ingestion no longer derives names from Wikidata labels — only from
+/// property-backed name claims like P1448 (official name) — so most test
+/// entities have no names at all. Name content is asserted explicitly by
+/// the tests that exercise a P1448-bearing entity, not here.
 async fn lookup_one(db: &TestDb, qid: &str, name: &str) -> Result<Entity> {
     let mut results = db
         .find_entities_by_external_id(&ExternalIdType::Wikidata, qid)
@@ -52,10 +57,7 @@ async fn lookup_one(db: &TestDb, qid: &str, name: &str) -> Result<Entity> {
         1,
         "expected exactly 1 entity for {qid} ({name})"
     );
-    let entity = results.remove(0);
-    let has_name = entity.entity.names.iter().any(|n| n.value.name == name);
-    assert!(has_name, "{qid} should have name '{name}'");
-    Ok(entity)
+    Ok(results.remove(0))
 }
 
 fn bounds(entity: &Entity) -> Result<&DateRange> {
@@ -207,11 +209,13 @@ async fn chioggia_cathedral_splits_on_rebuild() -> Result<()> {
         "both cathedrals should be at the same site"
     );
 
-    // There should be a Replaces relation between them
+    // The split still produces two entities, but the old-model Replaces
+    // relation between them is no longer emitted (synthetic "lifecycle"
+    // property markers were retired), so no entity_relations exist.
     let relation_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM entity_relations")
         .fetch_one(db.pool_ref())
         .await?;
-    assert_eq!(relation_count.0, 1);
+    assert_eq!(relation_count.0, 0);
 
     Ok(())
 }
@@ -244,5 +248,25 @@ async fn vanderbilt_entities() -> Result<()> {
     let loc = location(&triple)?;
     assert_coord(loc.lat, 40.7596);
 
+    Ok(())
+}
+
+/// Names are derived only from property-backed claims (P1448, official
+/// name), not from Wikidata labels. Ponte Vecchio carries a French P1448
+/// claim, so it is one of the few test entities with a name.
+#[tokio::test]
+async fn official_name_from_p1448() -> Result<()> {
+    let db = wikidata_db().await?;
+    let ponte = lookup_one(&db, "Q208633", "Ponte Vecchio").await?;
+    let has_official_name = ponte
+        .entity
+        .names
+        .iter()
+        .any(|n| n.value.name == "Ponte vecchio -  Point Vieux");
+    assert!(
+        has_official_name,
+        "Q208633 should carry its P1448 official name, got {:?}",
+        ponte.entity.names
+    );
     Ok(())
 }

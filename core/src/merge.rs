@@ -126,7 +126,10 @@ mod tests {
     use proptest::prelude::*;
 
     fn make_name(name: &str) -> Cited<EntityName, ()> {
-        #[allow(clippy::expect_used)]
+        #[expect(
+            clippy::expect_used,
+            reason = "the literal \"en\" is a valid BCP-47 language tag"
+        )]
         Cited::uncited(EntityName {
             name: name.to_string(),
             name_type: NameType::Common,

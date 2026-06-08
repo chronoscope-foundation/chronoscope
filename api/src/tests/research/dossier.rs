@@ -263,7 +263,10 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
             chronoscope_core::DatePrecision::Day,
         )?),
         location: Some(chronoscope_core::UnresolvedLocation::Resolved(
-            chronoscope_core::Location::point(GARY_INDIANA_LAT, GARY_INDIANA_LON)?,
+            chronoscope_core::Location::point(chronoscope_core::GeoPoint::new(
+                GARY_INDIANA_LAT,
+                GARY_INDIANA_LON,
+            )?),
         )),
         source_metadata: None,
         fetched_at: chrono::Utc::now().naive_utc(),
@@ -287,13 +290,12 @@ async fn test_dossier_media_with_gps_location() -> TestResult {
 
     let location = media.location.as_ref().ok_or("should have GPS location")?;
     if let chronoscope_core::UnresolvedLocation::Resolved(chronoscope_core::Location::Circle {
-        lat,
-        lon,
+        center,
         ..
     }) = location
     {
-        assert_eq!(*lat, GARY_INDIANA_LAT);
-        assert_eq!(*lon, GARY_INDIANA_LON);
+        assert_eq!(center.lat(), GARY_INDIANA_LAT);
+        assert_eq!(center.lon(), GARY_INDIANA_LON);
     } else {
         return Err("expected Resolved(Circle) location".into());
     }

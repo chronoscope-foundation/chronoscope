@@ -1,58 +1,55 @@
-//! Picture cluster — pictorial role-claim plus picture-specific
-//! attributes.
+//! Picture cluster — pictorial role-claim plus picture-specific attributes.
 //!
 //! Cluster module for the `Picture` variant of
-//! [`crate::facts::assertions::FactualAssertion`]. A "picture" is a
-//! image being treated as a photograph, painting, drawing, or other
-//! figurative depiction — distinct from a map (cartographic
-//! representation). The classification is a *claim* asserted by
-//! [`Fact::IsPicture`], not a structural property of the image.
+//! [`crate::facts::assertions::FactualAssertion`]. A "picture" is an image
+//! being treated as a photograph, painting, drawing, or other figurative
+//! depiction — distinct from a map (cartographic representation). The
+//! classification is a claim asserted by [`Fact::IsPicture`], not a structural
+//! property of the image.
 //!
-//! Capture metadata (when the photograph was taken, where) lives here
-//! because it's picture-role-specific — maps don't have a "capture date"
-//! in the same sense. Byte-level provenance (source URL) lives in the
+//! Capture metadata (when the photograph was taken, where) lives here because
+//! it's picture-role-specific — maps don't have a "capture date" in the same
+//! sense. Byte-level provenance (source URL) lives in the
 //! [`crate::facts::image`] cluster.
 //!
 //! # Error states (rejected at submit time)
 //!
-//! - **Picture-attribute fact on a map-role image.** [`Fact::CapturedDate`]
-//!   and [`Fact::CapturedLocation`] are valid only on images that carry
-//!   (or could plausibly carry) the picture role. Attaching them to an
-//!   image already asserted as a map via
-//!   [`crate::facts::map::Fact::IsMap`] is malformed.
+//! - **Picture-attribute fact on a map-role image.** [`Fact::CapturedDate`] and
+//!   [`Fact::CapturedLocation`] are valid only on images that carry (or could
+//!   plausibly carry) the picture role. Attaching them to an image already
+//!   asserted as a map via [`crate::facts::map::Fact::IsMap`] is malformed.
 //!
 //! # Conflicts (surfaced at projection time)
 //!
-//! - **Role disagreement.** A image carrying both [`Fact::IsPicture`]
-//!   and [`crate::facts::map::Fact::IsMap`] is a conflict the solver
-//!   surfaces; sources sometimes classify the same image differently
-//!   and a human picks the winner.
-//! - **Capture date / location disagreement.** Multiple
-//!   [`Fact::CapturedDate`] or [`Fact::CapturedLocation`] facts unify
-//!   the same way bookend dates and locations do — interval meet for
-//!   dates, the location subsumption lattice for locations. Empty meet
-//!   or contradictory locations surface as user-resolvable conflicts.
+//! - **Role disagreement.** An image carrying both [`Fact::IsPicture`] and
+//!   [`crate::facts::map::Fact::IsMap`] is a conflict the solver surfaces;
+//!   sources sometimes classify the same image differently and a human picks
+//!   the winner.
+//! - **Capture date / location disagreement.** Multiple [`Fact::CapturedDate`]
+//!   or [`Fact::CapturedLocation`] facts unify the same way bookend dates and
+//!   locations do — interval meet for dates, the location subsumption lattice
+//!   for locations. Empty meet or contradictory locations surface as
+//!   user-resolvable conflicts.
 
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use chronoscope_macros::grammar_type;
 
 use crate::date::UncertainDate;
 use crate::location::UnresolvedLocation;
 
 /// Picture-cluster fact.
 ///
-/// Generic over the image reference type `ImgId`. Picture facts no
-/// longer reference entities directly — `CapturedLocation` carries an
+/// Generic over the image reference type `ImgId`. Picture facts don't
+/// reference entities directly — `CapturedLocation` carries an
 /// [`UnresolvedLocation`] whose entity-scale containment is expressed
 /// via [`crate::facts::attribute::Fact::Relationship`] on the relevant
 /// entities, not embedded in the location reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(bound(
-    serialize = "ImgId: Serialize",
-    deserialize = "ImgId: serde::de::DeserializeOwned"
+    serialize = "ImgId: ::serde::Serialize",
+    deserialize = "ImgId: ::serde::de::DeserializeOwned"
 ))]
-#[schemars(bound = "ImgId: JsonSchema")]
+#[schemars(bound = "ImgId: ::schemars::JsonSchema")]
 pub enum Fact<ImgId> {
     /// Asserts the image is being treated as a picture — a photograph,
     /// painting, drawing, print, or other figurative depiction.
@@ -77,4 +74,34 @@ pub enum Fact<ImgId> {
         /// The capture location.
         location: UnresolvedLocation,
     },
+}
+
+impl<ImgId> Fact<ImgId> {
+    /// Visit the single image id this fact mentions.
+    pub fn for_each_id(&self, fi: &mut impl FnMut(&ImgId)) {
+        match self {
+            Self::IsPicture { image }
+            | Self::CapturedDate { image, .. }
+            | Self::CapturedLocation { image, .. } => fi(image),
+        }
+    }
+
+    /// Relabel the single image id through the fallible closure, producing
+    /// a `Fact<I2>`.
+    pub fn try_map_ids<I2, Err>(
+        &self,
+        fi: &mut impl FnMut(&ImgId) -> Result<I2, Err>,
+    ) -> Result<Fact<I2>, Err> {
+        match self {
+            Self::IsPicture { image } => Ok(Fact::IsPicture { image: fi(image)? }),
+            Self::CapturedDate { image, bound } => Ok(Fact::CapturedDate {
+                image: fi(image)?,
+                bound: bound.clone(),
+            }),
+            Self::CapturedLocation { image, location } => Ok(Fact::CapturedLocation {
+                image: fi(image)?,
+                location: location.clone(),
+            }),
+        }
+    }
 }

@@ -57,7 +57,11 @@ pub fn parse_wikidata_time(time_str: &str, precision: WikidataPrecision) -> Opti
     }
 }
 
-/// Extract names from labels and P1448 (official name).
+/// Extract names from P1448 (official name) claims.
+///
+/// Plain labels are intentionally not emitted: they carry no real
+/// Wikidata property to attribute evidence to. Only property-backed
+/// name claims (currently P1448) become names.
 pub fn extract_names(
     wd: &WikidataEntity,
     wikidata_id: &str,
@@ -65,29 +69,24 @@ pub fn extract_names(
 ) -> Vec<Cited<EntityName, SourceIdx>> {
     let mut names = Vec::new();
 
-    let entity_id = WikidataEntityId::new(wikidata_id);
-    let label_marker = WikidataPropertyId::new("label");
-    let p1448 = WikidataPropertyId::new("P1448");
+    // FIXME(old-model): label-derived name extraction was removed here.
+    // Wikidata labels have no property ID, and `Evidence::Wikidata.property_id`
+    // is required (we deliberately kept it required, not optional), so a label
+    // has nothing to attribute evidence to. Consequence: most entities now have
+    // NO name from this path — only those carrying a P1448 official name. This
+    // is a known degradation, tolerated only because this old-model ingestion
+    // path is slated for deletion. Before relying on entity names from this path,
+    // or before deleting it, restore label extraction (needs an optional
+    // property_id or a label-specific Evidence variant).
 
-    for (lang, label) in &wd.labels {
-        if let Ok(language_tag) = LanguageTag::parse(lang.0.clone()) {
-            names.push(Cited::new(
-                EntityName {
-                    name: label.value.clone(),
-                    name_type: NameType::Common,
-                    language: language_tag,
-                    valid_from: None,
-                    valid_to: None,
-                },
-                vec![Evidence::Wikidata {
-                    entity_id: entity_id.clone(),
-                    property_id: label_marker.clone(),
-                    property_value: format!("{}:{}", lang, label.value),
-                    revision_id,
-                }],
-            ));
-        }
-    }
+    // P1448 (official name) is the only label source that carries a real
+    // Wikidata property. The entity id is parsed once here; a non-entity
+    // id can't be cited, so we return whatever names were collected (none
+    // yet) rather than fabricate evidence.
+    let Ok(entity_id) = WikidataEntityId::parse(wikidata_id) else {
+        return names;
+    };
+    let p1448 = WikidataPropertyId::new(1448);
 
     // P1448 (official name)
     if let Some(claims) = wd.claims.get("P1448") {
@@ -104,8 +103,8 @@ pub fn extract_names(
                         valid_to: None,
                     },
                     vec![Evidence::Wikidata {
-                        entity_id: entity_id.clone(),
-                        property_id: p1448.clone(),
+                        entity_id,
+                        property_id: p1448,
                         property_value: format!("{}:{}", mono.language, mono.text),
                         revision_id,
                     }],
@@ -345,7 +344,11 @@ mod tests {
     // =============================================================================
 
     #[test]
-    fn test_extract_names_from_labels() -> TestResult {
+    fn extract_names_ignores_plain_labels() -> TestResult {
+        // Labels carry no real Wikidata property, so they no longer
+        // produce names. Only P1448 (official name) and similar
+        // property-backed claims do. An entity with labels but no such
+        // claims yields no names.
         let entity = WikidataEntity {
             id: wikidata_id("Q243")?,
             entity_type: WikidataEntityType::Item,
@@ -371,10 +374,10 @@ mod tests {
         };
 
         let names = extract_names(&entity, "Q243", 100);
-        assert_eq!(names.len(), 2);
-        let name_values: Vec<&str> = names.iter().map(|n| n.value.name.as_str()).collect();
-        assert!(name_values.contains(&"Eiffel Tower"));
-        assert!(name_values.contains(&"Tour Eiffel"));
+        assert!(
+            names.is_empty(),
+            "plain labels should not produce names, got {names:?}"
+        );
         Ok(())
     }
 

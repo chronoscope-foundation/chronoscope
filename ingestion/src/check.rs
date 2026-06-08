@@ -173,7 +173,7 @@ fn compute_distributions(output: &IngestionOutput) -> Distributions {
             if let Some(loc) = extract_location(transition) {
                 let loc_type = match loc {
                     UnresolvedLocation::Resolved(Location::Circle { .. }) => "Circle",
-                    UnresolvedLocation::Resolved(Location::UnionOf(_)) => "UnionOf",
+                    UnresolvedLocation::Resolved(Location::UnionOf { .. }) => "UnionOf",
                     UnresolvedLocation::Resolved(Location::Unbounded) => "Unbounded",
                     UnresolvedLocation::Reference(_) => "Reference",
                     UnresolvedLocation::OneOf(_) => "OneOf",
@@ -485,7 +485,7 @@ fn get_wikidata_id(output: &IngestionOutput, entity_key: &EntityIdx) -> Option<S
             if let Some(link) = output.external_links.get(link_key)
                 && let LinkTarget::Wikidata { entity_id } = &link.target
             {
-                return Some(entity_id.as_str().to_owned());
+                return Some(entity_id.to_string());
             }
         }
         None
@@ -923,7 +923,7 @@ mod tests {
             LinkIdx::new(0),
             ExternalLink {
                 target: LinkTarget::Wikidata {
-                    entity_id: WikidataEntityId::new("Q12345"),
+                    entity_id: WikidataEntityId::new(12345),
                 },
                 link_type: LinkType::SameAs,
             },

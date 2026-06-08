@@ -322,10 +322,10 @@ pub fn extract_location<S>(entity: &chronoscope_core::entity::Entity<S>) -> Opti
 
         if let Some(cited_loc) = loc
             && let chronoscope_core::UnresolvedLocation::Resolved(
-                chronoscope_core::Location::Circle { lat, lon, .. },
+                chronoscope_core::Location::Circle { center, .. },
             ) = &cited_loc.value
         {
-            result = Some((*lat, *lon));
+            result = Some((center.lat(), center.lon()));
         }
     }
     result
@@ -379,9 +379,9 @@ mod tests {
 
     #[test]
     fn extract_location_from_constructed() -> Result<(), Box<dyn std::error::Error>> {
-        use chronoscope_core::{Cited, Location, UnresolvedLocation};
+        use chronoscope_core::{Cited, GeoPoint, Location, UnresolvedLocation};
         let loc: UnresolvedLocation =
-            UnresolvedLocation::Resolved(Location::point(48.8584, 2.2945)?);
+            UnresolvedLocation::Resolved(Location::point(GeoPoint::new(48.8584, 2.2945)?));
         let entity: chronoscope_core::entity::Entity<SourceId> = chronoscope_core::entity::Entity {
             names: vec![],
             transitions: vec![chronoscope_core::entity::EntityTransition::Constructed {

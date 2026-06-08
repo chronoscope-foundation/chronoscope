@@ -148,10 +148,11 @@ mod tests {
             .location
             .ok_or("should have GPS location")?;
         if let chronoscope_core::UnresolvedLocation::Resolved(
-            chronoscope_core::Location::Circle { lat, .. },
+            chronoscope_core::Location::Circle { center, .. },
         ) = &location
         {
-            assert!((*lat - 43.467).abs() < 0.01, "lat: {lat}",);
+            let lat = center.lat();
+            assert!((lat - 43.467).abs() < 0.01, "lat: {lat}",);
         } else {
             return Err("expected Resolved(Circle) location".into());
         }

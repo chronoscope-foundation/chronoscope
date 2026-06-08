@@ -5,7 +5,7 @@ use chronoscope_integrations::IntegrationName;
 
 use crate::types::{Email, MediaAnalysisState, MediaType, ResearchUrlStatus, UserId};
 use chrono::{Duration, Utc};
-use chronoscope_core::{Location, UnresolvedLocation};
+use chronoscope_core::{GeoPoint, Location, UnresolvedLocation};
 
 macro_rules! assert_approx_eq {
     ($left:expr, $right:expr, $epsilon:expr) => {
@@ -565,10 +565,10 @@ async fn test_get_or_create_media_with_location() -> DbResult<()> {
         height: 480,
         duration_seconds: None,
         captured: None,
-        location: Some(UnresolvedLocation::Resolved(
-            Location::point(37.7749, -122.4194)
+        location: Some(UnresolvedLocation::Resolved(Location::point(
+            GeoPoint::new(37.7749, -122.4194)
                 .map_err(|e| DbError::InvalidArgument(e.to_string()))?,
-        )),
+        ))),
         source_metadata: None,
         fetched_at: Utc::now().naive_utc(),
     };
@@ -598,9 +598,9 @@ async fn test_get_or_create_media_with_location() -> DbResult<()> {
     let loc: UnresolvedLocation = serde_json::from_str(&meta_json)
         .map_err(|e| DbError::InvalidArgument(format!("bad json: {e}")))?;
     match loc {
-        UnresolvedLocation::Resolved(Location::Circle { lat, lon, .. }) => {
-            assert_approx_eq!(lat, 37.7749, 1e-4);
-            assert_approx_eq!(lon, -122.4194, 1e-4);
+        UnresolvedLocation::Resolved(Location::Circle { center, .. }) => {
+            assert_approx_eq!(center.lat(), 37.7749, 1e-4);
+            assert_approx_eq!(center.lon(), -122.4194, 1e-4);
         }
         other => {
             return Err(DbError::InvalidArgument(format!(

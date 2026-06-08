@@ -355,8 +355,10 @@ mod tests {
     fn test_convert_media_with_location() -> TestResult {
         let mut media = minimal_media();
         media.data.location = Some(chronoscope_core::UnresolvedLocation::Resolved(
-            chronoscope_core::Location::point(41.5908, -87.3467)
-                .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
+            chronoscope_core::Location::point(
+                chronoscope_core::GeoPoint::new(41.5908, -87.3467)
+                    .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
+            ),
         ));
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
@@ -366,10 +368,10 @@ mod tests {
             .ok_or_else(|| HttpError::for_bad_request(None, "should have location".to_string()))?;
         match location {
             chronoscope_core::UnresolvedLocation::Resolved(
-                chronoscope_core::Location::Circle { lat, lon, .. },
+                chronoscope_core::Location::Circle { center, .. },
             ) => {
-                assert_eq!(lat, 41.5908);
-                assert_eq!(lon, -87.3467);
+                assert_eq!(center.lat(), 41.5908);
+                assert_eq!(center.lon(), -87.3467);
             }
             _ => {
                 return Err(HttpError::for_bad_request(
@@ -385,8 +387,10 @@ mod tests {
     fn test_convert_media_with_elevation() -> TestResult {
         let mut media = minimal_media();
         media.data.location = Some(chronoscope_core::UnresolvedLocation::Resolved(
-            chronoscope_core::Location::point(41.5908, -87.3467)
-                .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
+            chronoscope_core::Location::point(
+                chronoscope_core::GeoPoint::new(41.5908, -87.3467)
+                    .map_err(|e| HttpError::for_bad_request(None, e.to_string()))?,
+            ),
         ));
 
         let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;

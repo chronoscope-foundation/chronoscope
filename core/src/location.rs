@@ -9,52 +9,53 @@
 //! - [`LocationReference`] — a symbolic pointer to a location in an external
 //!   system (OSM, OHM, named place, address, or "near" any of these).
 //!
-//! Merge operates on `UnresolvedLocation` (pure bag union / `OneOf` construction).
-//! Resolution maps `LocationReference` → `Location` via a caller-provided closure.
-//! The lattice operates on `Location` only.
+//! Merge operates on `UnresolvedLocation` (bag union / `OneOf` construction).
+//! Resolution maps `LocationReference` → `Location` via a caller-provided
+//! closure. The lattice operates on `Location` only.
 //!
 //! # Entity vs. region scope
 //!
-//! Entity-scale things — individual buildings, the Forbidden City as a
-//! complex, a fortress, a citadel — are first-class entities with their
-//! own [`crate::facts::ids::EntityId`]. Containment between such entities
-//! is expressed by
+//! Entity-scale things — individual buildings, the Forbidden City as a complex,
+//! a fortress, a citadel — are first-class entities with their own
+//! [`crate::facts::ids::EntityId`]. Containment between them is expressed by
 //! [`crate::facts::attribute::Fact::Relationship`] with
-//! [`crate::facts::attribute::EntityRelationType::Contains`], not by a
-//! location reference.
+//! [`crate::facts::attribute::EntityRelationType::Contains`], not by a location
+//! reference.
 //!
-//! Region-scale things — cities, neighborhoods, contested geographical
-//! areas like "Manhattan" or "Newark" — are *not* entities in the
-//! fact-store grammar. They live as opaque names inside
-//! [`LocationReference::NamedPlace`], to be resolved against an external
-//! gazetteer at projection time. The grammar does not enforce this split
-//! structurally; it is a convention the submission layer follows, and
-//! the projection layer relies on the same convention when deciding how
-//! to interpret a location claim.
+//! Region-scale things — cities, neighborhoods, contested geographical areas
+//! like "Manhattan" or "Newark" — are not entities in the fact-store grammar.
+//! They live as opaque names inside [`LocationReference::NamedPlace`], resolved
+//! against an external gazetteer at projection time. The grammar doesn't
+//! enforce this split structurally; it's a convention the submission and
+//! projection layers both follow.
 
+use std::cmp::Ordering;
 use std::fmt;
 
+use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::geo::{GeoPoint, GeoPointError};
 use crate::ids::{OhmId, OsmElementType, OsmId};
 
 /// Errors from location construction or validation.
 ///
-/// `Eq` is not derived because this is the one place the f64 fields
-/// genuinely carry non-`Eq` values — the rejected input being echoed
-/// back may be `NaN` or infinite. Constructed `Location` / `GeoPoint`
-/// values, which route through the smart constructors, do derive `Eq`.
+/// Coordinate validation (range / finiteness / negative-zero normalization)
+/// lives on [`GeoPoint`]; a circle's center error surfaces through the
+/// [`Self::Center`] wrapper. `LocationError`'s own variants are the
+/// location-specific checks: the radius bounds and the minimum-entry count for
+/// `UnionOf`/`OneOf`.
+///
+/// `PartialEq` only — the radius variants carry pre-validation `f64` that may be
+/// NaN/Inf. Errors aren't part of the content-addressed-fact graph, so missing
+/// `Eq`/`Ord` doesn't ripple.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocationError {
     /// `OneOf` / `UnionOf` requires at least 2 entries.
     TooFewEntries { count: usize },
-    /// Latitude is outside `[-90, 90]`.
-    LatitudeOutOfRange { lat: f64 },
-    /// Longitude is outside `[-180, 180]`.
-    LongitudeOutOfRange { lon: f64 },
-    /// `lat` or `lon` was `NaN` or infinite.
-    NonFiniteCoordinate { lat: f64, lon: f64 },
+    /// The circle's center coordinate failed [`GeoPoint`] validation.
+    Center(GeoPointError),
     /// Radius was negative.
     NegativeRadius { radius_m: f64 },
     /// Radius was `NaN` or infinite.
@@ -67,15 +68,7 @@ impl fmt::Display for LocationError {
             Self::TooFewEntries { count } => {
                 write!(f, "OneOf/UnionOf requires at least 2 entries, got {count}")
             }
-            Self::LatitudeOutOfRange { lat } => {
-                write!(f, "latitude {lat} out of range [-90, 90]")
-            }
-            Self::LongitudeOutOfRange { lon } => {
-                write!(f, "longitude {lon} out of range [-180, 180]")
-            }
-            Self::NonFiniteCoordinate { lat, lon } => {
-                write!(f, "lat/lon must be finite (got lat={lat}, lon={lon})")
-            }
+            Self::Center(e) => write!(f, "circle center: {e}"),
             Self::NegativeRadius { radius_m } => {
                 write!(f, "radius_m must be non-negative, got {radius_m}")
             }
@@ -86,7 +79,20 @@ impl fmt::Display for LocationError {
     }
 }
 
-impl std::error::Error for LocationError {}
+impl std::error::Error for LocationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Center(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<GeoPointError> for LocationError {
+    fn from(e: GeoPointError) -> Self {
+        Self::Center(e)
+    }
+}
 
 // ==================== Resolved Location ====================
 
@@ -95,24 +101,91 @@ impl std::error::Error for LocationError {}
 /// No external references — purely geometric. The lattice (merge via subsumption
 /// + union) is defined on this type.
 ///
-/// `Eq` is sound here because every reachable `Circle` routes through
-/// [`Location::circle`], which rejects `NaN` and infinity. The derive
-/// macro can't see that, so `Eq` is implemented manually.
+/// `Eq`/`Ord`/`Hash` are hand-implemented because the `Circle` variant carries
+/// an `f64` radius (needed for `BTreeSet<SubmitFact>` dedup of facts that
+/// transitively reach `Location`). The center's coordinate handling is
+/// [`GeoPoint`]'s; these impls delegate the center to it and add only the radius
+/// `total_cmp`/`to_bits`. The smart constructor [`Location::circle`] rejects
+/// NaN/Inf radii and normalizes `-0.0` so the manual `Hash`/`Ord` stay
+/// consistent with the derived `PartialEq`.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Location {
     /// A point with radius of uncertainty (circle on the earth's surface).
-    Circle { lat: f64, lon: f64, radius_m: f64 },
+    Circle { center: GeoPoint, radius_m: f64 },
     /// Disjoint or partially-overlapping shapes: "one of these is true."
     /// Parallels [`UnresolvedLocation::OneOf`] at the resolved level.
     /// Flattened when nested. Requires ≥2 children.
     #[serde(rename = "union_of")]
-    UnionOf(Vec<Location>),
-    /// No geometric information (resolution failed, or genuinely unknown).
+    UnionOf { members: Vec<Location> },
+    /// No geometric information (resolution failed, or unknown).
     Unbounded,
 }
 
 impl Eq for Location {}
+
+impl PartialOrd for Location {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Location {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Variant discriminant first, then payload. `Circle`'s f64s use
+        // `total_cmp` (NaN/Inf rejected at construction).
+        fn variant_index(loc: &Location) -> u8 {
+            match loc {
+                Location::Circle { .. } => 0,
+                Location::UnionOf { .. } => 1,
+                Location::Unbounded => 2,
+            }
+        }
+        let self_idx = variant_index(self);
+        let other_idx = variant_index(other);
+        if self_idx != other_idx {
+            return self_idx.cmp(&other_idx);
+        }
+        match (self, other) {
+            (
+                Self::Circle {
+                    center: c1,
+                    radius_m: r1,
+                },
+                Self::Circle {
+                    center: c2,
+                    radius_m: r2,
+                },
+                // `center` orders via `GeoPoint`'s `total_cmp`-based `Ord`; the
+                // radius `f64` uses `total_cmp` for the same NaN-free reason.
+            ) => c1.cmp(c2).then_with(|| r1.total_cmp(r2)),
+            (Self::UnionOf { members: a }, Self::UnionOf { members: b }) => a.cmp(b),
+            (Self::Unbounded, Self::Unbounded) => Ordering::Equal,
+            // Mixed variants are handled by the discriminant check above; these
+            // arms are unreachable but spelled out so adding a variant forces a
+            // decision.
+            (Self::Circle { .. }, _) | (Self::UnionOf { .. }, _) | (Self::Unbounded, _) => {
+                Ordering::Equal
+            }
+        }
+    }
+}
+
+impl std::hash::Hash for Location {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Circle { center, radius_m } => {
+                // `center` hashes via `GeoPoint`'s `to_bits`-based `Hash`;
+                // the radius hashes by bits for the same reason.
+                center.hash(state);
+                radius_m.to_bits().hash(state);
+            }
+            Self::UnionOf { members } => members.hash(state),
+            Self::Unbounded => {}
+        }
+    }
+}
 
 impl<'de> Deserialize<'de> for Location {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -121,29 +194,28 @@ impl<'de> Deserialize<'de> for Location {
     {
         #[derive(Deserialize)]
         #[serde(tag = "type", rename_all = "snake_case")]
+        #[serde(deny_unknown_fields)]
         enum Raw {
             Circle {
-                lat: f64,
-                lon: f64,
+                center: GeoPoint,
                 radius_m: f64,
             },
             #[serde(rename = "union_of")]
-            UnionOf(Vec<Location>),
+            UnionOf {
+                members: Vec<Location>,
+            },
             Unbounded,
         }
 
         let raw = Raw::deserialize(deserializer)?;
         match raw {
-            Raw::Circle { lat, lon, radius_m } => {
-                Location::circle(lat, lon, radius_m).map_err(serde::de::Error::custom)
+            // `center` is validated by `GeoPoint`'s own `Deserialize`;
+            // `circle` adds the radius checks.
+            Raw::Circle { center, radius_m } => {
+                Location::circle(center, radius_m).map_err(serde::de::Error::custom)
             }
-            Raw::UnionOf(children) => {
-                if children.len() < 2 {
-                    return Err(serde::de::Error::custom(LocationError::TooFewEntries {
-                        count: children.len(),
-                    }));
-                }
-                Ok(Location::UnionOf(children))
+            Raw::UnionOf { members } => {
+                Location::union_of(members).map_err(serde::de::Error::custom)
             }
             Raw::Unbounded => Ok(Location::Unbounded),
         }
@@ -151,27 +223,38 @@ impl<'de> Deserialize<'de> for Location {
 }
 
 impl Location {
-    /// Create a validated `Circle` location.
+    /// Create a validated `Circle` location from an already-validated
+    /// [`GeoPoint`] center and a radius.
     ///
-    /// Checks that latitude is in `[-90, 90]`, longitude is in `[-180, 180]`,
-    /// neither value is `NaN` or infinite, and radius is non-negative and finite.
-    pub fn circle(lat: f64, lon: f64, radius_m: f64) -> Result<Self, LocationError> {
-        validate_coordinates(lat, lon)?;
+    /// The center carries [`GeoPoint`]'s guarantees (in-range, finite,
+    /// negative-zero-normalized). This constructor adds the radius checks:
+    /// non-negative and finite. `-0.0` radius is normalized to `+0.0` so
+    /// the manual `Hash`/`Ord` (bit-level / `total_cmp`) stay consistent
+    /// with the derived `PartialEq`.
+    pub fn circle(center: GeoPoint, radius_m: f64) -> Result<Self, LocationError> {
         if !radius_m.is_finite() {
             return Err(LocationError::NonFiniteRadius { radius_m });
         }
         if radius_m < 0.0 {
             return Err(LocationError::NegativeRadius { radius_m });
         }
-        Ok(Self::Circle { lat, lon, radius_m })
+        // Normalize `-0.0` to `+0.0`: `-0.0 + 0.0 == +0.0`, and adding
+        // `0.0` is a no-op for every other finite value.
+        let radius_m = radius_m + 0.0;
+        Ok(Self::Circle { center, radius_m })
     }
 
-    /// Create a `Circle` from coordinates without explicit precision.
+    /// Create a zero-radius `Circle` at a [`GeoPoint`] — a point taken at
+    /// face value, with no explicit precision.
     ///
-    /// Uses `radius_m: 0.0` — the coordinate is taken at face value.
-    /// The lattice treats this as a zero-radius circle for geometric operations.
-    pub fn point(lat: f64, lon: f64) -> Result<Self, LocationError> {
-        Self::circle(lat, lon, 0.0)
+    /// Infallible: the center is already validated and a `0.0` radius
+    /// always passes the radius checks. The lattice treats this as a
+    /// zero-radius circle for geometric operations.
+    pub fn point(center: GeoPoint) -> Self {
+        Self::Circle {
+            center,
+            radius_m: 0.0,
+        }
     }
 
     /// Create a validated `UnionOf` with at least 2 children.
@@ -181,7 +264,7 @@ impl Location {
                 count: children.len(),
             });
         }
-        Ok(Self::UnionOf(children))
+        Ok(Self::UnionOf { members: children })
     }
 
     /// Merge two locations in the subsumption semilattice.
@@ -191,7 +274,6 @@ impl Location {
     /// determine which geometrically."
     ///
     /// `Unbounded` is the identity: `Unbounded.merge(x) == x`.
-    #[must_use]
     pub fn merge(&self, other: &Self) -> Self {
         if self.contains(other) {
             return other.clone();
@@ -203,14 +285,14 @@ impl Location {
         let mut children = Vec::new();
         // Flatten existing UnionOf children
         match self {
-            Self::UnionOf(cs) => children.extend(cs.iter().cloned()),
+            Self::UnionOf { members } => children.extend(members.iter().cloned()),
             other_val => children.push(other_val.clone()),
         }
         match other {
-            Self::UnionOf(cs) => children.extend(cs.iter().cloned()),
+            Self::UnionOf { members } => children.extend(members.iter().cloned()),
             other_val => children.push(other_val.clone()),
         }
-        Self::UnionOf(children)
+        Self::UnionOf { members: children }
     }
 
     /// Check if this location's region contains another's entirely.
@@ -225,36 +307,43 @@ impl Location {
             // Circle containment: distance between centers + other radius <= self radius
             (
                 Self::Circle {
-                    lat: la1,
-                    lon: lo1,
+                    center: c1,
                     radius_m: r1,
                 },
                 Self::Circle {
-                    lat: la2,
-                    lon: lo2,
+                    center: c2,
                     radius_m: r2,
                 },
             ) => {
-                let dist = haversine_meters(*la1, *lo1, *la2, *lo2);
+                let dist = haversine_meters(c1, c2);
                 dist + r2 <= *r1
             }
             // UnionOf vs UnionOf: self contains other if every child of other
             // is contained by some child of self.
-            (Self::UnionOf(self_children), Self::UnionOf(other_children)) => other_children
+            (
+                Self::UnionOf {
+                    members: self_children,
+                },
+                Self::UnionOf {
+                    members: other_children,
+                },
+            ) => other_children
                 .iter()
                 .all(|oc| self_children.iter().any(|sc| sc.contains(oc))),
             // UnionOf contains X if any child contains X
-            (Self::UnionOf(children), other_loc) => children.iter().any(|c| c.contains(other_loc)),
+            (Self::UnionOf { members }, other_loc) => members.iter().any(|c| c.contains(other_loc)),
             // X contains UnionOf if X contains every child
-            (_, Self::UnionOf(children)) => children.iter().all(|c| self.contains(c)),
+            (_, Self::UnionOf { members }) => members.iter().all(|c| self.contains(c)),
             // Circle doesn't contain Unbounded (handled above)
         }
     }
 }
 
-/// Haversine distance in meters between two (lat, lon) points.
-fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+/// Haversine distance in meters between two geo-points.
+fn haversine_meters(a_point: &GeoPoint, b_point: &GeoPoint) -> f64 {
     const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let (lat1, lon1) = (a_point.lat(), a_point.lon());
+    let (lat2, lon2) = (b_point.lat(), b_point.lon());
     let dlat = (lat2 - lat1).to_radians();
     let dlon = (lon2 - lon1).to_radians();
     let a = (dlat / 2.0).sin().powi(2)
@@ -263,27 +352,17 @@ fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     EARTH_RADIUS_M * c
 }
 
-pub(crate) fn validate_coordinates(lat: f64, lon: f64) -> Result<(), LocationError> {
-    if !lat.is_finite() || !lon.is_finite() {
-        return Err(LocationError::NonFiniteCoordinate { lat, lon });
-    }
-    if !(-90.0..=90.0).contains(&lat) {
-        return Err(LocationError::LatitudeOutOfRange { lat });
-    }
-    if !(-180.0..=180.0).contains(&lon) {
-        return Err(LocationError::LongitudeOutOfRange { lon });
-    }
-    Ok(())
-}
-
 // ==================== Unresolved Location ====================
 
 /// A location that may contain unresolved symbolic references.
 ///
-/// Uses adjacently-tagged serde (`tag` + `content`) because `Resolved` wraps
-/// a [`Location`] which has its own internal `type` tag — internal tagging
-/// on both levels would produce duplicate `type` fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+/// Adjacently-tagged serde (`tag` + `content`) because `Resolved` wraps a
+/// [`Location`] with its own internal `type` tag — internal tagging on both
+/// levels would produce duplicate `type` fields.
+///
+/// `Eq`/`Ord` propagate through [`Location`]'s hand-implemented Ord; see that
+/// type's doc-comment for the f64 handling.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum UnresolvedLocation {
     /// Already resolved to geometry.
@@ -316,6 +395,7 @@ impl<'de> Deserialize<'de> for UnresolvedLocation {
     {
         #[derive(Deserialize)]
         #[serde(tag = "type", content = "value", rename_all = "snake_case")]
+        #[serde(deny_unknown_fields)]
         enum Raw {
             Resolved(Location),
             Reference(LocationReference),
@@ -342,14 +422,13 @@ impl<'de> Deserialize<'de> for UnresolvedLocation {
 
 /// A symbolic reference to a location in an external system.
 ///
-/// These need external resolution (geocoding, OSM/OHM lookup, etc.) to
-/// produce a [`Location`]. References are deliberately region-scale:
-/// entity-scale containment lives on
-/// [`crate::facts::attribute::Fact::Relationship`], not here. See the
+/// These need external resolution (geocoding, OSM/OHM lookup, etc.) to produce
+/// a [`Location`]. References are region-scale: entity-scale containment lives
+/// on [`crate::facts::attribute::Fact::Relationship`], not here. See the
 /// module-level "Entity vs. region scope" note.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LocationReference {
     /// OpenStreetMap element reference.
     #[serde(rename = "osm_reference")]
@@ -377,8 +456,8 @@ pub enum LocationReference {
 /// Elevation representation with different reference systems.
 // TODO: "Current" in CurrentGroundOffset is awkward — ground level changes over time
 // (e.g., landfill, excavation, natural erosion). May need temporal qualification later.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Elevation {
     /// Offset from ground level (0 = ground, negative = below ground).
     CurrentGroundOffset { meters: i32 },
@@ -387,7 +466,9 @@ pub enum Elevation {
 }
 
 /// Qualitative distance descriptions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Distance {
     Adjacent,
@@ -398,77 +479,113 @@ pub enum Distance {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// Build a [`GeoPoint`] for test fixtures, surfacing construction
+    /// failure as the test's error rather than a panic.
+    fn gp(lat: f64, lon: f64) -> Result<GeoPoint, GeoPointError> {
+        GeoPoint::new(lat, lon)
+    }
 
     // --- Location (resolved) tests ---
 
     #[test]
-    fn valid_circle() {
-        let loc = Location::circle(40.7505, -73.9934, 10.0);
+    fn valid_circle() -> TestResult {
+        let loc = Location::circle(gp(40.7505, -73.9934)?, 10.0);
         assert!(loc.is_ok());
+        Ok(())
     }
 
     #[test]
-    fn valid_point() {
-        let loc = Location::point(40.7505, -73.9934);
-        assert!(loc.is_ok());
+    fn valid_point() -> TestResult {
         assert!(matches!(
-            loc.unwrap(),
+            Location::point(gp(40.7505, -73.9934)?),
             Location::Circle { radius_m, .. } if radius_m == 0.0
         ));
+        Ok(())
     }
 
     #[test]
-    fn circle_rejects_out_of_range_lat() {
-        let loc = Location::circle(91.0, 0.0, 10.0);
-        assert!(matches!(loc, Err(LocationError::LatitudeOutOfRange { .. })));
-    }
-
-    #[test]
-    fn circle_rejects_out_of_range_lon() {
-        let loc = Location::circle(0.0, 181.0, 10.0);
-        assert!(matches!(
-            loc,
-            Err(LocationError::LongitudeOutOfRange { .. })
-        ));
-    }
-
-    #[test]
-    fn circle_rejects_nan() {
-        let loc = Location::circle(f64::NAN, 0.0, 10.0);
-        assert!(matches!(
-            loc,
-            Err(LocationError::NonFiniteCoordinate { .. })
-        ));
-    }
-
-    #[test]
-    fn circle_rejects_infinity() {
-        let loc = Location::circle(0.0, f64::INFINITY, 10.0);
-        assert!(matches!(
-            loc,
-            Err(LocationError::NonFiniteCoordinate { .. })
-        ));
-    }
-
-    #[test]
-    fn circle_rejects_negative_radius() {
-        let loc = Location::circle(0.0, 0.0, -1.0);
+    fn circle_rejects_negative_radius() -> TestResult {
+        let loc = Location::circle(gp(0.0, 0.0)?, -1.0);
         assert!(matches!(loc, Err(LocationError::NegativeRadius { .. })));
+        Ok(())
     }
 
     #[test]
-    fn circle_boundary_values() {
-        assert!(Location::circle(90.0, 180.0, 0.0).is_ok());
-        assert!(Location::circle(-90.0, -180.0, 0.0).is_ok());
+    fn circle_rejects_non_finite_radius() -> TestResult {
+        let loc = Location::circle(gp(0.0, 0.0)?, f64::INFINITY);
+        assert!(matches!(loc, Err(LocationError::NonFiniteRadius { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn circle_deserialize_rejects_out_of_range_center() {
+        // The center routes through `GeoPoint`'s validating `Deserialize`,
+        // so an out-of-range coordinate is rejected at the `Location`
+        // boundary as a `Center` error rather than reaching the interior.
+        let result: Result<Location, _> = serde_json::from_str(
+            r#"{"type":"circle","center":{"lat":91.0,"lon":0.0},"radius_m":10.0}"#,
+        );
+        assert!(
+            result.is_err(),
+            "out-of-range center must fail at deserialize"
+        );
+    }
+
+    #[test]
+    fn circle_boundary_values() -> TestResult {
+        assert!(Location::circle(gp(90.0, 180.0)?, 0.0).is_ok());
+        assert!(Location::circle(gp(-90.0, -180.0)?, 0.0).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn circle_negative_zero_radius_is_consistent_across_eq_hash_ord() -> TestResult {
+        use std::collections::HashSet;
+        use std::hash::{Hash, Hasher};
+
+        // A `-0.0` radius must normalize to `+0.0` so the two forms are
+        // indistinguishable under Eq, Hash, and Ord — the contract the
+        // manual Hash/Ord impls would otherwise violate. (Center
+        // normalization is `GeoPoint`'s, covered in `geo.rs`; here the
+        // same center is reused so the radius is the only variable.)
+        let center = gp(0.0, 0.0)?;
+        let neg = Location::circle(center, -0.0)?;
+        let pos = Location::circle(center, 0.0)?;
+
+        assert_eq!(neg, pos, "negative and positive zero radius must be equal");
+
+        let mut hasher_neg = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher_pos = std::collections::hash_map::DefaultHasher::new();
+        neg.hash(&mut hasher_neg);
+        pos.hash(&mut hasher_pos);
+        assert_eq!(
+            hasher_neg.finish(),
+            hasher_pos.finish(),
+            "equal circles must hash equally"
+        );
+
+        let mut set = HashSet::new();
+        set.insert(neg.clone());
+        set.insert(pos.clone());
+        assert_eq!(set.len(), 1, "the two zero-forms must dedup to one entry");
+
+        assert_eq!(
+            neg.cmp(&pos),
+            std::cmp::Ordering::Equal,
+            "equal circles must order Equal"
+        );
+        Ok(())
     }
 
     // --- UnresolvedLocation tests ---
 
     #[test]
-    fn one_of_serde_roundtrip() {
+    fn one_of_serde_roundtrip() -> TestResult {
         let loc = UnresolvedLocation::OneOf(vec![
             UnresolvedLocation::Reference(LocationReference::NamedPlace {
                 name: "Paris".to_string(),
@@ -478,13 +595,14 @@ mod tests {
             }),
         ]);
 
-        let json = serde_json::to_string(&loc).unwrap();
-        let deserialized: UnresolvedLocation = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&loc)?;
+        let deserialized: UnresolvedLocation = serde_json::from_str(&json)?;
         assert_eq!(loc, deserialized);
+        Ok(())
     }
 
     #[test]
-    fn one_of_rejects_single_entry() {
+    fn one_of_rejects_single_entry() -> TestResult {
         // Construct a single-entry OneOf — serialization succeeds but
         // deserialization must reject it (minimum 2 entries).
         let loc = UnresolvedLocation::OneOf(vec![UnresolvedLocation::Reference(
@@ -492,113 +610,116 @@ mod tests {
                 name: "Paris".to_string(),
             },
         )]);
-        let json = serde_json::to_string(&loc).unwrap();
+        let json = serde_json::to_string(&loc)?;
         assert!(serde_json::from_str::<UnresolvedLocation>(&json).is_err());
+        Ok(())
     }
 
     #[test]
-    fn resolved_serde_roundtrip() {
-        let loc = UnresolvedLocation::Resolved(Location::circle(48.8584, 2.2945, 10.0).unwrap());
-        let json = serde_json::to_string(&loc).unwrap();
-        let deserialized: UnresolvedLocation = serde_json::from_str(&json).unwrap();
+    fn resolved_serde_roundtrip() -> TestResult {
+        let loc = UnresolvedLocation::Resolved(Location::circle(gp(48.8584, 2.2945)?, 10.0)?);
+        let json = serde_json::to_string(&loc)?;
+        let deserialized: UnresolvedLocation = serde_json::from_str(&json)?;
         assert_eq!(loc, deserialized);
+        Ok(())
     }
 
     #[test]
-    fn near_reference_serde_roundtrip() {
+    fn near_reference_serde_roundtrip() -> TestResult {
         let loc = UnresolvedLocation::Reference(LocationReference::Near {
             reference: Box::new(LocationReference::NamedPlace {
                 name: "Paris".to_string(),
             }),
             distance: Some(Distance::WalkingDistance),
         });
-        let json = serde_json::to_string(&loc).unwrap();
-        let deserialized: UnresolvedLocation = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&loc)?;
+        let deserialized: UnresolvedLocation = serde_json::from_str(&json)?;
         assert_eq!(loc, deserialized);
+        Ok(())
     }
 
     // --- Location merge (lattice) tests ---
 
     #[test]
-    fn merge_unbounded_is_identity() {
-        let c = Location::circle(48.8, 2.3, 100.0).unwrap();
+    fn merge_unbounded_is_identity() -> TestResult {
+        let c = Location::circle(gp(48.8, 2.3)?, 100.0)?;
         assert_eq!(Location::Unbounded.merge(&c), c);
         assert_eq!(c.merge(&Location::Unbounded), c);
+        Ok(())
     }
 
     #[test]
-    fn merge_circle_subsumes_smaller() {
-        let big = Location::circle(48.8, 2.3, 1000.0).unwrap();
-        let small = Location::circle(48.8, 2.3, 10.0).unwrap();
+    fn merge_circle_subsumes_smaller() -> TestResult {
+        let big = Location::circle(gp(48.8, 2.3)?, 1000.0)?;
+        let small = Location::circle(gp(48.8, 2.3)?, 10.0)?;
         // big contains small → merge returns the tighter (small)
         assert_eq!(big.merge(&small), small);
         assert_eq!(small.merge(&big), small);
+        Ok(())
     }
 
     #[test]
-    fn merge_disjoint_circles_produces_union() {
-        let paris = Location::circle(48.8, 2.3, 10.0).unwrap();
-        let london = Location::circle(51.5, -0.1, 10.0).unwrap();
+    fn merge_disjoint_circles_produces_union() -> TestResult {
+        let paris = Location::circle(gp(48.8, 2.3)?, 10.0)?;
+        let london = Location::circle(gp(51.5, -0.1)?, 10.0)?;
         let merged = paris.merge(&london);
-        assert!(matches!(merged, Location::UnionOf(ref cs) if cs.len() == 2));
+        assert!(matches!(merged, Location::UnionOf { ref members } if members.len() == 2));
+        Ok(())
     }
 
     #[test]
-    fn merge_flattens_union() {
-        let a = Location::circle(48.8, 2.3, 10.0).unwrap();
-        let b = Location::circle(51.5, -0.1, 10.0).unwrap();
-        let c = Location::circle(40.7, -74.0, 10.0).unwrap();
+    fn merge_flattens_union() -> TestResult {
+        let a = Location::circle(gp(48.8, 2.3)?, 10.0)?;
+        let b = Location::circle(gp(51.5, -0.1)?, 10.0)?;
+        let c = Location::circle(gp(40.7, -74.0)?, 10.0)?;
         // (a ∪ b) merge c should flatten to [a, b, c], not [[a, b], c]
         let ab = a.merge(&b);
         let abc = ab.merge(&c);
-        assert!(matches!(abc, Location::UnionOf(ref cs) if cs.len() == 3));
+        assert!(matches!(abc, Location::UnionOf { ref members } if members.len() == 3));
+        Ok(())
     }
 
     #[test]
-    fn merge_idempotent_circle() {
-        let c = Location::circle(48.8, 2.3, 100.0).unwrap();
+    fn merge_idempotent_circle() -> TestResult {
+        let c = Location::circle(gp(48.8, 2.3)?, 100.0)?;
         assert_eq!(c.merge(&c), c);
+        Ok(())
     }
 
     #[test]
-    fn merge_idempotent_unbounded() {
-        assert_eq!(
-            Location::Unbounded.merge(&Location::Unbounded),
-            Location::Unbounded
-        );
-    }
-
-    #[test]
-    fn merge_union_with_union() {
-        let a = Location::circle(48.8, 2.3, 10.0).unwrap();
-        let b = Location::circle(51.5, -0.1, 10.0).unwrap();
-        let c = Location::circle(40.7, -74.0, 10.0).unwrap();
-        let d_loc = Location::circle(35.7, 139.7, 10.0).unwrap();
+    fn merge_union_with_union() -> TestResult {
+        let a = Location::circle(gp(48.8, 2.3)?, 10.0)?;
+        let b = Location::circle(gp(51.5, -0.1)?, 10.0)?;
+        let c = Location::circle(gp(40.7, -74.0)?, 10.0)?;
+        let d_loc = Location::circle(gp(35.7, 139.7)?, 10.0)?;
         let ab = a.merge(&b); // UnionOf([a, b])
         let cd = c.merge(&d_loc); // UnionOf([c, d])
         let merged = ab.merge(&cd);
-        assert!(matches!(merged, Location::UnionOf(ref cs) if cs.len() == 4));
+        assert!(matches!(merged, Location::UnionOf { ref members } if members.len() == 4));
+        Ok(())
     }
 
     #[test]
-    fn merge_offset_circle_containment() {
+    fn merge_offset_circle_containment() -> TestResult {
         // Big circle centered at origin with 1000km radius
-        let big = Location::circle(0.0, 0.0, 1_000_000.0).unwrap();
+        let big = Location::circle(gp(0.0, 0.0)?, 1_000_000.0)?;
         // Small circle offset but still within big
-        let small = Location::circle(1.0, 1.0, 10.0).unwrap();
+        let small = Location::circle(gp(1.0, 1.0)?, 10.0)?;
         // big should contain small → merge returns small
         assert_eq!(big.merge(&small), small);
+        Ok(())
     }
 
     #[test]
-    fn merge_offset_circle_not_contained() {
+    fn merge_offset_circle_not_contained() -> TestResult {
         // Small circle at origin with 100m radius
-        let small_a = Location::circle(0.0, 0.0, 100.0).unwrap();
+        let small_a = Location::circle(gp(0.0, 0.0)?, 100.0)?;
         // Another small circle ~111km away (1 degree of latitude)
-        let small_b = Location::circle(1.0, 0.0, 100.0).unwrap();
+        let small_b = Location::circle(gp(1.0, 0.0)?, 100.0)?;
         // Neither contains the other → UnionOf
         let merged = small_a.merge(&small_b);
-        assert!(matches!(merged, Location::UnionOf(_)));
+        assert!(matches!(merged, Location::UnionOf { .. }));
+        Ok(())
     }
 
     // --- Location merge property tests ---
@@ -606,14 +727,19 @@ mod tests {
     use proptest::prelude::*;
 
     fn arb_circle() -> impl Strategy<Value = Location> {
-        (-90.0f64..=90.0, -180.0f64..=180.0, 0.0f64..10000.0)
-            .prop_filter_map("valid circle", |(lat, lon, r)| {
-                Location::circle(lat, lon, r).ok()
-            })
+        (-90.0f64..=90.0, -180.0f64..=180.0, 0.0f64..10000.0).prop_filter_map(
+            "valid circle",
+            |(lat, lon, r)| {
+                let center = GeoPoint::new(lat, lon).ok()?;
+                Location::circle(center, r).ok()
+            },
+        )
     }
 
     fn arb_location() -> impl Strategy<Value = Location> {
-        let union = (arb_circle(), arb_circle()).prop_map(|(a, b)| Location::UnionOf(vec![a, b]));
+        let union = (arb_circle(), arb_circle()).prop_map(|(a, b)| Location::UnionOf {
+            members: vec![a, b],
+        });
         prop_oneof![
             6 => arb_circle(),
             2 => union,
@@ -634,7 +760,7 @@ mod tests {
             // which side is self vs other. We verify by checking that both
             // results contain the same geometry semantically.
             match (&ab, &ba) {
-                (Location::UnionOf(cs1), Location::UnionOf(cs2)) => {
+                (Location::UnionOf { members: cs1 }, Location::UnionOf { members: cs2 }) => {
                     prop_assert_eq!(cs1.len(), cs2.len());
                     // Both should contain the same elements (possibly reordered)
                     for c in cs1 {

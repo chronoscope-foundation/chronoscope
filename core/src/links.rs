@@ -69,14 +69,16 @@ pub enum LinkTarget {
 }
 
 /// Parse a hardcoded base URL. Only used with string literals.
-#[allow(clippy::expect_used)]
+#[expect(
+    clippy::expect_used,
+    reason = "only ever called with the hardcoded string-literal base URLs in to_url; a literal base URL always parses"
+)]
 fn base(url: &str) -> Url {
     Url::parse(url).expect("hardcoded base URL is valid")
 }
 
 impl ExternalLink {
     /// Generate the canonical URL for this external link.
-    #[must_use]
     pub fn to_url(&self) -> Url {
         self.target.to_url()
     }
@@ -84,14 +86,13 @@ impl ExternalLink {
 
 impl LinkTarget {
     /// Generate the canonical URL for this link target.
-    #[must_use]
     pub fn to_url(&self) -> Url {
         match self {
             Self::Wikidata { entity_id } => {
                 let mut url = base("https://www.wikidata.org");
                 url.set_path(&format!(
                     "/wiki/{}",
-                    urlencoding::encode(entity_id.as_str())
+                    urlencoding::encode(&entity_id.to_string())
                 ));
                 url
             }
@@ -115,7 +116,10 @@ impl LinkTarget {
             }
             Self::Wikipedia { language, title } => {
                 let mut url = base("https://en.wikipedia.org");
-                #[allow(clippy::expect_used)]
+                #[expect(
+                    clippy::expect_used,
+                    reason = "a validated BCP-47 primary language subtag followed by .wikipedia.org is always a valid URL host"
+                )]
                 url.set_host(Some(&format!("{}.wikipedia.org", language.as_str())))
                     .expect("BCP 47 primary language subtag is valid in hostname");
                 url.set_path(&format!("/wiki/{}", urlencoding::encode(title)));
@@ -157,16 +161,17 @@ impl LinkTarget {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn sanborn_url_uses_query_param() {
+    fn sanborn_url_uses_query_param() -> TestResult {
         let link = ExternalLink {
             target: LinkTarget::Sanborn {
                 item_id: "sanborn02194_006".to_string(),
-                panel: std::num::NonZeroU32::new(5).unwrap(),
+                panel: std::num::NonZeroU32::new(5).ok_or("5 is non-zero")?,
             },
             link_type: LinkType::SameAs,
         };
@@ -176,18 +181,20 @@ mod tests {
             "https://www.loc.gov/resource/sanborn02194_006/?sp=5"
         );
         assert_eq!(link.link_type, LinkType::SameAs);
+        Ok(())
     }
 
     #[test]
-    fn wikipedia_url() {
+    fn wikipedia_url() -> TestResult {
         let target = LinkTarget::Wikipedia {
-            language: LanguageTag::parse("en".to_string()).unwrap(),
+            language: LanguageTag::parse("en".to_string())?,
             title: "Pantheon, Rome".to_string(),
         };
         assert_eq!(
             target.to_url().as_str(),
             "https://en.wikipedia.org/wiki/Pantheon%2C%20Rome"
         );
+        Ok(())
     }
 
     #[test]
