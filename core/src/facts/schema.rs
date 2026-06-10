@@ -152,14 +152,16 @@ pub struct PageItem<F, S> {
     pub representative: S,
 }
 
-/// A page of walk results. `truncated = true` means more rows exist past
-/// this page; the caller should issue the next request with the cursor
-/// derived from the last item's `fact_id`.
+/// A page of walk results. `next_cursor = Some(c)` means more rows may exist
+/// past this page; the caller resumes the walk at cursor `c`. `None` means the
+/// walk is exhausted. A page can carry zero items yet still point at a next
+/// cursor — a backend filtering rows inside a window returns an empty page that
+/// resumes past the window it scanned.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FactPage<F, S> {
     pub items: Vec<PageItem<F, S>>,
-    /// Whether more pages remain past this one.
-    pub truncated: bool,
+    /// The cursor to resume at, or `None` when the walk is exhausted.
+    pub next_cursor: Option<FactId>,
 }
 
 // ============================================================================

@@ -151,8 +151,9 @@ where
 {
     /// The judgment assertion.
     pub assertion: JudgmentAssertion<EntId, EvtId, ImgId>,
-    /// The judgment source backing the claim.
-    pub source: JudgmentSource,
+    /// The judgment source backing the claim. Its observed image (for an
+    /// `ImageObservation`) is the resolved persistent id.
+    pub source: JudgmentSource<ImgId>,
 }
 
 /// A stored meta-fact: a [`MetaAssertion`] plus its source.
@@ -183,6 +184,39 @@ where
     Judgment(StoredJudgmentFact<EntId, EvtId, ImgId>),
     /// A fact about other facts (retraction, supersession).
     Meta(StoredMetaFact),
+}
+
+impl<EntId, EvtId, ImgId> StoredFact<EntId, EvtId, ImgId>
+where
+    EntId: Ord,
+    EvtId: Ord,
+    ImgId: Ord,
+{
+    /// Visit every id this fact mentions, dispatching each to its kind's
+    /// closure. The fact-level traversal: it folds the assertion's own ids
+    /// together with a judgment's observed image, so callers building backlink
+    /// or by-subject indexes see one complete id stream per fact.
+    ///
+    /// A `Judgment`'s `ImageObservation` citation contributes its observed
+    /// image through `fi`. `Meta` references facts and commits, not subject
+    /// ids, so it visits nothing.
+    pub fn for_each_id(
+        &self,
+        fe: &mut impl FnMut(&EntId),
+        fv: &mut impl FnMut(&EvtId),
+        fi: &mut impl FnMut(&ImgId),
+    ) {
+        match self {
+            Self::Factual(f) => f.assertion.for_each_id(fe, fv, fi),
+            Self::Judgment(j) => {
+                j.assertion.for_each_id(fe, fv, fi);
+                if let Some(image) = j.source.observed_image() {
+                    fi(image);
+                }
+            }
+            Self::Meta(_) => {}
+        }
+    }
 }
 
 // ============================================================================

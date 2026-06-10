@@ -12,13 +12,35 @@ use crate::facts::citations::{Excerpt, ExternalSource, FactualCitation};
 use crate::facts::citations::{JudgmentSource, Justification};
 use crate::facts::identity;
 use crate::facts::ids::UserId;
+use crate::facts::lifecycle::{DamageCause, DurationalRole, MoveMethod};
 use crate::facts::submit::{
     Commit as SubmitBundle, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact,
 };
-use crate::facts::submit::{CommitAuthor, ResolutionOrigin, StoredFact, SubmitError, commit_facts};
+use crate::facts::submit::{
+    CommitAuthor, ImageRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError, commit_facts,
+};
+use crate::location::{LocationReference, UnresolvedLocation};
+use crate::nonempty::NonEmptyVec;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type TestBundle = SubmitBundle<MemoryEntityId, MemoryEventId, MemoryImageId>;
+type SubmitErrorBatch = NonEmptyVec<SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>>;
+
+/// A page limit large enough to fit every fact the backlink tests submit.
+const PAGE_100: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(100) {
+    Some(n) => n,
+    None => std::num::NonZeroUsize::MIN,
+};
+
+/// The batch of `SubmitError`s a rejected submit carries, or a test failure if
+/// the error was a `Backend` failure. The single entry point every error-path
+/// test uses to inspect the accumulated batch.
+fn submit_batch(err: MemSubmitCommitError) -> Result<SubmitErrorBatch, Box<dyn std::error::Error>> {
+    match err {
+        SubmitCommitError::Submit(errs) => Ok(errs),
+        other => Err(format!("expected Submit batch, got {other:?}").into()),
+    }
+}
 
 // --- helpers ---
 
@@ -296,36 +318,42 @@ async fn assert_idx_out_of_range(
         Err(e) => e,
     };
 
-    match (kind, err) {
+    let errs = submit_batch(err)?;
+    assert_eq!(
+        errs.len().get(),
+        1,
+        "expected exactly one out-of-range error"
+    );
+    match (kind, errs.first()) {
         (
             ExpectedKind::Entity,
-            SubmitCommitError::Submit(SubmitError::EntityIdxOutOfRange {
+            SubmitError::EntityIdxOutOfRange {
                 idx,
                 decl_count: got,
-            }),
+            },
         ) => {
-            assert_eq!(idx, bad_idx);
-            assert_eq!(got, decl_count);
+            assert_eq!(*idx, bad_idx);
+            assert_eq!(*got, decl_count);
         }
         (
             ExpectedKind::Event,
-            SubmitCommitError::Submit(SubmitError::EventIdxOutOfRange {
+            SubmitError::EventIdxOutOfRange {
                 idx,
                 decl_count: got,
-            }),
+            },
         ) => {
-            assert_eq!(idx, bad_idx);
-            assert_eq!(got, decl_count);
+            assert_eq!(*idx, bad_idx);
+            assert_eq!(*got, decl_count);
         }
         (
             ExpectedKind::Image,
-            SubmitCommitError::Submit(SubmitError::ImageIdxOutOfRange {
+            SubmitError::ImageIdxOutOfRange {
                 idx,
                 decl_count: got,
-            }),
+            },
         ) => {
-            assert_eq!(idx, bad_idx);
-            assert_eq!(got, decl_count);
+            assert_eq!(*idx, bad_idx);
+            assert_eq!(*got, decl_count);
         }
         (k, other) => {
             return Err(format!("expected {k:?} out-of-range error, got {other:?}").into());
@@ -407,24 +435,21 @@ async fn assert_unknown_existing(kind: UnknownKind, phantom_counter: u64) -> Tes
         Err(e) => e,
     };
 
-    match (kind, err) {
-        (
-            UnknownKind::Entity,
-            SubmitCommitError::Submit(SubmitError::UnknownExistingEntity { decl_position }),
-        ) => {
-            assert_eq!(decl_position, EntityIdx(0));
+    let errs = submit_batch(err)?;
+    assert_eq!(
+        errs.len().get(),
+        1,
+        "expected exactly one UnknownExisting* error"
+    );
+    match (kind, errs.first()) {
+        (UnknownKind::Entity, SubmitError::UnknownExistingEntity { decl_position }) => {
+            assert_eq!(*decl_position, EntityIdx(0));
         }
-        (
-            UnknownKind::Event,
-            SubmitCommitError::Submit(SubmitError::UnknownExistingEvent { decl_position }),
-        ) => {
-            assert_eq!(decl_position, EventIdx(0));
+        (UnknownKind::Event, SubmitError::UnknownExistingEvent { decl_position }) => {
+            assert_eq!(*decl_position, EventIdx(0));
         }
-        (
-            UnknownKind::Image,
-            SubmitCommitError::Submit(SubmitError::UnknownExistingImage { decl_position }),
-        ) => {
-            assert_eq!(decl_position, ImageIdx(0));
+        (UnknownKind::Image, SubmitError::UnknownExistingImage { decl_position }) => {
+            assert_eq!(*decl_position, ImageIdx(0));
         }
         (k, other) => {
             return Err(format!("expected {k:?} UnknownExisting* error, got {other:?}").into());
@@ -592,7 +617,7 @@ async fn walk_entities_returns_submitted_entity_facts() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .walk_entities(&EntityStream::All, FactId::new(0), 100)
+        .walk_entities(&EntityStream::All, FactId::new(0), PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -611,7 +636,6 @@ async fn walk_entities_returns_submitted_entity_facts() -> TestResult {
 /// on one entity and asserts both come back. `#[ignore]`d while stubbed;
 /// flips green once the backlink index reads the fact bag.
 #[tokio::test]
-#[ignore = "all_facts_about_entity is stubbed to an empty page; this pins the backlink-returns-mentioning-facts contract and flips green once the backlink index is implemented"]
 async fn all_facts_about_entity_returns_facts_mentioning_it() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
@@ -638,7 +662,7 @@ async fn all_facts_about_entity_returns_facts_mentioning_it() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .all_facts_about_entity(&entity, FactId::new(0), 100)
+        .all_facts_about_entity(&entity, FactId::new(0), PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -678,7 +702,7 @@ async fn walk_events_returns_submitted_event_facts() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .walk_events(&EventStream::All, FactId::new(0), 100)
+        .walk_events(&EventStream::All, FactId::new(0), PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -696,7 +720,6 @@ async fn walk_events_returns_submitted_event_facts() -> TestResult {
 /// `all_facts_about_event(event, ...)`. `#[ignore]`d while stubbed; flips
 /// green once the backlink index is implemented.
 #[tokio::test]
-#[ignore = "all_facts_about_event is stubbed to an empty page; this pins the backlink-returns-mentioning-facts contract and flips green once the backlink index is implemented"]
 async fn all_facts_about_event_returns_facts_mentioning_it() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
@@ -719,7 +742,7 @@ async fn all_facts_about_event_returns_facts_mentioning_it() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .all_facts_about_event(&event, FactId::new(0), 100)
+        .all_facts_about_event(&event, FactId::new(0), PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -759,7 +782,7 @@ async fn walk_images_returns_submitted_image_facts() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .walk_images(&ImageStream::All, FactId::new(0), 100)
+        .walk_images(&ImageStream::All, FactId::new(0), PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -777,7 +800,6 @@ async fn walk_images_returns_submitted_image_facts() -> TestResult {
 /// `all_facts_about_image(image, ...)`. `#[ignore]`d while stubbed; flips
 /// green once the backlink index is implemented.
 #[tokio::test]
-#[ignore = "all_facts_about_image is stubbed to an empty page; this pins the backlink-returns-mentioning-facts contract and flips green once the backlink index is implemented"]
 async fn all_facts_about_image_returns_facts_mentioning_it() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
@@ -800,7 +822,7 @@ async fn all_facts_about_image_returns_facts_mentioning_it() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .all_facts_about_image(&image, FactId::new(0), 100)
+        .all_facts_about_image(&image, FactId::new(0), PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -1157,6 +1179,70 @@ async fn fact_referencing_out_of_range_image_idx_returns_error() -> TestResult {
     assert_idx_out_of_range(3, 5, ExpectedKind::Image).await
 }
 
+/// The first invalid index — `idx == decl_count` — is the boundary the
+/// range check guards. With three entity decls (valid indices 0..=2), index
+/// 3 is rejected with `EntityIdxOutOfRange`. Entity kind alone pins the
+/// boundary; the three out-of-range tests above share the dispatch.
+#[tokio::test]
+async fn entity_idx_at_decl_count_is_first_rejected() -> TestResult {
+    assert_idx_out_of_range(3, 3, ExpectedKind::Entity).await
+}
+
+/// The last valid index — `idx == decl_count - 1` — is accepted. With three
+/// entity decls, index 2 resolves; all three decls are referenced so the
+/// only thing under test is the upper bound, not `UnusedDeclaration`.
+#[tokio::test]
+async fn entity_idx_at_decl_count_minus_one_is_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [
+            name_fact(0, "a")?,
+            name_fact(1, "b")?,
+            name_fact(2, "last-valid")?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    commit_ok(&store, bundle).await
+}
+
+// --- unused-declaration error path ---
+
+/// A declared entity that no fact references is rejected with
+/// `UnusedDeclaration` naming its position. The bundle pairs the unused decl
+/// (position 0) with a referenced one (position 1) so the only complaint is
+/// the unreferenced decl.
+#[tokio::test]
+async fn unreferenced_entity_decl_rejected_as_unused() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        // Decl 0 is never referenced; decl 1 is.
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(1, "referenced")?].into_iter().collect(),
+    };
+    let errs = commit_err(&store, bundle).await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::UnusedDeclaration {
+                kind: SubjectKind::Entity,
+                position: 0,
+            }
+        )),
+        "expected UnusedDeclaration for entity decl 0, got {errs:?}"
+    );
+    Ok(())
+}
+
 // --- unknown-existing-id error paths ---
 
 #[tokio::test]
@@ -1177,14 +1263,14 @@ async fn decl_existing_unknown_image_id_rejected() -> TestResult {
 // --- substitution-time rejection ---
 
 /// Two `Decl::Existing(same_id)` slots resolving to one persistent entity
-/// id, plus an identity fact over the two indices, must be rejected at
-/// substitution with `IdentityEntitySelfEquivalence` carrying the shared
-/// typed id.
+/// id, plus an identity fact over the two indices, are rejected. The shared id
+/// trips two independent guards that accumulate together: the substitution-time
+/// `IdentityEntitySelfEquivalence` (the identity fact collapsed) and the
+/// decl-distinctness `DuplicateEntityDecl`, both carrying the shared typed id.
 #[tokio::test]
 async fn same_entity_resolving_to_one_id_rejected_at_substitution() -> TestResult {
     let store = MemoryFactStore::new();
 
-    // 1. Mint a real entity id via a Local commit.
     let mint: TestBundle = SubmitBundle {
         author: user_author()?,
         recorded_at: fixed_time(),
@@ -1202,8 +1288,6 @@ async fn same_entity_resolving_to_one_id_rejected_at_substitution() -> TestResul
         .ok_or("expected mint")?
         .id;
 
-    // 2. Submit two `Decl::Existing(entity_id)` slots on the same minted
-    //    id, plus a SameEntity fact over the two indices.
     let identity_pair = identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?;
     let user = UserId::new("alice");
     let justification =
@@ -1235,10 +1319,65 @@ async fn same_entity_resolving_to_one_id_rejected_at_substitution() -> TestResul
         Err(e) => e,
     };
 
-    let SubmitCommitError::Submit(SubmitError::IdentityEntitySelfEquivalence { id }) = err else {
-        return Err(format!("expected IdentityEntitySelfEquivalence, got {err:?}").into());
+    let errs = submit_batch(err)?;
+    assert!(
+        errs.iter().any(
+            |e| matches!(e, SubmitError::IdentityEntitySelfEquivalence { id } if *id == entity_id)
+        ),
+        "expected IdentityEntitySelfEquivalence on {entity_id:?}, got {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::DuplicateEntityDecl { id } if *id == entity_id)),
+        "expected DuplicateEntityDecl on {entity_id:?}, got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Two `Decl::Existing { id: X }` slots on one minted entity, each referenced by
+/// a distinct fact, resolve to the same persistent id and are rejected with
+/// `DuplicateEntityDecl` carrying that id. Both decls are referenced, so the
+/// rejection is the distinctness guard, not `UnusedDeclaration`.
+#[tokio::test]
+async fn two_entity_decls_resolving_to_one_id_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+
+    let mint: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "real-entity")?].into_iter().collect(),
     };
-    assert_eq!(id, entity_id);
+    let minted = commit_facts(&store, mint)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity_id = minted
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("expected mint")?
+        .id;
+
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![
+            Decl::Existing { id: entity_id },
+            Decl::Existing { id: entity_id },
+        ],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "via-decl-0")?, name_fact(1, "via-decl-1")?]
+            .into_iter()
+            .collect(),
+    };
+    let errs = commit_err(&store, bundle).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::DuplicateEntityDecl { id } if *id == entity_id)),
+        "got {errs:?}"
+    );
     Ok(())
 }
 
@@ -1269,10 +1408,12 @@ async fn retract_commit_targeting_unrecorded_commit_rejected() -> TestResult {
         Err(e) => e,
     };
 
-    let SubmitCommitError::Submit(SubmitError::CommitNotFound { id }) = err else {
-        return Err(format!("expected CommitNotFound, got {err:?}").into());
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::CommitNotFound { id } = errs.first() else {
+        return Err(format!("expected CommitNotFound, got {:?}", errs.first()).into());
     };
-    assert_eq!(id, phantom);
+    assert_eq!(*id, phantom);
     Ok(())
 }
 
@@ -1367,19 +1508,16 @@ async fn two_commits_share_one_with_tx_brand() -> TestResult {
 
 // --- UnionSource internals ---
 
-/// Smoke test for [`UnionSource`] + [`Pending`] + [`apply_pending`].
+/// Stage a fact via the [`UnionSource`] + [`Pending`] + [`apply_pending`]
+/// path and verify it lands.
 ///
-/// Starts with one committed fact, builds a [`UnionSource`], mints one id
-/// of each kind, stages a fact, drains, and applies. Verifies:
-///
-/// - mints come from the in-flight counters (one past each committed one);
-/// - the staged fact is visible at its slot (`committed.len()`) before
-///   apply;
-/// - `apply_pending` assigns its [`FactId`] at that slot and advances the
-///   counters.
+/// Starts with one committed fact, builds a [`UnionSource`], mints one id of
+/// each kind, stages a fact, drains, and applies. Verifies `apply_pending`
+/// assigns the staged fact the slot one past the committed facts
+/// (`committed.len()`) and advances the counters by the mints.
 #[tokio::test]
 async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult {
-    // 1. Commit one fact so the store has committed state to union over.
+    // Commit one fact so the store has committed state to union over.
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
         author: user_author()?,
@@ -1394,9 +1532,9 @@ async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult 
         .map_err(|e| format!("{e:?}"))?;
     assert_eq!(seed_result.fact_ids.len(), 1);
 
-    // 2. Clone the committed fact's body to re-push as the pending fact
-    //    (avoids synthesising a fresh StoredFact). Drop the guard before
-    //    the UnionSource interaction to control re-acquisition.
+    // Clone the committed fact's body to re-push as the pending fact, avoiding a
+    // freshly synthesised StoredFact. Drop the guard before the UnionSource
+    // interaction to control re-acquisition.
     let (
         committed_len_before,
         next_entity_before,
@@ -1422,48 +1560,16 @@ async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult 
     // The slot the staged fact will occupy: one past the committed facts.
     let expected_fact_id = FactId::new(committed_len_before as u64);
 
-    // 3. Mint one of each kind, stage the seed fact, drain to Pending.
-    let pending;
-    let minted_entity;
-    let minted_event;
-    let minted_image;
-    {
+    // Mint one of each kind, stage the seed fact, drain to Pending.
+    let pending = {
         let guard = store.lock_inner().await;
         let mut source = UnionSource::from_inner(&guard);
 
-        // Counters start at the committed values.
-        assert_eq!(source.pending.next_entity_id, next_entity_before);
-        assert_eq!(source.pending.next_event_id, next_event_before);
-        assert_eq!(source.pending.next_image_id, next_image_before);
-
-        minted_entity = source.mint_entity();
-        minted_event = source.mint_event();
-        minted_image = source.mint_image();
-
-        // Minted ids land at the pre-mint counter value.
-        assert_eq!(minted_entity.0, next_entity_before);
-        assert_eq!(minted_event.0, next_event_before);
-        assert_eq!(minted_image.0, next_image_before);
-
-        // The source considers them known; Inner is still untouched.
-        assert!(source.entity_known(&minted_entity));
-        assert!(source.event_known(&minted_event));
-        assert!(source.image_known(&minted_image));
-
-        // snapshot reports committed + pending; pending is empty pre-push.
-        // UFCS because the blanket `FactView::snapshot` also applies.
-        assert_eq!(
-            CoreSource::snapshot(&source).get(),
-            committed_len_before as u64
-        );
+        source.mint_entity();
+        source.mint_event();
+        source.mint_image();
 
         source.push_fact(seed_stored.clone());
-
-        // After push, snapshot reflects the new total.
-        assert_eq!(
-            CoreSource::snapshot(&source).get(),
-            (committed_len_before + 1) as u64
-        );
 
         // Staged fact is visible at its slot. `with_core` awaits nothing
         // for a `UnionSource` but is async to match the trait.
@@ -1474,10 +1580,10 @@ async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult 
             return Err(format!("pending fact must read Active; got {lookup:?}").into());
         };
 
-        pending = source.into_pending();
-    } // guard dropped here
+        source.into_pending()
+    }; // guard dropped here
 
-    // 4. Apply the pending payload mutably.
+    // Apply the pending payload mutably.
     let commit_id = seed_result.commit_id.clone();
     let assigned = {
         let mut guard = store.lock_inner().await;
@@ -1491,7 +1597,7 @@ async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult 
         "apply_pending must assign the staged fact its slot's FactId"
     );
 
-    // 5. After apply: facts vec grew by one, counters advanced by the mints.
+    // After apply: facts vec grew by one, counters advanced by the mints.
     {
         let guard = store.lock_inner().await;
         assert_eq!(guard.facts.len(), committed_len_before + 1);
@@ -1526,10 +1632,12 @@ async fn retract_fact_targeting_same_commit_fact_rejected() -> TestResult {
         Ok(_) => return Err("expected MetaTargetInSameCommit".into()),
         Err(e) => e,
     };
-    let SubmitCommitError::Submit(SubmitError::MetaTargetInSameCommit { target }) = err else {
-        return Err(format!("expected MetaTargetInSameCommit, got {err:?}").into());
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::MetaTargetInSameCommit { target } = errs.first() else {
+        return Err(format!("expected MetaTargetInSameCommit, got {:?}", errs.first()).into());
     };
-    assert_eq!(target, in_commit);
+    assert_eq!(*target, in_commit);
     Ok(())
 }
 
@@ -1582,10 +1690,12 @@ async fn supersede_fact_targeting_same_commit_fact_rejected() -> TestResult {
         Ok(_) => return Err("expected MetaTargetInSameCommit".into()),
         Err(e) => e,
     };
-    let SubmitCommitError::Submit(SubmitError::MetaTargetInSameCommit { target }) = err else {
-        return Err(format!("expected MetaTargetInSameCommit, got {err:?}").into());
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::MetaTargetInSameCommit { target } = errs.first() else {
+        return Err(format!("expected MetaTargetInSameCommit, got {:?}", errs.first()).into());
     };
-    assert_eq!(target, in_commit);
+    assert_eq!(*target, in_commit);
     Ok(())
 }
 
@@ -1609,11 +1719,16 @@ async fn supersede_fact_with_equal_target_and_replacement_rejected() -> TestResu
         Ok(_) => return Err("expected SupersedeReplacementEqualsTarget".into()),
         Err(e) => e,
     };
-    let SubmitCommitError::Submit(SubmitError::SupersedeReplacementEqualsTarget { target }) = err
-    else {
-        return Err(format!("expected SupersedeReplacementEqualsTarget, got {err:?}").into());
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::SupersedeReplacementEqualsTarget { target } = errs.first() else {
+        return Err(format!(
+            "expected SupersedeReplacementEqualsTarget, got {:?}",
+            errs.first()
+        )
+        .into());
     };
-    assert_eq!(target, fact_id);
+    assert_eq!(*target, fact_id);
     Ok(())
 }
 
@@ -1650,6 +1765,66 @@ async fn retract_fact_hides_target_only_after_its_commit() -> TestResult {
         return Err(format!("expected Retracted after retraction, got {lookup:?}").into());
     };
     assert_eq!(by, retractor);
+    Ok(())
+}
+
+/// A read snapshot classifies a committed fact as `Committed` and an id at or
+/// past the snapshot as `Absent`, and never reports `InFlight` — it has no
+/// in-flight commit.
+#[tokio::test]
+async fn read_snapshot_placement_is_committed_or_absent() -> TestResult {
+    let store = MemoryFactStore::new();
+    let first = commit_name(&store, "alpha").await?;
+    let committed = *first.fact_ids.first().ok_or("no committed fact id")?;
+    let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+
+    assert_eq!(
+        view.placement(committed)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        FactPlacement::Committed
+    );
+    // The next id to be minted is past the snapshot — no fact lives there yet.
+    assert_eq!(
+        view.placement(snapshot)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        FactPlacement::Absent
+    );
+    Ok(())
+}
+
+/// A read snapshot whose watermark sits far past the committed fact count
+/// reports `Absent`, not `InFlight`, for ids between the committed count and the
+/// watermark — a read view has no in-flight commit, so `InFlight` is
+/// structurally unreachable.
+#[tokio::test]
+async fn read_snapshot_placement_never_inflight_past_watermark() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_name(&store, "alpha").await?;
+    commit_name(&store, "beta").await?;
+    let committed_count = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(committed_count, crate::facts::ids::FactId::new(2));
+
+    // An "everything" view whose watermark is well past the committed count.
+    let view = store.no_later_than(crate::facts::ids::FactId::new(1_000));
+
+    // An id between the committed count and the watermark names no fact — the
+    // old lower-bound-only `InFlight` branch wrongly reported `InFlight` here.
+    assert_eq!(
+        view.placement(crate::facts::ids::FactId::new(500))
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        FactPlacement::Absent
+    );
+    // An id below the committed count is `Committed`.
+    assert_eq!(
+        view.placement(crate::facts::ids::FactId::new(0))
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        FactPlacement::Committed
+    );
     Ok(())
 }
 
@@ -1816,10 +1991,12 @@ async fn supersede_fact_with_unminted_replacement_rejected() -> TestResult {
         Ok(_) => return Err("expected FactNotFound for replacement".into()),
         Err(e) => e,
     };
-    let SubmitCommitError::Submit(SubmitError::FactNotFound { id }) = err else {
-        return Err(format!("expected FactNotFound, got {err:?}").into());
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::FactNotFound { id } = errs.first() else {
+        return Err(format!("expected FactNotFound, got {:?}", errs.first()).into());
     };
-    assert_eq!(id, phantom);
+    assert_eq!(*id, phantom);
     Ok(())
 }
 
@@ -1849,4 +2026,1202 @@ async fn retracted_by_reports_lowest_still_effective_retractor() -> TestResult {
         "ra is cancelled, so rb is the lowest still-effective retractor"
     );
     Ok(())
+}
+
+// --- cluster-rule + accumulation fixtures ---
+
+/// A single-commit bundle of all-`Local` declarations.
+fn local_bundle(
+    entities: usize,
+    events: usize,
+    images: usize,
+    secs: i64,
+    facts: Vec<SubmitFact>,
+) -> Result<TestBundle, Box<dyn std::error::Error>> {
+    Ok(SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(secs),
+        entities: vec![Decl::Local; entities],
+        events: vec![Decl::Local; events],
+        images: vec![Decl::Local; images],
+        facts: facts.into_iter().collect(),
+    })
+}
+
+/// Commit `bundle`, failing the test if it was rejected.
+async fn commit_ok(store: &MemoryFactStore, bundle: TestBundle) -> TestResult {
+    commit_facts(store, bundle)
+        .await
+        .map_err(|e| format!("expected the commit to be accepted, got {e:?}"))?;
+    Ok(())
+}
+
+/// Commit `bundle`, returning its rejection batch or failing if it was accepted.
+async fn commit_err(
+    store: &MemoryFactStore,
+    bundle: TestBundle,
+) -> Result<SubmitErrorBatch, Box<dyn std::error::Error>> {
+    match commit_facts(store, bundle).await {
+        Ok(_) => Err("expected the commit to be rejected".into()),
+        Err(e) => submit_batch(e),
+    }
+}
+
+fn sample_location() -> UnresolvedLocation {
+    UnresolvedLocation::Reference(LocationReference::NamedPlace {
+        name: "somewhere".to_owned(),
+    })
+}
+
+fn year_date(year: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+    Ok(UncertainDate::with_precision(
+        chrono::NaiveDate::from_ymd_opt(year, 1, 1).ok_or("date")?,
+        DatePrecision::Year,
+    )?)
+}
+
+fn judgment_citation() -> Result<JudgmentSource<ImageIdx>, Box<dyn std::error::Error>> {
+    Ok(JudgmentSource::PersonalKnowledge {
+        user: UserId::new("alice"),
+        justification: Justification::new("a test judgment")?,
+    })
+}
+
+/// A `Demolition` bookend carrying a location — the rejected shape.
+fn demolition_location_fact(entity_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Demolition {
+            fact: bookend::Fact::Location {
+                entity: EntityIdx(entity_idx),
+                location: sample_location(),
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// A `Construction` bookend carrying a location — accepted, unlike demolition.
+fn construction_location_fact(entity_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: bookend::Fact::Location {
+                entity: EntityIdx(entity_idx),
+                location: sample_location(),
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// A `Name` fact with optional year-precision validity bounds.
+fn name_window_fact(
+    entity_idx: usize,
+    valid_from: Option<i32>,
+    valid_to: Option<i32>,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    let language = LanguageTag::parse("en".to_owned())?;
+    let valid_from = valid_from.map(year_date).transpose()?;
+    let valid_to = valid_to.map(year_date).transpose()?;
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Attribute {
+            fact: attribute::Fact::Name {
+                entity: EntityIdx(entity_idx),
+                name: "name".to_owned(),
+                language,
+                name_type: NameType::Common,
+                valid_from,
+                valid_to,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+fn event_damage_cause_fact(event_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Event {
+            fact: crate::facts::event::Fact::DamageCause {
+                event: EventIdx(event_idx),
+                cause: DamageCause::Fire,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+fn event_move_method_fact(event_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Event {
+            fact: crate::facts::event::Fact::MoveMethod {
+                event: EventIdx(event_idx),
+                method: MoveMethod::Whole,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+fn event_durational_date_fact(event_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Event {
+            fact: crate::facts::event::Fact::DurationalDate {
+                event: EventIdx(event_idx),
+                role: DurationalRole::Started,
+                bound: year_date(1850)?,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// A composite `IsSubimageOf` fact linking the two image indices.
+fn subimage_fact(
+    subimage_idx: usize,
+    parent_idx: usize,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    let region = crate::facts::composites::SubimageRegion::rect(0.0, 0.0, 0.5, 0.5)?;
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Composite {
+            fact: crate::facts::composites::Fact::IsSubimageOf {
+                subimage: ImageIdx(subimage_idx),
+                parent: ImageIdx(parent_idx),
+                region,
+            },
+        },
+        citation: judgment_citation()?,
+    })
+}
+
+fn is_map_fact(image_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Map {
+            fact: crate::facts::map::Fact::IsMap {
+                image: ImageIdx(image_idx),
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+fn in_picture_fact(
+    entity_idx: usize,
+    image_idx: usize,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Depiction {
+            fact: crate::facts::depiction::Fact::InPicture {
+                entity: EntityIdx(entity_idx),
+                image: ImageIdx(image_idx),
+                perspective: crate::facts::depiction::Perspective::Unknown,
+                region: None,
+            },
+        },
+        citation: judgment_citation()?,
+    })
+}
+
+fn on_map_fact(
+    entity_idx: usize,
+    image_idx: usize,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Depiction {
+            fact: crate::facts::depiction::Fact::OnMap {
+                entity: EntityIdx(entity_idx),
+                image: ImageIdx(image_idx),
+                geometry: None,
+            },
+        },
+        citation: judgment_citation()?,
+    })
+}
+
+// --- accumulation ---
+
+/// One bundle violating three independent rules — a demolition location, an
+/// inverted name window, and a self-parent subimage — is rejected with all three
+/// in a single batch, accumulation rather than first-failure.
+#[tokio::test]
+async fn multi_rule_violations_accumulate_in_one_batch() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle = local_bundle(
+        2,
+        0,
+        1,
+        0,
+        vec![
+            demolition_location_fact(0)?,
+            name_window_fact(1, Some(1900), Some(1800))?,
+            subimage_fact(0, 0)?,
+        ],
+    )?;
+    let errs = commit_err(&store, bundle).await?;
+    assert_eq!(
+        errs.len().get(),
+        3,
+        "expected three rule violations, got {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::DemolitionLocation { .. })),
+        "missing DemolitionLocation: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::NameWindowInverted { .. })),
+        "missing NameWindowInverted: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeSelfParent { .. })),
+        "missing CompositeSelfParent: {errs:?}"
+    );
+    Ok(())
+}
+
+/// The resolvability check batches every out-of-range index and unknown
+/// `Decl::Existing` together and gates the rules out: a rule-violating fact in
+/// the same bundle is not reported, because its references can't resolve.
+#[tokio::test]
+async fn resolvability_gate_batches_and_skips_rules() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Existing {
+            id: MemoryEntityId(999),
+        }],
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [
+            name_fact(5, "out-of-range-entity")?,
+            is_picture_fact(7)?,
+            demolition_location_fact(0)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let errs = commit_err(&store, bundle).await?;
+    assert_eq!(
+        errs.len().get(),
+        3,
+        "expected three resolvability errors only, got {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EntityIdxOutOfRange { idx: 5, .. })),
+        "missing EntityIdxOutOfRange: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::ImageIdxOutOfRange { idx: 7, .. })),
+        "missing ImageIdxOutOfRange: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::UnknownExistingEntity { .. })),
+        "missing UnknownExistingEntity: {errs:?}"
+    );
+    // The would-be demolition-location and unused-declaration violations only
+    // run after resolvability passes, so the early return suppresses them.
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, SubmitError::DemolitionLocation { .. })),
+        "a rule fired despite the resolvability gate: {errs:?}"
+    );
+    Ok(())
+}
+
+// --- backlink reads (active-only, snapshot-scoped) ---
+
+/// `all_facts_about_image` returns only active facts: a retracted fact about
+/// the image is excluded.
+#[tokio::test]
+async fn all_facts_about_image_excludes_retracted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(&store, local_bundle(0, 0, 1, 0, vec![is_picture_fact(0)?])?)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let image = c1.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
+    let target = *c1.fact_ids.first().ok_or("no fact id")?;
+
+    let retraction: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(target)?].into_iter().collect(),
+    };
+    commit_facts(&store, retraction)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = view
+        .all_facts_about_image(&image, FactId::new(0), PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        !page.items.iter().any(|item| item.fact_id == target),
+        "retracted fact must not appear in all_facts_about_image; got {:?}",
+        page.items
+    );
+    Ok(())
+}
+
+/// `all_facts_about_image` is snapshot-scoped: a fact about the image committed
+/// after the snapshot is absent from a view pinned at it.
+#[tokio::test]
+async fn all_facts_about_image_respects_snapshot() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(&store, local_bundle(0, 0, 1, 0, vec![is_picture_fact(0)?])?)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let image = c1.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
+    let early = *c1.fact_ids.first().ok_or("no fact id")?;
+    let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: image }],
+        facts: [captured_date_fact(0)?].into_iter().collect(),
+    };
+    let c2 = commit_facts(&store, c2)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let late = *c2.fact_ids.first().ok_or("no fact id")?;
+
+    let view = store.no_later_than(snapshot);
+    let page = view
+        .all_facts_about_image(&image, FactId::new(0), PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let returned: std::collections::BTreeSet<FactId> =
+        page.items.iter().map(|item| item.fact_id).collect();
+    assert!(returned.contains(&early), "pre-snapshot fact must appear");
+    assert!(
+        !returned.contains(&late),
+        "post-snapshot fact must be absent; got {returned:?}"
+    );
+    Ok(())
+}
+
+// --- cluster rules ---
+
+/// A demolition bookend carrying a location is rejected.
+#[tokio::test]
+async fn demolition_location_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![demolition_location_fact(0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::DemolitionLocation { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A construction bookend carrying a location is accepted.
+#[tokio::test]
+async fn construction_location_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_location_fact(0)?])?,
+    )
+    .await
+}
+
+/// A damage-cause and a move-method on one event have disjoint kind sets, so the
+/// commit is rejected.
+#[tokio::test]
+async fn event_damage_and_move_conflict_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            0,
+            1,
+            0,
+            0,
+            vec![event_damage_cause_fact(0)?, event_move_method_fact(0)?],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventKindConflict { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A damage-cause and a durational date narrow to `{Damaged}` and are accepted.
+#[tokio::test]
+async fn event_damage_and_durational_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(
+            0,
+            1,
+            0,
+            0,
+            vec![event_damage_cause_fact(0)?, event_durational_date_fact(0)?],
+        )?,
+    )
+    .await
+}
+
+/// A lone point date (kind-set of size two) is accepted.
+#[tokio::test]
+async fn event_point_date_alone_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(0, 1, 0, 0, vec![event_point_date_fact(0)?])?,
+    )
+    .await
+}
+
+/// The kind conflict spans commits: a move-method in C1 and a damage-cause in C2
+/// on the same event are rejected, via the event backlink.
+#[tokio::test]
+async fn event_kind_conflict_across_commits_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 1, 0, 0, vec![event_move_method_fact(0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let event = c1.events.get(&EventIdx(0)).ok_or("missing event")?.id;
+
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [event_damage_cause_fact(0)?].into_iter().collect(),
+    };
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventKindConflict { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A same-commit retraction of the conflicting pre-commit fact clears the kind
+/// conflict: C1 puts a `DamageCause` on event E; C2 retracts it and adds a
+/// `MoveMethod` on E. The retraction is visible to the rule read in C2, so the
+/// surviving kind set is `{Moved}` and the commit is accepted. Without the
+/// pending-retractor overlay the doomed `DamageCause` reads active and the
+/// commit is falsely rejected as `EventKindConflict`.
+#[tokio::test]
+async fn event_kind_conflict_resolved_by_same_commit_retraction_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 1, 0, 0, vec![event_damage_cause_fact(0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let event = c1.events.get(&EventIdx(0)).ok_or("missing event")?.id;
+    let damage = *c1.fact_ids.first().ok_or("no damage fact id")?;
+
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [retract_fact(damage)?, event_move_method_fact(0)?]
+            .into_iter()
+            .collect(),
+    };
+    commit_ok(&store, c2).await
+}
+
+/// A same-commit retraction of the only depiction unmasks the gap: C1 records
+/// the sole `InPicture{X, I}` depiction; C2 retracts it and adds an
+/// `ImageObservation` of X on I. The retraction is visible to the rule read in
+/// C2, so the depiction no longer satisfies the pairing and the commit is
+/// rejected as `ObservationWithoutDepiction`. Without the pending-retractor
+/// overlay the doomed depiction reads active and the commit is falsely accepted.
+#[tokio::test]
+async fn observation_depiction_retracted_in_same_commit_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 0, 1, 0, vec![in_picture_fact(0, 0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1.entities.get(&EntityIdx(0)).ok_or("missing entity")?.id;
+    let image = c1.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
+    let depiction = *c1.fact_ids.first().ok_or("no depiction fact id")?;
+
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: image }],
+        facts: [
+            retract_fact(depiction)?,
+            observation_feature_fact(0, image_observation_citation(0)?)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::ObservationWithoutDepiction { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// An inverted name window is rejected.
+#[tokio::test]
+async fn name_window_inverted_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![name_window_fact(0, Some(1900), Some(1800))?],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::NameWindowInverted { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// An equal-bound window (earliest == latest year) is accepted.
+#[tokio::test]
+async fn name_window_equal_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![name_window_fact(0, Some(1850), Some(1850))?],
+        )?,
+    )
+    .await
+}
+
+/// An open upper bound can't prove inversion, so it's accepted.
+#[tokio::test]
+async fn name_window_open_bound_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![name_window_fact(0, Some(1900), None)?])?,
+    )
+    .await
+}
+
+/// A subimage that is its own parent is rejected.
+#[tokio::test]
+async fn composite_self_parent_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![subimage_fact(0, 0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeSelfParent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Distinct subimage and parent are accepted.
+#[tokio::test]
+async fn composite_distinct_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(0, 0, 2, 0, vec![subimage_fact(0, 1)?])?,
+    )
+    .await
+}
+
+/// A second parent for the same subimage, arriving in a later commit, is
+/// rejected via the image backlink.
+#[tokio::test]
+async fn composite_multiple_parents_across_commits_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 0, 2, 0, vec![subimage_fact(0, 1)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let subimage = c1.images.get(&ImageIdx(0)).ok_or("missing subimage")?.id;
+
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: subimage }, Decl::Local],
+        facts: [subimage_fact(0, 1)?].into_iter().collect(),
+    };
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeMultipleParents { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A self-loop edge `{s←s}` isn't a genuine parent, so `{s←s}` alongside `{s←p}`
+/// reports only the self-parent error, not a spurious multiple-parents error.
+/// `s` has exactly one real parent, `p`.
+#[tokio::test]
+async fn composite_self_loop_does_not_trip_multiple_parents() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(0, 0, 2, 0, vec![subimage_fact(0, 0)?, subimage_fact(0, 1)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeSelfParent { .. })),
+        "expected the self-parent error: {errs:?}"
+    );
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, SubmitError::CompositeMultipleParents { .. })),
+        "self-loop must not count as a second parent: {errs:?}"
+    );
+    Ok(())
+}
+
+/// A chain formed across commits (A←X in C1, then X←B in C2) is rejected: X is
+/// both a subimage and a parent.
+#[tokio::test]
+async fn composite_chain_across_commits_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    // C1: A (img 0) is a subimage of X (img 1).
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 0, 2, 0, vec![subimage_fact(0, 1)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let x = c1.images.get(&ImageIdx(1)).ok_or("missing X")?.id;
+
+    // C2: X is a subimage of a fresh B (img 1).
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: x }, Decl::Local],
+        facts: [subimage_fact(0, 1)?].into_iter().collect(),
+    };
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeChain { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Role coherence — a capture-date attribute (presupposes picture) on an image
+/// claimed `IsMap` is rejected as an `ImageRoleConflict`.
+#[tokio::test]
+async fn picture_attribute_on_map_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![is_map_fact(0)?, captured_date_fact(0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::ImageRoleConflict {
+                used_as: ImageRole::Picture,
+                claimed: ImageRole::Map,
+                ..
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Role coherence — a capture date on an image with no role-claim is accepted.
+#[tokio::test]
+async fn captured_date_on_no_role_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![captured_date_fact(0)?])?,
+    )
+    .await
+}
+
+/// Role coherence — two role *claims* don't conflict: `IsPicture` alongside
+/// `IsMap` is accepted (claim-vs-claim disagreement surfaces at projection,
+/// not submit).
+#[tokio::test]
+async fn is_picture_on_map_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![is_map_fact(0)?, is_picture_fact(0)?])?,
+    )
+    .await
+}
+
+/// Role coherence — an in-picture depiction (presupposes picture) of an image
+/// claimed `IsMap` is rejected as an `ImageRoleConflict`.
+#[tokio::test]
+async fn in_picture_on_map_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 1, 0, vec![is_map_fact(0)?, in_picture_fact(0, 0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::ImageRoleConflict {
+                used_as: ImageRole::Picture,
+                claimed: ImageRole::Map,
+                ..
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Role coherence — an in-picture depiction of an image with no role-claim is
+/// accepted.
+#[tokio::test]
+async fn in_picture_on_no_role_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 1, 0, vec![in_picture_fact(0, 0)?])?,
+    )
+    .await
+}
+
+/// Role coherence — an on-map depiction (presupposes map) of an image claimed
+/// `IsPicture` is rejected as an `ImageRoleConflict`.
+#[tokio::test]
+async fn on_map_on_picture_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 1, 0, vec![is_picture_fact(0)?, on_map_fact(0, 0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::ImageRoleConflict {
+                used_as: ImageRole::Map,
+                claimed: ImageRole::Picture,
+                ..
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+// --- observation -> depiction pairing ---
+
+/// An `ImageObservation` citation pointing at the given image index.
+fn image_observation_citation(
+    image_idx: usize,
+) -> Result<JudgmentSource<ImageIdx>, Box<dyn std::error::Error>> {
+    Ok(JudgmentSource::ImageObservation {
+        image: ImageIdx(image_idx),
+        region: None,
+        observer: crate::facts::citations::Observer::User {
+            user: UserId::new("alice"),
+            justification: None,
+        },
+    })
+}
+
+/// An `External`-cited judgment source (carries no observed image).
+fn external_judgment_citation() -> Result<JudgmentSource<ImageIdx>, Box<dyn std::error::Error>> {
+    Ok(JudgmentSource::External {
+        source: ExternalSource::Url {
+            url: Url::parse("https://example.com/observed")?,
+            published: None,
+        },
+    })
+}
+
+/// A feature observation on `entity_idx`, cited by `citation`.
+fn observation_feature_fact(
+    entity_idx: usize,
+    citation: JudgmentSource<ImageIdx>,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Observation {
+            fact: crate::facts::observation::Fact::Feature {
+                entity: EntityIdx(entity_idx),
+                feature: crate::facts::features::Feature::StoryCount { stories: 2 },
+            },
+        },
+        citation,
+    })
+}
+
+/// An image-observation of an entity with no paired depiction is rejected.
+#[tokio::test]
+async fn observation_without_depiction_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle = local_bundle(
+        1,
+        0,
+        1,
+        0,
+        vec![observation_feature_fact(0, image_observation_citation(0)?)?],
+    )?;
+    let errs = commit_err(&store, bundle).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::ObservationWithoutDepiction { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A depiction of the entity on the observed image, in the same commit,
+/// satisfies the pairing.
+#[tokio::test]
+async fn observation_with_same_commit_depiction_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle = local_bundle(
+        1,
+        0,
+        1,
+        0,
+        vec![
+            observation_feature_fact(0, image_observation_citation(0)?)?,
+            in_picture_fact(0, 0)?,
+        ],
+    )?;
+    commit_ok(&store, bundle).await
+}
+
+/// A depiction in a prior commit satisfies the pairing, via the image backlink.
+#[tokio::test]
+async fn observation_with_prior_commit_depiction_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 0, 1, 0, vec![in_picture_fact(0, 0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1.entities.get(&EntityIdx(0)).ok_or("missing entity")?.id;
+    let image = c1.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
+
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: image }],
+        facts: [observation_feature_fact(0, image_observation_citation(0)?)?]
+            .into_iter()
+            .collect(),
+    };
+    commit_ok(&store, c2).await
+}
+
+/// An observation cited by `External` carries no observed image, so the pairing
+/// requirement doesn't apply.
+#[tokio::test]
+async fn observation_cited_external_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle = local_bundle(
+        1,
+        0,
+        0,
+        0,
+        vec![observation_feature_fact(0, external_judgment_citation()?)?],
+    )?;
+    commit_ok(&store, bundle).await
+}
+
+// --- property tests ---
+
+mod props {
+    //! Property tests for the two unscaffolded algorithms: the backlink
+    //! pagination cursor loop (async, over a live store) and the
+    //! accumulating index substitution (sync, over the pipeline boundary).
+
+    use std::collections::BTreeSet;
+    use std::num::NonZeroUsize;
+
+    use proptest::prelude::*;
+
+    use super::{EntityIdx, MemoryEntityId, MemoryFactStore, SubmitError, name_fact};
+    use crate::facts::ids::FactId;
+    use crate::facts::store::{EntityView, FactStore};
+    use crate::facts::submit::pipeline::substitute_facts_accumulating;
+
+    /// A pagination scenario: `n` facts about one entity, a per-fact retraction
+    /// mask of length `n`, and a page `limit` in `1..=n+2`.
+    #[derive(Debug, Clone)]
+    struct PaginationSpec {
+        n: usize,
+        retracted: Vec<bool>,
+        limit: NonZeroUsize,
+    }
+
+    fn pagination_spec() -> impl Strategy<Value = PaginationSpec> {
+        (1usize..=12)
+            .prop_flat_map(|n| {
+                let mask = proptest::collection::vec(any::<bool>(), n);
+                let limit = 1usize..=(n + 2);
+                (Just(n), mask, limit)
+            })
+            .prop_filter_map("limit is non-zero", |(n, retracted, limit)| {
+                NonZeroUsize::new(limit).map(|limit| PaginationSpec {
+                    n,
+                    retracted,
+                    limit,
+                })
+            })
+    }
+
+    /// Commit `n` distinct name facts about one entity, retract the masked
+    /// subset in later commits, then drain the entity backlink page-by-page
+    /// with `limit`. Returns the drained ids in page order and the active set
+    /// (submitted minus retracted). Any store error becomes a `TestCaseError`.
+    async fn drive_pagination(
+        spec: &PaginationSpec,
+    ) -> Result<(Vec<FactId>, BTreeSet<FactId>), TestCaseError> {
+        let store = MemoryFactStore::new();
+
+        let mut facts = BTreeSet::new();
+        for i in 0..spec.n {
+            let fact = name_fact(0, &format!("name-{i}"))
+                .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+            facts.insert(fact);
+        }
+        let bundle = super::SubmitBundle {
+            author: super::user_author().map_err(|e| TestCaseError::fail(format!("{e:?}")))?,
+            recorded_at: super::fixed_time(),
+            entities: vec![super::Decl::Local],
+            events: Vec::new(),
+            images: Vec::new(),
+            facts,
+        };
+        let result = super::commit_facts(&store, bundle)
+            .await
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+        let entity = result
+            .entities
+            .get(&EntityIdx(0))
+            .ok_or_else(|| TestCaseError::fail("entity 0 missing"))?
+            .id;
+
+        // Submitted fact ids, in push (ascending) order.
+        let submitted = &result.fact_ids;
+        if submitted.len() != spec.n {
+            return Err(TestCaseError::fail(format!(
+                "expected {} facts, committed {}",
+                spec.n,
+                submitted.len()
+            )));
+        }
+
+        // Retract the masked subset, each in its own later commit so the
+        // retractor meta-facts hash distinctly.
+        let mut active = BTreeSet::new();
+        for (i, &fid) in submitted.iter().enumerate() {
+            if spec.retracted.get(i).copied().unwrap_or(false) {
+                super::commit_retract(&store, fid, (i as i64) + 1)
+                    .await
+                    .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+            } else {
+                active.insert(fid);
+            }
+        }
+
+        // Drive the cursor loop. Cap iterations so a cursor bug can't hang.
+        let view = store
+            .now()
+            .await
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+        let mut drained = Vec::new();
+        let mut cursor = FactId::new(0);
+        let max_pages = spec.n + 2;
+        let mut pages = 0;
+        loop {
+            if pages > max_pages {
+                return Err(TestCaseError::fail(format!(
+                    "cursor loop did not terminate after {max_pages} pages: {drained:?}"
+                )));
+            }
+            pages += 1;
+            let page = view
+                .all_facts_about_entity(&entity, cursor, spec.limit)
+                .await
+                .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+            drained.extend(page.items.iter().map(|item| item.fact_id));
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+
+        Ok((drained, active))
+    }
+
+    /// A scenario: `decl_count` declared entities and a vector of entity
+    /// indices, each `< 2 * decl_count` so roughly half land out of range.
+    #[derive(Debug, Clone)]
+    struct SubstitutionSpec {
+        decl_count: usize,
+        indices: Vec<usize>,
+    }
+
+    fn substitution_spec() -> impl Strategy<Value = SubstitutionSpec> {
+        (1usize..=8)
+            .prop_flat_map(|decl_count| {
+                // Indices span both in-range (< decl_count) and out-of-range
+                // (>= decl_count) so each call exercises both partitions.
+                let upper = 2 * decl_count;
+                let indices = proptest::collection::vec(0usize..upper, 0..=12);
+                (Just(decl_count), indices)
+            })
+            .prop_map(|(decl_count, indices)| SubstitutionSpec {
+                decl_count,
+                indices,
+            })
+    }
+
+    proptest! {
+        /// Paging the backlink drains exactly the active set, in strictly
+        /// ascending id order. Covers the `next_cursor` resume loop, the
+        /// all-retracted empty drain, and the short-page-with-cursor case
+        /// (a retracted fact is skipped without consuming a slot).
+        #[test]
+        fn pagination_drains_exactly_the_active_set(spec in pagination_spec()) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| TestCaseError::fail(format!("runtime: {e}")))?;
+            let (drained, active) = rt.block_on(drive_pagination(&spec))?;
+
+            let ascending = drained.windows(2).all(|w| w[0] < w[1]);
+            prop_assert!(
+                ascending,
+                "pages must drain ascending with no dup/skip: {drained:?}"
+            );
+            let drained_set: BTreeSet<FactId> = drained.into_iter().collect();
+            prop_assert_eq!(drained_set, active);
+        }
+
+        /// Substitution partitions the fact set by entity-index validity:
+        /// every in-range fact lands in `out`, every out-of-range one lands
+        /// as a typed `EntityIdxOutOfRange` carrying the input `decl_count`,
+        /// and the two partitions cover the input exactly once.
+        ///
+        /// Order-independence is structural (the input is a `BTreeSet`), so
+        /// the pinned property is the count-partition and the typed error,
+        /// not ordering.
+        #[test]
+        fn substitution_partitions_facts_by_index_validity(spec in substitution_spec()) {
+            // One distinct fact per index (unique names → distinct BTreeSet
+            // elements). Distinct names keep every index its own fact even
+            // when indices repeat.
+            let mut facts = BTreeSet::new();
+            for (slot, &idx) in spec.indices.iter().enumerate() {
+                let fact = name_fact(idx, &format!("fact-{slot}"))
+                    .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+                facts.insert(fact);
+            }
+            let total = facts.len();
+
+            // Resolution map for the in-range indices only.
+            let entities: std::collections::HashMap<EntityIdx, MemoryEntityId> = (0..spec.decl_count)
+                .map(|i| (EntityIdx(i), MemoryEntityId(i as u64)))
+                .collect();
+            let events = std::collections::HashMap::new();
+            let images = std::collections::HashMap::new();
+
+            let (out, errors) = substitute_facts_accumulating::<
+                MemoryEntityId,
+                crate::facts::memory::MemoryEventId,
+                crate::facts::memory::MemoryImageId,
+            >(&facts, &entities, &events, &images);
+
+            let expected_errors = spec
+                .indices
+                .iter()
+                .filter(|&&idx| idx >= spec.decl_count)
+                .count();
+            // Indices collapsed by the unique-name BTreeSet can't drop an
+            // out-of-range one: each name is distinct, so `total == indices`.
+            prop_assert_eq!(total, spec.indices.len());
+            prop_assert_eq!(errors.len(), expected_errors);
+
+            for err in &errors {
+                match err {
+                    SubmitError::EntityIdxOutOfRange { decl_count, .. } => {
+                        prop_assert_eq!(*decl_count, spec.decl_count);
+                    }
+                    other => {
+                        return Err(TestCaseError::fail(format!(
+                            "expected EntityIdxOutOfRange, got {other:?}"
+                        )));
+                    }
+                }
+            }
+
+            // Every fact classified exactly once: in-range → out, else error.
+            prop_assert_eq!(out.len(), total - expected_errors);
+            prop_assert_eq!(out.len() + errors.len(), total);
+        }
+    }
 }

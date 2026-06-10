@@ -26,7 +26,7 @@ pub mod result;
 
 // Selective re-exports so common types reach via `crate::facts::submit::X`.
 pub use crate::facts::ids::SubjectKind;
-pub use error::SubmitError;
+pub use error::{ImageRole, SubmitError};
 pub use pipeline::commit_facts;
 pub use result::{
     CommitAuthor, FactLookup, Resolution, ResolutionOrigin, StoredCommit, StoredFact, SubmitResult,
@@ -150,8 +150,10 @@ pub enum SubmitFact {
     Judgment {
         /// The judgment assertion (with bundle-local indices).
         assertion: SubmitJudgmentAssertion,
-        /// The judgment source backing the claim.
-        citation: JudgmentSource,
+        /// The judgment source backing the claim. Its observed image (for an
+        /// `ImageObservation`) is a bundle-local [`ImageIdx`], rewritten to a
+        /// persistent id at submission alongside the assertion.
+        citation: JudgmentSource<ImageIdx>,
     },
     /// A fact about other facts (retraction, supersession), backed by a
     /// meta source.
@@ -161,6 +163,37 @@ pub enum SubmitFact {
         /// The meta source backing the claim.
         citation: MetaSource,
     },
+}
+
+impl SubmitFact {
+    /// Visit every bundle-local index this fact references, dispatching each to
+    /// its kind's closure. The fact-level traversal: it folds the assertion's
+    /// own indices together with a judgment's observed image, so callers
+    /// resolving or counting references see one complete stream per fact.
+    ///
+    /// A `Judgment`'s `ImageObservation` citation contributes its observed
+    /// image through `fi`. `Meta` references facts and commits by persistent
+    /// id, not bundle-local indices, so it visits nothing.
+    pub fn for_each_id(
+        &self,
+        fe: &mut impl FnMut(&EntityIdx),
+        fv: &mut impl FnMut(&EventIdx),
+        fi: &mut impl FnMut(&ImageIdx),
+    ) {
+        match self {
+            Self::Factual { assertion, .. } => assertion.for_each_id(fe, fv, fi),
+            Self::Judgment {
+                assertion,
+                citation,
+            } => {
+                assertion.for_each_id(fe, fv, fi);
+                if let Some(idx) = citation.observed_image() {
+                    fi(idx);
+                }
+            }
+            Self::Meta { .. } => {}
+        }
+    }
 }
 
 // ============================================================================
@@ -334,6 +367,46 @@ mod tests {
             images: Vec::new(),
             facts: facts.into_iter().collect(),
         }
+    }
+
+    /// A judgment fact whose `ImageObservation` citation names an image the
+    /// assertion never mentions has that observed image visited by the
+    /// fact-level `for_each_id` — the citation id is folded into the traversal,
+    /// not just the assertion's own ids.
+    #[test]
+    fn for_each_id_visits_observed_image_of_judgment_citation() -> TestResult {
+        use crate::facts::assertions::JudgmentAssertion;
+        use crate::facts::citations::{JudgmentSource, Observer};
+        use crate::facts::observation;
+
+        let observed = ImageIdx(7);
+        let fact = SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Observation {
+                fact: observation::Fact::Feature {
+                    entity: EntityIdx(0),
+                    feature: crate::facts::features::Feature::StoryCount { stories: 2 },
+                },
+            },
+            citation: JudgmentSource::ImageObservation {
+                image: observed,
+                region: None,
+                observer: Observer::User {
+                    user: UserId::new("alice"),
+                    justification: None,
+                },
+            },
+        };
+
+        let mut entities = Vec::new();
+        let mut images = Vec::new();
+        fact.for_each_id(
+            &mut |e: &EntityIdx| entities.push(*e),
+            &mut |_v: &EventIdx| {},
+            &mut |i: &ImageIdx| images.push(*i),
+        );
+        assert_eq!(entities, vec![EntityIdx(0)]);
+        assert_eq!(images, vec![observed]);
+        Ok(())
     }
 
     #[test]

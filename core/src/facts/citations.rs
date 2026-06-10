@@ -22,7 +22,7 @@ use url::Url;
 
 use crate::date::UncertainDate;
 use crate::facts::geometry::ImageRegion;
-use crate::facts::ids::{FactId, ImageId, IngesterRunId, UserId};
+use crate::facts::ids::{FactId, IngesterRunId, UserId};
 use crate::ids::{
     GeoNamesId, GettyTgnId, NrhpReferenceNumber, OhmId, OsmElementType, OsmId, PleiadesPlaceId,
     WikidataEntityId, WikidataPropertyId,
@@ -437,9 +437,21 @@ pub enum ExternalSource {
 /// Four warrant flavors: an external citation, the researcher's personal
 /// knowledge, reasoning over existing facts, or a direct image observation
 /// with optional region.
+///
+/// Generic over the image reference type so the observed image rides through
+/// the same bundle-local-index → persistent-id substitution as the depiction
+/// facts it pairs with: a producer references the observed image by
+/// [`ImageIdx`](crate::facts::submit::ImageIdx), and submission rewrites it to
+/// the backend id. Only the `ImageObservation` flavor carries an image; the
+/// others are id-free.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum JudgmentSource {
+#[serde(bound(
+    serialize = "ImgId: ::serde::Serialize",
+    deserialize = "ImgId: ::serde::de::DeserializeOwned"
+))]
+#[schemars(bound = "ImgId: ::schemars::JsonSchema")]
+pub enum JudgmentSource<ImgId> {
     /// External evidence wrapping any [`ExternalSource`]. Preferred when
     /// available.
     External { source: ExternalSource },
@@ -468,13 +480,61 @@ pub enum JudgmentSource {
     /// finer than the commit-level ingester attribution.
     ImageObservation {
         /// The image the observer looked at.
-        image: ImageId,
+        image: ImgId,
         /// Where in the image the observer focused, when known. `None` for a
         /// whole-image observation that doesn't bound a region.
         region: Option<ImageRegion>,
         /// Who or what made the observation.
         observer: Observer,
     },
+}
+
+impl<ImgId> JudgmentSource<ImgId> {
+    /// The image this source was observed against (the `ImageObservation`
+    /// flavor); `None` for the others, which reference no image.
+    pub fn observed_image(&self) -> Option<&ImgId> {
+        match self {
+            Self::ImageObservation { image, .. } => Some(image),
+            Self::External { .. } | Self::PersonalKnowledge { .. } | Self::Analysis { .. } => None,
+        }
+    }
+
+    /// Relabel the observed image through the fallible closure, producing a
+    /// `JudgmentSource<I2>`. Only `ImageObservation` carries an image; the
+    /// other flavors are rebuilt verbatim.
+    pub fn try_map_image<I2, Err>(
+        &self,
+        fi: &mut impl FnMut(&ImgId) -> Result<I2, Err>,
+    ) -> Result<JudgmentSource<I2>, Err> {
+        Ok(match self {
+            Self::External { source } => JudgmentSource::External {
+                source: source.clone(),
+            },
+            Self::PersonalKnowledge {
+                user,
+                justification,
+            } => JudgmentSource::PersonalKnowledge {
+                user: user.clone(),
+                justification: justification.clone(),
+            },
+            Self::Analysis {
+                input_facts,
+                reasoning,
+            } => JudgmentSource::Analysis {
+                input_facts: input_facts.clone(),
+                reasoning: reasoning.clone(),
+            },
+            Self::ImageObservation {
+                image,
+                region,
+                observer,
+            } => JudgmentSource::ImageObservation {
+                image: fi(image)?,
+                region: region.clone(),
+                observer: observer.clone(),
+            },
+        })
+    }
 }
 
 /// Who made an image observation.

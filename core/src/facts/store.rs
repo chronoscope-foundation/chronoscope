@@ -83,6 +83,7 @@ use crate::facts::schema::{
 };
 use crate::facts::submit;
 use crate::facts::submit::{FactLookup, StoredFact, SubmitError, SubmitResult};
+use crate::nonempty::NonEmptyVec;
 
 // ============================================================================
 // PersistentId — the persistent-id bound alias
@@ -252,16 +253,17 @@ pub trait FactStore: Send + Sync + Sized {
 
 /// Aggregate error for `submit_commit`: a submit-pipeline domain error or a
 /// backend failure, in one enum so the return type stays `Result<_, _>`.
-/// `Submit` failures carry a rule message; backend failures carry backend
-/// diagnostics.
+/// `Submit` carries every rule violation the pipeline found in one batch;
+/// backend failures carry backend diagnostics.
 ///
 /// `E` is the backend error; `EntId` / `EvtId` / `ImgId` are the backend's id
 /// kinds, threaded into [`SubmitError`] so a rejection carries the offending
 /// id typed. They appear only in the `Submit` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitCommitError<E, EntId, EvtId, ImgId> {
-    /// A submit-pipeline rule rejected the bundle.
-    Submit(SubmitError<EntId, EvtId, ImgId>),
+    /// A submit-pipeline run rejected the bundle, carrying the non-empty
+    /// batch of every rule it violated.
+    Submit(NonEmptyVec<SubmitError<EntId, EvtId, ImgId>>),
     /// A backend failure (I/O, transaction abort, etc.).
     Backend(E),
 }
@@ -275,7 +277,17 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Submit(e) => write!(f, "submit pipeline rejected commit: {e}"),
+            Self::Submit(errs) => {
+                write!(
+                    f,
+                    "submit pipeline rejected commit ({} error(s)):",
+                    errs.len()
+                )?;
+                for e in errs {
+                    write!(f, "\n  - {e}")?;
+                }
+                Ok(())
+            }
             Self::Backend(e) => write!(f, "backend failure: {e}"),
         }
     }
@@ -294,7 +306,7 @@ impl<E, EntId, EvtId, ImgId> From<SubmitError<EntId, EvtId, ImgId>>
     for SubmitCommitError<E, EntId, EvtId, ImgId>
 {
     fn from(e: SubmitError<EntId, EvtId, ImgId>) -> Self {
-        Self::Submit(e)
+        Self::Submit(NonEmptyVec::singleton(e))
     }
 }
 
@@ -334,6 +346,29 @@ pub trait FactView<S: FactStore>: Send + Sync {
         &self,
         id: &crate::facts::ids::CommitId,
     ) -> impl Future<Output = Result<bool, S::Error>> + Send;
+
+    /// Where `id` sits relative to this view's snapshot — see [`FactPlacement`].
+    ///
+    /// A read snapshot has no in-flight commit, so it never reports `InFlight`
+    /// — only `Committed` or `Absent`. A commit-in-preparation view (the submit
+    /// union view) additionally reports `InFlight` for facts this commit mints.
+    fn placement(&self, id: FactId)
+    -> impl Future<Output = Result<FactPlacement, S::Error>> + Send;
+}
+
+/// Where a [`FactId`] sits relative to the commit a view is preparing.
+///
+/// The meta-rules read this to classify a retract/supersede target: a target
+/// must predate the in-flight commit ([`Self::Committed`]), not be minted
+/// inside it ([`Self::InFlight`]) and not be missing ([`Self::Absent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactPlacement {
+    /// No such fact at this view's snapshot — a future id or one never minted.
+    Absent,
+    /// Minted in the in-flight commit this view is preparing.
+    InFlight,
+    /// A fact at-or-before the snapshot, predating any in-flight commit.
+    Committed,
 }
 
 /// Store-pinned [`StoredFact`] alias, to keep signatures returning
@@ -373,7 +408,7 @@ pub trait EntityView<S: FactStore>: FactView<S> {
         &'a self,
         stream: &'a EntityStream<'a>,
         cursor: FactId,
-        limit: usize,
+        limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::EntityId>, S::Error>> + Send + 'a;
 
     /// Paginated backlink walk — "which facts mention this entity?".
@@ -383,7 +418,7 @@ pub trait EntityView<S: FactStore>: FactView<S> {
         &self,
         entity: &S::EntityId,
         cursor: FactId,
-        limit: usize,
+        limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::EntityId>, S::Error>> + Send;
 
     /// Closure of edge facts reachable from `seed` via the `Topological`
@@ -397,7 +432,7 @@ pub trait EntityView<S: FactStore>: FactView<S> {
         &self,
         seed: S::EntityId,
         cursor: FactId,
-        limit: usize,
+        limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<EdgeSubgraph<S::EntityId, StoredFactOf<S>>, S::Error>> + Send;
 }
 
@@ -427,7 +462,7 @@ pub trait EventView<S: FactStore>: FactView<S> {
         &'a self,
         stream: &'a EventStream<'a>,
         cursor: FactId,
-        limit: usize,
+        limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::EventId>, S::Error>> + Send + 'a;
 
     /// Paginated backlink walk — "which facts mention this event?".
@@ -435,7 +470,7 @@ pub trait EventView<S: FactStore>: FactView<S> {
         &self,
         event: &S::EventId,
         cursor: FactId,
-        limit: usize,
+        limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::EventId>, S::Error>> + Send;
 }
 
@@ -466,7 +501,7 @@ pub trait ImageView<S: FactStore>: FactView<S> {
         &'a self,
         stream: &'a ImageStream<'a>,
         cursor: FactId,
-        limit: usize,
+        limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::ImageId>, S::Error>> + Send + 'a;
 
     /// Paginated backlink walk — "which facts mention this image?".
@@ -474,6 +509,6 @@ pub trait ImageView<S: FactStore>: FactView<S> {
         &self,
         image: &S::ImageId,
         cursor: FactId,
-        limit: usize,
+        limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::ImageId>, S::Error>> + Send;
 }

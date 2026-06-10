@@ -6,13 +6,14 @@
 //!
 //! The module provides:
 //!
-//! - [`substitute_facts`] — translates index references to persistent ids.
+//! - [`substitute_facts_accumulating`] — translates index references to
+//!   persistent ids, collecting every per-fact substitution failure.
 //! - [`match_entities`] / [`match_images`] — resolve each [`Decl::Local`]
 //!   against the unified view, returning [`MatchOutcome::Matched`] for a
 //!   single hit or [`MatchOutcome::Mint`] otherwise.
-//! - [`validate_submit`] — runs the submit-rule checks (meta-fact target
-//!   existence and the same-commit / self-replacement guards) over the
-//!   in-flight commit.
+//! - [`validate_submit`] — runs the submit-rule checks (the meta-fact target
+//!   guards plus the cluster rules) over the in-flight commit, accumulating
+//!   every violation into one batch.
 //!
 //! Commit-id derivation lives on [`Commit::id`](super::Commit::id); backends
 //! call `bundle.id()?`.
@@ -29,18 +30,23 @@
 //! reads against its transaction.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::num::NonZeroUsize;
 
-use super::error::SubmitError;
-use super::result::{
-    FactLookup, StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMetaFact,
-};
+use super::error::{ImageRole, SubmitError};
+use super::result::{StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMetaFact};
 use super::{Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
+use crate::facts::citations::JudgmentSource;
 use crate::facts::identity::{IdMapError, SelfLoop};
 use crate::facts::ids::{FactId, SubjectKind};
+use crate::facts::lifecycle::LifetimeEventKind;
+use crate::facts::schema::FactPage;
 use crate::facts::store::{
-    FactStore, FactView, StoredFactOf, SubmitCommitError, SubmitCommitInput, SubmitCommitOutput,
+    EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf, SubmitCommitError,
+    SubmitCommitInput, SubmitCommitOutput,
 };
+use crate::facts::{attribute, bookend, composites, depiction, event, map, picture};
 
 // ============================================================================
 // commit_facts — end-to-end transaction-and-commit wrapper
@@ -174,33 +180,39 @@ pub async fn match_images<S: FactStore, V: FactView<S>>(
 ///
 /// Each [`MetaAssertion`] target resolves against `view` (the committed
 /// snapshot unioned with this commit's already-pushed facts), and
-/// `first_in_commit_fact_id` (the committed fact count at lock time) is the
-/// boundary that classifies a fact target as pre-existing or same-commit:
+/// [`FactView::placement`] classifies a fact target as pre-existing,
+/// same-commit, or absent:
 ///
 /// - [`MetaAssertion::RetractFact`] / [`MetaAssertion::SupersedeFact`] name a
-///   `target` [`FactId`]. A target resolving to [`FactLookup::Unknown`] /
-///   [`FactLookup::Future`] doesn't exist ([`SubmitError::FactNotFound`]); one
-///   at-or-above the boundary is a fact in this commit
-///   ([`SubmitError::MetaTargetInSameCommit`]); a pre-existing one passes.
-///   `SupersedeFact` also rejects `target == replacement`
-///   ([`SubmitError::SupersedeReplacementEqualsTarget`]) and requires
-///   `replacement` to name an existing fact — prior or minted in this commit —
-///   else [`SubmitError::FactNotFound`].
+///   `target` [`FactId`]. An [`FactPlacement::Absent`] target doesn't exist
+///   ([`SubmitError::FactNotFound`]); an [`FactPlacement::InFlight`] one is a
+///   fact in this commit ([`SubmitError::MetaTargetInSameCommit`]); a
+///   [`FactPlacement::Committed`] one passes. `SupersedeFact` also rejects
+///   `target == replacement` ([`SubmitError::SupersedeReplacementEqualsTarget`])
+///   and requires `replacement` to merely exist — prior or minted in this
+///   commit — rejecting only [`FactPlacement::Absent`] with
+///   [`SubmitError::FactNotFound`].
 /// - [`MetaAssertion::RetractCommit`] names a `target`
 ///   [`CommitId`](crate::facts::ids::CommitId), resolved via
 ///   [`FactView::commit_known`]. An unrecorded commit is
 ///   [`SubmitError::CommitNotFound`]; a recorded one passes.
 ///
-/// Async: target lookups go through `view.fact(...)` / `view.commit_known(...)`,
-/// served from memory here and from the open transaction in a SQL backend.
+/// Async: target lookups go through `view.placement(...)` /
+/// `view.commit_known(...)`, served from memory here and from the open
+/// transaction in a SQL backend.
 ///
-/// Returns `Result<(), SubmitCommitError<…>>` — rule rejections in the `Submit`
-/// arm, backend read failures in the `Backend` arm.
-pub async fn validate_submit<S: FactStore, V: FactView<S>>(
+/// Returns `Ok(batch)` — every rule violation found, in deterministic order, for
+/// the caller to fold into its accumulating reject batch — or `Err(S::Error)`
+/// when a backend read fails. An empty `Vec` means the commit passed every rule.
+///
+/// The bound widens to [`EventView`] + [`ImageView`] because the gather phase
+/// drains `all_facts_about_event` / `all_facts_about_image` through `view` to
+/// build the subject neighbourhood the cluster rules read.
+pub async fn validate_submit<S: FactStore, V: FactView<S> + EventView<S> + ImageView<S>>(
     candidates: &[StoredFactOf<S>],
     view: &V,
-    first_in_commit_fact_id: FactId,
-) -> Result<(), SubmitCommitError<S::Error, S::EntityId, S::EventId, S::ImageId>> {
+) -> Result<Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>, S::Error> {
+    let mut errors = Vec::new();
     for fact in candidates {
         let StoredFact::Meta(meta) = fact else {
             continue;
@@ -208,7 +220,9 @@ pub async fn validate_submit<S: FactStore, V: FactView<S>>(
         // Exhaustive so a new MetaAssertion variant forces a decision here.
         match &meta.assertion {
             MetaAssertion::RetractFact { target, .. } => {
-                check_meta_fact_target(view, *target, first_in_commit_fact_id).await?;
+                if let Some(e) = check_meta_fact_target::<S, V>(view, *target).await? {
+                    errors.push(e);
+                }
             }
             MetaAssertion::SupersedeFact {
                 target,
@@ -216,80 +230,125 @@ pub async fn validate_submit<S: FactStore, V: FactView<S>>(
                 ..
             } => {
                 if target == replacement {
-                    return Err(
-                        SubmitError::SupersedeReplacementEqualsTarget { target: *target }.into(),
-                    );
+                    // A self-superseding meta-fact is malformed on its own; the
+                    // target/replacement existence checks would be redundant.
+                    errors.push(SubmitError::SupersedeReplacementEqualsTarget { target: *target });
+                } else {
+                    if let Some(e) = check_meta_fact_target::<S, V>(view, *target).await? {
+                        errors.push(e);
+                    }
+                    // The replacement is the corrected fact; require only that it
+                    // names a real fact — a prior one, or one minted in this commit
+                    // (already visible through `view`). Only an absent id is a miss.
+                    if view.placement(*replacement).await? == FactPlacement::Absent {
+                        errors.push(SubmitError::FactNotFound { id: *replacement });
+                    }
                 }
-                check_meta_fact_target(view, *target, first_in_commit_fact_id).await?;
-                // The replacement is the corrected fact; require only that it
-                // names a real fact — a prior one, or one minted in this commit
-                // (already visible through `view`).
-                require_existing_fact(view, *replacement).await?;
             }
             MetaAssertion::RetractCommit { target, .. } => {
-                let known = view
-                    .commit_known(target)
-                    .await
-                    .map_err(SubmitCommitError::Backend)?;
-                if !known {
-                    return Err(SubmitError::CommitNotFound { id: target.clone() }.into());
+                if !view.commit_known(target).await? {
+                    errors.push(SubmitError::CommitNotFound { id: target.clone() });
                 }
             }
         }
     }
-    Ok(())
+    let (event_facts, image_facts) = gather_subject_neighborhood::<S, V>(candidates, view).await?;
+    run_cluster_rules::<S>(candidates, &event_facts, &image_facts, &mut errors);
+    Ok(errors)
 }
 
-/// Resolve a retract/supersede fact-target against the committed view.
+/// Drain each event and image this commit's `candidates` touch exactly once,
+/// producing the subject-keyed neighbourhood the cluster rules read.
 ///
-/// A target must already exist (`Active` or `Retracted`) and predate this
-/// commit. A target minted in this commit is
-/// [`SubmitError::MetaTargetInSameCommit`]; a never-minted id is
-/// [`SubmitError::FactNotFound`].
+/// `for_each_id` folds each candidate's mentioned subject ids (the entity
+/// closure is a no-op — no cluster rule keys off the entity neighbourhood, and
+/// the judgment citation's observed image already reaches `fi`). Every touched
+/// event / image is drained once via `drain_facts_about_event` /
+/// `drain_facts_about_image`, so a subject several candidates mention is read a
+/// single time. The maps are looked up by id, never iterated for output, so the
+/// `HashMap` choice doesn't affect rule determinism.
+async fn gather_subject_neighborhood<S, V>(
+    candidates: &[StoredFactOf<S>],
+    view: &V,
+) -> Result<
+    (
+        HashMap<S::EventId, Vec<StoredFactOf<S>>>,
+        HashMap<S::ImageId, Vec<StoredFactOf<S>>>,
+    ),
+    S::Error,
+>
+where
+    S: FactStore,
+    V: EventView<S> + ImageView<S>,
+{
+    let mut events: BTreeSet<S::EventId> = BTreeSet::new();
+    let mut images: BTreeSet<S::ImageId> = BTreeSet::new();
+    for fact in candidates {
+        fact.for_each_id(
+            &mut |_entity| {},
+            &mut |event: &S::EventId| {
+                events.insert(event.clone());
+            },
+            &mut |image: &S::ImageId| {
+                images.insert(image.clone());
+            },
+        );
+    }
+    let mut event_facts: HashMap<S::EventId, Vec<StoredFactOf<S>>> = HashMap::new();
+    for e in events {
+        let drained = drain_facts_about_event::<S, V>(view, &e).await?;
+        event_facts.insert(e, drained);
+    }
+    let mut image_facts: HashMap<S::ImageId, Vec<StoredFactOf<S>>> = HashMap::new();
+    for i in images {
+        let drained = drain_facts_about_image::<S, V>(view, &i).await?;
+        image_facts.insert(i, drained);
+    }
+    Ok((event_facts, image_facts))
+}
+
+/// Resolve a retract/supersede fact-target by its [`FactPlacement`].
+///
+/// A target must predate the in-flight commit ([`FactPlacement::Committed`]).
+/// An [`FactPlacement::InFlight`] target is minted in this commit
+/// ([`SubmitError::MetaTargetInSameCommit`]); an [`FactPlacement::Absent`] one
+/// was never minted ([`SubmitError::FactNotFound`]). `Ok(None)` means the
+/// target passes; only a backend read failure short-circuits as `Err`.
 async fn check_meta_fact_target<S: FactStore, V: FactView<S>>(
     view: &V,
     target: FactId,
-    first_in_commit_fact_id: FactId,
-) -> Result<(), SubmitCommitError<S::Error, S::EntityId, S::EventId, S::ImageId>> {
-    require_existing_fact(view, target).await?;
-    if target.get() >= first_in_commit_fact_id.get() {
-        return Err(SubmitError::MetaTargetInSameCommit { target }.into());
-    }
-    Ok(())
-}
-
-/// Error unless `id` resolves to an existing fact (`Active` or `Retracted`).
-/// A never-minted or not-yet-visible id is [`SubmitError::FactNotFound`].
-async fn require_existing_fact<S: FactStore, V: FactView<S>>(
-    view: &V,
-    id: FactId,
-) -> Result<(), SubmitCommitError<S::Error, S::EntityId, S::EventId, S::ImageId>> {
-    let lookup = view.fact(id).await.map_err(SubmitCommitError::Backend)?;
-    match lookup {
-        FactLookup::Active(_) | FactLookup::Retracted { .. } => Ok(()),
-        FactLookup::Unknown | FactLookup::Future => Err(SubmitError::FactNotFound { id }.into()),
-    }
+) -> Result<Option<SubmitError<S::EntityId, S::EventId, S::ImageId>>, S::Error> {
+    Ok(match view.placement(target).await? {
+        FactPlacement::Absent => Some(SubmitError::FactNotFound { id: target }),
+        FactPlacement::InFlight => Some(SubmitError::MetaTargetInSameCommit { target }),
+        FactPlacement::Committed => None,
+    })
 }
 
 // ============================================================================
 // substitute_facts
 // ============================================================================
 
-/// Result of substituting a commit's facts: the [`StoredFact`]s on success, a
-/// [`SubmitError`] (carrying any typed offending id) on failure. An alias to
-/// keep the signatures readable and clippy's `type_complexity` quiet.
-type SubstituteResult<EntId, EvtId, ImgId> =
-    Result<Vec<StoredFact<EntId, EvtId, ImgId>>, SubmitError<EntId, EvtId, ImgId>>;
+/// The substituted [`StoredFact`]s plus the per-fact [`SubmitError`]s
+/// substitution rejected. An alias to keep the signature readable and clippy's
+/// `type_complexity` quiet.
+type SubstituteResult<EntId, EvtId, ImgId> = (
+    Vec<StoredFact<EntId, EvtId, ImgId>>,
+    Vec<SubmitError<EntId, EvtId, ImgId>>,
+);
 
 /// Translate every bundle-local index in `facts` to its resolved persistent
-/// id, returning the substituted [`StoredFact`]s.
+/// id, accumulating rather than stopping at the first failure.
 ///
-/// Iterates in `BTreeSet` order, so the output order is a function of the
-/// facts, not submission order. An out-of-range index produces a
-/// [`SubmitError::EntityIdxOutOfRange`] / `EventIdxOutOfRange` /
-/// `ImageIdxOutOfRange`. The lookup maps are per-Idx (the three id kinds use
-/// distinct newtypes).
-pub fn substitute_facts<EntId, EvtId, ImgId>(
+/// Iterates in `BTreeSet` order, so both the output facts and the errors are a
+/// function of the facts, not submission order. Each successfully substituted
+/// fact lands in the facts vec and proceeds to the rules; a fact whose
+/// substitution fails — an out-of-range index
+/// ([`SubmitError::EntityIdxOutOfRange`] / `EventIdxOutOfRange` /
+/// `ImageIdxOutOfRange`) or a resolved self-loop — lands in the error vec and is
+/// omitted from the rule set. The lookup maps are per-Idx (the
+/// three id kinds use distinct newtypes).
+pub fn substitute_facts_accumulating<EntId, EvtId, ImgId>(
     facts: &BTreeSet<SubmitFact>,
     entities: &HashMap<EntityIdx, EntId>,
     events: &HashMap<EventIdx, EvtId>,
@@ -301,11 +360,14 @@ where
     ImgId: Clone + Ord + std::fmt::Display + std::fmt::Debug + serde::de::DeserializeOwned,
 {
     let mut out = Vec::with_capacity(facts.len());
+    let mut errors = Vec::new();
     for fact in facts {
-        let stored = substitute_one(fact, entities, events, images)?;
-        out.push(stored);
+        match substitute_one(fact, entities, events, images) {
+            Ok(stored) => out.push(stored),
+            Err(e) => errors.push(e),
+        }
     }
-    Ok(out)
+    (out, errors)
 }
 
 fn substitute_one<EntId, EvtId, ImgId>(
@@ -332,7 +394,7 @@ where
             citation,
         } => Ok(StoredFact::Judgment(StoredJudgmentFact {
             assertion: substitute_judgment(assertion, entities, events, images)?,
-            source: citation.clone(),
+            source: substitute_judgment_source(citation, images)?,
         })),
         SubmitFact::Meta {
             assertion,
@@ -482,6 +544,21 @@ where
     .map_err(id_map_error_to_submit)
 }
 
+/// Substitute a judgment citation's observed-image index for its persistent id.
+/// Only `ImageObservation` carries an image; an out-of-range index lowers to
+/// [`SubmitError::ImageIdxOutOfRange`], the same as the assertion path.
+fn substitute_judgment_source<EntId, EvtId, ImgId>(
+    source: &JudgmentSource<ImageIdx>,
+    images: &HashMap<ImageIdx, ImgId>,
+) -> Result<JudgmentSource<ImgId>, SubmitError<EntId, EvtId, ImgId>>
+where
+    ImgId: Clone,
+{
+    source
+        .try_map_image(&mut |idx: &ImageIdx| lookup_image::<EntId, EvtId, ImgId>(images, *idx))
+        .map_err(id_map_error_to_submit)
+}
+
 // MetaAssertion holds FactId / CommitId references — already persistent — so
 // substitution is a deep clone. Exhaustive `match` so a new variant forces a
 // decision; wildcard arms are disallowed by the coding standards.
@@ -505,4 +582,556 @@ fn substitute_meta(meta: &MetaAssertion) -> MetaAssertion {
             reason: *reason,
         },
     }
+}
+
+// ============================================================================
+// Backlink drain (committed ∪ pending, straight from the view)
+// ============================================================================
+
+/// Page size for the backlink drains. Pagination is an internal detail of the
+/// rule reads; one page covers most subjects, and the loop handles the rest.
+const BACKLINK_PAGE: NonZeroUsize = match NonZeroUsize::new(256) {
+    Some(n) => n,
+    None => NonZeroUsize::MIN,
+};
+
+/// Drain every fact a `fetch` closure reports, following `FactPage::next_cursor`
+/// until the walk is exhausted. The shared loop behind the event and image
+/// drains — they differ only in which backlink read they call.
+async fn drain_facts<S, F, Fut, Sub>(mut fetch: F) -> Result<Vec<StoredFactOf<S>>, S::Error>
+where
+    S: FactStore,
+    F: FnMut(FactId) -> Fut,
+    Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
+{
+    let mut out = Vec::new();
+    let mut cursor = FactId::new(0);
+    loop {
+        let page = fetch(cursor).await?;
+        out.extend(page.items.into_iter().map(|it| it.fact));
+        match page.next_cursor {
+            Some(c) => cursor = c,
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// Every active fact about `event` — committed ∪ pending — draining
+/// `all_facts_about_event` through the union view until the walk is exhausted.
+async fn drain_facts_about_event<S, V>(
+    view: &V,
+    event: &S::EventId,
+) -> Result<Vec<StoredFactOf<S>>, S::Error>
+where
+    S: FactStore,
+    V: EventView<S>,
+{
+    drain_facts::<S, _, _, _>(|cursor| view.all_facts_about_event(event, cursor, BACKLINK_PAGE))
+        .await
+}
+
+/// Every active fact about `image`; the image analogue of
+/// [`drain_facts_about_event`].
+async fn drain_facts_about_image<S, V>(
+    view: &V,
+    image: &S::ImageId,
+) -> Result<Vec<StoredFactOf<S>>, S::Error>
+where
+    S: FactStore,
+    V: ImageView<S>,
+{
+    drain_facts::<S, _, _, _>(|cursor| view.all_facts_about_image(image, cursor, BACKLINK_PAGE))
+        .await
+}
+
+// ============================================================================
+// Cluster rules
+// ============================================================================
+
+/// Run the cluster rules, appending every violation to `errors` in a fixed
+/// order. Each rule keys off the subjects this commit's `candidates` touch and
+/// reads the committed ∪ pending fact set from the precomputed neighbourhood
+/// (`event_facts` / `image_facts`), so the rules are pure lookups — the gather
+/// phase already did every drain.
+fn run_cluster_rules<S>(
+    candidates: &[StoredFactOf<S>],
+    event_facts: &HashMap<S::EventId, Vec<StoredFactOf<S>>>,
+    image_facts: &HashMap<S::ImageId, Vec<StoredFactOf<S>>>,
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) where
+    S: FactStore,
+{
+    rule_demolition_location::<S>(candidates, errors);
+    rule_event_kind::<S>(candidates, event_facts, errors);
+    rule_name_window::<S>(candidates, errors);
+    rule_observation_depiction::<S>(candidates, image_facts, errors);
+    rule_composite_self_parent::<S>(candidates, errors);
+    rule_composite_multiple_parents::<S>(candidates, image_facts, errors);
+    rule_composite_chain::<S>(candidates, image_facts, errors);
+    rule_image_role_coherence::<S>(candidates, image_facts, errors);
+}
+
+/// A `Demolition` bookend may not carry a location — demolition location is
+/// derived from the entity's last known location.
+fn rule_demolition_location<S: FactStore>(
+    candidates: &[StoredFactOf<S>],
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) {
+    let mut offending: BTreeSet<S::EntityId> = BTreeSet::new();
+    for fact in candidates {
+        if let StoredFact::Factual(StoredFactualFact {
+            assertion:
+                FactualAssertion::Demolition {
+                    fact: bookend::Fact::Location { entity, .. },
+                },
+            ..
+        }) = fact
+        {
+            offending.insert(entity.clone());
+        }
+    }
+    for entity in offending {
+        errors.push(SubmitError::DemolitionLocation { entity });
+    }
+}
+
+/// Every lifetime event's facts must agree on a kind. For each event the commit
+/// touches, narrow the candidate kinds by each attached fact's compatibility set
+/// (in-commit ∪ pre-commit); an empty narrowing is a conflict.
+fn rule_event_kind<S>(
+    candidates: &[StoredFactOf<S>],
+    event_facts: &HashMap<S::EventId, Vec<StoredFactOf<S>>>,
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) where
+    S: FactStore,
+{
+    let mut events: BTreeSet<S::EventId> = BTreeSet::new();
+    for fact in candidates {
+        if let StoredFact::Factual(StoredFactualFact {
+            assertion: FactualAssertion::Event { fact: ef },
+            ..
+        }) = fact
+            && let Some(e) = event_attaches_to(ef)
+        {
+            events.insert(e.clone());
+        }
+    }
+    for e in events {
+        let gathered = event_facts.get(&e).map(Vec::as_slice).unwrap_or(&[]);
+        let mut narrowed = LifetimeEventKind::all();
+        for g in gathered {
+            if let StoredFact::Factual(StoredFactualFact {
+                assertion: FactualAssertion::Event { fact: ef },
+                ..
+            }) = g
+                && event_attaches_to(ef) == Some(&e)
+                && let Some(compat) = kind_compat(ef)
+            {
+                narrowed = narrowed.intersection(&compat).copied().collect();
+            }
+        }
+        if narrowed.is_empty() {
+            errors.push(SubmitError::EventKindConflict { event: e });
+        }
+    }
+}
+
+/// A name's validity window may not close before it opens. With both bounds
+/// present, the earliest possible `valid_from` must not exceed the latest
+/// possible `valid_to`. Equal is accepted; an open bound can't prove inversion.
+fn rule_name_window<S: FactStore>(
+    candidates: &[StoredFactOf<S>],
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) {
+    let mut offending: BTreeSet<S::EntityId> = BTreeSet::new();
+    for fact in candidates {
+        if let StoredFact::Factual(StoredFactualFact {
+            assertion:
+                FactualAssertion::Attribute {
+                    fact:
+                        attribute::Fact::Name {
+                            entity,
+                            valid_from: Some(vf),
+                            valid_to: Some(vt),
+                            ..
+                        },
+                },
+            ..
+        }) = fact
+            && let (Some(from_start), Some(to_end)) = (vf.earliest(), vt.latest())
+            && from_start > to_end
+        {
+            offending.insert(entity.clone());
+        }
+    }
+    for entity in offending {
+        errors.push(SubmitError::NameWindowInverted { entity });
+    }
+}
+
+/// Every entity an image-observation names must have a depiction (`InPicture` /
+/// `OnMap`) tying it to the observed image, in-commit ∪ pre-commit. Only
+/// `ImageObservation`-cited observations gate; the other warrant flavors carry no
+/// observed image. Pushes dedup by `(entity, image)`.
+fn rule_observation_depiction<S>(
+    candidates: &[StoredFactOf<S>],
+    image_facts: &HashMap<S::ImageId, Vec<StoredFactOf<S>>>,
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) where
+    S: FactStore,
+{
+    let mut offending: BTreeSet<(S::EntityId, S::ImageId)> = BTreeSet::new();
+    for fact in candidates {
+        let StoredFact::Judgment(StoredJudgmentFact {
+            assertion: JudgmentAssertion::Observation { fact: obs },
+            source: JudgmentSource::ImageObservation { image, .. },
+        }) = fact
+        else {
+            continue;
+        };
+        let mut entities: BTreeSet<S::EntityId> = BTreeSet::new();
+        obs.for_each_id(&mut |e: &S::EntityId| {
+            entities.insert(e.clone());
+        });
+        let gathered = image_facts.get(image).map(Vec::as_slice).unwrap_or(&[]);
+        for entity in entities {
+            if !gathered
+                .iter()
+                .any(|g| depicts_entity_on_image(g, &entity, image))
+            {
+                offending.insert((entity, image.clone()));
+            }
+        }
+    }
+    for (entity, image) in offending {
+        errors.push(SubmitError::ObservationWithoutDepiction { entity, image });
+    }
+}
+
+/// Whether a stored fact is a depiction (`InPicture` / `OnMap`) placing
+/// `entity` on `image`.
+fn depicts_entity_on_image<EntId, EvtId, ImgId>(
+    fact: &StoredFact<EntId, EvtId, ImgId>,
+    entity: &EntId,
+    image: &ImgId,
+) -> bool
+where
+    EntId: Ord,
+    EvtId: Ord,
+    ImgId: Ord,
+{
+    if let StoredFact::Judgment(StoredJudgmentFact {
+        assertion: JudgmentAssertion::Depiction { fact: df },
+        ..
+    }) = fact
+    {
+        match df {
+            depiction::Fact::InPicture {
+                entity: e,
+                image: i,
+                ..
+            }
+            | depiction::Fact::OnMap {
+                entity: e,
+                image: i,
+                ..
+            } => e == entity && i == image,
+        }
+    } else {
+        false
+    }
+}
+
+/// A subimage may not be its own parent.
+fn rule_composite_self_parent<S: FactStore>(
+    candidates: &[StoredFactOf<S>],
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) {
+    let mut offending: BTreeSet<S::ImageId> = BTreeSet::new();
+    for fact in candidates {
+        if let StoredFact::Judgment(StoredJudgmentFact {
+            assertion:
+                JudgmentAssertion::Composite {
+                    fact:
+                        composites::Fact::IsSubimageOf {
+                            subimage, parent, ..
+                        },
+                },
+            ..
+        }) = fact
+            && subimage == parent
+        {
+            offending.insert(subimage.clone());
+        }
+    }
+    for image in offending {
+        errors.push(SubmitError::CompositeSelfParent { image });
+    }
+}
+
+/// A subimage has at most one parent. Two `IsSubimageOf` facts naming the same
+/// subimage under different parents (in-commit ∪ pre-commit) conflict.
+fn rule_composite_multiple_parents<S>(
+    candidates: &[StoredFactOf<S>],
+    image_facts: &HashMap<S::ImageId, Vec<StoredFactOf<S>>>,
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) where
+    S: FactStore,
+{
+    let mut subimages: BTreeSet<S::ImageId> = BTreeSet::new();
+    for fact in candidates {
+        if let StoredFact::Judgment(StoredJudgmentFact {
+            assertion:
+                JudgmentAssertion::Composite {
+                    fact: composites::Fact::IsSubimageOf { subimage, .. },
+                },
+            ..
+        }) = fact
+        {
+            subimages.insert(subimage.clone());
+        }
+    }
+    for s in subimages {
+        let gathered = image_facts.get(&s).map(Vec::as_slice).unwrap_or(&[]);
+        // A self-loop edge `{s, s}` isn't a genuine parent — the self-parent
+        // check owns it — so `subimage_edge` filters it out before the count.
+        let parents: BTreeSet<&S::ImageId> = gathered
+            .iter()
+            .filter_map(subimage_edge)
+            .filter(|(subimage, _)| *subimage == &s)
+            .map(|(_, parent)| parent)
+            .collect();
+        if parents.len() > 1 {
+            errors.push(SubmitError::CompositeMultipleParents { subimage: s });
+        }
+    }
+}
+
+/// Composites are one layer deep. An in-commit `IsSubimageOf{s, p}` is a chain if
+/// `s` is itself some image's parent, or `p` is itself some image's subimage
+/// (in-commit ∪ pre-commit). Self-loop facts (`subimage == parent`) aren't chain
+/// evidence — the self-parent check owns them — so they are skipped as triggers
+/// and filtered from the gathered edges. Pushes dedup by image id.
+fn rule_composite_chain<S>(
+    candidates: &[StoredFactOf<S>],
+    image_facts: &HashMap<S::ImageId, Vec<StoredFactOf<S>>>,
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) where
+    S: FactStore,
+{
+    let mut offending: BTreeSet<S::ImageId> = BTreeSet::new();
+    for fact in candidates {
+        let StoredFact::Judgment(StoredJudgmentFact {
+            assertion:
+                JudgmentAssertion::Composite {
+                    fact:
+                        composites::Fact::IsSubimageOf {
+                            subimage: s,
+                            parent: p,
+                            ..
+                        },
+                },
+            ..
+        }) = fact
+        else {
+            continue;
+        };
+        if s == p {
+            continue;
+        }
+        let about_s = image_facts.get(s).map(Vec::as_slice).unwrap_or(&[]);
+        if about_s
+            .iter()
+            .filter_map(subimage_edge)
+            .any(|(_, parent)| parent == s)
+        {
+            offending.insert(s.clone());
+        }
+        let about_p = image_facts.get(p).map(Vec::as_slice).unwrap_or(&[]);
+        if about_p
+            .iter()
+            .filter_map(subimage_edge)
+            .any(|(subimage, _)| subimage == p)
+        {
+            offending.insert(p.clone());
+        }
+    }
+    for image in offending {
+        errors.push(SubmitError::CompositeChain { image });
+    }
+}
+
+/// The `(subimage, parent)` edge of an `IsSubimageOf` fact, or `None` when the
+/// fact isn't one or is a self-loop. Self-loops carry no genuine parent/child
+/// layering, so they don't count as chain evidence.
+fn subimage_edge<EntId, EvtId, ImgId>(
+    fact: &StoredFact<EntId, EvtId, ImgId>,
+) -> Option<(&ImgId, &ImgId)>
+where
+    EntId: Ord,
+    EvtId: Ord,
+    ImgId: Ord,
+{
+    if let StoredFact::Judgment(StoredJudgmentFact {
+        assertion:
+            JudgmentAssertion::Composite {
+                fact:
+                    composites::Fact::IsSubimageOf {
+                        subimage, parent, ..
+                    },
+            },
+        ..
+    }) = fact
+        && subimage != parent
+    {
+        Some((subimage, parent))
+    } else {
+        None
+    }
+}
+
+/// An image's role must stay coherent: a fact presupposing a role (a capture
+/// attribute or in-picture depiction implies picture; on-map implies map) must
+/// not contradict an explicit `IsPicture` / `IsMap` claim on the same image. Two
+/// opposing claims aren't rejected here — that disagreement is real-world
+/// uncertainty for projection to resolve, not a malformed bundle.
+fn rule_image_role_coherence<S>(
+    candidates: &[StoredFactOf<S>],
+    image_facts: &HashMap<S::ImageId, Vec<StoredFactOf<S>>>,
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) where
+    S: FactStore,
+{
+    let mut offending: BTreeSet<(S::ImageId, ImageRole)> = BTreeSet::new();
+    for fact in candidates {
+        let Some((used, image)) = presupposed_role(fact) else {
+            continue;
+        };
+        let gathered = image_facts.get(image).map(Vec::as_slice).unwrap_or(&[]);
+        if gathered
+            .iter()
+            .filter_map(claimed_role)
+            .any(|claimed| claimed != used)
+        {
+            offending.insert((image.clone(), used));
+        }
+    }
+    for (image, used_as) in offending {
+        let claimed = match used_as {
+            ImageRole::Picture => ImageRole::Map,
+            ImageRole::Map => ImageRole::Picture,
+        };
+        errors.push(SubmitError::ImageRoleConflict {
+            image,
+            used_as,
+            claimed,
+        });
+    }
+}
+
+/// The [`ImageRole`] a fact explicitly claims: `IsPicture` → `Picture`,
+/// `IsMap` → `Map`. Other facts make no role claim. The picture / map cluster
+/// matches are exhaustive so a new role-claim variant forces a decision here;
+/// the gather scopes facts to one image, so the claimed image isn't returned.
+fn claimed_role<EntId, EvtId, ImgId>(fact: &StoredFact<EntId, EvtId, ImgId>) -> Option<ImageRole>
+where
+    EntId: Ord,
+    EvtId: Ord,
+    ImgId: Ord,
+{
+    match fact {
+        StoredFact::Factual(StoredFactualFact {
+            assertion: FactualAssertion::Picture { fact: pf },
+            ..
+        }) => match pf {
+            picture::Fact::IsPicture { .. } => Some(ImageRole::Picture),
+            picture::Fact::CapturedDate { .. } | picture::Fact::CapturedLocation { .. } => None,
+        },
+        StoredFact::Factual(StoredFactualFact {
+            assertion: FactualAssertion::Map { fact: mf },
+            ..
+        }) => match mf {
+            map::Fact::IsMap { .. } => Some(ImageRole::Map),
+        },
+        _ => None,
+    }
+}
+
+/// The [`ImageRole`] a fact presupposes for an image, paired with that image: a
+/// picture-capture attribute or in-picture depiction presupposes a picture; an
+/// on-map depiction presupposes a map. Role claims (`IsPicture` / `IsMap`)
+/// presuppose nothing — they *are* the claim. Other facts presuppose no role.
+fn presupposed_role<EntId, EvtId, ImgId>(
+    fact: &StoredFact<EntId, EvtId, ImgId>,
+) -> Option<(ImageRole, &ImgId)>
+where
+    EntId: Ord,
+    EvtId: Ord,
+    ImgId: Ord,
+{
+    match fact {
+        StoredFact::Factual(StoredFactualFact {
+            assertion: FactualAssertion::Picture { fact: pf },
+            ..
+        }) => match pf {
+            picture::Fact::CapturedDate { image, .. }
+            | picture::Fact::CapturedLocation { image, .. } => Some((ImageRole::Picture, image)),
+            picture::Fact::IsPicture { .. } => None,
+        },
+        StoredFact::Judgment(StoredJudgmentFact {
+            assertion: JudgmentAssertion::Depiction { fact: df },
+            ..
+        }) => match df {
+            depiction::Fact::InPicture { image, .. } => Some((ImageRole::Picture, image)),
+            depiction::Fact::OnMap { image, .. } => Some((ImageRole::Map, image)),
+        },
+        _ => None,
+    }
+}
+
+/// The lifetime-event id a non-`Gap` event fact attaches to. `Gap` attaches to
+/// no event (it references events as endpoints), so it yields `None`.
+fn event_attaches_to<EntId, EvtId>(fact: &event::Fact<EntId, EvtId>) -> Option<&EvtId>
+where
+    EntId: Ord,
+    EvtId: Ord,
+{
+    match fact {
+        event::Fact::DurationalDate { event, .. }
+        | event::Fact::PointDate { event, .. }
+        | event::Fact::MovedToLocation { event, .. }
+        | event::Fact::DamageCause { event, .. }
+        | event::Fact::MoveMethod { event, .. }
+        | event::Fact::UsageChange { event, .. }
+        | event::Fact::Designation { event, .. }
+        | event::Fact::Description { event, .. } => Some(event),
+        event::Fact::Gap { .. } => None,
+    }
+}
+
+/// The lifetime-event kinds an event fact is compatible with. `None` for `Gap`,
+/// which constrains no event's kind. The match is exhaustive so a new event
+/// variant forces a categorisation here.
+fn kind_compat<EntId, EvtId>(
+    fact: &event::Fact<EntId, EvtId>,
+) -> Option<BTreeSet<LifetimeEventKind>>
+where
+    EntId: Ord,
+    EvtId: Ord,
+{
+    Some(match fact {
+        event::Fact::DamageCause { .. } => std::iter::once(LifetimeEventKind::Damaged).collect(),
+        event::Fact::MoveMethod { .. } | event::Fact::MovedToLocation { .. } => {
+            std::iter::once(LifetimeEventKind::Moved).collect()
+        }
+        event::Fact::UsageChange { .. } => {
+            std::iter::once(LifetimeEventKind::UsageChanged).collect()
+        }
+        event::Fact::Designation { .. } => std::iter::once(LifetimeEventKind::Designated).collect(),
+        event::Fact::DurationalDate { .. } => LifetimeEventKind::durational_kinds(),
+        event::Fact::PointDate { .. } => LifetimeEventKind::point_kinds(),
+        event::Fact::Description { .. } => LifetimeEventKind::all(),
+        event::Fact::Gap { .. } => return None,
+    })
 }

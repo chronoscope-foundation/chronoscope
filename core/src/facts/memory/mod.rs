@@ -12,9 +12,8 @@
 //!   view's snapshot, resolved by scanning the fact bag.
 //! - `next_fact_id` / `no_later_than` / `now` clock surface.
 //! - The per-subject view methods (`walk_*`, `*_representative`, `*_class`,
-//!   `*_subgraph`) return valid stubs — an empty page, the subject as its own
-//!   representative, a singleton class, a single-node subgraph — pending the
-//!   index machinery.
+//!   `*_subgraph`) are stubs: a subject is its own representative, its class a
+//!   singleton, its subgraph a single node, the walks an empty page.
 //!
 //! ## Concrete id types
 //!
@@ -57,15 +56,18 @@ use serde::{Deserialize, Serialize};
 use crate::facts::assertions::MetaAssertion;
 use crate::facts::ids::{CommitId, FactId};
 use crate::facts::schema::{
-    EdgeSubgraph, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
+    EdgeSubgraph, EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem,
 };
 use crate::facts::store::{
-    EntityView, EventView, FactStore, FactView, ImageView, StoredFactOf, SubmitCommitError,
+    EntityView, EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf,
+    SubmitCommitError,
 };
-use crate::facts::submit::pipeline::{self, MatchOutcome, substitute_facts, validate_submit};
+use crate::facts::submit::pipeline::{
+    self, MatchOutcome, substitute_facts_accumulating, validate_submit,
+};
 use crate::facts::submit::{
     Commit, Decl, EntityIdx, EventIdx, FactLookup, ImageIdx, Resolution, ResolutionOrigin,
-    StoredCommit, StoredFact, SubjectKind, SubmitError, SubmitFact, SubmitResult,
+    StoredCommit, StoredFact, SubjectKind, SubmitError, SubmitResult,
 };
 use crate::nonempty::NonEmptyVec;
 
@@ -165,6 +167,15 @@ struct Inner {
     /// meta-facts retracting it. Grown as facts land in [`apply_pending`], so a
     /// read consults it without rebuilding; resolution filters by snapshot.
     retractors: HashMap<FactId, Vec<FactId>>,
+    /// Backlink indexes: each subject id → the ids of facts mentioning it.
+    /// Grown alongside [`Self::retractors`] in [`apply_pending`]. The value is a
+    /// [`BTreeSet`] so the ids stay sorted and deduped, and a paginated read
+    /// seeks to its cursor with `range(cursor..)` instead of skipping the
+    /// prefix. (The retractor index keeps a `Vec` — it is fully iterated with no
+    /// cursor seek, so a sorted set buys it nothing.)
+    entity_backlinks: HashMap<MemoryEntityId, BTreeSet<FactId>>,
+    event_backlinks: HashMap<MemoryEventId, BTreeSet<FactId>>,
+    image_backlinks: HashMap<MemoryImageId, BTreeSet<FactId>>,
     /// Content-addressed dedup cache: the `SubmitResult` from the first
     /// successful submit of a `CommitId`. A re-submit returns this with
     /// `previously_committed: true` and does no mints or inserts.
@@ -242,8 +253,35 @@ struct ReadCore<'a> {
     /// [`Inner::retractors`]), borrowed for the lookup; resolution filters its
     /// entries by snapshot.
     retractors: &'a HashMap<FactId, Vec<FactId>>,
+    /// In-flight reverse-retraction edges from a commit still being validated
+    /// (see [`UnionSource::pending_retractors`]); `None` for a committed-only
+    /// source. [`Self::retracted_by`] unions these with [`Self::retractors`] so
+    /// a same-commit retraction of a pre-commit fact is visible to the reads
+    /// the cluster rules drive.
+    pending_retractors: Option<&'a HashMap<FactId, Vec<FactId>>>,
+    /// Backlink indexes over committed facts (see [`Inner::entity_backlinks`]),
+    /// borrowed for the paginated `all_facts_about_*` reads.
+    entity_backlinks: &'a HashMap<MemoryEntityId, BTreeSet<FactId>>,
+    event_backlinks: &'a HashMap<MemoryEventId, BTreeSet<FactId>>,
+    image_backlinks: &'a HashMap<MemoryImageId, BTreeSet<FactId>>,
+    /// In-flight backlink edges from a commit still being validated (see
+    /// [`UnionSource`]'s `pending_*_backlinks`); `None` for a committed-only
+    /// source. [`Self::facts_about`] chains the pending range onto the committed
+    /// one so `all_facts_about_*` returns committed ∪ pending.
+    pending_entity_backlinks: Option<&'a HashMap<MemoryEntityId, BTreeSet<FactId>>>,
+    pending_event_backlinks: Option<&'a HashMap<MemoryEventId, BTreeSet<FactId>>>,
+    pending_image_backlinks: Option<&'a HashMap<MemoryImageId, BTreeSet<FactId>>>,
     /// Exclusive upper bound: ids `>= snapshot` read as [`FactLookup::Future`].
     snapshot: FactId,
+}
+
+/// Where a [`FactId`] lands in a [`ReadCore`]'s committed/pending partition,
+/// before any snapshot filtering: an index into `committed`, an offset into
+/// `pending`, or past both halves.
+enum Partition {
+    Committed(usize),
+    Pending(usize),
+    Beyond,
 }
 
 impl<'a> ReadCore<'a> {
@@ -261,22 +299,42 @@ impl<'a> ReadCore<'a> {
         if fact_id.get() >= self.snapshot.get() {
             return FactLookup::Future;
         }
-        let committed_len = self.committed.len() as u64;
-        if fact_id.get() < committed_len {
-            let Ok(idx) = usize::try_from(fact_id.get()) else {
-                return FactLookup::Unknown;
-            };
-            return match self.committed.get(idx) {
-                Some(fact) => self.resolve_active_or_retracted(fact_id, fact),
-                None => FactLookup::Unknown,
-            };
-        }
-        let Ok(offset) = usize::try_from(fact_id.get() - committed_len) else {
-            return FactLookup::Unknown;
-        };
-        match self.pending.get(offset) {
+        match self.fact_slot(fact_id) {
             Some(fact) => self.resolve_active_or_retracted(fact_id, fact),
             None => FactLookup::Unknown,
+        }
+    }
+
+    /// Which half of the committed/pending partition `id` lands in, ignoring the
+    /// snapshot. The committed half is `0..committed.len()`; the pending half the
+    /// `pending.len()` slots above it; anything higher — or an id too large for
+    /// `usize` — is [`Partition::Beyond`]. [`Self::fact_slot`] and
+    /// [`Self::placement_at`] share this one boundary computation.
+    fn locate(&self, id: FactId) -> Partition {
+        let committed_len = self.committed.len() as u64;
+        if id.get() < committed_len {
+            match usize::try_from(id.get()) {
+                Ok(i) => Partition::Committed(i),
+                Err(_) => Partition::Beyond,
+            }
+        } else {
+            match usize::try_from(id.get() - committed_len) {
+                Ok(off) if off < self.pending.len() => Partition::Pending(off),
+                _ => Partition::Beyond,
+            }
+        }
+    }
+
+    /// The stored fact at `fact_id`, reading the committed half below
+    /// `committed.len()` and the pending half above it; `None` for an id past
+    /// both halves or one that doesn't fit a `usize`. The slot resolver behind
+    /// [`Self::fact_at`] and [`Self::facts_about`], with no snapshot filtering —
+    /// callers gate on the snapshot first.
+    fn fact_slot(&self, fact_id: FactId) -> Option<&MemStoredFact> {
+        match self.locate(fact_id) {
+            Partition::Committed(i) => self.committed.get(i),
+            Partition::Pending(off) => self.pending.get(off),
+            Partition::Beyond => None,
         }
     }
 
@@ -300,10 +358,9 @@ impl<'a> ReadCore<'a> {
     /// lowest of its retractors that is visible at this snapshot and not itself
     /// effectively retracted.
     fn retracted_by(&self, fact_id: FactId) -> Option<FactId> {
-        // No retractor edge → active; the common path allocates nothing.
-        if !self.retractors.contains_key(&fact_id) {
-            return None;
-        }
+        // No retractor edge in either source → active. The `?` returns None now,
+        // before the walk below allocates its frontier and subgraph.
+        self.retractor_ids(fact_id).next()?;
         // Collect the facts reachable upward from `fact_id` through visible
         // retractor edges. Edges climb in id, so the frontier drains and a
         // shared retractor is collected once.
@@ -313,30 +370,37 @@ impl<'a> ReadCore<'a> {
             if !subgraph.insert(id) {
                 continue;
             }
-            if let Some(retractor_ids) = self.retractors.get(&id) {
-                frontier.extend(
-                    retractor_ids
-                        .iter()
-                        .copied()
-                        .filter(|candidate| candidate.get() < self.snapshot.get()),
-                );
-            }
+            frontier.extend(
+                self.retractor_ids(id)
+                    .filter(|candidate| candidate.get() < self.snapshot.get()),
+            );
         }
         // Resolve the subgraph high-to-low: each retractor resolves before the
         // fact it retracts.
         let mut retracted: HashMap<FactId, Option<FactId>> = HashMap::new();
         for &id in subgraph.iter().rev() {
-            let by = self.retractors.get(&id).and_then(|candidate_ids| {
-                candidate_ids
-                    .iter()
-                    .copied()
-                    .filter(|candidate| candidate.get() < self.snapshot.get())
-                    .filter(|candidate| retracted.get(candidate).copied().flatten().is_none())
-                    .min()
-            });
+            let by = self
+                .retractor_ids(id)
+                .filter(|candidate| candidate.get() < self.snapshot.get())
+                .filter(|candidate| retracted.get(candidate).copied().flatten().is_none())
+                .min();
             retracted.insert(id, by);
         }
         retracted.get(&fact_id).copied().flatten()
+    }
+
+    /// Every fact id retracting `id`, unioning the committed index with the
+    /// in-flight pending overlay. A fact can be retracted by a pre-commit
+    /// meta-fact (committed) and an in-commit one (pending) at once, so both
+    /// sources are walked.
+    fn retractor_ids(&self, id: FactId) -> impl Iterator<Item = FactId> + '_ {
+        let committed = self.retractors.get(&id).into_iter().flatten();
+        let pending = self
+            .pending_retractors
+            .and_then(|m| m.get(&id))
+            .into_iter()
+            .flatten();
+        committed.chain(pending).copied()
     }
 
     /// Whether `id` names a committed commit; see [`Self::committed_commits`].
@@ -344,6 +408,88 @@ impl<'a> ReadCore<'a> {
     /// doesn't erase the commit), so it reports as existing.
     fn commit_known_at(&self, id: &CommitId) -> bool {
         self.committed_commits.contains_key(id)
+    }
+
+    /// Where `id` sits relative to the snapshot: at-or-past the snapshot is
+    /// [`FactPlacement::Absent`], a pending provisional id is
+    /// [`FactPlacement::InFlight`], a committed id is
+    /// [`FactPlacement::Committed`], and an id past both halves is
+    /// [`FactPlacement::Absent`]. `InFlight` is bounded by the real
+    /// `pending.len()`, so a committed-only source (empty `pending`) reports
+    /// only `Committed` / `Absent`.
+    fn placement_at(&self, id: FactId) -> FactPlacement {
+        if id.get() >= self.snapshot.get() {
+            FactPlacement::Absent
+        } else {
+            match self.locate(id) {
+                Partition::Committed(_) => FactPlacement::Committed,
+                Partition::Pending(_) => FactPlacement::InFlight,
+                Partition::Beyond => FactPlacement::Absent,
+            }
+        }
+    }
+
+    /// A page of the facts mentioning `subject`, active and below the snapshot,
+    /// starting at the pagination `cursor`. The one paginator behind every
+    /// `all_facts_about_*` read — pass the matching committed and pending
+    /// `*_backlinks` maps and subject id.
+    ///
+    /// The subject is its own `representative` — backlinks are literal, not
+    /// scoped to an equivalence class. Both backlink sets are
+    /// sorted, and committed fids (`0..committed.len()`) sit wholly below pending
+    /// provisional fids (`committed.len()..`), so chaining the committed range
+    /// onto the pending range walks one ascending stream. `range(cursor..)` on
+    /// each seeks past already-paged facts and the snapshot bound breaks the scan
+    /// as soon as it is crossed. A committed-only source passes `None` for the
+    /// pending map, degrading to a committed-only walk.
+    ///
+    /// `next_cursor` is `Some(fid)` at the id where the scan stopped while more
+    /// eligible ids remain — whether the page filled or the snapshot bound was
+    /// hit mid-range — and `None` once the backlink range is exhausted. A
+    /// retracted fact is skipped without consuming a slot, so a page can come
+    /// back short or empty yet still carry a resume cursor.
+    fn facts_about<S>(
+        &self,
+        backlinks: &HashMap<S, BTreeSet<FactId>>,
+        pending_backlinks: Option<&HashMap<S, BTreeSet<FactId>>>,
+        subject: &S,
+        cursor: FactId,
+        limit: std::num::NonZeroUsize,
+    ) -> FactPage<MemStoredFact, S>
+    where
+        S: Copy + Ord + std::hash::Hash,
+    {
+        let committed = backlinks
+            .get(subject)
+            .into_iter()
+            .flat_map(|ids| ids.range(cursor..));
+        let pending = pending_backlinks
+            .and_then(|m| m.get(subject))
+            .into_iter()
+            .flat_map(|ids| ids.range(cursor..));
+        let mut items = Vec::new();
+        let mut next_cursor = None;
+        for &fid in committed.chain(pending) {
+            if fid.get() >= self.snapshot.get() {
+                break;
+            }
+            if items.len() == limit.get() {
+                next_cursor = Some(fid);
+                break;
+            }
+            if self.retracted_by(fid).is_some() {
+                continue;
+            }
+            let Some(fact) = self.fact_slot(fid) else {
+                continue;
+            };
+            items.push(PageItem {
+                fact_id: fid,
+                fact: fact.clone(),
+                representative: *subject,
+            });
+        }
+        FactPage { items, next_cursor }
     }
 }
 
@@ -388,6 +534,13 @@ impl CoreSource for MemorySource<'_> {
             pending: &[],
             committed_commits: &inner.commits,
             retractors: &inner.retractors,
+            pending_retractors: None,
+            entity_backlinks: &inner.entity_backlinks,
+            event_backlinks: &inner.event_backlinks,
+            image_backlinks: &inner.image_backlinks,
+            pending_entity_backlinks: None,
+            pending_event_backlinks: None,
+            pending_image_backlinks: None,
             snapshot: self.snapshot,
         })
     }
@@ -400,34 +553,54 @@ impl CoreSource for MemorySource<'_> {
 // UnionSource — in-flight accumulator that unions committed + pending state
 // ============================================================================
 
-/// Owned mutation payload accumulated during a `submit_commit` call: the
-/// in-flight facts plus the mint-advanced next-id counters.
+/// The complete delta a `submit_commit` call adds: the in-flight facts, the
+/// mint-advanced next-id counters, and the backlink / reverse-retraction edges
+/// those facts contribute. The provisional fact ids the edges reference equal
+/// the durable ids [`apply_pending`] will assign, so the same structure serves
+/// the in-flight reads during validation and the durable splice at apply.
 ///
 /// Held in a [`UnionSource`] while the commit is prepared, yielded by
-/// [`UnionSource::into_pending`], drained into `Inner` via [`apply_pending`].
-/// Carrying the counters alongside the facts means a validator failure drops
-/// the [`Pending`] without touching `Inner` — counter rollback is implicit in
-/// not applying it.
+/// [`UnionSource::into_pending`], spliced into `Inner` via [`apply_pending`].
+/// Carrying the counters and edges alongside the facts means a validator
+/// failure drops the [`Pending`] without touching `Inner` — rollback is
+/// implicit in not applying it.
 struct Pending {
     facts: Vec<MemStoredFact>,
     next_entity_id: u64,
     next_event_id: u64,
     next_image_id: u64,
+    /// Backlink edges this commit's facts contribute, keyed by subject id. Each
+    /// fact's provisional fid lands at `committed.len() + pending.len()`, above
+    /// every committed fid and below the snapshot, so the paginated scan and
+    /// snapshot filter accept it during validation; [`apply_pending`] merges
+    /// these into the durable indexes unchanged.
+    entity_backlinks: HashMap<MemoryEntityId, BTreeSet<FactId>>,
+    event_backlinks: HashMap<MemoryEventId, BTreeSet<FactId>>,
+    image_backlinks: HashMap<MemoryImageId, BTreeSet<FactId>>,
+    /// Reverse-retraction edges this commit's pending meta-facts contribute,
+    /// keyed by retracted fact id. A read unions this with the committed
+    /// [`Inner::retractors`], so a commit that retracts a pre-commit fact and
+    /// then adds facts depending on its absence validates against the
+    /// post-retraction state. Provisional retractor ids climb above every
+    /// pre-commit target and below the snapshot, so the high-to-low retraction
+    /// walk and snapshot filter accept them.
+    retractors: HashMap<FactId, Vec<FactId>>,
 }
 
 /// Source that unions committed `Inner` storage with the in-flight
-/// [`Pending`] payload of a `submit_commit` call. The single read surface
+/// [`Pending`] delta of a `submit_commit` call. The single read surface
 /// across the match → mint → validate → insert sequence.
 ///
 /// Borrowed via [`UnionSource::from_inner`] while the inner mutex is held.
-/// Reads see committed facts plus any pushed onto `pending.facts`; mints and
-/// pushes accumulate in the owned `pending`, leaving `Inner` untouched.
-/// [`UnionSource::into_pending`] yields that payload at the end, and the caller
-/// drains it into `Inner` via [`apply_pending`].
+/// Reads see committed facts plus any pushed onto `pending.facts`, and the
+/// committed indexes unioned with `pending`'s edge maps; mints and pushes
+/// accumulate in the owned `pending`, leaving `Inner` untouched.
+/// [`UnionSource::into_pending`] yields that delta at the end, and the caller
+/// splices it into `Inner` via [`apply_pending`].
 ///
-/// The in-flight facts and the three counters live only in `pending`, so
-/// there's one owner of the mutation state. Counter rollback on validation
-/// failure is implicit: drop the source without calling `apply_pending`.
+/// The in-flight facts, counters, and edges all live in `pending`, so there's
+/// one owner of the mutation state. Rollback on validation failure is implicit:
+/// drop the source without calling `apply_pending`.
 ///
 /// `'g` is the `Inner` borrow — the held guard's deref lifetime.
 struct UnionSource<'g> {
@@ -437,7 +610,8 @@ struct UnionSource<'g> {
 
 impl<'g> UnionSource<'g> {
     /// Construct a [`UnionSource`] from the held `Inner` guard. Seeds the
-    /// pending counters from the committed ones; starts with no pending facts.
+    /// pending counters from the committed ones; starts with no pending facts
+    /// or edges.
     fn from_inner(inner: &'g Inner) -> Self {
         Self {
             committed: inner,
@@ -446,6 +620,10 @@ impl<'g> UnionSource<'g> {
                 next_entity_id: inner.next_entity_id,
                 next_event_id: inner.next_event_id,
                 next_image_id: inner.next_image_id,
+                entity_backlinks: HashMap::new(),
+                event_backlinks: HashMap::new(),
+                image_backlinks: HashMap::new(),
+                retractors: HashMap::new(),
             },
         }
     }
@@ -488,7 +666,36 @@ impl<'g> UnionSource<'g> {
     /// Stage a fact onto the pending list, fixing its position. The durable
     /// [`FactId`] is assigned later by [`apply_pending`], which appends pending
     /// facts in push order.
+    ///
+    /// Every staged fact records its provisional backlink edges into the
+    /// `pending_*_backlinks` maps, and a staged meta-fact also records its
+    /// reverse-retraction edges into [`Self::pending_retractors`], so an
+    /// in-flight fact is visible to the cluster-rule reads that follow it in the
+    /// same commit. The provisional id matches the slot `apply_pending` will
+    /// assign — the pre-push total of committed plus pending facts. A
+    /// `RetractCommit` expands over the committed commit's fact ids; an in-flight
+    /// commit isn't recorded yet, so it contributes no retractor edges (and an
+    /// in-commit fact can't be retracted in-commit — `MetaTargetInSameCommit`
+    /// forbids it).
     fn push_fact(&mut self, fact: MemStoredFact) {
+        // The staged fact takes the union snapshot — the next id to assign, which
+        // `apply_pending` then gives it.
+        let provisional_id = CoreSource::snapshot(self);
+        record_backlink_edges(
+            &fact,
+            provisional_id,
+            &mut self.pending.entity_backlinks,
+            &mut self.pending.event_backlinks,
+            &mut self.pending.image_backlinks,
+        );
+        if let StoredFact::Meta(meta) = &fact {
+            record_retractor_edges(
+                &self.committed.commits,
+                &mut self.pending.retractors,
+                &meta.assertion,
+                provisional_id,
+            );
+        }
         self.pending.facts.push(fact);
     }
 
@@ -511,6 +718,13 @@ impl CoreSource for UnionSource<'_> {
             pending: &self.pending.facts,
             committed_commits: &self.committed.commits,
             retractors: &self.committed.retractors,
+            pending_retractors: Some(&self.pending.retractors),
+            entity_backlinks: &self.committed.entity_backlinks,
+            event_backlinks: &self.committed.event_backlinks,
+            image_backlinks: &self.committed.image_backlinks,
+            pending_entity_backlinks: Some(&self.pending.entity_backlinks),
+            pending_event_backlinks: Some(&self.pending.event_backlinks),
+            pending_image_backlinks: Some(&self.pending.image_backlinks),
             snapshot: CoreSource::snapshot(self),
         })
     }
@@ -550,6 +764,10 @@ impl<Src: CoreSource + Send + Sync> FactView<MemoryFactStore> for Src {
     async fn commit_known(&self, id: &CommitId) -> Result<bool, MemoryError> {
         Ok(self.with_core(|core| core.commit_known_at(id)).await)
     }
+
+    async fn placement(&self, id: FactId) -> Result<FactPlacement, MemoryError> {
+        Ok(self.with_core(|core| core.placement_at(id)).await)
+    }
 }
 
 // ============================================================================
@@ -582,31 +800,38 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
         &'b self,
         _stream: &'b EntityStream<'b>,
         _cursor: FactId,
-        _limit: usize,
+        _limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEntityId>, MemoryError> {
         Ok(FactPage {
             items: Vec::new(),
-            truncated: false,
+            next_cursor: None,
         })
     }
 
     async fn all_facts_about_entity(
         &self,
-        _entity: &MemoryEntityId,
-        _cursor: FactId,
-        _limit: usize,
+        entity: &MemoryEntityId,
+        cursor: FactId,
+        limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEntityId>, MemoryError> {
-        Ok(FactPage {
-            items: Vec::new(),
-            truncated: false,
-        })
+        Ok(self
+            .with_core(|c| {
+                c.facts_about(
+                    c.entity_backlinks,
+                    c.pending_entity_backlinks,
+                    entity,
+                    cursor,
+                    limit,
+                )
+            })
+            .await)
     }
 
     async fn entity_topological_subgraph(
         &self,
         seed: MemoryEntityId,
         _cursor: FactId,
-        _limit: usize,
+        _limit: std::num::NonZeroUsize,
     ) -> Result<EdgeSubgraph<MemoryEntityId, StoredFactOf<MemoryFactStore>>, MemoryError> {
         Ok(EdgeSubgraph {
             subjects: vec![seed],
@@ -638,24 +863,31 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
         &'b self,
         _stream: &'b EventStream<'b>,
         _cursor: FactId,
-        _limit: usize,
+        _limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId>, MemoryError> {
         Ok(FactPage {
             items: Vec::new(),
-            truncated: false,
+            next_cursor: None,
         })
     }
 
     async fn all_facts_about_event(
         &self,
-        _event: &MemoryEventId,
-        _cursor: FactId,
-        _limit: usize,
+        event: &MemoryEventId,
+        cursor: FactId,
+        limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId>, MemoryError> {
-        Ok(FactPage {
-            items: Vec::new(),
-            truncated: false,
-        })
+        Ok(self
+            .with_core(|c| {
+                c.facts_about(
+                    c.event_backlinks,
+                    c.pending_event_backlinks,
+                    event,
+                    cursor,
+                    limit,
+                )
+            })
+            .await)
     }
 }
 
@@ -681,74 +913,129 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
         &'b self,
         _stream: &'b ImageStream<'b>,
         _cursor: FactId,
-        _limit: usize,
+        _limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryImageId>, MemoryError> {
         Ok(FactPage {
             items: Vec::new(),
-            truncated: false,
+            next_cursor: None,
         })
     }
 
     async fn all_facts_about_image(
         &self,
-        _image: &MemoryImageId,
-        _cursor: FactId,
-        _limit: usize,
+        image: &MemoryImageId,
+        cursor: FactId,
+        limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryImageId>, MemoryError> {
-        Ok(FactPage {
-            items: Vec::new(),
-            truncated: false,
-        })
+        Ok(self
+            .with_core(|c| {
+                c.facts_about(
+                    c.image_backlinks,
+                    c.pending_image_backlinks,
+                    image,
+                    cursor,
+                    limit,
+                )
+            })
+            .await)
     }
 }
 
-/// Drain a [`Pending`] payload into `Inner`, assigning each fact its durable
-/// [`FactId`]. Appends in push order (the first at the current
-/// `Inner::facts.len()`), records the parallel `fact_commits`, advances the
-/// counters, and returns the assigned ids in order. The sole assigner of fact
-/// ids; the union source's staging only fixed the order.
+/// Splice a [`Pending`] delta into `Inner`, assigning each fact its durable
+/// [`FactId`] and merging the delta's precomputed edge maps into the durable
+/// indexes.
+///
+/// Appends each fact in push order (the first at the current
+/// `Inner::facts.len()`), records the parallel `fact_commits`, and collects the
+/// assigned ids to return. The provisional ids the delta's edges reference equal
+/// these durable ids, so the backlink and reverse-retraction maps merge in
+/// wholesale — `push_fact` already built them at push, sparing a per-fact
+/// rebuild here. The sole assigner of fact ids; the union source's staging only
+/// fixed the order.
 fn apply_pending(inner: &mut Inner, pending: Pending, commit_id: CommitId) -> Vec<FactId> {
     let mut assigned = Vec::with_capacity(pending.facts.len());
     for fact in pending.facts {
-        let id = FactId::new(inner.facts.len() as u64);
-        if let StoredFact::Meta(meta) = &fact {
-            record_retractors(inner, &meta.assertion, id);
-        }
+        let id = inner.next_fact_id();
         inner.facts.push(fact);
         inner.fact_commits.push(commit_id.clone());
         assigned.push(id);
     }
+    merge_index(&mut inner.entity_backlinks, pending.entity_backlinks);
+    merge_index(&mut inner.event_backlinks, pending.event_backlinks);
+    merge_index(&mut inner.image_backlinks, pending.image_backlinks);
+    merge_index(&mut inner.retractors, pending.retractors);
     inner.next_entity_id = pending.next_entity_id;
     inner.next_event_id = pending.next_event_id;
     inner.next_image_id = pending.next_image_id;
     assigned
 }
 
-/// Record the reverse-retraction edges a meta-fact at `retractor_id`
-/// contributes to [`Inner::retractors`]: a fact target maps to `retractor_id`;
-/// a commit target expands across the committed commit's fact ids. Called as
-/// each meta-fact lands, so reads consult the index without rebuilding it.
-fn record_retractors(inner: &mut Inner, assertion: &MetaAssertion, retractor_id: FactId) {
+/// Add a delta's per-subject id lists into a durable index, extending each
+/// subject's existing entry with the incoming ids.
+fn merge_index<K, C, V>(dst: &mut HashMap<K, C>, src: HashMap<K, C>)
+where
+    K: Eq + std::hash::Hash,
+    C: Default + Extend<V> + IntoIterator<Item = V>,
+{
+    for (subject, ids) in src {
+        dst.entry(subject).or_default().extend(ids);
+    }
+}
+
+/// The edge-recording logic shared by the committed index and the in-flight
+/// pending overlay — both reached through [`UnionSource::push_fact`]. A
+/// fact-target assertion maps its target to `retractor_id`; a commit-target
+/// expands over the named commit's fact ids read from `commits`. A
+/// `RetractCommit` against a commit absent from `commits` records nothing —
+/// in-flight commit metadata doesn't exist until apply, mirroring the
+/// committed-only existence check.
+fn record_retractor_edges(
+    commits: &HashMap<CommitId, StoredCommit>,
+    retractors: &mut HashMap<FactId, Vec<FactId>>,
+    assertion: &MetaAssertion,
+    retractor_id: FactId,
+) {
     match assertion {
         MetaAssertion::RetractFact { target, .. } | MetaAssertion::SupersedeFact { target, .. } => {
-            inner
-                .retractors
-                .entry(*target)
-                .or_default()
-                .push(retractor_id);
+            retractors.entry(*target).or_default().push(retractor_id);
         }
         MetaAssertion::RetractCommit { target, .. } => {
-            if let Some(commit) = inner.commits.get(target) {
+            if let Some(commit) = commits.get(target) {
                 for retracted in &commit.fact_ids {
-                    inner
-                        .retractors
-                        .entry(*retracted)
-                        .or_default()
-                        .push(retractor_id);
+                    retractors.entry(*retracted).or_default().push(retractor_id);
                 }
             }
         }
     }
+}
+
+/// Record the backlink edges a fact at `id` contributes: `id` is inserted into
+/// the sorted set of every entity / event / image id the fact mentions. A fact
+/// mentioning one id twice records it once — `id` is constant and the
+/// destination is a set, so the repeated insert is idempotent. Meta facts
+/// mention no subjects.
+///
+/// Called from [`UnionSource::push_fact`] at the provisional fid the push
+/// assigns; [`apply_pending`] then merges the resulting maps into the durable
+/// indexes, where the provisional fid equals the durable one.
+fn record_backlink_edges(
+    fact: &MemStoredFact,
+    id: FactId,
+    entity_backlinks: &mut HashMap<MemoryEntityId, BTreeSet<FactId>>,
+    event_backlinks: &mut HashMap<MemoryEventId, BTreeSet<FactId>>,
+    image_backlinks: &mut HashMap<MemoryImageId, BTreeSet<FactId>>,
+) {
+    fact.for_each_id(
+        &mut |e| {
+            entity_backlinks.entry(*e).or_default().insert(id);
+        },
+        &mut |v| {
+            event_backlinks.entry(*v).or_default().insert(id);
+        },
+        &mut |i| {
+            image_backlinks.entry(*i).or_default().insert(id);
+        },
+    );
 }
 
 // ============================================================================
@@ -823,26 +1110,18 @@ impl FactStore for MemoryFactStore {
         Self: 'brand,
         'brand: 'tx,
     {
-        // 1. Hash the producer-form commit.
         let commit_id = commit
             .id()
             .map_err(|e| SubmitCommitError::Backend(e.into()))?;
 
-        // 2. Structural check before any I/O: out-of-range indices and unused
-        //    declarations are producer-side bundle bugs, so reject them before
-        //    taking the lock and making a contended writer wait.
-        check_idx_refs(&commit)?;
-
-        // 3. Acquire the inner lock once and hold it across the sequence. The
-        //    `Send` guard spans the `.await`s below: the `UnionSource`
-        //    accumulates owned pending state, the matcher and validator resolve
-        //    immediately, and the drain runs on the same task, so the lock
-        //    never serialises real I/O.
+        // Hold the lock across the whole sequence so the reads and the insert see
+        // one snapshot. The `Send` guard spans the `.await`s below; the matcher
+        // and validator resolve immediately, so the lock never serialises I/O.
         let mut inner_guard = self.lock_inner().await;
 
-        // 4. Idempotent dedup: a re-submit returns the cached result with
-        //    `previously_committed: true`, doing no mints, inserts, or rule
-        //    re-evaluation.
+        // A re-submit of a known `CommitId` returns the cached result with
+        // `previously_committed: true`, doing no mints, inserts, or rule
+        // re-evaluation.
         if let Some(cached) = inner_guard.submit_results.get(&commit_id) {
             return Ok(SubmitResult {
                 previously_committed: true,
@@ -850,56 +1129,70 @@ impl FactStore for MemoryFactStore {
             });
         }
 
-        // 5. Open the union source over the committed `Inner`. All reads /
-        //    mints / pushes go through it, so `Inner` is touched only at apply.
-        //    Trait reads borrow `&source`, ending before the `&mut source` mint
-        //    phase.
-        // First in-commit FactId: the committed count, captured before any
-        // pending push. A retract/supersede target at-or-above it names a fact
-        // in this commit.
-        let first_in_commit_fact_id = inner_guard.next_fact_id();
+        // All reads / mints / pushes go through the union source, so `Inner` is
+        // touched only at apply.
         let mut source = UnionSource::from_inner(&inner_guard);
 
-        // 6. Reject any Decl::Existing id unknown to the source, before any
-        //    mint, so counter advances stay tied to successful commits.
+        // Reject unresolvable references before minting, so a malformed bundle
+        // burns no ids. A fact pointing at a missing declaration can't resolve, so
+        // collect every out-of-range index and every unknown `Decl::Existing` id
+        // into one batch.
+        let (entity_refs, event_refs, image_refs) = collect_idx_refs(&commit);
+        let mut resolvability_errors: Vec<
+            SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>,
+        > = Vec::new();
+        resolvability_errors.extend(check_refs_in_range(
+            &entity_refs,
+            commit.entities.len(),
+            |idx| idx.0,
+            |idx, decl_count| SubmitError::EntityIdxOutOfRange { idx, decl_count },
+        ));
+        resolvability_errors.extend(check_refs_in_range(
+            &event_refs,
+            commit.events.len(),
+            |idx| idx.0,
+            |idx, decl_count| SubmitError::EventIdxOutOfRange { idx, decl_count },
+        ));
+        resolvability_errors.extend(check_refs_in_range(
+            &image_refs,
+            commit.images.len(),
+            |idx| idx.0,
+            |idx, decl_count| SubmitError::ImageIdxOutOfRange { idx, decl_count },
+        ));
         for (i, decl) in commit.entities.iter().enumerate() {
             if let Decl::Existing { id } = decl
                 && !source.entity_known(id)
             {
-                return Err(SubmitCommitError::Submit(
-                    SubmitError::UnknownExistingEntity {
-                        decl_position: EntityIdx(i),
-                    },
-                ));
+                resolvability_errors.push(SubmitError::UnknownExistingEntity {
+                    decl_position: EntityIdx(i),
+                });
             }
         }
         for (i, decl) in commit.events.iter().enumerate() {
             if let Decl::Existing { id } = decl
                 && !source.event_known(id)
             {
-                return Err(SubmitCommitError::Submit(
-                    SubmitError::UnknownExistingEvent {
-                        decl_position: EventIdx(i),
-                    },
-                ));
+                resolvability_errors.push(SubmitError::UnknownExistingEvent {
+                    decl_position: EventIdx(i),
+                });
             }
         }
         for (i, decl) in commit.images.iter().enumerate() {
             if let Decl::Existing { id } = decl
                 && !source.image_known(id)
             {
-                return Err(SubmitCommitError::Submit(
-                    SubmitError::UnknownExistingImage {
-                        decl_position: ImageIdx(i),
-                    },
-                ));
+                resolvability_errors.push(SubmitError::UnknownExistingImage {
+                    decl_position: ImageIdx(i),
+                });
             }
         }
+        if let Ok(batch) = NonEmptyVec::try_from_vec(resolvability_errors) {
+            return Err(SubmitCommitError::Submit(batch));
+        }
 
-        // 7. Run the matchers against the source to resolve each Local decl to
-        //    a match or a mint. Events are never matched, so each Local event
-        //    decl gets a synthesised mint outcome. The `&source` borrows end
-        //    before the `&mut source` mint phase.
+        // Resolve each Local decl to a match or a mint. Events are never matched,
+        // so each Local event decl gets a synthesised mint outcome. The `&source`
+        // borrows end before the `&mut source` mints below.
         let entity_outcomes =
             pipeline::match_entities(&commit.entities, &commit.facts, &source).await;
         let image_outcomes = pipeline::match_images(&commit.images, &commit.facts, &source).await;
@@ -918,8 +1211,7 @@ impl FactStore for MemoryFactStore {
             })
             .collect();
 
-        // 8. Resolve each declaration to a persistent id. Mints land in the
-        //    source's pending counters; `Inner` stays untouched.
+        // Mints land in the source's pending counters; `Inner` stays untouched.
         let entity_resolutions = resolve_decls(
             &commit.entities,
             &entity_outcomes,
@@ -956,26 +1248,88 @@ impl FactStore for MemoryFactStore {
             .map(|(idx, res)| (*idx, res.id))
             .collect();
 
-        let stored_facts = substitute_facts(
+        // Substitute, accumulating: the reject batch begins with any substitution
+        // self-loops, and successfully substituted facts proceed to the rules.
+        let (stored_facts, mut validation_errors) = substitute_facts_accumulating(
             &commit.facts,
             &entity_sub_map,
             &event_sub_map,
             &image_sub_map,
-        )
-        .map_err(SubmitCommitError::Submit)?;
+        );
 
-        // 9. Stage the substituted facts onto the pending list, fixing their
-        //    order. `apply_pending` assigns their FactIds at drain.
+        // Stage the substituted facts onto the pending list, fixing their order;
+        // `apply_pending` assigns their FactIds at drain.
         for fact in &stored_facts {
             source.push_fact(fact.clone());
         }
 
-        // 10. Run the rule validator over the source. On rejection, drop the
-        //     source without applying — counter rollback is implicit.
-        validate_submit(&stored_facts, &source, first_in_commit_fact_id).await?;
+        // Unused declarations are checked post-mint, but the mint rollback is
+        // implicit: a non-empty reject batch means apply never runs, so the
+        // source's mints drop and no counter is burned.
+        validation_errors.extend(check_all_decls_referenced(
+            &entity_refs,
+            commit.entities.len(),
+            EntityIdx,
+            |position| SubmitError::UnusedDeclaration {
+                kind: SubjectKind::Entity,
+                position,
+            },
+        ));
+        validation_errors.extend(check_all_decls_referenced(
+            &event_refs,
+            commit.events.len(),
+            EventIdx,
+            |position| SubmitError::UnusedDeclaration {
+                kind: SubjectKind::Event,
+                position,
+            },
+        ));
+        validation_errors.extend(check_all_decls_referenced(
+            &image_refs,
+            commit.images.len(),
+            ImageIdx,
+            |position| SubmitError::UnusedDeclaration {
+                kind: SubjectKind::Image,
+                position,
+            },
+        ));
 
-        // 11. Drain into `Inner`. `apply_pending` is the sole assigner of the
-        //     FactIds, returning them in push order.
+        // Two declarations of one kind resolving to the same persistent id is
+        // non-canonical: it breaks content-address dedup, and a self-pair would
+        // otherwise slip through. One error per duplicated id.
+        validation_errors.extend(
+            duplicate_resolved_ids(&entity_resolutions)
+                .into_iter()
+                .map(|id| SubmitError::DuplicateEntityDecl { id }),
+        );
+        validation_errors.extend(
+            duplicate_resolved_ids(&event_resolutions)
+                .into_iter()
+                .map(|id| SubmitError::DuplicateEventDecl { id }),
+        );
+        validation_errors.extend(
+            duplicate_resolved_ids(&image_resolutions)
+                .into_iter()
+                .map(|id| SubmitError::DuplicateImageDecl { id }),
+        );
+
+        // Run the rule validator (meta + cluster rules) over the source, folding
+        // its batch in. Only a backend read failure short-circuits; a rule
+        // violation joins the batch.
+        validation_errors.extend(
+            validate_submit(&stored_facts, &source)
+                .await
+                .map_err(SubmitCommitError::Backend)?,
+        );
+
+        // Reject the whole batch if any rule fired. Drop the source without
+        // applying — the mints roll back implicitly.
+        if let Ok(batch) = NonEmptyVec::try_from_vec(validation_errors) {
+            return Err(SubmitCommitError::Submit(batch));
+        }
+
+        // `apply_pending` is the sole assigner of the FactIds, returning them in
+        // push order.
         let pending = source.into_pending();
         let assigned_fact_ids = apply_pending(&mut inner_guard, pending, commit_id.clone());
 
@@ -1093,19 +1447,17 @@ where
     out
 }
 
-/// Collect the bundle-local indices every fact references and reject two
-/// producer bugs in priority order:
-///
-/// 1. Out-of-range — any idx past its decl-list length, checked first.
-/// 2. Unused declaration — once references are in-range, any decl position with
-///    no incoming reference. A decl with no fact under it is almost certainly a
-///    bug, better surfaced than silently minted.
-///
-/// Runs before mint allocation, so neither rejection burns a counter. O(N+F)
-/// over decls and facts.
-fn check_idx_refs<EntId, EvtId, ImgId>(
+/// Collect the bundle-local indices every fact references, bucketed by kind.
+/// `Meta` targets are persistent `FactId` / `CommitId`, not indices, so they
+/// contribute none. The collector half of the id-traversal; the resulting sets
+/// feed both the out-of-range check and the unused-declaration check.
+fn collect_idx_refs<EntId, EvtId, ImgId>(
     commit: &Commit<EntId, EvtId, ImgId>,
-) -> Result<(), SubmitCommitError<MemoryError, EntId, EvtId, ImgId>> {
+) -> (
+    std::collections::HashSet<EntityIdx>,
+    std::collections::HashSet<EventIdx>,
+    std::collections::HashSet<ImageIdx>,
+) {
     use std::collections::HashSet;
 
     let mut entity_refs: HashSet<EntityIdx> = HashSet::new();
@@ -1113,110 +1465,78 @@ fn check_idx_refs<EntId, EvtId, ImgId>(
     let mut image_refs: HashSet<ImageIdx> = HashSet::new();
 
     for fact in &commit.facts {
-        // The collector half of the id-traversal records each referenced
-        // index into the per-kind sets. `Meta` targets are persistent
-        // `FactId` / `CommitId`, not indices, so they contribute none.
-        let mut on_entity = |idx: &EntityIdx| {
-            entity_refs.insert(*idx);
-        };
-        let mut on_event = |idx: &EventIdx| {
-            event_refs.insert(*idx);
-        };
-        let mut on_image = |idx: &ImageIdx| {
-            image_refs.insert(*idx);
-        };
-        match fact {
-            SubmitFact::Factual { assertion, .. } => {
-                assertion.for_each_id(&mut on_entity, &mut on_event, &mut on_image);
-            }
-            SubmitFact::Judgment { assertion, .. } => {
-                assertion.for_each_id(&mut on_entity, &mut on_event, &mut on_image);
-            }
-            SubmitFact::Meta { .. } => {}
-        }
+        fact.for_each_id(
+            &mut |idx: &EntityIdx| {
+                entity_refs.insert(*idx);
+            },
+            &mut |idx: &EventIdx| {
+                event_refs.insert(*idx);
+            },
+            &mut |idx: &ImageIdx| {
+                image_refs.insert(*idx);
+            },
+        );
     }
-
-    // Out-of-range across all three kinds first, then unused-decl across
-    // all three. Each check is one helper parameterised over the kind's
-    // reference set, declaration count, and idx newtype.
-    check_refs_in_range(
-        &entity_refs,
-        commit.entities.len(),
-        |idx| idx.0,
-        |idx, decl_count| SubmitError::EntityIdxOutOfRange { idx, decl_count },
-    )?;
-    check_refs_in_range(
-        &event_refs,
-        commit.events.len(),
-        |idx| idx.0,
-        |idx, decl_count| SubmitError::EventIdxOutOfRange { idx, decl_count },
-    )?;
-    check_refs_in_range(
-        &image_refs,
-        commit.images.len(),
-        |idx| idx.0,
-        |idx, decl_count| SubmitError::ImageIdxOutOfRange { idx, decl_count },
-    )?;
-
-    check_all_decls_referenced(&entity_refs, commit.entities.len(), EntityIdx, |position| {
-        SubmitError::UnusedDeclaration {
-            kind: SubjectKind::Entity,
-            position,
-        }
-    })?;
-    check_all_decls_referenced(&event_refs, commit.events.len(), EventIdx, |position| {
-        SubmitError::UnusedDeclaration {
-            kind: SubjectKind::Event,
-            position,
-        }
-    })?;
-    check_all_decls_referenced(&image_refs, commit.images.len(), ImageIdx, |position| {
-        SubmitError::UnusedDeclaration {
-            kind: SubjectKind::Image,
-            position,
-        }
-    })?;
-    Ok(())
+    (entity_refs, event_refs, image_refs)
 }
 
-/// Reject any reference past the end of its kind's declaration list.
-/// Parameterised over the reference set, declaration count, the `position`
-/// extractor, and the out-of-range error constructor. Called once per kind by
-/// [`check_idx_refs`].
+/// Every reference past the end of its kind's declaration list, one
+/// [`SubmitError`] per offending position in ascending order. Parameterised over
+/// the reference set, declaration count, the `position` extractor, and the
+/// out-of-range error constructor.
 fn check_refs_in_range<Idx, EntId, EvtId, ImgId>(
     refs: &std::collections::HashSet<Idx>,
     decl_count: usize,
     position: impl Fn(&Idx) -> usize,
     out_of_range: impl Fn(usize, usize) -> SubmitError<EntId, EvtId, ImgId>,
-) -> Result<(), SubmitCommitError<MemoryError, EntId, EvtId, ImgId>> {
-    for r in refs {
-        let idx = position(r);
-        if idx >= decl_count {
-            return Err(SubmitCommitError::Submit(out_of_range(idx, decl_count)));
-        }
-    }
-    Ok(())
+) -> Vec<SubmitError<EntId, EvtId, ImgId>> {
+    let mut offending: Vec<usize> = refs
+        .iter()
+        .map(&position)
+        .filter(|&idx| idx >= decl_count)
+        .collect();
+    offending.sort_unstable();
+    offending
+        .into_iter()
+        .map(|idx| out_of_range(idx, decl_count))
+        .collect()
 }
 
-/// Reject the first declaration position with no incoming reference.
-/// Parameterised over the reference set, declaration count, the `idx_ctor` for
-/// testing set membership, and the unreferenced-position error constructor.
-/// Called once per kind by [`check_idx_refs`], after the in-range checks pass.
+/// Every declaration position with no incoming reference, one [`SubmitError`]
+/// per position in ascending order. A decl with no fact under it is almost
+/// certainly a bug, better surfaced than silently minted. Parameterised over the
+/// reference set, declaration count, the `idx_ctor` for testing set membership,
+/// and the unreferenced-position error constructor.
 fn check_all_decls_referenced<Idx, EntId, EvtId, ImgId>(
     refs: &std::collections::HashSet<Idx>,
     decl_count: usize,
     idx_ctor: fn(usize) -> Idx,
     unused: impl Fn(usize) -> SubmitError<EntId, EvtId, ImgId>,
-) -> Result<(), SubmitCommitError<MemoryError, EntId, EvtId, ImgId>>
+) -> Vec<SubmitError<EntId, EvtId, ImgId>>
 where
     Idx: Eq + std::hash::Hash,
 {
-    for i in 0..decl_count {
-        if !refs.contains(&idx_ctor(i)) {
-            return Err(SubmitCommitError::Submit(unused(i)));
+    (0..decl_count)
+        .filter(|i| !refs.contains(&idx_ctor(*i)))
+        .map(unused)
+        .collect()
+}
+
+/// The persistent ids that more than one declaration resolved to, sorted and
+/// deduped. Empty when every declaration of the kind resolved to a distinct id.
+/// The order is deterministic so a rejected commit's batch is reproducible.
+fn duplicate_resolved_ids<Idx, Id>(resolutions: &HashMap<Idx, Resolution<Id>>) -> Vec<Id>
+where
+    Id: Clone + Ord,
+{
+    let mut seen: BTreeSet<Id> = BTreeSet::new();
+    let mut duplicated: BTreeSet<Id> = BTreeSet::new();
+    for res in resolutions.values() {
+        if !seen.insert(res.id.clone()) {
+            duplicated.insert(res.id.clone());
         }
     }
-    Ok(())
+    duplicated.into_iter().collect()
 }
 
 #[cfg(test)]

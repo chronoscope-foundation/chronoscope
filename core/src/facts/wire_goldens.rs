@@ -49,7 +49,7 @@ use crate::facts::map;
 use crate::facts::observation;
 use crate::facts::picture;
 use crate::facts::spatial::TopologicalRel;
-use crate::facts::submit::{Commit, CommitAuthor, Decl, EntityIdx, SubmitFact};
+use crate::facts::submit::{Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact};
 use crate::geo::GeoPoint;
 use crate::location::Location;
 
@@ -84,9 +84,9 @@ fn sample_factual_citation() -> Result<FactualCitation> {
     Ok(FactualCitation::new(source, excerpts)?)
 }
 
-fn sample_judgment_source() -> Result<JudgmentSource> {
+fn sample_judgment_source() -> Result<JudgmentSource<ImageIdx>> {
     Ok(JudgmentSource::ImageObservation {
-        image: img("img-1")?,
+        image: ImageIdx(0),
         region: None,
         observer: Observer::User {
             user: UserId::new("alice"),
@@ -403,7 +403,7 @@ fn golden_submit_fact_judgment() -> Result<()> {
     };
     assert_golden_roundtrip(
         &fact,
-        r#"{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"image":"img-1","observer":{"justification":null,"type":"user","user":"alice"},"region":null,"type":"image_observation"},"type":"judgment"}"#,
+        r#"{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"image":0,"observer":{"justification":null,"type":"user","user":"alice"},"region":null,"type":"image_observation"},"type":"judgment"}"#,
     )
 }
 
@@ -466,14 +466,14 @@ fn golden_commit_id_full_bundle() -> Result<()> {
             .ok_or("fixed time")?,
         entities: vec![Decl::Local, Decl::Local],
         events: Vec::new(),
-        images: Vec::new(),
+        images: vec![Decl::Local],
         facts,
     };
 
     let id = bundle.id()?;
     assert_golden(
         id.as_str(),
-        "238a5f549dc36b779c10e89b915fb8c2fa6977ca3485fb31d7dcd0be4434c3e8",
+        "6505cedede83dc2523ed8842f8f80868ce7ae341c56bf341b2a272d59983765f",
     );
     Ok(())
 }

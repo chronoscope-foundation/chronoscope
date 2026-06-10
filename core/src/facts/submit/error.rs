@@ -14,6 +14,27 @@
 use super::{EntityIdx, EventIdx, ImageIdx};
 use crate::facts::ids::{CommitId, FactId, SubjectKind};
 
+/// The role an image is used as or claimed to be. A picture carries capture
+/// metadata and depicts entities in-frame; a map places entities by location.
+/// Role coherence (one image, one role) is checked at submit time; the Display
+/// form renders the word used in [`SubmitError::ImageRoleConflict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ImageRole {
+    /// A photographic image — captures a scene, depicts entities in-frame.
+    Picture,
+    /// A cartographic image — places entities by geographic location.
+    Map,
+}
+
+impl std::fmt::Display for ImageRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Picture => write!(f, "picture"),
+            Self::Map => write!(f, "map"),
+        }
+    }
+}
+
 /// Errors from `submit_commit`. `#[non_exhaustive]`, so dependent code handles
 /// a default arm and rule-specific variants can be added without a breaking
 /// change.
@@ -155,5 +176,91 @@ pub enum SubmitError<E, V, I> {
         kind: SubjectKind,
         /// Position of the unreferenced decl in its respective list.
         position: usize,
+    },
+    /// Two entity declarations resolved to one persistent id. A commit that
+    /// names one entity twice is non-canonical — it breaks content-address
+    /// dedup, and a self-pair would otherwise be the only thing caught.
+    #[error("two entity declarations resolved to the same id {id}")]
+    DuplicateEntityDecl {
+        /// The id two entity declarations resolved to.
+        id: E,
+    },
+    /// Two event declarations resolved to one persistent id. See
+    /// [`Self::DuplicateEntityDecl`].
+    #[error("two event declarations resolved to the same id {id}")]
+    DuplicateEventDecl {
+        /// The id two event declarations resolved to.
+        id: V,
+    },
+    /// Two image declarations resolved to one persistent id. See
+    /// [`Self::DuplicateEntityDecl`].
+    #[error("two image declarations resolved to the same id {id}")]
+    DuplicateImageDecl {
+        /// The id two image declarations resolved to.
+        id: I,
+    },
+    /// A `Demolition` bookend carries a location. Demolition location is
+    /// derived from the entity's last known location, not separately asserted.
+    #[error("demolition bookend carries a location for {entity}; demolition location is derived")]
+    DemolitionLocation {
+        /// The entity whose demolition bookend carried a location.
+        entity: E,
+    },
+    /// A lifetime event carries facts whose kinds can't agree — e.g. a
+    /// damage-cause and a move-method on one event.
+    #[error("event {event} carries facts with incompatible lifetime-event kinds")]
+    EventKindConflict {
+        /// The event whose attached facts conflict on kind.
+        event: V,
+    },
+    /// A name's validity window closes before it opens: `valid_from`'s earliest
+    /// possible date is after `valid_to`'s latest possible date.
+    #[error("name validity window for {entity} is inverted: valid_from is after valid_to")]
+    NameWindowInverted {
+        /// The entity whose name window is inverted.
+        entity: E,
+    },
+    /// An image-observation names an entity with no paired depiction tying that
+    /// entity to the observed image. The observation describes something seen in
+    /// the image, so the entity reference is meaningless without the depiction.
+    #[error("image-observation references {entity} with no paired depiction on image {image}")]
+    ObservationWithoutDepiction {
+        /// The entity the observation names.
+        entity: E,
+        /// The image the observation was made against.
+        image: I,
+    },
+    /// A composite subimage equals its own parent.
+    #[error("subimage equals its parent: {image}")]
+    CompositeSelfParent {
+        /// The image named as both subimage and parent.
+        image: I,
+    },
+    /// A subimage is placed under more than one parent.
+    #[error("subimage {subimage} is placed under more than one parent")]
+    CompositeMultipleParents {
+        /// The subimage with multiple parents.
+        subimage: I,
+    },
+    /// An image is both a subimage and a parent; composites are one layer deep.
+    #[error("image {image} is both a subimage and a parent; composites are flat")]
+    CompositeChain {
+        /// The image forming the chain.
+        image: I,
+    },
+    /// A fact presupposes one role for an image (a picture-capture attribute or
+    /// in-picture depiction needs a picture; an on-map depiction needs a map)
+    /// while another fact about that image claims the opposite role. A
+    /// claim-vs-claim disagreement (both `IsPicture` and `IsMap`) is deferred
+    /// to projection — uncertainty is data — so only presupposition-vs-claim
+    /// fires here.
+    #[error("image {image} used as {used_as} but claimed as {claimed}")]
+    ImageRoleConflict {
+        /// The image whose role is contested.
+        image: I,
+        /// The role a fact presupposed for the image.
+        used_as: ImageRole,
+        /// The role another fact claimed the image to be.
+        claimed: ImageRole,
     },
 }
