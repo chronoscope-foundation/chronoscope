@@ -15,5 +15,8 @@ fi
 {
     git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo no-head
     git -C "$PROJECT_DIR" diff HEAD 2>/dev/null
-    git -C "$PROJECT_DIR" status --porcelain 2>/dev/null
+    # Paths only: staging flips porcelain's XY columns without changing
+    # content, and add→commit between check and commit is the normal flow.
+    # Content is covered by `git diff HEAD`; untracked files count by path.
+    git -C "$PROJECT_DIR" status --porcelain 2>/dev/null | cut -c4-
 } | hash_cmd | cut -d' ' -f1
