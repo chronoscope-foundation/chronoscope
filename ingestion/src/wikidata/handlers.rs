@@ -563,14 +563,19 @@ mod tests {
         assert_eq!(cited.evidence.len(), 1);
         if let chronoscope_core::Evidence::Wikidata {
             entity_id,
-            property_id,
-            property_value,
             revision_id,
+            field,
+            observed_value,
         } = &cited.evidence[0]
         {
             assert_eq!(*entity_id, WikidataEntityId::new(100));
-            assert_eq!(*property_id, WikidataPropertyId::new(571));
-            assert_eq!(property_value, "test_raw");
+            assert_eq!(
+                *field,
+                chronoscope_core::WikidataField::Statement {
+                    property_id: WikidataPropertyId::new(571),
+                }
+            );
+            assert_eq!(observed_value, "test_raw");
             assert_eq!(*revision_id, 42);
         } else {
             return Err("expected Wikidata evidence".into());

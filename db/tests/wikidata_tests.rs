@@ -44,10 +44,9 @@ async fn wikidata_db() -> Result<TestDb> {
 /// Look up exactly one entity by Wikidata Q-ID.
 ///
 /// The `name` parameter is a human-readable label for diagnostics only.
-/// Ingestion no longer derives names from Wikidata labels — only from
-/// property-backed name claims like P1448 (official name) — so most test
-/// entities have no names at all. Name content is asserted explicitly by
-/// the tests that exercise a P1448-bearing entity, not here.
+/// Ingestion derives common names from Wikidata labels and official names
+/// from P1448 claims; tests that care about name content assert it
+/// explicitly.
 async fn lookup_one(db: &TestDb, qid: &str, name: &str) -> Result<Entity> {
     let mut results = db
         .find_entities_by_external_id(&ExternalIdType::Wikidata, qid)
@@ -251,9 +250,9 @@ async fn vanderbilt_entities() -> Result<()> {
     Ok(())
 }
 
-/// Names are derived only from property-backed claims (P1448, official
-/// name), not from Wikidata labels. Ponte Vecchio carries a French P1448
-/// claim, so it is one of the few test entities with a name.
+/// Every entity carries common names from its Wikidata labels; Ponte
+/// Vecchio additionally has a French P1448 (official name) claim, and that
+/// official name is what this test pins.
 #[tokio::test]
 async fn official_name_from_p1448() -> Result<()> {
     let db = wikidata_db().await?;

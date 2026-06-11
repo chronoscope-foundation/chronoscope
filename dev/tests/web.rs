@@ -1086,15 +1086,12 @@ async fn test_zoom_in_to_rome_shows_4_entities() -> TestResult {
             format!("expected no cluster markers at high zoom, got {clusters:?}"),
         )?;
 
-        // The Wikidata Pantheon entity (Q99309) has multiple English labels:
-        // both "Pantheon" and "Pantheon, Rome" appear in the names list,
-        // and `best_name("en")` returns whichever comes first. The order is
-        // determined by how Wikidata's labels deserialize and isn't strictly
-        // pinned, so accept either form via a prefix match.
-        //
-        // Other entities have a single canonical English label and are
-        // matched exactly.
-        let exact_names = ["Castel Sant'Angelo", "Trajan's Column", "Colosseum"];
+        let exact_names = [
+            "Castel Sant'Angelo",
+            "Trajan's Column",
+            "Colosseum",
+            "Pantheon",
+        ];
         for name in exact_names {
             check(
                 entities.contains_key(name),
@@ -1104,13 +1101,6 @@ async fn test_zoom_in_to_rome_shows_4_entities() -> TestResult {
                 ),
             )?;
         }
-        check(
-            entities.keys().any(|k| k.starts_with("Pantheon")),
-            format!(
-                "expected a 'Pantheon*' entity at Rome zoom 13, got: {:?}",
-                entities.keys()
-            ),
-        )?;
 
         check(
             entities.len() == 4,

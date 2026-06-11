@@ -4,7 +4,7 @@
 //! API/dump boundary. This catches malformed data early and provides typed
 //! field access throughout the ingestion pipeline.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 // =============================================================================
 
 /// Define a newtype wrapper over `String` with standard traits for use as
-/// typed identifiers, `HashMap` keys, and serde-transparent serialization.
+/// typed identifiers, map keys, and serde-transparent serialization.
 macro_rules! string_newtype {
     ($(#[$meta:meta])* $vis:vis $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
         #[serde(transparent)]
         $vis struct $name(pub String);
 
@@ -144,7 +144,7 @@ impl std::fmt::Display for PageId {
 /// Construction requires validation: the string must start with `P` followed by
 /// one or more ASCII digits. This is enforced by [`TryFrom<String>`], making a
 /// `PropertyId` value proof that the format is valid.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PropertyId(String);
 
@@ -378,15 +378,15 @@ pub struct WikidataEntityContent {
 
     /// Labels keyed by language code (e.g., "en", "de").
     #[serde(default)]
-    pub labels: HashMap<LanguageCode, Label>,
+    pub labels: BTreeMap<LanguageCode, Label>,
 
     /// Claims keyed by property ID (e.g., "P31", "P571").
     #[serde(default)]
-    pub claims: HashMap<PropertyId, Vec<Claim>>,
+    pub claims: BTreeMap<PropertyId, Vec<Claim>>,
 
     /// Sitelinks keyed by site ID (e.g., "enwiki", "commonswiki").
     #[serde(default)]
-    pub sitelinks: HashMap<SiteId, Sitelink>,
+    pub sitelinks: BTreeMap<SiteId, Sitelink>,
 }
 
 impl WikidataEntityContent {
@@ -424,15 +424,15 @@ pub struct WikidataEntity {
 
     /// Labels keyed by language code (e.g., "en", "de").
     #[serde(default)]
-    pub labels: HashMap<LanguageCode, Label>,
+    pub labels: BTreeMap<LanguageCode, Label>,
 
     /// Claims keyed by property ID (e.g., "P31", "P571").
     #[serde(default)]
-    pub claims: HashMap<PropertyId, Vec<Claim>>,
+    pub claims: BTreeMap<PropertyId, Vec<Claim>>,
 
     /// Sitelinks keyed by site ID (e.g., "enwiki", "commonswiki").
     #[serde(default)]
-    pub sitelinks: HashMap<SiteId, Sitelink>,
+    pub sitelinks: BTreeMap<SiteId, Sitelink>,
 }
 
 /// Wikidata entity type.
@@ -469,7 +469,7 @@ pub struct Claim {
 
     /// Qualifier snaks keyed by property ID.
     #[serde(default)]
-    pub qualifiers: HashMap<PropertyId, Vec<Snak>>,
+    pub qualifiers: BTreeMap<PropertyId, Vec<Snak>>,
 
     /// Statement rank.
     pub rank: Rank,
@@ -481,7 +481,7 @@ impl Claim {
     pub fn simple(snak: Snak) -> Self {
         Self {
             mainsnak: snak,
-            qualifiers: HashMap::new(),
+            qualifiers: BTreeMap::new(),
             rank: Rank::Normal,
         }
     }

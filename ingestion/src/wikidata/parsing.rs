@@ -8,7 +8,7 @@ use crate::SourceIdx;
 use chrono::NaiveDate;
 use chronoscope_core::{
     Cited, DatePrecision, EntityName, Evidence, ExternalLink, LinkTarget, LinkType, NameType,
-    UncertainDate, WikidataEntityId, WikidataPropertyId,
+    UncertainDate, WikidataEntityId, WikidataField, WikidataPropertyId,
 };
 use chronoscope_integrations::wikidata::{DataValue, Snak, WikidataEntity, WikidataPrecision};
 use oxilangtag::LanguageTag;
@@ -57,11 +57,7 @@ pub fn parse_wikidata_time(time_str: &str, precision: WikidataPrecision) -> Opti
     }
 }
 
-/// Extract names from P1448 (official name) claims.
-///
-/// Plain labels are intentionally not emitted: they carry no real
-/// Wikidata property to attribute evidence to. Only property-backed
-/// name claims (currently P1448) become names.
+/// Extract names from labels (common names) and P1448 (official name) claims.
 pub fn extract_names(
     wd: &WikidataEntity,
     wikidata_id: &str,
@@ -69,23 +65,32 @@ pub fn extract_names(
 ) -> Vec<Cited<EntityName, SourceIdx>> {
     let mut names = Vec::new();
 
-    // FIXME(old-model): label-derived name extraction was removed here.
-    // Wikidata labels have no property ID, and `Evidence::Wikidata.property_id`
-    // is required (we deliberately kept it required, not optional), so a label
-    // has nothing to attribute evidence to. Consequence: most entities now have
-    // NO name from this path — only those carrying a P1448 official name. This
-    // is a known degradation, tolerated only because this old-model ingestion
-    // path is slated for deletion. Before relying on entity names from this path,
-    // or before deleting it, restore label extraction (needs an optional
-    // property_id or a label-specific Evidence variant).
-
-    // P1448 (official name) is the only label source that carries a real
-    // Wikidata property. The entity id is parsed once here; a non-entity
-    // id can't be cited, so we return whatever names were collected (none
-    // yet) rather than fabricate evidence.
+    // The entity id is parsed once here; a non-entity id can't be cited,
+    // so we return no names rather than fabricate evidence.
     let Ok(entity_id) = WikidataEntityId::parse(wikidata_id) else {
         return names;
     };
+
+    for (lang, label) in &wd.labels {
+        if let Ok(language) = LanguageTag::parse(lang.0.clone()) {
+            names.push(Cited::new(
+                EntityName {
+                    name: label.value.clone(),
+                    name_type: NameType::Common,
+                    language: language.clone(),
+                    valid_from: None,
+                    valid_to: None,
+                },
+                vec![Evidence::Wikidata {
+                    entity_id,
+                    revision_id,
+                    field: WikidataField::Label { language },
+                    observed_value: label.value.clone(),
+                }],
+            ));
+        }
+    }
+
     let p1448 = WikidataPropertyId::new(1448);
 
     // P1448 (official name)
@@ -104,9 +109,9 @@ pub fn extract_names(
                     },
                     vec![Evidence::Wikidata {
                         entity_id,
-                        property_id: p1448,
-                        property_value: format!("{}:{}", mono.language, mono.text),
                         revision_id,
+                        field: WikidataField::Statement { property_id: p1448 },
+                        observed_value: format!("{}:{}", mono.language, mono.text),
                     }],
                 ));
             }
@@ -160,7 +165,7 @@ mod tests {
         Claim, Label, LanguageCode, MonolingualTextValue, PropertyId, Rank, RevisionId, Snak,
         WikidataEntityType, WikidataId,
     };
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -344,16 +349,12 @@ mod tests {
     // =============================================================================
 
     #[test]
-    fn extract_names_ignores_plain_labels() -> TestResult {
-        // Labels carry no real Wikidata property, so they no longer
-        // produce names. Only P1448 (official name) and similar
-        // property-backed claims do. An entity with labels but no such
-        // claims yields no names.
+    fn extract_names_emits_common_names_from_labels() -> TestResult {
         let entity = WikidataEntity {
             id: wikidata_id("Q243")?,
             entity_type: WikidataEntityType::Item,
             lastrevid: RevisionId(100),
-            labels: HashMap::from([
+            labels: BTreeMap::from([
                 (
                     LanguageCode("en".to_string()),
                     Label {
@@ -369,15 +370,45 @@ mod tests {
                     },
                 ),
             ]),
-            claims: HashMap::new(),
-            sitelinks: HashMap::new(),
+            claims: BTreeMap::new(),
+            sitelinks: BTreeMap::new(),
         };
 
         let names = extract_names(&entity, "Q243", 100);
-        assert!(
-            names.is_empty(),
-            "plain labels should not produce names, got {names:?}"
+        assert_eq!(names.len(), 2);
+
+        let english = names
+            .iter()
+            .find(|n| n.value.language.as_str() == "en")
+            .ok_or("expected an English name")?;
+        assert_eq!(english.value.name, "Eiffel Tower");
+        assert_eq!(english.value.name_type, NameType::Common);
+        assert_eq!(english.evidence.len(), 1);
+        let Evidence::Wikidata {
+            entity_id,
+            revision_id,
+            field,
+            observed_value,
+        } = &english.evidence[0]
+        else {
+            return Err("expected Wikidata evidence".into());
+        };
+        assert_eq!(*entity_id, WikidataEntityId::new(243));
+        assert_eq!(*revision_id, 100);
+        assert_eq!(
+            *field,
+            WikidataField::Label {
+                language: LanguageTag::parse("en".to_string())?,
+            }
         );
+        assert_eq!(observed_value, "Eiffel Tower");
+
+        let french = names
+            .iter()
+            .find(|n| n.value.language.as_str() == "fr")
+            .ok_or("expected a French name")?;
+        assert_eq!(french.value.name, "Tour Eiffel");
+        assert_eq!(french.value.name_type, NameType::Common);
         Ok(())
     }
 
@@ -387,25 +418,44 @@ mod tests {
             id: wikidata_id("Q243")?,
             entity_type: WikidataEntityType::Item,
             lastrevid: RevisionId(100),
-            labels: HashMap::new(),
-            claims: HashMap::from([(
+            labels: BTreeMap::new(),
+            claims: BTreeMap::from([(
                 PropertyId::try_from("P1448".to_string())?,
                 vec![Claim {
                     mainsnak: Snak::Value(DataValue::MonolingualText(MonolingualTextValue {
                         text: "Tour Eiffel".to_string(),
                         language: LanguageCode("fr".to_string()),
                     })),
-                    qualifiers: HashMap::new(),
+                    qualifiers: BTreeMap::new(),
                     rank: Rank::Normal,
                 }],
             )]),
-            sitelinks: HashMap::new(),
+            sitelinks: BTreeMap::new(),
         };
 
         let names = extract_names(&entity, "Q243", 100);
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].value.name, "Tour Eiffel");
         assert_eq!(names[0].value.name_type, NameType::Official);
+        assert_eq!(names[0].evidence.len(), 1);
+        let Evidence::Wikidata {
+            entity_id,
+            revision_id,
+            field,
+            observed_value,
+        } = &names[0].evidence[0]
+        else {
+            return Err("expected Wikidata evidence".into());
+        };
+        assert_eq!(*entity_id, WikidataEntityId::new(243));
+        assert_eq!(*revision_id, 100);
+        assert_eq!(
+            *field,
+            WikidataField::Statement {
+                property_id: WikidataPropertyId::new(1448),
+            }
+        );
+        assert_eq!(observed_value, "fr:Tour Eiffel");
         Ok(())
     }
 

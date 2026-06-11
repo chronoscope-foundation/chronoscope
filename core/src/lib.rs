@@ -43,7 +43,7 @@ pub use entity::{
 };
 pub use evidence::{
     Cited, Evidence, ImageRegion, MaskDimensions, Polyline, PolylineError, RleMask, SourceDetail,
-    SpatialGeometry,
+    SpatialGeometry, WikidataField,
 };
 pub use geo::{Bbox, BboxError, GeoPoint, GeoPointError};
 pub use ids::{

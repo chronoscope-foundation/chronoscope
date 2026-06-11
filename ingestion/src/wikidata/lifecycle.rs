@@ -4,7 +4,7 @@
 //! from Wikidata properties. Handles entity splitting when demolish->rebuild patterns
 //! indicate a new entity.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::SourceIdx;
 use chrono::NaiveDate;
@@ -187,7 +187,7 @@ fn cite_all(
 
 /// Extract single time from a property's claims.
 fn extract_property_time(
-    claims: &HashMap<PropertyId, Vec<Claim>>,
+    claims: &BTreeMap<PropertyId, Vec<Claim>>,
     prop: &str,
     ctx: &PropertyContext,
 ) -> (Option<Cited<UncertainDate, SourceIdx>>, Vec<String>) {
@@ -213,7 +213,7 @@ fn extract_property_time(
 
 /// Extract location from P625.
 fn extract_property_location(
-    claims: &HashMap<PropertyId, Vec<Claim>>,
+    claims: &BTreeMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext,
 ) -> (Option<Cited<UnresolvedLocation, SourceIdx>>, Vec<String>) {
     let mut warnings = Vec::new();
@@ -513,7 +513,7 @@ fn process_p793_claim(claim: &Claim, ctx: &PropertyContext) -> (Vec<DatedTransit
 /// Returns (`entity_lifecycles`, warnings). Multiple inner vecs when demolish->construct
 /// indicates entity splitting. Caller creates `EntityRelation::Replaces` between them.
 pub fn build_lifecycles(
-    claims: &HashMap<PropertyId, Vec<Claim>>,
+    claims: &BTreeMap<PropertyId, Vec<Claim>>,
     ctx: &PropertyContext,
 ) -> (Vec<Vec<EntityTransition<SourceIdx>>>, Vec<String>) {
     let mut warnings = Vec::new();
@@ -801,7 +801,7 @@ mod tests {
         point_in_time: &str,
         precision: WikidataPrecision,
     ) -> Result<Claim, String> {
-        let mut qualifiers = HashMap::new();
+        let mut qualifiers = BTreeMap::new();
         qualifiers.insert(
             property_id("P585")?,
             vec![Snak::Value(DataValue::Time(TimeValue {
@@ -820,7 +820,7 @@ mod tests {
     }
 
     fn p793_event_with_range(qid: &str, start: &str, end: &str) -> Result<Claim, String> {
-        let mut qualifiers = HashMap::new();
+        let mut qualifiers = BTreeMap::new();
         qualifiers.insert(
             property_id("P580")?,
             vec![Snak::Value(DataValue::Time(TimeValue {
@@ -847,7 +847,7 @@ mod tests {
 
     fn claims_from(
         pairs: Vec<(&str, Vec<Claim>)>,
-    ) -> Result<HashMap<PropertyId, Vec<Claim>>, String> {
+    ) -> Result<BTreeMap<PropertyId, Vec<Claim>>, String> {
         pairs
             .into_iter()
             .map(|(k, v)| Ok((property_id(k)?, v)))
@@ -893,7 +893,7 @@ mod tests {
                 longitude: 25.0,
                 precision: Some(1.0),
             })),
-            qualifiers: HashMap::new(),
+            qualifiers: BTreeMap::new(),
             rank: Rank::Normal,
         };
         let (loc, warnings) = extract::mainsnak_coordinates(&claim_high_lat);
@@ -1476,7 +1476,7 @@ mod tests {
     /// Empty claims produce no transitions and no warnings
     #[test]
     fn build_empty_claims() -> TestResult {
-        let claims = HashMap::new();
+        let claims = BTreeMap::new();
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
         assert!(warnings.is_empty());
         assert!(lifecycles.is_empty());

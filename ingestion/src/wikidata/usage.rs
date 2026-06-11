@@ -169,6 +169,7 @@ mod tests {
         Claim, DataValue, EntityRefValue, PropertyId, RevisionId, Snak, WikidataEntityType,
         WikidataId,
     };
+    use std::collections::BTreeMap;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -181,15 +182,15 @@ mod tests {
     }
 
     fn entity_with_claims(
-        claims: HashMap<PropertyId, Vec<Claim>>,
+        claims: BTreeMap<PropertyId, Vec<Claim>>,
     ) -> Result<WikidataEntity, String> {
         Ok(WikidataEntity {
             id: wikidata_id("Q1")?,
             entity_type: WikidataEntityType::Item,
             lastrevid: RevisionId(1),
-            labels: HashMap::new(),
+            labels: BTreeMap::new(),
             claims,
-            sitelinks: HashMap::new(),
+            sitelinks: BTreeMap::new(),
         })
     }
 
@@ -208,7 +209,7 @@ mod tests {
     #[test]
     fn infer_p366_has_use_transportation() -> TestResult {
         // Q1571929 = general aviation -> Transportation
-        let entity = entity_with_claims(HashMap::from([(
+        let entity = entity_with_claims(BTreeMap::from([(
             property_id("P366")?,
             vec![entity_id_claim("Q1571929")?],
         )]))?;
@@ -221,7 +222,7 @@ mod tests {
     #[test]
     fn infer_p366_multiple_usages() -> TestResult {
         // Q1571929 = Transportation, Q33506 = Cultural (museum)
-        let entity = entity_with_claims(HashMap::from([(
+        let entity = entity_with_claims(BTreeMap::from([(
             property_id("P366")?,
             vec![entity_id_claim("Q1571929")?, entity_id_claim("Q33506")?],
         )]))?;
@@ -235,7 +236,7 @@ mod tests {
     #[test]
     fn infer_p31_fallback_when_no_p366() -> TestResult {
         // Q55488 = railway station -> Transportation (via P31)
-        let entity = entity_with_claims(HashMap::from([(
+        let entity = entity_with_claims(BTreeMap::from([(
             property_id("P31")?,
             vec![entity_id_claim("Q55488")?],
         )]))?;
@@ -248,7 +249,7 @@ mod tests {
     #[test]
     fn infer_p366_takes_priority_over_p31() -> TestResult {
         // P366 gives Transportation, P31 gives Religious — P366 should win
-        let entity = entity_with_claims(HashMap::from([
+        let entity = entity_with_claims(BTreeMap::from([
             (property_id("P366")?, vec![entity_id_claim("Q1571929")?]),
             (property_id("P31")?, vec![entity_id_claim("Q16970")?]),
         ]))?;
@@ -262,7 +263,7 @@ mod tests {
 
     #[test]
     fn infer_unknown_when_no_match() -> TestResult {
-        let entity = entity_with_claims(HashMap::from([(
+        let entity = entity_with_claims(BTreeMap::from([(
             property_id("P366")?,
             vec![entity_id_claim("Q999999999")?],
         )]))?;
@@ -274,7 +275,7 @@ mod tests {
 
     #[test]
     fn infer_unknown_when_no_claims() -> TestResult {
-        let entity = entity_with_claims(HashMap::new())?;
+        let entity = entity_with_claims(BTreeMap::new())?;
         let result = infer(&entity);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&Usage::Unknown));
@@ -295,7 +296,7 @@ mod tests {
             ("Q12280", Usage::Infrastructure),
         ];
         for (qid, expected_usage) in test_cases {
-            let entity = entity_with_claims(HashMap::from([(
+            let entity = entity_with_claims(BTreeMap::from([(
                 property_id("P366")?,
                 vec![entity_id_claim(qid)?],
             )]))?;
@@ -323,7 +324,7 @@ mod tests {
             ("Q12280", Usage::Infrastructure),
         ];
         for (qid, expected_usage) in test_cases {
-            let entity = entity_with_claims(HashMap::from([(
+            let entity = entity_with_claims(BTreeMap::from([(
                 property_id("P31")?,
                 vec![entity_id_claim(qid)?],
             )]))?;

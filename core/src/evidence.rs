@@ -4,6 +4,7 @@
 
 use std::fmt;
 
+use oxilangtag::LanguageTag;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -103,11 +104,27 @@ pub enum Evidence<S> {
     /// Evidence from Wikidata.
     Wikidata {
         entity_id: WikidataEntityId,
-        property_id: WikidataPropertyId,
-        /// The property value as it appears in Wikidata
-        property_value: String,
         /// Entity revision ID for permalink construction
         revision_id: u64,
+        field: WikidataField,
+        /// The value as it appears in Wikidata
+        observed_value: String,
+    },
+}
+
+/// The field of a Wikidata entity record an observation was read from.
+///
+/// Statements are addressed by property; termbox entries (labels) are
+/// addressed by language and carry no property, qualifiers, or references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WikidataField {
+    Statement {
+        property_id: WikidataPropertyId,
+    },
+    Label {
+        #[schemars(with = "String")]
+        language: LanguageTag<String>,
     },
 }
 

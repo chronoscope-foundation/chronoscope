@@ -33,7 +33,8 @@ mod entity_accumulator {
     use crate::SourceIdx;
     use chronoscope_core::{
         AnnotationKind, Cited, Entity, EntityName, EntityTransition, Evidence, ExternalLink,
-        ImageSource, Usage, WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
+        ImageSource, Usage, WikidataEntityId, WikidataField, WikidataIdParseError,
+        WikidataPropertyId,
     };
     use chronoscope_integrations::wikidata::{RevisionId, WikidataId};
 
@@ -260,9 +261,11 @@ mod entity_accumulator {
                 value,
                 vec![Evidence::Wikidata {
                     entity_id: self.entity_id,
-                    property_id: self.property_id,
-                    property_value: raw.into(),
                     revision_id: self.revision_id,
+                    field: WikidataField::Statement {
+                        property_id: self.property_id,
+                    },
+                    observed_value: raw.into(),
                 }],
             )
         }
@@ -621,7 +624,7 @@ fn process_entity(
     // FIXME(old-model): KNOWN-WRONG — this attributes ALL lifecycle-transition
     // evidence to P793 (significant event), but transitions sourced from
     // P571/P576/P625/P1619 are NOT P793; their real property survives only in
-    // each evidence's `property_value`. This over-claims provenance. Tolerated
+    // each evidence's `observed_value`. This over-claims provenance. Tolerated
     // only because this old-model path is slated for deletion. Do not trust
     // lifecycle `property_id`; before relying on it or deleting this code, thread
     // the real per-transition property through `build_lifecycles` (or drop the
