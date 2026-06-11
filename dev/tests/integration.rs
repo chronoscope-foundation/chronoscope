@@ -289,11 +289,16 @@ where
         if let Some(value) = check().await? {
             return Ok(value);
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the no-progress timeout deadline this helper exists to enforce"
+        )]
+        let deadline_sleep = tokio::time::sleep_until(deadline);
         tokio::select! {
             res = progress.changed() => {
                 res.map_err(|e| format!("worker_progress sender dropped: {e}"))?;
             }
-            () = tokio::time::sleep_until(deadline) => {
+            () = deadline_sleep => {
                 return Err(format!(
                     "timeout after {timeout:?} (no worker progress)"
                 ).into());

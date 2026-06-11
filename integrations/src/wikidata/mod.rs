@@ -30,14 +30,36 @@ pub use entity::{
 };
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
+use reqwest::StatusCode;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::Value;
+use tokio::time::Instant;
 use url::Url;
 
-use crate::http::{HttpClient, HttpError, HttpRequest};
+use crate::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
 
 /// Maximum revisions per MediaWiki API batch request.
 const BATCH_SIZE: usize = 50;
+
+/// Pause between consecutive API requests. Wikimedia's rate limiter allows
+/// only a small burst from anonymous clients; spacing requests out keeps us
+/// under it most of the time, with the 429 retry loop as backstop.
+const DEFAULT_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Total tries per request, counting the first.
+const MAX_ATTEMPTS: u32 = 6;
+
+/// Ceiling on any single rate-limit wait, whatever Retry-After claims.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(120);
+
+/// First wait of the doubling backoff used when a 429 arrives with a
+/// missing or unparseable Retry-After header.
+const FALLBACK_BACKOFF_BASE: Duration = Duration::from_secs(5);
+
+/// Characters of response body quoted in errors.
+const BODY_EXCERPT_CHARS: usize = 200;
 
 // =============================================================================
 // API Timestamp
@@ -117,6 +139,22 @@ pub enum WikidataError {
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),
 
+    /// API returned a non-success HTTP status.
+    #[error("HTTP {status} from {url}: {body_excerpt}")]
+    Status {
+        status: u16,
+        url: String,
+        body_excerpt: String,
+    },
+
+    /// API returned a success status with a body that failed to parse as JSON.
+    #[error("invalid JSON from {url}: {source} (body: {body_excerpt})")]
+    JsonBody {
+        url: String,
+        source: serde_json::Error,
+        body_excerpt: String,
+    },
+
     /// Wikidata API returned an error or unexpected response.
     #[error("API error: {message}")]
     Api { message: String },
@@ -130,6 +168,38 @@ pub enum WikidataError {
     ResponseTooLarge(usize),
 }
 
+/// First [`BODY_EXCERPT_CHARS`] characters of a response body,
+/// whitespace-collapsed so the error stays on one line. Lossy on invalid
+/// UTF-8.
+fn body_excerpt(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = collapsed.chars();
+    let excerpt: String = chars.by_ref().take(BODY_EXCERPT_CHARS).collect();
+    if excerpt.is_empty() {
+        "(empty body)".to_string()
+    } else if chars.next().is_some() {
+        format!("{excerpt}…")
+    } else {
+        excerpt
+    }
+}
+
+/// Parse the Retry-After header as a number of seconds.
+fn retry_after_duration(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Parse a response body as JSON, quoting the body in the error on failure.
+fn parse_json_body(url: &Url, body: &[u8]) -> Result<Value, WikidataError> {
+    serde_json::from_slice(body).map_err(|source| WikidataError::JsonBody {
+        url: url.to_string(),
+        source,
+        body_excerpt: body_excerpt(body),
+    })
+}
+
 // =============================================================================
 // Client
 // =============================================================================
@@ -137,14 +207,106 @@ pub enum WikidataError {
 /// Client for the Wikidata Action API, SPARQL endpoint, and Wikimedia Commons.
 ///
 /// Generic over `H: HttpClient` to enable testing with cached or mock HTTP.
+///
+/// All requests go through a shared pacing/retry layer: consecutive requests
+/// are spaced at least `min_request_interval` apart, and 429 responses are
+/// retried after the server's Retry-After delay (bounded attempts, capped
+/// waits). This policy belongs to the Wikimedia endpoints specifically, so it
+/// lives here and the [`HttpClient`] underneath stays generic.
 pub struct WikidataClient<H: HttpClient> {
     http: H,
+    min_request_interval: Duration,
+    last_request: tokio::sync::Mutex<Option<Instant>>,
 }
 
 impl<H: HttpClient> WikidataClient<H> {
     /// Create a new client wrapping the given HTTP implementation.
     pub fn new(http: H) -> Self {
-        Self { http }
+        Self::with_min_request_interval(http, DEFAULT_MIN_REQUEST_INTERVAL)
+    }
+
+    /// Create a client with a custom pacing interval between API requests.
+    ///
+    /// `Duration::ZERO` disables pacing; useful when replaying recorded
+    /// fixtures.
+    pub fn with_min_request_interval(http: H, min_request_interval: Duration) -> Self {
+        Self {
+            http,
+            min_request_interval,
+            last_request: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Sleep until at least `min_request_interval` has passed since the
+    /// previous request. The lock is held across the sleep so concurrent
+    /// callers queue up behind it.
+    async fn pace(&self) {
+        if self.min_request_interval.is_zero() {
+            return;
+        }
+        let mut last = self.last_request.lock().await;
+        if let Some(previous) = *last {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "deliberate inter-request pacing toward the Wikimedia API"
+            )]
+            tokio::time::sleep_until(previous + self.min_request_interval).await;
+        }
+        *last = Some(Instant::now());
+    }
+
+    /// Execute a request with pacing and rate-limit retries, returning the
+    /// response only for a success status.
+    ///
+    /// On 429 this waits out the server's Retry-After (doubling backoff when
+    /// the header is absent or unparseable) and retries, up to
+    /// [`MAX_ATTEMPTS`] tries total. Every other non-success status, and 429
+    /// once attempts run out, becomes [`WikidataError::Status`] carrying the
+    /// status, URL, and a body excerpt.
+    async fn execute_checked(&self, request: HttpRequest) -> Result<HttpResponse, WikidataError> {
+        let mut attempt: u32 = 1;
+        loop {
+            self.pace().await;
+            let response = self.http.execute(request.clone()).await?;
+
+            if response.status.is_success() {
+                return Ok(response);
+            }
+
+            if response.status == StatusCode::TOO_MANY_REQUESTS && attempt < MAX_ATTEMPTS {
+                let wait = retry_after_duration(&response.headers)
+                    .unwrap_or(FALLBACK_BACKOFF_BASE * 2u32.pow(attempt - 1))
+                    .min(MAX_RETRY_WAIT);
+                // Visible progress: these fetches run inside Nix builds,
+                // where a silent wait looks like a hang.
+                eprintln!(
+                    "wikidata: HTTP 429 from {}; waiting {}s before retry \
+                     (attempt {attempt} of {MAX_ATTEMPTS})",
+                    request.url,
+                    wait.as_secs(),
+                );
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "deliberate wait honoring the server's rate-limit Retry-After"
+                )]
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+                continue;
+            }
+
+            return Err(WikidataError::Status {
+                status: response.status.as_u16(),
+                url: request.url.to_string(),
+                body_excerpt: body_excerpt(&response.body),
+            });
+        }
+    }
+
+    /// GET a URL and parse the response body as JSON, with pacing, status
+    /// checking, and rate-limit retries.
+    async fn get_json(&self, url: Url) -> Result<Value, WikidataError> {
+        let response = self.execute_checked(HttpRequest::get(url.clone())).await?;
+        parse_json_body(&url, &response.body)
     }
 
     // =========================================================================
@@ -182,9 +344,7 @@ impl<H: HttpClient> WikidataClient<H> {
                  action=query&revids={joined}&prop=revisions&rvprop=ids%7Ccontent&format=json"
             );
 
-            let request = HttpRequest::get(Url::parse(&url)?);
-            let response = self.http.execute(request).await?;
-            let json: Value = serde_json::from_slice(&response.body)?;
+            let json = self.get_json(Url::parse(&url)?).await?;
 
             Self::extract_revision_entities(&json, &expected, &mut all_entities)?;
         }
@@ -215,9 +375,7 @@ impl<H: HttpClient> WikidataClient<H> {
                  &rvprop=ids&rvstart={timestamp}&rvdir=older&rvlimit=1&format=json"
             );
 
-            let request = HttpRequest::get(Url::parse(&url)?);
-            let response = self.http.execute(request).await?;
-            let json: Value = serde_json::from_slice(&response.body)?;
+            let json = self.get_json(Url::parse(&url)?).await?;
 
             let pages = json
                 .pointer("/query/pages")
@@ -421,7 +579,7 @@ impl<H: HttpClient> WikidataClient<H> {
         &self,
         root_type: &WikidataId,
     ) -> Result<HashSet<WikidataId>, WikidataError> {
-        sparql::fetch_subclasses(&self.http, root_type).await
+        sparql::fetch_subclasses(self, root_type).await
     }
 
     // =========================================================================
@@ -441,7 +599,7 @@ impl<H: HttpClient> WikidataClient<H> {
         &self,
         rev_id: RevisionId,
     ) -> Result<Vec<CommonsFilename>, WikidataError> {
-        commons::fetch_gallery_media_at_revision(&self.http, rev_id).await
+        commons::fetch_gallery_media_at_revision(self, rev_id).await
     }
 
     /// Resolve a Commons gallery page's revision at a specific timestamp.
@@ -459,13 +617,18 @@ impl<H: HttpClient> WikidataClient<H> {
         gallery: &str,
         timestamp: &ApiTimestamp,
     ) -> Result<Option<(PageId, RevisionId)>, WikidataError> {
-        commons::resolve_gallery_revision(&self.http, gallery, timestamp).await
+        commons::resolve_gallery_revision(self, gallery, timestamp).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+
     use super::*;
+    use crate::http::{HeaderValue, MockHttpClient};
 
     type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -526,6 +689,227 @@ mod tests {
     }
 
     // =========================================================================
+    // Rate-limit, status-check, and pacing tests (scripted MockHttpClient).
+    //
+    // Paused tokio time: sleeps auto-advance the clock, so retry waits and
+    // pacing are observable without real delays.
+    // =========================================================================
+
+    fn api_url() -> Result<Url, url::ParseError> {
+        Url::parse("https://www.wikidata.org/w/api.php")
+    }
+
+    fn response(
+        url: &Url,
+        status: StatusCode,
+        headers: HeaderMap,
+        body: &str,
+    ) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status,
+            headers,
+            body: Bytes::copy_from_slice(body.as_bytes()),
+            final_url: url.clone(),
+        })
+    }
+
+    fn retry_after_headers(seconds: &'static str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static(seconds));
+        headers
+    }
+
+    fn revisions_json(revid: u64) -> String {
+        serde_json::json!({
+            "query": { "pages": { "1": { "revisions": [{ "revid": revid }] } } }
+        })
+        .to_string()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_429_after_server_delay() -> TestResult {
+        let url = api_url()?;
+        let mock = Arc::new(MockHttpClient::with_responses(vec![
+            response(
+                &url,
+                StatusCode::TOO_MANY_REQUESTS,
+                retry_after_headers("51"),
+                "You are making too many requests to the API.",
+            ),
+            response(&url, StatusCode::OK, HeaderMap::new(), &revisions_json(456)),
+        ]));
+        let client = WikidataClient::with_min_request_interval(Arc::clone(&mock), Duration::ZERO);
+        let ts = ApiTimestamp::try_from("2022-01-03T00:00:00Z".to_string())?;
+
+        let start = Instant::now();
+        let revisions = client.resolve_revisions(&["Q243"], &ts).await?;
+
+        assert_eq!(revisions.get("Q243").copied(), Some(RevisionId(456)));
+        assert_eq!(mock.request_count(), 2, "429 should be retried once");
+        assert!(
+            start.elapsed() >= Duration::from_secs(51),
+            "retry should wait out the Retry-After delay"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_retry_after_falls_back_to_backoff() -> TestResult {
+        let url = api_url()?;
+        let mock = Arc::new(MockHttpClient::with_responses(vec![
+            response(
+                &url,
+                StatusCode::TOO_MANY_REQUESTS,
+                HeaderMap::new(),
+                "rate limited, no header",
+            ),
+            response(&url, StatusCode::OK, HeaderMap::new(), &revisions_json(456)),
+        ]));
+        let client = WikidataClient::with_min_request_interval(Arc::clone(&mock), Duration::ZERO);
+        let ts = ApiTimestamp::try_from("2022-01-03T00:00:00Z".to_string())?;
+
+        let start = Instant::now();
+        let revisions = client.resolve_revisions(&["Q243"], &ts).await?;
+
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(mock.request_count(), 2);
+        assert!(
+            start.elapsed() >= FALLBACK_BACKOFF_BASE,
+            "header-less 429 should wait the first backoff step"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_after_bounded_429_attempts() -> TestResult {
+        let url = api_url()?;
+        let scripted: Vec<_> = (0..MAX_ATTEMPTS)
+            .map(|_| {
+                response(
+                    &url,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    retry_after_headers("1"),
+                    "still rate limited",
+                )
+            })
+            .collect();
+        let mock = Arc::new(MockHttpClient::with_responses(scripted));
+        let client = WikidataClient::with_min_request_interval(Arc::clone(&mock), Duration::ZERO);
+        let ts = ApiTimestamp::try_from("2022-01-03T00:00:00Z".to_string())?;
+
+        let err = client
+            .resolve_revisions(&["Q243"], &ts)
+            .await
+            .err()
+            .ok_or("expected rate-limit exhaustion to error")?;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("429"),
+            "error should name the status: {message}"
+        );
+        assert!(
+            message.contains("still rate limited"),
+            "error should quote the body: {message}"
+        );
+        assert_eq!(mock.request_count(), MAX_ATTEMPTS as usize);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn non_success_error_carries_status_and_body_excerpt() -> TestResult {
+        let url = api_url()?;
+        let body = format!("access denied by abuse filter {}", "x".repeat(400));
+        let mock = Arc::new(MockHttpClient::with_response(response(
+            &url,
+            StatusCode::FORBIDDEN,
+            HeaderMap::new(),
+            &body,
+        )));
+        let client = WikidataClient::with_min_request_interval(Arc::clone(&mock), Duration::ZERO);
+        let ts = ApiTimestamp::try_from("2022-01-03T00:00:00Z".to_string())?;
+
+        let err = client
+            .resolve_revisions(&["Q243"], &ts)
+            .await
+            .err()
+            .ok_or("expected 403 to error")?;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("403"),
+            "error should name the status: {message}"
+        );
+        assert!(
+            message.contains("access denied by abuse filter"),
+            "error should quote the body: {message}"
+        );
+        assert!(
+            !message.contains(&"x".repeat(BODY_EXCERPT_CHARS + 1)),
+            "body excerpt should be truncated: {message}"
+        );
+        assert_eq!(
+            mock.request_count(),
+            1,
+            "statuses besides 429 fail immediately"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn json_parse_failure_quotes_body() -> TestResult {
+        let url = api_url()?;
+        let mock = Arc::new(MockHttpClient::with_response(response(
+            &url,
+            StatusCode::OK,
+            HeaderMap::new(),
+            "<html>Wikimedia Error</html>",
+        )));
+        let client = WikidataClient::with_min_request_interval(mock, Duration::ZERO);
+        let ts = ApiTimestamp::try_from("2022-01-03T00:00:00Z".to_string())?;
+
+        let err = client
+            .resolve_revisions(&["Q243"], &ts)
+            .await
+            .err()
+            .ok_or("expected HTML body to fail JSON parsing")?;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("invalid JSON"),
+            "error should name the failure: {message}"
+        );
+        assert!(
+            message.contains("Wikimedia Error"),
+            "error should quote the body: {message}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paces_consecutive_requests() -> TestResult {
+        let url = api_url()?;
+        let mock = Arc::new(MockHttpClient::with_responses(vec![
+            response(&url, StatusCode::OK, HeaderMap::new(), &revisions_json(1)),
+            response(&url, StatusCode::OK, HeaderMap::new(), &revisions_json(2)),
+        ]));
+        let interval = Duration::from_millis(200);
+        let client = WikidataClient::with_min_request_interval(Arc::clone(&mock), interval);
+        let ts = ApiTimestamp::try_from("2022-01-03T00:00:00Z".to_string())?;
+
+        let start = Instant::now();
+        let revisions = client.resolve_revisions(&["Q1", "Q2"], &ts).await?;
+
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(mock.request_count(), 2);
+        assert!(
+            start.elapsed() >= interval,
+            "second request should wait out the pacing interval"
+        );
+        Ok(())
+    }
+
+    // =========================================================================
     // VCR fixture tests — recorded from real Wikidata/Commons API responses.
     //
     // Record fixtures: cargo test -p chronoscope-integrations --features record-fixtures
@@ -543,7 +927,11 @@ mod tests {
             crate::CacheMode::Offline
         };
         let http = crate::CachingClient::new(wikidata_fixtures_dir(), mode)?;
-        Ok(WikidataClient::new(http))
+        // Replay needs no pacing; recording leans on the 429 retry loop.
+        Ok(WikidataClient::with_min_request_interval(
+            http,
+            Duration::ZERO,
+        ))
     }
 
     #[tokio::test]

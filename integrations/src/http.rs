@@ -328,6 +328,13 @@ pub trait HttpClient: Send + Sync {
     async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError>;
 }
 
+#[async_trait::async_trait]
+impl<T: HttpClient + ?Sized> HttpClient for std::sync::Arc<T> {
+    async fn execute(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.as_ref().execute(request).await
+    }
+}
+
 // ==================== ReqwestClient (Production) ====================
 
 /// Production HTTP client using reqwest with SSRF protection.
@@ -755,7 +762,21 @@ impl HttpClient for CachingClient {
                 // Write-through caching: we overwrite any existing entry.
                 // For polling APIs, this means the cache ends up with the final
                 // response (e.g., "SUCCEEDED"), which is what we want for playback.
+                //
+                // Rate-limit and server-error responses are moment-in-time
+                // artifacts; recording one would poison offline replay, so
+                // they pass through uncached.
                 let response = self.inner.execute(request.clone()).await?;
+                if response.status == StatusCode::TOO_MANY_REQUESTS
+                    || response.status.is_server_error()
+                {
+                    tracing::debug!(
+                        url = %request.url,
+                        status = %response.status,
+                        "VCR skipping cache write for transient status"
+                    );
+                    return Ok(response);
+                }
                 self.write_cache(&request, &response).await?;
                 Ok(response)
             }
@@ -773,20 +794,38 @@ impl HttpClient for CachingClient {
 /// For integration tests with realistic request/response matching, use
 /// [`CachingClient`] in offline mode with recorded fixtures instead.
 ///
-/// Requires the `testing` feature to be enabled.
-#[cfg(feature = "testing")]
+/// Available in this crate's own tests, and to dependent crates via the
+/// `testing` feature.
+#[cfg(any(test, feature = "testing"))]
 pub struct MockHttpClient {
     responses: tokio::sync::Mutex<Vec<Result<HttpResponse, HttpError>>>,
+    requests: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 impl MockHttpClient {
+    /// Create a mock client that returns the given responses, one per
+    /// request, in the order given.
+    #[must_use]
+    pub fn with_responses(mut responses: Vec<Result<HttpResponse, HttpError>>) -> Self {
+        // execute() pops from the back
+        responses.reverse();
+        Self {
+            responses: tokio::sync::Mutex::new(responses),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
     /// Create a mock client that returns the given response.
     #[must_use]
     pub fn with_response(response: Result<HttpResponse, HttpError>) -> Self {
-        Self {
-            responses: tokio::sync::Mutex::new(vec![response]),
-        }
+        Self::with_responses(vec![response])
+    }
+
+    /// Number of requests executed against this mock.
+    #[must_use]
+    pub fn request_count(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Create a mock client that returns a successful response with the given body.
@@ -835,22 +874,24 @@ impl MockHttpClient {
 }
 
 /// Error constructing a mock HTTP client.
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 #[derive(Debug, thiserror::Error)]
 #[error("failed to construct mock: {0}")]
 pub struct MockHttpError(String);
 
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 fn mock_url() -> Result<Url, MockHttpError> {
     "http://mock.test/"
         .parse()
         .map_err(|e| MockHttpError(format!("invalid mock URL: {e}")))
 }
 
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 #[async_trait::async_trait]
 impl HttpClient for MockHttpClient {
     async fn execute(&self, _request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut responses = self.responses.lock().await;
         match responses.pop() {
             Some(response) => response,

@@ -52,5 +52,5 @@ md-5 = "0.10"
 tracing = "0.1"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
 tempfile = "3"

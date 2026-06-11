@@ -33,7 +33,7 @@ let
     #   - 8 distinct Italian regions total (state-level clustering)
     curated = {
       timestamp = "2022-01-03T00:00:00Z";
-      hash = "sha256-QK1HYjDZKokoItGF6vgAUb0658zmpYB5+NjNQr6liqM=";
+      hash = "sha256-6jcOrNExkUgjUl44ncEEL1ukMYtUwu+wo8wGIDZEkvo=";
       entities = {
         # Original test set (non-Italian + Chioggia)
         "Q243" = "Eiffel Tower";

@@ -8,9 +8,8 @@ use md5::{Digest, Md5};
 use url::Url;
 use urlencoding::encode as urlencode;
 
-use super::ApiTimestamp;
-use super::WikidataError;
 use super::entity::{CommonsFilename, PageId, RevisionId};
+use super::{ApiTimestamp, WikidataClient, WikidataError};
 use crate::http::{HttpClient, HttpRequest};
 
 /// Base URL for Wikimedia Commons file uploads.
@@ -37,7 +36,7 @@ const MEDIA_EXTENSIONS: &[&str] = &[
 /// # Errors
 /// Returns an error if the API request fails or the response cannot be parsed.
 pub(super) async fn resolve_gallery_revision<H: HttpClient>(
-    http: &H,
+    client: &WikidataClient<H>,
     gallery: &str,
     timestamp: &ApiTimestamp,
 ) -> Result<Option<(PageId, RevisionId)>, WikidataError> {
@@ -52,9 +51,7 @@ pub(super) async fn resolve_gallery_revision<H: HttpClient>(
     );
     let rev_url = Url::parse(&rev_url_str)?;
 
-    let rev_request = HttpRequest::get(rev_url);
-    let rev_response = http.execute(rev_request).await?;
-    let rev_json: serde_json::Value = serde_json::from_slice(&rev_response.body)?;
+    let rev_json = client.get_json(rev_url).await?;
 
     let pages = rev_json
         .pointer("/query/pages")
@@ -97,7 +94,7 @@ pub(super) async fn resolve_gallery_revision<H: HttpClient>(
 /// # Errors
 /// Returns an error if the API request fails or the response cannot be parsed.
 pub(super) async fn fetch_gallery_media_at_revision<H: HttpClient>(
-    http: &H,
+    client: &WikidataClient<H>,
     rev_id: RevisionId,
 ) -> Result<Vec<CommonsFilename>, WikidataError> {
     // Use oldid alone — pageid and oldid cannot be combined in action=parse
@@ -108,14 +105,14 @@ pub(super) async fn fetch_gallery_media_at_revision<H: HttpClient>(
     );
     let parse_url = Url::parse(&parse_url_str)?;
 
-    let parse_request = HttpRequest::get(parse_url);
-    let parse_response = http.execute(parse_request).await?;
+    let parse_request = HttpRequest::get(parse_url.clone());
+    let parse_response = client.execute_checked(parse_request).await?;
 
     if parse_response.body.len() > MAX_RESPONSE_SIZE {
         return Err(WikidataError::ResponseTooLarge(parse_response.body.len()));
     }
 
-    let json: serde_json::Value = serde_json::from_slice(&parse_response.body)?;
+    let json = super::parse_json_body(&parse_url, &parse_response.body)?;
     Ok(extract_gallery_media(&json))
 }
 

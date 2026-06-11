@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use url::Url;
 
-use super::WikidataError;
 use super::entity::WikidataId;
+use super::{WikidataClient, WikidataError};
 use crate::http::{ACCEPT, HeaderValue, HttpClient, HttpRequest};
 
 /// Timeout for SPARQL queries (5 minutes for large queries).
@@ -18,7 +18,7 @@ const SPARQL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Returns an error if `root_type` is not a valid Q-ID, the HTTP request fails,
 /// or the JSON response cannot be parsed.
 pub(super) async fn fetch_subclasses<H: HttpClient>(
-    http: &H,
+    client: &WikidataClient<H>,
     root_type: &WikidataId,
 ) -> Result<HashSet<WikidataId>, WikidataError> {
     if !root_type.as_str().starts_with('Q') {
@@ -34,37 +34,25 @@ pub(super) async fn fetch_subclasses<H: HttpClient>(
     );
 
     let parsed_url = Url::parse(&url)?;
-    let request = HttpRequest::get(parsed_url)
+    let request = HttpRequest::get(parsed_url.clone())
         .header(
             ACCEPT,
             HeaderValue::from_static("application/sparql-results+json"),
         )
         .timeout(SPARQL_TIMEOUT);
 
-    let response = http.execute(request).await?;
-
-    if !response.status.is_success() {
-        let body = String::from_utf8_lossy(&response.body);
-        return Err(WikidataError::Api {
-            message: format!(
-                "SPARQL query failed with status {}: {body}",
-                response.status
-            ),
-        });
-    }
-
-    parse_sparql_qids(&response.body)
+    let response = client.execute_checked(request).await?;
+    let json = super::parse_json_body(&parsed_url, &response.body)?;
+    extract_qids(&json)
 }
 
-/// Parse Q-IDs from a SPARQL JSON response.
+/// Extract Q-IDs from a SPARQL JSON response.
 ///
 /// Expects the standard SPARQL Results JSON Format:
 /// ```json
 /// { "results": { "bindings": [{ "class": { "type": "uri", "value": "http://..." } }] } }
 /// ```
-fn parse_sparql_qids(body: &[u8]) -> Result<HashSet<WikidataId>, WikidataError> {
-    let json: serde_json::Value = serde_json::from_slice(body)?;
-
+fn extract_qids(json: &serde_json::Value) -> Result<HashSet<WikidataId>, WikidataError> {
     let bindings = json
         .pointer("/results/bindings")
         .and_then(|b| b.as_array())
@@ -105,8 +93,7 @@ mod tests {
             }
         });
 
-        let body = serde_json::to_vec(&json)?;
-        let qids = parse_sparql_qids(&body)?;
+        let qids = extract_qids(&json)?;
         assert!(qids.contains("Q41176"));
         assert!(qids.contains("Q811979"));
         // P31 is a property, not Q-prefixed, should be excluded
@@ -123,8 +110,7 @@ mod tests {
             }
         });
 
-        let body = serde_json::to_vec(&json)?;
-        let qids = parse_sparql_qids(&body)?;
+        let qids = extract_qids(&json)?;
         assert!(qids.is_empty());
         Ok(())
     }
@@ -132,8 +118,7 @@ mod tests {
     #[test]
     fn test_parse_sparql_qids_missing_bindings() -> Result<(), Box<dyn std::error::Error>> {
         let json = serde_json::json!({ "results": {} });
-        let body = serde_json::to_vec(&json)?;
-        let result = parse_sparql_qids(&body);
+        let result = extract_qids(&json);
         assert!(result.is_err());
         Ok(())
     }
