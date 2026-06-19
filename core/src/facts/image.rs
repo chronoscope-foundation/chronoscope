@@ -38,10 +38,10 @@
 //!   distinct claims surface as conflicts.
 
 use chronoscope_macros::grammar_type;
-use oxilangtag::LanguageTag;
 use url::Url;
 
 use crate::date::UncertainDate;
+use crate::facts::citations::Language;
 
 /// Image-cluster fact. Claims about the image's bytes and the
 /// underlying artifact those bytes represent.
@@ -77,9 +77,8 @@ pub enum Fact<ImgId> {
         image: ImgId,
         /// The author's name as the source recorded it.
         name: String,
-        /// BCP-47 language tag for the name.
-        #[schemars(with = "String")]
-        language: LanguageTag<String>,
+        /// BCP-47 language tag for the name, in canonical form.
+        language: Language,
     },
     /// When the underlying artifact was created — when the photograph
     /// was originally taken, when the painting was painted, when the

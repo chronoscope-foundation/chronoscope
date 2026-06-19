@@ -1,15 +1,14 @@
 use super::*;
 use chrono::TimeZone;
-use oxilangtag::LanguageTag;
 use url::Url;
 
 use crate::date::{DatePrecision, UncertainDate};
 use crate::facts::assertions::FactualAssertion;
 use crate::facts::assertions::JudgmentAssertion;
-use crate::facts::attribute::{self, NameType};
+use crate::facts::attribute::{self, NameText, NameType};
 use crate::facts::bookend;
-use crate::facts::citations::{Excerpt, ExternalSource, FactualCitation};
-use crate::facts::citations::{JudgmentSource, Justification};
+use crate::facts::citations::{Excerpt, ExternalReference, ExternalSource, FactualCitation};
+use crate::facts::citations::{JudgmentSource, Justification, Language};
 use crate::facts::identity;
 use crate::facts::ids::UserId;
 use crate::facts::lifecycle::{DamageCause, DurationalRole, MoveMethod};
@@ -22,8 +21,8 @@ use crate::facts::submit::{
 use crate::location::{LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
-type TestBundle = SubmitBundle<MemoryEntityId, MemoryEventId, MemoryImageId>;
+pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
+pub(super) type TestBundle = SubmitBundle<MemoryEntityId, MemoryEventId, MemoryImageId>;
 type SubmitErrorBatch = NonEmptyVec<SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>>;
 
 /// A page limit large enough to fit every fact the backlink tests submit.
@@ -45,7 +44,7 @@ fn submit_batch(err: MemSubmitCommitError) -> Result<SubmitErrorBatch, Box<dyn s
 // --- helpers ---
 
 /// A fixed UTC timestamp for test fixtures.
-fn fixed_time() -> chrono::DateTime<chrono::Utc> {
+pub(super) fn fixed_time() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc
         .with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
         .single()
@@ -62,13 +61,26 @@ fn sample_citation() -> Result<FactualCitation, Box<dyn std::error::Error>> {
     Ok(FactualCitation::new(source, excerpts)?)
 }
 
-fn name_fact(entity_idx: usize, name: &str) -> Result<SubmitFact, Box<dyn std::error::Error>> {
-    let language = LanguageTag::parse("en".to_owned())?;
+pub(super) fn name_fact(
+    entity_idx: usize,
+    name: &str,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    name_fact_in_language(entity_idx, name, "en")
+}
+
+/// A `Name` fact with an explicit language tag, canonicalized at
+/// construction.
+pub(super) fn name_fact_in_language(
+    entity_idx: usize,
+    name: &str,
+    language: &str,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    let language = Language::new(language)?;
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Attribute {
             fact: attribute::Fact::Name {
                 entity: EntityIdx(entity_idx),
-                name: name.to_owned(),
+                name: NameText::new(name),
                 language,
                 name_type: NameType::Common,
                 valid_from: None,
@@ -79,24 +91,114 @@ fn name_fact(entity_idx: usize, name: &str) -> Result<SubmitFact, Box<dyn std::e
     })
 }
 
-fn construction_started_fact(entity_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
-    let bound = UncertainDate::with_precision(
-        chrono::NaiveDate::from_ymd_opt(1700, 1, 1).ok_or("date")?,
-        DatePrecision::Year,
-    )?;
+pub(super) fn construction_started_fact(
+    entity_idx: usize,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    construction_started_in(entity_idx, 1700)
+}
+
+/// A `Construction::Started` fact with a year-precision bound.
+pub(super) fn construction_started_in(
+    entity_idx: usize,
+    year: i32,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
             fact: bookend::Fact::Started {
                 entity: EntityIdx(entity_idx),
-                bound,
+                bound: year_date(year)?,
             },
         },
         citation: sample_citation()?,
     })
 }
 
+/// A `Demolition::Completed` fact with a year-precision bound.
+pub(super) fn demolition_completed_in(
+    entity_idx: usize,
+    year: i32,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Demolition {
+            fact: bookend::Fact::Completed {
+                entity: EntityIdx(entity_idx),
+                bound: year_date(year)?,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// A `Construction::Location` fact placing the entity at a named place.
+pub(super) fn construction_location_in(
+    entity_idx: usize,
+    place: &str,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: bookend::Fact::Location {
+                entity: EntityIdx(entity_idx),
+                location: UnresolvedLocation::Reference(LocationReference::NamedPlace {
+                    name: place.to_owned(),
+                }),
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// An `ExternalReference` attribute fact pointing the entity at a Wikidata
+/// QID.
+pub(super) fn external_reference_fact(
+    entity_idx: usize,
+    qid: u64,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Attribute {
+            fact: attribute::Fact::ExternalReference {
+                entity: EntityIdx(entity_idx),
+                reference: ExternalReference::Wikidata {
+                    qid: crate::ids::WikidataEntityId::new(qid),
+                },
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// An `image::Fact::Source` fact sourcing the image from `url`.
+pub(super) fn image_source_fact(
+    image_idx: usize,
+    url: &str,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Image {
+            fact: crate::facts::image::Fact::Source {
+                image: ImageIdx(image_idx),
+                url: Url::parse(url)?,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// A `SameEntity` judgment between two entity indices.
+pub(super) fn same_entity_fact(
+    a: usize,
+    b: usize,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Identity {
+            fact: identity::Fact::same_entity(EntityIdx(a), EntityIdx(b))?,
+        },
+        citation: judgment_citation()?,
+    })
+}
+
 /// An event-touching `PointDate` fact for the given event index.
-fn event_point_date_fact(event_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+pub(super) fn event_point_date_fact(
+    event_idx: usize,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     let bound = UncertainDate::with_precision(
         chrono::NaiveDate::from_ymd_opt(1850, 1, 1).ok_or("date")?,
         DatePrecision::Year,
@@ -154,14 +256,14 @@ fn captured_date_fact(image_idx: usize) -> Result<SubmitFact, Box<dyn std::error
     })
 }
 
-fn user_author() -> Result<CommitAuthor, Box<dyn std::error::Error>> {
+pub(super) fn user_author() -> Result<CommitAuthor, Box<dyn std::error::Error>> {
     Ok(CommitAuthor::User(UserId::new("alice")))
 }
 
 /// A `RetractCommit` meta-fact targeting `target`. References no indices
 /// (the target is a `CommitId`), so a bundle carrying only this fact
 /// declares no entities / events / images.
-fn retract_commit_fact(
+pub(super) fn retract_commit_fact(
     target: crate::facts::ids::CommitId,
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Meta {
@@ -508,7 +610,7 @@ async fn roundtrip_small_commit_through_fact_lookup() -> TestResult {
         return Err("expected Name attribute".into());
     };
     assert_eq!(entity, &resolved_entity);
-    assert_eq!(name, "Pantheon");
+    assert_eq!(name.as_str(), "Pantheon");
     assert_eq!(*name_type, NameType::Common);
 
     Ok(())
@@ -592,10 +694,10 @@ async fn local_decls_mint_distinct_newly_minted_ids() -> TestResult {
 
 /// A commit's entity-touching facts must appear in a `walk_entities(All,
 /// ...)` page — the walk-conformance check every backend owes. `#[ignore]`d
-/// while the in-memory `walk_*` returns an empty stub; flips green once
-/// `walk_entities` reads the fact bag.
+/// while the non-keyed `walk_entities` arms return an empty stub; flips
+/// green once the `All` arm reads the fact bag.
 #[tokio::test]
-#[ignore = "walk_entities is stubbed to an empty page in this backend; this pins the walk-returns-submitted-facts contract and flips green once walk_* is implemented (a backend stubbing/lying about walk support fails this check)"]
+#[ignore = "the non-keyed walk_entities arms (All / InBbox / InTimeRange / InBboxAndTimeRange) are stubbed to an empty page; only the keyed ByName / ByExternalReference arms read the fact bag. This pins the walk-returns-submitted-facts contract and flips green once the All arm is implemented (a backend stubbing/lying about walk support fails this check)"]
 async fn walk_entities_returns_submitted_entity_facts() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
@@ -757,10 +859,10 @@ async fn all_facts_about_event_returns_facts_mentioning_it() -> TestResult {
 }
 
 /// Image analogue of [`walk_entities_returns_submitted_entity_facts`].
-/// `#[ignore]`d while stubbed; flips green once `walk_images` reads the
-/// fact bag.
+/// `#[ignore]`d while the non-keyed `walk_images` arms return an empty
+/// stub; flips green once the `All` arm reads the fact bag.
 #[tokio::test]
-#[ignore = "walk_images is stubbed to an empty page; this pins the walk-returns-submitted-facts contract and flips green once walk_images reads the fact bag"]
+#[ignore = "the non-keyed walk_images arms (All / InBbox / InTimeRange / InBboxAndTimeRange) are stubbed to an empty page; only the keyed BySourceUrl arm reads the fact bag. This pins the walk-returns-submitted-facts contract and flips green once the All arm is implemented"]
 async fn walk_images_returns_submitted_image_facts() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
@@ -840,14 +942,12 @@ async fn all_facts_about_image_returns_facts_mentioning_it() -> TestResult {
 //
 // These exercise the `*_class` / `*_representative` view methods. Each
 // commits a `Same*` fact between two freshly-minted ids, so the stored
-// fact carries two distinct ids in one class. The stubs answer as if every
-// id were a singleton — contradicting a two-member class below.
+// fact carries two distinct ids in one class. The event reads are still the
+// singleton stubs, so the event tests stay ignored.
 
 /// After a `SameEntity` fact links two ids, `entity_class` of either member
-/// must contain both. `#[ignore]`d while the stub returns the singleton;
-/// flips green once the class read unions the equivalence facts.
+/// must contain both.
 #[tokio::test]
-#[ignore = "entity_class is stubbed to the singleton {member}; this pins that a SameEntity-linked pair shares a two-member class and flips green once the union-find read is implemented"]
 async fn entity_class_contains_both_same_entity_members() -> TestResult {
     let store = MemoryFactStore::new();
     let identity_pair = identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?;
@@ -889,11 +989,8 @@ async fn entity_class_contains_both_same_entity_members() -> TestResult {
 
 /// A `SameEntity`-linked pair must resolve to one representative whichever
 /// member is queried, and it must be a class member agreeing with
-/// `entity_class(..).representative`. `#[ignore]`d while the stub returns
-/// `member`; flips green once representative selection reads the
-/// equivalence facts.
+/// `entity_class(..).representative`.
 #[tokio::test]
-#[ignore = "entity_representative is stubbed to return member itself; this pins that both SameEntity members share one canonical representative and flips green once representative selection is implemented"]
 async fn entity_representative_is_canonical_across_same_entity_members() -> TestResult {
     let store = MemoryFactStore::new();
     let identity_pair = identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?;
@@ -1053,10 +1150,7 @@ async fn event_representative_is_canonical_across_same_event_members() -> TestRe
 }
 
 /// Image analogue of [`entity_class_contains_both_same_entity_members`].
-/// `#[ignore]`d while stubbed; flips green once the class read unions the
-/// equivalence facts.
 #[tokio::test]
-#[ignore = "image_class is stubbed to the singleton {member}; this pins that a SameArtifact-linked pair shares a two-member class and flips green once the union-find read is implemented"]
 async fn image_class_contains_both_same_artifact_members() -> TestResult {
     let store = MemoryFactStore::new();
     let identity_pair = identity::Fact::same_artifact(ImageIdx(0), ImageIdx(1))?;
@@ -1098,10 +1192,7 @@ async fn image_class_contains_both_same_artifact_members() -> TestResult {
 
 /// Image analogue of
 /// [`entity_representative_is_canonical_across_same_entity_members`].
-/// `#[ignore]`d while stubbed; flips green once representative selection
-/// reads the equivalence facts.
 #[tokio::test]
-#[ignore = "image_representative is stubbed to return member itself; this pins that both SameArtifact members share one canonical representative and flips green once representative selection is implemented"]
 async fn image_representative_is_canonical_across_same_artifact_members() -> TestResult {
     let store = MemoryFactStore::new();
     let identity_pair = identity::Fact::same_artifact(ImageIdx(0), ImageIdx(1))?;
@@ -1161,6 +1252,51 @@ async fn image_representative_is_canonical_across_same_artifact_members() -> Tes
 // `observation::Fact::Spatial` — and which feeds the canonical `Topological`
 // walk isn't fixed yet. The two choices yield different pins, so pinning
 // either risks asserting the wrong contract.
+
+// --- canonical-form wire boundary ---
+//
+// Commits are content-addressed over their producer-form bytes, so the wire
+// boundary rejects non-canonical values: anything that deserializes
+// re-serializes byte-identically.
+
+/// Deserializing a non-NFC name errors, and the error names the canonical
+/// form.
+#[test]
+fn deserializing_non_nfc_name_is_rejected() -> TestResult {
+    let result = serde_json::from_str::<NameText>("\"Panthe\\u0301on\"");
+    let Err(e) = result else {
+        return Err(format!("expected a non-NFC rejection, got {result:?}").into());
+    };
+    assert!(
+        e.to_string().contains("Panth\u{e9}on"),
+        "the rejection must name the canonical form; got {e}"
+    );
+    Ok(())
+}
+
+/// Deserializing a non-canonical language tag errors, and the error names
+/// the canonical form.
+#[test]
+fn deserializing_non_canonical_language_tag_is_rejected() -> TestResult {
+    let result = serde_json::from_str::<Language>("\"en-us\"");
+    let Err(e) = result else {
+        return Err(format!("expected a non-canonical rejection, got {result:?}").into());
+    };
+    assert!(
+        e.to_string().contains("en-US"),
+        "the rejection must name the canonical form; got {e}"
+    );
+    Ok(())
+}
+
+/// A canonical language tag deserializes and re-serializes byte-identically.
+#[test]
+fn canonical_language_tag_round_trips_byte_identically() -> TestResult {
+    let wire = "\"en-US\"";
+    let tag: Language = serde_json::from_str(wire)?;
+    assert_eq!(serde_json::to_string(&tag)?, wire);
+    Ok(())
+}
 
 // --- index-reference error paths ---
 
@@ -2031,7 +2167,7 @@ async fn retracted_by_reports_lowest_still_effective_retractor() -> TestResult {
 // --- cluster-rule + accumulation fixtures ---
 
 /// A single-commit bundle of all-`Local` declarations.
-fn local_bundle(
+pub(super) fn local_bundle(
     entities: usize,
     events: usize,
     images: usize,
@@ -2048,6 +2184,17 @@ fn local_bundle(
     })
 }
 
+/// Commit `bundle`, returning its `SubmitResult` or failing the test if it
+/// was rejected.
+pub(super) async fn commit_result(
+    store: &MemoryFactStore,
+    bundle: TestBundle,
+) -> Result<MemSubmitResult, Box<dyn std::error::Error>> {
+    Ok(commit_facts(store, bundle)
+        .await
+        .map_err(|e| format!("expected the commit to be accepted, got {e:?}"))?)
+}
+
 /// Commit `bundle`, failing the test if it was rejected.
 async fn commit_ok(store: &MemoryFactStore, bundle: TestBundle) -> TestResult {
     commit_facts(store, bundle)
@@ -2057,7 +2204,7 @@ async fn commit_ok(store: &MemoryFactStore, bundle: TestBundle) -> TestResult {
 }
 
 /// Commit `bundle`, returning its rejection batch or failing if it was accepted.
-async fn commit_err(
+pub(super) async fn commit_err(
     store: &MemoryFactStore,
     bundle: TestBundle,
 ) -> Result<SubmitErrorBatch, Box<dyn std::error::Error>> {
@@ -2119,14 +2266,14 @@ fn name_window_fact(
     valid_from: Option<i32>,
     valid_to: Option<i32>,
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
-    let language = LanguageTag::parse("en".to_owned())?;
+    let language = Language::new("en")?;
     let valid_from = valid_from.map(year_date).transpose()?;
     let valid_to = valid_to.map(year_date).transpose()?;
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Attribute {
             fact: attribute::Fact::Name {
                 entity: EntityIdx(entity_idx),
-                name: "name".to_owned(),
+                name: NameText::new("name"),
                 language,
                 name_type: NameType::Common,
                 valid_from,

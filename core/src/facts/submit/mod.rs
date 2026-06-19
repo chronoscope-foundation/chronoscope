@@ -8,8 +8,9 @@
 //! Key shapes:
 //!
 //! - [`Commit`] — the top-level bundle.
-//! - [`Decl<Id>`] — generic over the id type. [`Decl::Local`] resolves via
-//!   match-or-mint; [`Decl::Existing`] adopts a known id.
+//! - [`Decl<Id>`] — generic over the id type. [`Decl::Local`] mints a fresh
+//!   id (a matcher match is asserted as an identity judgment, not adopted);
+//!   [`Decl::Existing`] adopts a known id.
 //! - [`EntityIdx`] / [`EventIdx`] / [`ImageIdx`] — bundle-local index
 //!   newtypes that prevent intermixing.
 //! - [`SubmitFact`] — one variant per assertion category, pairing the
@@ -21,6 +22,7 @@
 //! with the index newtypes instead of persistent ids.
 
 pub mod error;
+pub mod matcher;
 pub mod pipeline;
 pub mod result;
 
@@ -80,8 +82,11 @@ pub struct ImageIdx(pub usize);
 /// A declaration in a submission bundle.
 ///
 /// Generic over the id type so one enum covers entity, event, and image
-/// declarations. `Existing` adopts a previously-minted id; `Local` asks the
-/// store to match-or-mint.
+/// declarations. `Existing` adopts a previously-minted id — producer
+/// knowledge, a hard identity claim. `Local` always mints fresh; when the
+/// store's matcher recognises the subject, it asserts the identity as a
+/// machine-authored judgment in a companion commit instead of adopting, so
+/// one retraction undoes a bad match.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[serde(bound(
@@ -95,8 +100,8 @@ pub enum Decl<Id> {
         /// The persistent id to adopt.
         id: Id,
     },
-    /// Resolve via match-or-mint: adopt a matched existing id, or mint a
-    /// fresh one when there's no unambiguous match.
+    /// Mint a fresh id; any matcher match is asserted as an identity
+    /// judgment rather than adopted.
     Local,
 }
 
@@ -276,6 +281,17 @@ where
     /// fails [`CommitId::parse`] (can't happen for a 64-char SHA-256 hex, but
     /// surfaced as a typed error rather than a panic).
     pub fn id(&self) -> Result<CommitId, serde_json::Error> {
+        let canonical = self.canonical_jcs()?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        CommitId::parse(hex::encode(hasher.finalize()))
+            .map_err(|e| serde_json::Error::custom(e.to_string()))
+    }
+
+    /// The JCS bytes the [`CommitId`] hashes — the canonical hash-input
+    /// projection ([`CommitHashView`]).
+    pub(crate) fn canonical_jcs(&self) -> Result<String, serde_json::Error> {
         let view = CommitHashView {
             author: self.author.canonical_string(),
             entities: &self.entities,
@@ -284,12 +300,7 @@ where
             images: &self.images,
             recorded_at: self.recorded_at.trunc_subsecs(0).to_rfc3339(),
         };
-        let canonical = serde_jcs::to_string(&view)?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.as_bytes());
-        CommitId::parse(hex::encode(hasher.finalize()))
-            .map_err(|e| serde_json::Error::custom(e.to_string()))
+        serde_jcs::to_string(&view)
     }
 }
 
@@ -297,12 +308,11 @@ where
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use oxilangtag::LanguageTag;
     use url::Url;
 
     use crate::facts::assertions::FactualAssertion;
-    use crate::facts::attribute::{self, NameType};
-    use crate::facts::citations::{Excerpt, ExternalSource, FactualCitation};
+    use crate::facts::attribute::{self, NameText, NameType};
+    use crate::facts::citations::{Excerpt, ExternalSource, FactualCitation, Language};
     use crate::facts::ids::{IngesterRunId, UserId};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -326,12 +336,12 @@ mod tests {
     /// A `Name` fact on `EntityIdx(0)` — a stable `SubmitFact` for the hash
     /// determinism / order-insensitivity tests.
     fn named_fact(name: &str) -> Result<SubmitFact, Box<dyn std::error::Error>> {
-        let language = LanguageTag::parse("en".to_owned())?;
+        let language = Language::new("en")?;
         Ok(SubmitFact::Factual {
             assertion: FactualAssertion::Attribute {
                 fact: attribute::Fact::Name {
                     entity: EntityIdx(0),
-                    name: name.to_owned(),
+                    name: NameText::new(name),
                     language,
                     name_type: NameType::Common,
                     valid_from: None,

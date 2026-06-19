@@ -1,19 +1,23 @@
 //! In-memory fact-store backend.
 //!
-//! For tests and proptests. Not optimised — linear scans where the DB
-//! backends use indexes. The same [`FactStore`] properties hold here.
+//! For tests and proptests. Aims to be simple and correct, holding the same
+//! [`FactStore`] properties as the DB backends.
 //!
 //! Surface:
 //!
-//! - `submit_commit` resolves [`Decl::Local`] via match-or-mint and passes
-//!   [`Decl::Existing`] through.
+//! - `submit_commit` mints a fresh id per [`Decl::Local`] and passes
+//!   [`Decl::Existing`] through. A matcher match is recorded as a
+//!   `SameEntity` / `SameArtifact` judgment in a machine-authored companion
+//!   commit, persisted under the same lock right after the producer commit.
 //! - `fact()` returns `Active` / `Retracted` / `Future` / `Unknown`. A
 //!   resolved slot reads `Retracted` when an effective retractor exists at the
 //!   view's snapshot, resolved by scanning the fact bag.
 //! - `next_fact_id` / `no_later_than` / `now` clock surface.
-//! - The per-subject view methods (`walk_*`, `*_representative`, `*_class`,
-//!   `*_subgraph`) are stubs: a subject is its own representative, its class a
-//!   singleton, its subgraph a single node, the walks an empty page.
+//! - Per-subject view reads: `all_facts_about_*` page the backlink indexes;
+//!   the entity / image `*_representative` / `*_class` reads union-find over
+//!   the visible `SameEntity` / `SameArtifact` facts; `walk_entities` over
+//!   `ByName` / `ByExternalReference` and `walk_images` over `BySourceUrl`
+//!   scan the fact bag.
 //!
 //! ## Concrete id types
 //!
@@ -38,11 +42,12 @@
 //! in owned state and the drain runs on the same task — so the held lock never
 //! serialises real I/O.
 //!
-//! `Inner` is mutated only at [`apply_pending`], at the end of `submit_commit`,
-//! under the held lock; everything before accumulates in the [`UnionSource`]'s
-//! pending state. So dropping the [`MemoryTx`] without applying — a validator
-//! rejection, an early return, a panic — leaves `Inner` untouched, with no
-//! rollback path because nothing was mutated.
+//! `Inner` is mutated only at [`apply_pending`] — once per persisted commit
+//! (the producer's, then the matcher's companion when something matched) —
+//! under the held lock; everything before accumulates in the
+//! [`UnionSource`]'s pending state. So dropping the [`MemoryTx`] without
+//! applying — a validator rejection, an early return, a panic — leaves
+//! `Inner` untouched, with no rollback path because nothing was mutated.
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -50,26 +55,36 @@ use std::marker::PhantomData;
 
 use async_lock::{Mutex, MutexGuard};
 
+use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::facts::assertions::MetaAssertion;
+use crate::facts::assertions::{JudgmentAssertion, MetaAssertion};
+use crate::facts::citations::JudgmentSource;
+use crate::facts::identity;
 use crate::facts::ids::{CommitId, FactId};
 use crate::facts::schema::{
     EdgeSubgraph, EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem,
+    normalize_name,
 };
 use crate::facts::store::{
     EntityView, EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf,
     SubmitCommitError,
 };
-use crate::facts::submit::pipeline::{
-    self, MatchOutcome, substitute_facts_accumulating, validate_submit,
-};
+use crate::facts::submit::matcher::{self, MatchOutcome};
+use crate::facts::submit::pipeline::{substitute_facts_accumulating, validate_submit};
 use crate::facts::submit::{
-    Commit, Decl, EntityIdx, EventIdx, FactLookup, ImageIdx, Resolution, ResolutionOrigin,
-    StoredCommit, StoredFact, SubjectKind, SubmitError, SubmitResult,
+    Commit, CommitAuthor, Decl, EntityIdx, EventIdx, FactLookup, ImageIdx, Resolution,
+    ResolutionOrigin, StoredCommit, StoredFact, SubjectKind, SubmitError, SubmitFact, SubmitResult,
 };
 use crate::nonempty::NonEmptyVec;
+
+mod equiv;
+mod scan;
+
+use self::scan::{
+    entity_named, entity_referenced, image_sourced_from, same_artifact_edge, same_entity_edge,
+};
 
 // ============================================================================
 // Concrete id types
@@ -128,16 +143,16 @@ impl std::fmt::Display for MemoryImageId {
 /// [`SubmitError`](crate::facts::submit::SubmitError) inside
 /// [`SubmitCommitError::Submit`] instead.
 ///
-/// Holds the message as a `String` because [`serde_json::Error`] isn't
-/// `Eq`/`PartialEq` and this type is value-compared in tests; the `From` impl
-/// preserves the rendering.
+/// Holds the rendered message as a `String` (each construction site supplies
+/// its context prefix) because [`serde_json::Error`] isn't `Eq`/`PartialEq`
+/// and this type is value-compared in tests.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("commit hash encoding failed: {0}")]
+#[error("{0}")]
 pub struct MemoryError(String);
 
 impl From<serde_json::Error> for MemoryError {
     fn from(e: serde_json::Error) -> Self {
-        Self(e.to_string())
+        Self(format!("commit hash encoding failed: {e}"))
     }
 }
 
@@ -491,6 +506,20 @@ impl<'a> ReadCore<'a> {
         }
         FactPage { items, next_cursor }
     }
+
+    /// Every fact below the snapshot with its id — the committed half then the
+    /// pending half, ids ascending.
+    ///
+    /// `i as u64` is lossless: a `usize` index fits in `u64` under the crate's
+    /// `size_of::<usize>() <= size_of::<u64>()` invariant.
+    fn visible_facts(&self) -> impl Iterator<Item = (FactId, &MemStoredFact)> {
+        self.committed
+            .iter()
+            .chain(self.pending.iter())
+            .enumerate()
+            .map(|(i, fact)| (FactId::new(i as u64), fact))
+            .take_while(|(fid, _)| fid.get() < self.snapshot.get())
+    }
 }
 
 /// "Lend me a [`ReadCore`]" — abstracts where the committed + pending slices
@@ -783,29 +812,60 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
         &self,
         member: &MemoryEntityId,
     ) -> Result<MemoryEntityId, MemoryError> {
-        Ok(*member)
+        let member = *member;
+        Ok(self
+            .with_core(move |core| core.equiv_class(member, same_entity_edge).representative)
+            .await)
     }
 
     async fn entity_class(
         &self,
         member: &MemoryEntityId,
     ) -> Result<EquivClass<MemoryEntityId>, MemoryError> {
-        Ok(EquivClass {
-            representative: *member,
-            members: std::iter::once(*member).collect(),
-        })
+        let member = *member;
+        Ok(self
+            .with_core(move |core| core.equiv_class(member, same_entity_edge))
+            .await)
     }
 
     async fn walk_entities<'b>(
         &'b self,
-        _stream: &'b EntityStream<'b>,
-        _cursor: FactId,
-        _limit: std::num::NonZeroUsize,
+        stream: &'b EntityStream<'b>,
+        cursor: FactId,
+        limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEntityId>, MemoryError> {
-        Ok(FactPage {
-            items: Vec::new(),
-            next_cursor: None,
-        })
+        match stream {
+            EntityStream::ByName { name, language } => {
+                let needle = normalize_name(name);
+                Ok(self
+                    .with_core(move |core| {
+                        core.walk_matching(
+                            cursor,
+                            limit,
+                            |fact| entity_named(fact, &needle, language),
+                            same_entity_edge,
+                        )
+                    })
+                    .await)
+            }
+            EntityStream::ByExternalReference { reference } => Ok(self
+                .with_core(move |core| {
+                    core.walk_matching(
+                        cursor,
+                        limit,
+                        |fact| entity_referenced(fact, reference),
+                        same_entity_edge,
+                    )
+                })
+                .await),
+            EntityStream::All
+            | EntityStream::InBbox(_)
+            | EntityStream::InTimeRange(_)
+            | EntityStream::InBboxAndTimeRange { .. } => Ok(FactPage {
+                items: Vec::new(),
+                next_cursor: None,
+            }),
+        }
     }
 
     async fn all_facts_about_entity(
@@ -896,29 +956,47 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
         &self,
         member: &MemoryImageId,
     ) -> Result<MemoryImageId, MemoryError> {
-        Ok(*member)
+        let member = *member;
+        Ok(self
+            .with_core(move |core| core.equiv_class(member, same_artifact_edge).representative)
+            .await)
     }
 
     async fn image_class(
         &self,
         member: &MemoryImageId,
     ) -> Result<EquivClass<MemoryImageId>, MemoryError> {
-        Ok(EquivClass {
-            representative: *member,
-            members: std::iter::once(*member).collect(),
-        })
+        let member = *member;
+        Ok(self
+            .with_core(move |core| core.equiv_class(member, same_artifact_edge))
+            .await)
     }
 
     async fn walk_images<'b>(
         &'b self,
-        _stream: &'b ImageStream<'b>,
-        _cursor: FactId,
-        _limit: std::num::NonZeroUsize,
+        stream: &'b ImageStream<'b>,
+        cursor: FactId,
+        limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryImageId>, MemoryError> {
-        Ok(FactPage {
-            items: Vec::new(),
-            next_cursor: None,
-        })
+        match stream {
+            ImageStream::BySourceUrl { url } => Ok(self
+                .with_core(move |core| {
+                    core.walk_matching(
+                        cursor,
+                        limit,
+                        |fact| image_sourced_from(fact, url),
+                        same_artifact_edge,
+                    )
+                })
+                .await),
+            ImageStream::All
+            | ImageStream::InBbox(_)
+            | ImageStream::InTimeRange(_)
+            | ImageStream::InBboxAndTimeRange { .. } => Ok(FactPage {
+                items: Vec::new(),
+                next_cursor: None,
+            }),
+        }
     }
 
     async fn all_facts_about_image(
@@ -1110,249 +1188,35 @@ impl FactStore for MemoryFactStore {
         Self: 'brand,
         'brand: 'tx,
     {
-        let commit_id = commit
-            .id()
-            .map_err(|e| SubmitCommitError::Backend(e.into()))?;
-
-        // Hold the lock across the whole sequence so the reads and the insert see
-        // one snapshot. The `Send` guard spans the `.await`s below; the matcher
+        // Hold the lock across the whole sequence — the producer commit and
+        // any matcher companion — so the reads and the inserts see one
+        // snapshot. The `Send` guard spans the `.await`s below; the matcher
         // and validator resolve immediately, so the lock never serialises I/O.
         let mut inner_guard = self.lock_inner().await;
 
-        // A re-submit of a known `CommitId` returns the cached result with
-        // `previously_committed: true`, doing no mints, inserts, or rule
-        // re-evaluation.
-        if let Some(cached) = inner_guard.submit_results.get(&commit_id) {
-            return Ok(SubmitResult {
-                previously_committed: true,
-                ..cached.clone()
-            });
+        let recorded_at = commit.recorded_at;
+        let (mut result, matched) = submit_locked(&mut inner_guard, commit).await?;
+        if result.previously_committed {
+            return Ok(result);
         }
 
-        // All reads / mints / pushes go through the union source, so `Inner` is
-        // touched only at apply.
-        let mut source = UnionSource::from_inner(&inner_guard);
-
-        // Reject unresolvable references before minting, so a malformed bundle
-        // burns no ids. A fact pointing at a missing declaration can't resolve, so
-        // collect every out-of-range index and every unknown `Decl::Existing` id
-        // into one batch.
-        let (entity_refs, event_refs, image_refs) = collect_idx_refs(&commit);
-        let mut resolvability_errors: Vec<
-            SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>,
-        > = Vec::new();
-        resolvability_errors.extend(check_refs_in_range(
-            &entity_refs,
-            commit.entities.len(),
-            |idx| idx.0,
-            |idx, decl_count| SubmitError::EntityIdxOutOfRange { idx, decl_count },
-        ));
-        resolvability_errors.extend(check_refs_in_range(
-            &event_refs,
-            commit.events.len(),
-            |idx| idx.0,
-            |idx, decl_count| SubmitError::EventIdxOutOfRange { idx, decl_count },
-        ));
-        resolvability_errors.extend(check_refs_in_range(
-            &image_refs,
-            commit.images.len(),
-            |idx| idx.0,
-            |idx, decl_count| SubmitError::ImageIdxOutOfRange { idx, decl_count },
-        ));
-        for (i, decl) in commit.entities.iter().enumerate() {
-            if let Decl::Existing { id } = decl
-                && !source.entity_known(id)
-            {
-                resolvability_errors.push(SubmitError::UnknownExistingEntity {
-                    decl_position: EntityIdx(i),
-                });
+        // The matcher's judgments become a companion commit, persisted under
+        // the held lock right after the producer commit. It runs the full
+        // pipeline; a rejection can only mean a store bug, so it bubbles as
+        // this submit's error. The companion's decls are all `Existing`, so
+        // its own matched set is empty and the nesting stops here.
+        if let Some(companion) = build_companion_commit(recorded_at, &matched)? {
+            let (companion_result, _) = submit_locked(&mut inner_guard, companion).await?;
+            if !companion_result.previously_committed {
+                inner_guard
+                    .submit_results
+                    .insert(companion_result.commit_id.clone(), companion_result.clone());
             }
-        }
-        for (i, decl) in commit.events.iter().enumerate() {
-            if let Decl::Existing { id } = decl
-                && !source.event_known(id)
-            {
-                resolvability_errors.push(SubmitError::UnknownExistingEvent {
-                    decl_position: EventIdx(i),
-                });
-            }
-        }
-        for (i, decl) in commit.images.iter().enumerate() {
-            if let Decl::Existing { id } = decl
-                && !source.image_known(id)
-            {
-                resolvability_errors.push(SubmitError::UnknownExistingImage {
-                    decl_position: ImageIdx(i),
-                });
-            }
-        }
-        if let Ok(batch) = NonEmptyVec::try_from_vec(resolvability_errors) {
-            return Err(SubmitCommitError::Submit(batch));
+            result.companion_commit_id = Some(companion_result.commit_id);
         }
 
-        // Resolve each Local decl to a match or a mint. Events are never matched,
-        // so each Local event decl gets a synthesised mint outcome. The `&source`
-        // borrows end before the `&mut source` mints below.
-        let entity_outcomes =
-            pipeline::match_entities(&commit.entities, &commit.facts, &source).await;
-        let image_outcomes = pipeline::match_images(&commit.images, &commit.facts, &source).await;
-        let event_outcomes: HashMap<EventIdx, MatchOutcome<MemoryEventId>> = commit
-            .events
-            .iter()
-            .enumerate()
-            .filter(|(_, d)| matches!(d, Decl::Local))
-            .map(|(i, _)| {
-                (
-                    EventIdx(i),
-                    MatchOutcome::Mint {
-                        candidates: Vec::new(),
-                    },
-                )
-            })
-            .collect();
-
-        // Mints land in the source's pending counters; `Inner` stays untouched.
-        let entity_resolutions = resolve_decls(
-            &commit.entities,
-            &entity_outcomes,
-            EntityIdx,
-            |s| s.mint_entity(),
-            &mut source,
-        );
-        let event_resolutions = resolve_decls(
-            &commit.events,
-            &event_outcomes,
-            EventIdx,
-            |s| s.mint_event(),
-            &mut source,
-        );
-        let image_resolutions = resolve_decls(
-            &commit.images,
-            &image_outcomes,
-            ImageIdx,
-            |s| s.mint_image(),
-            &mut source,
-        );
-
-        // Build substitution maps over the resolved ids.
-        let entity_sub_map: HashMap<EntityIdx, MemoryEntityId> = entity_resolutions
-            .iter()
-            .map(|(idx, res)| (*idx, res.id))
-            .collect();
-        let event_sub_map: HashMap<EventIdx, MemoryEventId> = event_resolutions
-            .iter()
-            .map(|(idx, res)| (*idx, res.id))
-            .collect();
-        let image_sub_map: HashMap<ImageIdx, MemoryImageId> = image_resolutions
-            .iter()
-            .map(|(idx, res)| (*idx, res.id))
-            .collect();
-
-        // Substitute, accumulating: the reject batch begins with any substitution
-        // self-loops, and successfully substituted facts proceed to the rules.
-        let (stored_facts, mut validation_errors) = substitute_facts_accumulating(
-            &commit.facts,
-            &entity_sub_map,
-            &event_sub_map,
-            &image_sub_map,
-        );
-
-        // Stage the substituted facts onto the pending list, fixing their order;
-        // `apply_pending` assigns their FactIds at drain.
-        for fact in &stored_facts {
-            source.push_fact(fact.clone());
-        }
-
-        // Unused declarations are checked post-mint, but the mint rollback is
-        // implicit: a non-empty reject batch means apply never runs, so the
-        // source's mints drop and no counter is burned.
-        validation_errors.extend(check_all_decls_referenced(
-            &entity_refs,
-            commit.entities.len(),
-            EntityIdx,
-            |position| SubmitError::UnusedDeclaration {
-                kind: SubjectKind::Entity,
-                position,
-            },
-        ));
-        validation_errors.extend(check_all_decls_referenced(
-            &event_refs,
-            commit.events.len(),
-            EventIdx,
-            |position| SubmitError::UnusedDeclaration {
-                kind: SubjectKind::Event,
-                position,
-            },
-        ));
-        validation_errors.extend(check_all_decls_referenced(
-            &image_refs,
-            commit.images.len(),
-            ImageIdx,
-            |position| SubmitError::UnusedDeclaration {
-                kind: SubjectKind::Image,
-                position,
-            },
-        ));
-
-        // Two declarations of one kind resolving to the same persistent id is
-        // non-canonical: it breaks content-address dedup, and a self-pair would
-        // otherwise slip through. One error per duplicated id.
-        validation_errors.extend(
-            duplicate_resolved_ids(&entity_resolutions)
-                .into_iter()
-                .map(|id| SubmitError::DuplicateEntityDecl { id }),
-        );
-        validation_errors.extend(
-            duplicate_resolved_ids(&event_resolutions)
-                .into_iter()
-                .map(|id| SubmitError::DuplicateEventDecl { id }),
-        );
-        validation_errors.extend(
-            duplicate_resolved_ids(&image_resolutions)
-                .into_iter()
-                .map(|id| SubmitError::DuplicateImageDecl { id }),
-        );
-
-        // Run the rule validator (meta + cluster rules) over the source, folding
-        // its batch in. Only a backend read failure short-circuits; a rule
-        // violation joins the batch.
-        validation_errors.extend(
-            validate_submit(&stored_facts, &source)
-                .await
-                .map_err(SubmitCommitError::Backend)?,
-        );
-
-        // Reject the whole batch if any rule fired. Drop the source without
-        // applying — the mints roll back implicitly.
-        if let Ok(batch) = NonEmptyVec::try_from_vec(validation_errors) {
-            return Err(SubmitCommitError::Submit(batch));
-        }
-
-        // `apply_pending` is the sole assigner of the FactIds, returning them in
-        // push order.
-        let pending = source.into_pending();
-        let assigned_fact_ids = apply_pending(&mut inner_guard, pending, commit_id.clone());
-
-        inner_guard.commits.insert(
-            commit_id.clone(),
-            StoredCommit {
-                commit_id: commit_id.clone(),
-                author: commit.author.clone(),
-                recorded_at: commit.recorded_at,
-                fact_ids: assigned_fact_ids.clone(),
-            },
-        );
-
-        let result = SubmitResult {
-            commit_id,
-            previously_committed: false,
-            fact_ids: assigned_fact_ids,
-            entities: entity_resolutions,
-            events: event_resolutions,
-            images: image_resolutions,
-        };
-
-        // Cache the result for idempotent re-submission.
+        // Cache after the companion id is attached, so the idempotent
+        // re-submission path reports the same companion.
         inner_guard
             .submit_results
             .insert(result.commit_id.clone(), result.clone());
@@ -1381,15 +1245,457 @@ impl FactStore for MemoryFactStore {
 }
 
 // ============================================================================
-// Decl resolution (match-or-mint, single pass per id kind)
+// Locked submit pipeline (shared by the producer and companion commits)
+// ============================================================================
+
+/// One matcher-asserted identity: the fresh id a matched decl minted, the
+/// existing subject it matched, and the anchor facts behind the hit.
+struct MatchedPair<Id> {
+    fresh: Id,
+    matched: Id,
+    basis: BTreeSet<FactId>,
+}
+
+/// Every identity the matcher asserted during one locked submit, plus the
+/// view snapshot it judged at. Feeds [`build_companion_commit`]; both lists
+/// are empty when nothing matched.
+struct AssertedIdentities {
+    /// Exclusive upper bound of the matcher's view — the committed watermark
+    /// before this commit's facts staged. Every basis id is below it.
+    snapshot: FactId,
+    entities: Vec<MatchedPair<MemoryEntityId>>,
+    images: Vec<MatchedPair<MemoryImageId>>,
+}
+
+/// Run the full submit pipeline for one commit against the held `Inner`:
+/// content-address dedup, reference checks, matcher, decl resolution,
+/// substitution, rule validation, and apply. Returns the result plus the
+/// identity pairs the matcher asserted, which the caller turns into the
+/// companion commit. The result is not cached here — the caller caches after
+/// attaching the companion id, so the dedup path replays the full result.
+async fn submit_locked(
+    inner: &mut Inner,
+    commit: MemCommit,
+) -> Result<(MemSubmitResult, AssertedIdentities), MemSubmitCommitError> {
+    let commit_id = commit
+        .id()
+        .map_err(|e| SubmitCommitError::Backend(e.into()))?;
+
+    // A re-submit of a known `CommitId` returns the cached result with
+    // `previously_committed: true`, doing no mints, inserts, or rule
+    // re-evaluation.
+    if let Some(cached) = inner.submit_results.get(&commit_id) {
+        return Ok((
+            SubmitResult {
+                previously_committed: true,
+                ..cached.clone()
+            },
+            AssertedIdentities {
+                snapshot: inner.next_fact_id(),
+                entities: Vec::new(),
+                images: Vec::new(),
+            },
+        ));
+    }
+
+    // All reads / mints / pushes go through the union source, so `Inner` is
+    // touched only at apply. The matcher runs before any fact stages, so the
+    // snapshot captured here — the committed watermark — is the view every
+    // matcher judgment cites.
+    let mut source = UnionSource::from_inner(inner);
+    let matcher_snapshot = CoreSource::snapshot(&source);
+
+    // Reject unresolvable references before minting, so a malformed bundle
+    // burns no ids. A fact pointing at a missing declaration can't resolve, so
+    // collect every out-of-range index and every unknown `Decl::Existing` id
+    // into one batch.
+    let (entity_refs, event_refs, image_refs) = collect_idx_refs(&commit);
+    let mut resolvability_errors: Vec<SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>> =
+        Vec::new();
+    resolvability_errors.extend(check_refs_in_range(
+        &entity_refs,
+        commit.entities.len(),
+        |idx| idx.0,
+        |idx, decl_count| SubmitError::EntityIdxOutOfRange { idx, decl_count },
+    ));
+    resolvability_errors.extend(check_refs_in_range(
+        &event_refs,
+        commit.events.len(),
+        |idx| idx.0,
+        |idx, decl_count| SubmitError::EventIdxOutOfRange { idx, decl_count },
+    ));
+    resolvability_errors.extend(check_refs_in_range(
+        &image_refs,
+        commit.images.len(),
+        |idx| idx.0,
+        |idx, decl_count| SubmitError::ImageIdxOutOfRange { idx, decl_count },
+    ));
+    for (i, decl) in commit.entities.iter().enumerate() {
+        if let Decl::Existing { id } = decl
+            && !source.entity_known(id)
+        {
+            resolvability_errors.push(SubmitError::UnknownExistingEntity {
+                decl_position: EntityIdx(i),
+            });
+        }
+    }
+    for (i, decl) in commit.events.iter().enumerate() {
+        if let Decl::Existing { id } = decl
+            && !source.event_known(id)
+        {
+            resolvability_errors.push(SubmitError::UnknownExistingEvent {
+                decl_position: EventIdx(i),
+            });
+        }
+    }
+    for (i, decl) in commit.images.iter().enumerate() {
+        if let Decl::Existing { id } = decl
+            && !source.image_known(id)
+        {
+            resolvability_errors.push(SubmitError::UnknownExistingImage {
+                decl_position: ImageIdx(i),
+            });
+        }
+    }
+    if let Ok(batch) = NonEmptyVec::try_from_vec(resolvability_errors) {
+        return Err(SubmitCommitError::Submit(batch));
+    }
+
+    // Judge each Local decl against the view; every Local mints below, and
+    // a match becomes an identity judgment in the companion commit. Events
+    // are never matched, so each Local event decl gets a synthesised
+    // unmatched outcome. The `&source` borrows end before the `&mut source`
+    // mints.
+    let entity_outcomes = matcher::match_entities(&commit.entities, &commit.facts, &source)
+        .await
+        .map_err(SubmitCommitError::Backend)?;
+    let image_outcomes = matcher::match_images(&commit.images, &commit.facts, &source)
+        .await
+        .map_err(SubmitCommitError::Backend)?;
+    let event_outcomes: HashMap<EventIdx, MatchOutcome<MemoryEventId>> = commit
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| matches!(d, Decl::Local))
+        .map(|(i, _)| {
+            (
+                EventIdx(i),
+                MatchOutcome::Unmatched {
+                    candidates: Vec::new(),
+                },
+            )
+        })
+        .collect();
+
+    // Mints land in the source's pending counters; `Inner` stays untouched.
+    let entity_resolutions = resolve_decls(
+        &commit.entities,
+        &entity_outcomes,
+        EntityIdx,
+        |s| s.mint_entity(),
+        &mut source,
+    );
+    let event_resolutions = resolve_decls(
+        &commit.events,
+        &event_outcomes,
+        EventIdx,
+        |s| s.mint_event(),
+        &mut source,
+    );
+    let image_resolutions = resolve_decls(
+        &commit.images,
+        &image_outcomes,
+        ImageIdx,
+        |s| s.mint_image(),
+        &mut source,
+    );
+
+    // The matcher's verdicts, paired with the fresh ids they minted —
+    // the payload of the companion commit.
+    let matched = AssertedIdentities {
+        snapshot: matcher_snapshot,
+        entities: collect_matched_pairs(&entity_resolutions, &entity_outcomes)?,
+        images: collect_matched_pairs(&image_resolutions, &image_outcomes)?,
+    };
+
+    // Build substitution maps over the resolved ids.
+    let entity_sub_map: HashMap<EntityIdx, MemoryEntityId> = entity_resolutions
+        .iter()
+        .map(|(idx, res)| (*idx, res.id))
+        .collect();
+    let event_sub_map: HashMap<EventIdx, MemoryEventId> = event_resolutions
+        .iter()
+        .map(|(idx, res)| (*idx, res.id))
+        .collect();
+    let image_sub_map: HashMap<ImageIdx, MemoryImageId> = image_resolutions
+        .iter()
+        .map(|(idx, res)| (*idx, res.id))
+        .collect();
+
+    // Substitute, accumulating: the reject batch begins with any substitution
+    // self-loops, and successfully substituted facts proceed to the rules.
+    let (stored_facts, mut validation_errors) = substitute_facts_accumulating(
+        &commit.facts,
+        &entity_sub_map,
+        &event_sub_map,
+        &image_sub_map,
+    );
+
+    // Stage the substituted facts onto the pending list, fixing their order;
+    // `apply_pending` assigns their FactIds at drain.
+    for fact in &stored_facts {
+        source.push_fact(fact.clone());
+    }
+
+    // Unused declarations are checked post-mint, but the mint rollback is
+    // implicit: a non-empty reject batch means apply never runs, so the
+    // source's mints drop and no counter is burned.
+    validation_errors.extend(check_all_decls_referenced(
+        &entity_refs,
+        commit.entities.len(),
+        EntityIdx,
+        |position| SubmitError::UnusedDeclaration {
+            kind: SubjectKind::Entity,
+            position,
+        },
+    ));
+    validation_errors.extend(check_all_decls_referenced(
+        &event_refs,
+        commit.events.len(),
+        EventIdx,
+        |position| SubmitError::UnusedDeclaration {
+            kind: SubjectKind::Event,
+            position,
+        },
+    ));
+    validation_errors.extend(check_all_decls_referenced(
+        &image_refs,
+        commit.images.len(),
+        ImageIdx,
+        |position| SubmitError::UnusedDeclaration {
+            kind: SubjectKind::Image,
+            position,
+        },
+    ));
+
+    // Two `Existing` declarations of one kind naming the same persistent
+    // id is non-canonical: it breaks content-address dedup, and a
+    // self-pair would otherwise slip through. One error per duplicated id.
+    validation_errors.extend(
+        duplicate_existing_decl_ids(&entity_resolutions)
+            .into_iter()
+            .map(|id| SubmitError::DuplicateEntityDecl { id }),
+    );
+    validation_errors.extend(
+        duplicate_existing_decl_ids(&event_resolutions)
+            .into_iter()
+            .map(|id| SubmitError::DuplicateEventDecl { id }),
+    );
+    validation_errors.extend(
+        duplicate_existing_decl_ids(&image_resolutions)
+            .into_iter()
+            .map(|id| SubmitError::DuplicateImageDecl { id }),
+    );
+
+    // Run the rule validator (meta + cluster rules) over the source, folding
+    // its batch in. Only a backend read failure short-circuits; a rule
+    // violation joins the batch.
+    validation_errors.extend(
+        validate_submit(&stored_facts, &source)
+            .await
+            .map_err(SubmitCommitError::Backend)?,
+    );
+
+    // Reject the whole batch if any rule fired. Drop the source without
+    // applying — the mints roll back implicitly.
+    if let Ok(batch) = NonEmptyVec::try_from_vec(validation_errors) {
+        return Err(SubmitCommitError::Submit(batch));
+    }
+
+    // `apply_pending` is the sole assigner of the FactIds, returning them in
+    // push order.
+    let pending = source.into_pending();
+    let assigned_fact_ids = apply_pending(inner, pending, commit_id.clone());
+
+    inner.commits.insert(
+        commit_id.clone(),
+        StoredCommit {
+            commit_id: commit_id.clone(),
+            author: commit.author.clone(),
+            recorded_at: commit.recorded_at,
+            fact_ids: assigned_fact_ids.clone(),
+        },
+    );
+
+    let result = SubmitResult {
+        commit_id,
+        previously_committed: false,
+        fact_ids: assigned_fact_ids,
+        entities: entity_resolutions,
+        events: event_resolutions,
+        images: image_resolutions,
+        companion_commit_id: None,
+    };
+
+    Ok((result, matched))
+}
+
+/// Zip one kind's resolutions with its matcher outcomes, yielding the
+/// `(fresh, matched, basis)` triple of every matched decl.
+///
+/// A `MatchedExisting` resolution and a `Matched` outcome are two sides of one
+/// fact — the resolver writes the former exactly when it reads the latter — so
+/// the two subsets must agree at every index. A divergence is a resolver bug
+/// (a join over them would silently lose both sides of a symmetric
+/// difference), so the keysets are checked here rather than `filter_map`ped
+/// over. The raw maps legitimately differ — `resolutions` also holds
+/// `Decl::Existing` entries, `outcomes` only `Local` ones — so only the
+/// matched subsets are compared.
+fn collect_matched_pairs<Id, Idx>(
+    resolutions: &HashMap<Idx, Resolution<Id>>,
+    outcomes: &HashMap<Idx, MatchOutcome<Id>>,
+) -> Result<Vec<MatchedPair<Id>>, MemSubmitCommitError>
+where
+    Id: Clone + Ord,
+    Idx: Copy + Ord + std::hash::Hash + std::fmt::Debug,
+{
+    let matched_resolutions: BTreeSet<Idx> = resolutions
+        .iter()
+        .filter(|(_, res)| matches!(res.origin, ResolutionOrigin::MatchedExisting { .. }))
+        .map(|(idx, _)| *idx)
+        .collect();
+    let matched_outcomes: BTreeSet<Idx> = outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, MatchOutcome::Matched { .. }))
+        .map(|(idx, _)| *idx)
+        .collect();
+    if matched_resolutions != matched_outcomes {
+        let resolved_not_matched: Vec<Idx> = matched_resolutions
+            .difference(&matched_outcomes)
+            .copied()
+            .collect();
+        let matched_not_resolved: Vec<Idx> = matched_outcomes
+            .difference(&matched_resolutions)
+            .copied()
+            .collect();
+        return Err(SubmitCommitError::Backend(MemoryError(format!(
+            "matcher outcomes and decl resolutions disagree on which decls matched; \
+             resolved MatchedExisting without a Matched outcome: {resolved_not_matched:?}; \
+             Matched outcome without a MatchedExisting resolution: {matched_not_resolved:?}"
+        ))));
+    }
+
+    let mut pairs: Vec<MatchedPair<Id>> = resolutions
+        .iter()
+        .filter_map(|(idx, res)| {
+            let ResolutionOrigin::MatchedExisting { matched } = &res.origin else {
+                return None;
+            };
+            let Some(MatchOutcome::Matched { basis, .. }) = outcomes.get(idx) else {
+                return None;
+            };
+            Some(MatchedPair {
+                fresh: res.id.clone(),
+                matched: matched.clone(),
+                basis: basis.clone(),
+            })
+        })
+        .collect();
+    // Each matched decl minted its own fresh id, so this orders the pairs
+    // deterministically for the companion's decl list.
+    pairs.sort_by(|a, b| a.fresh.cmp(&b.fresh));
+    Ok(pairs)
+}
+
+/// Build the matcher's companion commit: one machine-authored identity
+/// judgment per matched decl, each citing the anchor facts behind the match
+/// and the snapshot it was judged at. `recorded_at` borrows the producer
+/// commit's timestamp so the companion's content address is a function of the
+/// producer bundle and the matched state, not of wall-clock at persist time.
+/// `None` when nothing matched.
+fn build_companion_commit(
+    recorded_at: DateTime<Utc>,
+    matched: &AssertedIdentities,
+) -> Result<Option<MemCommit>, MemSubmitCommitError> {
+    if matched.entities.is_empty() && matched.images.is_empty() {
+        return Ok(None);
+    }
+    let (process, version) = matcher::matcher_identity();
+    let derivation = |basis: &BTreeSet<FactId>| JudgmentSource::Derivation {
+        process: process.clone(),
+        version: version.clone(),
+        basis: basis.clone(),
+        snapshot: matched.snapshot,
+    };
+
+    let mut entities: Vec<MemoryEntityId> = Vec::new();
+    let mut images: Vec<MemoryImageId> = Vec::new();
+    let mut facts: BTreeSet<SubmitFact> = BTreeSet::new();
+    for pair in &matched.entities {
+        let fresh = EntityIdx(intern(&mut entities, pair.fresh));
+        let existing = EntityIdx(intern(&mut entities, pair.matched));
+        let fact = identity::Fact::same_entity(fresh, existing).map_err(companion_bug)?;
+        facts.insert(SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity { fact },
+            citation: derivation(&pair.basis),
+        });
+    }
+    for pair in &matched.images {
+        let fresh = ImageIdx(intern(&mut images, pair.fresh));
+        let existing = ImageIdx(intern(&mut images, pair.matched));
+        let fact = identity::Fact::same_artifact(fresh, existing).map_err(companion_bug)?;
+        facts.insert(SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity { fact },
+            citation: derivation(&pair.basis),
+        });
+    }
+
+    Ok(Some(Commit {
+        author: CommitAuthor::Analyzer { process, version },
+        recorded_at,
+        entities: entities
+            .into_iter()
+            .map(|id| Decl::Existing { id })
+            .collect(),
+        events: Vec::new(),
+        images: images.into_iter().map(|id| Decl::Existing { id }).collect(),
+        facts,
+    }))
+}
+
+/// The declaration slot of `id`, appending a new slot on first sight. The
+/// matched pairs arrive sorted, so slot assignment is deterministic; a
+/// subject shared across pairs (two decls matching one entity) declares once.
+fn intern<Id: Copy + PartialEq>(decls: &mut Vec<Id>, id: Id) -> usize {
+    match decls.iter().position(|d| *d == id) {
+        Some(i) => i,
+        None => {
+            decls.push(id);
+            decls.len() - 1
+        }
+    }
+}
+
+/// A companion-commit construction failure is a store bug — the inputs are
+/// fresh mints paired with pre-existing subjects under a fixed analyzer
+/// identity — so it surfaces loudly as a backend error.
+fn companion_bug<E: std::fmt::Display>(e: E) -> MemSubmitCommitError {
+    SubmitCommitError::Backend(MemoryError(format!(
+        "companion commit construction failed: {e}"
+    )))
+}
+
+// ============================================================================
+// Decl resolution (single pass per id kind)
 // ============================================================================
 
 /// Resolve every declaration of one kind to a persistent id.
 ///
-/// [`Decl::Existing(id)`] passes through as `DeclaredExisting`. For
-/// [`Decl::Local`] the matcher outcome at the matching `Idx` selects an adopted
-/// match (`MatchedExisting`, no mint) or a fresh mint (empty vs non-empty
-/// candidates distinguishing `NewlyMinted` from `Ambiguous`).
+/// [`Decl::Existing(id)`] passes through as `DeclaredExisting`. Every
+/// [`Decl::Local`] mints fresh; the matcher outcome at the matching `Idx`
+/// selects the origin — `MatchedExisting` carrying the matched subject (the
+/// identity judgment lands in the companion commit), or `NewlyMinted` /
+/// `Ambiguous` by the candidate count.
 ///
 /// Matcher contract: one entry per `Decl::Local` keyed by `Idx`, none for
 /// `Decl::Existing`. A missing `Local` entry is treated as a no-match rather
@@ -1416,14 +1722,19 @@ where
                 origin: ResolutionOrigin::DeclaredExisting,
             },
             Decl::Local => match outcomes.get(&idx) {
-                Some(MatchOutcome::Matched(id)) => Resolution {
-                    id: id.clone(),
-                    origin: ResolutionOrigin::MatchedExisting,
-                },
+                Some(MatchOutcome::Matched { id, .. }) => {
+                    let fresh = mint(source);
+                    Resolution {
+                        id: fresh,
+                        origin: ResolutionOrigin::MatchedExisting {
+                            matched: id.clone(),
+                        },
+                    }
+                }
                 // A missing Local outcome is treated as
-                // `Mint { candidates: vec![] }`: mint fresh with no
+                // `Unmatched { candidates: vec![] }`: mint fresh with no
                 // candidates rather than drop the decl and corrupt the map.
-                Some(MatchOutcome::Mint { candidates }) => {
+                Some(MatchOutcome::Unmatched { candidates }) => {
                     let id = mint(source);
                     let origin = NonEmptyVec::try_from_vec(candidates.clone()).map_or(
                         ResolutionOrigin::NewlyMinted,
@@ -1522,16 +1833,21 @@ where
         .collect()
 }
 
-/// The persistent ids that more than one declaration resolved to, sorted and
-/// deduped. Empty when every declaration of the kind resolved to a distinct id.
-/// The order is deterministic so a rejected commit's batch is reproducible.
-fn duplicate_resolved_ids<Idx, Id>(resolutions: &HashMap<Idx, Resolution<Id>>) -> Vec<Id>
+/// The persistent ids that more than one `Decl::Existing` declaration named,
+/// sorted and deduped. Local decls always mint distinct fresh ids, so a
+/// producer naming one id in two decl slots is the only way declarations of
+/// one kind can collide. The order is deterministic so a rejected commit's
+/// batch is reproducible.
+fn duplicate_existing_decl_ids<Idx, Id>(resolutions: &HashMap<Idx, Resolution<Id>>) -> Vec<Id>
 where
     Id: Clone + Ord,
 {
     let mut seen: BTreeSet<Id> = BTreeSet::new();
     let mut duplicated: BTreeSet<Id> = BTreeSet::new();
     for res in resolutions.values() {
+        if !matches!(res.origin, ResolutionOrigin::DeclaredExisting) {
+            continue;
+        }
         if !seen.insert(res.id.clone()) {
             duplicated.insert(res.id.clone());
         }
@@ -1539,6 +1855,8 @@ where
     duplicated.into_iter().collect()
 }
 
+#[cfg(test)]
+mod matcher_tests;
 #[cfg(test)]
 mod tests;
 

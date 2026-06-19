@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use super::{EntityIdx, EventIdx, ImageIdx};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use crate::facts::citations::{FactualCitation, JudgmentSource, MetaSource};
-use crate::facts::ids::{CommitId, FactId, IngesterRunId, UserId};
+use crate::facts::ids::{
+    AnalyzerProcess, AnalyzerVersion, CommitId, FactId, IngesterRunId, UserId,
+};
 use crate::nonempty::NonEmptyVec;
 
 // ============================================================================
@@ -29,27 +31,39 @@ use crate::nonempty::NonEmptyVec;
 /// was arrived at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution<Id> {
-    /// The id the declaration resolved to (matched, ambiguous-fallback
-    /// mint, or freshly minted).
+    /// The id the declaration resolved to: the producer-named id for a
+    /// `Decl::Existing`, a fresh mint for every `Decl::Local`.
     pub id: Id,
     /// How the id was arrived at.
     pub origin: ResolutionOrigin<Id>,
 }
 
-/// How a declaration resolved to its id.
+/// How a declaration resolved to its id. Every variant resolves to one id;
+/// they differ in provenance — whether the producer named the id, and whether
+/// the matcher additionally asserts a sameness judgment against an existing
+/// subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolutionOrigin<Id> {
-    /// No matcher candidates — store minted a fresh id.
+    /// A `Decl::Local` the matcher found no single subject for — a fresh id,
+    /// no sameness asserted.
     NewlyMinted,
     /// The producer named the id directly (a `Decl::Existing(id)`); no
     /// matching happened. The id is in the surrounding [`Resolution`].
     DeclaredExisting,
     /// The store matched a `Decl::Local` to one existing subject from its
-    /// anchors. Unlike [`Self::DeclaredExisting`], the store identified the
-    /// subject. The id is in the surrounding [`Resolution`].
-    MatchedExisting,
-    /// More than one matcher candidate — the store minted a fresh id (see
-    /// [`Resolution::id`]) and reports the existing candidates here.
+    /// anchors. The id in the surrounding [`Resolution`] is the decl's fresh
+    /// id; the matcher additionally asserts the identity with `matched` as a
+    /// machine-authored judgment in the companion commit
+    /// ([`SubmitResult::companion_commit_id`]), so retracting that one edge
+    /// undoes a bad match.
+    MatchedExisting {
+        /// The existing subject the matcher identified — the class
+        /// representative the anchors hit.
+        matched: Id,
+    },
+    /// A `Decl::Local` whose anchors hit more than one existing subject — a
+    /// fresh id (see [`Resolution::id`]), the ambiguous candidates reported
+    /// here, no sameness asserted.
     Ambiguous {
         /// The existing subjects that matched the anchors. Excludes the
         /// minted fallback id (which is in [`Resolution::id`]).
@@ -84,6 +98,11 @@ pub struct SubmitResult<EntId, EvtId, ImgId> {
     pub events: HashMap<EventIdx, Resolution<EvtId>>,
     /// Per-declaration image resolution map.
     pub images: HashMap<ImageIdx, Resolution<ImgId>>,
+    /// The matcher's companion commit: machine-authored identity judgments
+    /// linking each matched decl's fresh id to the subject it matched,
+    /// persisted immediately after this commit under the same lock. `None`
+    /// when no decl matched.
+    pub companion_commit_id: Option<CommitId>,
 }
 
 // ============================================================================
@@ -92,11 +111,12 @@ pub struct SubmitResult<EntId, EvtId, ImgId> {
 
 /// Who recorded a commit.
 ///
-/// Canonical hash form: `user:<UserId>` / `ingester:<IngesterRunId>`, via
-/// `canonical_string`.
+/// Canonical hash form via `canonical_string`: `user:<UserId>` /
+/// `ingester:<IngesterRunId>` / `analyzer:<process>@<version>`.
 ///
 /// JSON shape is externally tagged: `{ "user": "<UserId>" }` /
-/// `{ "ingester": "<IngesterRunId>" }`. (serde doesn't support
+/// `{ "ingester": "<IngesterRunId>" }` /
+/// `{ "analyzer": { "process": .., "version": .. } }`. (serde doesn't support
 /// internally-tagged tuple variants, and `canonical_string` is the source
 /// of truth for hashing regardless of the wire form.)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -106,6 +126,15 @@ pub enum CommitAuthor {
     User(UserId),
     /// An automated ingester run.
     Ingester(IngesterRunId),
+    /// A machine analysis process — a versioned algorithm authoring
+    /// judgments derived from store facts, e.g. the submit matcher's
+    /// companion commits.
+    Analyzer {
+        /// The process that authored the commit.
+        process: AnalyzerProcess,
+        /// The build of the process that ran.
+        version: AnalyzerVersion,
+    },
 }
 
 impl CommitAuthor {
@@ -114,6 +143,7 @@ impl CommitAuthor {
         match self {
             Self::User(user) => format!("user:{user}"),
             Self::Ingester(run) => format!("ingester:{run}"),
+            Self::Analyzer { process, version } => format!("analyzer:{process}@{version}"),
         }
     }
 }

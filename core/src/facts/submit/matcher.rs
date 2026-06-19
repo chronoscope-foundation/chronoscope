@@ -1,0 +1,257 @@
+//! Submit-time matching for declared subjects.
+//!
+//! [`match_entities`] / [`match_images`] judge each [`Decl::Local`] against
+//! the unified view of committed + in-flight state, returning
+//! [`MatchOutcome::Matched`] when a single existing subject is identified and
+//! [`MatchOutcome::Unmatched`] otherwise. A match is the matcher's identity
+//! judgment — submit records it as a `SameEntity` / `SameArtifact` fact in a
+//! machine-authored companion commit, citing the anchor facts in
+//! [`MatchOutcome::Matched::basis`]. Async for the same reason as the
+//! validator in [`pipeline`](super::pipeline): a SQL backend `.await`s its
+//! index reads inside the transaction holding the commit.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
+
+use url::Url;
+
+use super::pipeline::{DRAIN_PAGE, drain_pages};
+use super::{Decl, EntityIdx, ImageIdx, SubmitFact};
+use crate::facts::assertions::FactualAssertion;
+use crate::facts::citations::{ExternalReference, Language};
+use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId};
+use crate::facts::schema::{EntityStream, FactPage, ImageStream, normalize_name};
+use crate::facts::store::{EntityView, FactStore, ImageView, StoredFactOf};
+use crate::facts::{attribute, image};
+
+// ============================================================================
+// Analyzer identity
+// ============================================================================
+
+/// The submit matcher's process name — the author of its companion commits
+/// and the `process` of their derivation citations.
+const MATCHER_PROCESS: &str = "submit-matcher";
+
+/// The submit matcher's analyzer identity: [`MATCHER_PROCESS`] at this
+/// build's [`BUILD_VERSION`](crate::BUILD_VERSION).
+pub fn matcher_identity() -> (AnalyzerProcess, AnalyzerVersion) {
+    (
+        AnalyzerProcess::new(MATCHER_PROCESS),
+        AnalyzerVersion::new(crate::BUILD_VERSION),
+    )
+}
+
+// ============================================================================
+// MatchOutcome
+// ============================================================================
+
+/// What the matcher concluded for one declaration: whether it identified a
+/// single existing subject the decl should be classed with.
+///
+/// One entry per [`Decl::Local`]; [`Decl::Existing`] bypasses the matcher.
+/// The decl mints a fresh id regardless; the outcome decides whether submit
+/// also asserts a sameness judgment against an existing subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchOutcome<Id> {
+    /// Exactly one existing subject identified. Submit records the identity
+    /// with `id` as a machine-authored judgment in the companion commit,
+    /// citing `basis`.
+    Matched {
+        /// The existing subject — the class representative the anchors hit.
+        id: Id,
+        /// The anchor facts that produced the hit, from the winning key
+        /// family (an external-ref hit never cites name rows).
+        basis: BTreeSet<FactId>,
+    },
+    /// No single existing subject identified, so no sameness judgment.
+    /// `candidates` is empty for no match, non-empty when several existing
+    /// ids matched the anchors (flowing to
+    /// [`ResolutionOrigin::Ambiguous`](super::result::ResolutionOrigin::Ambiguous)).
+    Unmatched {
+        /// Existing ids that matched the anchors. Empty = no match,
+        /// non-empty = ambiguous.
+        candidates: Vec<Id>,
+    },
+}
+
+// ============================================================================
+// match_entities / match_images
+// ============================================================================
+
+/// Match each [`Decl::Local`] entity declaration against the unified view of
+/// committed + in-flight state.
+///
+/// Exact-match only: a decl's anchors are the [`attribute::Fact::ExternalReference`]
+/// values and normalized `(name, language)` pairs its bundle facts carry, and
+/// its candidates are the existing entities sharing an anchor, each
+/// canonicalised to its `SameEntity` class representative. An external-ref hit
+/// is a hard precedence over a name hit — a reference is an authoritative
+/// cross-system identity, a shared name is weaker evidence. Exactly one
+/// distinct candidate is [`MatchOutcome::Matched`]; zero or several are
+/// [`MatchOutcome::Unmatched`], the candidate list feeding
+/// [`ResolutionOrigin::Ambiguous`](super::result::ResolutionOrigin::Ambiguous).
+/// A decl with no anchor facts is unmatched.
+///
+/// Returns a `HashMap<EntityIdx, MatchOutcome<EntityId>>` keyed by decl
+/// position. [`Decl::Existing`] decls produce no entry; `submit_commit`
+/// handles them directly.
+///
+/// Async so a backend's indexes can `.await` view reads; a failed read
+/// surfaces as `Err(S::Error)` rather than reading as "no match", which on a
+/// transient backend failure would leave the decl unclassed from the existing
+/// subject it should have matched.
+pub async fn match_entities<S: FactStore, V: EntityView<S>>(
+    decls: &[Decl<S::EntityId>],
+    facts: &BTreeSet<SubmitFact>,
+    view: &V,
+) -> Result<HashMap<EntityIdx, MatchOutcome<S::EntityId>>, S::Error> {
+    // Anchor values keyed by decl position, one pass over the bundle.
+    let mut references: HashMap<EntityIdx, BTreeSet<&ExternalReference>> = HashMap::new();
+    let mut names: HashMap<EntityIdx, BTreeSet<(String, &Language)>> = HashMap::new();
+    for fact in facts {
+        let SubmitFact::Factual {
+            assertion: FactualAssertion::Attribute { fact },
+            ..
+        } = fact
+        else {
+            continue;
+        };
+        match fact {
+            attribute::Fact::Name {
+                entity,
+                name,
+                language,
+                ..
+            } => {
+                // Every NameType anchors — a historical name still names the
+                // entity.
+                names
+                    .entry(*entity)
+                    .or_default()
+                    .insert((normalize_name(name.as_str()), language));
+            }
+            attribute::Fact::ExternalReference { entity, reference } => {
+                references.entry(*entity).or_default().insert(reference);
+            }
+            attribute::Fact::Relationship { .. } => {}
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (i, decl) in decls.iter().enumerate() {
+        if !matches!(decl, Decl::Local) {
+            continue;
+        }
+        let idx = EntityIdx(i);
+        let mut candidates: BTreeMap<S::EntityId, BTreeSet<FactId>> = BTreeMap::new();
+        for reference in references.get(&idx).into_iter().flatten() {
+            let stream = EntityStream::ByExternalReference { reference };
+            collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
+                view.walk_entities(&stream, cursor, DRAIN_PAGE)
+            })
+            .await?;
+        }
+        // Hard precedence: names are consulted only with no external-ref hit.
+        if candidates.is_empty() {
+            for (name, language) in names.get(&idx).into_iter().flatten() {
+                let stream = EntityStream::ByName { name, language };
+                collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
+                    view.walk_entities(&stream, cursor, DRAIN_PAGE)
+                })
+                .await?;
+            }
+        }
+        out.insert(idx, outcome_of(candidates));
+    }
+    Ok(out)
+}
+
+/// Match each [`Decl::Local`] image declaration against the unified view of
+/// committed + in-flight state.
+///
+/// The image analogue of [`match_entities`] with a single anchor kind: the
+/// exact source `url` of each [`image::Fact::Source`] the decl's bundle facts
+/// carry, candidates canonicalised to their `SameArtifact` class
+/// representative.
+pub async fn match_images<S: FactStore, V: ImageView<S>>(
+    decls: &[Decl<S::ImageId>],
+    facts: &BTreeSet<SubmitFact>,
+    view: &V,
+) -> Result<HashMap<ImageIdx, MatchOutcome<S::ImageId>>, S::Error> {
+    let mut urls: HashMap<ImageIdx, BTreeSet<&Url>> = HashMap::new();
+    for fact in facts {
+        if let SubmitFact::Factual {
+            assertion:
+                FactualAssertion::Image {
+                    fact: image::Fact::Source { image, url },
+                },
+            ..
+        } = fact
+        {
+            urls.entry(*image).or_default().insert(url);
+        }
+    }
+
+    let mut out = HashMap::new();
+    for (i, decl) in decls.iter().enumerate() {
+        if !matches!(decl, Decl::Local) {
+            continue;
+        }
+        let idx = ImageIdx(i);
+        let mut candidates: BTreeMap<S::ImageId, BTreeSet<FactId>> = BTreeMap::new();
+        for url in urls.get(&idx).into_iter().flatten() {
+            let stream = ImageStream::BySourceUrl { url };
+            collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
+                view.walk_images(&stream, cursor, DRAIN_PAGE)
+            })
+            .await?;
+        }
+        out.insert(idx, outcome_of(candidates));
+    }
+    Ok(out)
+}
+
+/// Drain a keyed walk to exhaustion, folding each row's class representative
+/// into `candidates` along with the row's fact id — the anchor evidence a
+/// match cites as its [`MatchOutcome::Matched::basis`]. Representatives come
+/// straight off
+/// [`PageItem::representative`](crate::facts::schema::PageItem::representative),
+/// so several hits inside one equivalence class collapse to one candidate
+/// instead of a spurious ambiguity.
+async fn collect_candidates<S, Sub, F, Fut>(
+    candidates: &mut BTreeMap<Sub, BTreeSet<FactId>>,
+    fetch: F,
+) -> Result<(), S::Error>
+where
+    S: FactStore,
+    Sub: Ord,
+    F: FnMut(FactId) -> Fut,
+    Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
+{
+    drain_pages::<S, _, _, _>(fetch, |item| {
+        candidates
+            .entry(item.representative)
+            .or_default()
+            .insert(item.fact_id);
+    })
+    .await
+}
+
+/// Select the [`MatchOutcome`] for one decl's deduped candidate map: exactly
+/// one candidate is a match carrying its anchor rows as the basis; zero or
+/// several are unmatched, carrying the candidates onward. The `BTreeMap` order
+/// keeps the ambiguous candidate list deterministic.
+fn outcome_of<Id: Ord>(candidates: BTreeMap<Id, BTreeSet<FactId>>) -> MatchOutcome<Id> {
+    let mut iter = candidates.into_iter();
+    match (iter.next(), iter.next()) {
+        (Some((id, basis)), None) => MatchOutcome::Matched { id, basis },
+        (first, second) => MatchOutcome::Unmatched {
+            candidates: first
+                .into_iter()
+                .chain(second)
+                .chain(iter)
+                .map(|(id, _)| id)
+                .collect(),
+        },
+    }
+}

@@ -14,6 +14,8 @@
 //! claim came from — but sits nearby for the cross-references.
 //! [`ExternalReference::from_url`] maps a URL source to one.
 
+use std::collections::BTreeSet;
+
 use chronoscope_macros::grammar_type;
 use oxilangtag::LanguageTag;
 use schemars::JsonSchema;
@@ -22,7 +24,7 @@ use url::Url;
 
 use crate::date::UncertainDate;
 use crate::facts::geometry::ImageRegion;
-use crate::facts::ids::{FactId, IngesterRunId, UserId};
+use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId, IngesterRunId, UserId};
 use crate::ids::{
     GeoNamesId, GettyTgnId, NrhpReferenceNumber, OhmId, OsmElementType, OsmId, PleiadesPlaceId,
     WikidataEntityId, WikidataPropertyId,
@@ -112,6 +114,101 @@ impl std::fmt::Display for ExcerptError {
 }
 
 impl std::error::Error for ExcerptError {}
+
+// ============================================================================
+// Language — canonical BCP-47 tag
+// ============================================================================
+
+/// A BCP-47 language tag in canonical form (`en-US`, not `en-us`).
+///
+/// Tags compare byte-for-byte, so two casings of one tag would otherwise be
+/// distinct values — and distinct matcher anchor keys. The constructor
+/// canonicalizes its input, so commits are built and hashed from the
+/// canonical form. Wire input must already be canonical: a stored value
+/// re-serializes to exactly the bytes its commit was hashed over, so
+/// [`Language::deserialize`] rejects non-canonical input.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct Language {
+    inner: String,
+}
+
+impl Language {
+    /// Parse a BCP-47 tag and canonicalize it (case normalization per RFC
+    /// 5646; `en-us` becomes `en-US`).
+    pub fn new(tag: impl AsRef<str>) -> Result<Self, LanguageError> {
+        let raw = tag.as_ref();
+        let inner = LanguageTag::parse_and_normalize(raw)
+            .map_err(|e| LanguageError::Unparseable {
+                input: raw.to_owned(),
+                message: e.to_string(),
+            })?
+            .as_str()
+            .to_owned();
+        Ok(Self { inner })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl<'de> Deserialize<'de> for Language {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let canonical = Self::new(&s).map_err(serde::de::Error::custom)?;
+        if canonical.as_str() != s {
+            return Err(serde::de::Error::custom(LanguageError::NotCanonical {
+                input: s,
+                canonical: canonical.as_str().to_owned(),
+            }));
+        }
+        Ok(canonical)
+    }
+}
+
+impl std::fmt::Display for Language {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl AsRef<str> for Language {
+    fn as_ref(&self) -> &str {
+        &self.inner
+    }
+}
+
+/// Errors from [`Language`] construction and deserialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanguageError {
+    /// The input failed BCP-47 parsing.
+    Unparseable { input: String, message: String },
+    /// Wire input parsed but was not in canonical form. The wire form feeds
+    /// the commit hash, so the boundary rejects it.
+    NotCanonical { input: String, canonical: String },
+}
+
+impl std::fmt::Display for LanguageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unparseable { input, message } => {
+                write!(f, "language tag {input:?} failed BCP-47 parsing: {message}")
+            }
+            Self::NotCanonical { input, canonical } => {
+                write!(
+                    f,
+                    "language tag {input:?} is not canonical (canonical form is {canonical:?})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for LanguageError {}
 
 // ============================================================================
 // WikimediaCategoryName
@@ -434,9 +531,9 @@ pub enum ExternalSource {
 
 /// Source for a [`crate::facts::assertions::JudgmentAssertion`].
 ///
-/// Four warrant flavors: an external citation, the researcher's personal
-/// knowledge, reasoning over existing facts, or a direct image observation
-/// with optional region.
+/// Five warrant flavors: an external citation, the researcher's personal
+/// knowledge, human reasoning over existing facts, a machine derivation from
+/// existing facts, or a direct image observation with optional region.
 ///
 /// Generic over the image reference type so the observed image rides through
 /// the same bundle-local-index → persistent-id substitution as the depiction
@@ -474,6 +571,22 @@ pub enum JudgmentSource<ImgId> {
         /// generalize the conclusion.
         reasoning: Justification,
     },
+    /// A judgment computed by a versioned machine process from store facts —
+    /// the most machine-checkable warrant in the system: re-run the process
+    /// on the basis at the snapshot and compare. The machine counterpart of
+    /// [`Self::Analysis`], with structure in place of free-text reasoning.
+    Derivation {
+        /// The process that computed the judgment.
+        process: AnalyzerProcess,
+        /// The build of the process that ran.
+        version: AnalyzerVersion,
+        /// The evidence facts the process consulted. A `BTreeSet` gives the
+        /// basis a canonical serialized order.
+        basis: BTreeSet<FactId>,
+        /// Exclusive upper bound: the view the judgment was computed at.
+        /// Every basis id is below it.
+        snapshot: FactId,
+    },
     /// A direct image observation, backing feature observations, spatial
     /// relations, and depiction judgments made by looking at an image (often a
     /// region within it). The [`Observer`] field records human vs pipeline —
@@ -495,7 +608,10 @@ impl<ImgId> JudgmentSource<ImgId> {
     pub fn observed_image(&self) -> Option<&ImgId> {
         match self {
             Self::ImageObservation { image, .. } => Some(image),
-            Self::External { .. } | Self::PersonalKnowledge { .. } | Self::Analysis { .. } => None,
+            Self::External { .. }
+            | Self::PersonalKnowledge { .. }
+            | Self::Analysis { .. }
+            | Self::Derivation { .. } => None,
         }
     }
 
@@ -523,6 +639,17 @@ impl<ImgId> JudgmentSource<ImgId> {
             } => JudgmentSource::Analysis {
                 input_facts: input_facts.clone(),
                 reasoning: reasoning.clone(),
+            },
+            Self::Derivation {
+                process,
+                version,
+                basis,
+                snapshot,
+            } => JudgmentSource::Derivation {
+                process: process.clone(),
+                version: version.clone(),
+                basis: basis.clone(),
+                snapshot: *snapshot,
             },
             Self::ImageObservation {
                 image,
@@ -636,9 +763,9 @@ pub enum ExternalReference {
     },
     /// Wikipedia article in a specific language edition.
     Wikipedia {
-        /// BCP-47 language tag matching the `*.wikipedia.org` subdomain.
-        #[schemars(with = "String")]
-        language: LanguageTag<String>,
+        /// BCP-47 language tag matching the `*.wikipedia.org` subdomain,
+        /// in canonical form.
+        language: Language,
         /// The article title (URL-decoded, no `_` substitutions).
         title: String,
     },
@@ -751,7 +878,7 @@ fn parse_wikipedia(host: &str, segments: &[&str]) -> Option<ExternalReference> {
     if language.contains('.') {
         return None;
     }
-    let language = LanguageTag::parse(language.to_owned()).ok()?;
+    let language = Language::new(language).ok()?;
     let [first, title, ..] = segments else {
         return None;
     };

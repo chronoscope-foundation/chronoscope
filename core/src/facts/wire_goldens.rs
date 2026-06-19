@@ -23,18 +23,17 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 
 use chrono::TimeZone;
-use oxilangtag::LanguageTag;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
 
 use crate::date::{DatePrecision, UncertainDate};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
-use crate::facts::attribute::{self, EntityRelationType, NameType};
+use crate::facts::attribute::{self, EntityRelationType, NameText, NameType};
 use crate::facts::bookend;
 use crate::facts::citations::{
-    Excerpt, ExternalReference, ExternalSource, FactualCitation, JudgmentSource, MetaSource,
-    Observer,
+    Excerpt, ExternalReference, ExternalSource, FactualCitation, JudgmentSource, Language,
+    MetaSource, Observer,
 };
 use crate::facts::composites::{self, SubimageRegion};
 use crate::facts::depiction::{self, Perspective};
@@ -42,7 +41,9 @@ use crate::facts::event;
 use crate::facts::features::Feature;
 use crate::facts::geometry::{ImageRegion, SpatialGeometry};
 use crate::facts::identity;
-use crate::facts::ids::{EntityId, FactId, ImageId, LifetimeEventId, UserId};
+use crate::facts::ids::{
+    AnalyzerProcess, AnalyzerVersion, EntityId, FactId, ImageId, LifetimeEventId, UserId,
+};
 use crate::facts::image;
 use crate::facts::lifecycle::{DurationalRole, MoveMethod};
 use crate::facts::map;
@@ -65,8 +66,8 @@ fn img(s: &str) -> std::result::Result<ImageId, std::convert::Infallible> {
     Ok(ImageId::new(s))
 }
 
-fn en() -> std::result::Result<LanguageTag<String>, Box<dyn std::error::Error>> {
-    Ok(LanguageTag::parse("en".to_owned())?)
+fn en() -> std::result::Result<Language, Box<dyn std::error::Error>> {
+    Ok(Language::new("en")?)
 }
 
 fn sample_date() -> std::result::Result<UncertainDate, Box<dyn std::error::Error>> {
@@ -95,12 +96,26 @@ fn sample_judgment_source() -> Result<JudgmentSource<ImageIdx>> {
     })
 }
 
+/// A machine-derivation judgment source with fixed literals, so the pinned
+/// bytes are independent of the build environment.
+fn sample_derivation_source() -> Result<JudgmentSource<ImageIdx>> {
+    Ok(JudgmentSource::Derivation {
+        process: AnalyzerProcess::new("matcher"),
+        version: AnalyzerVersion::new("test-version"),
+        basis: [FactId::new(3), FactId::new(5)].into_iter().collect(),
+        snapshot: FactId::new(7),
+    })
+}
+
 /// Assert `actual == expected`, with both strings in the panic message so a
 /// regenerated golden is easy to copy in.
 ///
-/// For serialize-only types: `SubmitFact` and `Commit` are built in Rust and
-/// never deserialized, so they pin only the JCS bytes. Types that also
-/// implement `DeserializeOwned` use [`assert_golden_roundtrip`].
+/// For one-way projections: a commit's canonical JCS is the
+/// [`CommitHashView`](crate::facts::submit) hash input, which flattens the
+/// author to a lossy canonical string and quantizes `recorded_at`, so it can't
+/// round-trip back to the value. Pinning the JCS still fully determines the
+/// resulting [`CommitId`](crate::facts::ids::CommitId). Types that round-trip
+/// use [`assert_golden_roundtrip`].
 #[track_caller]
 fn assert_golden(actual: &str, expected: &str) {
     assert_eq!(
@@ -151,7 +166,7 @@ where
 fn golden_attribute_fact_name() -> Result<()> {
     let f: attribute::Fact<EntityId> = attribute::Fact::Name {
         entity: ent("e-1")?,
-        name: "Pantheon".to_owned(),
+        name: NameText::new("Pantheon"),
         language: en()?,
         name_type: NameType::Common,
         valid_from: None,
@@ -375,7 +390,7 @@ fn golden_submit_fact_factual() -> Result<()> {
     let assertion = FactualAssertion::Attribute {
         fact: attribute::Fact::Name {
             entity: EntityIdx(0),
-            name: "X".to_owned(),
+            name: NameText::new("X"),
             language: en()?,
             name_type: NameType::Common,
             valid_from: None,
@@ -408,6 +423,21 @@ fn golden_submit_fact_judgment() -> Result<()> {
 }
 
 #[test]
+fn golden_submit_fact_judgment_derivation() -> Result<()> {
+    let assertion = JudgmentAssertion::Identity {
+        fact: identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?,
+    };
+    let fact = SubmitFact::Judgment {
+        assertion,
+        citation: sample_derivation_source()?,
+    };
+    assert_golden_roundtrip(
+        &fact,
+        r#"{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"basis":[3,5],"process":"matcher","snapshot":7,"type":"derivation","version":"test-version"},"type":"judgment"}"#,
+    )
+}
+
+#[test]
 fn golden_submit_fact_meta() -> Result<()> {
     let assertion = MetaAssertion::RetractFact {
         target: FactId::new(7),
@@ -433,16 +463,17 @@ fn golden_submit_fact_meta() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Mixes a Factual and a Judgment fact under a Local entity decl and a User
-/// author, then pins the resulting `CommitId`. Catches any wire-shape change
-/// that would invalidate every existing commit hash.
+/// author, then pins the canonical JCS the `CommitId` hashes. The JCS fully
+/// determines the id, so this catches any wire-shape change that would
+/// invalidate every existing commit hash, with the changed field visible.
 #[test]
-fn golden_commit_id_full_bundle() -> Result<()> {
+fn golden_commit_canonical_jcs_full_bundle() -> Result<()> {
     let mut facts = BTreeSet::new();
     facts.insert(SubmitFact::Factual {
         assertion: FactualAssertion::Attribute {
             fact: attribute::Fact::Name {
                 entity: EntityIdx(0),
-                name: "Pantheon".to_owned(),
+                name: NameText::new("Pantheon"),
                 language: en()?,
                 name_type: NameType::Common,
                 valid_from: None,
@@ -470,10 +501,63 @@ fn golden_commit_id_full_bundle() -> Result<()> {
         facts,
     };
 
-    let id = bundle.id()?;
     assert_golden(
-        id.as_str(),
-        "6505cedede83dc2523ed8842f8f80868ce7ae341c56bf341b2a272d59983765f",
+        &bundle.canonical_jcs()?,
+        r#"{"author":"user:alice","entities":[{"type":"local"},{"type":"local"}],"events":[],"facts":[{"assertion":{"fact":{"entity":0,"language":"en","name":"Pantheon","name_type":"common","type":"name","valid_from":null,"valid_to":null},"type":"attribute"},"citation":{"excerpts":["source-text"],"source":{"published":null,"type":"url","url":"https://example.com/source"}},"type":"factual"},{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"image":0,"observer":{"justification":null,"type":"user","user":"alice"},"region":null,"type":"image_observation"},"type":"judgment"}],"images":[{"type":"local"}],"recorded_at":"2024-01-01T12:00:00+00:00"}"#,
+    );
+    Ok(())
+}
+
+/// Pins the externally-tagged struct-variant shape of the machine author.
+#[test]
+fn golden_commit_author_analyzer() -> Result<()> {
+    let author = CommitAuthor::Analyzer {
+        process: AnalyzerProcess::new("matcher"),
+        version: AnalyzerVersion::new("test-version"),
+    };
+    assert_golden_roundtrip(
+        &author,
+        r#"{"analyzer":{"process":"matcher","version":"test-version"}}"#,
+    )
+}
+
+/// A companion-shaped bundle — analyzer author, `Existing` decls, one
+/// `Derivation`-cited identity judgment — pinning the canonical JCS its
+/// `CommitId` hashes. The JCS fully determines the id, so this catches any
+/// wire-shape change to the machine-author canonical string or the derivation
+/// citation. Built from fixed literals, so the bytes are independent of the
+/// build environment.
+#[test]
+fn golden_commit_canonical_jcs_analyzer_companion_bundle() -> Result<()> {
+    let mut facts = BTreeSet::new();
+    facts.insert(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Identity {
+            fact: identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?,
+        },
+        citation: sample_derivation_source()?,
+    });
+
+    let bundle: Commit<EntityId, LifetimeEventId, ImageId> = Commit {
+        author: CommitAuthor::Analyzer {
+            process: AnalyzerProcess::new("matcher"),
+            version: AnalyzerVersion::new("test-version"),
+        },
+        recorded_at: chrono::Utc
+            .with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
+            .single()
+            .ok_or("fixed time")?,
+        entities: vec![
+            Decl::Existing { id: ent("e-1")? },
+            Decl::Existing { id: ent("e-2")? },
+        ],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts,
+    };
+
+    assert_golden(
+        &bundle.canonical_jcs()?,
+        r#"{"author":"analyzer:matcher@test-version","entities":[{"id":"e-1","type":"existing"},{"id":"e-2","type":"existing"}],"events":[],"facts":[{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"basis":[3,5],"process":"matcher","snapshot":7,"type":"derivation","version":"test-version"},"type":"judgment"}],"images":[],"recorded_at":"2024-01-01T12:00:00+00:00"}"#,
     );
     Ok(())
 }

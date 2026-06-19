@@ -47,8 +47,9 @@
 //!   [`submit::FactLookup`]); [`submit::error`] for the
 //!   [`submit::SubmitError`] enum; [`submit::pipeline`] for the
 //!   free functions backends compose
-//!   ([`submit::pipeline::substitute_facts_accumulating`], the matcher / validator
-//!   entry points, and [`submit::commit_facts`]). Commit-id derivation
+//!   ([`submit::pipeline::substitute_facts_accumulating`], the validator
+//!   entry point, and [`submit::commit_facts`]); [`submit::matcher`] for
+//!   the submit-time matcher entry points. Commit-id derivation
 //!   lives directly on [`submit::Commit::id`].
 //! - [`memory`] — [`memory::MemoryFactStore`] backend.
 //!

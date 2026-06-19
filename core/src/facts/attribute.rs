@@ -56,12 +56,93 @@
 //!   duplicate-fact tolerance.
 
 use chronoscope_macros::grammar_type;
-use oxilangtag::LanguageTag;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::date::UncertainDate;
-use crate::facts::citations::ExternalReference;
+use crate::facts::citations::{ExternalReference, Language};
+
+// ============================================================================
+// NameText — NFC-canonical name text
+// ============================================================================
+
+/// The text of a [`Fact::Name`], stored in Unicode NFC.
+///
+/// Equality on names is byte equality, so the precomposed and decomposed
+/// spellings of one name (`é` vs `e` + combining acute) would otherwise be
+/// distinct values. The constructor NFC-normalizes — case and content are
+/// untouched — so commits are built and hashed from the canonical form. Wire
+/// input must already be NFC: a stored value re-serializes to exactly the
+/// bytes its commit was hashed over, so [`NameText::deserialize`] rejects
+/// non-NFC input.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct NameText {
+    inner: String,
+}
+
+impl NameText {
+    /// Wrap name text, normalizing it to NFC. Infallible — every string has
+    /// an NFC form.
+    pub fn new(text: impl AsRef<str>) -> Self {
+        Self {
+            inner: text.as_ref().nfc().collect(),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl<'de> Deserialize<'de> for NameText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        if !unicode_normalization::is_nfc(&s) {
+            return Err(serde::de::Error::custom(NameTextError {
+                input: s.clone(),
+                canonical: s.nfc().collect(),
+            }));
+        }
+        Ok(Self { inner: s })
+    }
+}
+
+impl std::fmt::Display for NameText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl AsRef<str> for NameText {
+    fn as_ref(&self) -> &str {
+        &self.inner
+    }
+}
+
+/// Error from [`NameText`] deserialization: the wire input was not NFC. The
+/// wire form feeds the commit hash, so the boundary rejects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameTextError {
+    pub input: String,
+    pub canonical: String,
+}
+
+impl std::fmt::Display for NameTextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "name text {:?} is not NFC (canonical form is {:?})",
+            self.input, self.canonical
+        )
+    }
+}
+
+impl std::error::Error for NameTextError {}
 
 /// Attribute-cluster fact.
 ///
@@ -80,11 +161,10 @@ pub enum Fact<EntId: Ord> {
     /// A name applied to the entity, with temporal validity bounds.
     Name {
         entity: EntId,
-        /// The name as the source used it.
-        name: String,
-        /// BCP-47 language tag.
-        #[schemars(with = "String")]
-        language: LanguageTag<String>,
+        /// The name as the source used it, NFC-normalized.
+        name: NameText,
+        /// BCP-47 language tag, in canonical form.
+        language: Language,
         name_type: NameType,
         /// When this name first applied, when known. The single bound
         /// expresses imprecision.

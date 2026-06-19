@@ -2,10 +2,12 @@
 //!
 //! Two families live here:
 //!
-//! - **String-shaped IDs** (`UserId`, `IngesterRunId`). Wrappers around
-//!   `String` with no validation invariants — the constructor is infallible.
-//!   The `string_id_newtype` macro keeps their derives + serde shape in
-//!   lockstep.
+//! - **String-shaped IDs** (`UserId`, `IngesterRunId`, `AnalyzerProcess`,
+//!   `AnalyzerVersion`). Wrappers around `String` with no validation
+//!   invariants — the constructor is infallible. The `string_id_newtype`
+//!   macro keeps their derives + serde shape in lockstep. `AnalyzerProcess` /
+//!   `AnalyzerVersion` name the machine process behind an analyzer commit and
+//!   the build that ran it.
 //! - **Integer-shaped IDs** (`FactId`, `CommitId`). [`FactId`] is a `u64`
 //!   newtype that prevents intermixing with other integer ids. [`CommitId`] is
 //!   content-addressed — derived from the commit's canonical encoding so
@@ -336,6 +338,22 @@ string_id_newtype! {
     IngesterRunId
 }
 
+string_id_newtype! {
+    /// The name of a machine analysis process (e.g. the submit matcher).
+    /// Names *what kind* of computation authored a judgment, so consumers can
+    /// filter and group machine-authored commits without string parsing.
+    AnalyzerProcess
+}
+
+string_id_newtype! {
+    /// The version label of a machine analysis process — the build that ran
+    /// it (a git SHA, or a crate version when none was injected; see
+    /// [`crate::BUILD_VERSION`]). Paired with [`AnalyzerProcess`] it pins what
+    /// produced a judgment, so a re-derivation check knows which code to
+    /// re-run.
+    AnalyzerVersion
+}
+
 // ============================================================================
 // FactId
 // ============================================================================
@@ -442,7 +460,8 @@ impl std::fmt::Display for SubjectKind {
 /// ```
 ///
 /// - `<author>` is the canonical form of the author identity (e.g.
-///   `user:<UserId>` or `ingester:<IngesterRunId>`).
+///   `user:<UserId>`, `ingester:<IngesterRunId>`, or
+///   `analyzer:<process>@<version>`).
 /// - The three declaration lists (`entities`, `events`, `images`) are
 ///   serialized in their declared positional order — not sorted — because a
 ///   fact references a subject by its index into that order; reordering a list

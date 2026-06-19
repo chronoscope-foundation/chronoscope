@@ -38,9 +38,10 @@
 
 use std::collections::BTreeSet;
 
-use oxilangtag::LanguageTag;
+use unicode_normalization::UnicodeNormalization;
+use url::Url;
 
-use crate::facts::citations::ExternalReference;
+use crate::facts::citations::{ExternalReference, Language};
 use crate::facts::ids::FactId;
 
 // ============================================================================
@@ -62,6 +63,20 @@ pub use crate::date::TimeRangeError;
 // Per-subject streams
 // ============================================================================
 
+/// Normalize a name for [`EntityStream::ByName`] comparison: trim, Unicode
+/// lowercase, then NFC (lowercasing can denormalize, so NFC runs last). The
+/// comparison is normalized-exact — both the query key and each stored
+/// [`super::attribute::Fact::Name`] pass through here, so the matcher's
+/// anchor keys and a backend's scan cannot drift.
+///
+/// Case-folding is a match-recall heuristic, not case correctness — the
+/// stored name keeps its own casing. The store carries every language, so a
+/// tag that folds imperfectly (Turkish dotted-I, say) only costs a missed
+/// candidate, never a wrong or unsound result.
+pub fn normalize_name(name: &str) -> String {
+    name.trim().to_lowercase().nfc().collect()
+}
+
 /// Which index to walk for entity-scoped queries. Consumed by the entity view
 /// trait's `walk_entities`, which class-scopes the result by the canonical
 /// `SameEntity` equivalence.
@@ -82,11 +97,12 @@ pub enum EntityStream<'a> {
         range: &'a TimeRange,
     },
     /// Walk [`super::attribute::Fact::Name`] facts whose name and language
-    /// match.
+    /// match. Names compare through [`normalize_name`]; the language tag is an
+    /// exact compare.
     ByName {
         name: &'a str,
-        /// The BCP-47 language tag of the name.
-        language: &'a LanguageTag<String>,
+        /// The BCP-47 language tag of the name, in canonical form.
+        language: &'a Language,
     },
     /// Walk [`super::attribute::Fact::ExternalReference`] facts whose reference
     /// equals the supplied one. A SQL backend implements this as an indexed
@@ -115,7 +131,8 @@ pub enum EventStream<'a> {
 ///
 /// Pictures and maps carry capture date / capture location, so both spatial
 /// and temporal filters are meaningful. Naming and external references are
-/// entity-level concepts, so the image grammar indexes only date and location.
+/// entity-level concepts, so the image grammar indexes date, location, and the
+/// byte-level source URL.
 #[derive(Debug)]
 pub enum ImageStream<'a> {
     /// Walk every image-touching fact in `fact_id` order.
@@ -129,6 +146,10 @@ pub enum ImageStream<'a> {
         bbox: &'a Bbox,
         range: &'a TimeRange,
     },
+    /// Walk [`super::image::Fact::Source`] facts whose source URL equals the
+    /// supplied one — an exact value compare, the image matcher's anchor
+    /// query. A SQL backend implements this as an indexed scan.
+    BySourceUrl { url: &'a Url },
 }
 
 // ============================================================================

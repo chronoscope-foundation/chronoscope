@@ -323,7 +323,7 @@ mod traversal_props {
 
     use crate::WikidataEntityId;
     use crate::date::{DatePrecision, UncertainDate};
-    use crate::facts::citations::ExternalReference;
+    use crate::facts::citations::{ExternalReference, Language};
     use crate::facts::composites::SubimageRegion;
     use crate::facts::geometry::{ImageRegion, SpatialGeometry};
     use crate::facts::identity::IdMapError;
@@ -420,10 +420,8 @@ mod traversal_props {
         })
     }
 
-    fn sentinel_language() -> impl Strategy<Value = oxilangtag::LanguageTag<String>> {
-        Just(()).prop_filter_map("valid sentinel language tag", |()| {
-            oxilangtag::LanguageTag::parse("en".to_owned()).ok()
-        })
+    fn sentinel_language() -> impl Strategy<Value = Language> {
+        Just(()).prop_filter_map("valid sentinel language tag", |()| Language::new("en").ok())
     }
 
     fn sentinel_url() -> impl Strategy<Value = url::Url> {
@@ -443,7 +441,7 @@ mod traversal_props {
             (arb_entity(), sentinel_language()).prop_map(|(entity, language)| {
                 attribute::Fact::Name {
                     entity,
-                    name: "name".to_owned(),
+                    name: attribute::NameText::new("name"),
                     language,
                     name_type: attribute::NameType::Common,
                     valid_from: None,

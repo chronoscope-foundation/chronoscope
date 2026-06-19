@@ -217,8 +217,11 @@ pub trait FactStore: Send + Sync + Sized {
     /// Submit a commit bundle inside the supplied transaction. Derives the
     /// [`CommitId`](crate::facts::ids::CommitId) via `Commit::id()` (JCS +
     /// SHA-256) and dedups against the commit cache, resolves every
-    /// declaration to a persistent id via match-or-mint, rewrites each fact's
-    /// bundle-local indices to the resolved ids, and inserts.
+    /// declaration to a persistent id (`Existing` passes through, `Local`
+    /// mints fresh), rewrites each fact's bundle-local indices to the
+    /// resolved ids, and inserts. A matcher match on a `Local` decl is
+    /// persisted as a machine-authored identity judgment in a companion
+    /// commit, reported via `SubmitResult::companion_commit_id`.
     ///
     /// The `tx` borrow is `&mut` so the caller can't overlap two
     /// `submit_commit` calls on one handle; sequential commits inside one

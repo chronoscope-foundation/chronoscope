@@ -19,6 +19,21 @@ const _: () = {
     );
 };
 
+/// The build's version label: the git SHA injected via
+/// `CHRONOSCOPE_BUILD_VERSION` at build time, or the crate version when the
+/// variable is absent. Machine-authored fact-store commits carry it as their
+/// [`facts::ids`] `AnalyzerVersion`, so a stored judgment names the code that
+/// produced it.
+pub const BUILD_VERSION: &str = match option_env!("CHRONOSCOPE_BUILD_VERSION") {
+    Some(sha) => sha,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+const _: () = assert!(
+    !BUILD_VERSION.is_empty(),
+    "CHRONOSCOPE_BUILD_VERSION must not be set to an empty string"
+);
+
 pub mod annotation;
 pub mod consistency;
 pub mod date;

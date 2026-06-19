@@ -8,20 +8,19 @@
 //!
 //! - [`substitute_facts_accumulating`] — translates index references to
 //!   persistent ids, collecting every per-fact substitution failure.
-//! - [`match_entities`] / [`match_images`] — resolve each [`Decl::Local`]
-//!   against the unified view, returning [`MatchOutcome::Matched`] for a
-//!   single hit or [`MatchOutcome::Mint`] otherwise.
 //! - [`validate_submit`] — runs the submit-rule checks (the meta-fact target
 //!   guards plus the cluster rules) over the in-flight commit, accumulating
 //!   every violation into one batch.
 //!
-//! Commit-id derivation lives on [`Commit::id`](super::Commit::id); backends
-//! call `bundle.id()?`.
+//! Submit-time matching lives in [`matcher`](super::matcher); commit-id
+//! derivation lives on [`Commit::id`](super::Commit::id) — backends call
+//! `bundle.id()?`.
 //!
-//! The matcher and validator are async so a SQL backend can `.await` reads
-//! (index lookups, rule reads) inside the transaction holding the commit; the
-//! in-memory backend reads its unified view through the same async
-//! [`FactView`] surface. They take a `&V: FactView<S>` and return a future.
+//! The validator is async so a SQL backend can `.await` reads (index lookups,
+//! rule reads) inside the transaction holding the commit; the in-memory
+//! backend reads its unified view through the same async [`FactView`]
+//! surface. It takes a `&V` bounded by the view traits it reads and returns a
+//! future.
 //! The in-memory backend's [`async_lock::Mutex`] guard is `Send`, so holding
 //! it across these awaits keeps the future `Send`. The validator awaits even
 //! in-memory — resolving each retraction target through `view.fact(...)` and
@@ -35,13 +34,13 @@ use std::num::NonZeroUsize;
 
 use super::error::{ImageRole, SubmitError};
 use super::result::{StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMetaFact};
-use super::{Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact};
+use super::{EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use crate::facts::citations::JudgmentSource;
 use crate::facts::identity::{IdMapError, SelfLoop};
 use crate::facts::ids::{FactId, SubjectKind};
 use crate::facts::lifecycle::LifetimeEventKind;
-use crate::facts::schema::FactPage;
+use crate::facts::schema::{FactPage, PageItem};
 use crate::facts::store::{
     EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf, SubmitCommitError,
     SubmitCommitInput, SubmitCommitOutput,
@@ -82,94 +81,6 @@ pub async fn commit_facts<S: FactStore>(
         .with_tx(|s, tx| Box::pin(async move { s.submit_commit(tx, bundle).await }))
         .await
         .map_err(SubmitCommitError::Backend)?
-}
-
-// ============================================================================
-// MatchOutcome
-// ============================================================================
-
-/// What the matcher concluded for one declaration.
-///
-/// One entry per [`Decl::Local`]; [`Decl::Existing`] bypasses the matcher. The
-/// `Mint` arm covers both no-match (empty `candidates`) and ambiguous
-/// (non-empty) — both mint a fresh id, and the candidate list distinguishes
-/// the resolution origin downstream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MatchOutcome<Id> {
-    /// Exactly one existing id; the pipeline adopts it.
-    Matched(Id),
-    /// No single unambiguous match — the pipeline mints. `candidates` is
-    /// empty for no-match, non-empty when several existing ids matched the
-    /// anchors (flowing to
-    /// [`ResolutionOrigin::Ambiguous`](super::result::ResolutionOrigin::Ambiguous)).
-    Mint {
-        /// Existing ids that matched the anchors. Empty = no-match,
-        /// non-empty = ambiguous.
-        candidates: Vec<Id>,
-    },
-}
-
-// ============================================================================
-// match_entities / match_images
-// ============================================================================
-
-/// Match each [`Decl::Local`] entity declaration against the unified view of
-/// committed + in-flight state.
-///
-/// The exact-match matcher reads name / external-ref indexes over the view;
-/// with no match a `Local` decl resolves to [`MatchOutcome::Mint`] with an
-/// empty candidate list.
-///
-/// Returns a `HashMap<EntityIdx, MatchOutcome<EntityId>>` keyed by decl
-/// position. [`Decl::Existing`] decls produce no entry; `submit_commit`
-/// handles them directly.
-///
-/// Async so a backend's indexes can `.await` view reads. The future is `Send`
-/// (`V: FactView<S>` is `Sync`), so a backend can drive it under its write
-/// guard. A backend with nothing to await resolves immediately.
-pub async fn match_entities<S: FactStore, V: FactView<S>>(
-    decls: &[Decl<S::EntityId>],
-    _facts: &BTreeSet<SubmitFact>,
-    _view: &V,
-) -> HashMap<EntityIdx, MatchOutcome<S::EntityId>> {
-    // One empty-candidates Mint per Local decl; Existing decls bypass.
-    let mut out = HashMap::new();
-    for (i, decl) in decls.iter().enumerate() {
-        if matches!(decl, Decl::Local) {
-            out.insert(
-                EntityIdx(i),
-                MatchOutcome::Mint {
-                    candidates: Vec::new(),
-                },
-            );
-        }
-    }
-    out
-}
-
-/// Match each [`Decl::Local`] image declaration against the unified view of
-/// committed + in-flight state.
-///
-/// Reads the image-source URL index; with no match a `Local` decl resolves to
-/// [`MatchOutcome::Mint`] with an empty candidate list. See [`match_entities`]
-/// for the async / view rationale.
-pub async fn match_images<S: FactStore, V: FactView<S>>(
-    decls: &[Decl<S::ImageId>],
-    _facts: &BTreeSet<SubmitFact>,
-    _view: &V,
-) -> HashMap<ImageIdx, MatchOutcome<S::ImageId>> {
-    let mut out = HashMap::new();
-    for (i, decl) in decls.iter().enumerate() {
-        if matches!(decl, Decl::Local) {
-            out.insert(
-                ImageIdx(i),
-                MatchOutcome::Mint {
-                    candidates: Vec::new(),
-                },
-            );
-        }
-    }
-    out
 }
 
 // ============================================================================
@@ -263,10 +174,10 @@ pub async fn validate_submit<S: FactStore, V: FactView<S> + EventView<S> + Image
 /// `for_each_id` folds each candidate's mentioned subject ids (the entity
 /// closure is a no-op — no cluster rule keys off the entity neighbourhood, and
 /// the judgment citation's observed image already reaches `fi`). Every touched
-/// event / image is drained once via `drain_facts_about_event` /
-/// `drain_facts_about_image`, so a subject several candidates mention is read a
-/// single time. The maps are looked up by id, never iterated for output, so the
-/// `HashMap` choice doesn't affect rule determinism.
+/// event / image is drained once through the union view, so a subject several
+/// candidates mention is read a single time. The maps are looked up by id,
+/// never iterated for output, so the `HashMap` choice doesn't affect rule
+/// determinism.
 async fn gather_subject_neighborhood<S, V>(
     candidates: &[StoredFactOf<S>],
     view: &V,
@@ -296,12 +207,16 @@ where
     }
     let mut event_facts: HashMap<S::EventId, Vec<StoredFactOf<S>>> = HashMap::new();
     for e in events {
-        let drained = drain_facts_about_event::<S, V>(view, &e).await?;
+        let drained =
+            drain_facts::<S, _, _, _>(|cursor| view.all_facts_about_event(&e, cursor, DRAIN_PAGE))
+                .await?;
         event_facts.insert(e, drained);
     }
     let mut image_facts: HashMap<S::ImageId, Vec<StoredFactOf<S>>> = HashMap::new();
     for i in images {
-        let drained = drain_facts_about_image::<S, V>(view, &i).await?;
+        let drained =
+            drain_facts::<S, _, _, _>(|cursor| view.all_facts_about_image(&i, cursor, DRAIN_PAGE))
+                .await?;
         image_facts.insert(i, drained);
     }
     Ok((event_facts, image_facts))
@@ -588,61 +503,51 @@ fn substitute_meta(meta: &MetaAssertion) -> MetaAssertion {
 // Backlink drain (committed ∪ pending, straight from the view)
 // ============================================================================
 
-/// Page size for the backlink drains. Pagination is an internal detail of the
-/// rule reads; one page covers most subjects, and the loop handles the rest.
-const BACKLINK_PAGE: NonZeroUsize = match NonZeroUsize::new(256) {
+/// Page size for the view drains — the backlink reads behind the cluster
+/// rules and the matcher's keyed walks. Pagination is an internal detail
+/// here; one page covers most subjects, and the loops handle the rest.
+pub(super) const DRAIN_PAGE: NonZeroUsize = match NonZeroUsize::new(256) {
     Some(n) => n,
     None => NonZeroUsize::MIN,
 };
 
-/// Drain every fact a `fetch` closure reports, following `FactPage::next_cursor`
-/// until the walk is exhausted. The shared loop behind the event and image
-/// drains — they differ only in which backlink read they call.
-async fn drain_facts<S, F, Fut, Sub>(mut fetch: F) -> Result<Vec<StoredFactOf<S>>, S::Error>
+/// Drain a paged read to exhaustion, following `FactPage::next_cursor` and
+/// handing every row to `on_item`. The one cursor loop behind every drain:
+/// the matcher's candidate collection and the cluster rules' backlink reads
+/// differ only in which read they call and what they keep from each row.
+pub(super) async fn drain_pages<S, Sub, F, Fut>(
+    mut fetch: F,
+    mut on_item: impl FnMut(PageItem<StoredFactOf<S>, Sub>),
+) -> Result<(), S::Error>
+where
+    S: FactStore,
+    F: FnMut(FactId) -> Fut,
+    Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
+{
+    let mut cursor = FactId::new(0);
+    loop {
+        let page = fetch(cursor).await?;
+        page.items.into_iter().for_each(&mut on_item);
+        match page.next_cursor {
+            Some(c) => cursor = c,
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// Every fact a `fetch` closure reports, drained to exhaustion. The shared
+/// shape behind the event and image backlink drains — they differ only in
+/// which backlink read they call.
+async fn drain_facts<S, F, Fut, Sub>(fetch: F) -> Result<Vec<StoredFactOf<S>>, S::Error>
 where
     S: FactStore,
     F: FnMut(FactId) -> Fut,
     Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
 {
     let mut out = Vec::new();
-    let mut cursor = FactId::new(0);
-    loop {
-        let page = fetch(cursor).await?;
-        out.extend(page.items.into_iter().map(|it| it.fact));
-        match page.next_cursor {
-            Some(c) => cursor = c,
-            None => break,
-        }
-    }
+    drain_pages::<S, _, _, _>(fetch, |item| out.push(item.fact)).await?;
     Ok(out)
-}
-
-/// Every active fact about `event` — committed ∪ pending — draining
-/// `all_facts_about_event` through the union view until the walk is exhausted.
-async fn drain_facts_about_event<S, V>(
-    view: &V,
-    event: &S::EventId,
-) -> Result<Vec<StoredFactOf<S>>, S::Error>
-where
-    S: FactStore,
-    V: EventView<S>,
-{
-    drain_facts::<S, _, _, _>(|cursor| view.all_facts_about_event(event, cursor, BACKLINK_PAGE))
-        .await
-}
-
-/// Every active fact about `image`; the image analogue of
-/// [`drain_facts_about_event`].
-async fn drain_facts_about_image<S, V>(
-    view: &V,
-    image: &S::ImageId,
-) -> Result<Vec<StoredFactOf<S>>, S::Error>
-where
-    S: FactStore,
-    V: ImageView<S>,
-{
-    drain_facts::<S, _, _, _>(|cursor| view.all_facts_about_image(image, cursor, BACKLINK_PAGE))
-        .await
 }
 
 // ============================================================================
