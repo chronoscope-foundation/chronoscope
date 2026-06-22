@@ -28,7 +28,7 @@ pub mod result;
 
 // Selective re-exports so common types reach via `crate::facts::submit::X`.
 pub use crate::facts::ids::SubjectKind;
-pub use error::{ImageRole, SubmitError};
+pub use error::{DateRole, ImageRole, SubmitError};
 pub use pipeline::commit_facts;
 pub use result::{
     CommitAuthor, FactLookup, Resolution, ResolutionOrigin, StoredCommit, StoredFact, SubmitResult,

@@ -538,10 +538,10 @@ fn format_date_bound(bound: &DateBound) -> String {
         | DatePrecision::Decade
         | DatePrecision::Century
         | DatePrecision::Millennium => {
-            format!("{}", bound.date().format("%Y"))
+            format!("{}", bound.period_start().format("%Y"))
         }
-        DatePrecision::Month => format!("{}", bound.date().format("%Y-%m")),
-        DatePrecision::Day => format!("{}", bound.date().format("%Y-%m-%d")),
+        DatePrecision::Month => format!("{}", bound.period_start().format("%Y-%m")),
+        DatePrecision::Day => format!("{}", bound.period_start().format("%Y-%m-%d")),
     }
 }
 

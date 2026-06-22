@@ -94,6 +94,86 @@ impl From<GeoPointError> for LocationError {
     }
 }
 
+/// The sealed home of the two union member-lists. Each newtype's inner `Vec`
+/// is private to this module, reachable only through its canonicalizing
+/// constructor ([`UnionMembers::canonicalize`] / [`OneOfEntries::canonicalize`],
+/// both `pub(super)`). A raw `UnionOf { members }` / `OneOf(entries)` therefore
+/// cannot be assembled outside these constructors, so every stored union is
+/// canonical. The types are `pub` (read-only externally via [`as_slice`]); only
+/// the inner `Vec` is sealed.
+///
+/// [`as_slice`]: UnionMembers::as_slice
+///
+/// Both newtypes serialize transparently as the bare inner `Vec`, so the wire
+/// shape and `JsonSchema` surface match a plain list; deserialization routes
+/// through the constructors via the host enums' hand-written `Deserialize`.
+mod canonical {
+    use schemars::JsonSchema;
+    use serde::Serialize;
+
+    use super::{Location, UnresolvedLocation};
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[serde(transparent)]
+    #[schemars(transparent)]
+    pub struct UnionMembers(Vec<Location>);
+
+    impl UnionMembers {
+        /// Canonicalize union members: flatten nested unions, drop a member
+        /// geometrically subsumed by a sibling, then sort and dedup.
+        pub(super) fn canonicalize(children: Vec<Location>) -> Self {
+            Self(super::canonical_union_members(children))
+        }
+
+        /// The canonical members, in sorted order.
+        pub fn as_slice(&self) -> &[Location] {
+            &self.0
+        }
+
+        /// The number of members.
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// Whether the union has no members (only ⊥-shaped inputs reach here;
+        /// a valid `UnionOf` always has ≥2).
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+    #[serde(transparent)]
+    #[schemars(transparent)]
+    pub struct OneOfEntries(Vec<UnresolvedLocation>);
+
+    impl OneOfEntries {
+        /// Canonicalize `OneOf` entries: flatten nested `OneOf`s, then sort and
+        /// dedup. No containment collapse — entries may be unresolved.
+        pub(super) fn canonicalize(entries: Vec<UnresolvedLocation>) -> Self {
+            Self(super::canonical_one_of_entries(entries))
+        }
+
+        /// The canonical entries, in sorted order.
+        pub fn as_slice(&self) -> &[UnresolvedLocation] {
+            &self.0
+        }
+
+        /// The number of entries.
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+
+        /// Whether the disjunction has no entries (a valid `OneOf` always has
+        /// ≥2).
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+}
+
+pub use canonical::{OneOfEntries, UnionMembers};
+
 // ==================== Resolved Location ====================
 
 /// Resolved location geometry.
@@ -116,8 +196,10 @@ pub enum Location {
     /// Disjoint or partially-overlapping shapes: "one of these is true."
     /// Parallels [`UnresolvedLocation::OneOf`] at the resolved level.
     /// Flattened when nested. Requires ≥2 children.
+    ///
+    /// Construct via [`Location::union_of`]; `members` is sealed canonical.
     #[serde(rename = "union_of")]
-    UnionOf { members: Vec<Location> },
+    UnionOf { members: UnionMembers },
     /// No geometric information (resolution failed, or unknown).
     Unbounded,
 }
@@ -257,47 +339,27 @@ impl Location {
         }
     }
 
-    /// Create a validated `UnionOf` with at least 2 children.
+    /// Create a validated, canonical `UnionOf`.
+    ///
+    /// Canonicalizes the members so one logical union has a single wire form:
+    /// nested `UnionOf`s flatten, a member geometrically contained by a sibling
+    /// drops as redundant, and the survivors sort and dedup. The `≥2` minimum
+    /// is checked on the canonical result, so a union that collapses to one
+    /// member (all-equal, or one subsuming the rest) is rejected.
     pub fn union_of(children: Vec<Location>) -> Result<Self, LocationError> {
-        if children.len() < 2 {
+        let members = UnionMembers::canonicalize(children);
+        if members.len() < 2 {
             return Err(LocationError::TooFewEntries {
-                count: children.len(),
+                count: members.len(),
             });
         }
-        Ok(Self::UnionOf { members: children })
-    }
-
-    /// Merge two locations in the subsumption semilattice.
-    ///
-    /// If one location's region contains the other, returns the tighter (more
-    /// precise) one. Otherwise returns `UnionOf` — "one of these, but we can't
-    /// determine which geometrically."
-    ///
-    /// `Unbounded` is the identity: `Unbounded.merge(x) == x`.
-    pub fn merge(&self, other: &Self) -> Self {
-        if self.contains(other) {
-            return other.clone();
-        }
-        if other.contains(self) {
-            return self.clone();
-        }
-        // Neither contains the other — produce a union
-        let mut children = Vec::new();
-        // Flatten existing UnionOf children
-        match self {
-            Self::UnionOf { members } => children.extend(members.iter().cloned()),
-            other_val => children.push(other_val.clone()),
-        }
-        match other {
-            Self::UnionOf { members } => children.extend(members.iter().cloned()),
-            other_val => children.push(other_val.clone()),
-        }
-        Self::UnionOf { members: children }
+        Ok(Self::UnionOf { members })
     }
 
     /// Check if this location's region contains another's entirely.
     ///
-    /// Private — subsumption is implied by `merge(a, b) == b` when `a` contains `b`.
+    /// Private — drives the union canonicalization's redundant-member collapse
+    /// (a member contained by a sibling carries no information).
     fn contains(&self, other: &Self) -> bool {
         match (self, other) {
             // Unbounded contains everything
@@ -328,15 +390,47 @@ impl Location {
                     members: other_children,
                 },
             ) => other_children
+                .as_slice()
                 .iter()
-                .all(|oc| self_children.iter().any(|sc| sc.contains(oc))),
+                .all(|oc| self_children.as_slice().iter().any(|sc| sc.contains(oc))),
             // UnionOf contains X if any child contains X
-            (Self::UnionOf { members }, other_loc) => members.iter().any(|c| c.contains(other_loc)),
+            (Self::UnionOf { members }, other_loc) => {
+                members.as_slice().iter().any(|c| c.contains(other_loc))
+            }
             // X contains UnionOf if X contains every child
-            (_, Self::UnionOf { members }) => members.iter().all(|c| self.contains(c)),
-            // Circle doesn't contain Unbounded (handled above)
+            (_, Self::UnionOf { members }) => members.as_slice().iter().all(|c| self.contains(c)), // Circle doesn't contain Unbounded (handled above)
         }
     }
+}
+
+/// Canonicalize the members of a [`Location::UnionOf`] so one logical union
+/// has a single wire form: flatten nested unions, drop any member geometrically
+/// contained by a distinct sibling (redundant in a union), then sort and dedup.
+/// Confluent — the result is independent of input order.
+fn canonical_union_members(children: Vec<Location>) -> Vec<Location> {
+    let mut flat: Vec<Location> = Vec::new();
+    for child in children {
+        match child {
+            Location::UnionOf { members } => flat.extend_from_slice(members.as_slice()),
+            other => flat.push(other),
+        }
+    }
+    // Drop a member subsumed by a distinct sibling. Containment is reflexive,
+    // so when two members contain each other (geometrically equal), keep the
+    // earlier index and let `dedup` clear the rest after the sort.
+    let mut kept: Vec<Location> = (0..flat.len())
+        .filter(|&i| {
+            let m = &flat[i];
+            !flat
+                .iter()
+                .enumerate()
+                .any(|(j, other)| i != j && other.contains(m) && (!m.contains(other) || j < i))
+        })
+        .map(|i| flat[i].clone())
+        .collect();
+    kept.sort();
+    kept.dedup();
+    kept
 }
 
 /// Haversine distance in meters between two geo-points.
@@ -372,13 +466,20 @@ pub enum UnresolvedLocation {
     /// One of these, don't know which (conflicting sources).
     /// Flattened when nested. Requires ≥2 entries.
     ///
-    /// Construct via [`UnresolvedLocation::one_of`] to enforce the minimum.
-    OneOf(Vec<UnresolvedLocation>),
+    /// Construct via [`UnresolvedLocation::one_of`]; the entry list is sealed
+    /// canonical.
+    OneOf(OneOfEntries),
 }
 
 impl UnresolvedLocation {
-    /// Create a validated `OneOf` with at least 2 entries.
+    /// Create a validated, canonical `OneOf`.
+    ///
+    /// Canonicalizes the entries so one logical disjunction has a single wire
+    /// form: nested `OneOf`s flatten, then the entries sort and dedup. The `≥2`
+    /// minimum is checked on the canonical result, so an all-equal disjunction
+    /// (which dedups to one entry) is rejected.
     pub fn one_of(entries: Vec<UnresolvedLocation>) -> Result<Self, LocationError> {
+        let entries = OneOfEntries::canonicalize(entries);
         if entries.len() < 2 {
             return Err(LocationError::TooFewEntries {
                 count: entries.len(),
@@ -386,6 +487,23 @@ impl UnresolvedLocation {
         }
         Ok(Self::OneOf(entries))
     }
+}
+
+/// Canonicalize the entries of an [`UnresolvedLocation::OneOf`]: flatten nested
+/// `OneOf`s, then sort and dedup so one logical disjunction has a single wire
+/// form. Confluent — independent of input order. No containment collapse: the
+/// entries may be symbolic references whose geometry isn't known yet.
+fn canonical_one_of_entries(entries: Vec<UnresolvedLocation>) -> Vec<UnresolvedLocation> {
+    let mut flat: Vec<UnresolvedLocation> = Vec::new();
+    for entry in entries {
+        match entry {
+            UnresolvedLocation::OneOf(inner) => flat.extend_from_slice(inner.as_slice()),
+            other => flat.push(other),
+        }
+    }
+    flat.sort();
+    flat.dedup();
+    flat
 }
 
 impl<'de> Deserialize<'de> for UnresolvedLocation {
@@ -406,14 +524,7 @@ impl<'de> Deserialize<'de> for UnresolvedLocation {
         match raw {
             Raw::Resolved(loc) => Ok(Self::Resolved(loc)),
             Raw::Reference(r) => Ok(Self::Reference(r)),
-            Raw::OneOf(entries) => {
-                if entries.len() < 2 {
-                    return Err(serde::de::Error::custom(LocationError::TooFewEntries {
-                        count: entries.len(),
-                    }));
-                }
-                Ok(Self::OneOf(entries))
-            }
+            Raw::OneOf(entries) => Self::one_of(entries).map_err(serde::de::Error::custom),
         }
     }
 }
@@ -586,14 +697,14 @@ mod tests {
 
     #[test]
     fn one_of_serde_roundtrip() -> TestResult {
-        let loc = UnresolvedLocation::OneOf(vec![
+        let loc = UnresolvedLocation::one_of(vec![
             UnresolvedLocation::Reference(LocationReference::NamedPlace {
                 name: "Paris".to_string(),
             }),
             UnresolvedLocation::Reference(LocationReference::Address {
                 address_text: "123 Main St".to_string(),
             }),
-        ]);
+        ])?;
 
         let json = serde_json::to_string(&loc)?;
         let deserialized: UnresolvedLocation = serde_json::from_str(&json)?;
@@ -602,17 +713,12 @@ mod tests {
     }
 
     #[test]
-    fn one_of_rejects_single_entry() -> TestResult {
-        // Construct a single-entry OneOf — serialization succeeds but
-        // deserialization must reject it (minimum 2 entries).
-        let loc = UnresolvedLocation::OneOf(vec![UnresolvedLocation::Reference(
-            LocationReference::NamedPlace {
-                name: "Paris".to_string(),
-            },
-        )]);
-        let json = serde_json::to_string(&loc)?;
-        assert!(serde_json::from_str::<UnresolvedLocation>(&json).is_err());
-        Ok(())
+    fn one_of_rejects_single_entry() {
+        // A single-entry OneOf on the wire must be rejected (minimum 2 entries).
+        // The sealed `OneOf` can't be built in-memory below the minimum, so the
+        // degenerate shape is supplied as raw wire bytes.
+        let json = r#"{"type":"one_of","value":[{"type":"reference","value":{"type":"named_place","name":"Paris"}}]}"#;
+        assert!(serde_json::from_str::<UnresolvedLocation>(json).is_err());
     }
 
     #[test]
@@ -638,91 +744,111 @@ mod tests {
         Ok(())
     }
 
-    // --- Location merge (lattice) tests ---
+    // --- UnionOf / OneOf canonicalization ---
 
     #[test]
-    fn merge_unbounded_is_identity() -> TestResult {
-        let c = Location::circle(gp(48.8, 2.3)?, 100.0)?;
-        assert_eq!(Location::Unbounded.merge(&c), c);
-        assert_eq!(c.merge(&Location::Unbounded), c);
-        Ok(())
-    }
-
-    #[test]
-    fn merge_circle_subsumes_smaller() -> TestResult {
-        let big = Location::circle(gp(48.8, 2.3)?, 1000.0)?;
-        let small = Location::circle(gp(48.8, 2.3)?, 10.0)?;
-        // big contains small → merge returns the tighter (small)
-        assert_eq!(big.merge(&small), small);
-        assert_eq!(small.merge(&big), small);
-        Ok(())
-    }
-
-    #[test]
-    fn merge_disjoint_circles_produces_union() -> TestResult {
+    fn union_of_member_order_is_canonical() -> TestResult {
+        // Two orderings of the same disjoint circles produce one wire form.
         let paris = Location::circle(gp(48.8, 2.3)?, 10.0)?;
         let london = Location::circle(gp(51.5, -0.1)?, 10.0)?;
-        let merged = paris.merge(&london);
-        assert!(matches!(merged, Location::UnionOf { ref members } if members.len() == 2));
+        let forward = Location::union_of(vec![paris.clone(), london.clone()])?;
+        let reversed = Location::union_of(vec![london, paris])?;
+        assert_eq!(
+            serde_json::to_string(&forward)?,
+            serde_json::to_string(&reversed)?
+        );
         Ok(())
     }
 
     #[test]
-    fn merge_flattens_union() -> TestResult {
+    fn union_of_flattens_nested() -> TestResult {
+        // A nested UnionOf child flattens — the only useful part of the removed
+        // `merge` now lives in the constructor.
         let a = Location::circle(gp(48.8, 2.3)?, 10.0)?;
         let b = Location::circle(gp(51.5, -0.1)?, 10.0)?;
         let c = Location::circle(gp(40.7, -74.0)?, 10.0)?;
-        // (a ∪ b) merge c should flatten to [a, b, c], not [[a, b], c]
-        let ab = a.merge(&b);
-        let abc = ab.merge(&c);
-        assert!(matches!(abc, Location::UnionOf { ref members } if members.len() == 3));
+        let nested = Location::union_of(vec![Location::union_of(vec![a, b])?, c])?;
+        assert!(matches!(nested, Location::UnionOf { ref members } if members.len() == 3));
         Ok(())
     }
 
     #[test]
-    fn merge_idempotent_circle() -> TestResult {
-        let c = Location::circle(gp(48.8, 2.3)?, 100.0)?;
-        assert_eq!(c.merge(&c), c);
-        Ok(())
-    }
-
-    #[test]
-    fn merge_union_with_union() -> TestResult {
-        let a = Location::circle(gp(48.8, 2.3)?, 10.0)?;
-        let b = Location::circle(gp(51.5, -0.1)?, 10.0)?;
-        let c = Location::circle(gp(40.7, -74.0)?, 10.0)?;
-        let d_loc = Location::circle(gp(35.7, 139.7)?, 10.0)?;
-        let ab = a.merge(&b); // UnionOf([a, b])
-        let cd = c.merge(&d_loc); // UnionOf([c, d])
-        let merged = ab.merge(&cd);
-        assert!(matches!(merged, Location::UnionOf { ref members } if members.len() == 4));
-        Ok(())
-    }
-
-    #[test]
-    fn merge_offset_circle_containment() -> TestResult {
-        // Big circle centered at origin with 1000km radius
+    fn union_of_drops_subsumed_member() -> TestResult {
+        // A small circle inside a big one at the same center is redundant in a
+        // union, so it drops; what survives is the big circle plus a disjoint
+        // third, leaving two members.
         let big = Location::circle(gp(0.0, 0.0)?, 1_000_000.0)?;
-        // Small circle offset but still within big
-        let small = Location::circle(gp(1.0, 1.0)?, 10.0)?;
-        // big should contain small → merge returns small
-        assert_eq!(big.merge(&small), small);
+        let small = Location::circle(gp(1.0, 1.0)?, 10.0)?; // inside big
+        let elsewhere = Location::circle(gp(40.7, -74.0)?, 10.0)?;
+        let union = Location::union_of(vec![big.clone(), small, elsewhere.clone()])?;
+        let Location::UnionOf { members } = &union else {
+            return Err("expected a union".into());
+        };
+        assert_eq!(members.len(), 2);
+        assert!(members.as_slice().contains(&big) && members.as_slice().contains(&elsewhere));
         Ok(())
     }
 
     #[test]
-    fn merge_offset_circle_not_contained() -> TestResult {
-        // Small circle at origin with 100m radius
-        let small_a = Location::circle(gp(0.0, 0.0)?, 100.0)?;
-        // Another small circle ~111km away (1 degree of latitude)
-        let small_b = Location::circle(gp(1.0, 0.0)?, 100.0)?;
-        // Neither contains the other → UnionOf
-        let merged = small_a.merge(&small_b);
-        assert!(matches!(merged, Location::UnionOf { .. }));
+    fn union_of_all_subsumed_collapses_and_is_rejected() -> TestResult {
+        // Every member contained by one big circle leaves a single survivor;
+        // a one-member union is degenerate and rejected.
+        let big = Location::circle(gp(0.0, 0.0)?, 1_000_000.0)?;
+        let small = Location::circle(gp(1.0, 1.0)?, 10.0)?;
+        let result = Location::union_of(vec![big, small]);
+        assert!(matches!(result, Err(LocationError::TooFewEntries { .. })));
         Ok(())
     }
 
-    // --- Location merge property tests ---
+    #[test]
+    fn one_of_entry_order_is_canonical() -> TestResult {
+        let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+            name: "Paris".to_string(),
+        });
+        let address = UnresolvedLocation::Reference(LocationReference::Address {
+            address_text: "123 Main St".to_string(),
+        });
+        let forward = UnresolvedLocation::one_of(vec![paris.clone(), address.clone()])?;
+        let reversed = UnresolvedLocation::one_of(vec![address, paris])?;
+        assert_eq!(
+            serde_json::to_string(&forward)?,
+            serde_json::to_string(&reversed)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn one_of_flattens_nested_and_dedups() -> TestResult {
+        let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+            name: "Paris".to_string(),
+        });
+        let london = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+            name: "London".to_string(),
+        });
+        // A nested OneOf plus a duplicate of one of its entries flatten and
+        // dedup to {London, Paris}.
+        let nested = UnresolvedLocation::one_of(vec![
+            UnresolvedLocation::one_of(vec![paris.clone(), london])?,
+            paris,
+        ])?;
+        let UnresolvedLocation::OneOf(entries) = &nested else {
+            return Err("expected a OneOf".into());
+        };
+        assert_eq!(entries.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn one_of_all_equal_rejected() -> TestResult {
+        let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+            name: "Paris".to_string(),
+        });
+        let result = UnresolvedLocation::one_of(vec![paris.clone(), paris]);
+        assert!(matches!(result, Err(LocationError::TooFewEntries { .. })));
+        Ok(())
+    }
+
+    // --- canonicalization property tests ---
 
     use proptest::prelude::*;
 
@@ -736,53 +862,46 @@ mod tests {
         )
     }
 
-    fn arb_location() -> impl Strategy<Value = Location> {
-        let union = (arb_circle(), arb_circle()).prop_map(|(a, b)| Location::UnionOf {
-            members: vec![a, b],
-        });
-        prop_oneof![
-            6 => arb_circle(),
-            2 => union,
-            2 => Just(Location::Unbounded),
-        ]
-    }
-
     proptest! {
+        /// `union_of` is confluent: any permutation of the same members yields
+        /// one wire form (the determinism the unsorted constructor broke).
+        /// Restricted to circles of equal radius so no member subsumes another,
+        /// keeping the member count permutation-invariant.
         #[test]
-        fn prop_location_merge_commutative(a in arb_location(), b in arb_location()) {
-            // Commutativity: merge(a, b) == merge(b, a)
-            // Note: UnionOf children may be in different order, so we compare
-            // by checking mutual containment.
-            let ab = a.merge(&b);
-            let ba = b.merge(&a);
-            // For simple cases (non-union results), direct equality works.
-            // For UnionOf, the children are in insertion order which depends on
-            // which side is self vs other. We verify by checking that both
-            // results contain the same geometry semantically.
-            match (&ab, &ba) {
-                (Location::UnionOf { members: cs1 }, Location::UnionOf { members: cs2 }) => {
-                    prop_assert_eq!(cs1.len(), cs2.len());
-                    // Both should contain the same elements (possibly reordered)
-                    for c in cs1 {
-                        prop_assert!(cs2.contains(c), "ab contains {:?} not in ba", c);
-                    }
-                }
-                _ => prop_assert_eq!(ab, ba),
+        fn prop_union_of_order_independent(
+            circles in prop::collection::vec(
+                (-90.0f64..=90.0, -180.0f64..=180.0).prop_filter_map(
+                    "distinct-center circle",
+                    |(lat, lon)| {
+                        let center = GeoPoint::new(lat, lon).ok()?;
+                        Location::circle(center, 1.0).ok()
+                    },
+                ),
+                2..=5,
+            ),
+            rotate in 0usize..5,
+        ) {
+            let forward = Location::union_of(circles.clone());
+            let mut rotated = circles;
+            let len = rotated.len();
+            rotated.rotate_right(rotate % len);
+            let other = Location::union_of(rotated);
+            // Both constructions agree on success/shape regardless of order.
+            match (forward, other) {
+                (Ok(a), Ok(b)) => prop_assert_eq!(a, b),
+                (Err(_), Err(_)) => {}
+                (a, b) => prop_assert!(false, "order changed validity: {:?} vs {:?}", a, b),
             }
         }
+    }
 
+    // Keep `arb_circle` exercised even when only the proptest above runs.
+    proptest! {
         #[test]
-        fn prop_location_merge_identity(a in arb_location()) {
-            prop_assert_eq!(Location::Unbounded.merge(&a), a.clone());
-            prop_assert_eq!(a.merge(&Location::Unbounded), a);
-        }
-
-        #[test]
-        fn prop_location_merge_idempotent(a in arb_circle()) {
-            // Idempotent for circles (self-containment is trivially true).
-            // UnionOf idempotence is more complex due to child duplication,
-            // so we test only atomic locations here.
-            prop_assert_eq!(a.merge(&a), a);
+        fn prop_circle_round_trips(c in arb_circle()) {
+            let json = serde_json::to_string(&c)?;
+            let back: Location = serde_json::from_str(&json)?;
+            prop_assert_eq!(back, c);
         }
     }
 }

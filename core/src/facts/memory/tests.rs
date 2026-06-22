@@ -16,7 +16,8 @@ use crate::facts::submit::{
     Commit as SubmitBundle, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact,
 };
 use crate::facts::submit::{
-    CommitAuthor, ImageRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError, commit_facts,
+    CommitAuthor, DateRole, ImageRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError,
+    commit_facts,
 };
 use crate::location::{LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
@@ -3135,6 +3136,184 @@ async fn observation_cited_external_accepted() -> TestResult {
         vec![observation_feature_fact(0, external_judgment_citation()?)?],
     )?;
     commit_ok(&store, bundle).await
+}
+
+// --- single-interval stored-date rule ---
+
+/// A two-interval disjunction ("1920 or 1940"), built by joining two disjoint
+/// year claims — the read-side shape a stored fact may not carry.
+fn disjunctive_date() -> Result<UncertainDate, Box<dyn std::error::Error>> {
+    let a = year_date(1920)?;
+    let b = year_date(1940)?;
+    let joined = a.join(&b);
+    assert_eq!(joined.intervals().len(), 2, "expected a real disjunction");
+    Ok(joined)
+}
+
+/// A `Construction::Started` bookend carrying an arbitrary date — the
+/// fact-payload host for the single-interval rule.
+fn started_with_date(
+    entity_idx: usize,
+    bound: UncertainDate,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: bookend::Fact::Started {
+                entity: EntityIdx(entity_idx),
+                bound,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// An `External`-cited judgment whose citation date is `published` — the
+/// non-`Factual` citation host (`JudgmentSource::External`). A feature
+/// observation cited externally trips no other rule.
+fn observation_external_published(
+    entity_idx: usize,
+    published: Option<UncertainDate>,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    let citation = JudgmentSource::External {
+        source: ExternalSource::Url {
+            url: Url::parse("https://example.com/observed")?,
+            published,
+        },
+    };
+    observation_feature_fact(entity_idx, citation)
+}
+
+/// A bookend carrying a single interval is accepted (the storable shape).
+#[tokio::test]
+async fn single_interval_bookend_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![started_with_date(0, year_date(1900)?)?])?,
+    )
+    .await
+}
+
+/// A bookend carrying a disjunction is rejected at the fact-payload host.
+#[tokio::test]
+async fn disjunctive_bookend_date_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![started_with_date(0, disjunctive_date()?)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::NonSingleIntervalDate {
+                role: DateRole::BookendBound
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A bookend carrying the empty date (⊥) is rejected — ⊥ is no honest claim.
+#[tokio::test]
+async fn empty_bookend_date_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![started_with_date(0, UncertainDate::empty())?],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::NonSingleIntervalDate { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A `JudgmentSource::External` citation carrying a disjunctive `published`
+/// date is rejected — the rule reaches citation dates, not just fact payloads.
+#[tokio::test]
+async fn disjunctive_judgment_citation_date_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![observation_external_published(
+                0,
+                Some(disjunctive_date()?),
+            )?],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::NonSingleIntervalDate {
+                role: DateRole::CitationDate
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A `MetaSource::External` citation carrying a disjunctive `created` date is
+/// rejected — the third `ExternalSource` host the traversal must reach.
+#[tokio::test]
+async fn disjunctive_meta_citation_date_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    // Seed a commit so the retraction has a real target.
+    let seed = commit_facts(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![name_fact(0, "seed")?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+
+    let retraction = SubmitFact::Meta {
+        assertion: crate::facts::assertions::MetaAssertion::RetractCommit {
+            target: seed.commit_id,
+            reason: crate::facts::assertions::RetractionReason::FactualError,
+        },
+        citation: crate::facts::citations::MetaSource::External {
+            source: ExternalSource::Archive {
+                collection: "fonds".to_owned(),
+                catalog_id: None,
+                created: Some(disjunctive_date()?),
+            },
+        },
+    };
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retraction].into_iter().collect(),
+    };
+    let errs = commit_err(&store, bundle).await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::NonSingleIntervalDate {
+                role: DateRole::CitationDate
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
 }
 
 // --- property tests ---

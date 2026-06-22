@@ -32,11 +32,12 @@ use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::num::NonZeroUsize;
 
-use super::error::{ImageRole, SubmitError};
+use super::error::{DateRole, ImageRole, SubmitError};
 use super::result::{StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMetaFact};
 use super::{EntityIdx, EventIdx, ImageIdx, SubmitFact};
+use crate::date::UncertainDate;
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
-use crate::facts::citations::JudgmentSource;
+use crate::facts::citations::{ExternalSource, FactualCitation, JudgmentSource, MetaSource};
 use crate::facts::identity::{IdMapError, SelfLoop};
 use crate::facts::ids::{FactId, SubjectKind};
 use crate::facts::lifecycle::LifetimeEventKind;
@@ -45,7 +46,7 @@ use crate::facts::store::{
     EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf, SubmitCommitError,
     SubmitCommitInput, SubmitCommitOutput,
 };
-use crate::facts::{attribute, bookend, composites, depiction, event, map, picture};
+use crate::facts::{attribute, bookend, composites, depiction, event, image, map, picture};
 
 // ============================================================================
 // commit_facts — end-to-end transaction-and-commit wrapper
@@ -570,6 +571,7 @@ fn run_cluster_rules<S>(
     rule_demolition_location::<S>(candidates, errors);
     rule_event_kind::<S>(candidates, event_facts, errors);
     rule_name_window::<S>(candidates, errors);
+    rule_single_interval_date::<S>(candidates, errors);
     rule_observation_depiction::<S>(candidates, image_facts, errors);
     rule_composite_self_parent::<S>(candidates, errors);
     rule_composite_multiple_parents::<S>(candidates, image_facts, errors);
@@ -672,6 +674,133 @@ fn rule_name_window<S: FactStore>(
     }
     for entity in offending {
         errors.push(SubmitError::NameWindowInverted { entity });
+    }
+}
+
+/// Every stored `UncertainDate` must be a single non-empty interval. We model
+/// no use for a disjunction or ⊥ in a submission today, so we reject them to
+/// keep the model simple and junk out of the store. This is a deliberately
+/// strict guard: a real use case can relax it later with nothing breaking. The
+/// traversal in [`for_each_stored_date`] currently covers every date position;
+/// until it is macro-derived, a new date-bearing grammar variant must be added
+/// there by hand.
+fn rule_single_interval_date<S: FactStore>(
+    candidates: &[StoredFactOf<S>],
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) {
+    for fact in candidates {
+        for_each_stored_date(fact, &mut |role, date| {
+            if date.as_single_interval().is_none() {
+                errors.push(SubmitError::NonSingleIntervalDate { role });
+            }
+        });
+    }
+}
+
+/// Visit every [`UncertainDate`] a stored fact reaches — fact-payload date
+/// fields and every `ExternalSource` date across the three citation hosts —
+/// tagging each with its [`DateRole`]. The one closed traversal the
+/// single-interval rule walks; routing all `ExternalSource` hosts through
+/// [`for_each_external_source_date`] keeps a future fourth host from
+/// reintroducing the citation-date hole.
+fn for_each_stored_date<EntId, EvtId, ImgId>(
+    fact: &StoredFact<EntId, EvtId, ImgId>,
+    visit: &mut impl FnMut(DateRole, &UncertainDate),
+) where
+    EntId: Ord,
+    EvtId: Ord,
+    ImgId: Ord,
+{
+    match fact {
+        StoredFact::Factual(StoredFactualFact {
+            assertion,
+            citation,
+        }) => {
+            for_each_assertion_date(assertion, visit);
+            let FactualCitation { source, .. } = citation;
+            for_each_external_source_date(source, visit);
+        }
+        StoredFact::Judgment(StoredJudgmentFact { source, .. }) => {
+            if let JudgmentSource::External { source } = source {
+                for_each_external_source_date(source, visit);
+            }
+        }
+        StoredFact::Meta(StoredMetaFact { source, .. }) => {
+            if let MetaSource::External { source } = source {
+                for_each_external_source_date(source, visit);
+            }
+        }
+    }
+}
+
+/// Visit the date fields a factual assertion's payload carries. `Gap` carries
+/// no `UncertainDate`, so the event arm reaches only the dated event facts.
+fn for_each_assertion_date<EntId, EvtId, ImgId>(
+    assertion: &FactualAssertion<EntId, EvtId, ImgId>,
+    visit: &mut impl FnMut(DateRole, &UncertainDate),
+) where
+    EntId: Ord,
+    EvtId: Ord,
+{
+    match assertion {
+        FactualAssertion::Attribute {
+            fact:
+                attribute::Fact::Name {
+                    valid_from,
+                    valid_to,
+                    ..
+                },
+        } => {
+            if let Some(date) = valid_from {
+                visit(DateRole::NameValidFrom, date);
+            }
+            if let Some(date) = valid_to {
+                visit(DateRole::NameValidTo, date);
+            }
+        }
+        FactualAssertion::Construction { fact } | FactualAssertion::Demolition { fact } => {
+            if let bookend::Fact::Started { bound, .. } | bookend::Fact::Completed { bound, .. } =
+                fact
+            {
+                visit(DateRole::BookendBound, bound);
+            }
+        }
+        FactualAssertion::Event { fact } => {
+            if let event::Fact::PointDate { bound, .. }
+            | event::Fact::DurationalDate { bound, .. } = fact
+            {
+                visit(DateRole::EventDate, bound);
+            }
+        }
+        FactualAssertion::Image { fact } => {
+            if let image::Fact::CreatedDate { bound, .. } = fact {
+                visit(DateRole::ImageCreated, bound);
+            }
+        }
+        FactualAssertion::Picture { fact } => {
+            if let picture::Fact::CapturedDate { bound, .. } = fact {
+                visit(DateRole::PictureCaptured, bound);
+            }
+        }
+        FactualAssertion::Attribute { .. } | FactualAssertion::Map { .. } => {}
+    }
+}
+
+/// Visit the publication/creation date an `ExternalSource` carries, when one is
+/// present. The structured variants pin their version instead of a date.
+fn for_each_external_source_date(
+    source: &ExternalSource,
+    visit: &mut impl FnMut(DateRole, &UncertainDate),
+) {
+    let date = match source {
+        ExternalSource::Url { published, .. } | ExternalSource::Book { published, .. } => {
+            published.as_ref()
+        }
+        ExternalSource::Archive { created, .. } => created.as_ref(),
+        ExternalSource::Wikidata { .. } | ExternalSource::Dbpedia { .. } => None,
+    };
+    if let Some(date) = date {
+        visit(DateRole::CitationDate, date);
     }
 }
 

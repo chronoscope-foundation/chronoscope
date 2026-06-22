@@ -14,6 +14,42 @@
 use super::{EntityIdx, EventIdx, ImageIdx};
 use crate::facts::ids::{CommitId, FactId, SubjectKind};
 
+/// Which date a fact carries, named so a [`SubmitError::NonSingleIntervalDate`]
+/// pinpoints the offending position across fact payloads and citations alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DateRole {
+    /// `attribute::Fact::Name { valid_from }`.
+    NameValidFrom,
+    /// `attribute::Fact::Name { valid_to }`.
+    NameValidTo,
+    /// A construction/demolition bookend bound (`Started` / `Completed`).
+    BookendBound,
+    /// A lifetime-event date (`PointDate` / `DurationalDate`).
+    EventDate,
+    /// `image::Fact::CreatedDate`.
+    ImageCreated,
+    /// `picture::Fact::CapturedDate`.
+    PictureCaptured,
+    /// An `ExternalSource` publication/creation date carried by a citation
+    /// (`Url`/`Book` published, `Archive` created).
+    CitationDate,
+}
+
+impl std::fmt::Display for DateRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::NameValidFrom => "name valid-from",
+            Self::NameValidTo => "name valid-to",
+            Self::BookendBound => "bookend bound",
+            Self::EventDate => "event date",
+            Self::ImageCreated => "image created-date",
+            Self::PictureCaptured => "picture captured-date",
+            Self::CitationDate => "citation date",
+        };
+        f.write_str(label)
+    }
+}
+
 /// The role an image is used as or claimed to be. A picture carries capture
 /// metadata and depicts entities in-frame; a map places entities by location.
 /// Role coherence (one image, one role) is checked at submit time; the Display
@@ -219,6 +255,16 @@ pub enum SubmitError<E, V, I> {
     NameWindowInverted {
         /// The entity whose name window is inverted.
         entity: E,
+    },
+    /// A stored fact carries an [`UncertainDate`](crate::date::UncertainDate)
+    /// that isn't a single non-empty interval — a disjunction or the empty
+    /// union. A single source asserts one interval; a disjunction ("I can't
+    /// decide") and ⊥ ("no possible date") are read-side projections, not
+    /// storable claims.
+    #[error("{role} carries a disjunction or empty date; a stored claim must be a single interval")]
+    NonSingleIntervalDate {
+        /// Which date position carried the non-single value.
+        role: DateRole,
     },
     /// An image-observation names an entity with no paired depiction tying that
     /// entity to the observed image. The observation describes something seen in
