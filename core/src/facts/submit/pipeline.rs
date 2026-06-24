@@ -29,24 +29,23 @@
 //! reads against its transaction.
 
 use std::collections::{BTreeSet, HashMap};
-use std::future::Future;
-use std::num::NonZeroUsize;
 
-use super::error::{DateRole, ImageRole, SubmitError};
+use super::error::{DateRole, ImageRole, LocationRole, SubmitError};
 use super::result::{StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMetaFact};
 use super::{EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::date::UncertainDate;
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use crate::facts::citations::{ExternalSource, FactualCitation, JudgmentSource, MetaSource};
+use crate::facts::drain::{DRAIN_PAGE, drain_facts};
 use crate::facts::identity::{IdMapError, SelfLoop};
 use crate::facts::ids::{FactId, SubjectKind};
 use crate::facts::lifecycle::LifetimeEventKind;
-use crate::facts::schema::{FactPage, PageItem};
 use crate::facts::store::{
     EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf, SubmitCommitError,
     SubmitCommitInput, SubmitCommitOutput,
 };
 use crate::facts::{attribute, bookend, composites, depiction, event, image, map, picture};
+use crate::location::UnresolvedLocation;
 
 // ============================================================================
 // commit_facts — end-to-end transaction-and-commit wrapper
@@ -209,15 +208,13 @@ where
     let mut event_facts: HashMap<S::EventId, Vec<StoredFactOf<S>>> = HashMap::new();
     for e in events {
         let drained =
-            drain_facts::<S, _, _, _>(|cursor| view.all_facts_about_event(&e, cursor, DRAIN_PAGE))
-                .await?;
+            drain_facts(|cursor| view.all_facts_about_event(&e, cursor, DRAIN_PAGE)).await?;
         event_facts.insert(e, drained);
     }
     let mut image_facts: HashMap<S::ImageId, Vec<StoredFactOf<S>>> = HashMap::new();
     for i in images {
         let drained =
-            drain_facts::<S, _, _, _>(|cursor| view.all_facts_about_image(&i, cursor, DRAIN_PAGE))
-                .await?;
+            drain_facts(|cursor| view.all_facts_about_image(&i, cursor, DRAIN_PAGE)).await?;
         image_facts.insert(i, drained);
     }
     Ok((event_facts, image_facts))
@@ -501,57 +498,6 @@ fn substitute_meta(meta: &MetaAssertion) -> MetaAssertion {
 }
 
 // ============================================================================
-// Backlink drain (committed ∪ pending, straight from the view)
-// ============================================================================
-
-/// Page size for the view drains — the backlink reads behind the cluster
-/// rules and the matcher's keyed walks. Pagination is an internal detail
-/// here; one page covers most subjects, and the loops handle the rest.
-pub(super) const DRAIN_PAGE: NonZeroUsize = match NonZeroUsize::new(256) {
-    Some(n) => n,
-    None => NonZeroUsize::MIN,
-};
-
-/// Drain a paged read to exhaustion, following `FactPage::next_cursor` and
-/// handing every row to `on_item`. The one cursor loop behind every drain:
-/// the matcher's candidate collection and the cluster rules' backlink reads
-/// differ only in which read they call and what they keep from each row.
-pub(super) async fn drain_pages<S, Sub, F, Fut>(
-    mut fetch: F,
-    mut on_item: impl FnMut(PageItem<StoredFactOf<S>, Sub>),
-) -> Result<(), S::Error>
-where
-    S: FactStore,
-    F: FnMut(FactId) -> Fut,
-    Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
-{
-    let mut cursor = FactId::new(0);
-    loop {
-        let page = fetch(cursor).await?;
-        page.items.into_iter().for_each(&mut on_item);
-        match page.next_cursor {
-            Some(c) => cursor = c,
-            None => break,
-        }
-    }
-    Ok(())
-}
-
-/// Every fact a `fetch` closure reports, drained to exhaustion. The shared
-/// shape behind the event and image backlink drains — they differ only in
-/// which backlink read they call.
-async fn drain_facts<S, F, Fut, Sub>(fetch: F) -> Result<Vec<StoredFactOf<S>>, S::Error>
-where
-    S: FactStore,
-    F: FnMut(FactId) -> Fut,
-    Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
-{
-    let mut out = Vec::new();
-    drain_pages::<S, _, _, _>(fetch, |item| out.push(item.fact)).await?;
-    Ok(out)
-}
-
-// ============================================================================
 // Cluster rules
 // ============================================================================
 
@@ -569,9 +515,11 @@ fn run_cluster_rules<S>(
     S: FactStore,
 {
     rule_demolition_location::<S>(candidates, errors);
-    rule_event_kind::<S>(candidates, event_facts, errors);
+    rule_event_has_one_kind::<S>(candidates, event_facts, errors);
+    rule_event_fact_kind_consistency::<S>(candidates, event_facts, errors);
     rule_name_window::<S>(candidates, errors);
     rule_single_interval_date::<S>(candidates, errors);
+    rule_no_empty_location::<S>(candidates, errors);
     rule_observation_depiction::<S>(candidates, image_facts, errors);
     rule_composite_self_parent::<S>(candidates, errors);
     rule_composite_multiple_parents::<S>(candidates, image_facts, errors);
@@ -603,45 +551,152 @@ fn rule_demolition_location<S: FactStore>(
     }
 }
 
-/// Every lifetime event's facts must agree on a kind. For each event the commit
-/// touches, narrow the candidate kinds by each attached fact's compatibility set
-/// (in-commit ∪ pre-commit); an empty narrowing is a conflict.
-fn rule_event_kind<S>(
+/// The distinct `{entity, kind}` `HasEvent` claims an event carries in the
+/// cumulative neighbourhood (committed ∪ this commit, active-only). The set
+/// keys on `(entity, kind)`, so an identical claim re-asserted in another
+/// commit collapses to one entry; counting distinct entries signals genuine
+/// disagreement: one is well-typed, ≥2 is a subject/kind self-contradiction.
+fn has_event_claims<S>(
+    event: &S::EventId,
+    gathered: &[StoredFactOf<S>],
+) -> BTreeSet<(S::EntityId, LifetimeEventKind)>
+where
+    S: FactStore,
+{
+    let mut claims = BTreeSet::new();
+    for fact in gathered {
+        if let Some(event::Fact::HasEvent {
+            entity,
+            event: e,
+            kind,
+        }) = fact.event_fact()
+            && e == event
+        {
+            claims.insert((entity.clone(), *kind));
+        }
+    }
+    claims
+}
+
+/// Exactly one `HasEvent` per event id. An event has one subject entity and one
+/// declared kind, so each id the commit *references* — as a typing or payload
+/// subject, or as a `Gap` endpoint — must carry exactly one `HasEvent` across
+/// the cumulative neighbourhood (committed ∪ this commit): no `HasEvent` is
+/// [`SubmitError::EventMissingHasEvent`]; two or more *distinct* `HasEvent`
+/// facts is [`SubmitError::EventMultipleHasEvent`]. Re-asserting an identical
+/// `HasEvent` collapses into the `{entity, kind}` set, so it never counts twice.
+/// A `Gap` endpoint pointing at an untyped event id trips the missing case,
+/// which is why the set spans every referenced id, not just typing/payload
+/// subjects.
+/// Cross-source disagreement on the subject or kind belongs on separate
+/// `SameEvent`-linked event ids, not on one id.
+fn rule_event_has_one_kind<S>(
     candidates: &[StoredFactOf<S>],
     event_facts: &HashMap<S::EventId, Vec<StoredFactOf<S>>>,
     errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
 ) where
     S: FactStore,
 {
-    let mut events: BTreeSet<S::EventId> = BTreeSet::new();
-    for fact in candidates {
-        if let StoredFact::Factual(StoredFactualFact {
-            assertion: FactualAssertion::Event { fact: ef },
-            ..
-        }) = fact
-            && let Some(e) = event_attaches_to(ef)
-        {
-            events.insert(e.clone());
+    for e in referenced_events::<S>(candidates) {
+        let gathered = event_facts.get(&e).map(Vec::as_slice).unwrap_or(&[]);
+        match has_event_claims::<S>(&e, gathered).len() {
+            0 => errors.push(SubmitError::EventMissingHasEvent { event: e }),
+            1 => {}
+            _ => errors.push(SubmitError::EventMultipleHasEvent { event: e }),
         }
     }
-    for e in events {
+}
+
+/// Cumulative payload/date↔kind consistency. Every payload or date fact active
+/// on a touched event must suit the kind the event declares via `HasEvent` — a
+/// `DamageCause` only on a `Damaged` event, a `DurationalDate` only on a
+/// durational kind, and so on (the [`crate::facts::event`] availability matrix).
+/// Both the declared kind and the payloads read from the cumulative
+/// neighbourhood (committed ∪ this commit, active-only), so the check covers a
+/// payload added against a prior typing *and* a prior payload left active when
+/// this commit re-types the event. Re-typing therefore requires retracting the
+/// payloads the new kind doesn't admit in the same commit, or the commit is
+/// rejected. An event already failing [`rule_event_has_one_kind`] with ≥2
+/// distinct `HasEvent` is skipped — its kind is genuinely disputed, an
+/// order-dependent mismatch here would just double-report. Stored cross-source
+/// kind disagreement lives on separate `SameEvent`-linked ids, each internally
+/// consistent.
+fn rule_event_fact_kind_consistency<S>(
+    candidates: &[StoredFactOf<S>],
+    event_facts: &HashMap<S::EventId, Vec<StoredFactOf<S>>>,
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) where
+    S: FactStore,
+{
+    // The single declared kind per touched event, from the cumulative
+    // neighbourhood. Skip an event with ≥2 distinct claims (disputed kind).
+    let mut declared: HashMap<S::EventId, LifetimeEventKind> = HashMap::new();
+    for e in touched_events::<S>(candidates) {
         let gathered = event_facts.get(&e).map(Vec::as_slice).unwrap_or(&[]);
-        let mut narrowed = LifetimeEventKind::all();
-        for g in gathered {
-            if let StoredFact::Factual(StoredFactualFact {
-                assertion: FactualAssertion::Event { fact: ef },
-                ..
-            }) = g
-                && event_attaches_to(ef) == Some(&e)
-                && let Some(compat) = kind_compat(ef)
+        // 0 or ≥2 distinct claims: rule_event_has_one_kind already reports it,
+        // and there's no single declared kind to typecheck against, so skip.
+        let claims = has_event_claims::<S>(&e, gathered);
+        if claims.len() == 1
+            && let Some((_, kind)) = claims.into_iter().next()
+        {
+            declared.insert(e, kind);
+        }
+    }
+    let mut offending: BTreeSet<(S::EventId, &'static str, LifetimeEventKind)> = BTreeSet::new();
+    for (event, &kind) in &declared {
+        let gathered = event_facts.get(event).map(Vec::as_slice).unwrap_or(&[]);
+        for fact in gathered {
+            if let Some(ef) = fact.event_fact()
+                && ef.subject() == event
+                && !ef.kind_constraints().contains(&kind)
             {
-                narrowed = narrowed.intersection(&compat).copied().collect();
+                offending.insert((event.clone(), ef.into(), kind));
             }
         }
-        if narrowed.is_empty() {
-            errors.push(SubmitError::EventKindConflict { event: e });
+    }
+    for (event, fact, declared) in offending {
+        errors.push(SubmitError::EventFactKindMismatch {
+            event,
+            fact,
+            declared,
+        });
+    }
+}
+
+/// The distinct event ids this commit's candidates mention as a subject — the
+/// typing or payload subject of an event fact.
+fn touched_events<S>(candidates: &[StoredFactOf<S>]) -> BTreeSet<S::EventId>
+where
+    S: FactStore,
+{
+    let mut events = BTreeSet::new();
+    for fact in candidates {
+        if let Some(ef) = fact.event_fact() {
+            events.insert(ef.subject().clone());
         }
     }
+    events
+}
+
+/// Every distinct event id any candidate references — typing/payload subjects
+/// plus the event endpoints of a `Gap` (and any `SameEvent` member). The full
+/// id closure, so the exactly-one-`HasEvent` rule reaches an event named only
+/// as a gap endpoint.
+fn referenced_events<S>(candidates: &[StoredFactOf<S>]) -> BTreeSet<S::EventId>
+where
+    S: FactStore,
+{
+    let mut events = BTreeSet::new();
+    for fact in candidates {
+        fact.for_each_id(
+            &mut |_entity| {},
+            &mut |event: &S::EventId| {
+                events.insert(event.clone());
+            },
+            &mut |_image| {},
+        );
+    }
+    events
 }
 
 /// A name's validity window may not close before it opens. With both bounds
@@ -733,8 +788,9 @@ fn for_each_stored_date<EntId, EvtId, ImgId>(
     }
 }
 
-/// Visit the date fields a factual assertion's payload carries. `Gap` carries
-/// no `UncertainDate`, so the event arm reaches only the dated event facts.
+/// Visit the date fields a factual assertion's payload carries. The event and
+/// gap clusters carry no calendar dates except the dated event facts, so the
+/// event arm reaches only those.
 fn for_each_assertion_date<EntId, EvtId, ImgId>(
     assertion: &FactualAssertion<EntId, EvtId, ImgId>,
     visit: &mut impl FnMut(DateRole, &UncertainDate),
@@ -782,7 +838,9 @@ fn for_each_assertion_date<EntId, EvtId, ImgId>(
                 visit(DateRole::PictureCaptured, bound);
             }
         }
-        FactualAssertion::Attribute { .. } | FactualAssertion::Map { .. } => {}
+        FactualAssertion::Attribute { .. }
+        | FactualAssertion::Gap { .. }
+        | FactualAssertion::Map { .. } => {}
     }
 }
 
@@ -801,6 +859,66 @@ fn for_each_external_source_date(
     };
     if let Some(date) = date {
         visit(DateRole::CitationDate, date);
+    }
+}
+
+/// Every stored location must name a place. The impossible location (⊥, an
+/// `Empty` reachable in the value) is rejected, the spatial parallel of
+/// [`rule_single_interval_date`]'s empty-interval guard — no source asserts a
+/// place that is nowhere. The total join produces ⊥ only as a read-side artifact,
+/// so it never reaches the wire from a well-formed submission.
+fn rule_no_empty_location<S: FactStore>(
+    candidates: &[StoredFactOf<S>],
+    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
+) {
+    for fact in candidates {
+        for_each_stored_location(fact, &mut |role, location| {
+            if location.reaches_empty() {
+                errors.push(SubmitError::EmptyLocation { role });
+            }
+        });
+    }
+}
+
+/// Visit every [`UnresolvedLocation`] a stored fact carries, tagging each with
+/// its [`LocationRole`]. Only factual facts carry a location: a construction
+/// bookend, a `Moved` event's destination, a picture's capture place. Until this
+/// is macro-derived, a new location-bearing grammar variant must be added here by
+/// hand.
+fn for_each_stored_location<EntId, EvtId, ImgId>(
+    fact: &StoredFact<EntId, EvtId, ImgId>,
+    visit: &mut impl FnMut(LocationRole, &UnresolvedLocation),
+) where
+    EntId: Ord,
+    EvtId: Ord,
+    ImgId: Ord,
+{
+    let StoredFact::Factual(StoredFactualFact { assertion, .. }) = fact else {
+        return;
+    };
+    match assertion {
+        // Demolition location is rejected outright by `rule_demolition_location`,
+        // so only the construction phase contributes a bookend location here.
+        FactualAssertion::Construction {
+            fact: bookend::Fact::Location { location, .. },
+        }
+        | FactualAssertion::Demolition {
+            fact: bookend::Fact::Location { location, .. },
+        } => visit(LocationRole::BookendLocation, location),
+        FactualAssertion::Event {
+            fact: event::Fact::MovedToLocation { location, .. },
+        } => visit(LocationRole::MovedToLocation, location),
+        FactualAssertion::Picture {
+            fact: picture::Fact::CapturedLocation { location, .. },
+        } => visit(LocationRole::PictureCaptured, location),
+        FactualAssertion::Attribute { .. }
+        | FactualAssertion::Construction { .. }
+        | FactualAssertion::Demolition { .. }
+        | FactualAssertion::Event { .. }
+        | FactualAssertion::Image { .. }
+        | FactualAssertion::Picture { .. }
+        | FactualAssertion::Map { .. }
+        | FactualAssertion::Gap { .. } => {}
     }
 }
 
@@ -1122,50 +1240,4 @@ where
         },
         _ => None,
     }
-}
-
-/// The lifetime-event id a non-`Gap` event fact attaches to. `Gap` attaches to
-/// no event (it references events as endpoints), so it yields `None`.
-fn event_attaches_to<EntId, EvtId>(fact: &event::Fact<EntId, EvtId>) -> Option<&EvtId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-{
-    match fact {
-        event::Fact::DurationalDate { event, .. }
-        | event::Fact::PointDate { event, .. }
-        | event::Fact::MovedToLocation { event, .. }
-        | event::Fact::DamageCause { event, .. }
-        | event::Fact::MoveMethod { event, .. }
-        | event::Fact::UsageChange { event, .. }
-        | event::Fact::Designation { event, .. }
-        | event::Fact::Description { event, .. } => Some(event),
-        event::Fact::Gap { .. } => None,
-    }
-}
-
-/// The lifetime-event kinds an event fact is compatible with. `None` for `Gap`,
-/// which constrains no event's kind. The match is exhaustive so a new event
-/// variant forces a categorisation here.
-fn kind_compat<EntId, EvtId>(
-    fact: &event::Fact<EntId, EvtId>,
-) -> Option<BTreeSet<LifetimeEventKind>>
-where
-    EntId: Ord,
-    EvtId: Ord,
-{
-    Some(match fact {
-        event::Fact::DamageCause { .. } => std::iter::once(LifetimeEventKind::Damaged).collect(),
-        event::Fact::MoveMethod { .. } | event::Fact::MovedToLocation { .. } => {
-            std::iter::once(LifetimeEventKind::Moved).collect()
-        }
-        event::Fact::UsageChange { .. } => {
-            std::iter::once(LifetimeEventKind::UsageChanged).collect()
-        }
-        event::Fact::Designation { .. } => std::iter::once(LifetimeEventKind::Designated).collect(),
-        event::Fact::DurationalDate { .. } => LifetimeEventKind::durational_kinds(),
-        event::Fact::PointDate { .. } => LifetimeEventKind::point_kinds(),
-        event::Fact::Description { .. } => LifetimeEventKind::all(),
-        event::Fact::Gap { .. } => return None,
-    })
 }

@@ -2,16 +2,21 @@
 //!
 //! Three types model locations at different stages of resolution:
 //!
-//! - [`Location`] — resolved geometry (circles, unions, unbounded). The lattice
-//!   (merge via subsumption + union) is defined here.
+//! - [`Location`] — resolved geometry (circles, unions, the empty location, the
+//!   unbounded one). A bounded join lattice: `Empty` (⊥) and `Unbounded` (⊤)
+//!   bracket it, `union_of` is the join, and its
+//!   [`JoinSemilattice`](crate::lattice::JoinSemilattice) impl folds a stream
+//!   into a canonical union. The constructors canonicalize — flattening nested
+//!   unions and dropping a member a sibling subsumes.
 //! - [`UnresolvedLocation`] — may contain symbolic [`LocationReference`]s that
-//!   need external resolution (geocoding, OSM lookup, etc.).
+//!   need external resolution (geocoding, OSM lookup, etc.). It carries the same
+//!   join one level up via [`UnresolvedLocation::one_of`] and its own
+//!   [`JoinSemilattice`](crate::lattice::JoinSemilattice) impl.
 //! - [`LocationReference`] — a symbolic pointer to a location in an external
 //!   system (OSM, OHM, named place, address, or "near" any of these).
 //!
-//! Merge operates on `UnresolvedLocation` (bag union / `OneOf` construction).
 //! Resolution maps `LocationReference` → `Location` via a caller-provided
-//! closure. The lattice operates on `Location` only.
+//! closure.
 //!
 //! # Entity vs. region scope
 //!
@@ -178,8 +183,11 @@ pub use canonical::{OneOfEntries, UnionMembers};
 
 /// Resolved location geometry.
 ///
-/// No external references — purely geometric. The lattice (merge via subsumption
-/// + union) is defined on this type.
+/// No external references — purely geometric. A bounded join lattice:
+/// [`Empty`](Self::Empty) (⊥) and [`Unbounded`](Self::Unbounded) (⊤) bracket it,
+/// [`union_of`](Self::union_of) joins by union-with-subsumption, and the
+/// [`JoinSemilattice`](crate::lattice::JoinSemilattice) impl folds a stream to
+/// the canonical join.
 ///
 /// `Eq`/`Ord`/`Hash` are hand-implemented because the `Circle` variant carries
 /// an `f64` radius (needed for `BTreeSet<SubmitFact>` dedup of facts that
@@ -191,6 +199,12 @@ pub use canonical::{OneOfEntries, UnionMembers};
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Location {
+    /// The empty location (⊥): no place at all. The bottom of the lattice — it
+    /// drops out of a union and is contained by every other location. Reached
+    /// only as a join seed or a degenerate read-side artifact; the submit
+    /// boundary forbids storing it, the same way it forbids storing an empty
+    /// date interval.
+    Empty,
     /// A point with radius of uncertainty (circle on the earth's surface).
     Circle { center: GeoPoint, radius_m: f64 },
     /// Disjoint or partially-overlapping shapes: "one of these is true."
@@ -200,7 +214,8 @@ pub enum Location {
     /// Construct via [`Location::union_of`]; `members` is sealed canonical.
     #[serde(rename = "union_of")]
     UnionOf { members: UnionMembers },
-    /// No geometric information (resolution failed, or unknown).
+    /// No geometric information (resolution failed, or unknown). The top of the
+    /// lattice (⊤): it contains every other location and absorbs a union.
     Unbounded,
 }
 
@@ -218,9 +233,10 @@ impl Ord for Location {
         // `total_cmp` (NaN/Inf rejected at construction).
         fn variant_index(loc: &Location) -> u8 {
             match loc {
-                Location::Circle { .. } => 0,
-                Location::UnionOf { .. } => 1,
-                Location::Unbounded => 2,
+                Location::Empty => 0,
+                Location::Circle { .. } => 1,
+                Location::UnionOf { .. } => 2,
+                Location::Unbounded => 3,
             }
         }
         let self_idx = variant_index(self);
@@ -229,6 +245,7 @@ impl Ord for Location {
             return self_idx.cmp(&other_idx);
         }
         match (self, other) {
+            (Self::Empty, Self::Empty) => Ordering::Equal,
             (
                 Self::Circle {
                     center: c1,
@@ -246,9 +263,10 @@ impl Ord for Location {
             // Mixed variants are handled by the discriminant check above; these
             // arms are unreachable but spelled out so adding a variant forces a
             // decision.
-            (Self::Circle { .. }, _) | (Self::UnionOf { .. }, _) | (Self::Unbounded, _) => {
-                Ordering::Equal
-            }
+            (Self::Empty, _)
+            | (Self::Circle { .. }, _)
+            | (Self::UnionOf { .. }, _)
+            | (Self::Unbounded, _) => Ordering::Equal,
         }
     }
 }
@@ -264,7 +282,7 @@ impl std::hash::Hash for Location {
                 radius_m.to_bits().hash(state);
             }
             Self::UnionOf { members } => members.hash(state),
-            Self::Unbounded => {}
+            Self::Empty | Self::Unbounded => {}
         }
     }
 }
@@ -278,6 +296,7 @@ impl<'de> Deserialize<'de> for Location {
         #[serde(tag = "type", rename_all = "snake_case")]
         #[serde(deny_unknown_fields)]
         enum Raw {
+            Empty,
             Circle {
                 center: GeoPoint,
                 radius_m: f64,
@@ -291,6 +310,7 @@ impl<'de> Deserialize<'de> for Location {
 
         let raw = Raw::deserialize(deserializer)?;
         match raw {
+            Raw::Empty => Ok(Location::Empty),
             // `center` is validated by `GeoPoint`'s own `Deserialize`;
             // `circle` adds the radius checks.
             Raw::Circle { center, radius_m } => {
@@ -356,6 +376,18 @@ impl Location {
         Ok(Self::UnionOf { members })
     }
 
+    /// Whether the impossible location (⊥, [`Empty`](Self::Empty)) is reachable
+    /// in this value — `Empty` itself, or an `Empty` surviving inside a union.
+    /// The submit boundary rejects storing such a value: no source asserts a
+    /// place that is nowhere, the spatial parallel of the empty date interval.
+    pub fn reaches_empty(&self) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Circle { .. } | Self::Unbounded => false,
+            Self::UnionOf { members } => members.as_slice().iter().any(Self::reaches_empty),
+        }
+    }
+
     /// Check if this location's region contains another's entirely.
     ///
     /// Private — drives the union canonicalization's redundant-member collapse
@@ -366,6 +398,11 @@ impl Location {
             (Self::Unbounded, _) => true,
             // Nothing (except Unbounded) contains Unbounded
             (_, Self::Unbounded) => false,
+            // Everything contains Empty (⊥); Empty contains nothing but itself,
+            // already settled by the line above.
+            (_, Self::Empty) => true,
+            // Empty contains nothing but Empty, handled above.
+            (Self::Empty, _) => false,
             // Circle containment: distance between centers + other radius <= self radius
             (
                 Self::Circle {
@@ -403,6 +440,22 @@ impl Location {
     }
 }
 
+/// The join half of the resolved location lattice. ⊥ is [`Empty`](Location::Empty);
+/// the join unions and canonicalizes, so `Unbounded` (⊤) absorbs the union and
+/// `Empty` drops out through the subsumption pass. Canonicalization is confluent
+/// and idempotent, so the default [`join_all`](crate::lattice::JoinSemilattice::join_all)
+/// fold yields the same canonical [`UnionOf`](Location::UnionOf) as collecting and
+/// canonicalizing in one pass: a singleton folds to itself, ≥2 to their union.
+impl crate::lattice::JoinSemilattice for Location {
+    fn bottom() -> Self {
+        Self::Empty
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        union_from_members(canonical_union_members(vec![self.clone(), other.clone()]))
+    }
+}
+
 /// Canonicalize the members of a [`Location::UnionOf`] so one logical union
 /// has a single wire form: flatten nested unions, drop any member geometrically
 /// contained by a distinct sibling (redundant in a union), then sort and dedup.
@@ -431,6 +484,20 @@ fn canonical_union_members(children: Vec<Location>) -> Vec<Location> {
     kept.sort();
     kept.dedup();
     kept
+}
+
+/// Rebuild a [`Location`] from already-canonical union members: no member is
+/// `Empty` (⊥), so `0 → Empty`, `1 → that member`, `≥2 → UnionOf`. The total
+/// join's final step, where the validating [`Location::union_of`] would instead
+/// reject a sub-`2` collapse.
+fn union_from_members(mut members: Vec<Location>) -> Location {
+    match members.len() {
+        0 => Location::Empty,
+        1 => members.remove(0),
+        _ => Location::UnionOf {
+            members: UnionMembers::canonicalize(members),
+        },
+    }
 }
 
 /// Haversine distance in meters between two geo-points.
@@ -487,12 +554,53 @@ impl UnresolvedLocation {
         }
         Ok(Self::OneOf(entries))
     }
+
+    /// Whether the impossible location (⊥) is reachable in this value:
+    /// `Resolved(Empty)`, or an `Empty`-reaching entry inside a `OneOf`. The
+    /// submit boundary rejects storing such a value; see
+    /// [`Location::reaches_empty`].
+    pub fn reaches_empty(&self) -> bool {
+        match self {
+            Self::Resolved(loc) => loc.reaches_empty(),
+            Self::Reference(_) => false,
+            Self::OneOf(entries) => entries.as_slice().iter().any(Self::reaches_empty),
+        }
+    }
+}
+
+/// The join half of the unresolved location lattice, mirroring [`Location`]'s
+/// one level up. ⊥ is `Resolved(Empty)`; the join unions and canonicalizes, so
+/// the canonicalizer's ⊤/⊥ pass drops `Resolved(Empty)` entries and lets a
+/// `Resolved(Unbounded)` (⊤) absorb the disjunction. References stay symbolic —
+/// no containment collapse runs, only the `OneOf` flatten/sort/dedup. The
+/// canonicalization is confluent and idempotent, so the default
+/// [`join_all`](crate::lattice::JoinSemilattice::join_all) fold yields the same
+/// canonical [`OneOf`](UnresolvedLocation::OneOf) as a one-pass collect: a
+/// singleton folds to itself, ≥2 to their disjunction.
+impl crate::lattice::JoinSemilattice for UnresolvedLocation {
+    fn bottom() -> Self {
+        Self::Resolved(Location::Empty)
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        let mut entries = canonical_one_of_entries(vec![self.clone(), other.clone()]);
+        match entries.len() {
+            0 => Self::bottom(),
+            1 => entries.remove(0),
+            _ => Self::OneOf(OneOfEntries::canonicalize(entries)),
+        }
+    }
 }
 
 /// Canonicalize the entries of an [`UnresolvedLocation::OneOf`]: flatten nested
-/// `OneOf`s, then sort and dedup so one logical disjunction has a single wire
-/// form. Confluent — independent of input order. No containment collapse: the
-/// entries may be symbolic references whose geometry isn't known yet.
+/// `OneOf`s, apply the ⊤/⊥ lattice bounds, then sort and dedup so one logical
+/// disjunction has a single wire form. Confluent — independent of input order.
+///
+/// The bounds are definitional, not geometric, so they hold even for unresolved
+/// entries: a `Resolved(Unbounded)` (⊤) entry absorbs the disjunction to
+/// `[Resolved(Unbounded)]`, and every `Resolved(Empty)` (⊥) entry drops as the
+/// join identity. No general containment collapse — the remaining entries may be
+/// symbolic references whose geometry isn't known yet.
 fn canonical_one_of_entries(entries: Vec<UnresolvedLocation>) -> Vec<UnresolvedLocation> {
     let mut flat: Vec<UnresolvedLocation> = Vec::new();
     for entry in entries {
@@ -501,6 +609,13 @@ fn canonical_one_of_entries(entries: Vec<UnresolvedLocation>) -> Vec<UnresolvedL
             other => flat.push(other),
         }
     }
+    if flat
+        .iter()
+        .any(|e| matches!(e, UnresolvedLocation::Resolved(Location::Unbounded)))
+    {
+        return vec![UnresolvedLocation::Resolved(Location::Unbounded)];
+    }
+    flat.retain(|e| !matches!(e, UnresolvedLocation::Resolved(Location::Empty)));
     flat.sort();
     flat.dedup();
     flat
@@ -846,6 +961,32 @@ mod tests {
         let result = UnresolvedLocation::one_of(vec![paris.clone(), paris]);
         assert!(matches!(result, Err(LocationError::TooFewEntries { .. })));
         Ok(())
+    }
+
+    // --- ⊤/⊥ in a OneOf disjunction ---
+
+    #[test]
+    fn one_of_join_with_unbounded_collapses_to_unbounded() {
+        use crate::lattice::JoinSemilattice;
+        // ⊤ absorbs the disjunction: joining a symbolic reference with
+        // `Resolved(Unbounded)` leaves just ⊤, even unresolved.
+        let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+            name: "Paris".to_string(),
+        });
+        let top = UnresolvedLocation::Resolved(Location::Unbounded);
+        assert_eq!(paris.join(&top), top);
+    }
+
+    #[test]
+    fn one_of_join_drops_empty_entry() {
+        use crate::lattice::JoinSemilattice;
+        // ⊥ is the join identity: joining a reference with `Resolved(Empty)`
+        // drops the empty entry, leaving the reference alone.
+        let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+            name: "Paris".to_string(),
+        });
+        let bottom = UnresolvedLocation::Resolved(Location::Empty);
+        assert_eq!(paris.join(&bottom), paris);
     }
 
     // --- canonicalization property tests ---

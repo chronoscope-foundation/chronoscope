@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 
 use super::tests::{
     TestBundle, TestResult, commit_result, construction_location_in, construction_started_fact,
-    construction_started_in, demolition_completed_in, event_point_date_fact,
-    external_reference_fact, fixed_time, image_source_fact, local_bundle, name_fact,
-    name_fact_in_language, retract_commit_fact, same_entity_fact, user_author,
+    construction_started_in, demolition_completed_in, designated_kind, event_point_date_fact,
+    external_reference_fact, fixed_time, has_event_fact, image_source_fact, local_bundle,
+    name_fact, name_fact_in_language, retract_commit_fact, same_entity_fact, user_author,
 };
 use super::{MemoryEntityId, MemoryEventId, MemoryFactStore, MemoryImageId};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion};
@@ -545,7 +545,16 @@ async fn events_always_mint() -> TestResult {
     let store = MemoryFactStore::new();
     let first = commit_result(
         &store,
-        local_bundle(0, 1, 0, 0, vec![event_point_date_fact(0)?])?,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, designated_kind())?,
+                event_point_date_fact(0)?,
+            ],
+        )?,
     )
     .await?;
     let a = first.events.get(&EventIdx(0)).ok_or("missing decl")?;
@@ -553,7 +562,16 @@ async fn events_always_mint() -> TestResult {
 
     let second = commit_result(
         &store,
-        local_bundle(0, 1, 0, 10, vec![event_point_date_fact(0)?])?,
+        local_bundle(
+            1,
+            1,
+            0,
+            10,
+            vec![
+                has_event_fact(0, 0, designated_kind())?,
+                event_point_date_fact(0)?,
+            ],
+        )?,
     )
     .await?;
     let b = second.events.get(&EventIdx(0)).ok_or("missing decl")?;

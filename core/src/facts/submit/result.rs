@@ -247,6 +247,20 @@ where
             Self::Meta(_) => {}
         }
     }
+
+    /// The event-cluster fact this stores, when it is one. The peel both the
+    /// submit consistency rules and the projection's entity→event hop read
+    /// before classifying — one place to recognize an event fact, so the two
+    /// can't drift.
+    pub fn event_fact(&self) -> Option<&crate::facts::event::Fact<EntId, EvtId>> {
+        match self {
+            Self::Factual(StoredFactualFact {
+                assertion: FactualAssertion::Event { fact },
+                ..
+            }) => Some(fact),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================

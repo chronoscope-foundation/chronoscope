@@ -13,6 +13,7 @@
 
 use super::{EntityIdx, EventIdx, ImageIdx};
 use crate::facts::ids::{CommitId, FactId, SubjectKind};
+use crate::facts::lifecycle::LifetimeEventKind;
 
 /// Which date a fact carries, named so a [`SubmitError::NonSingleIntervalDate`]
 /// pinpoints the offending position across fact payloads and citations alike.
@@ -45,6 +46,29 @@ impl std::fmt::Display for DateRole {
             Self::ImageCreated => "image created-date",
             Self::PictureCaptured => "picture captured-date",
             Self::CitationDate => "citation date",
+        };
+        f.write_str(label)
+    }
+}
+
+/// Which location a fact carries, named so a [`SubmitError::EmptyLocation`]
+/// pinpoints the offending position across the location-bearing facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LocationRole {
+    /// A construction bookend's `Location`.
+    BookendLocation,
+    /// `event::Fact::MovedToLocation`.
+    MovedToLocation,
+    /// `picture::Fact::CapturedLocation`.
+    PictureCaptured,
+}
+
+impl std::fmt::Display for LocationRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::BookendLocation => "bookend location",
+            Self::MovedToLocation => "move location",
+            Self::PictureCaptured => "picture captured-location",
         };
         f.write_str(label)
     }
@@ -242,12 +266,40 @@ pub enum SubmitError<E, V, I> {
         /// The entity whose demolition bookend carried a location.
         entity: E,
     },
-    /// A lifetime event carries facts whose kinds can't agree — e.g. a
-    /// damage-cause and a move-method on one event.
-    #[error("event {event} carries facts with incompatible lifetime-event kinds")]
-    EventKindConflict {
-        /// The event whose attached facts conflict on kind.
+    /// An event id carries no `HasEvent`. Every event has one subject entity
+    /// and one declared kind, so each id needs exactly one `HasEvent` tying it
+    /// to its entity; a minted event without one is typeless and can't be
+    /// projected. The corrected commit adds the `HasEvent`.
+    #[error("event {event} carries no HasEvent; every event must declare its subject and kind")]
+    EventMissingHasEvent {
+        /// The event with no `HasEvent`.
         event: V,
+    },
+    /// An event id carries more than one distinct `HasEvent` — a different
+    /// subject entity or a different declared kind on one id. An event has one
+    /// subject and one kind; genuine cross-source disagreement is expressed as
+    /// separate events (different ids) linked by `SameEvent`, never two
+    /// `HasEvent` on one id. (Re-asserting the identical `HasEvent`
+    /// content-addresses to one fact, so it isn't a duplicate.)
+    #[error(
+        "event {event} carries conflicting HasEvent claims; disagreement belongs on separate SameEvent-linked events"
+    )]
+    EventMultipleHasEvent {
+        /// The event with conflicting `HasEvent` claims.
+        event: V,
+    },
+    /// A payload or date fact on an event doesn't suit the kind the same
+    /// commit's `HasEvent` declares — a damage cause on a non-`Damaged` event, a
+    /// `DurationalDate` on a point event. The availability matrix
+    /// ([`crate::facts::event`] module docs) pins which fact suits which kind.
+    #[error("event {event}: a {fact} fact does not match its declared kind {declared}")]
+    EventFactKindMismatch {
+        /// The event whose payload/date contradicts its declared kind.
+        event: V,
+        /// The offending payload or date fact's variant name.
+        fact: &'static str,
+        /// The kind the event's `HasEvent` declares.
+        declared: LifetimeEventKind,
     },
     /// A name's validity window closes before it opens: `valid_from`'s earliest
     /// possible date is after `valid_to`'s latest possible date.
@@ -265,6 +317,15 @@ pub enum SubmitError<E, V, I> {
     NonSingleIntervalDate {
         /// Which date position carried the non-single value.
         role: DateRole,
+    },
+    /// A stored fact carries the impossible location (⊥): the empty location
+    /// itself, or one surviving inside a union/disjunction. A single source
+    /// asserts a place, never the absence of one — the spatial parallel of the
+    /// empty date interval.
+    #[error("{role} carries the empty location; a stored claim must name a place")]
+    EmptyLocation {
+        /// Which location position carried the impossible value.
+        role: LocationRole,
     },
     /// An image-observation names an entity with no paired depiction tying that
     /// entity to the observed image. The observation describes something seen in

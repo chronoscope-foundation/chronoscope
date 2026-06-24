@@ -585,19 +585,26 @@ impl UncertainDate {
 
     /// Meet (intersection) of an iterator of dates, seeded from
     /// [`unknown`](Self::unknown) (⊤, the meet identity). The empty iterator
-    /// yields ⊤; one element yields itself.
+    /// yields ⊤; one element yields itself. The meet half of the lattice is
+    /// date-specific — no [`JoinSemilattice`](crate::lattice::JoinSemilattice)
+    /// counterpart — so it stays an inherent method.
     pub fn meet_all<'a>(dates: impl IntoIterator<Item = &'a Self>) -> Self {
         dates
             .into_iter()
             .fold(Self::unknown(), |acc, d| acc.meet(d))
     }
+}
 
-    /// Join (union) of an iterator of dates, seeded from [`empty`](Self::empty)
-    /// (⊥, the join identity). The empty iterator yields ⊥; one element yields
-    /// itself. Seeding from ⊥ avoids the absorbing-seed footgun of folding from
-    /// `unknown()`, which would poison every real bound to ⊤.
-    pub fn join_all<'a>(dates: impl IntoIterator<Item = &'a Self>) -> Self {
-        dates.into_iter().fold(Self::empty(), |acc, d| acc.join(d))
+/// The join half of the date lattice. The fold seeds from ⊥
+/// ([`empty`](Self::empty)), so a real bound is never poisoned — seeding from
+/// ⊤ (`unknown`) would absorb every disjunct.
+impl crate::lattice::JoinSemilattice for UncertainDate {
+    fn bottom() -> Self {
+        Self::empty()
+    }
+
+    fn join(&self, other: &Self) -> Self {
+        UncertainDate::join(self, other)
     }
 }
 
@@ -818,6 +825,7 @@ fn precision_end(date: NaiveDate, precision: DatePrecision) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lattice::JoinSemilattice;
     use proptest::prelude::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1221,7 +1229,7 @@ mod tests {
     #[test]
     fn join_all_singleton_is_self() -> TestResult {
         let a = year(1920)?;
-        assert_eq!(UncertainDate::join_all([&a]), a);
+        assert_eq!(UncertainDate::join_all([a.clone()]), a);
         Ok(())
     }
 
@@ -1231,7 +1239,7 @@ mod tests {
         // absorb every disjunct to `unknown()`.
         let a = year(1920)?;
         let b = year(1930)?;
-        let result = UncertainDate::join_all([&a, &b]);
+        let result = UncertainDate::join_all([a, b]);
         assert_ne!(result, UncertainDate::unknown());
         assert_eq!(result.earliest(), Some(d(1920, 1, 1)?));
         assert_eq!(result.latest(), Some(d(1930, 12, 31)?));
@@ -1397,8 +1405,8 @@ mod tests {
     /// so the result is canonical, possibly merging back to fewer intervals).
     fn arb_uncertain_date() -> impl Strategy<Value = UncertainDate> {
         let empty = Just(UncertainDate::empty());
-        let disjunction = prop::collection::vec(arb_single_interval(), 2..=4)
-            .prop_map(|pieces| UncertainDate::join_all(pieces.iter()));
+        let disjunction =
+            prop::collection::vec(arb_single_interval(), 2..=4).prop_map(UncertainDate::join_all);
         prop_oneof![
             6 => arb_single_interval(),
             1 => empty,

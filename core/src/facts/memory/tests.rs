@@ -11,7 +11,9 @@ use crate::facts::citations::{Excerpt, ExternalReference, ExternalSource, Factua
 use crate::facts::citations::{JudgmentSource, Justification, Language};
 use crate::facts::identity;
 use crate::facts::ids::UserId;
-use crate::facts::lifecycle::{DamageCause, DurationalRole, MoveMethod};
+use crate::facts::lifecycle::{
+    DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind,
+};
 use crate::facts::submit::{
     Commit as SubmitBundle, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact,
 };
@@ -789,19 +791,23 @@ async fn walk_events_returns_submitted_event_facts() -> TestResult {
     let bundle: TestBundle = SubmitBundle {
         author: user_author()?,
         recorded_at: fixed_time(),
-        entities: Vec::new(),
+        entities: vec![Decl::Local],
         events: vec![Decl::Local],
         images: Vec::new(),
-        facts: [event_point_date_fact(0)?, event_description_fact(0)?]
-            .into_iter()
-            .collect(),
+        facts: [
+            has_event_fact(0, 0, designated_kind())?,
+            event_point_date_fact(0)?,
+            event_description_fact(0)?,
+        ]
+        .into_iter()
+        .collect(),
     };
 
     let result = commit_facts(&store, bundle)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let submitted: std::collections::BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
-    assert_eq!(submitted.len(), 2, "expected two submitted facts");
+    assert_eq!(submitted.len(), 3, "expected three submitted facts");
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
@@ -828,19 +834,23 @@ async fn all_facts_about_event_returns_facts_mentioning_it() -> TestResult {
     let bundle: TestBundle = SubmitBundle {
         author: user_author()?,
         recorded_at: fixed_time(),
-        entities: Vec::new(),
+        entities: vec![Decl::Local],
         events: vec![Decl::Local],
         images: Vec::new(),
-        facts: [event_point_date_fact(0)?, event_description_fact(0)?]
-            .into_iter()
-            .collect(),
+        facts: [
+            has_event_fact(0, 0, designated_kind())?,
+            event_point_date_fact(0)?,
+            event_description_fact(0)?,
+        ]
+        .into_iter()
+        .collect(),
     };
 
     let result = commit_facts(&store, bundle)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let submitted: std::collections::BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
-    assert_eq!(submitted.len(), 2, "expected two submitted facts");
+    assert_eq!(submitted.len(), 3, "expected three submitted facts");
     let event = result.events.get(&EventIdx(0)).ok_or("missing event")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
@@ -2322,6 +2332,62 @@ fn event_durational_date_fact(event_idx: usize) -> Result<SubmitFact, Box<dyn st
     })
 }
 
+/// A `MovedToLocation` payload — suits a `Moved` event, contradicts every other
+/// kind.
+fn event_moved_to_location_fact(
+    event_idx: usize,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Event {
+            fact: crate::facts::event::Fact::MovedToLocation {
+                event: EventIdx(event_idx),
+                location: sample_location(),
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// A `HasEvent` fact tying the event index to the entity index and declaring its
+/// kind — the typing claim every minted event needs.
+pub(super) fn has_event_fact(
+    event_idx: usize,
+    entity_idx: usize,
+    kind: LifetimeEventKind,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Event {
+            fact: crate::facts::event::Fact::HasEvent {
+                entity: EntityIdx(entity_idx),
+                event: EventIdx(event_idx),
+                kind,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// `Durational { Damaged }`.
+fn damaged_kind() -> LifetimeEventKind {
+    LifetimeEventKind::Durational {
+        kind: DurationalKind::Damaged,
+    }
+}
+
+/// `Durational { Moved }`.
+fn moved_kind() -> LifetimeEventKind {
+    LifetimeEventKind::Durational {
+        kind: DurationalKind::Moved,
+    }
+}
+
+/// `Point { Designated }`.
+pub(super) fn designated_kind() -> LifetimeEventKind {
+    LifetimeEventKind::Point {
+        kind: PointKind::Designated,
+    }
+}
+
 /// A composite `IsSubimageOf` fact linking the two image indices.
 fn subimage_fact(
     subimage_idx: usize,
@@ -2589,117 +2655,322 @@ async fn construction_location_accepted() -> TestResult {
     .await
 }
 
-/// A damage-cause and a move-method on one event have disjoint kind sets, so the
-/// commit is rejected.
+/// A minted event with one `HasEvent` and payloads consistent with its declared
+/// kind commits and stores.
 #[tokio::test]
-async fn event_damage_and_move_conflict_rejected() -> TestResult {
+async fn event_with_has_event_and_consistent_payloads_stored() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_ok(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                event_damage_cause_fact(0)?,
+                event_durational_date_fact(0)?,
+            ],
+        )?,
+    )
+    .await
+}
+
+/// A minted event with no `HasEvent` is typeless and rejected: a payload alone
+/// doesn't declare the event's subject or kind.
+#[tokio::test]
+async fn event_without_has_event_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![event_durational_date_fact(0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventMissingHasEvent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A `Gap` fact whose earlier endpoint is the lifetime event `event_idx` and
+/// whose later endpoint is `entity_idx`'s construction completion. References the
+/// event without typing it — the shape that must still demand a `HasEvent`.
+fn gap_from_event_fact(
+    event_idx: usize,
+    entity_idx: usize,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    use crate::facts::event::{Days, GapBounds, OrderableEvent};
+    let bounds = GapBounds::new(
+        OrderableEvent::Event {
+            event: EventIdx(event_idx),
+        },
+        OrderableEvent::ConstructionCompletion {
+            entity: EntityIdx(entity_idx),
+        },
+        Some(Days::new(1)),
+        None,
+    )?;
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Gap { bounds },
+        citation: sample_citation()?,
+    })
+}
+
+/// An event referenced only as a `Gap` endpoint, with no `HasEvent`, is still
+/// rejected as typeless: the rule's event set spans every referenced id, not
+/// just typing/payload subjects, so a gap endpoint can't smuggle in an untyped
+/// event.
+#[tokio::test]
+async fn event_referenced_only_as_gap_endpoint_without_has_event_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![gap_from_event_fact(0, 0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventMissingHasEvent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Two `HasEvent` facts of different kinds on one minted event id is a
+/// self-contradiction — an event has one kind — and is rejected, not stored.
+/// Disagreement belongs on separate `SameEvent`-linked event ids.
+#[tokio::test]
+async fn event_two_has_event_kinds_rejected() -> TestResult {
     let store = MemoryFactStore::new();
     let errs = commit_err(
         &store,
         local_bundle(
-            0,
+            1,
             1,
             0,
             0,
-            vec![event_damage_cause_fact(0)?, event_move_method_fact(0)?],
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                has_event_fact(0, 0, moved_kind())?,
+            ],
         )?,
     )
     .await?;
     assert!(
         errs.iter()
-            .any(|e| matches!(e, SubmitError::EventKindConflict { .. })),
+            .any(|e| matches!(e, SubmitError::EventMultipleHasEvent { .. })),
         "got {errs:?}"
     );
     Ok(())
 }
 
-/// A damage-cause and a durational date narrow to `{Damaged}` and are accepted.
+/// Two `HasEvent` facts naming different subject entities on one event id is the
+/// same self-contradiction over the entity rather than the kind: an event has
+/// one subject. Rejected as `EventMultipleHasEvent`.
 #[tokio::test]
-async fn event_damage_and_durational_accepted() -> TestResult {
+async fn event_two_has_event_entities_rejected() -> TestResult {
     let store = MemoryFactStore::new();
-    commit_ok(
+    let errs = commit_err(
         &store,
         local_bundle(
-            0,
+            2,
             1,
             0,
             0,
-            vec![event_damage_cause_fact(0)?, event_durational_date_fact(0)?],
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                has_event_fact(0, 1, damaged_kind())?,
+            ],
         )?,
     )
-    .await
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventMultipleHasEvent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
 }
 
-/// A lone point date (kind-set of size two) is accepted.
+/// A payload contradicting the commit's `HasEvent` kind is rejected: a
+/// `MoveMethod` on a `Damaged` event doesn't suit the declared kind.
 #[tokio::test]
-async fn event_point_date_alone_accepted() -> TestResult {
+async fn event_payload_contradicts_declared_kind_rejected() -> TestResult {
     let store = MemoryFactStore::new();
-    commit_ok(
+    let errs = commit_err(
         &store,
-        local_bundle(0, 1, 0, 0, vec![event_point_date_fact(0)?])?,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                event_move_method_fact(0)?,
+            ],
+        )?,
     )
-    .await
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventFactKindMismatch { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
 }
 
-/// The kind conflict spans commits: a move-method in C1 and a damage-cause in C2
-/// on the same event are rejected, via the event backlink.
+/// A `PointDate` on a durational-kinded event is a category mismatch, rejected
+/// the same way a typed payload mismatch is.
 #[tokio::test]
-async fn event_kind_conflict_across_commits_rejected() -> TestResult {
+async fn event_date_contradicts_declared_category_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                event_point_date_fact(0)?,
+            ],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventFactKindMismatch { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Two sources disagreeing on an event's kind store fine as *separate* events
+/// linked by `SameEvent`: C1 mints event E `Damaged`, C2 mints event F `Moved`
+/// and judges `SameEvent(E, F)`. Each commit carries one `HasEvent` per minted
+/// id, so neither is rejected; the disagreement sits in the store as a
+/// class-level conflict, read back per id.
+#[tokio::test]
+async fn cross_source_kind_conflict_via_same_event_stored() -> TestResult {
     let store = MemoryFactStore::new();
     let c1 = commit_facts(
         &store,
-        local_bundle(0, 1, 0, 0, vec![event_move_method_fact(0)?])?,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, damaged_kind())?])?,
     )
     .await
     .map_err(|e| format!("{e:?}"))?;
-    let event = c1.events.get(&EventIdx(0)).ok_or("missing event")?.id;
+    let entity = c1.entities.get(&EntityIdx(0)).ok_or("missing entity")?.id;
+    let event_e = c1.events.get(&EventIdx(0)).ok_or("missing event")?.id;
 
     let c2: TestBundle = SubmitBundle {
         author: user_author()?,
         recorded_at: fixed_time() + chrono::Duration::seconds(10),
-        entities: Vec::new(),
+        entities: vec![Decl::Existing { id: entity }],
+        events: vec![Decl::Local, Decl::Existing { id: event_e }],
+        images: Vec::new(),
+        facts: [
+            has_event_fact(0, 0, moved_kind())?,
+            SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Identity {
+                    fact: crate::facts::identity::Fact::same_event(EventIdx(0), EventIdx(1))?,
+                },
+                citation: judgment_citation()?,
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+    commit_ok(&store, c2).await
+}
+
+/// A same-commit retraction is visible to the exactly-one rule's read: C1 puts a
+/// `HasEvent { Moved }` on event E; C2 retracts it and adds a
+/// `HasEvent { Damaged }`. The retraction is visible, so the surviving claim
+/// count is one and the commit is accepted — without the pending-retractor
+/// overlay the stale `Moved` claim would read active alongside the new one,
+/// tripping `EventMultipleHasEvent`.
+#[tokio::test]
+async fn event_kind_rule_sees_same_commit_retraction() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, moved_kind())?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1.entities.get(&EntityIdx(0)).ok_or("missing entity")?.id;
+    let event = c1.events.get(&EventIdx(0)).ok_or("missing event")?.id;
+    let has_event_moved = *c1.fact_ids.first().ok_or("no has-event fact id")?;
+
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
         events: vec![Decl::Existing { id: event }],
         images: Vec::new(),
-        facts: [event_damage_cause_fact(0)?].into_iter().collect(),
+        facts: [
+            retract_fact(has_event_moved)?,
+            has_event_fact(0, 0, damaged_kind())?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    commit_ok(&store, c2).await
+}
+
+/// Re-typing an event must atomically retract the payloads the new kind doesn't
+/// admit. C1 mints event E `Moved` with a `MovedToLocation` payload; C2 retracts
+/// the `HasEvent { Moved }` and adds `HasEvent { Damaged }` but leaves the
+/// `MovedToLocation` active. The consistency rule reads the cumulative active
+/// payloads — not just C2's candidates — so the orphaned `MovedToLocation` meets
+/// the newly-declared `Damaged` kind and the commit is rejected. Without the
+/// cumulative read the stale payload would never be re-checked.
+#[tokio::test]
+async fn event_retype_without_retracting_stale_payload_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let c1 = commit_facts(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, moved_kind())?,
+                event_moved_to_location_fact(0)?,
+            ],
+        )?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1.entities.get(&EntityIdx(0)).ok_or("missing entity")?.id;
+    let event = c1.events.get(&EventIdx(0)).ok_or("missing event")?.id;
+    let has_event_moved = *c1.fact_ids.first().ok_or("no has-event fact id")?;
+
+    let c2: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [
+            retract_fact(has_event_moved)?,
+            has_event_fact(0, 0, damaged_kind())?,
+        ]
+        .into_iter()
+        .collect(),
     };
     let errs = commit_err(&store, c2).await?;
     assert!(
         errs.iter()
-            .any(|e| matches!(e, SubmitError::EventKindConflict { .. })),
-        "got {errs:?}"
+            .any(|e| matches!(e, SubmitError::EventFactKindMismatch { .. })),
+        "the stale MovedToLocation must mismatch the new Damaged kind: {errs:?}"
     );
     Ok(())
-}
-
-/// A same-commit retraction of the conflicting pre-commit fact clears the kind
-/// conflict: C1 puts a `DamageCause` on event E; C2 retracts it and adds a
-/// `MoveMethod` on E. The retraction is visible to the rule read in C2, so the
-/// surviving kind set is `{Moved}` and the commit is accepted. Without the
-/// pending-retractor overlay the doomed `DamageCause` reads active and the
-/// commit is falsely rejected as `EventKindConflict`.
-#[tokio::test]
-async fn event_kind_conflict_resolved_by_same_commit_retraction_accepted() -> TestResult {
-    let store = MemoryFactStore::new();
-    let c1 = commit_facts(
-        &store,
-        local_bundle(0, 1, 0, 0, vec![event_damage_cause_fact(0)?])?,
-    )
-    .await
-    .map_err(|e| format!("{e:?}"))?;
-    let event = c1.events.get(&EventIdx(0)).ok_or("missing event")?.id;
-    let damage = *c1.fact_ids.first().ok_or("no damage fact id")?;
-
-    let c2: TestBundle = SubmitBundle {
-        author: user_author()?,
-        recorded_at: fixed_time() + chrono::Duration::seconds(10),
-        entities: Vec::new(),
-        events: vec![Decl::Existing { id: event }],
-        images: Vec::new(),
-        facts: [retract_fact(damage)?, event_move_method_fact(0)?]
-            .into_iter()
-            .collect(),
-    };
-    commit_ok(&store, c2).await
 }
 
 /// A same-commit retraction of the only depiction unmasks the gap: C1 records

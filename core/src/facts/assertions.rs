@@ -53,11 +53,11 @@ use crate::facts::{
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(bound(
-    serialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::Serialize, bookend::Fact<EntId>: ::serde::Serialize, event::Fact<EntId, EvtId>: ::serde::Serialize, image::Fact<ImgId>: ::serde::Serialize, picture::Fact<ImgId>: ::serde::Serialize, map::Fact<ImgId>: ::serde::Serialize",
-    deserialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::de::DeserializeOwned, bookend::Fact<EntId>: ::serde::de::DeserializeOwned, event::Fact<EntId, EvtId>: ::serde::de::DeserializeOwned, image::Fact<ImgId>: ::serde::de::DeserializeOwned, picture::Fact<ImgId>: ::serde::de::DeserializeOwned, map::Fact<ImgId>: ::serde::de::DeserializeOwned"
+    serialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::Serialize, bookend::Fact<EntId>: ::serde::Serialize, event::Fact<EntId, EvtId>: ::serde::Serialize, event::GapBounds<EntId, EvtId>: ::serde::Serialize, image::Fact<ImgId>: ::serde::Serialize, picture::Fact<ImgId>: ::serde::Serialize, map::Fact<ImgId>: ::serde::Serialize",
+    deserialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::de::DeserializeOwned, bookend::Fact<EntId>: ::serde::de::DeserializeOwned, event::Fact<EntId, EvtId>: ::serde::de::DeserializeOwned, event::GapBounds<EntId, EvtId>: ::serde::de::DeserializeOwned, image::Fact<ImgId>: ::serde::de::DeserializeOwned, picture::Fact<ImgId>: ::serde::de::DeserializeOwned, map::Fact<ImgId>: ::serde::de::DeserializeOwned"
 ))]
 #[schemars(
-    bound = "EntId: ::schemars::JsonSchema + Ord, EvtId: ::schemars::JsonSchema + Ord, ImgId: ::schemars::JsonSchema, attribute::Fact<EntId>: ::schemars::JsonSchema, bookend::Fact<EntId>: ::schemars::JsonSchema, event::Fact<EntId, EvtId>: ::schemars::JsonSchema, image::Fact<ImgId>: ::schemars::JsonSchema, picture::Fact<ImgId>: ::schemars::JsonSchema, map::Fact<ImgId>: ::schemars::JsonSchema"
+    bound = "EntId: ::schemars::JsonSchema + Ord, EvtId: ::schemars::JsonSchema + Ord, ImgId: ::schemars::JsonSchema, attribute::Fact<EntId>: ::schemars::JsonSchema, bookend::Fact<EntId>: ::schemars::JsonSchema, event::Fact<EntId, EvtId>: ::schemars::JsonSchema, event::GapBounds<EntId, EvtId>: ::schemars::JsonSchema, image::Fact<ImgId>: ::schemars::JsonSchema, picture::Fact<ImgId>: ::schemars::JsonSchema, map::Fact<ImgId>: ::schemars::JsonSchema"
 )]
 pub enum FactualAssertion<EntId: Ord, EvtId: Ord, ImgId> {
     /// Entity-level attribute claims (names, external refs, relationships).
@@ -66,8 +66,15 @@ pub enum FactualAssertion<EntId: Ord, EvtId: Ord, ImgId> {
     Construction { fact: bookend::Fact<EntId> },
     /// Demolition bookend (start / completion / location).
     Demolition { fact: bookend::Fact<EntId> },
-    /// Interior-lifetime event facts plus cross-event gaps.
+    /// Interior-lifetime event facts.
     Event { fact: event::Fact<EntId, EvtId> },
+    /// A temporal-ordering relationship between two events or entity bookends.
+    /// A gap names two endpoints rather than one event subject, so it sits
+    /// beside the event cluster rather than inside [`event::Fact`].
+    Gap {
+        /// The cross-event gap bounds (endpoints plus day range).
+        bounds: event::GapBounds<EntId, EvtId>,
+    },
     /// Byte-level image facts (source URL).
     Image { fact: image::Fact<ImgId> },
     /// Pictorial role-claim plus picture-specific attributes (capture
@@ -82,8 +89,8 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
     /// closure. The collector half of the id-traversal.
     ///
     /// Holds all three closures and hands each cluster the subset it needs
-    /// (attribute / bookend get entity, event gets entity + event, image /
-    /// picture / map get image).
+    /// (attribute / bookend get entity, event and gap get entity + event,
+    /// image / picture / map get image).
     pub fn for_each_id(
         &self,
         fe: &mut impl FnMut(&EntId),
@@ -94,6 +101,7 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
             Self::Attribute { fact } => fact.for_each_id(fe),
             Self::Construction { fact } | Self::Demolition { fact } => fact.for_each_id(fe),
             Self::Event { fact } => fact.for_each_id(fe, fv),
+            Self::Gap { bounds } => bounds.for_each_id(fe, fv),
             Self::Image { fact } => fact.for_each_id(fi),
             Self::Picture { fact } => fact.for_each_id(fi),
             Self::Map { fact } => fact.for_each_id(fi),
@@ -133,6 +141,9 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
             }),
             Self::Event { fact } => Ok(FactualAssertion::Event {
                 fact: fact.try_map_ids(fe, fv)?,
+            }),
+            Self::Gap { bounds } => Ok(FactualAssertion::Gap {
+                bounds: bounds.try_map_ids(fe, fv)?,
             }),
             Self::Image { fact } => Ok(FactualAssertion::Image {
                 fact: fact.try_map_ids(fi)?,
@@ -327,7 +338,10 @@ mod traversal_props {
     use crate::facts::composites::SubimageRegion;
     use crate::facts::geometry::{ImageRegion, SpatialGeometry};
     use crate::facts::identity::IdMapError;
-    use crate::facts::lifecycle::{DamageCause, DurationalRole, MoveMethod, Usage};
+    use crate::facts::lifecycle::{
+        DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind,
+        Usage,
+    };
     use crate::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
     use crate::facts::spatial::TopologicalRel;
     use crate::facts::{
@@ -487,11 +501,18 @@ mod traversal_props {
         ]
     }
 
-    /// `event::Fact` — all nine variants, including `Gap` (forcing the
-    /// nested `Fact -> GapBounds -> OrderableEvent` recursion across both
-    /// closures). The two `Gap` endpoints are generated independently.
+    /// `event::Fact` — all nine variants, including `HasEvent` (the only one
+    /// carrying both an entity and an event ref, with a random declared kind so
+    /// both category arms and every subtype are exercised).
     fn arb_event_fact() -> impl Strategy<Value = event::Fact<MemoryEntityId, MemoryEventId>> {
         prop_oneof![
+            (arb_entity(), arb_event(), arb_lifetime_event_kind()).prop_map(
+                |(entity, event, kind)| event::Fact::HasEvent {
+                    entity,
+                    event,
+                    kind,
+                }
+            ),
             (arb_event(), sentinel_date()).prop_map(|(event, bound)| {
                 event::Fact::DurationalDate {
                     event,
@@ -525,20 +546,41 @@ mod traversal_props {
                 event,
                 text: "text".to_owned(),
             }),
-            (arb_orderable_event(), arb_orderable_event()).prop_filter_map(
-                "valid gap bounds",
-                |(from, to)| {
-                    event::GapBounds::new(
-                        from,
-                        to,
-                        Some(event::Days::new(1)),
-                        Some(event::Days::new(5)),
-                    )
-                    .ok()
-                    .map(|bounds| event::Fact::Gap { bounds })
-                }
-            ),
         ]
+    }
+
+    /// A random [`LifetimeEventKind`] across both category arms and every
+    /// subtype, so the `HasEvent` generator exercises the full kind grammar.
+    fn arb_lifetime_event_kind() -> impl Strategy<Value = LifetimeEventKind> {
+        prop_oneof![
+            prop_oneof![
+                Just(DurationalKind::Modified),
+                Just(DurationalKind::Damaged),
+                Just(DurationalKind::Repaired),
+                Just(DurationalKind::Moved),
+            ]
+            .prop_map(|kind| LifetimeEventKind::Durational { kind }),
+            prop_oneof![Just(PointKind::UsageChanged), Just(PointKind::Designated),]
+                .prop_map(|kind| LifetimeEventKind::Point { kind }),
+        ]
+    }
+
+    /// `event::GapBounds` — both endpoints generated independently, so a mixed
+    /// gap routes through both id closures. Forces the nested
+    /// `GapBounds -> OrderableEvent` recursion.
+    fn arb_gap_bounds() -> impl Strategy<Value = event::GapBounds<MemoryEntityId, MemoryEventId>> {
+        (arb_orderable_event(), arb_orderable_event()).prop_filter_map(
+            "valid gap bounds",
+            |(from, to)| {
+                event::GapBounds::new(
+                    from,
+                    to,
+                    Some(event::Days::new(1)),
+                    Some(event::Days::new(5)),
+                )
+                .ok()
+            },
+        )
     }
 
     /// `image::Fact` — all three variants (`Source`, `Author`,
@@ -671,6 +713,7 @@ mod traversal_props {
             arb_bookend().prop_map(|fact| FactualAssertion::Construction { fact }),
             arb_bookend().prop_map(|fact| FactualAssertion::Demolition { fact }),
             arb_event_fact().prop_map(|fact| FactualAssertion::Event { fact }),
+            arb_gap_bounds().prop_map(|bounds| FactualAssertion::Gap { bounds }),
             arb_image_fact().prop_map(|fact| FactualAssertion::Image { fact }),
             arb_picture().prop_map(|fact| FactualAssertion::Picture { fact }),
             arb_map().prop_map(|fact| FactualAssertion::Map { fact }),

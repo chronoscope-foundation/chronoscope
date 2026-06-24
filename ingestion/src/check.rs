@@ -172,6 +172,7 @@ fn compute_distributions(output: &IngestionOutput) -> Distributions {
 
             if let Some(loc) = extract_location(transition) {
                 let loc_type = match loc {
+                    UnresolvedLocation::Resolved(Location::Empty) => "Empty",
                     UnresolvedLocation::Resolved(Location::Circle { .. }) => "Circle",
                     UnresolvedLocation::Resolved(Location::UnionOf { .. }) => "UnionOf",
                     UnresolvedLocation::Resolved(Location::Unbounded) => "Unbounded",

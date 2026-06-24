@@ -9,10 +9,12 @@
 //! designations, descriptions, and cross-event temporal gaps.
 //!
 //! [`OrderableEvent`] and [`GapBounds`] live here too. They underpin the
-//! [`Fact::Gap`] variant — sources sometimes claim a relative temporal
-//! relationship between two events without absolute dates ("Y happened
-//! after X", "Y happened exactly five years after X"), and the gap shape
-//! captures all of these uniformly.
+//! [`crate::facts::assertions::FactualAssertion::Gap`] variant — sources
+//! sometimes claim a relative temporal relationship between two events without
+//! absolute dates ("Y happened after X", "Y happened exactly five years after
+//! X"), and the gap shape captures all of these uniformly. A gap is an ordering
+//! relationship over events and entity bookends, not an event with one subject,
+//! so it sits beside the event cluster rather than inside [`Fact`].
 //!
 //! | Source claim                                     | `GapBounds` shape                               |
 //! |--------------------------------------------------|-------------------------------------------------|
@@ -28,76 +30,42 @@
 //! don't appear in real cross-boundary ordering claims and are absent; we can
 //! add others if the need arises.
 //!
-//! # Partial-event patterns
+//! # Typing: every event declares its kind
 //!
-//! Sources don't always describe a lifetime event with both a kind and a date.
-//! The grammar accommodates two partial shapes by composition rather than
-//! dedicated variants.
+//! A [`Fact::HasEvent`] ties an event id to its one subject entity and declares
+//! its [`crate::facts::lifecycle::LifetimeEventKind`]. The submit layer requires
+//! exactly one per event id, so an event is never typeless and the kind is a
+//! stored claim rather than an inference off the payloads. The payload facts
+//! (`DamageCause`, `MoveMethod`, `UsageChange`, `Designation`) carry pure data.
 //!
-//! ## Typeless event (date, no kind-implying payload)
+//! A date may still be unknown: a source noting a building became a hotel, with
+//! no date attached, mints an event with `HasEvent { kind: Point(UsageChanged)
+//! }` and a [`Fact::UsageChange`]; a later source adds a [`Fact::PointDate`]
+//! when the date surfaces.
 //!
-//! An event id with a [`Fact::PointDate`] (or [`Fact::DurationalDate`]) and no
-//! kind-implying payload — no [`Fact::DamageCause`], [`Fact::MoveMethod`],
-//! [`Fact::UsageChange`], or [`Fact::Designation`] — means "something happened
-//! on this entity in this interval, we don't know what." This is the shape for
-//! era-overlap claims: "the 19th-century X" mints a fresh
-//! [`crate::facts::ids::LifetimeEventId`] on the entity and attaches a single
-//! `PointDate { bound: <1800-01-01 .. 1900-01-01> }`. The event's existence
-//! plus its date implies the entity was alive somewhere in that span.
+//! # Per-kind field availability (enforced at submit time)
 //!
-//! ## Undated event (kind-implying payload, no date)
+//! A payload or date fact must suit the kind its event's `HasEvent` declares —
+//! a `DamageCause` only on a `Damaged` event, a `DurationalDate` only on a
+//! durational kind, and so on. [`Fact::kind_constraints`] is the authoritative
+//! mapping; the submit layer intersects it against the declared kind. Any
+//! [`Fact`] variant attaches to any event id at the type level, so the guard
+//! lives in the submit layer rather than the grammar.
 //!
-//! An event id with a kind-implying payload but no date means "this kind of
-//! event happened at some unknown time." "The X hotel" mints a fresh
-//! [`crate::facts::ids::LifetimeEventId`] and attaches a single
-//! [`Fact::UsageChange`] with `new_usages: {Hotel}` — the usage transition is
-//! recorded without committing to when. The kind is whatever the payload
-//! implies ([`crate::facts::lifecycle::LifetimeEventKind::UsageChanged`] here);
-//! later sources may add a [`Fact::PointDate`] when the date becomes known.
-//!
-//! # Error states (rejected at submit time)
-//!
-//! Combinations the grammar permits structurally but the fact-store layer
-//! rejects at submit time — bugs in caller code, not outside-world uncertainty.
-//!
-//! ## Per-kind field availability
-//!
-//! Any [`Fact`] variant may attach to any event id at the type level; the
-//! submit layer rejects facts whose variant doesn't match the referenced
-//! event's [`crate::facts::lifecycle::LifetimeEventKind`]. Rules consult the
-//! event's own kind claim before applying.
-//!
-//! - [`Fact::DurationalDate`] is valid only when the referenced event's
-//!   kind is durational (`Modified`, `Damaged`, `Repaired`, `Moved`).
-//!   Point events use [`Fact::PointDate`].
-//! - [`Fact::PointDate`] is valid only when the referenced event's kind
-//!   is point (`UsageChanged`, `Designated`). Durational events use
-//!   [`Fact::DurationalDate`] paired with a
-//!   [`crate::facts::lifecycle::DurationalRole`].
-//! - [`Fact::DamageCause`] is valid only when the referenced event's
-//!   kind is `Damaged`.
-//! - [`Fact::MoveMethod`] is valid only when the referenced event's
-//!   kind is `Moved`.
-//! - [`Fact::UsageChange`] is valid only when the referenced event's
-//!   kind is `UsageChanged`.
-//! - [`Fact::Designation`] is valid only when the referenced event's
-//!   kind is `Designated`.
-//! - [`Fact::Description`] is valid on any interior event kind.
-//! - [`Fact::MovedToLocation`] is valid only when the referenced
-//!   event's kind is `Moved` — a fire happens *at* a building but
-//!   doesn't change its location, so any spatial fact about other
-//!   interior events should live on the entity (via bookends) or on a
-//!   depiction. Construction location lives on the bookend cluster (see
-//!   [`crate::facts::bookend::Fact::Location`]); demolition location is
-//!   derived (see [`crate::facts::bookend`]'s error-states section).
+//! [`Fact::MovedToLocation`] carries rationale beyond the mapping: a fire
+//! happens *at* a building but doesn't change its location, so spatial facts
+//! about other interior events belong on the entity (via bookends) or a
+//! depiction. Construction location lives on the bookend cluster (see
+//! [`crate::facts::bookend::Fact::Location`]); demolition location is derived
+//! (see [`crate::facts::bookend`]'s error-states section).
 //!
 //! ## Reference invariants
 //!
-//! - [`Fact::Gap`] requires both `from` and `to` endpoints to reference
-//!   events that actually exist by the time projection runs. The
-//!   wire-boundary smart constructor [`GapBounds::new`] enforces only
-//!   the local invariants (at least one bound present, `min <= max`);
-//!   the existence check is a submit-layer rule.
+//! - [`crate::facts::assertions::FactualAssertion::Gap`] requires both `from`
+//!   and `to` endpoints to reference events that actually exist by the time
+//!   projection runs. The wire-boundary smart constructor [`GapBounds::new`]
+//!   enforces only the local invariants (at least one bound present,
+//!   `min <= max`); the existence check is a submit-layer rule.
 //!
 //! # Conflicts (surfaced at projection time)
 //!
@@ -159,7 +127,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::date::UncertainDate;
-use crate::facts::lifecycle::{DamageCause, DurationalRole, MoveMethod, Usage};
+use crate::facts::lifecycle::{DamageCause, DurationalRole, LifetimeEventKind, MoveMethod, Usage};
 use crate::location::UnresolvedLocation;
 
 /// Event-cluster fact.
@@ -167,13 +135,26 @@ use crate::location::UnresolvedLocation;
 /// Generic over the entity reference type `EntId` and the lifetime-event
 /// reference type `EvtId`.
 #[grammar_type]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 #[serde(bound(
     serialize = "EntId: ::serde::Serialize + Ord, EvtId: ::serde::Serialize + Ord",
     deserialize = "EntId: ::serde::de::DeserializeOwned + Ord, EvtId: ::serde::de::DeserializeOwned + Ord"
 ))]
 #[schemars(bound = "EntId: ::schemars::JsonSchema + Ord, EvtId: ::schemars::JsonSchema + Ord")]
 pub enum Fact<EntId: Ord, EvtId: Ord> {
+    /// Ties an interior event to its subject entity and declares its kind.
+    /// Each minted event carries exactly one; a `SameEvent` class may carry
+    /// several when its sources disagree on the kind, a stored conflict the
+    /// projection reads back as an undetermined kind.
+    HasEvent {
+        /// The entity whose lifetime this event belongs to.
+        entity: EntId,
+        /// The event being typed.
+        event: EvtId,
+        /// The event's declared kind.
+        kind: LifetimeEventKind,
+    },
     /// An uncertain interval for one end (start or completion) of a
     /// durational lifetime event (`Modified`, `Damaged`, `Repaired`,
     /// `Moved`).
@@ -198,21 +179,21 @@ pub enum Fact<EntId: Ord, EvtId: Ord> {
         /// The destination location of the move.
         location: UnresolvedLocation,
     },
-    /// What caused a [`crate::facts::lifecycle::LifetimeEventKind::Damaged`]
+    /// What caused a [`crate::facts::lifecycle::DurationalKind::Damaged`]
     /// event.
     DamageCause { event: EvtId, cause: DamageCause },
-    /// How a [`crate::facts::lifecycle::LifetimeEventKind::Moved`] event
+    /// How a [`crate::facts::lifecycle::DurationalKind::Moved`] event
     /// was carried out.
     MoveMethod { event: EvtId, method: MoveMethod },
     /// New set of active uses after a
-    /// [`crate::facts::lifecycle::LifetimeEventKind::UsageChanged`] event.
+    /// [`crate::facts::lifecycle::PointKind::UsageChanged`] event.
     UsageChange {
         event: EvtId,
         /// The post-event usage set; empty represents closure or vacancy.
         new_usages: BTreeSet<Usage>,
     },
     /// Designation text for a
-    /// [`crate::facts::lifecycle::LifetimeEventKind::Designated`] event.
+    /// [`crate::facts::lifecycle::PointKind::Designated`] event.
     Designation {
         event: EvtId,
         /// The designation as the source phrased it.
@@ -220,13 +201,6 @@ pub enum Fact<EntId: Ord, EvtId: Ord> {
     },
     /// Free-form descriptive text attached to a lifetime event.
     Description { event: EvtId, text: String },
-    /// A claim about the temporal gap between two orderable events.
-    /// Covers pure ordering ("Y after X"), bounded gaps, and exact gaps
-    /// in a single shape — see the module docs for the encoding table.
-    Gap {
-        /// The cross-event gap bounds (endpoints plus day range).
-        bounds: GapBounds<EntId, EvtId>,
-    },
 }
 
 impl<EntId: Ord, EvtId: Ord> Fact<EntId, EvtId> {
@@ -234,11 +208,15 @@ impl<EntId: Ord, EvtId: Ord> Fact<EntId, EvtId> {
     /// the id's kind.
     ///
     /// Two closures, not three: the event cluster spans only lifetime-event
-    /// ids (most variants) and entity ids (only inside [`Fact::Gap`]'s
-    /// [`OrderableEvent`] endpoints). Each cluster takes only the closures
-    /// its id kinds require.
+    /// ids (every variant) and an entity id (only [`Fact::HasEvent`]'s
+    /// subject). Each cluster takes only the closures its id kinds require.
     pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId), fv: &mut impl FnMut(&EvtId)) {
         match self {
+            // The one variant carrying an entity ref: visit both ids.
+            Self::HasEvent { entity, event, .. } => {
+                fe(entity);
+                fv(event);
+            }
             Self::DurationalDate { event, .. }
             | Self::PointDate { event, .. }
             | Self::MovedToLocation { event, .. }
@@ -247,7 +225,6 @@ impl<EntId: Ord, EvtId: Ord> Fact<EntId, EvtId> {
             | Self::UsageChange { event, .. }
             | Self::Designation { event, .. }
             | Self::Description { event, .. } => fv(event),
-            Self::Gap { bounds } => bounds.for_each_id(fe, fv),
         }
     }
 
@@ -257,14 +234,22 @@ impl<EntId: Ord, EvtId: Ord> Fact<EntId, EvtId> {
     /// No distinct-pair payloads, so no `on_self_loop` wiring: the only
     /// failure is a leaf closure rejecting a reference. Generic over the
     /// error type `Err` so the cluster never names the concrete error the
-    /// assertion layer chooses. The nested [`Fact::Gap`] recursion threads
-    /// the same closures down to [`GapBounds`] and [`OrderableEvent`].
+    /// assertion layer chooses.
     pub fn try_map_ids<E2: Ord, V2: Ord, Err>(
         &self,
         fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
         fv: &mut impl FnMut(&EvtId) -> Result<V2, Err>,
     ) -> Result<Fact<E2, V2>, Err> {
         match self {
+            Self::HasEvent {
+                entity,
+                event,
+                kind,
+            } => Ok(Fact::HasEvent {
+                entity: fe(entity)?,
+                event: fv(event)?,
+                kind: *kind,
+            }),
             Self::DurationalDate { event, role, bound } => Ok(Fact::DurationalDate {
                 event: fv(event)?,
                 role: *role,
@@ -298,9 +283,51 @@ impl<EntId: Ord, EvtId: Ord> Fact<EntId, EvtId> {
                 event: fv(event)?,
                 text: text.clone(),
             }),
-            Self::Gap { bounds } => Ok(Fact::Gap {
-                bounds: bounds.try_map_ids(fe, fv)?,
-            }),
+        }
+    }
+
+    /// The single lifetime-event id this fact mentions as its subject.
+    pub fn subject(&self) -> &EvtId {
+        match self {
+            Self::HasEvent { event, .. }
+            | Self::DurationalDate { event, .. }
+            | Self::PointDate { event, .. }
+            | Self::MovedToLocation { event, .. }
+            | Self::DamageCause { event, .. }
+            | Self::MoveMethod { event, .. }
+            | Self::UsageChange { event, .. }
+            | Self::Designation { event, .. }
+            | Self::Description { event, .. } => event,
+        }
+    }
+
+    /// The lifetime-event kinds this fact admits for its event — the data the
+    /// kind typecheck intersects against the declared kind. `HasEvent` pins its
+    /// one declared kind; a payload admits the kind(s) its variant suits; a
+    /// description admits all.
+    pub fn kind_constraints(&self) -> BTreeSet<LifetimeEventKind> {
+        use crate::facts::lifecycle::{DurationalKind, PointKind};
+        match self {
+            Self::HasEvent { kind, .. } => BTreeSet::from([*kind]),
+            Self::DamageCause { .. } => BTreeSet::from([LifetimeEventKind::Durational {
+                kind: DurationalKind::Damaged,
+            }]),
+            Self::MoveMethod { .. } | Self::MovedToLocation { .. } => {
+                BTreeSet::from([LifetimeEventKind::Durational {
+                    kind: DurationalKind::Moved,
+                }])
+            }
+            Self::UsageChange { .. } => BTreeSet::from([LifetimeEventKind::Point {
+                kind: PointKind::UsageChanged,
+            }]),
+            Self::Designation { .. } => BTreeSet::from([LifetimeEventKind::Point {
+                kind: PointKind::Designated,
+            }]),
+            Self::DurationalDate { .. } => LifetimeEventKind::durational_kinds().collect(),
+            Self::PointDate { .. } => LifetimeEventKind::point_kinds().collect(),
+            Self::Description { .. } => LifetimeEventKind::durational_kinds()
+                .chain(LifetimeEventKind::point_kinds())
+                .collect(),
         }
     }
 }
@@ -367,7 +394,7 @@ impl std::ops::Sub for Days {
 // OrderableEvent
 // ============================================================================
 
-/// Endpoint of a [`Fact::Gap`].
+/// Endpoint of a [`crate::facts::assertions::FactualAssertion::Gap`].
 ///
 /// Three shapes are orderable across entity boundaries: a lifetime event by
 /// reference (anywhere inside the entity's lifetime), the completion of
@@ -666,68 +693,64 @@ mod tests {
         Ok(())
     }
 
-    // --- id-traversal: exercises `try_map_ids` / `for_each_id` ---
+    // --- id-traversal: exercises `GapBounds::try_map_ids` / `for_each_id` ---
     //
     // Built with the bundle-local index newtypes (`EntityIdx` / `EventIdx`) as
     // the input id types — the realistic pre-substitution shape — and relabels
-    // them to `String` so the type-changing relabel is visible. A `Gap` forces
-    // the nested recursion `Fact -> GapBounds -> OrderableEvent` and routes
-    // through both closures (one endpoint is an entity, the other an event), so
-    // a closure-dispatch swap would fail the assertion.
+    // them to `String` so the type-changing relabel is visible. The two
+    // endpoints route through both closures (one is an entity, the other an
+    // event), so a closure-dispatch swap would fail the assertion.
 
     use crate::facts::submit::{EntityIdx, EventIdx};
 
     /// A gap whose `from` endpoint carries an entity ref and whose `to`
     /// endpoint carries an event ref — so the relabel touches both id
     /// kinds through the nested recursion.
-    fn idx_gap_fact() -> Result<Fact<EntityIdx, EventIdx>, GapBoundsError> {
-        let gap = GapBounds::new(
+    fn idx_gap_bounds() -> Result<GapBounds<EntityIdx, EventIdx>, GapBoundsError> {
+        GapBounds::new(
             OrderableEvent::ConstructionCompletion {
                 entity: EntityIdx(7),
             },
             OrderableEvent::Event { event: EventIdx(3) },
             Some(Days::new(1)),
             Some(Days::new(5)),
-        )?;
-        Ok(Fact::Gap { bounds: gap })
+        )
     }
 
     #[test]
     fn try_map_ids_relabels_gap_through_both_closures() -> TestResult {
-        let fact = idx_gap_fact()?;
+        let bounds = idx_gap_bounds()?;
         // Distinguishable renderings per kind: a swapped dispatch (entity
         // closure firing on the event ref, or vice versa) would surface as the
         // wrong prefix. The closures never fail, but `try_map_ids` is generic
         // over the error type, so the error is named concretely
         // (`IdMapError<String, String, String>`) to pin inference.
-        let mapped: Fact<String, String> = fact.try_map_ids(
+        let mapped: GapBounds<String, String> = bounds.try_map_ids(
             &mut |e: &EntityIdx| {
                 Ok::<_, IdMapError<String, String, String>>(format!("entity-{}", e.0))
             },
             &mut |v: &EventIdx| Ok(format!("event-{}", v.0)),
         )?;
-        let expected = Fact::Gap {
-            bounds: GapBounds::new(
-                OrderableEvent::ConstructionCompletion {
-                    entity: "entity-7".to_owned(),
-                },
-                OrderableEvent::Event {
-                    event: "event-3".to_owned(),
-                },
-                Some(Days::new(1)),
-                Some(Days::new(5)),
-            )?,
-        };
+        let expected = GapBounds::new(
+            OrderableEvent::ConstructionCompletion {
+                entity: "entity-7".to_owned(),
+            },
+            OrderableEvent::Event {
+                event: "event-3".to_owned(),
+            },
+            Some(Days::new(1)),
+            Some(Days::new(5)),
+        )?;
         assert_eq!(mapped, expected);
         Ok(())
     }
 
     #[test]
     fn for_each_id_collects_gap_endpoint_ids() -> TestResult {
-        let fact = idx_gap_fact()?;
+        let bounds = idx_gap_bounds()?;
         let mut entities: Vec<EntityIdx> = Vec::new();
         let mut events: Vec<EventIdx> = Vec::new();
-        fact.for_each_id(
+        bounds.for_each_id(
             &mut |e: &EntityIdx| entities.push(*e),
             &mut |v: &EventIdx| events.push(*v),
         );
@@ -748,8 +771,8 @@ mod tests {
     #[test]
     fn try_map_ids_propagates_leaf_lookup_failure() -> TestResult {
         use crate::facts::ids::SubjectKind;
-        let fact = idx_gap_fact()?;
-        let result: Result<Fact<String, String>, IdMapError<String, String, String>> = fact
+        let bounds = idx_gap_bounds()?;
+        let result: Result<GapBounds<String, String>, IdMapError<String, String, String>> = bounds
             .try_map_ids(
                 &mut |e: &EntityIdx| {
                     Err(IdMapError::LeafLookup {

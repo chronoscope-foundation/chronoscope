@@ -43,6 +43,7 @@ pub mod facts;
 pub mod geo;
 pub mod ids;
 pub mod ingestion;
+pub mod lattice;
 pub mod links;
 pub mod location;
 pub mod merge;
@@ -66,6 +67,7 @@ pub use ids::{
     WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
 };
 pub use ingestion::{ImageSource, IngestionBundle, IngestionNotes, ReferenceError};
+pub use lattice::JoinSemilattice;
 pub use links::{ExternalLink, LinkTarget, LinkType};
 pub use location::{Distance, Location, LocationError, LocationReference, UnresolvedLocation};
 pub use moment::{Moment, TransitionRole, decompose, structural_edges, topological_order};

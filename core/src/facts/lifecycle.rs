@@ -13,21 +13,17 @@
 //! a [`DurationalRole`] to distinguish the start of the duration from
 //! its completion; point events do not.
 
-use std::collections::BTreeSet;
-
 use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use strum::IntoEnumIterator;
 
 /// Role for a date bound on a durational lifetime event.
 ///
-/// Durational events ([`LifetimeEventKind::Modified`],
-/// [`LifetimeEventKind::Damaged`], [`LifetimeEventKind::Repaired`],
-/// [`LifetimeEventKind::Moved`]) span an interval rather than a single
-/// instant; the role distinguishes the start of the duration from its
-/// end. Point events ([`LifetimeEventKind::UsageChanged`],
-/// [`LifetimeEventKind::Designated`]) describe a single instant and
-/// don't carry a role.
+/// Durational events ([`DurationalKind`]) span an interval rather than a
+/// single instant; the role distinguishes the start of the duration from its
+/// end. Point events ([`PointKind`]) describe a single instant and don't carry
+/// a role.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -39,30 +35,12 @@ pub enum DurationalRole {
     Completed,
 }
 
-/// Lifetime-event categories carried by interior lifecycle facts.
-///
-/// Construction and demolition are absent: they live as flat per-entity bookend
-/// facts on [`crate::facts::assertions::FactualAssertion`], not as values inside
-/// an event reference. Once-ness for the bookends is structural rather than
-/// rule-enforced.
-///
-/// Some kinds are durational (their facts use
-/// [`crate::facts::event::Fact::DurationalDate`] with a [`DurationalRole`]);
-/// others are point events (their facts use
-/// [`crate::facts::event::Fact::PointDate`]). `Damaged` and `Moved` are
-/// durational because significant damage and physical relocation span days to
-/// months and benefit from start/completion bookends. A durational event may
-/// carry only one of its two bounds (e.g. a `Damaged` with `Started` but no
-/// `Completed`) when the source supplies one endpoint.
-///
-/// # Solver rules
-///
-/// The kind serves as the dispatch tag the solver uses to validate
-/// per-kind field availability on event-cluster facts. See the
-/// "Solver rules" section of [`crate::facts::event`] for the full
-/// per-variant matrix. The kind also bounds the [`DurationalRole`]
-/// requirement on dates: durational kinds must carry a role on every
-/// date fact; point kinds must not.
+/// A durational lifetime event — one that spans an interval. Its facts use
+/// [`crate::facts::event::Fact::DurationalDate`] with a [`DurationalRole`].
+/// `Damaged` and `Moved` are durational because significant damage and physical
+/// relocation span days to months and benefit from start/completion bookends. A
+/// durational event may carry only one of its two bounds (e.g. a `Damaged` with
+/// `Started` but no `Completed`) when the source supplies one endpoint.
 #[derive(
     Debug,
     Clone,
@@ -76,129 +54,105 @@ pub enum DurationalRole {
     Deserialize,
     JsonSchema,
     strum::EnumIter,
+    strum::Display,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum LifetimeEventKind {
-    /// Durational — a renovation, expansion, or other physical change to
-    /// an existing structure.
+#[strum(serialize_all = "snake_case")]
+pub enum DurationalKind {
+    /// A renovation, expansion, or other physical change to an existing
+    /// structure.
     Modified,
-    /// Durational — damage from fire, flood, earthquake, war, neglect, or
-    /// other cause. Carries a damage cause via
-    /// [`crate::facts::event::Fact::DamageCause`].
+    /// Damage from fire, flood, earthquake, war, neglect, or other cause.
+    /// Carries a damage cause via [`crate::facts::event::Fact::DamageCause`].
     Damaged,
-    /// Durational — repair work after damage.
+    /// Repair work after damage.
     Repaired,
-    /// Durational — physical relocation of the structure. Carries the
-    /// method via [`crate::facts::event::Fact::MoveMethod`].
+    /// Physical relocation of the structure. Carries the method via
+    /// [`crate::facts::event::Fact::MoveMethod`].
     Moved,
-    /// Point — a change in the structure's active uses. Carries the new
-    /// usage set via [`crate::facts::event::Fact::UsageChange`].
+}
+
+/// A point lifetime event — one that describes a single instant. Its facts use
+/// [`crate::facts::event::Fact::PointDate`] and carry no [`DurationalRole`].
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    strum::EnumIter,
+    strum::Display,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PointKind {
+    /// A change in the structure's active uses. Carries the new usage set via
+    /// [`crate::facts::event::Fact::UsageChange`].
     UsageChanged,
-    /// Point — designation as a landmark, historic register listing, or
-    /// other named status. Carries the designation text via
+    /// Designation as a landmark, historic register listing, or other named
+    /// status. Carries the designation text via
     /// [`crate::facts::event::Fact::Designation`].
     Designated,
 }
 
-impl LifetimeEventKind {
-    /// The category (durational vs point) of the kind. Encoded as an
-    /// exhaustive `match` so adding a [`LifetimeEventKind`] variant
-    /// forces an explicit categorisation here — wildcard arms are
-    /// disallowed by this crate's coding standards.
-    pub fn category(self) -> LifetimeEventCategory {
-        match self {
-            Self::Modified | Self::Damaged | Self::Repaired | Self::Moved => {
-                LifetimeEventCategory::Durational
-            }
-            Self::UsageChanged | Self::Designated => LifetimeEventCategory::Point,
-        }
-    }
-
-    /// Every kind. Derived via [`strum::IntoEnumIterator`] so adding a
-    /// variant to the enum automatically includes it here. The partition
-    /// unit test still serves as a defense-in-depth check that
-    /// `durational_kinds() ∪ point_kinds() == all()`.
-    pub fn all() -> BTreeSet<Self> {
-        <Self as strum::IntoEnumIterator>::iter().collect()
-    }
-
-    /// The kinds that span an interval rather than a single instant
-    /// (`Modified`, `Damaged`, `Repaired`, `Moved`).
-    pub fn durational_kinds() -> BTreeSet<Self> {
-        Self::all()
-            .into_iter()
-            .filter(|k| matches!(k.category(), LifetimeEventCategory::Durational))
-            .collect()
-    }
-
-    /// The kinds that describe a single instant (`UsageChanged`,
-    /// `Designated`).
-    pub fn point_kinds() -> BTreeSet<Self> {
-        Self::all()
-            .into_iter()
-            .filter(|k| matches!(k.category(), LifetimeEventCategory::Point))
-            .collect()
-    }
-}
-
-/// Classification of a [`LifetimeEventKind`] as durational vs point.
+/// The declared kind of an interior lifetime event, split along its category
+/// boundary: a [`DurationalKind`] spanning an interval, or a [`PointKind`] at a
+/// single instant.
 ///
-/// A type rather than a bool so the partition is named once instead of
-/// re-encoded at each call site.
+/// Construction and demolition are absent: they live as flat per-entity bookend
+/// facts on [`crate::facts::assertions::FactualAssertion`], not as values inside
+/// an event reference. Once-ness for the bookends is structural rather than
+/// rule-enforced.
+///
+/// An event declares its kind through a
+/// [`crate::facts::event::Fact::HasEvent`] claim. The submit layer requires each
+/// minted event to carry one; sources that disagree on the kind of a merged
+/// event store several, which the projection collapses to `None`.
+#[grammar_type]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum LifetimeEventCategory {
-    /// Spans an interval rather than a single instant.
-    Durational,
-    /// Describes a single instant.
-    Point,
+pub enum LifetimeEventKind {
+    /// A durational event spanning an interval.
+    Durational {
+        /// The specific durational kind.
+        kind: DurationalKind,
+    },
+    /// A point event at a single instant.
+    Point {
+        /// The specific point kind.
+        kind: PointKind,
+    },
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Catches a swap: every kind reported as durational must classify
-    // as Durational under the central `category()` predicate. If
-    // `durational_kinds()` ever picked up a Point kind by mistake, this
-    // would surface immediately at the failed assertion.
-    #[test]
-    fn durational_kinds_all_have_durational_category() {
-        for k in LifetimeEventKind::durational_kinds() {
-            assert_eq!(k.category(), LifetimeEventCategory::Durational);
-        }
+impl LifetimeEventKind {
+    /// Every durational kind, wrapped. Built from [`DurationalKind`]'s variants so
+    /// a new variant flows in automatically.
+    pub fn durational_kinds() -> impl Iterator<Item = Self> {
+        DurationalKind::iter().map(|kind| Self::Durational { kind })
     }
 
-    // Symmetric to the above for the point side.
-    #[test]
-    fn point_kinds_all_have_point_category() {
-        for k in LifetimeEventKind::point_kinds() {
-            assert_eq!(k.category(), LifetimeEventCategory::Point);
-        }
-    }
-
-    // Defense-in-depth: the two sets must partition `all()`. Together
-    // with the two category-check tests above, this catches both swaps
-    // (wrong-side membership) and partition breakage (a kind in
-    // neither set, or in both).
-    #[test]
-    fn durational_and_point_partition_all() {
-        let dur = LifetimeEventKind::durational_kinds();
-        let point = LifetimeEventKind::point_kinds();
-        let all = LifetimeEventKind::all();
-        // Union = all
-        let union: BTreeSet<_> = dur.union(&point).copied().collect();
-        assert_eq!(union, all, "durational ∪ point must equal all()");
-        // Intersection = empty
-        let intersection: BTreeSet<_> = dur.intersection(&point).copied().collect();
-        assert!(
-            intersection.is_empty(),
-            "durational ∩ point must be empty, got {intersection:?}"
-        );
+    /// Every point kind, wrapped.
+    pub fn point_kinds() -> impl Iterator<Item = Self> {
+        PointKind::iter().map(|kind| Self::Point { kind })
     }
 }
 
-/// Cause of damage to a structure, carried by an [`LifetimeEventKind::Damaged`]
-/// event.
+impl std::fmt::Display for LifetimeEventKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Durational { kind } => write!(f, "{kind}"),
+            Self::Point { kind } => write!(f, "{kind}"),
+        }
+    }
+}
+
+/// Cause of damage to a structure, carried by a
+/// [`DurationalKind::Damaged`] event.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DamageCause {
@@ -226,8 +180,8 @@ pub enum DamageCause {
     },
 }
 
-/// Method used to relocate a structure, carried by an
-/// [`LifetimeEventKind::Moved`] event.
+/// Method used to relocate a structure, carried by a
+/// [`DurationalKind::Moved`] event.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]

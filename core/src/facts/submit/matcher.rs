@@ -15,10 +15,10 @@ use std::future::Future;
 
 use url::Url;
 
-use super::pipeline::{DRAIN_PAGE, drain_pages};
 use super::{Decl, EntityIdx, ImageIdx, SubmitFact};
 use crate::facts::assertions::FactualAssertion;
 use crate::facts::citations::{ExternalReference, Language};
+use crate::facts::drain::{DRAIN_PAGE, drain_pages};
 use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId};
 use crate::facts::schema::{EntityStream, FactPage, ImageStream, normalize_name};
 use crate::facts::store::{EntityView, FactStore, ImageView, StoredFactOf};
@@ -228,7 +228,7 @@ where
     F: FnMut(FactId) -> Fut,
     Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
 {
-    drain_pages::<S, _, _, _>(fetch, |item| {
+    drain_pages(fetch, |item| {
         candidates
             .entry(item.representative)
             .or_default()

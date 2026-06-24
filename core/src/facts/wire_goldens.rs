@@ -45,7 +45,7 @@ use crate::facts::ids::{
     AnalyzerProcess, AnalyzerVersion, EntityId, FactId, ImageId, LifetimeEventId, UserId,
 };
 use crate::facts::image;
-use crate::facts::lifecycle::{DurationalRole, MoveMethod};
+use crate::facts::lifecycle::{DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod};
 use crate::facts::map;
 use crate::facts::observation;
 use crate::facts::picture;
@@ -213,6 +213,21 @@ fn golden_event_fact_durational_date() -> Result<()> {
 }
 
 #[test]
+fn golden_event_fact_has_event() -> Result<()> {
+    let f: event::Fact<EntityId, LifetimeEventId> = event::Fact::HasEvent {
+        entity: ent("e-1")?,
+        event: evt("evt-1")?,
+        kind: LifetimeEventKind::Durational {
+            kind: DurationalKind::Damaged,
+        },
+    };
+    assert_golden_roundtrip(
+        &f,
+        r#"{"entity":"e-1","event":"evt-1","kind":{"kind":"damaged","type":"durational"},"type":"has_event"}"#,
+    )
+}
+
+#[test]
 fn golden_event_fact_move_method() -> Result<()> {
     let f: event::Fact<EntityId, LifetimeEventId> = event::Fact::MoveMethod {
         event: evt("evt-1")?,
@@ -350,6 +365,13 @@ fn golden_external_reference_unmodeled_url_locks_variant() -> Result<()> {
         &reference,
         r#"{"type":"unmodeled_url","url":"https://example.com/some/path"}"#,
     )
+}
+
+#[test]
+fn golden_location_empty_locks_bottom_tag() -> Result<()> {
+    // The empty location (⊥) is a unit variant tagged on `type`, byte-pinned so
+    // the bottom of the lattice has one stable wire form.
+    assert_golden_roundtrip(&Location::Empty, r#"{"type":"empty"}"#)
 }
 
 #[test]
