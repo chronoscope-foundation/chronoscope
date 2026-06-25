@@ -52,8 +52,8 @@ let
   # and the dev shell. To bump: change the date, set hash to lib.fakeHash,
   # rebuild — Nix reports the correct hash.
   italyPbf = pkgs.fetchurl {
-    url = "https://download.geofabrik.de/europe/italy-260425.osm.pbf";
-    hash = "sha256-54WU7TsePWN0A0XNiwiP8frNJ3Vcv7bfZk7qm1dyD7I=";
+    url = "https://download.geofabrik.de/europe/italy-260624.osm.pbf";
+    hash = "sha256-0UkvTrLN5JZX6gd7jkzcmzvK0x8tRoD6CJaAD9kqZfY=";
   };
 
   # Full planet PBF for production (~86 GB). Powers `api-world`.
