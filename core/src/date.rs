@@ -582,17 +582,6 @@ impl UncertainDate {
         pieces.extend_from_slice(other.intervals());
         Self::from_ranges(pieces)
     }
-
-    /// Meet (intersection) of an iterator of dates, seeded from
-    /// [`unknown`](Self::unknown) (⊤, the meet identity). The empty iterator
-    /// yields ⊤; one element yields itself. The meet half of the lattice is
-    /// date-specific — no [`JoinSemilattice`](crate::lattice::JoinSemilattice)
-    /// counterpart — so it stays an inherent method.
-    pub fn meet_all<'a>(dates: impl IntoIterator<Item = &'a Self>) -> Self {
-        dates
-            .into_iter()
-            .fold(Self::unknown(), |acc, d| acc.meet(d))
-    }
 }
 
 /// The join half of the date lattice. The fold seeds from ⊥
@@ -605,6 +594,18 @@ impl crate::lattice::JoinSemilattice for UncertainDate {
 
     fn join(&self, other: &Self) -> Self {
         UncertainDate::join(self, other)
+    }
+}
+
+/// The meet half of the date lattice. ⊤ is `unknown()`, the meet identity;
+/// `meet` delegates to the inherent intersection.
+impl crate::lattice::MeetSemilattice for UncertainDate {
+    fn top() -> Self {
+        Self::unknown()
+    }
+
+    fn meet(&self, other: &Self) -> Self {
+        UncertainDate::meet(self, other)
     }
 }
 
@@ -825,7 +826,7 @@ fn precision_end(date: NaiveDate, precision: DatePrecision) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lattice::JoinSemilattice;
+    use crate::lattice::{JoinSemilattice, MeetSemilattice};
     use proptest::prelude::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1477,71 +1478,6 @@ mod tests {
             }
         }
 
-        // --- Bounded-lattice property tests ---
-        //
-        // meet = set intersection, join = set union; both total. The laws below
-        // hold for a genuine bounded lattice — commutativity, associativity,
-        // idempotence, absorption, the four ⊤/⊥ identities — none of which the
-        // old `Option`-meet semilattice could express.
-
-        #[test]
-        fn prop_meet_commutative(a in arb_uncertain_date(), b in arb_uncertain_date()) {
-            prop_assert_eq!(a.meet(&b), b.meet(&a));
-        }
-
-        #[test]
-        fn prop_meet_associative(
-            a in arb_uncertain_date(),
-            b in arb_uncertain_date(),
-            c in arb_uncertain_date(),
-        ) {
-            prop_assert_eq!(a.meet(&b).meet(&c), a.meet(&b.meet(&c)));
-        }
-
-        #[test]
-        fn prop_meet_idempotent(a in arb_uncertain_date()) {
-            prop_assert_eq!(a.meet(&a), a.clone());
-        }
-
-        #[test]
-        fn prop_join_commutative(a in arb_uncertain_date(), b in arb_uncertain_date()) {
-            prop_assert_eq!(a.join(&b), b.join(&a));
-        }
-
-        #[test]
-        fn prop_join_associative(
-            a in arb_uncertain_date(),
-            b in arb_uncertain_date(),
-            c in arb_uncertain_date(),
-        ) {
-            prop_assert_eq!(a.join(&b).join(&c), a.join(&b.join(&c)));
-        }
-
-        #[test]
-        fn prop_join_idempotent(a in arb_uncertain_date()) {
-            prop_assert_eq!(a.join(&a), a.clone());
-        }
-
-        /// Absorption ties meet and join into one lattice — the law the old
-        /// per-op semilattice suite could not state.
-        #[test]
-        fn prop_absorption(a in arb_uncertain_date(), b in arb_uncertain_date()) {
-            prop_assert_eq!(a.meet(&a.join(&b)), a.clone());
-            prop_assert_eq!(a.join(&a.meet(&b)), a.clone());
-        }
-
-        /// The bounded identities: ⊤ is the meet unit, ⊥ the join unit, and each
-        /// is the other op's absorbing element.
-        #[test]
-        fn prop_bounded_identities(a in arb_uncertain_date()) {
-            let top = UncertainDate::unknown();
-            let bottom = UncertainDate::empty();
-            prop_assert_eq!(a.meet(&top), a.clone());
-            prop_assert_eq!(a.join(&bottom), a.clone());
-            prop_assert_eq!(a.meet(&bottom), bottom.clone());
-            prop_assert_eq!(a.join(&top), top);
-        }
-
         /// Closure: meet/join of any two canonical unions is itself canonical.
         #[test]
         fn prop_ops_preserve_canonical_form(
@@ -1592,4 +1528,6 @@ mod tests {
             prop_assert_eq!(back, a);
         }
     }
+
+    crate::bounded_lattice_laws!(lattice_laws, UncertainDate, arb_uncertain_date());
 }

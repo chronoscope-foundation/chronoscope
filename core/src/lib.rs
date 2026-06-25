@@ -35,6 +35,7 @@ const _: () = assert!(
 );
 
 pub mod annotation;
+pub mod claimed;
 pub mod consistency;
 pub mod date;
 pub mod entity;
@@ -51,6 +52,7 @@ pub mod moment;
 pub mod nonempty;
 
 pub use annotation::{Annotation, AnnotationKind};
+pub use claimed::Claimed;
 pub use consistency::ConsistencyWarning;
 pub use date::{DateBound, DateError, DatePrecision, UncertainDate};
 pub use entity::{
@@ -67,7 +69,7 @@ pub use ids::{
     WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
 };
 pub use ingestion::{ImageSource, IngestionBundle, IngestionNotes, ReferenceError};
-pub use lattice::JoinSemilattice;
+pub use lattice::{BoundedLattice, JoinSemilattice, MeetSemilattice};
 pub use links::{ExternalLink, LinkTarget, LinkType};
 pub use location::{Distance, Location, LocationError, LocationReference, UnresolvedLocation};
 pub use moment::{Moment, TransitionRole, decompose, structural_edges, topological_order};
