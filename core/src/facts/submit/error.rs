@@ -327,6 +327,21 @@ pub enum SubmitError<E, V, I> {
         /// Which location position carried the impossible value.
         role: LocationRole,
     },
+    /// A stored location names more circles than the input-validation bound
+    /// allows. A place is a handful of spots; hundreds signal machine-generated
+    /// junk or an adversarial input, and the emptiness check is cubic in the
+    /// circle count.
+    #[error(
+        "{role} names {circles} circles, over the {limit} limit; a place is a handful of spots"
+    )]
+    LocationTooComplex {
+        /// Which location position carried the over-complex value.
+        role: LocationRole,
+        /// The circle count the location carries.
+        circles: usize,
+        /// The maximum circle count a stored location may carry.
+        limit: usize,
+    },
     /// An image-observation names an entity with no paired depiction tying that
     /// entity to the observed image. The observation describes something seen in
     /// the image, so the entity reference is meaningless without the depiction.

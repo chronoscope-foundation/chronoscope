@@ -90,8 +90,8 @@
 //!   event (no role).
 //! - [`Fact::MovedToLocation`] keyed by `event` — multiple location
 //!   claims unify via the [`crate::location::Location`] subsumption
-//!   lattice. Disjoint locations produce a `UnionOf`; contradictions
-//!   are visible as the `UnionOf` widening rather than collapsing.
+//!   lattice. Disjoint locations produce a `OneOf`; contradictions
+//!   are visible as the `OneOf` widening rather than collapsing.
 //!
 //! **Discrete-valued slots (multiple facts must agree; disagreement is
 //! a conflict):**

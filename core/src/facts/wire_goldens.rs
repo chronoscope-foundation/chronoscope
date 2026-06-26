@@ -51,7 +51,7 @@ use crate::facts::observation;
 use crate::facts::picture;
 use crate::facts::spatial::TopologicalRel;
 use crate::facts::submit::{Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact};
-use crate::geo::GeoPoint;
+use crate::geo::{GeoPoint, Meters};
 use crate::location::Location;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -375,16 +375,16 @@ fn golden_location_empty_locks_bottom_tag() -> Result<()> {
 }
 
 #[test]
-fn golden_location_union_of_locks_nested_internal_tag() -> Result<()> {
-    // `UnionOf` nests `Location` values themselves tagged on `type`. Locks
+fn golden_location_one_of_locks_nested_internal_tag() -> Result<()> {
+    // `OneOf` nests `Location` values themselves tagged on `type`. Locks
     // that the nesting keeps the tag keys in separate maps.
-    let location = Location::union_of(vec![
-        Location::circle(GeoPoint::new(48.8, 2.3)?, 10.0)?,
-        Location::circle(GeoPoint::new(51.5, -0.1)?, 10.0)?,
+    let location = Location::one_of(vec![
+        Location::circle(GeoPoint::new(48.8, 2.3)?, Meters(10.0))?,
+        Location::circle(GeoPoint::new(51.5, -0.1)?, Meters(10.0))?,
     ])?;
     assert_golden_roundtrip(
         &location,
-        r#"{"members":[{"center":{"lat":48.8,"lon":2.3},"radius_m":10,"type":"circle"},{"center":{"lat":51.5,"lon":-0.1},"radius_m":10,"type":"circle"}],"type":"union_of"}"#,
+        r#"{"members":[{"center":{"lat":48.8,"lon":2.3},"radius":10,"type":"circle"},{"center":{"lat":51.5,"lon":-0.1},"radius":10,"type":"circle"}],"type":"one_of"}"#,
     )
 }
 

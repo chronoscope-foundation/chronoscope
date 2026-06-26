@@ -45,7 +45,7 @@
 //!
 //! [`Fact::Location`] (on the `Construction` phase only) unifies via the
 //! [`crate::location::Location`] subsumption lattice: containment collapses to
-//! the tighter region; disjoint regions produce a `UnionOf` ("one of these is
+//! the tighter region; disjoint regions produce a `OneOf` ("one of these is
 //! true").
 //!
 //! ## Intra-phase ordering

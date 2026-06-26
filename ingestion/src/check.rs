@@ -174,10 +174,12 @@ fn compute_distributions(output: &IngestionOutput) -> Distributions {
                 let loc_type = match loc {
                     UnresolvedLocation::Resolved(Location::Empty) => "Empty",
                     UnresolvedLocation::Resolved(Location::Circle { .. }) => "Circle",
-                    UnresolvedLocation::Resolved(Location::UnionOf { .. }) => "UnionOf",
+                    UnresolvedLocation::Resolved(Location::OneOf { .. }) => "OneOf",
+                    UnresolvedLocation::Resolved(Location::AllOf { .. }) => "AllOf",
                     UnresolvedLocation::Resolved(Location::Unbounded) => "Unbounded",
                     UnresolvedLocation::Reference(_) => "Reference",
                     UnresolvedLocation::OneOf(_) => "OneOf",
+                    UnresolvedLocation::AllOf(_) => "AllOf",
                 };
                 *location_types.entry(loc_type.to_string()).or_default() += 1;
             }

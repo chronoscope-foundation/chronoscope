@@ -21,7 +21,7 @@ use crate::wikidata::ingest::PropertyContext;
 // =============================================================================
 
 mod extract {
-    use chronoscope_core::{GeoPoint, Location, UncertainDate, UnresolvedLocation};
+    use chronoscope_core::{GeoPoint, Location, Meters, UncertainDate, UnresolvedLocation};
     use chronoscope_integrations::wikidata::{Claim, DataValue, Snak};
 
     use crate::wikidata::parsing::parse_wikidata_time;
@@ -72,7 +72,7 @@ mod extract {
         });
 
         let result = GeoPoint::new(coord.latitude, coord.longitude).map(|center| match radius_m {
-            Some(r) => Location::circle(center, r),
+            Some(r) => Location::circle(center, Meters(r)),
             None => Ok(Location::point(center)),
         });
 
@@ -900,8 +900,9 @@ mod tests {
         assert!(warnings.is_empty());
         let loc = loc.ok_or("expected Some")?;
 
-        if let UnresolvedLocation::Resolved(Location::Circle { radius_m, .. }) = loc {
+        if let UnresolvedLocation::Resolved(Location::Circle { radius, .. }) = loc {
             // At 60°N, 1 degree longitude ≈ 55,800m (not 111,000m)
+            let radius_m = radius.0;
             assert!(
                 radius_m < 70_000.0,
                 "precision at 60°N should be well under 70km, got {radius_m}m"

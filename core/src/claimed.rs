@@ -60,5 +60,10 @@ mod tests {
         ]
     }
 
-    crate::bounded_lattice_laws!(lattice_laws, Claimed<u8>, arb_claimed_u8());
+    crate::lattice_laws!(
+        lattice_laws,
+        Claimed<u8>,
+        arb_claimed_u8(),
+        |a: &Claimed<u8>, b: &Claimed<u8>| a == b
+    );
 }

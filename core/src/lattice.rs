@@ -56,16 +56,30 @@ pub trait BoundedLattice: JoinSemilattice + MeetSemilattice {}
 
 impl<T: JoinSemilattice + MeetSemilattice> BoundedLattice for T {}
 
-/// Emit the bounded-lattice law suite for a type and a proptest strategy.
+/// The whole bounded-lattice law suite in one block, asserted up to `$eq`.
 ///
-/// `$ty` is the carrier; `$strat` is a `Strategy<Value = $ty>` expression
-/// invoked fresh per generator. The block names itself `$name`, so several
-/// instantiations coexist in one test module. Requires `$ty: BoundedLattice +
-/// Clone + Debug + PartialEq` and `proptest::prelude::*` in scope.
+/// One macro, one call per carrier — every law (meet/join
+/// commutativity·associativity·idempotence, the four ⊤/⊥ identities,
+/// absorption, distributivity, and `⊓-all ⊑ ⊔-all`) is asserted together, so a
+/// carrier can't silently skip a half.
+///
+/// `$eq` is an `impl Fn(&$ty, &$ty) -> bool`, the equivalence the laws are
+/// checked against. `|a, b| a == b` recovers exact structural equality; a
+/// denotational equivalence lets a carrier whose `meet`/`join` keep a symbolic
+/// shape (a disjoint meet kept as an intersection rather than collapsed) satisfy
+/// the absorption/distributivity laws it obeys only set-theoretically.
+///
+/// Contract: every non-structural `$eq` (a denotational oracle) must have a
+/// companion `*_discriminates` test proving it rejects genuinely different
+/// values, else the laws pass vacuously.
+///
+/// `$ty` is the carrier; `$strat` a `Strategy<Value = $ty>` invoked fresh per
+/// generator. The block names itself `$name`. Requires `$ty: BoundedLattice +
+/// Clone + Debug` and `proptest::prelude::*` in scope.
 #[cfg(test)]
 #[macro_export]
-macro_rules! bounded_lattice_laws {
-    ($name:ident, $ty:ty, $strat:expr) => {
+macro_rules! lattice_laws {
+    ($name:ident, $ty:ty, $strat:expr, $eq:expr) => {
         mod $name {
             use super::*;
             use $crate::lattice::{JoinSemilattice, MeetSemilattice};
@@ -73,65 +87,74 @@ macro_rules! bounded_lattice_laws {
             proptest! {
                 #[test]
                 fn meet_commutative(a in $strat, b in $strat) {
-                    prop_assert_eq!(a.meet(&b), b.meet(&a));
+                    let eq = $eq;
+                    prop_assert!(eq(&a.meet(&b), &b.meet(&a)));
                 }
 
                 #[test]
                 fn join_commutative(a in $strat, b in $strat) {
-                    prop_assert_eq!(a.join(&b), b.join(&a));
+                    let eq = $eq;
+                    prop_assert!(eq(&a.join(&b), &b.join(&a)));
                 }
 
                 #[test]
                 fn meet_associative(a in $strat, b in $strat, c in $strat) {
-                    prop_assert_eq!(a.meet(&b).meet(&c), a.meet(&b.meet(&c)));
+                    let eq = $eq;
+                    prop_assert!(eq(&a.meet(&b).meet(&c), &a.meet(&b.meet(&c))));
                 }
 
                 #[test]
                 fn join_associative(a in $strat, b in $strat, c in $strat) {
-                    prop_assert_eq!(a.join(&b).join(&c), a.join(&b.join(&c)));
+                    let eq = $eq;
+                    prop_assert!(eq(&a.join(&b).join(&c), &a.join(&b.join(&c))));
                 }
 
                 #[test]
                 fn meet_idempotent(a in $strat) {
-                    prop_assert_eq!(a.meet(&a), a.clone());
+                    let eq = $eq;
+                    prop_assert!(eq(&a.meet(&a), &a));
                 }
 
                 #[test]
                 fn join_idempotent(a in $strat) {
-                    prop_assert_eq!(a.join(&a), a.clone());
-                }
-
-                /// Absorption ties meet and join into one lattice.
-                #[test]
-                fn absorption(a in $strat, b in $strat) {
-                    prop_assert_eq!(a.meet(&a.join(&b)), a.clone());
-                    prop_assert_eq!(a.join(&a.meet(&b)), a.clone());
+                    let eq = $eq;
+                    prop_assert!(eq(&a.join(&a), &a));
                 }
 
                 /// ⊤ is the meet unit, ⊥ the join unit, and each is the other
                 /// op's absorbing element.
                 #[test]
                 fn bounded_identities(a in $strat) {
+                    let eq = $eq;
                     let top = <$ty as MeetSemilattice>::top();
                     let bottom = <$ty as JoinSemilattice>::bottom();
-                    prop_assert_eq!(a.meet(&top), a.clone());
-                    prop_assert_eq!(a.join(&bottom), a.clone());
-                    prop_assert_eq!(a.meet(&bottom), bottom.clone());
-                    prop_assert_eq!(a.join(&top), top);
+                    prop_assert!(eq(&a.meet(&top), &a));
+                    prop_assert!(eq(&a.join(&bottom), &a));
+                    prop_assert!(eq(&a.meet(&bottom), &bottom));
+                    prop_assert!(eq(&a.join(&top), &top));
+                }
+
+                /// Absorption ties meet and join into one lattice.
+                #[test]
+                fn absorption(a in $strat, b in $strat) {
+                    let eq = $eq;
+                    prop_assert!(eq(&a.meet(&a.join(&b)), &a));
+                    prop_assert!(eq(&a.join(&a.meet(&b)), &a));
                 }
 
                 /// Both lattices are distributive — meet distributes over join
                 /// and the dual.
                 #[test]
                 fn distributive(a in $strat, b in $strat, c in $strat) {
-                    prop_assert_eq!(
-                        a.meet(&b.join(&c)),
-                        a.meet(&b).join(&a.meet(&c)),
-                    );
-                    prop_assert_eq!(
-                        a.join(&b.meet(&c)),
-                        a.join(&b).meet(&a.join(&c)),
-                    );
+                    let eq = $eq;
+                    prop_assert!(eq(
+                        &a.meet(&b.join(&c)),
+                        &a.meet(&b).join(&a.meet(&c)),
+                    ));
+                    prop_assert!(eq(
+                        &a.join(&b.meet(&c)),
+                        &a.join(&b).meet(&a.join(&c)),
+                    ));
                 }
 
                 /// Over a nonempty sample, ⊓ of all sits below ⊔ of all, where
@@ -141,9 +164,10 @@ macro_rules! bounded_lattice_laws {
                 fn meet_all_below_join_all(
                     xs in prop::collection::vec($strat, 1..=6),
                 ) {
+                    let eq = $eq;
                     let m = <$ty as MeetSemilattice>::meet_all(xs.iter().cloned());
                     let j = <$ty as JoinSemilattice>::join_all(xs.iter().cloned());
-                    prop_assert_eq!(m.join(&j), j);
+                    prop_assert!(eq(&m.join(&j), &j));
                 }
             }
         }

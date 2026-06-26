@@ -12,8 +12,8 @@ use oxilangtag::LanguageTag;
 use chronoscope_core::ingestion::TestBundle;
 use chronoscope_core::{
     Cited, DateBound, DatePrecision, Entity, EntityName, EntityRelation, EntityRelationType,
-    EntityTransition, GeoPoint, Location, MoveMethod, NameType, UncertainDate, UnresolvedLocation,
-    Usage,
+    EntityTransition, GeoPoint, Location, Meters, MoveMethod, NameType, UncertainDate,
+    UnresolvedLocation, Usage,
 };
 
 type FixtureEntity = Entity<&'static str>;
@@ -66,7 +66,7 @@ fn lang(tag: &str) -> FixtureResult<LanguageTag<String>> {
 fn coords(lat: f64, lon: f64, radius_m: Option<f64>) -> FixtureResult<UnresolvedLocation> {
     let center = GeoPoint::new(lat, lon)?;
     let location = match radius_m {
-        Some(r) => Location::circle(center, r)?,
+        Some(r) => Location::circle(center, Meters(r))?,
         None => Location::point(center),
     };
     Ok(UnresolvedLocation::Resolved(location))

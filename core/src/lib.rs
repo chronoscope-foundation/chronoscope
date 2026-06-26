@@ -63,7 +63,7 @@ pub use evidence::{
     Cited, Evidence, ImageRegion, MaskDimensions, Polyline, PolylineError, RleMask, SourceDetail,
     SpatialGeometry, WikidataField,
 };
-pub use geo::{Bbox, BboxError, GeoPoint, GeoPointError};
+pub use geo::{Bbox, BboxError, GeoPoint, GeoPointError, Meters};
 pub use ids::{
     ExternalStringIdError, GeoNamesId, GettyTgnId, OhmId, OsmElementType, OsmId, TriggerEventId,
     WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
@@ -71,5 +71,7 @@ pub use ids::{
 pub use ingestion::{ImageSource, IngestionBundle, IngestionNotes, ReferenceError};
 pub use lattice::{BoundedLattice, JoinSemilattice, MeetSemilattice};
 pub use links::{ExternalLink, LinkTarget, LinkType};
-pub use location::{Distance, Location, LocationError, LocationReference, UnresolvedLocation};
+pub use location::{
+    ConflictStatus, Distance, Location, LocationError, LocationReference, UnresolvedLocation,
+};
 pub use moment::{Moment, TransitionRole, decompose, structural_edges, topological_order};

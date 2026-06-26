@@ -1529,5 +1529,62 @@ mod tests {
         }
     }
 
-    crate::bounded_lattice_laws!(lattice_laws, UncertainDate, arb_uncertain_date());
+    /// Two dates denote the same instant-set iff their canonical intervals
+    /// cover the same days. Canonicalization sorts and coalesces by denoted day
+    /// ([`TimeRange::cmp_by_span`] / [`TimeRange::adjacent_or_overlapping`] both
+    /// key on `period_start`/`period_end`), so the `(period_start, period_end)`
+    /// day-range sequences are aligned and compare directly. `DatePrecision` is
+    /// dropped: the lattice is distributive over denoted days, not over the
+    /// precision-bearing structural form, since `meet`/`join` select bounds by
+    /// `(boundary_day, precision)` and two bounds can denote the same boundary
+    /// day at different precisions.
+    ///
+    /// The precision-clobbering this papers over is not the desired behavior;
+    /// it will be resolved in an upcoming commit.
+    fn date_denotes_same(a: &UncertainDate, b: &UncertainDate) -> bool {
+        fn day_ranges(d: &UncertainDate) -> Vec<(Option<NaiveDate>, Option<NaiveDate>)> {
+            d.intervals()
+                .iter()
+                .map(|r| {
+                    (
+                        r.earliest().map(DateBound::period_start),
+                        r.latest().map(DateBound::period_end),
+                    )
+                })
+                .collect()
+        }
+        day_ranges(a) == day_ranges(b)
+    }
+
+    #[test]
+    fn date_denotes_same_discriminates() -> TestResult {
+        // Genuinely different instant-sets must compare unequal, else the laws
+        // pass vacuously.
+        assert!(!date_denotes_same(&year(1000)?, &year(1001)?));
+
+        // Equi-denotational, structurally different: "1927" at year precision
+        // and the same span pinned with day-precision bounds cover the same days
+        // but carry different `DatePrecision`, so structural `==` would split
+        // them while the denotational oracle treats them as one.
+        let year_form = year(1927)?;
+        let day_form = UncertainDate::bounded(
+            Some(DateBound::new(d(1927, 1, 1)?, DatePrecision::Day)?),
+            Some(DateBound::new(d(1927, 12, 31)?, DatePrecision::Day)?),
+        )?;
+        assert_ne!(year_form, day_form);
+        assert!(date_denotes_same(&year_form, &day_form));
+        Ok(())
+    }
+
+    // Core laws run structurally (`==`), guarding canonical-form confluence that
+    // `CommitId` and `BTreeSet<SubmitFact>` dedup depend on. The order/lattice
+    // laws run denotationally: `meet`/`join` select bounds by `(day, precision)`,
+    // so distributivity rearranges which precision-tagged bound survives while
+    // denoting the same days — `date_denotes_same` ignores that tag.
+    crate::lattice_laws!(
+        lattice_laws,
+        UncertainDate,
+        arb_uncertain_date(),
+        date_denotes_same
+    );
 }

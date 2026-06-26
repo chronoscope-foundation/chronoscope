@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8dd40b30989ab7543c41e0560e0bc7774df2471025c3b1d7850f793d5cb9d98f # shrinks to a = UncertainDate(CanonicalRanges([TimeRange { earliest: Some(DateBound { date: 1000-01-01, precision: Year }), latest: Some(DateBound { date: 1000-01-01, precision: Year }) }])), b = UncertainDate(CanonicalRanges([TimeRange { earliest: None, latest: Some(DateBound { date: 0901-01-01, precision: Century }) }])), c = UncertainDate(CanonicalRanges([TimeRange { earliest: None, latest: Some(DateBound { date: 0001-01-01, precision: Day }) }, TimeRange { earliest: Some(DateBound { date: 1001-01-01, precision: Century }), latest: Some(DateBound { date: 1001-01-01, precision: Century }) }]))

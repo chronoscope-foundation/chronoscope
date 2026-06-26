@@ -45,7 +45,16 @@ use crate::facts::store::{
     SubmitCommitInput, SubmitCommitOutput,
 };
 use crate::facts::{attribute, bookend, composites, depiction, event, image, map, picture};
-use crate::location::UnresolvedLocation;
+use crate::location::{ConflictStatus, Location, UnresolvedLocation};
+
+/// Sanity bound on the number of circles a stored location may name. A place is
+/// a handful of spots, not hundreds — like
+/// [`MAX_UNCERTAINTY_RADIUS`](crate::location::MAX_UNCERTAINTY_RADIUS) on a
+/// single circle's radius, this is an input-validation bound, here on the whole
+/// location's circle count. It bounds the cubic candidate-point cost of
+/// [`UnresolvedLocation::conflict_status`]'s emptiness check against adversarial
+/// input.
+pub const MAX_LOCATION_CIRCLES: usize = 100;
 
 // ============================================================================
 // commit_facts — end-to-end transaction-and-commit wrapper
@@ -519,7 +528,7 @@ fn run_cluster_rules<S>(
     rule_event_fact_kind_consistency::<S>(candidates, event_facts, errors);
     rule_name_window::<S>(candidates, errors);
     rule_single_interval_date::<S>(candidates, errors);
-    rule_no_empty_location::<S>(candidates, errors);
+    rule_location_validity::<S>(candidates, errors);
     rule_observation_depiction::<S>(candidates, image_facts, errors);
     rule_composite_self_parent::<S>(candidates, errors);
     rule_composite_multiple_parents::<S>(candidates, image_facts, errors);
@@ -862,21 +871,68 @@ fn for_each_external_source_date(
     }
 }
 
-/// Every stored location must name a place. The impossible location (⊥, an
-/// `Empty` reachable in the value) is rejected, the spatial parallel of
-/// [`rule_single_interval_date`]'s empty-interval guard — no source asserts a
-/// place that is nowhere. The total join produces ⊥ only as a read-side artifact,
-/// so it never reaches the wire from a well-formed submission.
-fn rule_no_empty_location<S: FactStore>(
+/// Every stored location must name a place that could exist, named by a bounded
+/// number of circles. Per location: count its circles first; if the count is
+/// over [`MAX_LOCATION_CIRCLES`] reject it as [`LocationTooComplex`] and stop —
+/// the emptiness check never runs on an over-cap location, so the cubic
+/// candidate-point cost stays bounded by the cap that guards it. Otherwise its
+/// [`conflict_status`](UnresolvedLocation::conflict_status) decides: a
+/// [`Conflict`](ConflictStatus::Conflict) location is rejected as
+/// [`EmptyLocation`] (the spatial parallel of [`rule_single_interval_date`]'s
+/// empty-interval guard — no source asserts a place that is nowhere, whether a
+/// syntactic ⊥ or a geometrically-disjoint conjunction), while a
+/// [`Pending`](ConflictStatus::Pending) or
+/// [`Consistent`](ConflictStatus::Consistent) one passes.
+///
+/// The cap counts the same circle leaves the emptiness check draws its
+/// candidate points from ([`UnresolvedLocation::conflict_status`] gathers caps
+/// over the permissive skeleton, whose circles are exactly this location's), so
+/// the bound measures the cost it guards.
+///
+/// [`LocationTooComplex`]: SubmitError::LocationTooComplex
+/// [`EmptyLocation`]: SubmitError::EmptyLocation
+fn rule_location_validity<S: FactStore>(
     candidates: &[StoredFactOf<S>],
     errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
 ) {
     for fact in candidates {
         for_each_stored_location(fact, &mut |role, location| {
-            if location.reaches_empty() {
+            let circles = circle_count(location);
+            if circles > MAX_LOCATION_CIRCLES {
+                errors.push(SubmitError::LocationTooComplex {
+                    role,
+                    circles,
+                    limit: MAX_LOCATION_CIRCLES,
+                });
+            } else if location.conflict_status() == ConflictStatus::Conflict {
                 errors.push(SubmitError::EmptyLocation { role });
             }
         });
+    }
+}
+
+/// The number of `Circle` leaves in an [`UnresolvedLocation`] — its resolved
+/// circles plus those reachable through the combinators. A `Reference` is one
+/// opaque place, not a circle, so it doesn't count. This is the same leaf set
+/// the emptiness check enumerates, so it bounds that check's cost exactly.
+fn circle_count(location: &UnresolvedLocation) -> usize {
+    match location {
+        UnresolvedLocation::Resolved(loc) => resolved_circle_count(loc),
+        UnresolvedLocation::Reference(_) => 0,
+        UnresolvedLocation::OneOf(entries) | UnresolvedLocation::AllOf(entries) => {
+            entries.as_slice().iter().map(circle_count).sum()
+        }
+    }
+}
+
+/// The number of `Circle` leaves in a resolved [`Location`].
+fn resolved_circle_count(location: &Location) -> usize {
+    match location {
+        Location::Empty | Location::Unbounded => 0,
+        Location::Circle { .. } => 1,
+        Location::OneOf { members } | Location::AllOf { members } => {
+            members.as_slice().iter().map(resolved_circle_count).sum()
+        }
     }
 }
 

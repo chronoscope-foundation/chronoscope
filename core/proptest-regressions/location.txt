@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c36a390705f095e41492a27e88d5fd117571266db0cae7e213015cc908f69c41 # shrinks to circles = [Circle { center: GeoPoint { lat: -0.017656037065034862, lon: 0.0 }, radius: Meters(3213.475254632335) }, Circle { center: GeoPoint { lat: 0.0, lon: 0.0 }, radius: Meters(3344.2581428494996) }, Circle { center: GeoPoint { lat: 0.029928438994871416, lon: -0.024922952378289114 }, radius: Meters(3059.758998197242) }]

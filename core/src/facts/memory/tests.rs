@@ -21,7 +21,8 @@ use crate::facts::submit::{
     CommitAuthor, DateRole, ImageRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError,
     commit_facts,
 };
-use crate::location::{LocationReference, UnresolvedLocation};
+use crate::geo::{GeoPoint, Meters};
+use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
 
 pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -2271,6 +2272,23 @@ fn construction_location_fact(entity_idx: usize) -> Result<SubmitFact, Box<dyn s
     })
 }
 
+/// A `Construction` bookend carrying an explicit location — the host for the
+/// geometric-emptiness guard tests.
+fn construction_with_location(
+    entity_idx: usize,
+    location: UnresolvedLocation,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: bookend::Fact::Location {
+                entity: EntityIdx(entity_idx),
+                location,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
 /// A `Name` fact with optional year-precision validity bounds.
 fn name_window_fact(
     entity_idx: usize,
@@ -2651,6 +2669,120 @@ async fn construction_location_accepted() -> TestResult {
     commit_ok(
         &store,
         local_bundle(1, 0, 0, 0, vec![construction_location_fact(0)?])?,
+    )
+    .await
+}
+
+/// A stored location that conjoins two far-apart resolved circles denotes
+/// nothing — its `conflict_status` is `Conflict` — and is rejected as an empty
+/// location, the geometric extension of the bare-`Empty` guard.
+#[tokio::test]
+async fn disjoint_conjunction_location_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    let paris = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(48.8566, 2.3522)?,
+        Meters(1000.0),
+    )?);
+    let tokyo = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(35.6762, 139.6503)?,
+        Meters(1000.0),
+    )?);
+    let disjoint = UnresolvedLocation::all_of(vec![paris, tokyo])?;
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, disjoint)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EmptyLocation { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A stored location conjoining a circle with an unresolved reference is
+/// `Pending` — its emptiness can't be decided before the reference resolves — so
+/// the guard accepts it.
+#[tokio::test]
+async fn pending_conjunction_location_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let circle = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(40.0, -74.0)?,
+        Meters(1000.0),
+    )?);
+    let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+        name: "Paris".to_owned(),
+    });
+    let pending = UnresolvedLocation::all_of(vec![circle, reference])?;
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, pending)?])?,
+    )
+    .await
+}
+
+/// A stored location conjoining two overlapping resolved circles is
+/// `Consistent` and accepted.
+#[tokio::test]
+async fn consistent_conjunction_location_accepted() -> TestResult {
+    let store = MemoryFactStore::new();
+    let a = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(40.0, -74.0)?,
+        Meters(5000.0),
+    )?);
+    let b = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(40.005, -74.0)?,
+        Meters(5000.0),
+    )?);
+    let consistent = UnresolvedLocation::all_of(vec![a, b])?;
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, consistent)?])?,
+    )
+    .await
+}
+
+/// A resolved `OneOf` of `n` distinct-center, equal-radius circles — none
+/// subsumes another, so the union keeps every circle and the leaf count is
+/// exactly `n`. Centers step along a meridian by 0.01° (~1.1 km), well clear of
+/// the 1 m radii, so the disjoint members never collapse.
+fn n_circle_location(n: usize) -> Result<UnresolvedLocation, Box<dyn std::error::Error>> {
+    let mut circles = Vec::with_capacity(n);
+    for i in 0..n {
+        let lon = -120.0 + i as f64 * 0.01;
+        circles.push(Location::circle(GeoPoint::new(0.0, lon)?, Meters(1.0))?);
+    }
+    Ok(UnresolvedLocation::Resolved(Location::one_of(circles)?))
+}
+
+/// A stored location naming more than `MAX_LOCATION_CIRCLES` circles is rejected;
+/// one exactly at the cap commits. The bound guards the emptiness check's
+/// candidate-point cost against machine-generated junk.
+#[tokio::test]
+async fn over_complex_location_rejected_at_cap_accepted() -> TestResult {
+    use crate::facts::submit::pipeline::MAX_LOCATION_CIRCLES;
+
+    let store = MemoryFactStore::new();
+    let over = n_circle_location(MAX_LOCATION_CIRCLES + 1)?;
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, over)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::LocationTooComplex { circles, limit, .. }
+                if *circles == MAX_LOCATION_CIRCLES + 1 && *limit == MAX_LOCATION_CIRCLES
+        )),
+        "got {errs:?}"
+    );
+
+    let at_cap = n_circle_location(MAX_LOCATION_CIRCLES)?;
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, at_cap)?])?,
     )
     .await
 }
