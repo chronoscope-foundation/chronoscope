@@ -203,6 +203,16 @@ impl<EntId: Ord> Fact<EntId> {
 }
 
 impl<EntId: Ord> Fact<EntId> {
+    /// The entity this fact is a claim about. A relationship's subject is the
+    /// directed pair's source (`from`); the projected relation slot keys off the
+    /// target, but the fact belongs to the source entity.
+    pub fn subject(&self) -> &EntId {
+        match self {
+            Self::Name { entity, .. } | Self::ExternalReference { entity, .. } => entity,
+            Self::Relationship { pair, .. } => pair.from(),
+        }
+    }
+
     /// Visit every entity id this fact mentions.
     pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId)) {
         match self {

@@ -113,6 +113,15 @@ pub enum Fact<EntId> {
 }
 
 impl<EntId> Fact<EntId> {
+    /// The entity this bookend fact is a claim about.
+    pub fn subject(&self) -> &EntId {
+        match self {
+            Self::Started { entity, .. }
+            | Self::Completed { entity, .. }
+            | Self::Location { entity, .. } => entity,
+        }
+    }
+
     /// Visit the single entity id this fact mentions.
     pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId)) {
         match self {

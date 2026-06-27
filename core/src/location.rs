@@ -5,13 +5,13 @@
 //! - [`Location`] — resolved geometry (circles, unions, the empty location, the
 //!   unbounded one). A bounded join lattice: `Empty` (⊥) and `Unbounded` (⊤)
 //!   bracket it, `one_of` is the join, and its
-//!   [`JoinSemilattice`](crate::lattice::JoinSemilattice) impl folds a stream
+//!   [`JoinSemilattice`](crate::algebra::lattice::JoinSemilattice) impl folds a stream
 //!   into a canonical union. The constructors canonicalize — flattening nested
 //!   unions and dropping a member a sibling subsumes.
 //! - [`UnresolvedLocation`] — may contain symbolic [`LocationReference`]s that
 //!   need external resolution (geocoding, OSM lookup, etc.). It carries the same
 //!   join one level up via [`UnresolvedLocation::one_of`] and its own
-//!   [`JoinSemilattice`](crate::lattice::JoinSemilattice) impl.
+//!   [`JoinSemilattice`](crate::algebra::lattice::JoinSemilattice) impl.
 //! - [`LocationReference`] — a symbolic pointer to a location in an external
 //!   system (OSM, OHM, named place, address, or "near" any of these).
 //!
@@ -175,7 +175,7 @@ pub use canonical::Members;
 /// No external references — purely geometric. A bounded join lattice:
 /// [`Empty`](Self::Empty) (⊥) and [`Unbounded`](Self::Unbounded) (⊤) bracket it,
 /// [`one_of`](Self::one_of) joins by union-with-subsumption, and the
-/// [`JoinSemilattice`](crate::lattice::JoinSemilattice) impl folds a stream to
+/// [`JoinSemilattice`](crate::algebra::lattice::JoinSemilattice) impl folds a stream to
 /// the canonical join.
 ///
 /// `Eq`/`Ord`/`Hash` are hand-implemented because the `Circle` variant carries
@@ -559,6 +559,17 @@ impl Location {
             }
         }
     }
+
+    /// The number of `Circle` leaves this geometry holds.
+    pub(crate) fn circle_count(&self) -> usize {
+        match self {
+            Self::Empty | Self::Unbounded => 0,
+            Self::Circle { .. } => 1,
+            Self::OneOf { members } | Self::AllOf { members } => {
+                members.as_slice().iter().map(Self::circle_count).sum()
+            }
+        }
+    }
 }
 
 /// Whether a resolved or unresolved location's geometry is decidably empty,
@@ -566,37 +577,49 @@ impl Location {
 ///
 /// Defined here as `denotes_empty`'s first consumer; downstream layers that
 /// classify a location's resolution status can share it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The `Ord` derive ranks the verdicts `Consistent < Pending < Conflict`, so
+/// `a.max(b)` is the worse of two — a product field's conflict is the max over
+/// its parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConflictStatus {
     /// Fully resolved and denotes a non-empty region. `Consistent` implies fully
     /// resolved — `conflict_status` returns `Pending` while any reference
     /// remains.
     Consistent,
+    /// An unresolved reference remains; resolution could still empty it.
+    Pending,
     /// The most-permissive resolution is already empty — no resolution rescues
     /// it.
     Conflict,
-    /// An unresolved reference remains; resolution could still empty it.
-    Pending,
 }
 
 /// The join half of the resolved location lattice. ⊥ is [`Empty`](Location::Empty);
 /// the join unions and canonicalizes, so `Unbounded` (⊤) absorbs the union and
 /// `Empty` drops out through the subsumption pass. Canonicalization is confluent
-/// and idempotent, so the default [`join_all`](crate::lattice::JoinSemilattice::join_all)
+/// and idempotent, so the default [`join_all`](crate::algebra::lattice::JoinSemilattice::join_all)
 /// fold yields the same canonical [`OneOf`](Location::OneOf) as collecting and
 /// canonicalizing in one pass: a singleton folds to itself, ≥2 to their union.
-impl crate::lattice::JoinSemilattice for Location {
-    fn bottom() -> Self {
+impl crate::algebra::monoid::CommutativeMonoid for Location {
+    fn identity() -> Self {
         Self::Empty
     }
 
-    fn join(&self, other: &Self) -> Self {
-        resolved::one_of_from_members(resolved::canonical_one_of(vec![
-            self.clone(),
-            other.clone(),
-        ]))
+    fn combine(self, other: Self) -> Self {
+        // ⊥ (`Empty`) is the join identity: both operands are canonical by
+        // construction, so return the other untouched rather than re-running
+        // the union canonicalizer.
+        match (self, other) {
+            (Self::Empty, other) => other,
+            (one, Self::Empty) => one,
+            (one, other) => {
+                resolved::one_of_from_members(resolved::canonical_one_of(vec![one, other]))
+            }
+        }
     }
 }
+
+impl crate::algebra::lattice::JoinSemilattice for Location {}
 
 /// The meet half of the resolved location lattice, the dual of the join above.
 /// ⊤ is [`Unbounded`](Location::Unbounded); the meet intersects and
@@ -604,18 +627,24 @@ impl crate::lattice::JoinSemilattice for Location {
 /// drops out as the meet identity. Two disjoint shapes stay a symbolic
 /// [`AllOf`](Location::AllOf); detecting that such a region is actually empty is
 /// a separate concern. Canonicalization is confluent and idempotent, so the
-/// default [`meet_all`](crate::lattice::MeetSemilattice::meet_all) fold matches a
+/// default [`meet_all`](crate::algebra::lattice::MeetSemilattice::meet_all) fold matches a
 /// one-pass intersect-and-canonicalize.
-impl crate::lattice::MeetSemilattice for Location {
+impl crate::algebra::lattice::MeetSemilattice for Location {
     fn top() -> Self {
         Self::Unbounded
     }
 
-    fn meet(&self, other: &Self) -> Self {
-        resolved::all_of_from_members(resolved::canonical_all_of(vec![
-            self.clone(),
-            other.clone(),
-        ]))
+    fn meet(self, other: Self) -> Self {
+        // ⊤ (`Unbounded`) is the meet identity: both operands are canonical by
+        // construction, so return the other untouched rather than re-running
+        // the intersection canonicalizer.
+        match (self, other) {
+            (Self::Unbounded, other) => other,
+            (one, Self::Unbounded) => one,
+            (one, other) => {
+                resolved::all_of_from_members(resolved::canonical_all_of(vec![one, other]))
+            }
+        }
     }
 }
 
@@ -824,6 +853,20 @@ impl UnresolvedLocation {
         }
     }
 
+    /// The number of `Circle` leaves reachable through the combinators. A
+    /// `Reference` is one opaque place, not a circle, so it counts zero. This is
+    /// the same leaf set the emptiness check enumerates, so it bounds that
+    /// check's `O(m²·|expr|)` cost.
+    pub(crate) fn circle_count(&self) -> usize {
+        match self {
+            Self::Resolved(loc) => loc.circle_count(),
+            Self::Reference(_) => 0,
+            Self::OneOf(entries) | Self::AllOf(entries) => {
+                entries.as_slice().iter().map(Self::circle_count).sum()
+            }
+        }
+    }
+
     /// The most-permissive resolved skeleton: every `Reference` becomes ⊤
     /// ([`Location::Unbounded`]), `Resolved` keeps its geometry, `OneOf` maps to
     /// a union and `AllOf` to an intersection. Built through the canonical
@@ -860,23 +903,34 @@ impl UnresolvedLocation {
 /// `Resolved(Unbounded)` (⊤) absorb the disjunction. References stay symbolic —
 /// no containment collapse runs, only the `OneOf` flatten/sort/dedup. The
 /// canonicalization is confluent and idempotent, so the default
-/// [`join_all`](crate::lattice::JoinSemilattice::join_all) fold yields the same
+/// [`join_all`](crate::algebra::lattice::JoinSemilattice::join_all) fold yields the same
 /// canonical [`OneOf`](UnresolvedLocation::OneOf) as a one-pass collect: a
 /// singleton folds to itself, ≥2 to their disjunction.
-impl crate::lattice::JoinSemilattice for UnresolvedLocation {
-    fn bottom() -> Self {
+impl crate::algebra::monoid::CommutativeMonoid for UnresolvedLocation {
+    fn identity() -> Self {
         Self::Resolved(Location::Empty)
     }
 
-    fn join(&self, other: &Self) -> Self {
-        let mut entries = unresolved::canonical_one_of(vec![self.clone(), other.clone()]);
+    fn combine(self, other: Self) -> Self {
+        // ⊥ (`Resolved(Empty)`) is the join identity: both operands are
+        // canonical by construction, so return the other untouched rather than
+        // re-running the disjunction canonicalizer.
+        if matches!(self, Self::Resolved(Location::Empty)) {
+            return other;
+        }
+        if matches!(other, Self::Resolved(Location::Empty)) {
+            return self;
+        }
+        let mut entries = unresolved::canonical_one_of(vec![self, other]);
         match entries.len() {
-            0 => Self::bottom(),
+            0 => Self::identity(),
             1 => entries.remove(0),
             _ => Self::OneOf(Members::canonicalize(entries, unresolved::canonical_one_of)),
         }
     }
 }
+
+impl crate::algebra::lattice::JoinSemilattice for UnresolvedLocation {}
 
 /// The meet half of the unresolved location lattice, the dual of the join above.
 /// ⊤ is `Resolved(Unbounded)`; the meet conjoins and canonicalizes, so the
@@ -884,15 +938,24 @@ impl crate::lattice::JoinSemilattice for UnresolvedLocation {
 /// identity and lets a `Resolved(Empty)` (⊥) absorb the conjunction. References
 /// stay symbolic — no containment collapse, only the `AllOf` flatten/sort/dedup.
 /// Confluent and idempotent, so the default
-/// [`meet_all`](crate::lattice::MeetSemilattice::meet_all) fold matches a
+/// [`meet_all`](crate::algebra::lattice::MeetSemilattice::meet_all) fold matches a
 /// one-pass collect.
-impl crate::lattice::MeetSemilattice for UnresolvedLocation {
+impl crate::algebra::lattice::MeetSemilattice for UnresolvedLocation {
     fn top() -> Self {
         Self::Resolved(Location::Unbounded)
     }
 
-    fn meet(&self, other: &Self) -> Self {
-        let mut entries = unresolved::canonical_all_of(vec![self.clone(), other.clone()]);
+    fn meet(self, other: Self) -> Self {
+        // ⊤ (`Resolved(Unbounded)`) is the meet identity: both operands are
+        // canonical by construction, so return the other untouched rather than
+        // re-running the conjunction canonicalizer.
+        if matches!(self, Self::Resolved(Location::Unbounded)) {
+            return other;
+        }
+        if matches!(other, Self::Resolved(Location::Unbounded)) {
+            return self;
+        }
+        let mut entries = unresolved::canonical_all_of(vec![self, other]);
         match entries.len() {
             0 => Self::top(),
             1 => entries.remove(0),
@@ -1328,26 +1391,26 @@ mod tests {
 
     #[test]
     fn one_of_join_with_unbounded_collapses_to_unbounded() {
-        use crate::lattice::JoinSemilattice;
+        use crate::algebra::lattice::JoinSemilattice;
         // ⊤ absorbs the disjunction: joining a symbolic reference with
         // `Resolved(Unbounded)` leaves just ⊤, even unresolved.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
             name: "Paris".to_string(),
         });
         let top = UnresolvedLocation::Resolved(Location::Unbounded);
-        assert_eq!(paris.join(&top), top);
+        assert_eq!(paris.join(top.clone()), top);
     }
 
     #[test]
     fn one_of_join_drops_empty_entry() {
-        use crate::lattice::JoinSemilattice;
+        use crate::algebra::lattice::JoinSemilattice;
         // ⊥ is the join identity: joining a reference with `Resolved(Empty)`
         // drops the empty entry, leaving the reference alone.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
             name: "Paris".to_string(),
         });
         let bottom = UnresolvedLocation::Resolved(Location::Empty);
-        assert_eq!(paris.join(&bottom), paris);
+        assert_eq!(paris.clone().join(bottom), paris);
     }
 
     // --- canonicalization property tests ---
@@ -1411,7 +1474,7 @@ mod tests {
 
     #[test]
     fn all_of_drops_container_keeps_contained() -> TestResult {
-        use crate::lattice::MeetSemilattice;
+        use crate::algebra::lattice::MeetSemilattice;
         // A big circle around a small one at the same center is redundant in an
         // intersection — the small one is the tighter constraint, so the big
         // one drops and the meet collapses to the small circle alone.
@@ -1422,7 +1485,9 @@ mod tests {
         assert!(matches!(result, Err(LocationError::TooFewEntries { .. })));
         // Through the lattice meet, the same collapse yields the lone survivor.
         assert_eq!(
-            small.meet(&Location::circle(gp(0.0, 0.0)?, Meters(90_000.0))?),
+            small
+                .clone()
+                .meet(Location::circle(gp(0.0, 0.0)?, Meters(90_000.0))?),
             small
         );
         Ok(())
@@ -1430,28 +1495,28 @@ mod tests {
 
     #[test]
     fn meet_unbounded_is_identity() -> TestResult {
-        use crate::lattice::MeetSemilattice;
+        use crate::algebra::lattice::MeetSemilattice;
         let c = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
-        assert_eq!(c.meet(&Location::Unbounded), c);
+        assert_eq!(c.clone().meet(Location::Unbounded), c);
         Ok(())
     }
 
     #[test]
     fn meet_empty_is_empty() -> TestResult {
-        use crate::lattice::MeetSemilattice;
+        use crate::algebra::lattice::MeetSemilattice;
         let c = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
-        assert_eq!(c.meet(&Location::Empty), Location::Empty);
+        assert_eq!(c.meet(Location::Empty), Location::Empty);
         Ok(())
     }
 
     #[test]
     fn meet_disjoint_circles_stays_symbolic() -> TestResult {
-        use crate::lattice::MeetSemilattice;
+        use crate::algebra::lattice::MeetSemilattice;
         // Two far-apart circles meet to a symbolic `AllOf`; recognizing that the
         // region is actually empty is a separate concern.
         let paris = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
         let tokyo = Location::circle(gp(35.6, 139.7)?, Meters(10.0))?;
-        let meet = paris.meet(&tokyo);
+        let meet = paris.meet(tokyo);
         assert!(matches!(meet, Location::AllOf { ref members } if members.len() == 2));
         Ok(())
     }
@@ -1511,26 +1576,26 @@ mod tests {
 
     #[test]
     fn all_of_meet_with_empty_collapses_to_empty() {
-        use crate::lattice::MeetSemilattice;
+        use crate::algebra::lattice::MeetSemilattice;
         // ⊥ absorbs the conjunction: meeting a reference with `Resolved(Empty)`
         // leaves just ⊥, even unresolved — the dual of `OneOf` ⊤-absorption.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
             name: "Paris".to_string(),
         });
         let bottom = UnresolvedLocation::Resolved(Location::Empty);
-        assert_eq!(paris.meet(&bottom), bottom);
+        assert_eq!(paris.meet(bottom.clone()), bottom);
     }
 
     #[test]
     fn all_of_meet_drops_unbounded_entry() {
-        use crate::lattice::MeetSemilattice;
+        use crate::algebra::lattice::MeetSemilattice;
         // ⊤ is the meet identity: meeting a reference with `Resolved(Unbounded)`
         // drops the unbounded entry, leaving the reference alone.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
             name: "Paris".to_string(),
         });
         let top = UnresolvedLocation::Resolved(Location::Unbounded);
-        assert_eq!(paris.meet(&top), paris);
+        assert_eq!(paris.clone().meet(top), paris);
     }
 
     // --- Lattice law harness ---

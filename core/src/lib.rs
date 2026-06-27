@@ -34,6 +34,7 @@ const _: () = assert!(
     "CHRONOSCOPE_BUILD_VERSION must not be set to an empty string"
 );
 
+pub mod algebra;
 pub mod annotation;
 pub mod claimed;
 pub mod consistency;
@@ -44,13 +45,14 @@ pub mod facts;
 pub mod geo;
 pub mod ids;
 pub mod ingestion;
-pub mod lattice;
 pub mod links;
 pub mod location;
 pub mod merge;
 pub mod moment;
 pub mod nonempty;
 
+pub use algebra::lattice::{BoundedLattice, JoinSemilattice, MeetSemilattice};
+pub use algebra::monoid::CommutativeMonoid;
 pub use annotation::{Annotation, AnnotationKind};
 pub use claimed::Claimed;
 pub use consistency::ConsistencyWarning;
@@ -69,7 +71,6 @@ pub use ids::{
     WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
 };
 pub use ingestion::{ImageSource, IngestionBundle, IngestionNotes, ReferenceError};
-pub use lattice::{BoundedLattice, JoinSemilattice, MeetSemilattice};
 pub use links::{ExternalLink, LinkTarget, LinkType};
 pub use location::{
     ConflictStatus, Distance, Location, LocationError, LocationReference, UnresolvedLocation,

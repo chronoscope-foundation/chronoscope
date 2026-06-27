@@ -553,6 +553,19 @@ impl UncertainDate {
         !self.meet(other).intervals().is_empty()
     }
 
+    /// Whether this is ⊤ ([`unknown`](Self::unknown)) — the single
+    /// fully-unbounded interval. The meet identity.
+    fn is_unknown(&self) -> bool {
+        self.as_single_interval()
+            .is_some_and(|r| r.earliest().is_none() && r.latest().is_none())
+    }
+
+    /// Whether this is ⊥ ([`empty`](Self::empty)) — the empty union. The join
+    /// identity.
+    fn is_empty(&self) -> bool {
+        self.intervals().is_empty()
+    }
+
     /// Set intersection — meet in the lattice. Total: contradictory claims
     /// intersect to [`empty`](Self::empty) (⊥).
     ///
@@ -560,6 +573,14 @@ impl UncertainDate {
     /// then canonicalizes. `unknown()` (⊤) is the identity: `a ∧ unknown() == a`.
     /// Selects bounds from the inputs — never manufactures new `DateBound`s.
     pub fn meet(&self, other: &Self) -> Self {
+        // ⊤ (`unknown`) is the meet identity: the other operand is already
+        // canonical, so return it untouched rather than re-canonicalizing.
+        if self.is_unknown() {
+            return other.clone();
+        }
+        if other.is_unknown() {
+            return self.clone();
+        }
         let mut pieces = Vec::new();
         for a in self.intervals() {
             for b in other.intervals() {
@@ -578,6 +599,14 @@ impl UncertainDate {
     /// overlapping or adjacent intervals merge. `empty()` (⊥) is the identity:
     /// `a ∨ empty() == a`. Selects bounds from the inputs.
     pub fn join(&self, other: &Self) -> Self {
+        // ⊥ (`empty`) is the join identity: the other operand is already
+        // canonical, so return it untouched rather than re-canonicalizing.
+        if self.is_empty() {
+            return other.clone();
+        }
+        if other.is_empty() {
+            return self.clone();
+        }
         let mut pieces = self.intervals().to_vec();
         pieces.extend_from_slice(other.intervals());
         Self::from_ranges(pieces)
@@ -587,25 +616,27 @@ impl UncertainDate {
 /// The join half of the date lattice. The fold seeds from ⊥
 /// ([`empty`](Self::empty)), so a real bound is never poisoned — seeding from
 /// ⊤ (`unknown`) would absorb every disjunct.
-impl crate::lattice::JoinSemilattice for UncertainDate {
-    fn bottom() -> Self {
+impl crate::algebra::monoid::CommutativeMonoid for UncertainDate {
+    fn identity() -> Self {
         Self::empty()
     }
 
-    fn join(&self, other: &Self) -> Self {
-        UncertainDate::join(self, other)
+    fn combine(self, other: Self) -> Self {
+        UncertainDate::join(&self, &other)
     }
 }
 
+impl crate::algebra::lattice::JoinSemilattice for UncertainDate {}
+
 /// The meet half of the date lattice. ⊤ is `unknown()`, the meet identity;
 /// `meet` delegates to the inherent intersection.
-impl crate::lattice::MeetSemilattice for UncertainDate {
+impl crate::algebra::lattice::MeetSemilattice for UncertainDate {
     fn top() -> Self {
         Self::unknown()
     }
 
-    fn meet(&self, other: &Self) -> Self {
-        UncertainDate::meet(self, other)
+    fn meet(self, other: Self) -> Self {
+        UncertainDate::meet(&self, &other)
     }
 }
 
@@ -826,7 +857,7 @@ fn precision_end(date: NaiveDate, precision: DatePrecision) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lattice::{JoinSemilattice, MeetSemilattice};
+    use crate::algebra::lattice::{JoinSemilattice, MeetSemilattice};
     use proptest::prelude::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1098,7 +1129,7 @@ mod tests {
 
     #[test]
     fn meet_disjoint_is_empty() -> TestResult {
-        let result = year(1920)?.meet(&year(1950)?);
+        let result = year(1920)?.meet(year(1950)?);
         assert_eq!(result, UncertainDate::empty());
         assert_eq!(result.earliest(), None);
         assert_eq!(result.latest(), None);
@@ -1107,7 +1138,7 @@ mod tests {
 
     #[test]
     fn meet_overlapping_returns_intersection() -> TestResult {
-        let result = decade(1920)?.meet(&year(1925)?);
+        let result = decade(1920)?.meet(year(1925)?);
         assert_eq!(result.earliest(), Some(d(1925, 1, 1)?));
         assert_eq!(result.latest(), Some(d(1925, 12, 31)?));
         Ok(())
@@ -1124,7 +1155,7 @@ mod tests {
             Some(DateBound::new(d(1940, 1, 1)?, DatePrecision::Year)?),
             None,
         )?;
-        let result = before.meet(&after);
+        let result = before.meet(after);
         assert_eq!(result.earliest(), Some(d(1940, 1, 1)?));
         assert_eq!(result.latest(), Some(d(1950, 12, 31)?));
         Ok(())
@@ -1141,7 +1172,7 @@ mod tests {
             Some(DateBound::new(d(1950, 1, 1)?, DatePrecision::Year)?),
             None,
         )?;
-        assert_eq!(before.meet(&after), UncertainDate::empty());
+        assert_eq!(before.meet(after), UncertainDate::empty());
         Ok(())
     }
 
@@ -1149,7 +1180,7 @@ mod tests {
     fn join_disjoint_stays_disjoint() -> TestResult {
         // "the 1920s" ∨ "1935" keeps two intervals — no invented gap. An
         // envelope hull would collapse to [1920, 1935] and swallow 1930-1934.
-        let result = decade(1920)?.join(&year(1935)?);
+        let result = decade(1920)?.join(year(1935)?);
         assert_eq!(result.intervals().len(), 2);
         assert_eq!(result.earliest(), Some(d(1920, 1, 1)?));
         assert_eq!(result.latest(), Some(d(1935, 12, 31)?));
@@ -1159,7 +1190,7 @@ mod tests {
     #[test]
     fn join_adjacent_years_merge() -> TestResult {
         // 1929 and 1930 touch at the 1929-12-31 / 1930-01-01 boundary.
-        let result = year(1929)?.join(&year(1930)?);
+        let result = year(1929)?.join(year(1930)?);
         assert_eq!(result.intervals().len(), 1);
         assert_eq!(result.earliest(), Some(d(1929, 1, 1)?));
         assert_eq!(result.latest(), Some(d(1930, 12, 31)?));
@@ -1169,7 +1200,7 @@ mod tests {
     #[test]
     fn join_adjacent_decades_merge() -> TestResult {
         // The 1920s end 1929-12-31, the 1930s start 1930-01-01 — contiguous.
-        let result = decade(1920)?.join(&decade(1930)?);
+        let result = decade(1920)?.join(decade(1930)?);
         assert_eq!(result.intervals().len(), 1);
         assert_eq!(result.earliest(), Some(d(1920, 1, 1)?));
         assert_eq!(result.latest(), Some(d(1939, 12, 31)?));
@@ -1179,7 +1210,7 @@ mod tests {
     #[test]
     fn join_gapped_decades_stay_disjoint() -> TestResult {
         // A whole decade sits between the 1920s and the 1940s.
-        let result = decade(1920)?.join(&decade(1940)?);
+        let result = decade(1920)?.join(decade(1940)?);
         assert_eq!(result.intervals().len(), 2);
         Ok(())
     }
@@ -1187,7 +1218,7 @@ mod tests {
     #[test]
     fn join_overlapping_merges() -> TestResult {
         // "the 1920s" ∨ "1925" — 1925 sits inside, so the result is one interval.
-        let result = decade(1920)?.join(&year(1925)?);
+        let result = decade(1920)?.join(year(1925)?);
         assert_eq!(result.intervals().len(), 1);
         assert_eq!(result.earliest(), Some(d(1920, 1, 1)?));
         assert_eq!(result.latest(), Some(d(1929, 12, 31)?));
@@ -1196,7 +1227,7 @@ mod tests {
 
     #[test]
     fn join_unknown_absorbs() -> TestResult {
-        let result = year(1920)?.join(&UncertainDate::unknown());
+        let result = year(1920)?.join(UncertainDate::unknown());
         assert_eq!(result, UncertainDate::unknown());
         Ok(())
     }
@@ -1204,9 +1235,9 @@ mod tests {
     #[test]
     fn meet_of_disjunction_intersects_each_piece() -> TestResult {
         // {1920, 1940} ∧ "the 1920s" keeps only the 1920 piece.
-        let disjunction = year(1920)?.join(&year(1940)?);
+        let disjunction = year(1920)?.join(year(1940)?);
         assert_eq!(disjunction.intervals().len(), 2);
-        let result = disjunction.meet(&decade(1920)?);
+        let result = disjunction.meet(decade(1920)?);
         assert_eq!(result.intervals().len(), 1);
         assert_eq!(result.earliest(), Some(d(1920, 1, 1)?));
         assert_eq!(result.latest(), Some(d(1920, 12, 31)?));
@@ -1254,7 +1285,7 @@ mod tests {
         assert!(year(1920)?.as_single_interval().is_some());
         assert!(UncertainDate::unknown().as_single_interval().is_some());
         assert!(UncertainDate::empty().as_single_interval().is_none());
-        let disjunction = year(1920)?.join(&year(1940)?);
+        let disjunction = year(1920)?.join(year(1940)?);
         assert!(disjunction.as_single_interval().is_none());
         Ok(())
     }
@@ -1282,7 +1313,7 @@ mod tests {
 
     #[test]
     fn disjunction_serializes_one_of() -> TestResult {
-        let disjunction = year(1920)?.join(&year(1940)?);
+        let disjunction = year(1920)?.join(year(1940)?);
         let json = serde_json::to_string(&disjunction)?;
         assert!(json.starts_with(r#"{"one_of":["#), "got {json}");
         let back: UncertainDate = serde_json::from_str(&json)?;
@@ -1305,7 +1336,7 @@ mod tests {
         // single merged interval on the way in.
         let json = r#"{"one_of":[{"earliest":{"date":"1930-01-01","precision":"year"},"latest":{"date":"1930-01-01","precision":"year"}},{"earliest":{"date":"1929-01-01","precision":"year"},"latest":{"date":"1929-01-01","precision":"year"}}]}"#;
         let date: UncertainDate = serde_json::from_str(json)?;
-        assert_eq!(date, year(1929)?.join(&year(1930)?));
+        assert_eq!(date, year(1929)?.join(year(1930)?));
         assert_eq!(date.intervals().len(), 1);
         Ok(())
     }
@@ -1484,8 +1515,8 @@ mod tests {
             a in arb_uncertain_date(),
             b in arb_uncertain_date(),
         ) {
-            prop_assert!(is_canonical(&a.meet(&b)));
-            prop_assert!(is_canonical(&a.join(&b)));
+            prop_assert!(is_canonical(&UncertainDate::meet(&a, &b)));
+            prop_assert!(is_canonical(&UncertainDate::join(&a, &b)));
         }
 
         #[test]
@@ -1493,7 +1524,10 @@ mod tests {
             a in arb_uncertain_date(),
             b in arb_uncertain_date(),
         ) {
-            prop_assert_eq!(a.overlaps(&b), a.meet(&b) != UncertainDate::empty());
+            prop_assert_eq!(
+                a.overlaps(&b),
+                UncertainDate::meet(&a, &b) != UncertainDate::empty()
+            );
         }
 
         /// Canonicalization is confluent: the same multiset of intervals in any

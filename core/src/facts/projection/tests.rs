@@ -5,6 +5,7 @@ use chrono::TimeZone;
 use url::Url;
 
 use super::*;
+use crate::claimed::Claimed;
 use crate::date::{DatePrecision, UncertainDate};
 use crate::facts::assertions::{
     FactualAssertion, JudgmentAssertion, MetaAssertion, RetractionReason,
@@ -15,9 +16,12 @@ use crate::facts::citations::{
     Excerpt, ExternalReference, ExternalSource, FactualCitation, JudgmentSource, Justification,
     Language, MetaSource,
 };
-use crate::facts::identity;
+use crate::facts::event;
+use crate::facts::identity::{self, OrderedDistinctPair};
 use crate::facts::ids::{FactId, UserId};
-use crate::facts::lifecycle::{LifetimeEventKind, PointKind};
+use crate::facts::lifecycle::{
+    DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, PointKind,
+};
 use crate::facts::memory::{MemoryEntityId, MemoryFactStore};
 use crate::facts::schema::{FactPage, PageItem};
 use crate::facts::store::FactStore;
@@ -25,11 +29,13 @@ use crate::facts::submit::{
     Commit as SubmitBundle, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, StoredFact,
     SubmitFact, commit_facts,
 };
+use crate::location::ConflictStatus;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type MemEntId = <MemoryFactStore as FactStore>::EntityId;
 type MemEvtId = <MemoryFactStore as FactStore>::EventId;
 type MemImgId = <MemoryFactStore as FactStore>::ImageId;
+type Lin = MemberLineage<MemEntId, MemImgId>;
 
 fn fixed_time() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc
@@ -178,8 +184,20 @@ async fn submit(
         .map_err(|e| format!("{e:?}").into())
 }
 
+/// Look up a name entry's value record by language, for assertions that don't
+/// care about the full key.
+fn name_by_language<'e>(
+    entity: &'e ProjectedEntity<MemEntId, MemEvtId, Lin>,
+    language: &str,
+) -> Option<(&'e NameKey, &'e Cited<NameRecord<Lin>, Lin>)> {
+    entity
+        .names
+        .iter()
+        .find(|(key, _)| key.language.as_str() == language)
+}
+
 // ------------------------------------------------------------------
-// Names
+// Names — membership union, value-deduped support
 // ------------------------------------------------------------------
 
 #[tokio::test]
@@ -189,20 +207,15 @@ async fn single_name_projects_one_slot() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let projected = project_entity::<MemoryFactStore, _>(&view, id).await?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
-    assert_eq!(projected.entity.names.len(), 1);
-    let name = projected.entity.names.first().ok_or("no name")?;
-    assert_eq!(name.name.as_str(), "Pantheon");
-    assert_eq!(name.language.as_str(), "en");
-    assert_eq!(name.name_type, NameType::Common);
-
-    let path = JsonPath::root().field("names").index(0);
-    let prov = projected
-        .citations
-        .get(&path)
-        .ok_or("no citation at $.names[0]")?;
-    assert_eq!(prov.supports.len(), 1);
+    assert_eq!(entity.names.len(), 1);
+    let (key, entry) = entity.names.iter().next().ok_or("no name")?;
+    assert_eq!(key.name.as_str(), "Pantheon");
+    assert_eq!(key.language.as_str(), "en");
+    assert_eq!(key.name_type, NameType::Common);
+    // The membership key carries the one fact backing its presence.
+    assert_eq!(entry.support.iter().count(), 1);
     Ok(())
 }
 
@@ -226,117 +239,146 @@ async fn multiple_names_all_languages_preserved() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let projected = project_entity::<MemoryFactStore, _>(&view, id).await?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
     assert_eq!(
-        projected.entity.names.len(),
+        entity.names.len(),
         3,
         "the exact-triple duplicate collapses; the three distinct names stay"
     );
-    let langs: BTreeSet<&str> = projected
-        .entity
-        .names
-        .iter()
-        .map(|n| n.language.as_str())
-        .collect();
+    let langs: BTreeSet<&str> = entity.names.keys().map(|k| k.language.as_str()).collect();
     assert_eq!(langs, BTreeSet::from(["en", "it", "fr"]));
 
-    // The collapsed `en` slot cites BOTH backing facts.
-    let en_idx = projected
-        .entity
-        .names
-        .iter()
-        .position(|n| n.language.as_str() == "en")
-        .ok_or("no en name")?;
-    let path = JsonPath::root().field("names").index(en_idx);
-    let prov = projected.citations.get(&path).ok_or("no en citation")?;
+    // The collapsed `en` key cites BOTH backing facts.
+    let (_, en) = name_by_language(&entity, "en").ok_or("no en name")?;
     assert_eq!(
-        prov.supports.len(),
+        en.support.iter().count(),
         2,
-        "a value-deduped slot cites every fact that fed it"
+        "a value-deduped key cites every fact that fed it"
     );
     Ok(())
 }
 
 // ------------------------------------------------------------------
-// Dates — join, not hull
+// Dates — the bracket: extent joins, consensus meets
 // ------------------------------------------------------------------
 
 #[tokio::test]
-async fn multiple_date_claims_join_to_disjunction() -> TestResult {
+async fn two_overlapping_date_claims_tighten_the_consensus() -> TestResult {
     let store = MemoryFactStore::new();
-    // Two construction-start claims a decade apart: "the 1920s" and "1935".
-    let bound_1920s = UncertainDate::bounded(
-        crate::date::DateBound::new(
-            chrono::NaiveDate::from_ymd_opt(1920, 1, 1).ok_or("date")?,
-            DatePrecision::Decade,
-        )
-        .ok(),
-        crate::date::DateBound::new(
-            chrono::NaiveDate::from_ymd_opt(1920, 1, 1).ok_or("date")?,
-            DatePrecision::Decade,
-        )
-        .ok(),
+    // "the 1920s" and "1925": 1925 sits inside the decade, so the consensus
+    // (meet) is the tighter 1925 and the field is consistent.
+    let decade_1920s = UncertainDate::with_precision(
+        chrono::NaiveDate::from_ymd_opt(1920, 1, 1).ok_or("date")?,
+        DatePrecision::Decade,
     )?;
-    let bound_1935 = year_date(1935)?;
+    let year_1925 = year_date(1925)?;
 
-    let started_1920s = SubmitFact::Factual {
-        assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Started {
-                entity: EntityIdx(0),
-                bound: bound_1920s.clone(),
-            },
-        },
-        citation: sample_citation()?,
-    };
-    let started_1935 = SubmitFact::Factual {
-        assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Started {
-                entity: EntityIdx(0),
-                bound: bound_1935.clone(),
-            },
-        },
-        citation: sample_citation()?,
-    };
-
-    let result = submit(&store, 1, vec![started_1920s, started_1935]).await?;
+    let result = submit(
+        &store,
+        1,
+        vec![
+            started_fact(0, decade_1920s.clone(), "https://a.example/src")?,
+            started_fact(0, year_1925.clone(), "https://b.example/src")?,
+        ],
+    )
+    .await?;
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let projected = project_entity::<MemoryFactStore, _>(&view, id).await?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
-    let construction = projected
-        .entity
-        .construction
-        .as_ref()
-        .ok_or("no construction")?;
-    let started = construction.started_at.as_ref().ok_or("no start date")?;
-
-    let expected = bound_1920s.join(&bound_1935);
+    let started = &entity.construction.started_at;
     assert_eq!(
-        started, &expected,
-        "the slot is the set union of the two claims, not a hull"
+        started.consensus.value,
+        decade_1920s.meet(&year_1925),
+        "the consensus is the meet — the tighter agreed window"
     );
-    // The 1920s and 1935 claims are genuinely disjoint, so the union stays
-    // two intervals — a hull would have collapsed to one.
     assert_eq!(
-        started.intervals().len(),
-        2,
-        "disjoint claims stay disjoint; no gap is invented"
+        started.extent.value,
+        decade_1920s.join(&year_1925),
+        "the extent is the join — the widest any source allows"
     );
-
-    let path = JsonPath::root().field("construction").field("started_at");
-    let prov = projected.citations.get(&path).ok_or("no start citation")?;
-    assert_eq!(
-        prov.supports.len(),
-        2,
-        "both facts cited at the joined slot"
-    );
+    assert_eq!(started.conflict(), ConflictStatus::Consistent);
+    // Both facts cite the merged bound, on each end.
+    assert_eq!(started.consensus.support.iter().count(), 2);
+    assert_eq!(started.extent.support.iter().count(), 2);
     Ok(())
 }
 
+#[tokio::test]
+async fn disjoint_date_claims_conflict_with_a_disjunction_extent() -> TestResult {
+    let store = MemoryFactStore::new();
+    // "the 1920s" and "1935" are genuinely disjoint: the consensus (meet) is
+    // empty — an over-determined Conflict — while the extent (join) keeps both
+    // intervals rather than fabricating a hull.
+    let decade_1920s = UncertainDate::with_precision(
+        chrono::NaiveDate::from_ymd_opt(1920, 1, 1).ok_or("date")?,
+        DatePrecision::Decade,
+    )?;
+    let year_1935 = year_date(1935)?;
+
+    let result = submit(
+        &store,
+        1,
+        vec![
+            started_fact(0, decade_1920s.clone(), "https://a.example/src")?,
+            started_fact(0, year_1935.clone(), "https://b.example/src")?,
+        ],
+    )
+    .await?;
+    let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+
+    let started = &entity.construction.started_at;
+    assert_eq!(
+        started.conflict(),
+        ConflictStatus::Conflict,
+        "disjoint claims over-determine the consensus to empty"
+    );
+    assert!(
+        started.consensus.value.intervals().is_empty(),
+        "the consensus meet is the empty union"
+    );
+    assert_eq!(
+        started.extent.value.intervals().len(),
+        2,
+        "the extent keeps both disjoint intervals; no gap is invented"
+    );
+    // Whole-entity conflict surfaces the field's conflict.
+    assert_eq!(entity.conflict(), ConflictStatus::Conflict);
+    Ok(())
+}
+
+/// A construction-start fact citing a specific source, so two date claims from
+/// distinct sources keep distinct lineage citations.
+fn started_fact(
+    entity_idx: usize,
+    bound: UncertainDate,
+    source_url: &str,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    let citation = FactualCitation::new(
+        ExternalSource::Url {
+            url: Url::parse(source_url)?,
+            published: None,
+        },
+        vec![Excerpt::new("source-text")?],
+    )?;
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: bookend::Fact::Started {
+                entity: EntityIdx(entity_idx),
+                bound,
+            },
+        },
+        citation,
+    })
+}
+
 // ------------------------------------------------------------------
-// Class union and root provenance
+// Class union
 // ------------------------------------------------------------------
 
 #[tokio::test]
@@ -357,50 +399,18 @@ async fn same_entity_class_unions_members() -> TestResult {
     let a = result.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let projected = project_entity::<MemoryFactStore, _>(&view, a).await?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
 
-    let names: BTreeSet<&str> = projected
-        .entity
-        .names
-        .iter()
-        .map(|n| n.name.as_str())
-        .collect();
+    let names: BTreeSet<&str> = entity.names.keys().map(|k| k.name.as_str()).collect();
     assert_eq!(
         names,
         BTreeSet::from(["X", "Y"]),
         "projecting one member yields both members' names"
     );
     assert_eq!(
-        projected.entity.external_references.len(),
+        entity.refs.len(),
         1,
         "the other member's external ref surfaces too"
-    );
-
-    // Root cites the SameEntity edge's judgment source.
-    let prov = projected
-        .citations
-        .get(&JsonPath::root())
-        .ok_or("merged class must cite root")?;
-    assert_eq!(prov.supports.len(), 1);
-    assert!(matches!(
-        prov.supports.first(),
-        Some(ProjectedCitation::Judgment { .. })
-    ));
-    Ok(())
-}
-
-#[tokio::test]
-async fn singleton_class_leaves_root_unaddressed() -> TestResult {
-    let store = MemoryFactStore::new();
-    let result = submit(&store, 1, vec![name_fact(0, "Solo", "en")?]).await?;
-    let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
-
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let projected = project_entity::<MemoryFactStore, _>(&view, id).await?;
-
-    assert!(
-        projected.citations.get(&JsonPath::root()).is_none(),
-        "a singleton class fabricates no root provenance"
     );
     Ok(())
 }
@@ -470,22 +480,16 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
 
     // At now(): one name.
     let view_now = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let after = project_entity::<MemoryFactStore, _>(&view_now, id).await?;
-    assert_eq!(
-        after.entity.names.len(),
-        1,
-        "the retracted name is gone at now()"
-    );
-    assert_eq!(
-        after.entity.names.first().ok_or("no name")?.name.as_str(),
-        "New"
-    );
+    let after = project_entity::<MemoryFactStore, _, _>(&view_now, id, member_lineage).await?;
+    assert_eq!(after.names.len(), 1, "the retracted name is gone at now()");
+    let (key, _) = after.names.iter().next().ok_or("no name")?;
+    assert_eq!(key.name.as_str(), "New");
 
     // At the pre-retraction snapshot: both names.
     let view_before = store.no_later_than(snapshot_before);
-    let before = project_entity::<MemoryFactStore, _>(&view_before, id).await?;
+    let before = project_entity::<MemoryFactStore, _, _>(&view_before, id, member_lineage).await?;
     assert_eq!(
-        before.entity.names.len(),
+        before.names.len(),
         2,
         "before the retraction both names were active"
     );
@@ -493,15 +497,14 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
 }
 
 // ------------------------------------------------------------------
-// Address correctness; no Meta leakage
+// In-band provenance — every populated field carries support; no Meta leakage
 // ------------------------------------------------------------------
 
 #[tokio::test]
-async fn citation_addressing_resolves_each_field() -> TestResult {
+async fn populated_fields_carry_factual_support() -> TestResult {
     let store = MemoryFactStore::new();
-    // Two entities so a relationship target exists, linked into one class
-    // so the relation surfaces. Names + a bookend + an external ref + a
-    // relation across all members.
+    // Two entities so a relationship target exists, linked into one class.
+    // Names + a bookend + an external ref + a relation across all members.
     let result = submit(
         &store,
         2,
@@ -518,53 +521,52 @@ async fn citation_addressing_resolves_each_field() -> TestResult {
     let a = result.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let projected = project_entity::<MemoryFactStore, _>(&view, a).await?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
 
-    // Every populated value field has a sidecar entry that resolves.
-    for (idx, _) in projected.entity.names.iter().enumerate() {
-        let path = JsonPath::root().field("names").index(idx);
+    // Every populated value field carries its in-band support.
+    for entry in entity.names.values() {
         assert!(
-            projected.citations.get(&path).is_some(),
-            "name slot {idx} must be addressed"
+            entry.support.iter().next().is_some(),
+            "each name key cites its fact"
         );
     }
     assert!(
-        projected
-            .citations
-            .get(&JsonPath::root().field("construction").field("started_at"))
-            .is_some()
+        entity
+            .construction
+            .started_at
+            .consensus
+            .support
+            .iter()
+            .next()
+            .is_some(),
+        "the bookend start cites its fact"
     );
-    assert!(
-        projected
-            .citations
-            .get(&JsonPath::root().field("external_references").index(0))
-            .is_some()
-    );
-    assert!(
-        projected
-            .citations
-            .get(&JsonPath::root().field("relations").index(0))
-            .is_some()
-    );
+    let (_, ref_entry) = entity.refs.iter().next().ok_or("no ref")?;
+    assert!(ref_entry.support.iter().next().is_some());
+    let (_, rel_entry) = entity.relations.iter().next().ok_or("no relation")?;
+    assert!(rel_entry.support.iter().next().is_some());
 
-    // Meta facts never back a value (the sidecar sum has no meta arm, so a
-    // retracted/superseding fact can't reach a supports list). Here the
-    // only Judgment-backed slot is root; every value field is Factual-
-    // backed — a misrouted judgment into a value slot would fail this.
-    let root = JsonPath::root();
-    for (path, prov) in &projected.citations.0 {
-        for support in &prov.supports {
-            if path == &root {
-                assert!(matches!(support, ProjectedCitation::Judgment { .. }));
-            } else {
-                assert!(
-                    matches!(support, ProjectedCitation::Factual { .. }),
-                    "value slot {path} must be factual-backed"
-                );
-            }
-        }
+    // No field's support cites a meta fact — meta facts back no value. The
+    // SameEntity judgment drives grouping, not a field, so every value's
+    // support is factual.
+    for entry in entity.names.values() {
+        assert!(entry.support.iter().all(is_factual));
     }
+    assert!(
+        entity
+            .construction
+            .started_at
+            .consensus
+            .support
+            .iter()
+            .all(is_factual)
+    );
     Ok(())
+}
+
+/// Whether a member-aware lineage atom cites a factual fact (vs. a judgment).
+fn is_factual((_, citation): &(MemEntId, Citation<MemImgId>)) -> bool {
+    matches!(citation, Citation::Factual { .. })
 }
 
 // ------------------------------------------------------------------
@@ -684,11 +686,11 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
 }
 
 // ------------------------------------------------------------------
-// Interior events — category arms, role split, conflict-as-None
+// Interior events — product shape, value-mode conflict
 //
-// `project_events` is the pure merge over an entity's facts; it is
-// exercised here directly on a hand-built fact set, the same shape the
-// entity drain hands it.
+// `project_facts` is the pure fold over an entity's facts; it is exercised
+// here directly on a hand-built fact set, the same shape the entity drain
+// hands it.
 // ------------------------------------------------------------------
 
 type StoredEventFact = StoredFact<MemEntId, MemEvtId, MemImgId>;
@@ -732,14 +734,20 @@ fn has_event_stored(
     )
 }
 
+/// Project a hand-built fact map through the member-aware lineage fold, the same
+/// merge the entity entry point runs. The reacher map comes from the `HasEvent`
+/// facts in the bag, exactly as the entry point derives it.
+fn project(facts: &BTreeMap<FactId, StoredEventFact>) -> ProjectedEntity<MemEntId, MemEvtId, Lin> {
+    project_facts(facts, &event_reachers(facts), member_lineage)
+}
+
 /// Mint an entity and an interior event tied to it by a `HasEvent`, plus a
-/// `DurationalDate`, then project the *entity*. The events Vec must populate
-/// — through the real entry point, this is the entity→event hop the
-/// `HasEvent` bridge makes reachable.
+/// `DurationalDate`, then project the *entity*. The events map must populate —
+/// through the real entry point, this is the entity→event hop the `HasEvent`
+/// bridge makes reachable.
 #[tokio::test]
 async fn entity_projects_has_event_linked_event() -> TestResult {
     use crate::facts::event::Fact as EventFact;
-    use crate::facts::lifecycle::{DamageCause, DurationalKind, DurationalRole};
 
     let store = MemoryFactStore::new();
     let bundle: SubmitBundle<MemEntId, MemEvtId, MemImgId> = SubmitBundle {
@@ -790,31 +798,33 @@ async fn entity_projects_has_event_linked_event() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let projected = project_entity::<MemoryFactStore, _>(&view, id).await?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
     assert_eq!(
-        projected.entity.events.len(),
+        entity.events.len(),
         1,
         "the HasEvent-linked interior event is reachable through project_entity"
     );
-    let ProjectedLifetimeEvent::Durational {
-        kind, started_at, ..
-    } = projected.entity.events.first().ok_or("no event")?
-    else {
-        return Err("expected a durational event".into());
-    };
+    let (_, event) = entity.events.iter().next().ok_or("no event")?;
+    let record = &event.value;
     assert_eq!(
-        *kind,
-        BTreeSet::from([DurationalKind::Damaged]),
-        "the kind reads off the HasEvent claim"
+        record.kind.consensus.value,
+        Claimed::Of(BTreeSet::from([LifetimeEventKind::Durational {
+            kind: DurationalKind::Damaged,
+        }])),
+        "kind reads off the HasEvent"
     );
-    assert_eq!(started_at.as_ref(), Some(&year_date(1850)?));
+    assert_eq!(record.started_at.consensus.value, year_date(1850)?);
+    assert_eq!(
+        record.cause.consensus.value,
+        Claimed::Of(BTreeSet::from([DamageCause::Fire])),
+        "the value-mode cause payload projects"
+    );
     Ok(())
 }
 
 #[test]
 fn durational_event_splits_start_and_completion() -> TestResult {
-    use crate::facts::lifecycle::{DurationalKind, DurationalRole};
     let facts: BTreeMap<FactId, _> = [
         has_event_stored(
             0,
@@ -844,61 +854,35 @@ fn durational_event_splits_start_and_completion() -> TestResult {
     .into_iter()
     .collect();
 
-    let mut events = Vec::new();
-    let mut citations = CitationMap::new();
-    project_events(&facts, &mut events, &mut citations);
-
-    assert_eq!(events.len(), 1);
-    let ProjectedLifetimeEvent::Durational {
-        kind,
-        started_at,
-        completed_at,
-        ..
-    } = events.first().ok_or("no event")?
-    else {
-        return Err("expected a durational event".into());
-    };
-    assert_eq!(*kind, BTreeSet::from([DurationalKind::Modified]));
-    // Both endpoints populate, and from distinct claims — the bug was
-    // folding both roles into one slot.
-    assert_eq!(started_at.as_ref(), Some(&year_date(1900)?));
-    assert_eq!(completed_at.as_ref(), Some(&year_date(1905)?));
-    assert_ne!(started_at, completed_at);
-
-    // Each role's slot cites its own fact, not the other's.
-    let started_path = JsonPath::root()
-        .field("events")
-        .index(0)
-        .field("started_at");
-    let completed_path = JsonPath::root()
-        .field("events")
-        .index(0)
-        .field("completed_at");
+    let entity = project(&facts);
+    assert_eq!(entity.events.len(), 1);
+    let (_, event) = entity.events.iter().next().ok_or("no event")?;
+    let record = &event.value;
     assert_eq!(
-        citations
-            .get(&started_path)
-            .ok_or("no started cite")?
-            .supports
-            .len(),
-        1
+        record.kind.consensus.value,
+        Claimed::Of(BTreeSet::from([LifetimeEventKind::Durational {
+            kind: DurationalKind::Modified,
+        }]))
     );
-    assert_eq!(
-        citations
-            .get(&completed_path)
-            .ok_or("no completed cite")?
-            .supports
-            .len(),
-        1
+    // Both endpoints populate, and from distinct claims — the bug guarded
+    // against was folding both roles into one slot.
+    assert_eq!(record.started_at.consensus.value, year_date(1900)?);
+    assert_eq!(record.completed_at.consensus.value, year_date(1905)?);
+    assert_ne!(
+        record.started_at.consensus.value,
+        record.completed_at.consensus.value
     );
+    // Each role's bound cites its own fact, not the other's.
+    assert_eq!(record.started_at.consensus.support.iter().count(), 1);
+    assert_eq!(record.completed_at.consensus.support.iter().count(), 1);
     Ok(())
 }
 
 /// The kind reads off `HasEvent`, not the payloads: an event with a
-/// `HasEvent { Damaged }` and no `DamageCause` payload still projects
-/// `kind: Some(Damaged)`.
+/// `HasEvent { Damaged }` and no `DamageCause` payload still projects a settled
+/// `Damaged` kind.
 #[test]
 fn durational_kind_reads_off_has_event_not_payload() -> TestResult {
-    use crate::facts::lifecycle::{DurationalKind, DurationalRole};
     let facts: BTreeMap<FactId, _> = [
         has_event_stored(
             0,
@@ -920,21 +904,21 @@ fn durational_kind_reads_off_has_event_not_payload() -> TestResult {
     .into_iter()
     .collect();
 
-    let mut events = Vec::new();
-    let mut citations = CitationMap::new();
-    project_events(&facts, &mut events, &mut citations);
-
-    let ProjectedLifetimeEvent::Durational { kind, .. } = events.first().ok_or("no event")? else {
-        return Err("expected a durational event".into());
-    };
-    assert_eq!(*kind, BTreeSet::from([DurationalKind::Damaged]));
+    let entity = project(&facts);
+    let (_, event) = entity.events.iter().next().ok_or("no event")?;
+    assert_eq!(
+        event.value.kind.consensus.value,
+        Claimed::Of(BTreeSet::from([LifetimeEventKind::Durational {
+            kind: DurationalKind::Damaged,
+        }]))
+    );
     Ok(())
 }
 
 #[test]
-fn point_event_has_no_location_slot() -> TestResult {
-    // A designation is point-category. The Point arm carries occurred_at and
-    // its kind off the HasEvent, and structurally cannot carry a location.
+fn point_event_projects_kind_and_payloads() -> TestResult {
+    // A designation is point-category: the kind settles to `Designated` and
+    // the occurred_at / designation payloads project onto their slots.
     let facts: BTreeMap<FactId, _> = [
         has_event_stored(
             0,
@@ -962,23 +946,257 @@ fn point_event_has_no_location_slot() -> TestResult {
     .into_iter()
     .collect();
 
-    let mut events = Vec::new();
-    let mut citations = CitationMap::new();
-    project_events(&facts, &mut events, &mut citations);
+    let entity = project(&facts);
+    let (_, event) = entity.events.iter().next().ok_or("no event")?;
+    let record = &event.value;
+    assert_eq!(
+        record.kind.consensus.value,
+        Claimed::Of(BTreeSet::from([LifetimeEventKind::Point {
+            kind: PointKind::Designated,
+        }]))
+    );
+    assert_eq!(record.occurred_at.consensus.value, year_date(1966)?);
+    assert_eq!(
+        record.designation.consensus.value,
+        Claimed::Of(BTreeSet::from(["national landmark".to_owned()]))
+    );
+    Ok(())
+}
 
-    let ProjectedLifetimeEvent::Point {
-        kind, occurred_at, ..
-    } = events.first().ok_or("no event")?
-    else {
-        return Err("expected a point event".into());
-    };
-    assert_eq!(*kind, BTreeSet::from([PointKind::Designated]));
-    assert_eq!(occurred_at.as_ref(), Some(&year_date(1966)?));
-    // A location path is never addressed for a point event.
-    let location_path = JsonPath::root().field("events").index(0).field("location");
+/// Two sources disagree on a `Damaged` event's cause. The whole value is the
+/// atom, so the meet of `{Fire}` and `{Flood}` is empty — an over-determined
+/// value-mode conflict, distinct from a membership union.
+#[test]
+fn disagreeing_damage_cause_is_a_value_mode_conflict() -> TestResult {
+    let facts: BTreeMap<FactId, _> = [
+        has_event_stored(
+            0,
+            ent(7),
+            evt(1),
+            LifetimeEventKind::Durational {
+                kind: DurationalKind::Damaged,
+            },
+        )?,
+        event_stored(
+            1,
+            event::Fact::DamageCause {
+                event: evt(1),
+                cause: DamageCause::Fire,
+            },
+        )?,
+        event_stored(
+            2,
+            event::Fact::DamageCause {
+                event: evt(1),
+                cause: DamageCause::Flood,
+            },
+        )?,
+    ]
+    .into_iter()
+    .collect();
+
+    let entity = project(&facts);
+    let (_, event) = entity.events.iter().next().ok_or("no event")?;
+    assert_eq!(
+        event.value.cause.conflict(),
+        ConflictStatus::Conflict,
+        "different claimed causes over-determine the value"
+    );
+    assert_eq!(
+        event.value.cause.consensus.value,
+        Claimed::Of(BTreeSet::new()),
+        "the consensus meet of disjoint singletons is empty"
+    );
+    // The extent records both claims.
+    assert_eq!(
+        event.value.cause.extent.value,
+        Claimed::Of(BTreeSet::from([DamageCause::Fire, DamageCause::Flood]))
+    );
+    // The conflict propagates to the whole entity.
+    assert_eq!(entity.conflict(), ConflictStatus::Conflict);
+    Ok(())
+}
+
+/// A move event's destination is an unresolved reference. The consensus can't
+/// be decided as empty or non-empty until the reference resolves, so the
+/// location field is Pending rather than Conflict.
+#[test]
+fn unresolved_move_location_is_pending() -> TestResult {
+    use crate::location::{LocationReference, UnresolvedLocation};
+
+    let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+        name: "Springfield".to_owned(),
+    });
+    let facts: BTreeMap<FactId, _> = [
+        has_event_stored(
+            0,
+            ent(7),
+            evt(1),
+            LifetimeEventKind::Durational {
+                kind: DurationalKind::Moved,
+            },
+        )?,
+        event_stored(
+            1,
+            event::Fact::MovedToLocation {
+                event: evt(1),
+                location: reference,
+            },
+        )?,
+    ]
+    .into_iter()
+    .collect();
+
+    let entity = project(&facts);
+    let (_, event) = entity.events.iter().next().ok_or("no event")?;
+    assert_eq!(
+        event.value.location.conflict(),
+        ConflictStatus::Pending,
+        "an unresolved reference leaves the location's verdict pending"
+    );
+    assert_eq!(entity.conflict(), ConflictStatus::Pending);
+    Ok(())
+}
+
+// ------------------------------------------------------------------
+// SameEntity glue — the merge judgment is carried, not dropped
+//
+// A `SameEntity` judgment records one `sameness` edge keyed by its endpoint
+// pair, its support tagged symmetrically against both endpoints. The root
+// summary is the ⊔ of every edge's support; `connecting_glue` intersects a field's
+// contributing member ids against the edges: a field two merged members both
+// asserted surfaces the connecting judgment; a field only one member asserted
+// surfaces nothing.
+// ------------------------------------------------------------------
+
+/// The two minted member ids of a `SameEntity` class, taken from the submit
+/// resolution so tests can name which id a field's support carries.
+struct MergedClass {
+    x: MemEntId,
+    y: MemEntId,
+}
+
+/// Submit two entities sharing a construction-start date, a name on the first
+/// only, and a `SameEntity` judgment linking them. The shared-date field
+/// gathers both members' support; the name field only the first's.
+async fn merged_class(store: &MemoryFactStore) -> Result<MergedClass, Box<dyn std::error::Error>> {
+    let result = submit(
+        store,
+        2,
+        vec![
+            construction_started_fact(0, 1900)?,
+            construction_started_fact(1, 1900)?,
+            name_fact(0, "Hall", "en")?,
+            same_entity_fact(0, 1)?,
+        ],
+    )
+    .await?;
+    let x = result.entities.get(&EntityIdx(0)).ok_or("missing x")?.id;
+    let y = result.entities.get(&EntityIdx(1)).ok_or("missing y")?.id;
+    Ok(MergedClass { x, y })
+}
+
+#[tokio::test]
+async fn shared_field_surfaces_the_connecting_glue() -> TestResult {
+    let store = MemoryFactStore::new();
+    let MergedClass { x, y } = merged_class(&store).await?;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+
+    // The construction-start field was asserted by both members, so its
+    // support carries both ids and the connecting judgment is load-bearing.
+    let started = &entity.construction.started_at;
+    let support_ids: BTreeSet<&MemEntId> =
+        started.extent.support.iter().map(|(id, _)| id).collect();
+    assert_eq!(
+        support_ids,
+        BTreeSet::from([&x, &y]),
+        "both merged members asserted the shared construction date"
+    );
+    let glue = connecting_glue(&entity.sameness, &started.extent.support);
+    assert_eq!(
+        glue.len(),
+        1,
+        "the field spanning both members surfaces exactly the connecting judgment"
+    );
+    let edge = glue.first().ok_or("no glue edge")?;
+    assert_eq!(
+        edge.endpoints,
+        &OrderedDistinctPair::new(x, y)?,
+        "the glue edge is the canonical-ordered endpoint pair"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_member_field_has_no_glue() -> TestResult {
+    let store = MemoryFactStore::new();
+    let MergedClass { x, .. } = merged_class(&store).await?;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+
+    // The name was asserted by one member only; no SameEntity edge fits
+    // inside a single-id support set, so nothing is load-bearing for it.
+    let (_, name) = name_by_language(&entity, "en").ok_or("no name")?;
+    let name_ids: BTreeSet<&MemEntId> = name.support.iter().map(|(id, _)| id).collect();
+    assert_eq!(
+        name_ids,
+        BTreeSet::from([&x]),
+        "the name has one contributor"
+    );
     assert!(
-        citations.get(&location_path).is_none(),
-        "a point event has no location slot to address"
+        connecting_glue(&entity.sameness, &name.support).is_empty(),
+        "a single-source field has no load-bearing glue"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn identity_root_accumulates_the_merge_judgment() -> TestResult {
+    let store = MemoryFactStore::new();
+    let MergedClass { x, y } = merged_class(&store).await?;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+
+    // The derived root summary is the ⊔ of the class's edge supports. The one
+    // SameEntity edge is tagged symmetrically, so the root carries both
+    // endpoints' ids.
+    let root = sameness_summary(&entity.sameness);
+    let root_ids: BTreeSet<&MemEntId> = root.iter().map(|(id, _)| id).collect();
+    assert_eq!(
+        root_ids,
+        BTreeSet::from([&x, &y]),
+        "the merge judgment backs the root against both endpoints"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn judgment_citation_is_live_in_provenance() -> TestResult {
+    let store = MemoryFactStore::new();
+    let MergedClass { x, y } = merged_class(&store).await?;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let entity = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+
+    // `Citation::Judgment` reaches projected provenance only because the merge
+    // no longer drops judgments: it lands on the `sameness` edge.
+    let root = sameness_summary(&entity.sameness);
+    assert!(
+        root.iter()
+            .any(|(_, c)| matches!(c, Citation::Judgment { .. })),
+        "the merge judgment's citation surfaces on the derived root"
+    );
+    let pair = OrderedDistinctPair::new(x, y)?;
+    let edge = entity.sameness.get(&pair).ok_or("no sameness edge")?;
+    assert!(
+        edge.support
+            .iter()
+            .any(|(_, c)| matches!(c, Citation::Judgment { .. })),
+        "the same judgment citation backs the recorded glue edge"
     );
     Ok(())
 }

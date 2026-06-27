@@ -45,7 +45,7 @@ use crate::facts::store::{
     SubmitCommitInput, SubmitCommitOutput,
 };
 use crate::facts::{attribute, bookend, composites, depiction, event, image, map, picture};
-use crate::location::{ConflictStatus, Location, UnresolvedLocation};
+use crate::location::{ConflictStatus, UnresolvedLocation};
 
 /// Sanity bound on the number of circles a stored location may name. A place is
 /// a handful of spots, not hundreds — like
@@ -897,7 +897,7 @@ fn rule_location_validity<S: FactStore>(
 ) {
     for fact in candidates {
         for_each_stored_location(fact, &mut |role, location| {
-            let circles = circle_count(location);
+            let circles = location.circle_count();
             if circles > MAX_LOCATION_CIRCLES {
                 errors.push(SubmitError::LocationTooComplex {
                     role,
@@ -908,31 +908,6 @@ fn rule_location_validity<S: FactStore>(
                 errors.push(SubmitError::EmptyLocation { role });
             }
         });
-    }
-}
-
-/// The number of `Circle` leaves in an [`UnresolvedLocation`] — its resolved
-/// circles plus those reachable through the combinators. A `Reference` is one
-/// opaque place, not a circle, so it doesn't count. This is the same leaf set
-/// the emptiness check enumerates, so it bounds that check's cost exactly.
-fn circle_count(location: &UnresolvedLocation) -> usize {
-    match location {
-        UnresolvedLocation::Resolved(loc) => resolved_circle_count(loc),
-        UnresolvedLocation::Reference(_) => 0,
-        UnresolvedLocation::OneOf(entries) | UnresolvedLocation::AllOf(entries) => {
-            entries.as_slice().iter().map(circle_count).sum()
-        }
-    }
-}
-
-/// The number of `Circle` leaves in a resolved [`Location`].
-fn resolved_circle_count(location: &Location) -> usize {
-    match location {
-        Location::Empty | Location::Unbounded => 0,
-        Location::Circle { .. } => 1,
-        Location::OneOf { members } | Location::AllOf { members } => {
-            members.as_slice().iter().map(resolved_circle_count).sum()
-        }
     }
 }
 

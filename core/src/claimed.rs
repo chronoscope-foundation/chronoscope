@@ -8,7 +8,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::lattice::{JoinSemilattice, MeetSemilattice};
+use crate::algebra::lattice::{JoinSemilattice, MeetSemilattice};
+use crate::algebra::monoid::CommutativeMonoid;
 
 /// A claim over a domain `A`: either an explicit set of asserted values or the
 /// symbolic top ⊤ ([`Any`](Claimed::Any)).
@@ -20,28 +21,43 @@ pub enum Claimed<A: Ord> {
     Any,
 }
 
-impl<A: Ord + Clone> JoinSemilattice for Claimed<A> {
-    fn bottom() -> Self {
+impl<A: Ord> CommutativeMonoid for Claimed<A> {
+    fn identity() -> Self {
         Claimed::Of(BTreeSet::new())
     }
 
-    fn join(&self, other: &Self) -> Self {
+    fn combine(self, other: Self) -> Self {
         match (self, other) {
             (Claimed::Any, _) | (_, Claimed::Any) => Claimed::Any,
-            (Claimed::Of(a), Claimed::Of(b)) => Claimed::Of(a.union(b).cloned().collect()),
+            // ⊥ (the empty set) is the join identity: return the other operand
+            // untouched rather than rebuilding the union element by element.
+            (Claimed::Of(a), other) if a.is_empty() => other,
+            (one, Claimed::Of(b)) if b.is_empty() => one,
+            (Claimed::Of(mut a), Claimed::Of(b)) => {
+                a.extend(b);
+                Claimed::Of(a)
+            }
         }
     }
 }
 
-impl<A: Ord + Clone> MeetSemilattice for Claimed<A> {
+impl<A: Ord> JoinSemilattice for Claimed<A> {}
+
+impl<A: Ord> MeetSemilattice for Claimed<A> {
     fn top() -> Self {
         Claimed::Any
     }
 
-    fn meet(&self, other: &Self) -> Self {
+    fn meet(self, other: Self) -> Self {
         match (self, other) {
-            (Claimed::Any, x) | (x, Claimed::Any) => x.clone(),
-            (Claimed::Of(a), Claimed::Of(b)) => Claimed::Of(a.intersection(b).cloned().collect()),
+            (Claimed::Any, x) | (x, Claimed::Any) => x,
+            (Claimed::Of(a), Claimed::Of(b)) => {
+                // Intersection keeps the smaller set's surviving elements; retain
+                // on whichever is smaller avoids a clone of either operand.
+                let (mut keep, probe) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+                keep.retain(|x| probe.contains(x));
+                Claimed::Of(keep)
+            }
         }
     }
 }
