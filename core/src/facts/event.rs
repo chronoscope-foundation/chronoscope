@@ -303,31 +303,69 @@ impl<EntId: Ord, EvtId: Ord> Fact<EntId, EvtId> {
 
     /// The lifetime-event kinds this fact admits for its event — the data the
     /// kind typecheck intersects against the declared kind. `HasEvent` pins its
-    /// one declared kind; a payload admits the kind(s) its variant suits; a
-    /// description admits all.
+    /// one declared kind; a description admits all; every payload delegates to
+    /// [`EventPayload::allowed_kinds`], the shared payload→kinds rule.
     pub fn kind_constraints(&self) -> BTreeSet<LifetimeEventKind> {
-        use crate::facts::lifecycle::{DurationalKind, PointKind};
         match self {
             Self::HasEvent { kind, .. } => BTreeSet::from([*kind]),
-            Self::DamageCause { .. } => BTreeSet::from([LifetimeEventKind::Durational {
-                kind: DurationalKind::Damaged,
-            }]),
-            Self::MoveMethod { .. } | Self::MovedToLocation { .. } => {
+            Self::Description { .. } => LifetimeEventKind::durational_kinds()
+                .chain(LifetimeEventKind::point_kinds())
+                .collect(),
+            Self::DurationalDate { .. } => EventPayload::DurationalDate.allowed_kinds(),
+            Self::PointDate { .. } => EventPayload::PointDate.allowed_kinds(),
+            Self::MovedToLocation { .. } => EventPayload::MovedToLocation.allowed_kinds(),
+            Self::DamageCause { .. } => EventPayload::DamageCause.allowed_kinds(),
+            Self::MoveMethod { .. } => EventPayload::MoveMethod.allowed_kinds(),
+            Self::UsageChange { .. } => EventPayload::UsageChange.allowed_kinds(),
+            Self::Designation { .. } => EventPayload::Designation.allowed_kinds(),
+        }
+    }
+}
+
+/// The payload categories an event fact carries, each admitting the lifetime
+/// event kind(s) it suits. One source of the payload→kinds rule: the submit
+/// kind typecheck reads it through [`Fact::kind_constraints`], and the display
+/// off-kind guard reads it directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EventPayload {
+    /// A start/completion bound on a durational event.
+    DurationalDate,
+    /// A point event's date.
+    PointDate,
+    /// A `Moved` event's destination.
+    MovedToLocation,
+    /// A `Damaged` event's cause.
+    DamageCause,
+    /// A `Moved` event's method.
+    MoveMethod,
+    /// A `UsageChanged` event's post-event usage set.
+    UsageChange,
+    /// A `Designated` event's designation text.
+    Designation,
+}
+
+impl EventPayload {
+    /// The lifetime-event kinds this payload suits — the durational or point
+    /// family for the date payloads, a single kind for the rest.
+    pub fn allowed_kinds(self) -> BTreeSet<LifetimeEventKind> {
+        use crate::facts::lifecycle::{DurationalKind, PointKind};
+        match self {
+            Self::DurationalDate => LifetimeEventKind::durational_kinds().collect(),
+            Self::PointDate => LifetimeEventKind::point_kinds().collect(),
+            Self::MovedToLocation | Self::MoveMethod => {
                 BTreeSet::from([LifetimeEventKind::Durational {
                     kind: DurationalKind::Moved,
                 }])
             }
-            Self::UsageChange { .. } => BTreeSet::from([LifetimeEventKind::Point {
+            Self::DamageCause => BTreeSet::from([LifetimeEventKind::Durational {
+                kind: DurationalKind::Damaged,
+            }]),
+            Self::UsageChange => BTreeSet::from([LifetimeEventKind::Point {
                 kind: PointKind::UsageChanged,
             }]),
-            Self::Designation { .. } => BTreeSet::from([LifetimeEventKind::Point {
+            Self::Designation => BTreeSet::from([LifetimeEventKind::Point {
                 kind: PointKind::Designated,
             }]),
-            Self::DurationalDate { .. } => LifetimeEventKind::durational_kinds().collect(),
-            Self::PointDate { .. } => LifetimeEventKind::point_kinds().collect(),
-            Self::Description { .. } => LifetimeEventKind::durational_kinds()
-                .chain(LifetimeEventKind::point_kinds())
-                .collect(),
         }
     }
 }

@@ -26,6 +26,7 @@ strum.workspace = true
 sha2.workspace = true
 hex.workspace = true
 serde_jcs.workspace = true
+tracing.workspace = true
 urlencoding = "2.1"
 thiserror.workspace = true
 chronoscope-macros = { path = "../chronoscope-macros" }

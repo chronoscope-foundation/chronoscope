@@ -207,7 +207,7 @@ async fn single_name_projects_one_slot() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
     assert_eq!(entity.names.len(), 1);
     let (key, entry) = entity.names.iter().next().ok_or("no name")?;
@@ -239,7 +239,7 @@ async fn multiple_names_all_languages_preserved() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
     assert_eq!(
         entity.names.len(),
@@ -286,7 +286,7 @@ async fn two_overlapping_date_claims_tighten_the_consensus() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
     let started = &entity.construction.started_at;
     assert_eq!(
@@ -330,7 +330,7 @@ async fn disjoint_date_claims_conflict_with_a_disjunction_extent() -> TestResult
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
     let started = &entity.construction.started_at;
     assert_eq!(
@@ -399,7 +399,7 @@ async fn same_entity_class_unions_members() -> TestResult {
     let a = result.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
 
     let names: BTreeSet<&str> = entity.names.keys().map(|k| k.name.as_str()).collect();
     assert_eq!(
@@ -480,14 +480,15 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
 
     // At now(): one name.
     let view_now = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let after = project_entity::<MemoryFactStore, _, _>(&view_now, id, member_lineage).await?;
+    let (_, after) = project_entity::<MemoryFactStore, _, _>(&view_now, id, member_lineage).await?;
     assert_eq!(after.names.len(), 1, "the retracted name is gone at now()");
     let (key, _) = after.names.iter().next().ok_or("no name")?;
     assert_eq!(key.name.as_str(), "New");
 
     // At the pre-retraction snapshot: both names.
     let view_before = store.no_later_than(snapshot_before);
-    let before = project_entity::<MemoryFactStore, _, _>(&view_before, id, member_lineage).await?;
+    let (_, before) =
+        project_entity::<MemoryFactStore, _, _>(&view_before, id, member_lineage).await?;
     assert_eq!(
         before.names.len(),
         2,
@@ -521,7 +522,7 @@ async fn populated_fields_carry_factual_support() -> TestResult {
     let a = result.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
 
     // Every populated value field carries its in-band support.
     for entry in entity.names.values() {
@@ -798,7 +799,7 @@ async fn entity_projects_has_event_linked_event() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
 
     assert_eq!(
         entity.events.len(),
@@ -809,15 +810,19 @@ async fn entity_projects_has_event_linked_event() -> TestResult {
     let record = &event.value;
     assert_eq!(
         record.kind.consensus.value,
-        Claimed::Of(BTreeSet::from([LifetimeEventKind::Durational {
-            kind: DurationalKind::Damaged,
-        }])),
+        Claimed::Of {
+            values: BTreeSet::from([LifetimeEventKind::Durational {
+                kind: DurationalKind::Damaged,
+            }])
+        },
         "kind reads off the HasEvent"
     );
     assert_eq!(record.started_at.consensus.value, year_date(1850)?);
     assert_eq!(
         record.cause.consensus.value,
-        Claimed::Of(BTreeSet::from([DamageCause::Fire])),
+        Claimed::Of {
+            values: BTreeSet::from([DamageCause::Fire])
+        },
         "the value-mode cause payload projects"
     );
     Ok(())
@@ -860,9 +865,11 @@ fn durational_event_splits_start_and_completion() -> TestResult {
     let record = &event.value;
     assert_eq!(
         record.kind.consensus.value,
-        Claimed::Of(BTreeSet::from([LifetimeEventKind::Durational {
-            kind: DurationalKind::Modified,
-        }]))
+        Claimed::Of {
+            values: BTreeSet::from([LifetimeEventKind::Durational {
+                kind: DurationalKind::Modified,
+            }])
+        }
     );
     // Both endpoints populate, and from distinct claims — the bug guarded
     // against was folding both roles into one slot.
@@ -908,9 +915,11 @@ fn durational_kind_reads_off_has_event_not_payload() -> TestResult {
     let (_, event) = entity.events.iter().next().ok_or("no event")?;
     assert_eq!(
         event.value.kind.consensus.value,
-        Claimed::Of(BTreeSet::from([LifetimeEventKind::Durational {
-            kind: DurationalKind::Damaged,
-        }]))
+        Claimed::Of {
+            values: BTreeSet::from([LifetimeEventKind::Durational {
+                kind: DurationalKind::Damaged,
+            }])
+        }
     );
     Ok(())
 }
@@ -951,14 +960,18 @@ fn point_event_projects_kind_and_payloads() -> TestResult {
     let record = &event.value;
     assert_eq!(
         record.kind.consensus.value,
-        Claimed::Of(BTreeSet::from([LifetimeEventKind::Point {
-            kind: PointKind::Designated,
-        }]))
+        Claimed::Of {
+            values: BTreeSet::from([LifetimeEventKind::Point {
+                kind: PointKind::Designated,
+            }])
+        }
     );
     assert_eq!(record.occurred_at.consensus.value, year_date(1966)?);
     assert_eq!(
         record.designation.consensus.value,
-        Claimed::Of(BTreeSet::from(["national landmark".to_owned()]))
+        Claimed::Of {
+            values: BTreeSet::from(["national landmark".to_owned()])
+        }
     );
     Ok(())
 }
@@ -1004,13 +1017,17 @@ fn disagreeing_damage_cause_is_a_value_mode_conflict() -> TestResult {
     );
     assert_eq!(
         event.value.cause.consensus.value,
-        Claimed::Of(BTreeSet::new()),
+        Claimed::Of {
+            values: BTreeSet::new()
+        },
         "the consensus meet of disjoint singletons is empty"
     );
     // The extent records both claims.
     assert_eq!(
         event.value.cause.extent.value,
-        Claimed::Of(BTreeSet::from([DamageCause::Fire, DamageCause::Flood]))
+        Claimed::Of {
+            values: BTreeSet::from([DamageCause::Fire, DamageCause::Flood])
+        }
     );
     // The conflict propagates to the whole entity.
     assert_eq!(entity.conflict(), ConflictStatus::Conflict);
@@ -1102,7 +1119,7 @@ async fn shared_field_surfaces_the_connecting_glue() -> TestResult {
     let MergedClass { x, y } = merged_class(&store).await?;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
 
     // The construction-start field was asserted by both members, so its
     // support carries both ids and the connecting judgment is load-bearing.
@@ -1135,7 +1152,7 @@ async fn single_member_field_has_no_glue() -> TestResult {
     let MergedClass { x, .. } = merged_class(&store).await?;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
 
     // The name was asserted by one member only; no SameEntity edge fits
     // inside a single-id support set, so nothing is load-bearing for it.
@@ -1159,7 +1176,7 @@ async fn identity_root_accumulates_the_merge_judgment() -> TestResult {
     let MergedClass { x, y } = merged_class(&store).await?;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
 
     // The derived root summary is the ⊔ of the class's edge supports. The one
     // SameEntity edge is tagged symmetrically, so the root carries both
@@ -1180,7 +1197,7 @@ async fn judgment_citation_is_live_in_provenance() -> TestResult {
     let MergedClass { x, y } = merged_class(&store).await?;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let entity = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
 
     // `Citation::Judgment` reaches projected provenance only because the merge
     // no longer drops judgments: it lands on the `sameness` edge.

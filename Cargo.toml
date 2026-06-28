@@ -54,6 +54,9 @@ hex = "0.4"
 serde_jcs = "0.2"
 parking_lot = { version = "0.12", features = ["send_guard"] }
 
+# Structured logging
+tracing = "0.1"
+
 # Proc-macro authoring (chronoscope-macros)
 syn = "2"
 quote = "1"

@@ -390,8 +390,8 @@ fn optional_date<T: Semiring + Clone>(
     }
 }
 
-/// A value-mode bracket pinning one claimed value: `Claimed::Of({value})`. The
-/// whole value is the atom — two facts claiming different values meet to the
+/// A value-mode bracket pinning one claimed value: `Claimed::Of { values: {value} }`.
+/// The whole value is the atom — two facts claiming different values meet to the
 /// empty set, the over-determined conflict.
 fn claimed_of<A, T>(value: A, support: T) -> Bracket<Claimed<A>, T>
 where
@@ -399,5 +399,10 @@ where
     Claimed<A>: BoundedLattice,
     T: Semiring + Clone,
 {
-    Bracket::from((Claimed::Of(BTreeSet::from([value])), support))
+    Bracket::from((
+        Claimed::Of {
+            values: BTreeSet::from([value]),
+        },
+        support,
+    ))
 }

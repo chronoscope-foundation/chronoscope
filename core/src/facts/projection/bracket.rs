@@ -108,8 +108,8 @@ impl ConsensusConflict for UncertainDate {
 impl<A: Ord> ConsensusConflict for Claimed<A> {
     fn conflict(&self) -> ConflictStatus {
         match self {
-            Claimed::Of(values) if values.is_empty() => ConflictStatus::Conflict,
-            Claimed::Of(_) | Claimed::Any => ConflictStatus::Consistent,
+            Claimed::Of { values } if values.is_empty() => ConflictStatus::Conflict,
+            Claimed::Of { .. } | Claimed::Any => ConflictStatus::Consistent,
         }
     }
 }
@@ -154,7 +154,8 @@ mod laws {
 
     fn arb_claim() -> impl Strategy<Value = Claimed<u8>> {
         prop_oneof![
-            6 => prop::collection::btree_set(0u8..=6, 0..=4).prop_map(Claimed::Of),
+            6 => prop::collection::btree_set(0u8..=6, 0..=4)
+                .prop_map(|values| Claimed::Of { values }),
             1 => Just(Claimed::Any),
         ]
     }
@@ -195,9 +196,19 @@ mod laws {
         /// combining two disjoint value-mode claims does (the meet empties).
         #[test]
         fn disjoint_value_claims_conflict(x in 0u8..=6, y in 0u8..=6) {
-            let cx = B::from((Claimed::Of([x].into_iter().collect()), Lineage::one()));
+            let cx = B::from((
+                Claimed::Of {
+                    values: [x].into_iter().collect(),
+                },
+                Lineage::one(),
+            ));
             prop_assert_eq!(cx.conflict(), ConflictStatus::Consistent);
-            let cy = B::from((Claimed::Of([y].into_iter().collect()), Lineage::one()));
+            let cy = B::from((
+                Claimed::Of {
+                    values: [y].into_iter().collect(),
+                },
+                Lineage::one(),
+            ));
             let joined = cx.combine(cy);
             let expected = if x == y {
                 ConflictStatus::Consistent

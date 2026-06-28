@@ -170,7 +170,7 @@ mod laws {
 
     fn arb_value_slot() -> impl Strategy<Value = ValueSlot> {
         (prop::collection::btree_set(0u8..=4, 0..=3), arb_support())
-            .prop_map(|(claim, support)| Bracket::from((Claimed::Of(claim), support)))
+            .prop_map(|(values, support)| Bracket::from((Claimed::Of { values }, support)))
     }
 
     fn arb_map() -> impl Strategy<Value = Map> {
