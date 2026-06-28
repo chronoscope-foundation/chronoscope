@@ -59,7 +59,7 @@ derive_slot!(Bookend<T: Semiring>, { started_at, completed_at, location });
 /// possibly-uncertain bracket, so the honest shape is a product over an
 /// uncertain discriminant rather than a sum chosen up front.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventRecord<T> {
+pub struct Event<T> {
     /// The event's declared kind(s) — a single value once sources agree.
     pub kind: Bracket<Claimed<LifetimeEventKind>, T>,
     /// When a durational event started.
@@ -83,7 +83,7 @@ pub struct EventRecord<T> {
     pub descriptions: FactSet<String, T>,
 }
 
-derive_slot!(EventRecord<T: Semiring>, {
+derive_slot!(Event<T: Semiring>, {
     kind, started_at, completed_at, occurred_at, location,
     cause, method, usages, designation, descriptions
 });
@@ -157,7 +157,7 @@ where
 /// in `FactId` order — so this only matters to a consumer comparing projections
 /// built from different fact orders: compare those fields by denotation, not `==`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectedEntity<EntId: Ord, EvtId: Ord, T> {
+pub struct Entity<EntId: Ord, EvtId: Ord, T> {
     /// Name claims, deduped by triple, each with its validity window.
     pub names: FactMap<NameKey, NameRecord<T>, T>,
     /// Directed relationships: target entity → the coexisting relation kinds.
@@ -169,12 +169,12 @@ pub struct ProjectedEntity<EntId: Ord, EvtId: Ord, T> {
     /// The demolition bookend.
     pub demolition: Bookend<T>,
     /// Interior lifetime events, keyed by `SameEvent` class.
-    pub events: FactMap<EvtId, EventRecord<T>, T>,
+    pub events: FactMap<EvtId, Event<T>, T>,
     /// The class's `SameEntity` glue: each judgment's endpoint pair and support.
     /// The root summary and the per-field connecting edges derive from it.
     pub sameness: Sameness<EntId, T>,
 }
 
-derive_slot!(ProjectedEntity<EntId: Ord, EvtId: Ord, T: Semiring>, {
+derive_slot!(Entity<EntId: Ord, EvtId: Ord, T: Semiring>, {
     names, relations, refs, construction, demolition, events, sameness
 });

@@ -1,7 +1,7 @@
-//! Consumer-facing display projection.
+//! Consumer-facing typed projection.
 //!
-//! Flattens the lattice- and provenance-rich `ProjectedEntity` into a
-//! `DisplayEntity` DTO for read-side consumers: each restrictive field becomes a
+//! Flattens the lattice- and provenance-rich `projection::Entity` into an
+//! `Entity` DTO for read-side consumers: each restrictive field becomes a
 //! `Bounded` (the bracket read off as a settled value, a conflict, a pending
 //! verdict, or absent), each membership becomes an attributed value, and the
 //! interior events parse into a typed timeline.
@@ -26,10 +26,10 @@ use crate::facts::lifecycle::{
 use crate::facts::schema::EquivClass;
 use crate::location::{ConflictStatus, UnresolvedLocation};
 
-use super::bracket::{Bracket, ConsensusConflict};
-use super::provenance::{Citation, Cited, MemberLineage};
-use super::slot::{FactMap, FactSet};
-use super::types::{Bookend, EventRecord, NameKey, NameRecord, ProjectedEntity, Sameness};
+use crate::facts::projection::{
+    self, Bookend, Bracket, Citation, Cited, ConsensusConflict, FactMap, FactSet, MemberLineage,
+    NameKey, NameRecord, Sameness,
+};
 
 /// A value with the citations that attribute it — the additive-field mirror,
 /// where membership carries no consensus/extent split.
@@ -79,7 +79,7 @@ pub enum PendingReason {
 /// A name claim, flattened: the dedup triple plus its validity window and the
 /// citations behind its presence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DisplayName<ImgId> {
+pub struct Name<ImgId> {
     pub text: String,
     pub language: Language,
     pub name_type: NameType,
@@ -91,7 +91,7 @@ pub struct DisplayName<ImgId> {
 /// A directed relationship to a neighbor: the bare target id plus the relation
 /// kinds asserted, each attributed. Label resolution is a later ids→names pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DisplayRelation<EntId, ImgId> {
+pub struct Relation<EntId, ImgId> {
     pub other: EntId,
     pub kinds: Vec<Attributed<EntityRelationType, ImgId>>,
 }
@@ -104,7 +104,7 @@ pub struct Period<ImgId> {
     pub completed: Bounded<UncertainDate, ImgId>,
 }
 
-/// The flattened mirror of [`EventRecord`] (the semiring param removed), kept
+/// The flattened mirror of [`projection::Event`] (the semiring param removed), kept
 /// whole on an [`InteriorEvent::Ambiguous`] entry whose kind didn't settle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EventFacts<ImgId> {
@@ -205,25 +205,25 @@ pub struct MergeProvenance<EntId: Ord, ImgId> {
     pub bridges: Vec<MergeBridge<EntId, ImgId>>,
 }
 
-/// The display DTO for one entity: every restrictive field flattened to a
+/// The typed DTO for one entity: every restrictive field flattened to a
 /// [`Bounded`], every membership attributed, the interior events parsed into a
 /// sorted timeline, and the merge lineage surfaced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DisplayEntity<EntId: Ord, EvtId, ImgId> {
+pub struct Entity<EntId: Ord, EvtId, ImgId> {
     pub id: EntId,
-    pub names: Vec<DisplayName<ImgId>>,
-    pub relations: Vec<DisplayRelation<EntId, ImgId>>,
+    pub names: Vec<Name<ImgId>>,
+    pub relations: Vec<Relation<EntId, ImgId>>,
     pub external_refs: Vec<Attributed<ExternalReference, ImgId>>,
     pub location: Bounded<UnresolvedLocation, ImgId>,
     pub timeline: Vec<TimelineEntry<EvtId, ImgId>>,
-    pub depictions: Vec<DisplayDepiction<ImgId>>,
+    pub depictions: Vec<Depiction<ImgId>>,
     pub merged_from: MergeProvenance<EntId, ImgId>,
 }
 
 /// An image that depicts the entity. The id param threads the read-path image
 /// type through the DTO; depiction projection populates the fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DisplayDepiction<ImgId> {
+pub struct Depiction<ImgId> {
     _image: std::marker::PhantomData<ImgId>,
 }
 
@@ -232,7 +232,7 @@ pub struct DisplayDepiction<ImgId> {
 // ----------------------------------------------------------------------------
 
 /// Iterate a lineage's `(id, citation)` atoms, keep the citations, dedup. The
-/// id rode along to make cross-id glue computable in the projection; the display
+/// id rode along to make cross-id glue computable in the projection; the typed
 /// surface drops it.
 fn sources<EntId, ImgId>(support: &MemberLineage<EntId, ImgId>) -> Vec<Citation<ImgId>>
 where
@@ -315,50 +315,52 @@ where
 // The transform
 // ----------------------------------------------------------------------------
 
-/// Flatten a [`ProjectedEntity`] into its display DTO. Pure over the flat
-/// member-aware lineage; the `EquivClass` carries `mention_count = members.len()`.
-pub fn display<EntId, EvtId, ImgId>(
-    projected: &ProjectedEntity<EntId, EvtId, MemberLineage<EntId, ImgId>>,
-    class: &EquivClass<EntId>,
-) -> DisplayEntity<EntId, EvtId, ImgId>
+impl<EntId, EvtId, ImgId> Entity<EntId, EvtId, ImgId>
 where
     EntId: Ord + Clone,
     EvtId: Ord + Clone + std::fmt::Debug,
     ImgId: Ord + Clone,
 {
-    let names = display_names(&projected.names);
-    let relations = display_relations(&projected.relations);
-    let external_refs = projected
-        .refs
-        .iter()
-        .map(|(reference, entry)| factset(entry, reference.clone()))
-        .collect();
-    let timeline = timeline(projected);
-    let location = entity_location(&projected.construction.location, &timeline);
-    let merged_from = merge_provenance(&projected.sameness, class);
+    /// Flatten a [`projection::Entity`] into its typed DTO. Pure over the flat
+    /// member-aware lineage; the `EquivClass` carries `mention_count = members.len()`.
+    pub fn parse(
+        projected: &projection::Entity<EntId, EvtId, MemberLineage<EntId, ImgId>>,
+        class: &EquivClass<EntId>,
+    ) -> Self {
+        let names = display_names(&projected.names);
+        let relations = display_relations(&projected.relations);
+        let external_refs = projected
+            .refs
+            .iter()
+            .map(|(reference, entry)| factset(entry, reference.clone()))
+            .collect();
+        let timeline = timeline(projected);
+        let location = entity_location(&projected.construction.location, &timeline);
+        let merged_from = merge_provenance(&projected.sameness, class);
 
-    DisplayEntity {
-        id: class.representative.clone(),
-        names,
-        relations,
-        external_refs,
-        location,
-        timeline,
-        depictions: Vec::new(),
-        merged_from,
+        Self {
+            id: class.representative.clone(),
+            names,
+            relations,
+            external_refs,
+            location,
+            timeline,
+            depictions: Vec::new(),
+            merged_from,
+        }
     }
 }
 
 fn display_names<EntId, ImgId>(
     names: &FactMap<NameKey, NameRecord<MemberLineage<EntId, ImgId>>, MemberLineage<EntId, ImgId>>,
-) -> Vec<DisplayName<ImgId>>
+) -> Vec<Name<ImgId>>
 where
     EntId: Ord + Clone,
     ImgId: Ord + Clone,
 {
     names
         .iter()
-        .map(|(key, entry)| DisplayName {
+        .map(|(key, entry)| Name {
             text: key.name.as_str().to_owned(),
             language: key.language.clone(),
             name_type: key.name_type,
@@ -378,14 +380,14 @@ type ProjectedRelations<EntId, ImgId> = FactMap<
 
 fn display_relations<EntId, ImgId>(
     relations: &ProjectedRelations<EntId, ImgId>,
-) -> Vec<DisplayRelation<EntId, ImgId>>
+) -> Vec<Relation<EntId, ImgId>>
 where
     EntId: Ord + Clone,
     ImgId: Ord + Clone,
 {
     relations
         .iter()
-        .map(|(other, entry)| DisplayRelation {
+        .map(|(other, entry)| Relation {
             other: other.clone(),
             kinds: entry
                 .value
@@ -428,7 +430,9 @@ where
 }
 
 /// The flattened [`EventFacts`] of one event record.
-fn event_facts<EntId, ImgId>(record: &EventRecord<MemberLineage<EntId, ImgId>>) -> EventFacts<ImgId>
+fn event_facts<EntId, ImgId>(
+    record: &projection::Event<MemberLineage<EntId, ImgId>>,
+) -> EventFacts<ImgId>
 where
     EntId: Ord + Clone,
     ImgId: Ord + Clone,
@@ -463,7 +467,7 @@ fn settled_kind(consensus: &Consensus<Claimed<LifetimeEventKind>>) -> Option<Lif
 /// its log. `descriptions` is additive and rides every kind, so it sits outside
 /// this set.
 fn off_kind_fields<EntId, ImgId>(
-    record: &EventRecord<MemberLineage<EntId, ImgId>>,
+    record: &projection::Event<MemberLineage<EntId, ImgId>>,
     k: LifetimeEventKind,
 ) -> Vec<&'static str>
 where
@@ -514,7 +518,7 @@ where
 /// (`Reached { Of({k}) }`); every other shape routes to `Ambiguous` carrying the
 /// kind's extent as `candidates`.
 fn interior_event<EntId, EvtId, ImgId>(
-    record: &EventRecord<MemberLineage<EntId, ImgId>>,
+    record: &projection::Event<MemberLineage<EntId, ImgId>>,
     event_id: &EvtId,
 ) -> (InteriorEvent<ImgId>, Vec<Citation<ImgId>>)
 where
@@ -680,7 +684,7 @@ where
 /// Build the sorted timeline: construction first, demolition last, the interior
 /// events parsed and ordered by earliest known date with undated entries last.
 fn timeline<EntId, EvtId, ImgId>(
-    projected: &ProjectedEntity<EntId, EvtId, MemberLineage<EntId, ImgId>>,
+    projected: &projection::Entity<EntId, EvtId, MemberLineage<EntId, ImgId>>,
 ) -> Vec<TimelineEntry<EvtId, ImgId>>
 where
     EntId: Ord + Clone,
@@ -879,8 +883,8 @@ mod tests {
     }
 
     /// A minimal empty event record — every slot untouched.
-    fn empty_event() -> Result<EventRecord<Lin>, Box<dyn std::error::Error>> {
-        Ok(EventRecord {
+    fn empty_event() -> Result<projection::Event<Lin>, Box<dyn std::error::Error>> {
+        Ok(projection::Event {
             kind: untouched(),
             started_at: untouched(),
             completed_at: untouched(),
@@ -903,8 +907,8 @@ mod tests {
     }
 
     /// An entity with empty everything — the per-test base to populate.
-    fn empty_entity() -> ProjectedEntity<EntId, EvtId, Lin> {
-        ProjectedEntity {
+    fn empty_entity() -> projection::Entity<EntId, EvtId, Lin> {
+        projection::Entity {
             names: FactMap::new(),
             relations: FactMap::new(),
             refs: FactMap::new(),
@@ -1028,7 +1032,7 @@ mod tests {
     #[test]
     fn settled_kind_with_off_kind_field_routes_to_ambiguous() -> TestResult {
         // A Damaged event whose record also carries a `method` claim — a slot
-        // Damaged never reads. Submit forbids this; the display must route it to
+        // Damaged never reads. Submit forbids this; the typed projection must route it to
         // Ambiguous so the stray claim stays visible instead of being dropped.
         let mut record = empty_event()?;
         record.kind = date_kind(
@@ -1144,7 +1148,7 @@ mod tests {
         );
         entity.events.insert(1, cited(record, lin(1, "https://k")?));
 
-        let out = display::<EntId, EvtId, ImgId>(&entity, &solo_class(1));
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         let entry = out
             .timeline
             .iter()
@@ -1171,7 +1175,7 @@ mod tests {
     #[test]
     fn unmerged_entity_is_single_mention_no_bridges() -> TestResult {
         let entity = empty_entity();
-        let out = display::<EntId, EvtId, ImgId>(&entity, &solo_class(7));
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(7));
         assert_eq!(
             out.merged_from.mention_count,
             NonZeroUsize::MIN,
@@ -1195,7 +1199,7 @@ mod tests {
             representative: 1,
             members: [1, 2].into_iter().collect(),
         };
-        let out = display::<EntId, EvtId, ImgId>(&entity, &class);
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &class);
         assert_eq!(out.merged_from.mention_count.get(), 2);
         assert_eq!(out.merged_from.bridges.len(), 1);
         let bridge = out.merged_from.bridges.first().ok_or("no bridge")?;
@@ -1224,7 +1228,7 @@ mod tests {
         moved.location = claim(moved_to.clone(), lin(1, "https://m")?);
         entity.events.insert(10, cited(moved, lin(1, "https://m")?));
 
-        let out = display::<EntId, EvtId, ImgId>(&entity, &solo_class(1));
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         assert_eq!(
             out.location.possible, moved_to,
             "the move destination wins over the construction location"
@@ -1237,7 +1241,7 @@ mod tests {
         let mut entity = empty_entity();
         let built = resolved_point(41.0, 12.0)?;
         entity.construction.location = claim(built.clone(), lin(1, "https://built")?);
-        let out = display::<EntId, EvtId, ImgId>(&entity, &solo_class(1));
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         assert_eq!(out.location.possible, built);
         Ok(())
     }
@@ -1274,7 +1278,7 @@ mod tests {
             .events
             .insert(11, cited(move_late, lin(1, "https://l")?));
 
-        let out = display::<EntId, EvtId, ImgId>(&entity, &solo_class(1));
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         assert_eq!(
             out.location.possible, late,
             "the later move's destination is the entity location"
@@ -1313,7 +1317,7 @@ mod tests {
             .events
             .insert(11, cited(move_undated, lin(1, "https://u")?));
 
-        let out = display::<EntId, EvtId, ImgId>(&entity, &solo_class(1));
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         assert_eq!(
             out.location.possible, dated,
             "a dated move wins over an undated one"
@@ -1326,7 +1330,7 @@ mod tests {
     /// Build a designated point event at a given year (or undated).
     fn designated_event(
         year_opt: Option<i32>,
-    ) -> Result<EventRecord<Lin>, Box<dyn std::error::Error>> {
+    ) -> Result<projection::Event<Lin>, Box<dyn std::error::Error>> {
         let mut record = empty_event()?;
         record.kind = date_kind(
             LifetimeEventKind::Point {
@@ -1355,7 +1359,7 @@ mod tests {
             cited(designated_event(Some(1900))?, lin(1, "https://p")?),
         );
 
-        let out = display::<EntId, EvtId, ImgId>(&entity, &solo_class(1));
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         let kinds: Vec<&str> = out
             .timeline
             .iter()
@@ -1407,7 +1411,7 @@ mod tests {
                 lin(1, "https://n")?,
             ),
         );
-        let out = display::<EntId, EvtId, ImgId>(&entity, &solo_class(1));
+        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         let name = out.names.first().ok_or("no name")?;
         assert_eq!(name.text, "Pantheon");
         assert_eq!(

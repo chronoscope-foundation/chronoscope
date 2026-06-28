@@ -32,7 +32,7 @@
 //! we're choosing between keeping bundled durationals (current shape) and
 //! splitting them into flat `Start`/`End` records linked by an identifier.
 //! The design discussion is tracked outside the repo. Whichever way that
-//! decision lands, the projection consumers (display, consistency, solver)
+//! decision lands, the projection consumers (typed, consistency, solver)
 //! should be mostly stable — only [`decompose`] needs to change.
 
 use std::cmp::Reverse;

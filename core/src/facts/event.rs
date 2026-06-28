@@ -324,7 +324,7 @@ impl<EntId: Ord, EvtId: Ord> Fact<EntId, EvtId> {
 
 /// The payload categories an event fact carries, each admitting the lifetime
 /// event kind(s) it suits. One source of the payload→kinds rule: the submit
-/// kind typecheck reads it through [`Fact::kind_constraints`], and the display
+/// kind typecheck reads it through [`Fact::kind_constraints`], and the typed
 /// off-kind guard reads it directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EventPayload {

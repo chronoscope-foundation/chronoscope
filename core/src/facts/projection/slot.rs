@@ -116,7 +116,7 @@ where
 /// verdict. Product of monoids is a monoid; this is that theorem, mechanized.
 ///
 /// Each generic parameter carries a single trait bound, so the macro spans both
-/// the single-`Semiring` records and the multi-parameter [`ProjectedEntity`]
+/// the single-`Semiring` records and the multi-parameter [`Entity`]
 /// (`EntId: Ord, EvtId: Ord, T: Semiring`) over the one impl shape.
 macro_rules! derive_slot {
     ($ty:ident<$($g:ident: $bound:path),+ $(,)?>, { $($field:ident),+ $(,)? }) => {

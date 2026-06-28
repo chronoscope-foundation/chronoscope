@@ -12,23 +12,17 @@
 //! collapses to ⊥ under over-determination, surfaced through [`Slot::conflict`].
 
 mod bracket;
-mod display;
 mod merge;
 mod provenance;
 mod slot;
 mod types;
 
 pub use bracket::{Bracket, ConsensusConflict, MAX_PROJECTED_LOCATION_CIRCLES};
-pub use display::{
-    Attributed, Bounded, Consensus, DisplayDepiction, DisplayEntity, DisplayName, DisplayRelation,
-    EventDetail, EventFacts, InteriorEvent, MergeBridge, MergeProvenance, PendingReason, Period,
-    TimelineEntry, display,
-};
 pub use provenance::{Citation, Cited, MemberLineage};
 pub use slot::{FactMap, FactSet, Slot};
 pub use types::{
-    Bookend, EventRecord, GlueEdge, NameKey, NameRecord, ProjectedEntity, Sameness,
-    connecting_glue, sameness_summary,
+    Bookend, Entity, Event, GlueEdge, NameKey, NameRecord, Sameness, connecting_glue,
+    sameness_summary,
 };
 
 use std::collections::BTreeMap;
@@ -54,7 +48,7 @@ where
     Lineage::Of([(id.clone(), citation.clone())].into_iter().collect())
 }
 
-/// Project an entity's `SameEntity` class as a [`ProjectedEntity`] over the
+/// Project an entity's `SameEntity` class as an [`Entity`] over the
 /// `provenance` closure's semiring, returning the resolved [`EquivClass`]
 /// beside it.
 ///
@@ -66,20 +60,14 @@ where
 /// interior event. All reads are snapshot-scoped and active-only, so the
 /// projection carries no retraction logic of its own.
 ///
-/// Handing the class back lets a caller thread it straight into the display
+/// Handing the class back lets a caller thread it straight into the typed
 /// transform, sparing a second `entity_class` read — one resolution covers the
 /// representative, the mention count, and the projection.
 pub async fn project_entity<S, V, T>(
     view: &V,
     entity_id: S::EntityId,
     provenance: impl Fn(&S::EntityId, &Citation<S::ImageId>) -> T,
-) -> Result<
-    (
-        EquivClass<S::EntityId>,
-        ProjectedEntity<S::EntityId, S::EventId, T>,
-    ),
-    S::Error,
->
+) -> Result<(EquivClass<S::EntityId>, Entity<S::EntityId, S::EventId, T>), S::Error>
 where
     S: FactStore,
     V: EntityView<S> + EventView<S> + Sync,

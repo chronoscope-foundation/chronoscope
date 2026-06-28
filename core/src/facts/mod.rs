@@ -134,5 +134,6 @@ pub mod schema;
 pub mod spatial;
 pub mod store;
 pub mod submit;
+pub mod typed;
 #[cfg(test)]
 mod wire_goldens;

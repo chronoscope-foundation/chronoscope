@@ -187,7 +187,7 @@ async fn submit(
 /// Look up a name entry's value record by language, for assertions that don't
 /// care about the full key.
 fn name_by_language<'e>(
-    entity: &'e ProjectedEntity<MemEntId, MemEvtId, Lin>,
+    entity: &'e Entity<MemEntId, MemEvtId, Lin>,
     language: &str,
 ) -> Option<(&'e NameKey, &'e Cited<NameRecord<Lin>, Lin>)> {
     entity
@@ -738,7 +738,7 @@ fn has_event_stored(
 /// Project a hand-built fact map through the member-aware lineage fold, the same
 /// merge the entity entry point runs. The reacher map comes from the `HasEvent`
 /// facts in the bag, exactly as the entry point derives it.
-fn project(facts: &BTreeMap<FactId, StoredEventFact>) -> ProjectedEntity<MemEntId, MemEvtId, Lin> {
+fn project(facts: &BTreeMap<FactId, StoredEventFact>) -> Entity<MemEntId, MemEvtId, Lin> {
     project_facts(facts, &event_reachers(facts), member_lineage)
 }
 

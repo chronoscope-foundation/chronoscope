@@ -16,7 +16,7 @@ use crate::algebra::monoid::CommutativeMonoid;
 /// A claim over a domain `A`: either an explicit set of asserted values or the
 /// symbolic top ⊤ ([`Any`](Claimed::Any)).
 ///
-/// The display projection serializes this into the read-side surface — the
+/// The typed projection serializes this into the read-side surface — the
 /// settled-value wart (a singleton `Of { values: {x} }`) and `Any` reach the
 /// consumer as the value lattice. The derived `Serialize` tags each variant with
 /// an internal `"type"` field (`of` / `any`) for the grammar's uniform

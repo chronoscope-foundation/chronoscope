@@ -31,7 +31,7 @@ use crate::facts::submit::StoredFact;
 
 use super::bracket::Bracket;
 use super::provenance::{Citation, Cited};
-use super::types::{Bookend, EventRecord, NameKey, NameRecord, ProjectedEntity};
+use super::types::{Bookend, Entity, Event, NameKey, NameRecord};
 
 /// The citation a single fact warrants, when it warrants one. A meta fact backs
 /// no value, so it cites nothing.
@@ -77,7 +77,7 @@ where
     reachers
 }
 
-/// Merge an entity's facts into a [`ProjectedEntity`]. The generic fold over the
+/// Merge an entity's facts into a [`Entity`]. The generic fold over the
 /// product of slots, with provenance carried by the semiring `T`.
 ///
 /// `provenance` lifts a `(source id, citation)` pair into the semiring. The
@@ -93,7 +93,7 @@ pub(crate) fn project_facts<EntId, EvtId, ImgId, T>(
     facts: &BTreeMap<FactId, StoredFact<EntId, EvtId, ImgId>>,
     reachers: &BTreeMap<EvtId, EntId>,
     provenance: impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> ProjectedEntity<EntId, EvtId, T>
+) -> Entity<EntId, EvtId, T>
 where
     EntId: Ord + Clone,
     EvtId: Ord + Clone,
@@ -104,7 +104,7 @@ where
         .values()
         .map(|fact| inject(fact, reachers, &provenance))
         .fold(
-            <ProjectedEntity<EntId, EvtId, T> as CommutativeMonoid>::identity(),
+            <Entity<EntId, EvtId, T> as CommutativeMonoid>::identity(),
             CommutativeMonoid::combine,
         )
 }
@@ -117,7 +117,7 @@ fn inject<EntId, EvtId, ImgId, T>(
     fact: &StoredFact<EntId, EvtId, ImgId>,
     reachers: &BTreeMap<EvtId, EntId>,
     provenance: &impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> ProjectedEntity<EntId, EvtId, T>
+) -> Entity<EntId, EvtId, T>
 where
     EntId: Ord + Clone,
     EvtId: Ord + Clone,
@@ -127,17 +127,17 @@ where
     match fact {
         StoredFact::Factual(f) => {
             let Some(citation) = citation_of(fact) else {
-                return ProjectedEntity::identity();
+                return Entity::identity();
             };
             inject_factual(&f.assertion, reachers, &citation, provenance)
         }
         StoredFact::Judgment(j) => {
             let Some(citation) = citation_of(fact) else {
-                return ProjectedEntity::identity();
+                return Entity::identity();
             };
             inject_judgment(&j.assertion, &citation, provenance)
         }
-        StoredFact::Meta(_) => ProjectedEntity::identity(),
+        StoredFact::Meta(_) => Entity::identity(),
     }
 }
 
@@ -149,7 +149,7 @@ fn inject_factual<EntId, EvtId, ImgId, T>(
     reachers: &BTreeMap<EvtId, EntId>,
     citation: &Citation<ImgId>,
     provenance: &impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> ProjectedEntity<EntId, EvtId, T>
+) -> Entity<EntId, EvtId, T>
 where
     EntId: Ord + Clone,
     EvtId: Ord + Clone,
@@ -159,29 +159,29 @@ where
     match assertion {
         FactualAssertion::Attribute { fact } => {
             let support = provenance(fact.subject(), citation);
-            let mut entity = ProjectedEntity::identity();
+            let mut entity = Entity::identity();
             inject_attribute(fact, support, &mut entity);
             entity
         }
         FactualAssertion::Construction { fact } => {
             let support = provenance(fact.subject(), citation);
-            let mut entity = ProjectedEntity::identity();
+            let mut entity = Entity::identity();
             inject_bookend(fact, support, &mut entity.construction);
             entity
         }
         FactualAssertion::Demolition { fact } => {
             let support = provenance(fact.subject(), citation);
-            let mut entity = ProjectedEntity::identity();
+            let mut entity = Entity::identity();
             inject_bookend(fact, support, &mut entity.demolition);
             entity
         }
         FactualAssertion::Event { fact } => inject_event_fact(fact, reachers, citation, provenance),
         // A gap is an ordering relationship, not a single subject's field.
-        FactualAssertion::Gap { .. } => ProjectedEntity::identity(),
+        FactualAssertion::Gap { .. } => Entity::identity(),
         // Image facts feed the sibling image projection, not an entity field.
         FactualAssertion::Image { .. }
         | FactualAssertion::Picture { .. }
-        | FactualAssertion::Map { .. } => ProjectedEntity::identity(),
+        | FactualAssertion::Map { .. } => Entity::identity(),
     }
 }
 
@@ -194,7 +194,7 @@ fn inject_judgment<EntId, EvtId, ImgId, T>(
     assertion: &JudgmentAssertion<EntId, EvtId, ImgId>,
     citation: &Citation<ImgId>,
     provenance: &impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> ProjectedEntity<EntId, EvtId, T>
+) -> Entity<EntId, EvtId, T>
 where
     EntId: Ord + Clone,
     EvtId: Ord + Clone,
@@ -205,10 +205,10 @@ where
         fact: identity::Fact::SameEntity { pair },
     } = assertion
     else {
-        return ProjectedEntity::identity();
+        return Entity::identity();
     };
     let support = provenance(pair.a(), citation).plus(provenance(pair.b(), citation));
-    let mut entity = ProjectedEntity::identity();
+    let mut entity = Entity::identity();
     entity
         .sameness
         .insert(pair.clone(), Cited { value: (), support });
@@ -218,7 +218,7 @@ where
 fn inject_attribute<EntId, EvtId, T>(
     fact: &attribute::Fact<EntId>,
     support: T,
-    entity: &mut ProjectedEntity<EntId, EvtId, T>,
+    entity: &mut Entity<EntId, EvtId, T>,
 ) where
     EntId: Ord + Clone,
     EvtId: Ord,
@@ -300,7 +300,7 @@ fn inject_event_fact<EntId, EvtId, ImgId, T>(
     reachers: &BTreeMap<EvtId, EntId>,
     citation: &Citation<ImgId>,
     provenance: &impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> ProjectedEntity<EntId, EvtId, T>
+) -> Entity<EntId, EvtId, T>
 where
     EntId: Ord + Clone,
     EvtId: Ord + Clone,
@@ -308,10 +308,10 @@ where
     T: Semiring + Clone,
 {
     let Some(owner) = reachers.get(fact.subject()) else {
-        return ProjectedEntity::identity();
+        return Entity::identity();
     };
     let support = provenance(owner, citation);
-    let mut entity = ProjectedEntity::identity();
+    let mut entity = Entity::identity();
     inject_event(fact, support, &mut entity);
     entity
 }
@@ -319,13 +319,13 @@ where
 fn inject_event<EntId, EvtId, T>(
     fact: &event::Fact<EntId, EvtId>,
     support: T,
-    entity: &mut ProjectedEntity<EntId, EvtId, T>,
+    entity: &mut Entity<EntId, EvtId, T>,
 ) where
     EntId: Ord,
     EvtId: Ord + Clone,
     T: Semiring + Clone,
 {
-    let mut record = EventRecord::identity();
+    let mut record = Event::identity();
     match fact {
         event::Fact::HasEvent { kind, .. } => {
             record.kind = claimed_of(*kind, support.clone());
