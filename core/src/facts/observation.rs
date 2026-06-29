@@ -14,9 +14,8 @@
 //! rejects at submit time — bugs in caller code, not outside-world uncertainty.
 //!
 //! - **Missing depiction pairing.** Every entity referenced inside an
-//!   observation fact must also have a
-//!   [`crate::facts::depiction::Fact::InPicture`] or
-//!   [`crate::facts::depiction::Fact::OnMap`] fact tying it to the image the
+//!   observation fact must also have a [`crate::facts::depiction::Fact`] tying it
+//!   to the image the
 //!   observation was made against. An observation describes a feature or
 //!   relation seen in an image, so the entity reference is meaningless without
 //!   the depiction link. The two facts typically arrive in the same commit; the

@@ -14,9 +14,8 @@
 //! flavors.
 //!
 //! Two omissions: bare co-presence ("both visible in the same image") is
-//! derivable from two [`crate::facts::depiction::Fact::InPicture`] /
-//! [`crate::facts::depiction::Fact::OnMap`] facts sharing an image; and
-//! viewpoint-dependent occlusion is deferred until a use case demands it (its
+//! derivable from two [`crate::facts::depiction::Fact`] facts sharing an image;
+//! and viewpoint-dependent occlusion is deferred until a use case demands it (its
 //! home would be a separate observation variant carrying the image).
 //!
 //! Metric reasoning (distances, coordinates) isn't here — topology comes from

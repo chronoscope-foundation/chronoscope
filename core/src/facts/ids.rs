@@ -316,10 +316,10 @@ string_id_newtype! {
     /// different `ImageId`s; perceptual equivalence between them is
     /// asserted via `identity::Fact::SameArtifact`.
     ///
-    /// "Picture" (photograph / painting / drawing) and "map" are role-claims
-    /// layered on top of an `ImageId` via `picture::Fact::IsPicture` and
-    /// `map::Fact::IsMap` — facts that can be asserted, retracted, or
-    /// superseded, not type-level properties of the image.
+    /// "Picture" (photograph / painting / drawing) and "map" describe a medium,
+    /// not a type-level property of the image. The medium rides on the
+    /// non-gating `image::Fact::Medium` field; every other image fact applies
+    /// regardless.
     ImageId
 }
 

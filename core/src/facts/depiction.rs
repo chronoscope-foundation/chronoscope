@@ -1,71 +1,71 @@
 //! Depiction cluster — entity-in-image localization judgments.
 //!
 //! Cluster module for the `Depiction` variant of
-//! [`crate::facts::assertions::JudgmentAssertion`]. Holds the in-picture and
-//! on-map depiction shapes, plus the [`Perspective`] view-classification enum
-//! the in-picture variant carries.
+//! [`crate::facts::assertions::JudgmentAssertion`]. One depiction concept ties an
+//! entity to an image, carrying optional image-space localization and optional
+//! [`Perspective`] view-classification.
 //!
-//! Classification ([`Perspective`]) and localization (the depicting fact's
-//! `region` / `geometry` field) are independent axes. Ingestion paths provide
-//! them independently: a Wikidata P18 image fact arrives with `Unknown`
-//! perspective and no region; a VLM classifier may produce a perspective tag, a
-//! region, or both; a human curator may tag the view kind without drawing a
-//! bbox.
+//! Classification ([`Perspective`]) and localization (the `localization`
+//! field) are independent axes. Ingestion paths provide them
+//! independently: a Wikidata P18 image fact arrives with neither; a VLM
+//! analysis may produce a perspective tag, a localization, or both; a human
+//! curator may tag the view kind without drawing a region.
 //!
-//! `InPicture` and `OnMap` both reference an [`ImgId`] (image identifier) and
-//! differ in what spatial annotation they carry — pixel-precise [`ImageRegion`]
-//! for pictures, georeferenced [`SpatialGeometry`] (polyline-capable) for maps.
+//! `localization` is an [`ImageGeometry`] — a mask, a bbox, or a proportional
+//! polyline, all anchored to the image's own pixel / proportional frame. A trace
+//! on a map sheet is authored once, in image space; its geographic rendering is
+//! derived later by running the trace through the image's projection.
 //!
-//! # Error states (rejected at submit time)
-//!
-//! Combinations the grammar permits structurally but the fact-store layer
-//! rejects at submit time — bugs in caller code, not outside-world uncertainty.
-//!
-//! - **Variant / role mismatch.** [`Fact::InPicture`] must reference an image
-//!   carrying a [`crate::facts::picture::Fact::IsPicture`] role-claim (or none
-//!   yet); [`Fact::OnMap`] must reference an image carrying a
-//!   [`crate::facts::map::Fact::IsMap`] role-claim (or none yet). A depiction
-//!   whose variant contradicts an already-asserted role is malformed, not a
-//!   disagreement to resolve.
+//! Relative entity positions and an image's orientation are planned, design
+//! pending: single-image 3D reconstruction yields the relative positions of the
+//! entities in an image even with no absolute coordinates, and the image's pose
+//! gives its orientation. The grammar will hold a future photogrammetry solver's
+//! output; the solver is deferred.
 //!
 //! # Conflicts (surfaced at projection time)
 //!
-//! - **Disagreement on perspective or region.** Two `InPicture` facts on the
+//! - **Disagreement on perspective or localization.** Two depictions on the
 //!   same entity-image pair with different `Perspective` values or incompatible
-//!   region geometries surface as user-resolvable conflicts. Sources sometimes
-//!   classify the same image differently (an interior shot misread as exterior,
-//!   or two bboxes bounding the same building tightly vs loosely); the
-//!   projection preserves both for human review.
+//!   geometries surface as user-resolvable conflicts. Sources sometimes classify
+//!   the same image differently (an interior shot misread as exterior, or two
+//!   bboxes bounding the same building tightly vs loosely); the projection
+//!   preserves both for human review.
 
 use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::facts::geometry::{ImageRegion, SpatialGeometry};
+use crate::facts::geometry::ImageGeometry;
 
-/// View or framing classification of a picture relative to its
+/// View or framing classification of a depiction relative to its
 /// depicted entity.
 ///
-/// `Unknown` is the pre-analysis default for sources that don't
-/// differentiate views (e.g. a generic Wikidata P18 image fact). Once
-/// a downstream worker (VLM or human) classifies the image, the
-/// perspective tightens to `Exterior` or `Interior`. The localization
-/// axis — *where* in the frame the entity sits — is independent and
-/// lives on the depicting assertion as a sibling `region` field.
+/// A binary axis with no pre-analysis default — absence is structural, carried
+/// by the depicting fact's `Option<Perspective>`. Once a downstream worker (VLM
+/// or human) classifies the image, the perspective settles to `Exterior` or
+/// `Interior`. The localization axis — *where* in the frame the entity sits — is
+/// independent and lives on the depicting fact as a sibling field.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Perspective {
-    /// View not yet classified, or unspecified by the source.
-    Unknown,
     /// Exterior elevation.
     Exterior,
     /// Interior view.
     Interior,
 }
 
-/// Depiction-cluster fact.
+/// Depiction-cluster fact — one entity↔image depiction.
+///
+/// The entity appears in the image; the optional `localization` says where in
+/// the image's own frame, and the optional `perspective` classifies the view.
+/// The two annotation axes are independent — ingestion paths may supply either,
+/// both, or neither, and a later fact refines a bare depiction.
+///
+/// A single grammar struct (a product): the
+/// [`crate::facts::assertions::JudgmentAssertion::Depiction`] wrapper already
+/// tags it, so the inner fact needs no tag of its own.
 ///
 /// Generic over the entity and image reference types.
 #[grammar_type]
@@ -75,42 +75,23 @@ pub enum Perspective {
     deserialize = "EntId: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
 ))]
 #[schemars(bound = "EntId: ::schemars::JsonSchema, ImgId: ::schemars::JsonSchema")]
-pub enum Fact<EntId, ImgId> {
-    /// The entity appears in this picture (pictorial-role image). The
-    /// perspective classifies the view (interior / exterior / unknown);
-    /// the optional region localizes where in the frame the entity sits.
-    /// The two axes are independent — ingestion paths may provide
-    /// either, both, or neither.
-    InPicture {
-        entity: EntId,
-        /// Should carry a `picture::Fact::IsPicture` role-claim.
-        image: ImgId,
-        perspective: Perspective,
-        /// Where in the frame the entity appears, when known.
-        region: Option<ImageRegion>,
-    },
-    /// The entity appears on this map (map-role image), optionally with
-    /// a geometry (region mask or polyline) showing where on the sheet
-    /// it lies.
-    OnMap {
-        entity: EntId,
-        /// Should carry a `map::Fact::IsMap` role-claim.
-        image: ImgId,
-        /// The on-sheet geometry, when traced.
-        geometry: Option<SpatialGeometry>,
-    },
+pub struct Fact<EntId, ImgId> {
+    /// The depicted entity.
+    pub entity: EntId,
+    /// The image the entity appears in.
+    pub image: ImgId,
+    /// Where in the image the entity sits, when localized.
+    pub localization: Option<ImageGeometry>,
+    /// The view classification, when a source supplies one.
+    pub perspective: Option<Perspective>,
 }
 
 impl<EntId, ImgId> Fact<EntId, ImgId> {
     /// Visit every id this fact mentions, dispatching to the closure for
     /// the id's kind. Entity before image, matching the field order.
     pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId), fi: &mut impl FnMut(&ImgId)) {
-        match self {
-            Self::InPicture { entity, image, .. } | Self::OnMap { entity, image, .. } => {
-                fe(entity);
-                fi(image);
-            }
-        }
+        fe(&self.entity);
+        fi(&self.image);
     }
 
     /// Relabel every id through the kind-matching fallible closure,
@@ -120,27 +101,11 @@ impl<EntId, ImgId> Fact<EntId, ImgId> {
         fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
         fi: &mut impl FnMut(&ImgId) -> Result<I2, Err>,
     ) -> Result<Fact<E2, I2>, Err> {
-        match self {
-            Self::InPicture {
-                entity,
-                image,
-                perspective,
-                region,
-            } => Ok(Fact::InPicture {
-                entity: fe(entity)?,
-                image: fi(image)?,
-                perspective: *perspective,
-                region: region.clone(),
-            }),
-            Self::OnMap {
-                entity,
-                image,
-                geometry,
-            } => Ok(Fact::OnMap {
-                entity: fe(entity)?,
-                image: fi(image)?,
-                geometry: geometry.clone(),
-            }),
-        }
+        Ok(Fact {
+            entity: fe(&self.entity)?,
+            image: fi(&self.image)?,
+            localization: self.localization.clone(),
+            perspective: self.perspective,
+        })
     }
 }

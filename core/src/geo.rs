@@ -5,9 +5,6 @@
 //! up.
 //!
 //! - [`GeoPoint`] is a validated 2D `(lat, lon)` point in WGS-84 degrees.
-//! - [`Polyline`] is a sequence of `>=2` [`GeoPoint`]s, for traced linear
-//!   features on maps (roads, paths, boundaries) where a region shape doesn't
-//!   fit.
 //! - [`Bbox`] is an axis-aligned bounding box built from two [`GeoPoint`]s.
 //! - [`Meters`] is a meter-valued scalar — a distance or radius on the sphere.
 //! - [`SpherePoint`] / [`SphereCap`] are the compute-side spherical primitives:
@@ -157,77 +154,6 @@ impl std::fmt::Display for GeoPointError {
 }
 
 impl std::error::Error for GeoPointError {}
-
-// ============================================================================
-// Polyline
-// ============================================================================
-
-/// A polyline defined by a sequence of `>=2` 2D geo-points.
-///
-/// Used for traced linear features on maps (roads, paths, parcel
-/// boundaries) where a region mask is the wrong shape. The smart
-/// constructor [`Polyline::new`] enforces the minimum-point invariant at
-/// the parse boundary; the typed interior trusts the value.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
-pub struct Polyline {
-    points: Vec<GeoPoint>,
-}
-
-impl Polyline {
-    /// Construct a polyline from an ordered sequence of geo-points.
-    /// Rejects sequences with fewer than two points.
-    pub fn new(points: Vec<GeoPoint>) -> Result<Self, PolylineError> {
-        if points.len() < 2 {
-            return Err(PolylineError::TooFewPoints {
-                count: points.len(),
-            });
-        }
-        Ok(Self { points })
-    }
-
-    /// The points making up this polyline, in order.
-    pub fn points(&self) -> &[GeoPoint] {
-        &self.points
-    }
-}
-
-impl<'de> Deserialize<'de> for Polyline {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Raw {
-            points: Vec<GeoPoint>,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        Polyline::new(raw.points).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Errors from [`Polyline::new`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PolylineError {
-    /// Fewer than two points were supplied; a polyline requires at least
-    /// two points to define a segment.
-    TooFewPoints {
-        /// The number of points actually supplied.
-        count: usize,
-    },
-}
-
-impl std::fmt::Display for PolylineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooFewPoints { count } => {
-                write!(f, "polyline requires at least 2 points, got {count}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PolylineError {}
 
 // ============================================================================
 // Bbox
@@ -582,48 +508,6 @@ mod tests {
             std::cmp::Ordering::Equal,
             "equal points must order Equal"
         );
-        Ok(())
-    }
-
-    // --- Polyline tests ---
-
-    #[test]
-    fn polyline_rejects_zero_points() {
-        assert_eq!(
-            Polyline::new(Vec::new()),
-            Err(PolylineError::TooFewPoints { count: 0 })
-        );
-    }
-
-    #[test]
-    fn polyline_rejects_single_point() -> TestResult {
-        let p = GeoPoint::new(0.0, 0.0)?;
-        assert_eq!(
-            Polyline::new(vec![p]),
-            Err(PolylineError::TooFewPoints { count: 1 })
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn polyline_deserialize_rejects_short() {
-        let result: Result<Polyline, _> = serde_json::from_str(r#"{"points":[{"lat":0,"lon":0}]}"#);
-        assert!(
-            result.is_err(),
-            "single-point polyline must fail at deserialize"
-        );
-    }
-
-    #[test]
-    fn polyline_round_trips_with_points_preserved() -> TestResult {
-        let pl = Polyline::new(vec![
-            GeoPoint::new(1.0, 2.0)?,
-            GeoPoint::new(3.0, 4.0)?,
-            GeoPoint::new(5.0, 6.0)?,
-        ])?;
-        let json = serde_json::to_string(&pl)?;
-        let parsed: Polyline = serde_json::from_str(&json)?;
-        assert_eq!(parsed.points(), pl.points());
         Ok(())
     }
 

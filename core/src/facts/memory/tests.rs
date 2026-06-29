@@ -18,8 +18,7 @@ use crate::facts::submit::{
     Commit as SubmitBundle, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact,
 };
 use crate::facts::submit::{
-    CommitAuthor, DateRole, ImageRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError,
-    commit_facts,
+    CommitAuthor, DateRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError, commit_facts,
 };
 use crate::geo::{GeoPoint, Meters};
 use crate::location::{Location, LocationReference, UnresolvedLocation};
@@ -231,12 +230,26 @@ fn event_description_fact(event_idx: usize) -> Result<SubmitFact, Box<dyn std::e
     })
 }
 
-/// An image-touching `IsPicture` role-claim fact for the given image index.
-fn is_picture_fact(image_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+/// An image-touching `Medium` fact tagging the image as a picture.
+fn medium_picture_fact(image_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
-        assertion: FactualAssertion::Picture {
-            fact: crate::facts::picture::Fact::IsPicture {
+        assertion: FactualAssertion::Image {
+            fact: crate::facts::image::Fact::Medium {
                 image: ImageIdx(image_idx),
+                medium: crate::facts::image::ImageMedium::Picture,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// An image-touching `Medium` fact tagging the image as a map.
+fn map_medium_fact(image_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Image {
+            fact: crate::facts::image::Fact::Medium {
+                image: ImageIdx(image_idx),
+                medium: crate::facts::image::ImageMedium::Map,
             },
         },
         citation: sample_citation()?,
@@ -250,8 +263,8 @@ fn captured_date_fact(image_idx: usize) -> Result<SubmitFact, Box<dyn std::error
         DatePrecision::Year,
     )?;
     Ok(SubmitFact::Factual {
-        assertion: FactualAssertion::Picture {
-            fact: crate::facts::picture::Fact::CapturedDate {
+        assertion: FactualAssertion::Image {
+            fact: crate::facts::image::Fact::CapturedDate {
                 image: ImageIdx(image_idx),
                 bound,
             },
@@ -407,9 +420,10 @@ async fn assert_idx_out_of_range(
             events: Vec::new(),
             images: (0..decl_count).map(|_| Decl::Local).collect(),
             facts: [SubmitFact::Factual {
-                assertion: FactualAssertion::Picture {
-                    fact: crate::facts::picture::Fact::IsPicture {
+                assertion: FactualAssertion::Image {
+                    fact: crate::facts::image::Fact::Medium {
                         image: ImageIdx(bad_idx),
+                        medium: crate::facts::image::ImageMedium::Picture,
                     },
                 },
                 citation: sample_citation()?,
@@ -526,8 +540,11 @@ async fn assert_unknown_existing(kind: UnknownKind, phantom_counter: u64) -> Tes
                 id: MemoryImageId(phantom_counter),
             }],
             facts: [SubmitFact::Factual {
-                assertion: FactualAssertion::Picture {
-                    fact: crate::facts::picture::Fact::IsPicture { image: ImageIdx(0) },
+                assertion: FactualAssertion::Image {
+                    fact: crate::facts::image::Fact::Medium {
+                        image: ImageIdx(0),
+                        medium: crate::facts::image::ImageMedium::Picture,
+                    },
                 },
                 citation: sample_citation()?,
             }]
@@ -883,7 +900,7 @@ async fn walk_images_returns_submitted_image_facts() -> TestResult {
         entities: Vec::new(),
         events: Vec::new(),
         images: vec![Decl::Local],
-        facts: [is_picture_fact(0)?, captured_date_fact(0)?]
+        facts: [medium_picture_fact(0)?, captured_date_fact(0)?]
             .into_iter()
             .collect(),
     };
@@ -922,7 +939,7 @@ async fn all_facts_about_image_returns_facts_mentioning_it() -> TestResult {
         entities: Vec::new(),
         events: Vec::new(),
         images: vec![Decl::Local],
-        facts: [is_picture_fact(0)?, captured_date_fact(0)?]
+        facts: [medium_picture_fact(0)?, captured_date_fact(0)?]
             .into_iter()
             .collect(),
     };
@@ -2424,44 +2441,19 @@ fn subimage_fact(
     })
 }
 
-fn is_map_fact(image_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
-    Ok(SubmitFact::Factual {
-        assertion: FactualAssertion::Map {
-            fact: crate::facts::map::Fact::IsMap {
-                image: ImageIdx(image_idx),
-            },
-        },
-        citation: sample_citation()?,
-    })
-}
-
-fn in_picture_fact(
+/// A bare depiction tying `entity_idx` to `image_idx` — no localization, no
+/// perspective, the common P18 shape.
+fn depiction_fact(
     entity_idx: usize,
     image_idx: usize,
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Judgment {
         assertion: JudgmentAssertion::Depiction {
-            fact: crate::facts::depiction::Fact::InPicture {
+            fact: crate::facts::depiction::Fact {
                 entity: EntityIdx(entity_idx),
                 image: ImageIdx(image_idx),
-                perspective: crate::facts::depiction::Perspective::Unknown,
-                region: None,
-            },
-        },
-        citation: judgment_citation()?,
-    })
-}
-
-fn on_map_fact(
-    entity_idx: usize,
-    image_idx: usize,
-) -> Result<SubmitFact, Box<dyn std::error::Error>> {
-    Ok(SubmitFact::Judgment {
-        assertion: JudgmentAssertion::Depiction {
-            fact: crate::facts::depiction::Fact::OnMap {
-                entity: EntityIdx(entity_idx),
-                image: ImageIdx(image_idx),
-                geometry: None,
+                localization: None,
+                perspective: None,
             },
         },
         citation: judgment_citation()?,
@@ -2527,7 +2519,7 @@ async fn resolvability_gate_batches_and_skips_rules() -> TestResult {
         images: vec![Decl::Local],
         facts: [
             name_fact(5, "out-of-range-entity")?,
-            is_picture_fact(7)?,
+            medium_picture_fact(7)?,
             demolition_location_fact(0)?,
         ]
         .into_iter()
@@ -2572,9 +2564,12 @@ async fn resolvability_gate_batches_and_skips_rules() -> TestResult {
 #[tokio::test]
 async fn all_facts_about_image_excludes_retracted() -> TestResult {
     let store = MemoryFactStore::new();
-    let c1 = commit_facts(&store, local_bundle(0, 0, 1, 0, vec![is_picture_fact(0)?])?)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![medium_picture_fact(0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
     let image = c1.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
     let target = *c1.fact_ids.first().ok_or("no fact id")?;
 
@@ -2608,9 +2603,12 @@ async fn all_facts_about_image_excludes_retracted() -> TestResult {
 #[tokio::test]
 async fn all_facts_about_image_respects_snapshot() -> TestResult {
     let store = MemoryFactStore::new();
-    let c1 = commit_facts(&store, local_bundle(0, 0, 1, 0, vec![is_picture_fact(0)?])?)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![medium_picture_fact(0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
     let image = c1.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
     let early = *c1.fact_ids.first().ok_or("no fact id")?;
     let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
@@ -3106,7 +3104,7 @@ async fn event_retype_without_retracting_stale_payload_rejected() -> TestResult 
 }
 
 /// A same-commit retraction of the only depiction unmasks the gap: C1 records
-/// the sole `InPicture{X, I}` depiction; C2 retracts it and adds an
+/// the sole depiction tying X to I; C2 retracts it and adds an
 /// `ImageObservation` of X on I. The retraction is visible to the rule read in
 /// C2, so the depiction no longer satisfies the pairing and the commit is
 /// rejected as `ObservationWithoutDepiction`. Without the pending-retractor
@@ -3116,7 +3114,7 @@ async fn observation_depiction_retracted_in_same_commit_rejected() -> TestResult
     let store = MemoryFactStore::new();
     let c1 = commit_facts(
         &store,
-        local_bundle(1, 0, 1, 0, vec![in_picture_fact(0, 0)?])?,
+        local_bundle(1, 0, 1, 0, vec![depiction_fact(0, 0)?])?,
     )
     .await
     .map_err(|e| format!("{e:?}"))?;
@@ -3312,33 +3310,10 @@ async fn composite_chain_across_commits_rejected() -> TestResult {
     Ok(())
 }
 
-/// Role coherence — a capture-date attribute (presupposes picture) on an image
-/// claimed `IsMap` is rejected as an `ImageRoleConflict`.
+/// A capture date submits cleanly — capture metadata is a general image
+/// attribute, gated by no medium.
 #[tokio::test]
-async fn picture_attribute_on_map_rejected() -> TestResult {
-    let store = MemoryFactStore::new();
-    let errs = commit_err(
-        &store,
-        local_bundle(0, 0, 1, 0, vec![is_map_fact(0)?, captured_date_fact(0)?])?,
-    )
-    .await?;
-    assert!(
-        errs.iter().any(|e| matches!(
-            e,
-            SubmitError::ImageRoleConflict {
-                used_as: ImageRole::Picture,
-                claimed: ImageRole::Map,
-                ..
-            }
-        )),
-        "got {errs:?}"
-    );
-    Ok(())
-}
-
-/// Role coherence — a capture date on an image with no role-claim is accepted.
-#[tokio::test]
-async fn captured_date_on_no_role_accepted() -> TestResult {
+async fn captured_date_submits_cleanly() -> TestResult {
     let store = MemoryFactStore::new();
     commit_ok(
         &store,
@@ -3347,77 +3322,64 @@ async fn captured_date_on_no_role_accepted() -> TestResult {
     .await
 }
 
-/// Role coherence — two role *claims* don't conflict: `IsPicture` alongside
-/// `IsMap` is accepted (claim-vs-claim disagreement surfaces at projection,
-/// not submit).
+/// A depiction alongside a `Medium` on the same image submits cleanly: the
+/// medium is a non-gating render hint, constraining no other fact.
 #[tokio::test]
-async fn is_picture_on_map_accepted() -> TestResult {
+async fn depiction_with_medium_submits_cleanly() -> TestResult {
     let store = MemoryFactStore::new();
     commit_ok(
         &store,
-        local_bundle(0, 0, 1, 0, vec![is_map_fact(0)?, is_picture_fact(0)?])?,
+        local_bundle(
+            1,
+            0,
+            1,
+            0,
+            vec![medium_picture_fact(0)?, depiction_fact(0, 0)?],
+        )?,
     )
     .await
 }
 
-/// Role coherence — an in-picture depiction (presupposes picture) of an image
-/// claimed `IsMap` is rejected as an `ImageRoleConflict`.
+/// A combination the former role-coherence rule rejected — a map-medium image
+/// also carrying a capture date and a depiction — now submits. Medium gates
+/// nothing, so the bundle is well-formed; any tension is the projection's to
+/// surface, not submit's to reject.
 #[tokio::test]
-async fn in_picture_on_map_rejected() -> TestResult {
-    let store = MemoryFactStore::new();
-    let errs = commit_err(
-        &store,
-        local_bundle(1, 0, 1, 0, vec![is_map_fact(0)?, in_picture_fact(0, 0)?])?,
-    )
-    .await?;
-    assert!(
-        errs.iter().any(|e| matches!(
-            e,
-            SubmitError::ImageRoleConflict {
-                used_as: ImageRole::Picture,
-                claimed: ImageRole::Map,
-                ..
-            }
-        )),
-        "got {errs:?}"
-    );
-    Ok(())
-}
-
-/// Role coherence — an in-picture depiction of an image with no role-claim is
-/// accepted.
-#[tokio::test]
-async fn in_picture_on_no_role_accepted() -> TestResult {
+async fn former_role_conflict_combination_now_submits() -> TestResult {
     let store = MemoryFactStore::new();
     commit_ok(
         &store,
-        local_bundle(1, 0, 1, 0, vec![in_picture_fact(0, 0)?])?,
+        local_bundle(
+            1,
+            0,
+            1,
+            0,
+            vec![
+                map_medium_fact(0)?,
+                captured_date_fact(0)?,
+                depiction_fact(0, 0)?,
+            ],
+        )?,
     )
     .await
 }
 
-/// Role coherence — an on-map depiction (presupposes map) of an image claimed
-/// `IsPicture` is rejected as an `ImageRoleConflict`.
+/// Two disagreeing media on one image submit cleanly — `Medium` gates nothing,
+/// even self-contradicting, so the conflict surfaces at projection.
 #[tokio::test]
-async fn on_map_on_picture_rejected() -> TestResult {
+async fn disagreeing_media_submit_cleanly() -> TestResult {
     let store = MemoryFactStore::new();
-    let errs = commit_err(
+    commit_ok(
         &store,
-        local_bundle(1, 0, 1, 0, vec![is_picture_fact(0)?, on_map_fact(0, 0)?])?,
+        local_bundle(
+            0,
+            0,
+            1,
+            0,
+            vec![medium_picture_fact(0)?, map_medium_fact(0)?],
+        )?,
     )
-    .await?;
-    assert!(
-        errs.iter().any(|e| matches!(
-            e,
-            SubmitError::ImageRoleConflict {
-                used_as: ImageRole::Map,
-                claimed: ImageRole::Picture,
-                ..
-            }
-        )),
-        "got {errs:?}"
-    );
-    Ok(())
+    .await
 }
 
 // --- observation -> depiction pairing ---
@@ -3494,7 +3456,7 @@ async fn observation_with_same_commit_depiction_accepted() -> TestResult {
         0,
         vec![
             observation_feature_fact(0, image_observation_citation(0)?)?,
-            in_picture_fact(0, 0)?,
+            depiction_fact(0, 0)?,
         ],
     )?;
     commit_ok(&store, bundle).await
@@ -3506,7 +3468,7 @@ async fn observation_with_prior_commit_depiction_accepted() -> TestResult {
     let store = MemoryFactStore::new();
     let c1 = commit_facts(
         &store,
-        local_bundle(1, 0, 1, 0, vec![in_picture_fact(0, 0)?])?,
+        local_bundle(1, 0, 1, 0, vec![depiction_fact(0, 0)?])?,
     )
     .await
     .map_err(|e| format!("{e:?}"))?;

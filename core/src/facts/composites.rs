@@ -32,7 +32,7 @@
 
 use chronoscope_macros::grammar_type;
 
-use crate::facts::geometry::{ProportionalRect, ProportionalRectError};
+use crate::facts::geometry::{ProportionalCoordError, ProportionalRect};
 
 /// Composite-cluster fact.
 ///
@@ -102,7 +102,7 @@ impl<ImgId> Fact<ImgId> {
 /// of the parent — a higher-resolution rescan carries the same fractional
 /// bounds. The smart constructor [`SubimageRegion::rect`] is the
 /// sanctioned construction path; deserialization routes through
-/// [`ProportionalRect`] so invalid bounds fail at the wire boundary.
+/// [`ProportionalRect`] so out-of-range coordinates fail at the wire boundary.
 #[grammar_type]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SubimageRegion {
@@ -116,9 +116,9 @@ pub enum SubimageRegion {
 impl SubimageRegion {
     /// Construct a rectangular subimage region. See
     /// [`ProportionalRect::new`] for the validation rules.
-    pub fn rect(x: f32, y: f32, width: f32, height: f32) -> Result<Self, ProportionalRectError> {
+    pub fn rect(ax: f32, ay: f32, bx: f32, by: f32) -> Result<Self, ProportionalCoordError> {
         Ok(Self::Rect {
-            rect: ProportionalRect::new(x, y, width, height)?,
+            rect: ProportionalRect::new(ax, ay, bx, by)?,
         })
     }
 }

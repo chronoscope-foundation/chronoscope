@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use super::error::{DateRole, ImageRole, LocationRole, SubmitError};
+use super::error::{DateRole, LocationRole, SubmitError};
 use super::result::{StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMetaFact};
 use super::{EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::date::UncertainDate;
@@ -44,7 +44,7 @@ use crate::facts::store::{
     EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf, SubmitCommitError,
     SubmitCommitInput, SubmitCommitOutput,
 };
-use crate::facts::{attribute, bookend, composites, depiction, event, image, map, picture};
+use crate::facts::{attribute, bookend, composites, event, image};
 use crate::location::{ConflictStatus, UnresolvedLocation};
 
 /// Sanity bound on the number of circles a stored location may name. A place is
@@ -533,7 +533,6 @@ fn run_cluster_rules<S>(
     rule_composite_self_parent::<S>(candidates, errors);
     rule_composite_multiple_parents::<S>(candidates, image_facts, errors);
     rule_composite_chain::<S>(candidates, image_facts, errors);
-    rule_image_role_coherence::<S>(candidates, image_facts, errors);
 }
 
 /// A `Demolition` bookend may not carry a location — demolition location is
@@ -837,19 +836,15 @@ fn for_each_assertion_date<EntId, EvtId, ImgId>(
                 visit(DateRole::EventDate, bound);
             }
         }
-        FactualAssertion::Image { fact } => {
-            if let image::Fact::CreatedDate { bound, .. } = fact {
-                visit(DateRole::ImageCreated, bound);
-            }
-        }
-        FactualAssertion::Picture { fact } => {
-            if let picture::Fact::CapturedDate { bound, .. } = fact {
-                visit(DateRole::PictureCaptured, bound);
-            }
-        }
-        FactualAssertion::Attribute { .. }
-        | FactualAssertion::Gap { .. }
-        | FactualAssertion::Map { .. } => {}
+        FactualAssertion::Image { fact } => match fact {
+            image::Fact::CreatedDate { bound, .. } => visit(DateRole::ImageCreated, bound),
+            image::Fact::CapturedDate { bound, .. } => visit(DateRole::ImageCaptured, bound),
+            image::Fact::Source { .. }
+            | image::Fact::Author { .. }
+            | image::Fact::CapturedLocation { .. }
+            | image::Fact::Medium { .. } => {}
+        },
+        FactualAssertion::Attribute { .. } | FactualAssertion::Gap { .. } => {}
     }
 }
 
@@ -913,7 +908,7 @@ fn rule_location_validity<S: FactStore>(
 
 /// Visit every [`UnresolvedLocation`] a stored fact carries, tagging each with
 /// its [`LocationRole`]. Only factual facts carry a location: a construction
-/// bookend, a `Moved` event's destination, a picture's capture place. Until this
+/// bookend, a `Moved` event's destination, an image's capture place. Until this
 /// is macro-derived, a new location-bearing grammar variant must be added here by
 /// hand.
 fn for_each_stored_location<EntId, EvtId, ImgId>(
@@ -939,24 +934,28 @@ fn for_each_stored_location<EntId, EvtId, ImgId>(
         FactualAssertion::Event {
             fact: event::Fact::MovedToLocation { location, .. },
         } => visit(LocationRole::MovedToLocation, location),
-        FactualAssertion::Picture {
-            fact: picture::Fact::CapturedLocation { location, .. },
-        } => visit(LocationRole::PictureCaptured, location),
+        FactualAssertion::Image { fact } => match fact {
+            image::Fact::CapturedLocation { location, .. } => {
+                visit(LocationRole::ImageCaptured, location)
+            }
+            image::Fact::Source { .. }
+            | image::Fact::Author { .. }
+            | image::Fact::CreatedDate { .. }
+            | image::Fact::CapturedDate { .. }
+            | image::Fact::Medium { .. } => {}
+        },
         FactualAssertion::Attribute { .. }
         | FactualAssertion::Construction { .. }
         | FactualAssertion::Demolition { .. }
         | FactualAssertion::Event { .. }
-        | FactualAssertion::Image { .. }
-        | FactualAssertion::Picture { .. }
-        | FactualAssertion::Map { .. }
         | FactualAssertion::Gap { .. } => {}
     }
 }
 
-/// Every entity an image-observation names must have a depiction (`InPicture` /
-/// `OnMap`) tying it to the observed image, in-commit ∪ pre-commit. Only
-/// `ImageObservation`-cited observations gate; the other warrant flavors carry no
-/// observed image. Pushes dedup by `(entity, image)`.
+/// Every entity an image-observation names must have a depiction tying it to the
+/// observed image, in-commit ∪ pre-commit. Only `ImageObservation`-cited
+/// observations gate; the other warrant flavors carry no observed image. Pushes
+/// dedup by `(entity, image)`.
 fn rule_observation_depiction<S>(
     candidates: &[StoredFactOf<S>],
     image_facts: &HashMap<S::ImageId, Vec<StoredFactOf<S>>>,
@@ -992,8 +991,7 @@ fn rule_observation_depiction<S>(
     }
 }
 
-/// Whether a stored fact is a depiction (`InPicture` / `OnMap`) placing
-/// `entity` on `image`.
+/// Whether a stored fact is a depiction placing `entity` on `image`.
 fn depicts_entity_on_image<EntId, EvtId, ImgId>(
     fact: &StoredFact<EntId, EvtId, ImgId>,
     entity: &EntId,
@@ -1009,18 +1007,7 @@ where
         ..
     }) = fact
     {
-        match df {
-            depiction::Fact::InPicture {
-                entity: e,
-                image: i,
-                ..
-            }
-            | depiction::Fact::OnMap {
-                entity: e,
-                image: i,
-                ..
-            } => e == entity && i == image,
-        }
+        &df.entity == entity && &df.image == image
     } else {
         false
     }
@@ -1171,104 +1158,5 @@ where
         Some((subimage, parent))
     } else {
         None
-    }
-}
-
-/// An image's role must stay coherent: a fact presupposing a role (a capture
-/// attribute or in-picture depiction implies picture; on-map implies map) must
-/// not contradict an explicit `IsPicture` / `IsMap` claim on the same image. Two
-/// opposing claims aren't rejected here — that disagreement is real-world
-/// uncertainty for projection to resolve, not a malformed bundle.
-fn rule_image_role_coherence<S>(
-    candidates: &[StoredFactOf<S>],
-    image_facts: &HashMap<S::ImageId, Vec<StoredFactOf<S>>>,
-    errors: &mut Vec<SubmitError<S::EntityId, S::EventId, S::ImageId>>,
-) where
-    S: FactStore,
-{
-    let mut offending: BTreeSet<(S::ImageId, ImageRole)> = BTreeSet::new();
-    for fact in candidates {
-        let Some((used, image)) = presupposed_role(fact) else {
-            continue;
-        };
-        let gathered = image_facts.get(image).map(Vec::as_slice).unwrap_or(&[]);
-        if gathered
-            .iter()
-            .filter_map(claimed_role)
-            .any(|claimed| claimed != used)
-        {
-            offending.insert((image.clone(), used));
-        }
-    }
-    for (image, used_as) in offending {
-        let claimed = match used_as {
-            ImageRole::Picture => ImageRole::Map,
-            ImageRole::Map => ImageRole::Picture,
-        };
-        errors.push(SubmitError::ImageRoleConflict {
-            image,
-            used_as,
-            claimed,
-        });
-    }
-}
-
-/// The [`ImageRole`] a fact explicitly claims: `IsPicture` → `Picture`,
-/// `IsMap` → `Map`. Other facts make no role claim. The picture / map cluster
-/// matches are exhaustive so a new role-claim variant forces a decision here;
-/// the gather scopes facts to one image, so the claimed image isn't returned.
-fn claimed_role<EntId, EvtId, ImgId>(fact: &StoredFact<EntId, EvtId, ImgId>) -> Option<ImageRole>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
-    match fact {
-        StoredFact::Factual(StoredFactualFact {
-            assertion: FactualAssertion::Picture { fact: pf },
-            ..
-        }) => match pf {
-            picture::Fact::IsPicture { .. } => Some(ImageRole::Picture),
-            picture::Fact::CapturedDate { .. } | picture::Fact::CapturedLocation { .. } => None,
-        },
-        StoredFact::Factual(StoredFactualFact {
-            assertion: FactualAssertion::Map { fact: mf },
-            ..
-        }) => match mf {
-            map::Fact::IsMap { .. } => Some(ImageRole::Map),
-        },
-        _ => None,
-    }
-}
-
-/// The [`ImageRole`] a fact presupposes for an image, paired with that image: a
-/// picture-capture attribute or in-picture depiction presupposes a picture; an
-/// on-map depiction presupposes a map. Role claims (`IsPicture` / `IsMap`)
-/// presuppose nothing — they *are* the claim. Other facts presuppose no role.
-fn presupposed_role<EntId, EvtId, ImgId>(
-    fact: &StoredFact<EntId, EvtId, ImgId>,
-) -> Option<(ImageRole, &ImgId)>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
-    match fact {
-        StoredFact::Factual(StoredFactualFact {
-            assertion: FactualAssertion::Picture { fact: pf },
-            ..
-        }) => match pf {
-            picture::Fact::CapturedDate { image, .. }
-            | picture::Fact::CapturedLocation { image, .. } => Some((ImageRole::Picture, image)),
-            picture::Fact::IsPicture { .. } => None,
-        },
-        StoredFact::Judgment(StoredJudgmentFact {
-            assertion: JudgmentAssertion::Depiction { fact: df },
-            ..
-        }) => match df {
-            depiction::Fact::InPicture { image, .. } => Some((ImageRole::Picture, image)),
-            depiction::Fact::OnMap { image, .. } => Some((ImageRole::Map, image)),
-        },
-        _ => None,
     }
 }

@@ -179,9 +179,7 @@ where
         // A gap is an ordering relationship, not a single subject's field.
         FactualAssertion::Gap { .. } => Entity::identity(),
         // Image facts feed the sibling image projection, not an entity field.
-        FactualAssertion::Image { .. }
-        | FactualAssertion::Picture { .. }
-        | FactualAssertion::Map { .. } => Entity::identity(),
+        FactualAssertion::Image { .. } => Entity::identity(),
     }
 }
 

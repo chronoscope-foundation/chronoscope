@@ -67,16 +67,14 @@
 //!   (shared shape; the outer variant tag distinguishes the phase).
 //! - [`event`] — interior-lifetime event facts plus cross-event gap
 //!   primitives ([`event::OrderableEvent`], [`event::GapBounds`]).
-//! - [`image`] — byte-level image facts (source URL).
-//! - [`picture`] — pictorial role-claim and picture-specific
-//!   attributes (capture date, capture location).
-//! - [`map`] — map role-claim and map-specific attributes.
+//! - [`image`] — image-level facts: source URL, author, created date,
+//!   capture date / location, and the descriptive [`image::ImageMedium`].
 //!
 //! Judgment clusters:
 //!
 //! - [`identity`] — same-entity / same-artifact / same-event equivalence.
-//! - [`depiction`] — entity-in-picture / on-map depiction judgments plus
-//!   the [`depiction::Perspective`] view enum.
+//! - [`depiction`] — entity-in-image depiction judgments plus the
+//!   [`depiction::Perspective`] view enum.
 //! - [`observation`] — image-grounded feature and spatial-relation
 //!   observations.
 //! - [`composites`] — composite-image sub-region structural facts plus
@@ -101,15 +99,15 @@
 //! separate: a submitter can't reach into a prior commit's ids, and the
 //! matcher's judgments are reviewable, retractable facts like any other.
 //!
-//! # Image / picture / map layering
+//! # One image, no roles
 //!
 //! [`ids::ImageId`] identifies an image — the bytes of a specific scan or
 //! capture. "Picture" (a figurative depiction: photograph, painting, drawing)
-//! and "map" (a cartographic representation) are role-claims layered on top of
-//! images via [`picture::Fact::IsPicture`] and [`map::Fact::IsMap`]. An image
-//! can carry either role, both (rare, a conflict), or neither. Picture-specific
-//! attributes live in [`picture`]; map-specific attributes in [`map`];
-//! byte-level provenance in [`image`].
+//! and "map" (a cartographic representation) describe a medium, not a structural
+//! kind that gates which facts an image may carry. The grammar carries one image
+//! type; the medium rides on the non-gating, cited [`image::Fact::Medium`] field
+//! ([`image::ImageMedium`]). Every former map / picture attribute is a general
+//! [`image::Fact`].
 
 pub mod assertions;
 pub mod attribute;
@@ -125,10 +123,8 @@ pub mod identity;
 pub mod ids;
 pub mod image;
 pub mod lifecycle;
-pub mod map;
 pub mod memory;
 pub mod observation;
-pub mod picture;
 pub mod projection;
 pub mod schema;
 pub mod spatial;

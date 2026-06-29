@@ -22,16 +22,13 @@
 //! | [`crate::facts::bookend`]        | `FactualAssertion::Construction`, `FactualAssertion::Demolition` |
 //! | [`crate::facts::event`]          | `FactualAssertion::Event`        |
 //! | [`crate::facts::image`]          | `FactualAssertion::Image`        |
-//! | [`crate::facts::picture`]        | `FactualAssertion::Picture`      |
-//! | [`crate::facts::map`]            | `FactualAssertion::Map`          |
 //! | [`crate::facts::identity`]       | `JudgmentAssertion::Identity`    |
 //! | [`crate::facts::depiction`]      | `JudgmentAssertion::Depiction`   |
 //! | [`crate::facts::observation`]    | `JudgmentAssertion::Observation` |
 //! | [`crate::facts::composites`]     | `JudgmentAssertion::Composite`   |
 //!
 //! The outer variants are generic over reference shapes (`EntId`, `EvtId`,
-//! `ImgId`). Picture-role and map-role facts are both keyed by `ImgId` — the
-//! role is a claim on an image, not a separate id. The same enum serves
+//! `ImgId`). Every image-level fact is keyed by `ImgId`. The same enum serves
 //! submission (bundle-local indices) and storage (persistent ids); call sites
 //! pick the parameters.
 
@@ -41,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::facts::ids::{CommitId, FactId};
 use crate::facts::{
-    attribute, bookend, composites, depiction, event, identity, image, map, observation, picture,
+    attribute, bookend, composites, depiction, event, identity, image, observation,
 };
 
 /// Factual assertion — a claim about the external world.
@@ -53,11 +50,11 @@ use crate::facts::{
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(bound(
-    serialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::Serialize, bookend::Fact<EntId>: ::serde::Serialize, event::Fact<EntId, EvtId>: ::serde::Serialize, event::GapBounds<EntId, EvtId>: ::serde::Serialize, image::Fact<ImgId>: ::serde::Serialize, picture::Fact<ImgId>: ::serde::Serialize, map::Fact<ImgId>: ::serde::Serialize",
-    deserialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::de::DeserializeOwned, bookend::Fact<EntId>: ::serde::de::DeserializeOwned, event::Fact<EntId, EvtId>: ::serde::de::DeserializeOwned, event::GapBounds<EntId, EvtId>: ::serde::de::DeserializeOwned, image::Fact<ImgId>: ::serde::de::DeserializeOwned, picture::Fact<ImgId>: ::serde::de::DeserializeOwned, map::Fact<ImgId>: ::serde::de::DeserializeOwned"
+    serialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::Serialize, bookend::Fact<EntId>: ::serde::Serialize, event::Fact<EntId, EvtId>: ::serde::Serialize, event::GapBounds<EntId, EvtId>: ::serde::Serialize, image::Fact<ImgId>: ::serde::Serialize",
+    deserialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::de::DeserializeOwned, bookend::Fact<EntId>: ::serde::de::DeserializeOwned, event::Fact<EntId, EvtId>: ::serde::de::DeserializeOwned, event::GapBounds<EntId, EvtId>: ::serde::de::DeserializeOwned, image::Fact<ImgId>: ::serde::de::DeserializeOwned"
 ))]
 #[schemars(
-    bound = "EntId: ::schemars::JsonSchema + Ord, EvtId: ::schemars::JsonSchema + Ord, ImgId: ::schemars::JsonSchema, attribute::Fact<EntId>: ::schemars::JsonSchema, bookend::Fact<EntId>: ::schemars::JsonSchema, event::Fact<EntId, EvtId>: ::schemars::JsonSchema, event::GapBounds<EntId, EvtId>: ::schemars::JsonSchema, image::Fact<ImgId>: ::schemars::JsonSchema, picture::Fact<ImgId>: ::schemars::JsonSchema, map::Fact<ImgId>: ::schemars::JsonSchema"
+    bound = "EntId: ::schemars::JsonSchema + Ord, EvtId: ::schemars::JsonSchema + Ord, ImgId: ::schemars::JsonSchema, attribute::Fact<EntId>: ::schemars::JsonSchema, bookend::Fact<EntId>: ::schemars::JsonSchema, event::Fact<EntId, EvtId>: ::schemars::JsonSchema, event::GapBounds<EntId, EvtId>: ::schemars::JsonSchema, image::Fact<ImgId>: ::schemars::JsonSchema"
 )]
 pub enum FactualAssertion<EntId: Ord, EvtId: Ord, ImgId> {
     /// Entity-level attribute claims (names, external refs, relationships).
@@ -75,13 +72,9 @@ pub enum FactualAssertion<EntId: Ord, EvtId: Ord, ImgId> {
         /// The cross-event gap bounds (endpoints plus day range).
         bounds: event::GapBounds<EntId, EvtId>,
     },
-    /// Byte-level image facts (source URL).
+    /// Image-level facts: source URL, author, created / capture dates,
+    /// capture location, and the descriptive medium.
     Image { fact: image::Fact<ImgId> },
-    /// Pictorial role-claim plus picture-specific attributes (capture
-    /// date, capture location).
-    Picture { fact: picture::Fact<ImgId> },
-    /// Map role-claim plus map-specific attributes.
-    Map { fact: map::Fact<ImgId> },
 }
 
 impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
@@ -90,7 +83,7 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
     ///
     /// Holds all three closures and hands each cluster the subset it needs
     /// (attribute / bookend get entity, event and gap get entity + event,
-    /// image / picture / map get image).
+    /// image gets image).
     pub fn for_each_id(
         &self,
         fe: &mut impl FnMut(&EntId),
@@ -103,8 +96,6 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
             Self::Event { fact } => fact.for_each_id(fe, fv),
             Self::Gap { bounds } => bounds.for_each_id(fe, fv),
             Self::Image { fact } => fact.for_each_id(fi),
-            Self::Picture { fact } => fact.for_each_id(fi),
-            Self::Map { fact } => fact.for_each_id(fi),
         }
     }
 
@@ -148,12 +139,6 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
             Self::Image { fact } => Ok(FactualAssertion::Image {
                 fact: fact.try_map_ids(fi)?,
             }),
-            Self::Picture { fact } => Ok(FactualAssertion::Picture {
-                fact: fact.try_map_ids(fi)?,
-            }),
-            Self::Map { fact } => Ok(FactualAssertion::Map {
-                fact: fact.try_map_ids(fi)?,
-            }),
         }
     }
 }
@@ -177,7 +162,7 @@ pub enum JudgmentAssertion<EntId: Ord, EvtId: Ord, ImgId: Ord> {
     Identity {
         fact: identity::Fact<EntId, EvtId, ImgId>,
     },
-    /// Entity-in-picture / entity-on-map depiction judgments.
+    /// Entity-in-image depiction judgments.
     Depiction { fact: depiction::Fact<EntId, ImgId> },
     /// Feature and spatial-relation claims about entities (basis lives
     /// in the citation).
@@ -336,7 +321,7 @@ mod traversal_props {
     use crate::date::{DatePrecision, UncertainDate};
     use crate::facts::citations::{ExternalReference, Language};
     use crate::facts::composites::SubimageRegion;
-    use crate::facts::geometry::{ImageRegion, SpatialGeometry};
+    use crate::facts::geometry::{ImageGeometry, ProportionalPolyline};
     use crate::facts::identity::IdMapError;
     use crate::facts::lifecycle::{
         DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind,
@@ -345,8 +330,7 @@ mod traversal_props {
     use crate::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
     use crate::facts::spatial::TopologicalRel;
     use crate::facts::{
-        attribute, bookend, composites, depiction, event, identity, image, map, observation,
-        picture,
+        attribute, bookend, composites, depiction, event, identity, image, observation,
     };
     use crate::location::{LocationReference, UnresolvedLocation};
 
@@ -422,10 +406,26 @@ mod traversal_props {
         }
     }
 
-    fn sentinel_image_region() -> impl Strategy<Value = ImageRegion> {
+    fn sentinel_image_bbox() -> impl Strategy<Value = ImageGeometry> {
         Just(()).prop_filter_map("valid sentinel bbox", |()| {
-            ImageRegion::bbox(0.0, 0.0, 0.5, 0.5).ok()
+            ImageGeometry::bbox(0.0, 0.0, 0.5, 0.5).ok()
         })
+    }
+
+    fn sentinel_proportional_polyline() -> impl Strategy<Value = ProportionalPolyline> {
+        Just(()).prop_filter_map("valid sentinel polyline", |()| {
+            ProportionalPolyline::new(vec![(0.1, 0.2), (0.3, 0.4)]).ok()
+        })
+    }
+
+    /// A random [`image::ImageMedium`] across all three values, so the `Medium`
+    /// arm exercises picture, map, and pictorial-map rather than one fixed kind.
+    fn arb_image_medium() -> impl Strategy<Value = image::ImageMedium> {
+        prop_oneof![
+            Just(image::ImageMedium::Picture),
+            Just(image::ImageMedium::Map),
+            Just(image::ImageMedium::PictorialMap),
+        ]
     }
 
     fn sentinel_subimage_region() -> impl Strategy<Value = SubimageRegion> {
@@ -583,8 +583,8 @@ mod traversal_props {
         )
     }
 
-    /// `image::Fact` — all three variants (`Source`, `Author`,
-    /// `CreatedDate`).
+    /// `image::Fact` — all six variants (`Source`, `Author`, `CreatedDate`,
+    /// `CapturedDate`, `CapturedLocation`, `Medium`).
     fn arb_image_fact() -> impl Strategy<Value = image::Fact<MemoryImageId>> {
         prop_oneof![
             (arb_image(), sentinel_url())
@@ -596,26 +596,15 @@ mod traversal_props {
             }),
             (arb_image(), sentinel_date())
                 .prop_map(|(image, bound)| image::Fact::CreatedDate { image, bound }),
-        ]
-    }
-
-    /// `picture::Fact` — all three variants (`IsPicture`, `CapturedDate`,
-    /// `CapturedLocation`).
-    fn arb_picture() -> impl Strategy<Value = picture::Fact<MemoryImageId>> {
-        prop_oneof![
-            arb_image().prop_map(|image| picture::Fact::IsPicture { image }),
             (arb_image(), sentinel_date())
-                .prop_map(|(image, bound)| picture::Fact::CapturedDate { image, bound }),
-            arb_image().prop_map(|image| picture::Fact::CapturedLocation {
+                .prop_map(|(image, bound)| image::Fact::CapturedDate { image, bound }),
+            arb_image().prop_map(|image| image::Fact::CapturedLocation {
                 image,
                 location: sentinel_location(),
             }),
+            (arb_image(), arb_image_medium())
+                .prop_map(|(image, medium)| image::Fact::Medium { image, medium }),
         ]
-    }
-
-    /// `map::Fact` — the single `IsMap` variant.
-    fn arb_map() -> impl Strategy<Value = map::Fact<MemoryImageId>> {
-        arb_image().prop_map(|image| map::Fact::IsMap { image })
     }
 
     /// `identity::Fact` — all three variants, each fed two distinct
@@ -635,27 +624,33 @@ mod traversal_props {
         ]
     }
 
-    /// `depiction::Fact` — both variants, each with an entity id and an
-    /// image id (distinct kinds; the identity law pins the reconstruction).
+    /// `depiction::Fact` — the merged depiction struct, generated across the
+    /// localization-present and bare shapes (the optional fields carry no ids,
+    /// so the identity law pins the entity/image reconstruction either way).
     fn arb_depiction() -> impl Strategy<Value = depiction::Fact<MemoryEntityId, MemoryImageId>> {
         prop_oneof![
-            (arb_entity(), arb_image(), sentinel_image_region()).prop_map(
-                |(entity, image, region)| depiction::Fact::InPicture {
+            (arb_entity(), arb_image(), sentinel_image_bbox()).prop_map(
+                |(entity, image, geometry)| depiction::Fact {
                     entity,
                     image,
-                    perspective: depiction::Perspective::Exterior,
-                    region: Some(region),
+                    localization: Some(geometry),
+                    perspective: Some(depiction::Perspective::Exterior),
                 }
             ),
-            (arb_entity(), arb_image(), sentinel_image_region()).prop_map(
-                |(entity, image, region)| depiction::Fact::OnMap {
+            (arb_entity(), arb_image(), sentinel_proportional_polyline()).prop_map(
+                |(entity, image, polyline)| depiction::Fact {
                     entity,
                     image,
-                    // The SpatialGeometry variant is irrelevant — it carries
-                    // no ids.
-                    geometry: Some(SpatialGeometry::Region { region }),
+                    localization: Some(ImageGeometry::Polyline { polyline }),
+                    perspective: Some(depiction::Perspective::Interior),
                 }
             ),
+            (arb_entity(), arb_image()).prop_map(|(entity, image)| depiction::Fact {
+                entity,
+                image,
+                localization: None,
+                perspective: None,
+            }),
         ]
     }
 
@@ -715,8 +710,6 @@ mod traversal_props {
             arb_event_fact().prop_map(|fact| FactualAssertion::Event { fact }),
             arb_gap_bounds().prop_map(|bounds| FactualAssertion::Gap { bounds }),
             arb_image_fact().prop_map(|fact| FactualAssertion::Image { fact }),
-            arb_picture().prop_map(|fact| FactualAssertion::Picture { fact }),
-            arb_map().prop_map(|fact| FactualAssertion::Map { fact }),
         ]
     }
 

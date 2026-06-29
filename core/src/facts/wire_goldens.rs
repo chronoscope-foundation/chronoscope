@@ -39,16 +39,14 @@ use crate::facts::composites::{self, SubimageRegion};
 use crate::facts::depiction::{self, Perspective};
 use crate::facts::event;
 use crate::facts::features::Feature;
-use crate::facts::geometry::{ImageRegion, SpatialGeometry};
+use crate::facts::geometry::{ImageGeometry, ProportionalPolyline};
 use crate::facts::identity;
 use crate::facts::ids::{
     AnalyzerProcess, AnalyzerVersion, EntityId, FactId, ImageId, LifetimeEventId, UserId,
 };
-use crate::facts::image;
+use crate::facts::image::{self, ImageMedium};
 use crate::facts::lifecycle::{DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod};
-use crate::facts::map;
 use crate::facts::observation;
-use crate::facts::picture;
 use crate::facts::spatial::TopologicalRel;
 use crate::facts::submit::{Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact};
 use crate::geo::{GeoPoint, Meters};
@@ -252,19 +250,15 @@ fn golden_image_fact_source() -> Result<()> {
 }
 
 #[test]
-fn golden_picture_fact_is_picture() -> Result<()> {
-    let f: picture::Fact<ImageId> = picture::Fact::IsPicture {
+fn golden_image_fact_medium() -> Result<()> {
+    let f: image::Fact<ImageId> = image::Fact::Medium {
         image: img("img-1")?,
+        medium: ImageMedium::PictorialMap,
     };
-    assert_golden_roundtrip(&f, r#"{"image":"img-1","type":"is_picture"}"#)
-}
-
-#[test]
-fn golden_map_fact_is_map() -> Result<()> {
-    let f: map::Fact<ImageId> = map::Fact::IsMap {
-        image: img("img-1")?,
-    };
-    assert_golden_roundtrip(&f, r#"{"image":"img-1","type":"is_map"}"#)
+    assert_golden_roundtrip(
+        &f,
+        r#"{"image":"img-1","medium":"pictorial_map","type":"medium"}"#,
+    )
 }
 
 #[test]
@@ -277,16 +271,35 @@ fn golden_identity_fact_same_entity() -> Result<()> {
 }
 
 #[test]
-fn golden_depiction_fact_in_picture() -> Result<()> {
-    let f: depiction::Fact<EntityId, ImageId> = depiction::Fact::InPicture {
+fn golden_depiction_fact_bare() -> Result<()> {
+    // The common P18 case: an entity↔image link with no localization and no
+    // perspective. The struct carries no inner tag — the
+    // `JudgmentAssertion::Depiction` wrapper tags it.
+    let f: depiction::Fact<EntityId, ImageId> = depiction::Fact {
         entity: ent("e-1")?,
         image: img("img-1")?,
-        perspective: Perspective::Exterior,
-        region: None,
+        localization: None,
+        perspective: None,
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":"e-1","image":"img-1","perspective":"exterior","region":null,"type":"in_picture"}"#,
+        r#"{"entity":"e-1","image":"img-1","localization":null,"perspective":null}"#,
+    )
+}
+
+#[test]
+fn golden_depiction_fact_localized() -> Result<()> {
+    // A localized, classified depiction: the `ImageGeometry` bbox rides under
+    // `localization`, the leaf `Perspective` value under `perspective`.
+    let f: depiction::Fact<EntityId, ImageId> = depiction::Fact {
+        entity: ent("e-1")?,
+        image: img("img-1")?,
+        localization: Some(ImageGeometry::bbox(0.1, 0.2, 0.3, 0.4)?),
+        perspective: Some(Perspective::Interior),
+    };
+    assert_golden_roundtrip(
+        &f,
+        r#"{"entity":"e-1","image":"img-1","localization":{"rect":{"max":{"x":0.30000001192092896,"y":0.4000000059604645},"min":{"x":0.10000000149011612,"y":0.20000000298023224}},"type":"bbox"},"perspective":"interior"}"#,
     )
 }
 
@@ -327,7 +340,7 @@ fn golden_composites_fact_is_subimage_of() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"parent":"img-par","region":{"rect":{"height":0.5,"width":0.5,"x":0,"y":0},"type":"rect"},"subimage":"img-sub","type":"is_subimage_of"}"#,
+        r#"{"parent":"img-par","region":{"rect":{"max":{"x":0.5,"y":0.5},"min":{"x":0,"y":0}},"type":"rect"},"subimage":"img-sub","type":"is_subimage_of"}"#,
     )
 }
 
@@ -389,17 +402,28 @@ fn golden_location_one_of_locks_nested_internal_tag() -> Result<()> {
 }
 
 #[test]
-fn golden_spatial_geometry_region_bbox_locks_nested_tag() -> Result<()> {
-    // `SpatialGeometry` nests its tagged `ImageRegion` payload under the named
-    // `region` field so the inner `type` key stays in a separate map; the bbox
-    // nests one level deeper under `rect`. The round-trip guards that
-    // multi-level tagging.
-    let geometry = SpatialGeometry::Region {
-        region: ImageRegion::bbox(0.1, 0.2, 0.3, 0.4)?,
+fn golden_image_geometry_bbox_locks_tagged_rect() -> Result<()> {
+    // `ImageGeometry::BBox` carries its `ProportionalRect` corner-pair payload
+    // under the named `rect` field. The round-trip locks the bbox wire form and
+    // proves the manually-deserialized rect survives a streaming serialize.
+    let geometry = ImageGeometry::bbox(0.1, 0.2, 0.3, 0.4)?;
+    assert_golden_roundtrip(
+        &geometry,
+        r#"{"rect":{"max":{"x":0.30000001192092896,"y":0.4000000059604645},"min":{"x":0.10000000149011612,"y":0.20000000298023224}},"type":"bbox"}"#,
+    )
+}
+
+#[test]
+fn golden_image_geometry_polyline_locks_proportional_trace() -> Result<()> {
+    // The image-space trace: a `ProportionalPolyline` nests under the named
+    // `polyline` field. Locks the proportional-point wire form and its
+    // validating `Deserialize` round-trip.
+    let geometry = ImageGeometry::Polyline {
+        polyline: ProportionalPolyline::new(vec![(0.1, 0.2), (0.3, 0.4)])?,
     };
     assert_golden_roundtrip(
         &geometry,
-        r#"{"region":{"rect":{"height":0.4000000059604645,"width":0.30000001192092896,"x":0.10000000149011612,"y":0.20000000298023224},"type":"bbox"},"type":"region"}"#,
+        r#"{"polyline":{"points":[{"x":0.10000000149011612,"y":0.20000000298023224},{"x":0.30000001192092896,"y":0.4000000059604645}]},"type":"polyline"}"#,
     )
 }
 

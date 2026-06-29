@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::date::UncertainDate;
-use crate::facts::geometry::ImageRegion;
+use crate::facts::geometry::ImageGeometry;
 use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId, IngesterRunId, UserId};
 use crate::ids::{
     GeoNamesId, GettyTgnId, NrhpReferenceNumber, OhmId, OsmElementType, OsmId, PleiadesPlaceId,
@@ -594,9 +594,9 @@ pub enum JudgmentSource<ImgId> {
     ImageObservation {
         /// The image the observer looked at.
         image: ImgId,
-        /// Where in the image the observer focused, when known. `None` for a
-        /// whole-image observation that doesn't bound a region.
-        region: Option<ImageRegion>,
+        /// Where in the image the observer focused, when known — a mask, bbox,
+        /// or polyline. `None` for a whole-image observation.
+        region: Option<ImageGeometry>,
         /// Who or what made the observation.
         observer: Observer,
     },

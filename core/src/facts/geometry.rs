@@ -3,29 +3,34 @@
 //! [`RleMask`] is a run-length-encoded binary mask in the COCO-compressed ASCII
 //! format produced by `pycocotools` and SAM-family segmentation models.
 //!
+//! [`ProportionalCoord`] is one validated `0.0..=1.0` coordinate component; it
+//! holds the finite-check, range-check, and negative-zero normalization that
+//! [`ProportionalRect`] and [`ProportionalPoint`] share, so that machinery
+//! lives in one place.
+//!
 //! [`ProportionalRect`] is an axis-aligned rectangle in `0.0..=1.0`
-//! proportional coordinates, shared between [`ImageRegion::BBox`] and
+//! proportional coordinates, given as two corner [`ProportionalPoint`]s in
+//! canonical order. Shared between [`ImageGeometry::BBox`] and
 //! [`crate::facts::composites::SubimageRegion::Rect`] — same validation, same
 //! wire shape.
 //!
-//! [`ImageRegion`] is the sum of pixel-precise masks and axis-aligned
-//! proportional bounding boxes, anchored to the parent image. Both forms arrive
-//! from real pipelines — SAM-family models emit RLE masks, VLMs that produce
-//! normalized bbox output (Gemma 3, Florence-2) emit bboxes. The mask form's
-//! pixel grid equals the parent image's; the bbox form uses `0.0..=1.0`
-//! proportional coordinates, resolution-independent.
+//! [`ProportionalPolyline`] is a validated trace in `0.0..=1.0` proportional
+//! coordinates, the vector path-marking shape — a road or boundary traced on a
+//! sheet in the image's own frame.
 //!
-//! [`SpatialGeometry`] is the sum of [`ImageRegion`] and
-//! [`crate::geo::Polyline`], attached to map-bearing depiction facts where
-//! either shape may show up depending on the medium.
+//! [`ImageGeometry`] is the image-space localization sum a depiction carries —
+//! a pixel-precise [`RleMask`], an axis-aligned [`ProportionalRect`] bbox, or a
+//! [`ProportionalPolyline`] trace. Each form arrives from a real pipeline:
+//! SAM-family models emit RLE masks, VLMs that produce normalized bbox output
+//! (Gemma 3, Florence-2) emit bboxes, and a path-marking pass emits polylines.
+//! All are anchored to the image's own pixel / proportional frame; a geographic
+//! reading is a property of the image's projection, derived downstream.
 
 use std::cmp::Ordering;
 
 use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use crate::geo::Polyline;
 
 /// Run-length-encoded binary mask in the COCO compressed-string format.
 ///
@@ -40,119 +45,184 @@ pub struct RleMask {
     pub counts: String,
 }
 
-/// An axis-aligned proportional rectangle in `0.0..=1.0` coordinates.
+/// One coordinate component in `0.0..=1.0` proportional image space — the
+/// shared building block of [`ProportionalRect`] and [`ProportionalPoint`].
 ///
-/// The shared rect payload of [`ImageRegion::BBox`] and
-/// [`crate::facts::composites::SubimageRegion::Rect`]. The smart constructor
-/// [`ProportionalRect::new`] rejects non-finite coordinates, negative origins,
-/// non-positive extents, and rectangles that extend past the unit square.
-/// Deserialization routes through it so invalid shapes fail at the wire
-/// boundary.
+/// The smart constructor [`ProportionalCoord::new`] rejects non-finite values
+/// and anything outside `0.0..=1.0`, and normalizes `-0.0` to `+0.0`. That
+/// normalization plus the NaN/Inf rejection is what lets the manual `Hash`
+/// (via `f32::to_bits`) and `Ord` (via `f32::total_cmp`) stay consistent with
+/// the derived `PartialEq` (under which `-0.0 == +0.0`), so every type built
+/// from coordinates can derive its own `Eq`/`Hash`/`Ord` through this one.
 ///
-/// `Eq` is hand-implemented despite the `f32` fields: the constructor rejects
-/// NaN/Inf and normalizes `-0.0` to `+0.0`, so the manual `Hash` (via
-/// `f32::to_bits`) and `Ord` (via `f32::total_cmp`) stay consistent with the
-/// derived `PartialEq` (under which `-0.0 == +0.0`). Every constructed value is
-/// finite and free of negative zero, so equality is honest.
+/// `#[serde(transparent)]` keeps the wire form a bare number: a coordinate is
+/// indistinguishable from the `f32` it wraps. Deserialization routes that number
+/// through [`ProportionalCoord::new`], so a non-finite or out-of-range
+/// coordinate fails at the wire boundary, and every type built from coordinates
+/// inherits that guard by deserializing its fields as `ProportionalCoord`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema)]
-pub struct ProportionalRect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
+#[serde(transparent)]
+#[schemars(transparent)]
+pub struct ProportionalCoord(f32);
 
-impl Eq for ProportionalRect {}
-
-impl std::hash::Hash for ProportionalRect {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.x.to_bits().hash(state);
-        self.y.to_bits().hash(state);
-        self.width.to_bits().hash(state);
-        self.height.to_bits().hash(state);
+impl<'de> Deserialize<'de> for ProportionalCoord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = f32::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
-// Manual Ord via `total_cmp` field-by-field. The smart constructor rejects
-// NaN/Inf, so every constructed value compares cleanly. Field order mirrors the
-// struct layout (`x`, `y`, `width`, `height`); it feeds content-address
-// determinism, so changing it changes every CommitId.
-impl PartialOrd for ProportionalRect {
+impl Eq for ProportionalCoord {}
+
+impl std::hash::Hash for ProportionalCoord {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
+impl PartialOrd for ProportionalCoord {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ProportionalRect {
+impl Ord for ProportionalCoord {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.x
-            .total_cmp(&other.x)
-            .then_with(|| self.y.total_cmp(&other.y))
-            .then_with(|| self.width.total_cmp(&other.width))
-            .then_with(|| self.height.total_cmp(&other.height))
+        self.0.total_cmp(&other.0)
     }
 }
 
+impl ProportionalCoord {
+    /// Construct a proportional coordinate. The value must be finite and in
+    /// `0.0..=1.0`; `-0.0` is normalized to `+0.0`.
+    pub fn new(value: f32) -> Result<Self, ProportionalCoordError> {
+        if !value.is_finite() {
+            return Err(ProportionalCoordError::NotFinite { value });
+        }
+        if !(0.0..=1.0).contains(&value) {
+            return Err(ProportionalCoordError::OutOfBounds { value });
+        }
+        // `-0.0 + 0.0 == +0.0`, and adding `0.0` is a no-op for every other
+        // finite value, so this normalizes the one bit pattern that would
+        // otherwise split an equal value across `Hash`/`Ord`.
+        Ok(Self(value + 0.0))
+    }
+
+    /// The coordinate value, in `0.0..=1.0`.
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+/// Errors from [`ProportionalCoord::new`].
+///
+/// `PartialEq` only — the variants carry the pre-validation `f32`, which may be
+/// `NaN`, so a total ordering would be dishonest, and errors aren't part of the
+/// content-addressed fact graph.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProportionalCoordError {
+    /// The coordinate was not finite (`NaN` or infinite).
+    NotFinite { value: f32 },
+    /// The coordinate lay outside the `0.0..=1.0` unit range.
+    OutOfBounds { value: f32 },
+}
+
+impl std::fmt::Display for ProportionalCoordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFinite { value } => {
+                write!(f, "proportional coordinate must be finite, got {value}")
+            }
+            Self::OutOfBounds { value } => {
+                write!(
+                    f,
+                    "proportional coordinate must lie in 0.0..=1.0, got {value}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProportionalCoordError {}
+
+/// An axis-aligned proportional rectangle in `0.0..=1.0` coordinates, given by
+/// two corner points in canonical order (`min.x <= max.x`, `min.y <= max.y`).
+///
+/// The shared rect payload of [`ImageGeometry::BBox`] and
+/// [`crate::facts::composites::SubimageRegion::Rect`].
+/// [`ProportionalRect::from_corners`] takes two corners in any order and
+/// normalizes them; coincident corners give a zero-area rect, the honest shape
+/// for a VLM pointing at a small feature. Both corners already lie in `[0, 1]`,
+/// so the rect is always in-bounds and assembly itself can't fail.
+///
+/// Both corners are [`ProportionalPoint`], so `Eq`/`Hash`/`Ord` derive through
+/// their negative-zero-normalizing, NaN-free guarantee. Derived `Ord` compares
+/// `min` then `max`; that order feeds content-address determinism, so changing
+/// it changes every `CommitId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+pub struct ProportionalRect {
+    min: ProportionalPoint,
+    max: ProportionalPoint,
+}
+
 impl ProportionalRect {
-    /// Construct a proportional rect. Bounds must satisfy
-    /// `0.0 <= x`, `0.0 <= y`, `width > 0`, `height > 0`,
-    /// `x + width <= 1.0`, and `y + height <= 1.0`, with all four
-    /// components finite.
-    ///
-    /// `-0.0` is normalized to `+0.0` so the manual `Hash`/`Ord`
-    /// (bit-level / `total_cmp`) stay consistent with the derived
-    /// `PartialEq`.
-    pub fn new(x: f32, y: f32, width: f32, height: f32) -> Result<Self, ProportionalRectError> {
-        if !(x.is_finite() && y.is_finite() && width.is_finite() && height.is_finite()) {
-            return Err(ProportionalRectError::NotFinite);
+    /// Assemble a rect from two corner points in any order, normalizing per
+    /// axis to canonical order (`min.x <= max.x`, `min.y <= max.y`). Coincident
+    /// corners yield a zero-area rect. Infallible — both corners are already
+    /// valid in-range points.
+    pub fn from_corners(a: ProportionalPoint, b: ProportionalPoint) -> Self {
+        Self {
+            min: ProportionalPoint {
+                x: a.x.min(b.x),
+                y: a.y.min(b.y),
+            },
+            max: ProportionalPoint {
+                x: a.x.max(b.x),
+                y: a.y.max(b.y),
+            },
         }
-        if x < 0.0 || y < 0.0 {
-            return Err(ProportionalRectError::NegativeOrigin { x, y });
-        }
-        if width <= 0.0 || height <= 0.0 {
-            return Err(ProportionalRectError::NonPositiveExtent { width, height });
-        }
-        if x + width > 1.0 || y + height > 1.0 {
-            return Err(ProportionalRectError::OutOfBounds {
-                x,
-                y,
-                width,
-                height,
-            });
-        }
-        // Normalize `-0.0` to `+0.0`: `-0.0 + 0.0 == +0.0`, and adding
-        // `0.0` is a no-op for every other finite value. Only `x`/`y` can
-        // actually carry `-0.0` (extents <= 0.0 are already rejected), but
-        // normalize all four uniformly.
-        let x = x + 0.0;
-        let y = y + 0.0;
-        let width = width + 0.0;
-        let height = height + 0.0;
-        Ok(Self {
-            x,
-            y,
-            width,
-            height,
-        })
     }
 
-    /// Horizontal origin in `0.0..=1.0`.
+    /// Construct a rect from two corners given as raw floats, in any order.
+    /// Each coordinate routes through [`ProportionalCoord::new`] for the
+    /// finite + range check and the `-0.0` normalization, so an invalid
+    /// coordinate is the only failure mode; corner assembly cannot fail.
+    pub fn new(ax: f32, ay: f32, bx: f32, by: f32) -> Result<Self, ProportionalCoordError> {
+        let a = ProportionalPoint::new(ax, ay)?;
+        let b = ProportionalPoint::new(bx, by)?;
+        Ok(Self::from_corners(a, b))
+    }
+
+    /// The corner with the smaller coordinates.
+    pub fn min_corner(&self) -> ProportionalPoint {
+        self.min
+    }
+
+    /// The corner with the larger coordinates.
+    pub fn max_corner(&self) -> ProportionalPoint {
+        self.max
+    }
+
+    /// The smaller x coordinate, in `0.0..=1.0`.
     pub fn x(&self) -> f32 {
-        self.x
+        self.min.x()
     }
 
-    /// Vertical origin in `0.0..=1.0`.
+    /// The smaller y coordinate, in `0.0..=1.0`.
     pub fn y(&self) -> f32 {
-        self.y
+        self.min.y()
     }
 
-    /// Width in proportional units; positive, with `x + width <= 1.0`.
+    /// Width in proportional units; zero for a degenerate rect.
     pub fn width(&self) -> f32 {
-        self.width
+        self.max.x() - self.min.x()
     }
 
-    /// Height in proportional units; positive, with `y + height <= 1.0`.
+    /// Height in proportional units; zero for a degenerate rect.
     pub fn height(&self) -> f32 {
-        self.height
+        self.max.y() - self.min.y()
     }
 }
 
@@ -161,134 +231,222 @@ impl<'de> Deserialize<'de> for ProportionalRect {
     where
         D: serde::Deserializer<'de>,
     {
+        // Each corner validates through `ProportionalPoint`/`ProportionalCoord`
+        // as it materializes; `from_corners` then normalizes the axis order.
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
-            x: f32,
-            y: f32,
-            width: f32,
-            height: f32,
+            min: ProportionalPoint,
+            max: ProportionalPoint,
         }
         let w = Wire::deserialize(deserializer)?;
-        Self::new(w.x, w.y, w.width, w.height).map_err(serde::de::Error::custom)
+        Ok(Self::from_corners(w.min, w.max))
     }
 }
 
-/// A region within an image, anchored to its parent image.
+/// A point in `0.0..=1.0` proportional image coordinates — the vertex type of
+/// [`ProportionalPolyline`].
 ///
-/// Two forms map to real pipelines: pixel-precise masks (from segmentation
-/// models) and axis-aligned proportional bounding boxes (from VLMs that output
-/// normalized boxes). The mask form's pixel grid equals the parent image's
-/// dimensions; the bbox form uses `0.0..=1.0` proportional coordinates,
-/// resolution-independent.
+/// Both components are [`ProportionalCoord`], so `Eq`/`Hash`/`Ord` derive
+/// through its negative-zero-normalizing, NaN-free guarantee, and `Deserialize`
+/// derives each field through the coordinate's wire-boundary guard.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ProportionalPoint {
+    x: ProportionalCoord,
+    y: ProportionalCoord,
+}
+
+impl ProportionalPoint {
+    /// Construct a proportional point. Both components must be finite and in
+    /// `0.0..=1.0`; `-0.0` is normalized to `+0.0`.
+    pub fn new(x: f32, y: f32) -> Result<Self, ProportionalCoordError> {
+        Ok(Self {
+            x: ProportionalCoord::new(x)?,
+            y: ProportionalCoord::new(y)?,
+        })
+    }
+
+    /// Horizontal coordinate in `0.0..=1.0`.
+    pub fn x(&self) -> f32 {
+        self.x.get()
+    }
+
+    /// Vertical coordinate in `0.0..=1.0`.
+    pub fn y(&self) -> f32 {
+        self.y.get()
+    }
+}
+
+/// Upper bound on a [`ProportionalPolyline`]'s vertex count. Legitimate road
+/// and boundary traces run to many vertices, so the cap is generous; it bounds a
+/// stored trace's size and the cost of per-vertex validation, the same way
+/// [`MAX_LOCATION_CIRCLES`] caps an already-deserialized location. Wire-size is
+/// bounded upstream by the HTTP body limit, not by this cap.
 ///
-/// Construct bbox via the smart constructor [`ImageRegion::bbox`];
-/// deserialization routes through [`ProportionalRect`]'s wire boundary so
-/// out-of-range bboxes fail at parse time.
+/// [`MAX_LOCATION_CIRCLES`]: crate::facts::submit::pipeline::MAX_LOCATION_CIRCLES
+pub const MAX_POLYLINE_POINTS: usize = 10_000;
+
+/// A polyline traced in `0.0..=1.0` proportional image coordinates — a path on
+/// the image's own frame, such as a road or boundary traced across a map sheet.
+///
+/// The smart constructor [`ProportionalPolyline::new`] requires between two and
+/// [`MAX_POLYLINE_POINTS`] points, each finite and within the unit square.
+/// Deserialization validates each vertex through [`ProportionalCoord`] and
+/// enforces the same count bounds, so a too-short, over-long, or out-of-range
+/// trace fails at the wire boundary. `Eq`/`Hash`/`Ord` derive through
+/// [`ProportionalPoint`], and so through [`ProportionalCoord`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+pub struct ProportionalPolyline {
+    points: Vec<ProportionalPoint>,
+}
+
+impl ProportionalPolyline {
+    /// Construct a proportional polyline from raw `(x, y)` pairs. Requires
+    /// between two and [`MAX_POLYLINE_POINTS`] points, each finite and in
+    /// `0.0..=1.0`.
+    pub fn new(points: Vec<(f32, f32)>) -> Result<Self, ProportionalPolylineError> {
+        if points.len() < 2 {
+            return Err(ProportionalPolylineError::TooFewPoints {
+                count: points.len(),
+            });
+        }
+        if points.len() > MAX_POLYLINE_POINTS {
+            return Err(ProportionalPolylineError::TooManyPoints {
+                count: points.len(),
+                limit: MAX_POLYLINE_POINTS,
+            });
+        }
+        let points = points
+            .into_iter()
+            .map(|(x, y)| ProportionalPoint::new(x, y))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProportionalPolylineError::Coord)?;
+        Ok(Self { points })
+    }
+
+    /// The polyline's vertices in order; always at least two.
+    pub fn points(&self) -> &[ProportionalPoint] {
+        &self.points
+    }
+}
+
+impl<'de> Deserialize<'de> for ProportionalPolyline {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Each vertex validates through `ProportionalPoint`/`ProportionalCoord`
+        // as the `Vec` materializes; only the count bounds remain to enforce.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            points: Vec<ProportionalPoint>,
+        }
+        let Wire { points } = Wire::deserialize(deserializer)?;
+        let count = points.len();
+        if count < 2 {
+            return Err(serde::de::Error::custom(
+                ProportionalPolylineError::TooFewPoints { count },
+            ));
+        }
+        if count > MAX_POLYLINE_POINTS {
+            return Err(serde::de::Error::custom(
+                ProportionalPolylineError::TooManyPoints {
+                    count,
+                    limit: MAX_POLYLINE_POINTS,
+                },
+            ));
+        }
+        Ok(Self { points })
+    }
+}
+
+/// Errors from [`ProportionalPolyline::new`].
+///
+/// `PartialEq` only — a wrapped [`ProportionalCoordError`] carries a
+/// pre-validation `f32` that may be `NaN`, so a total ordering would be
+/// dishonest, and errors aren't part of the content-addressed fact graph.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProportionalPolylineError {
+    /// A vertex coordinate was invalid (non-finite or out of range).
+    Coord(ProportionalCoordError),
+    /// The trace named fewer than two points.
+    TooFewPoints { count: usize },
+    /// The trace named more than [`MAX_POLYLINE_POINTS`] points.
+    TooManyPoints { count: usize, limit: usize },
+}
+
+impl std::fmt::Display for ProportionalPolylineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Coord(e) => write!(f, "proportional polyline vertex invalid: {e}"),
+            Self::TooFewPoints { count } => write!(
+                f,
+                "proportional polyline needs at least two points, got {count}"
+            ),
+            Self::TooManyPoints { count, limit } => write!(
+                f,
+                "proportional polyline exceeds the {limit}-point limit, got {count}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProportionalPolylineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Coord(e) => Some(e),
+            Self::TooFewPoints { .. } | Self::TooManyPoints { .. } => None,
+        }
+    }
+}
+
+/// Image-space localization geometry for a depiction — where in the image's own
+/// pixel / proportional frame an entity sits.
+///
+/// A pixel-precise [`RleMask`], an axis-aligned [`ProportionalRect`] bbox, or a
+/// [`ProportionalPolyline`] trace. Masks and bboxes suit areal features, the
+/// polyline a linear feature traced across the sheet. All are anchored to the
+/// image's own frame; a geographic reading is a property of the image's
+/// projection, derived downstream.
+///
+/// Construct a bbox via [`ImageGeometry::bbox`]; deserialization routes the
+/// bbox and polyline payloads through their validating wire boundaries, so
+/// out-of-range coordinates fail at parse time.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ImageRegion {
+pub enum ImageGeometry {
     /// Pixel-precise binary mask whose grid matches the parent image's.
     Mask {
         /// The run-length-encoded binary mask.
         mask: RleMask,
     },
-    /// Axis-aligned proportional bounding box in `0.0..=1.0`
-    /// coordinates. Resolution-independent — survives rescans and
-    /// downsamples of the parent image.
+    /// Axis-aligned proportional bounding box in `0.0..=1.0` coordinates.
+    /// Resolution-independent — survives rescans and downsamples of the image.
     #[serde(rename = "bbox")]
     BBox {
         /// The proportional bounding rectangle.
         rect: ProportionalRect,
     },
+    /// Proportional polyline trace, for roads, paths, or boundaries.
+    Polyline {
+        /// The proportional polyline trace.
+        polyline: ProportionalPolyline,
+    },
 }
 
-impl ImageRegion {
-    /// Construct an axis-aligned proportional bbox. See
-    /// [`ProportionalRect::new`] for the validation rules.
-    pub fn bbox(x: f32, y: f32, width: f32, height: f32) -> Result<Self, ProportionalRectError> {
+impl ImageGeometry {
+    /// Construct an axis-aligned proportional bbox from two corners given as
+    /// raw floats, in any order. See [`ProportionalRect::new`] for the
+    /// coordinate validation.
+    pub fn bbox(ax: f32, ay: f32, bx: f32, by: f32) -> Result<Self, ProportionalCoordError> {
         Ok(Self::BBox {
-            rect: ProportionalRect::new(x, y, width, height)?,
+            rect: ProportionalRect::new(ax, ay, bx, by)?,
         })
     }
-}
-
-/// Errors from [`ProportionalRect::new`].
-///
-/// `PartialOrd` only — the error variants carry pre-validation `f32`
-/// values that may be `NaN` or infinite, so total ordering would be
-/// dishonest. Errors aren't part of the content-addressed-fact graph,
-/// so missing `Ord` here doesn't constrain anything downstream.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ProportionalRectError {
-    /// One or more coordinates were not finite (`NaN` or infinite).
-    NotFinite,
-    /// The origin had a negative component; the origin must lie in
-    /// `0.0..=1.0`.
-    NegativeOrigin { x: f32, y: f32 },
-    /// The width or height was zero or negative.
-    NonPositiveExtent { width: f32, height: f32 },
-    /// The rectangle extended beyond the unit square's `0.0..=1.0` range.
-    OutOfBounds {
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-    },
-}
-
-impl std::fmt::Display for ProportionalRectError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFinite => write!(f, "proportional rect coordinates must be finite"),
-            Self::NegativeOrigin { x, y } => write!(
-                f,
-                "proportional rect origin must be non-negative, got (x={x}, y={y})"
-            ),
-            Self::NonPositiveExtent { width, height } => write!(
-                f,
-                "proportional rect extent must be positive, got width={width}, height={height}"
-            ),
-            Self::OutOfBounds {
-                x,
-                y,
-                width,
-                height,
-            } => write!(
-                f,
-                "proportional rect exceeds unit-square bounds: x={x}, y={y}, width={width}, height={height}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ProportionalRectError {}
-
-/// Spatial geometry attached to a map-bearing depiction fact.
-///
-/// Either an image region (mask or bbox) or a polyline trace.
-/// Region is typical for areal features; polyline is typical for linear
-/// features traced from the sheet.
-///
-/// Internal `"type"` tagging with the payload in a named field: the
-/// `Region` payload is [`ImageRegion`], itself an internally-tagged enum
-/// keyed on `type`. Nesting it under a named field
-/// (`{"type":"region","region":{"type":"bbox",...}}`) keeps the inner
-/// `type` key in a separate map, so the two tag keys never collide — the
-/// duplicate-key failure a bare newtype payload would cause.
-#[grammar_type]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum SpatialGeometry {
-    /// Image region — mask or bbox.
-    Region {
-        /// The image region (mask or bbox).
-        region: ImageRegion,
-    },
-    /// Polyline trace, for roads, paths, or boundaries.
-    Polyline {
-        /// The polyline trace.
-        polyline: Polyline,
-    },
 }
 
 #[cfg(test)]
@@ -298,12 +456,12 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    // Origin coordinates that keep `-0.0` reachable: a plain `0.0..` float
+    // Coordinate values that keep `-0.0` reachable: a plain `0.0..` float
     // strategy almost never samples exactly `-0.0`, so the bug this guards
-    // against (negative-zero inconsistency between the derived `PartialEq` and
-    // the manual `Hash`/`Ord`) would slip past. Mixing the two zero forms in
-    // explicitly forces the law to exercise them.
-    fn arb_origin() -> impl Strategy<Value = f32> {
+    // against (negative-zero inconsistency between `PartialEq` and `Hash`/`Ord`)
+    // would slip past. Mixing the two zero forms in explicitly forces the laws
+    // to exercise them.
+    fn arb_coord() -> impl Strategy<Value = f32> {
         prop_oneof![
             4 => 0.0f32..0.5,
             1 => Just(-0.0f32),
@@ -312,93 +470,205 @@ mod tests {
     }
 
     fn arb_rect() -> impl Strategy<Value = ProportionalRect> {
-        (arb_origin(), arb_origin(), 0.01f32..0.5, 0.01f32..0.5).prop_filter_map(
-            "origin + extent must stay within the unit square",
-            |(x, y, width, height)| ProportionalRect::new(x, y, width, height).ok(),
+        (arb_coord(), arb_coord(), arb_coord(), arb_coord()).prop_filter_map(
+            "corner coordinates lie in the unit square",
+            |(ax, ay, bx, by)| ProportionalRect::new(ax, ay, bx, by).ok(),
         )
     }
 
-    fn hash_of(rect: &ProportionalRect) -> u64 {
-        use std::hash::{Hash, Hasher};
+    fn hash_of<T: std::hash::Hash>(value: &T) -> u64 {
+        use std::hash::Hasher;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        rect.hash(&mut hasher);
+        value.hash(&mut hasher);
         hasher.finish()
     }
 
     proptest! {
+        /// `ProportionalCoord` folds `-0.0` into `+0.0` and rejects NaN/Inf, so
+        /// its `Hash`/`Ord` must stay consistent with `PartialEq`. Every type
+        /// built from coordinates derives through this, so the law protects
+        /// `ProportionalRect`, `ProportionalPoint`, and `ProportionalPolyline`.
+        #[test]
+        fn proportional_coord_eq_hash_ord_consistent_with_negative_zero(
+            a in arb_coord(),
+            b in arb_coord(),
+        ) {
+            let ca = ProportionalCoord::new(a).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let cb = ProportionalCoord::new(b).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            if ca == cb {
+                prop_assert_eq!(hash_of(&ca), hash_of(&cb), "equal coords must hash equally");
+                prop_assert_eq!(ca.cmp(&cb), Ordering::Equal, "equal coords must order Equal");
+            }
+            let neg = ProportionalCoord::new(-0.0).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let pos = ProportionalCoord::new(0.0).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(neg, pos, "negative and positive zero must be equal");
+            prop_assert_eq!(hash_of(&neg), hash_of(&pos), "equal coords must hash equally");
+            prop_assert_eq!(neg.cmp(&pos), Ordering::Equal, "equal coords must order Equal");
+        }
+
         #[test]
         fn proportional_rect_eq_hash_ord_consistent_with_negative_zero(
             a in arb_rect(),
             b in arb_rect(),
         ) {
-            // Whenever two rects compare equal, the manual `Hash` and `Ord`
-            // must agree — the exact contract negative zero would otherwise
-            // break (derived `PartialEq` folds `-0.0 == +0.0`, but
-            // `to_bits`/`total_cmp` distinguish them).
+            // Whenever two rects compare equal, `Hash` and `Ord` must agree —
+            // the exact contract negative zero would otherwise break (`PartialEq`
+            // folds `-0.0 == +0.0`, but `to_bits`/`total_cmp` distinguish them).
             if a == b {
                 prop_assert_eq!(hash_of(&a), hash_of(&b), "equal rects must hash equally");
                 prop_assert_eq!(a.cmp(&b), Ordering::Equal, "equal rects must order Equal");
             }
 
-            // The origin coordinates are the only place `-0.0` can enter
-            // (extents <= 0.0 are rejected), so swapping `-0.0` for `+0.0`
-            // there must be invisible across Eq, Hash, and Ord.
-            let neg = ProportionalRect::new(-0.0, -0.0, a.width(), a.height())
+            // `-0.0` can enter any corner; swapping it for `+0.0` in the min
+            // corner must be invisible across Eq, Hash, and Ord.
+            let neg = ProportionalRect::new(-0.0, -0.0, a.max_corner().x(), a.max_corner().y())
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let pos = ProportionalRect::new(0.0, 0.0, a.width(), a.height())
+            let pos = ProportionalRect::new(0.0, 0.0, a.max_corner().x(), a.max_corner().y())
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            prop_assert_eq!(neg, pos, "negative and positive zero origins must be equal");
+            prop_assert_eq!(neg, pos, "negative and positive zero corners must be equal");
             prop_assert_eq!(hash_of(&neg), hash_of(&pos), "equal rects must hash equally");
             prop_assert_eq!(neg.cmp(&pos), Ordering::Equal, "equal rects must order Equal");
         }
     }
 
     #[test]
-    fn image_region_bbox_rejects_out_of_bounds() {
+    fn proportional_rect_normalizes_corner_order() -> TestResult {
+        // Corners in any order collapse to one canonical rect, so input order is
+        // not a construction failure point and equal regions compare equal.
+        let canonical = ProportionalRect::new(0.1, 0.2, 0.3, 0.4)?;
+        let reversed = ProportionalRect::new(0.3, 0.4, 0.1, 0.2)?;
+        let mixed = ProportionalRect::new(0.3, 0.2, 0.1, 0.4)?;
+        assert_eq!(canonical, reversed);
+        assert_eq!(canonical, mixed);
+        assert_eq!(canonical.min_corner(), ProportionalPoint::new(0.1, 0.2)?);
+        assert_eq!(canonical.max_corner(), ProportionalPoint::new(0.3, 0.4)?);
+        Ok(())
+    }
+
+    #[test]
+    fn proportional_rect_allows_zero_area() -> TestResult {
+        // Coincident corners — a VLM pointing at a small feature — are a valid
+        // degenerate rect, not an error.
+        let rect = ProportionalRect::new(0.5, 0.5, 0.5, 0.5)?;
+        assert_eq!(rect.min_corner(), rect.max_corner());
+        Ok(())
+    }
+
+    #[test]
+    fn proportional_rect_rejects_out_of_range_corner() {
         assert!(matches!(
-            ImageRegion::bbox(0.6, 0.0, 0.5, 0.5),
-            Err(ProportionalRectError::OutOfBounds { .. })
+            ProportionalRect::new(0.0, 0.0, 1.5, 0.5),
+            Err(ProportionalCoordError::OutOfBounds { .. })
         ));
     }
 
     #[test]
-    fn image_region_bbox_rejects_zero_extent() {
+    fn image_geometry_bbox_rejects_nan() {
         assert!(matches!(
-            ImageRegion::bbox(0.0, 0.0, 0.0, 0.5),
-            Err(ProportionalRectError::NonPositiveExtent { .. })
+            ImageGeometry::bbox(f32::NAN, 0.0, 0.5, 0.5),
+            Err(ProportionalCoordError::NotFinite { .. })
         ));
     }
 
     #[test]
-    fn image_region_bbox_rejects_nan() {
-        assert!(matches!(
-            ImageRegion::bbox(f32::NAN, 0.0, 0.5, 0.5),
-            Err(ProportionalRectError::NotFinite)
-        ));
-    }
-
-    #[test]
-    fn image_region_deserialize_validates_bbox() {
-        // The bbox payload nests under the named `rect` field; the
-        // out-of-bounds coordinates must still fail at the
-        // `ProportionalRect` wire boundary.
-        let result: Result<ImageRegion, _> = serde_json::from_str(
-            r#"{"type":"bbox","rect":{"x":0.6,"y":0.0,"width":0.5,"height":0.5}}"#,
+    fn image_geometry_deserialize_validates_bbox() {
+        // The out-of-range corner must fail at the `ProportionalRect` wire
+        // boundary, nested under the `bbox` tag and the `rect` field.
+        let result: Result<ImageGeometry, _> = serde_json::from_str(
+            r#"{"type":"bbox","rect":{"min":{"x":0.6,"y":0.0},"max":{"x":1.5,"y":0.5}}}"#,
         );
         assert!(
             result.is_err(),
-            "out-of-bounds bbox must fail at deserialize"
+            "out-of-range bbox must fail at deserialize"
         );
     }
 
     #[test]
-    fn image_region_bbox_round_trips_preserving_all_components() -> TestResult {
-        // Catches a manual-Deserialize Raw → smart-ctor wiring bug that
-        // dropped or reordered any of {x, y, width, height}.
-        let region = ImageRegion::bbox(0.1, 0.2, 0.3, 0.4)?;
-        let json = serde_json::to_string(&region)?;
-        let parsed: ImageRegion = serde_json::from_str(&json)?;
-        assert_eq!(parsed, region);
+    fn image_geometry_bbox_round_trips_preserving_corners() -> TestResult {
+        // Catches a manual-Deserialize Wire → from_corners wiring bug that
+        // dropped or swapped a corner coordinate.
+        let geometry = ImageGeometry::bbox(0.1, 0.2, 0.3, 0.4)?;
+        let json = serde_json::to_string(&geometry)?;
+        let parsed: ImageGeometry = serde_json::from_str(&json)?;
+        assert_eq!(parsed, geometry);
+        Ok(())
+    }
+
+    #[test]
+    fn proportional_point_rejects_nan() {
+        assert!(matches!(
+            ProportionalPoint::new(f32::NAN, 0.5),
+            Err(ProportionalCoordError::NotFinite { .. })
+        ));
+    }
+
+    #[test]
+    fn proportional_polyline_rejects_single_point() {
+        assert!(matches!(
+            ProportionalPolyline::new(vec![(0.1, 0.1)]),
+            Err(ProportionalPolylineError::TooFewPoints { count: 1 })
+        ));
+    }
+
+    #[test]
+    fn proportional_polyline_rejects_too_many_points() {
+        let points = vec![(0.5f32, 0.5f32); MAX_POLYLINE_POINTS + 1];
+        assert!(matches!(
+            ProportionalPolyline::new(points),
+            Err(ProportionalPolylineError::TooManyPoints { count, limit })
+                if count == MAX_POLYLINE_POINTS + 1 && limit == MAX_POLYLINE_POINTS
+        ));
+    }
+
+    #[test]
+    fn proportional_polyline_rejects_non_finite_vertex() {
+        assert!(matches!(
+            ProportionalPolyline::new(vec![(0.1, 0.1), (f32::INFINITY, 0.2)]),
+            Err(ProportionalPolylineError::Coord(
+                ProportionalCoordError::NotFinite { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn proportional_polyline_deserialize_validates_too_few_points() {
+        let result: Result<ProportionalPolyline, _> =
+            serde_json::from_str(r#"{"points":[{"x":0.1,"y":0.1}]}"#);
+        assert!(
+            result.is_err(),
+            "single-point trace must fail at deserialize"
+        );
+    }
+
+    #[test]
+    fn proportional_polyline_deserialize_validates_out_of_range() {
+        let result: Result<ProportionalPolyline, _> =
+            serde_json::from_str(r#"{"points":[{"x":0.0,"y":0.0},{"x":1.5,"y":0.2}]}"#);
+        assert!(
+            result.is_err(),
+            "out-of-range vertex must fail at the wire boundary"
+        );
+    }
+
+    #[test]
+    fn proportional_polyline_deserialize_validates_too_many_points() {
+        let points = vec![r#"{"x":0.5,"y":0.5}"#; MAX_POLYLINE_POINTS + 1].join(",");
+        let json = format!("{{\"points\":[{points}]}}");
+        let result: Result<ProportionalPolyline, _> = serde_json::from_str(&json);
+        assert!(
+            result.is_err(),
+            "over-long trace must fail at the wire boundary"
+        );
+    }
+
+    #[test]
+    fn proportional_polyline_round_trips_preserving_vertices() -> TestResult {
+        // Catches a derived-Deserialize bug that dropped, reordered, or swapped
+        // the x/y of any vertex.
+        let trace = ProportionalPolyline::new(vec![(0.1, 0.2), (0.3, 0.4), (0.5, 0.6)])?;
+        let json = serde_json::to_string(&trace)?;
+        let parsed: ProportionalPolyline = serde_json::from_str(&json)?;
+        assert_eq!(parsed, trace);
         Ok(())
     }
 }

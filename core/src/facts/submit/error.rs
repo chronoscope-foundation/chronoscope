@@ -29,8 +29,8 @@ pub enum DateRole {
     EventDate,
     /// `image::Fact::CreatedDate`.
     ImageCreated,
-    /// `picture::Fact::CapturedDate`.
-    PictureCaptured,
+    /// `image::Fact::CapturedDate`.
+    ImageCaptured,
     /// An `ExternalSource` publication/creation date carried by a citation
     /// (`Url`/`Book` published, `Archive` created).
     CitationDate,
@@ -44,7 +44,7 @@ impl std::fmt::Display for DateRole {
             Self::BookendBound => "bookend bound",
             Self::EventDate => "event date",
             Self::ImageCreated => "image created-date",
-            Self::PictureCaptured => "picture captured-date",
+            Self::ImageCaptured => "image captured-date",
             Self::CitationDate => "citation date",
         };
         f.write_str(label)
@@ -59,8 +59,8 @@ pub enum LocationRole {
     BookendLocation,
     /// `event::Fact::MovedToLocation`.
     MovedToLocation,
-    /// `picture::Fact::CapturedLocation`.
-    PictureCaptured,
+    /// `image::Fact::CapturedLocation`.
+    ImageCaptured,
 }
 
 impl std::fmt::Display for LocationRole {
@@ -68,30 +68,9 @@ impl std::fmt::Display for LocationRole {
         let label = match self {
             Self::BookendLocation => "bookend location",
             Self::MovedToLocation => "move location",
-            Self::PictureCaptured => "picture captured-location",
+            Self::ImageCaptured => "image captured-location",
         };
         f.write_str(label)
-    }
-}
-
-/// The role an image is used as or claimed to be. A picture carries capture
-/// metadata and depicts entities in-frame; a map places entities by location.
-/// Role coherence (one image, one role) is checked at submit time; the Display
-/// form renders the word used in [`SubmitError::ImageRoleConflict`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ImageRole {
-    /// A photographic image — captures a scene, depicts entities in-frame.
-    Picture,
-    /// A cartographic image — places entities by geographic location.
-    Map,
-}
-
-impl std::fmt::Display for ImageRole {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Picture => write!(f, "picture"),
-            Self::Map => write!(f, "map"),
-        }
     }
 }
 
@@ -369,20 +348,5 @@ pub enum SubmitError<E, V, I> {
     CompositeChain {
         /// The image forming the chain.
         image: I,
-    },
-    /// A fact presupposes one role for an image (a picture-capture attribute or
-    /// in-picture depiction needs a picture; an on-map depiction needs a map)
-    /// while another fact about that image claims the opposite role. A
-    /// claim-vs-claim disagreement (both `IsPicture` and `IsMap`) is deferred
-    /// to projection — uncertainty is data — so only presupposition-vs-claim
-    /// fires here.
-    #[error("image {image} used as {used_as} but claimed as {claimed}")]
-    ImageRoleConflict {
-        /// The image whose role is contested.
-        image: I,
-        /// The role a fact presupposed for the image.
-        used_as: ImageRole,
-        /// The role another fact claimed the image to be.
-        claimed: ImageRole,
     },
 }
