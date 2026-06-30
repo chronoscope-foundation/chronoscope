@@ -104,7 +104,7 @@ check target="all":
             nix build \
                 ".#checks.$SYS.fmt" \
                 ".#checks.$SYS.clippy" \
-                ".#checks.$SYS.test" \
+                ".#checks.$SYS.doctest" \
                 ".#checks.$SYS.llvm-cov" \
                 --no-link
             ;;

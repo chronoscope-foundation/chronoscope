@@ -48,15 +48,6 @@ let
     cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { CARGO_PROFILE = "test"; });
   };
 
-  # Workspace test run. The `chronoscope-dev::tests/web.rs` target is
-  # gated behind a `required-features = ["browser-tests"]` entry in
-  # `dev/Cargo.toml`, so this run silently skips it — the dedicated
-  # `web-test` check picks it up with capped parallelism. Keeping the heavy
-  # Chrome-driven tests out of this derivation lets the rest of the
-  # workspace's tests run at full cargo parallelism without Chrome processes
-  # co-contending for the cores.
-  test = craneLib.cargoTest (checkArgs // testExtraEnv);
-
   clippy = craneLib.cargoClippy (
     checkArgs
     // {
@@ -64,13 +55,31 @@ let
     }
   );
 
+  # Doctests get their own check because `cargo llvm-cov` (stable) skips them.
+  # They guard real invariants — e.g. the `compile_fail` grammar-macro examples
+  # in `chronoscope-macros` and `core/facts`.
+  doctest = craneLib.cargoTest (
+    checkArgs
+    // testExtraEnv
+    // {
+      pname = "chronoscope-doctest";
+      cargoTestExtraArgs = "--doc";
+    }
+  );
+
+  # Coverage doubles as the workspace test run: it executes the unit +
+  # integration suite (a failing test fails the check) and enforces the line
+  # threshold, so there is no separate plain test derivation. The
+  # `chronoscope-dev::tests/web.rs` target is gated behind `browser-tests` in
+  # `dev/Cargo.toml`, so it's skipped here; the dedicated `web-test` check runs
+  # the Chrome-driven tests with capped parallelism.
+  #
+  # crane's cargoLlvmCov sets installPhaseCommand="" and expects the command to
+  # write $out; --output-path $out puts the LCOV report there.
   llvm-cov = craneLib.cargoLlvmCov (
     checkArgs
     // testExtraEnv
     // {
-      # crane's cargoLlvmCov sets installPhaseCommand="" and expects the
-      # coverage command to write $out directly. --output-path $out writes
-      # the LCOV report as a file at $out (not a directory).
       cargoLlvmCovExtraArgs = "--fail-under-lines 75 --lcov --output-path $out";
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
         pkgs.cargo-llvm-cov
@@ -86,7 +95,7 @@ in
       version = "0.1.0";
     };
 
-    inherit test clippy llvm-cov;
+    inherit clippy doctest llvm-cov;
 
     # Dedicated check for the browser test suite, with `--test-threads=4`.
     # More concurrent Chromes than that starve `chromiumoxide`'s CDP-response
@@ -106,7 +115,7 @@ in
       // {
         pname = "chronoscope-web-tests";
         cargoTestExtraArgs = "-p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4";
-        CHRONOSCOPE_RUN_AFTER = "${test} ${clippy} ${llvm-cov}";
+        CHRONOSCOPE_RUN_AFTER = "${clippy} ${doctest} ${llvm-cov}";
       }
     );
   };
