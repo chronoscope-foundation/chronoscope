@@ -25,7 +25,7 @@ use crate::facts::attribute;
 use crate::facts::bookend;
 use crate::facts::event;
 use crate::facts::identity;
-use crate::facts::ids::FactId;
+use crate::facts::ids::{FactId, IdScheme};
 use crate::facts::lifecycle::DurationalRole;
 use crate::facts::submit::StoredFact;
 
@@ -35,14 +35,7 @@ use super::types::{Bookend, Entity, Event, NameKey, NameRecord};
 
 /// The citation a single fact warrants, when it warrants one. A meta fact backs
 /// no value, so it cites nothing.
-pub(super) fn citation_of<EntId, EvtId, ImgId>(
-    fact: &StoredFact<EntId, EvtId, ImgId>,
-) -> Option<Citation<ImgId>>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord + Clone,
-{
+pub(super) fn citation_of<R: IdScheme>(fact: &StoredFact<R>) -> Option<Citation<R::Image>> {
     match fact {
         StoredFact::Factual(f) => Some(Citation::Factual {
             citation: f.citation.clone(),
@@ -60,15 +53,10 @@ where
 /// `rule_event_has_one_kind` rejects a second distinct `HasEvent` on an event id
 /// (`EventMultipleHasEvent`) across the cumulative neighbourhood, so a reachable
 /// event has exactly one owner — one source id, not a set.
-pub(crate) fn event_reachers<EntId, EvtId, ImgId>(
-    facts: &BTreeMap<FactId, StoredFact<EntId, EvtId, ImgId>>,
-) -> BTreeMap<EvtId, EntId>
-where
-    EntId: Ord + Clone,
-    EvtId: Ord + Clone,
-    ImgId: Ord,
-{
-    let mut reachers: BTreeMap<EvtId, EntId> = BTreeMap::new();
+pub(crate) fn event_reachers<R: IdScheme>(
+    facts: &BTreeMap<FactId, StoredFact<R>>,
+) -> BTreeMap<R::Event, R::Entity> {
+    let mut reachers: BTreeMap<R::Event, R::Entity> = BTreeMap::new();
     for fact in facts.values() {
         if let Some(event::Fact::HasEvent { entity, event, .. }) = fact.event_fact() {
             reachers.insert(event.clone(), entity.clone());
@@ -89,22 +77,19 @@ where
 ///
 /// `reachers` maps each interior event id to the one entity whose `HasEvent`
 /// named it (see [`event_reachers`]); that entity is the event fact's source id.
-pub(crate) fn project_facts<EntId, EvtId, ImgId, T>(
-    facts: &BTreeMap<FactId, StoredFact<EntId, EvtId, ImgId>>,
-    reachers: &BTreeMap<EvtId, EntId>,
-    provenance: impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> Entity<EntId, EvtId, T>
+pub(crate) fn project_facts<R: IdScheme, T>(
+    facts: &BTreeMap<FactId, StoredFact<R>>,
+    reachers: &BTreeMap<R::Event, R::Entity>,
+    provenance: impl Fn(&R::Entity, &Citation<R::Image>) -> T,
+) -> Entity<R::Entity, R::Event, T>
 where
-    EntId: Ord + Clone,
-    EvtId: Ord + Clone,
-    ImgId: Ord + Clone,
     T: Semiring + Clone,
 {
     facts
         .values()
         .map(|fact| inject(fact, reachers, &provenance))
         .fold(
-            <Entity<EntId, EvtId, T> as CommutativeMonoid>::identity(),
+            <Entity<R::Entity, R::Event, T> as CommutativeMonoid>::identity(),
             CommutativeMonoid::combine,
         )
 }
@@ -113,15 +98,12 @@ where
 /// leaf set, its support the fact's citation lifted through `provenance` against
 /// the source id the fact spoke to. A `SameEntity` judgment lands one `sameness`
 /// edge. A meta fact backs nothing.
-fn inject<EntId, EvtId, ImgId, T>(
-    fact: &StoredFact<EntId, EvtId, ImgId>,
-    reachers: &BTreeMap<EvtId, EntId>,
-    provenance: &impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> Entity<EntId, EvtId, T>
+fn inject<R: IdScheme, T>(
+    fact: &StoredFact<R>,
+    reachers: &BTreeMap<R::Event, R::Entity>,
+    provenance: &impl Fn(&R::Entity, &Citation<R::Image>) -> T,
+) -> Entity<R::Entity, R::Event, T>
 where
-    EntId: Ord + Clone,
-    EvtId: Ord + Clone,
-    ImgId: Ord + Clone,
     T: Semiring + Clone,
 {
     match fact {
@@ -144,16 +126,13 @@ where
 /// A factual assertion's contribution. The source id is the fact's own subject
 /// entity for entity-level claims; for an interior event it is the one entity
 /// whose `HasEvent` owns the event.
-fn inject_factual<EntId, EvtId, ImgId, T>(
-    assertion: &FactualAssertion<EntId, EvtId, ImgId>,
-    reachers: &BTreeMap<EvtId, EntId>,
-    citation: &Citation<ImgId>,
-    provenance: &impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> Entity<EntId, EvtId, T>
+fn inject_factual<R: IdScheme, T>(
+    assertion: &FactualAssertion<R>,
+    reachers: &BTreeMap<R::Event, R::Entity>,
+    citation: &Citation<R::Image>,
+    provenance: &impl Fn(&R::Entity, &Citation<R::Image>) -> T,
+) -> Entity<R::Entity, R::Event, T>
 where
-    EntId: Ord + Clone,
-    EvtId: Ord + Clone,
-    ImgId: Ord + Clone,
     T: Semiring + Clone,
 {
     match assertion {
@@ -188,15 +167,12 @@ where
 /// and `b` — so a field either endpoint asserted into can find the edge by id,
 /// and `Citation::Judgment` stays live. Every other judgment kind backs no
 /// entity field.
-fn inject_judgment<EntId, EvtId, ImgId, T>(
-    assertion: &JudgmentAssertion<EntId, EvtId, ImgId>,
-    citation: &Citation<ImgId>,
-    provenance: &impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> Entity<EntId, EvtId, T>
+fn inject_judgment<R: IdScheme, T>(
+    assertion: &JudgmentAssertion<R>,
+    citation: &Citation<R::Image>,
+    provenance: &impl Fn(&R::Entity, &Citation<R::Image>) -> T,
+) -> Entity<R::Entity, R::Event, T>
 where
-    EntId: Ord + Clone,
-    EvtId: Ord + Clone,
-    ImgId: Ord + Clone,
     T: Semiring,
 {
     let JudgmentAssertion::Identity {

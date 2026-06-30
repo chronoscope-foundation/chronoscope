@@ -62,7 +62,7 @@ use serde::{Deserialize, Serialize};
 use crate::facts::assertions::{JudgmentAssertion, MetaAssertion};
 use crate::facts::citations::JudgmentSource;
 use crate::facts::identity;
-use crate::facts::ids::{CommitId, FactId};
+use crate::facts::ids::{CommitId, FactId, IdScheme};
 use crate::facts::schema::{
     EdgeSubgraph, EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem,
     normalize_name,
@@ -132,6 +132,16 @@ impl std::fmt::Display for MemoryImageId {
     }
 }
 
+/// The in-memory backend's id scheme: the three `u64`-newtype id kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema)]
+pub struct MemoryIds;
+
+impl IdScheme for MemoryIds {
+    type Entity = MemoryEntityId;
+    type Event = MemoryEventId;
+    type Image = MemoryImageId;
+}
+
 // ============================================================================
 // Backend error
 // ============================================================================
@@ -157,12 +167,12 @@ impl From<serde_json::Error> for MemoryError {
 }
 
 // Aliases to keep the spellings short.
-type MemStoredFact = StoredFact<MemoryEntityId, MemoryEventId, MemoryImageId>;
-type MemFactLookup = FactLookup<MemoryEntityId, MemoryEventId, MemoryImageId>;
-type MemCommit = Commit<MemoryEntityId, MemoryEventId, MemoryImageId>;
-type MemSubmitResult = SubmitResult<MemoryEntityId, MemoryEventId, MemoryImageId>;
-type MemSubmitCommitError =
-    SubmitCommitError<MemoryError, MemoryEntityId, MemoryEventId, MemoryImageId>;
+type MemStoredFact = StoredFact<MemoryIds>;
+type MemFactLookup = FactLookup<MemoryIds>;
+type MemCommit = Commit<MemoryIds>;
+type MemSubmitResult = SubmitResult<MemoryIds>;
+type MemSubmitCommitError = SubmitCommitError<MemoryError, MemoryIds>;
+type MemSubmitError = SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>;
 
 // ============================================================================
 // Storage
@@ -1149,9 +1159,7 @@ pub struct MemoryTx<'brand> {
 
 impl FactStore for MemoryFactStore {
     type Error = MemoryError;
-    type EntityId = MemoryEntityId;
-    type EventId = MemoryEventId;
-    type ImageId = MemoryImageId;
+    type Ids = MemoryIds;
     type Tx<'brand> = MemoryTx<'brand>;
     type View<'a> = MemorySource<'a>;
 
@@ -1310,8 +1318,7 @@ async fn submit_locked(
     // collect every out-of-range index and every unknown `Decl::Existing` id
     // into one batch.
     let (entity_refs, event_refs, image_refs) = collect_idx_refs(&commit);
-    let mut resolvability_errors: Vec<SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>> =
-        Vec::new();
+    let mut resolvability_errors: Vec<MemSubmitError> = Vec::new();
     resolvability_errors.extend(check_refs_in_range(
         &entity_refs,
         commit.entities.len(),
@@ -1762,8 +1769,8 @@ where
 /// `Meta` targets are persistent `FactId` / `CommitId`, not indices, so they
 /// contribute none. The collector half of the id-traversal; the resulting sets
 /// feed both the out-of-range check and the unused-declaration check.
-fn collect_idx_refs<EntId, EvtId, ImgId>(
-    commit: &Commit<EntId, EvtId, ImgId>,
+fn collect_idx_refs<R: IdScheme>(
+    commit: &Commit<R>,
 ) -> (
     std::collections::HashSet<EntityIdx>,
     std::collections::HashSet<EventIdx>,
@@ -1795,12 +1802,12 @@ fn collect_idx_refs<EntId, EvtId, ImgId>(
 /// [`SubmitError`] per offending position in ascending order. Parameterised over
 /// the reference set, declaration count, the `position` extractor, and the
 /// out-of-range error constructor.
-fn check_refs_in_range<Idx, EntId, EvtId, ImgId>(
+fn check_refs_in_range<Idx>(
     refs: &std::collections::HashSet<Idx>,
     decl_count: usize,
     position: impl Fn(&Idx) -> usize,
-    out_of_range: impl Fn(usize, usize) -> SubmitError<EntId, EvtId, ImgId>,
-) -> Vec<SubmitError<EntId, EvtId, ImgId>> {
+    out_of_range: impl Fn(usize, usize) -> MemSubmitError,
+) -> Vec<MemSubmitError> {
     let mut offending: Vec<usize> = refs
         .iter()
         .map(&position)
@@ -1818,12 +1825,12 @@ fn check_refs_in_range<Idx, EntId, EvtId, ImgId>(
 /// certainly a bug, better surfaced than silently minted. Parameterised over the
 /// reference set, declaration count, the `idx_ctor` for testing set membership,
 /// and the unreferenced-position error constructor.
-fn check_all_decls_referenced<Idx, EntId, EvtId, ImgId>(
+fn check_all_decls_referenced<Idx>(
     refs: &std::collections::HashSet<Idx>,
     decl_count: usize,
     idx_ctor: fn(usize) -> Idx,
-    unused: impl Fn(usize) -> SubmitError<EntId, EvtId, ImgId>,
-) -> Vec<SubmitError<EntId, EvtId, ImgId>>
+    unused: impl Fn(usize) -> MemSubmitError,
+) -> Vec<MemSubmitError>
 where
     Idx: Eq + std::hash::Hash,
 {

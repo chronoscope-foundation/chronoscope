@@ -7,8 +7,8 @@
 //! breaking enum change.
 //!
 //! `StoredFact` is the post-resolution form of the three assertion sums — the
-//! submission grammar's category shape with every id resolved to a persistent
-//! [`EntityId`] / [`LifetimeEventId`] / [`ImageId`].
+//! submission grammar's category shape with every bundle-local index resolved to
+//! the backend scheme's persistent entity / event / image id.
 
 use std::collections::HashMap;
 
@@ -19,7 +19,7 @@ use super::{EntityIdx, EventIdx, ImageIdx};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use crate::facts::citations::{FactualCitation, JudgmentSource, MetaSource};
 use crate::facts::ids::{
-    AnalyzerProcess, AnalyzerVersion, CommitId, FactId, IngesterRunId, UserId,
+    AnalyzerProcess, AnalyzerVersion, CommitId, FactId, IdScheme, IngesterRunId, UserId,
 };
 use crate::nonempty::NonEmptyVec;
 
@@ -81,7 +81,7 @@ pub enum ResolutionOrigin<Id> {
 /// `true` means the bundle deduped to an existing commit; `false` means the
 /// store saw it for the first time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubmitResult<EntId, EvtId, ImgId> {
+pub struct SubmitResult<R: IdScheme> {
     /// The content-addressed commit identifier.
     pub commit_id: CommitId,
     /// Whether this bundle deduped to an existing commit.
@@ -93,11 +93,11 @@ pub struct SubmitResult<EntId, EvtId, ImgId> {
     /// content.
     pub fact_ids: Vec<FactId>,
     /// Per-declaration entity resolution map.
-    pub entities: HashMap<EntityIdx, Resolution<EntId>>,
+    pub entities: HashMap<EntityIdx, Resolution<R::Entity>>,
     /// Per-declaration event resolution map.
-    pub events: HashMap<EventIdx, Resolution<EvtId>>,
+    pub events: HashMap<EventIdx, Resolution<R::Event>>,
     /// Per-declaration image resolution map.
-    pub images: HashMap<ImageIdx, Resolution<ImgId>>,
+    pub images: HashMap<ImageIdx, Resolution<R::Image>>,
     /// The matcher's companion commit: machine-authored identity judgments
     /// linking each matched decl's fresh id to the subject it matched,
     /// persisted immediately after this commit under the same lock. `None`
@@ -157,14 +157,9 @@ impl CommitAuthor {
 /// citation. Resolution substitutes every entity/event/image index with
 /// the corresponding persistent id.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StoredFactualFact<EntId, EvtId, ImgId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
+pub struct StoredFactualFact<R: IdScheme> {
     /// The factual assertion.
-    pub assertion: FactualAssertion<EntId, EvtId, ImgId>,
+    pub assertion: FactualAssertion<R>,
     /// The citation backing the claim.
     pub citation: FactualCitation,
 }
@@ -173,17 +168,12 @@ where
 /// [`JudgmentAssertion`](crate::facts::assertions::JudgmentAssertion) plus
 /// its source.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StoredJudgmentFact<EntId, EvtId, ImgId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
+pub struct StoredJudgmentFact<R: IdScheme> {
     /// The judgment assertion.
-    pub assertion: JudgmentAssertion<EntId, EvtId, ImgId>,
+    pub assertion: JudgmentAssertion<R>,
     /// The judgment source backing the claim. Its observed image (for an
     /// `ImageObservation`) is the resolved persistent id.
-    pub source: JudgmentSource<ImgId>,
+    pub source: JudgmentSource<R::Image>,
 }
 
 /// A stored meta-fact: a [`MetaAssertion`] plus its source.
@@ -202,26 +192,16 @@ pub struct StoredMetaFact {
 /// A fact as stored after submission. Three category arms mirror the
 /// three top-level assertion sums.
 #[derive(Debug, Clone, PartialEq)]
-pub enum StoredFact<EntId, EvtId, ImgId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
+pub enum StoredFact<R: IdScheme> {
     /// A factual claim about the external world.
-    Factual(StoredFactualFact<EntId, EvtId, ImgId>),
+    Factual(StoredFactualFact<R>),
     /// An interpretive judgment.
-    Judgment(StoredJudgmentFact<EntId, EvtId, ImgId>),
+    Judgment(StoredJudgmentFact<R>),
     /// A fact about other facts (retraction, supersession).
     Meta(StoredMetaFact),
 }
 
-impl<EntId, EvtId, ImgId> StoredFact<EntId, EvtId, ImgId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
+impl<R: IdScheme> StoredFact<R> {
     /// Visit every id this fact mentions, dispatching each to its kind's
     /// closure. The fact-level traversal: it folds the assertion's own ids
     /// together with a judgment's observed image, so callers building backlink
@@ -232,9 +212,9 @@ where
     /// ids, so it visits nothing.
     pub fn for_each_id(
         &self,
-        fe: &mut impl FnMut(&EntId),
-        fv: &mut impl FnMut(&EvtId),
-        fi: &mut impl FnMut(&ImgId),
+        fe: &mut impl FnMut(&R::Entity),
+        fv: &mut impl FnMut(&R::Event),
+        fi: &mut impl FnMut(&R::Image),
     ) {
         match self {
             Self::Factual(f) => f.assertion.for_each_id(fe, fv, fi),
@@ -252,7 +232,7 @@ where
     /// submit consistency rules and the projection's entity→event hop read
     /// before classifying — one place to recognize an event fact, so the two
     /// can't drift.
-    pub fn event_fact(&self) -> Option<&crate::facts::event::Fact<EntId, EvtId>> {
+    pub fn event_fact(&self) -> Option<&crate::facts::event::Fact<R::Entity, R::Event>> {
         match self {
             Self::Factual(StoredFactualFact {
                 assertion: FactualAssertion::Event { fact },
@@ -295,14 +275,9 @@ pub struct StoredCommit {
 /// `Future` / `Unknown` value would carry the worst-case size, and
 /// `view.fact()` returns those for every not-yet-minted id.
 #[derive(Debug, Clone, PartialEq)]
-pub enum FactLookup<EntId, EvtId, ImgId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
+pub enum FactLookup<R: IdScheme> {
     /// The fact exists and is active at this view's snapshot.
-    Active(Box<StoredFact<EntId, EvtId, ImgId>>),
+    Active(Box<StoredFact<R>>),
     /// The fact existed at-or-before snapshot but was retracted by
     /// another fact at-or-before snapshot. The retracting fact's id is
     /// reported.

@@ -13,15 +13,75 @@
 //!   content-addressed — derived from the commit's canonical encoding so
 //!   re-submitting an identical commit yields the same id.
 //!
-//! Entity / event / image id types are not here — each [`FactStore`] backend
-//! declares its own via associated `EntityId` / `EventId` / `ImageId` (the
-//! in-memory backend uses `MemoryEntityId(u64)` etc.; a Postgres backend would
-//! substitute its own shape). The wire-stable concept lives on `FactStore`.
+//! The backend's entity / event / image id kinds are bundled behind an
+//! [`IdScheme`] (its `Entity` / `Event` / `Image` associated types), pinned on
+//! [`FactStore::Ids`]. Each backend supplies its own scheme: the in-memory
+//! backend's [`MemoryIds`](super::memory::MemoryIds) over `MemoryEntityId(u64)`
+//! etc., and a Postgres backend would substitute its own.
 //!
 //! [`FactStore`]: super::store::FactStore
+//! [`FactStore::Ids`]: super::store::FactStore::Ids
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// Id-scheme traits
+// ============================================================================
+
+/// The bounds every id kind in a scheme must satisfy.
+///
+/// Mirrors the `PersistentId` bound alias in `store.rs` but adds what the
+/// grammar's serde / schema path needs: `Debug` and `DeserializeOwned` for the
+/// wire round-trip, `JsonSchema` for the schema derive. A supertrait plus
+/// blanket impl, so the bound pile is named once rather than repeated at every
+/// associated-type declaration.
+pub trait SchemeId:
+    Clone
+    + std::fmt::Debug
+    + Ord
+    + std::hash::Hash
+    + Serialize
+    + serde::de::DeserializeOwned
+    + JsonSchema
+    + Send
+    + Sync
+{
+}
+
+impl<T> SchemeId for T where
+    T: Clone
+        + std::fmt::Debug
+        + Ord
+        + std::hash::Hash
+        + Serialize
+        + serde::de::DeserializeOwned
+        + JsonSchema
+        + Send
+        + Sync
+{
+}
+
+/// Bundles the grammar's three id kinds behind one type parameter.
+///
+/// The grammar / store types take a single `R: IdScheme` instead of three
+/// separate `<EntId, EvtId, ImgId>` parameters; each reads `R::Entity`,
+/// `R::Event`, `R::Image` for the kind it needs. A scheme is a zero-size marker
+/// — [`BundleLocal`](super::submit::BundleLocal) (submission indices) and
+/// [`MemoryIds`](super::memory::MemoryIds) (the in-memory backend).
+///
+/// The marker carries the comparison / debug bounds the bundled types derive:
+/// `#[derive(Debug, Clone, PartialEq, Eq, Ord, Hash)]` on a type generic over
+/// `R` emits an `R: Debug` (etc.) bound on each impl, so `R: IdScheme` alone
+/// has to satisfy them for the derives to be usable behind the uniform bound.
+pub trait IdScheme: Clone + std::fmt::Debug + Eq + Ord + std::hash::Hash {
+    /// The entity id kind.
+    type Entity: SchemeId;
+    /// The lifetime-event id kind.
+    type Event: SchemeId;
+    /// The image id kind.
+    type Image: SchemeId;
+}
 
 // ============================================================================
 // String-ID macro
@@ -286,42 +346,6 @@ macro_rules! __validated_string_newtype_maybe_trim {
 // ============================================================================
 // String IDs (macro-generated)
 // ============================================================================
-
-string_id_newtype! {
-    /// Entity ID. Opaque identifier, minted at entity-resolution time and
-    /// reused for subsequent matching descriptions. Stable for the lifetime of
-    /// the entity. Core treats the byte pattern as opaque; presentational layers
-    /// may shape it however they want.
-    EntityId
-}
-
-string_id_newtype! {
-    /// Lifetime-event ID. Opaque identifier for an entity-interior
-    /// lifetime event (renovation, fire, repair, move, usage change,
-    /// designation). Either adopted from an external system that mints
-    /// event ids (e.g. Wikidata's P793 "significant event" targets) or
-    /// minted fresh at ingest when the source doesn't supply one;
-    /// downstream equivalence between such ids is asserted through
-    /// [`crate::facts::identity::Fact::SameEvent`].
-    ///
-    /// Bookend life-stage facts (`Construction*`, `Demolition*`) hang
-    /// directly off the entity and do not carry a `LifetimeEventId`.
-    LifetimeEventId
-}
-
-string_id_newtype! {
-    /// Image ID. Opaque identifier for a specific byte sequence
-    /// (JPEG, PNG, scan). Minted at first ingestion via hash lookup or
-    /// catalog import. Two scans of the same physical photograph have
-    /// different `ImageId`s; perceptual equivalence between them is
-    /// asserted via `identity::Fact::SameArtifact`.
-    ///
-    /// "Picture" (photograph / painting / drawing) and "map" describe a medium,
-    /// not a type-level property of the image. The medium rides on the
-    /// non-gating `image::Fact::Medium` field; every other image fact applies
-    /// regardless.
-    ImageId
-}
 
 string_id_newtype! {
     /// User ID for attribution. Opaque identifier minted by the

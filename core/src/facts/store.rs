@@ -72,12 +72,9 @@
 
 use std::fmt::Debug;
 use std::future::Future;
-use std::hash::Hash;
 use std::pin::Pin;
 
-use serde::Serialize;
-
-use crate::facts::ids::FactId;
+use crate::facts::ids::{FactId, IdScheme};
 use crate::facts::schema::{
     EdgeSubgraph, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
 };
@@ -86,60 +83,31 @@ use crate::facts::submit::{FactLookup, StoredFact, SubmitError, SubmitResult};
 use crate::nonempty::NonEmptyVec;
 
 // ============================================================================
-// PersistentId — the persistent-id bound alias
+// Store id-projection aliases
 // ============================================================================
 
-/// The bounds every backend's persistent id type must satisfy.
-///
-/// A supertrait plus a blanket impl, so the bound pile is named once instead
-/// of repeated at every associated-type declaration. Each bound is used
-/// somewhere in the store / view / submit surface:
-///
-/// - `Clone` — ids are copied out of resolution maps and into results.
-/// - `Ord` — class members live in the `BTreeSet` inside
-///   [`EquivClass`](crate::facts::schema::EquivClass); also supplies `Eq`.
-/// - `Hash` — keys in the `HashMap` lookup indexes.
-/// - `Serialize` — a [`Decl::Existing`](crate::facts::submit::Decl::Existing)
-///   carries an id, so [`Commit::id`](crate::facts::submit::Commit::id)
-///   serializes id types into the JCS hash input.
-/// - `Send + Sync` — the store surface is `Send + Sync` and ids flow through
-///   `Send` futures.
-///
-/// `Debug`, `DeserializeOwned`, `Display`, and `'static` are absent: the
-/// trait surface never uses them on an id (ids are minted in-store and a
-/// read-path `Decl::Existing` id arrives already typed). Concrete backend id
-/// types may still derive them for their own needs.
-pub trait PersistentId: Clone + Ord + Hash + Serialize + Send + Sync {}
-
-impl<T> PersistentId for T where T: Clone + Ord + Hash + Serialize + Send + Sync {}
+/// The entity id kind of store `S`'s scheme.
+pub type EntityIdOf<S> = <<S as FactStore>::Ids as IdScheme>::Entity;
+/// The lifetime-event id kind of store `S`'s scheme.
+pub type EventIdOf<S> = <<S as FactStore>::Ids as IdScheme>::Event;
+/// The image id kind of store `S`'s scheme.
+pub type ImageIdOf<S> = <<S as FactStore>::Ids as IdScheme>::Image;
 
 /// Producer-form commit consumed by [`FactStore::submit_commit`], pinned to
-/// a store's three id kinds. An alias to keep signatures readable and
-/// clippy's `type_complexity` quiet.
-pub type SubmitCommitInput<S> = submit::Commit<
-    <S as FactStore>::EntityId,
-    <S as FactStore>::EventId,
-    <S as FactStore>::ImageId,
->;
+/// a store's id scheme. An alias to keep signatures readable and clippy's
+/// `type_complexity` quiet.
+pub type SubmitCommitInput<S> = submit::Commit<<S as FactStore>::Ids>;
 
 /// Output of [`FactStore::submit_commit`]. The [`SubmitCommitError`] carries
-/// the store's three id types so a rejection surfaces the offending id typed,
-/// not stringified.
+/// the store's id scheme so a rejection surfaces the offending id typed, not
+/// stringified.
 pub type SubmitCommitOutput<S> = Result<
-    SubmitResult<<S as FactStore>::EntityId, <S as FactStore>::EventId, <S as FactStore>::ImageId>,
-    SubmitCommitError<
-        <S as FactStore>::Error,
-        <S as FactStore>::EntityId,
-        <S as FactStore>::EventId,
-        <S as FactStore>::ImageId,
-    >,
+    SubmitResult<<S as FactStore>::Ids>,
+    SubmitCommitError<<S as FactStore>::Error, <S as FactStore>::Ids>,
 >;
 
 /// Result of [`FactView::fact`] for a view over store `S`.
-pub type FactLookupOutput<S> = Result<
-    FactLookup<<S as FactStore>::EntityId, <S as FactStore>::EventId, <S as FactStore>::ImageId>,
-    <S as FactStore>::Error,
->;
+pub type FactLookupOutput<S> = Result<FactLookup<<S as FactStore>::Ids>, <S as FactStore>::Error>;
 
 // ============================================================================
 // FactStore — writeable handle
@@ -161,16 +129,14 @@ pub trait FactStore: Send + Sync + Sized {
     /// Backend-specific error type for non-domain failures.
     type Error: Debug + Send + Sync;
 
-    /// Persistent entity id this backend mints and references. Shape
-    /// varies by backend (`u64`-newtypes in-memory, something else for
-    /// SQL); the trait pins only [`PersistentId`].
-    type EntityId: PersistentId;
-    /// Persistent lifetime-event id this backend mints and references. See
-    /// [`Self::EntityId`].
-    type EventId: PersistentId;
-    /// Persistent image id this backend mints and references. See
-    /// [`Self::EntityId`].
-    type ImageId: PersistentId;
+    /// The persistent id scheme this backend mints and references — its
+    /// entity / event / image id kinds bundled behind one
+    /// [`IdScheme`]. Shape varies by backend (`u64`-newtypes in-memory,
+    /// something else for SQL); the trait pins only [`IdScheme`], whose
+    /// associated [`SchemeId`](crate::facts::ids::SchemeId) kinds carry the
+    /// clone / order / hash / serde / schema / display bounds the store, view,
+    /// and submit surface use.
+    type Ids: IdScheme;
 
     /// Branded transaction handle threaded through [`Self::submit_commit`].
     /// `'brand` is a fresh existential minted per [`Self::with_tx`] call; it
@@ -259,24 +225,24 @@ pub trait FactStore: Send + Sync + Sized {
 /// `Submit` carries every rule violation the pipeline found in one batch;
 /// backend failures carry backend diagnostics.
 ///
-/// `E` is the backend error; `EntId` / `EvtId` / `ImgId` are the backend's id
-/// kinds, threaded into [`SubmitError`] so a rejection carries the offending
-/// id typed. They appear only in the `Submit` arm.
+/// `E` is the backend error; `R` is the backend's id scheme, threaded into
+/// [`SubmitError`] so a rejection carries the offending id typed. The scheme
+/// appears only in the `Submit` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SubmitCommitError<E, EntId, EvtId, ImgId> {
+pub enum SubmitCommitError<E, R: IdScheme> {
     /// A submit-pipeline run rejected the bundle, carrying the non-empty
     /// batch of every rule it violated.
-    Submit(NonEmptyVec<SubmitError<EntId, EvtId, ImgId>>),
+    Submit(NonEmptyVec<SubmitError<R::Entity, R::Event, R::Image>>),
     /// A backend failure (I/O, transaction abort, etc.).
     Backend(E),
 }
 
-impl<E, EntId, EvtId, ImgId> std::fmt::Display for SubmitCommitError<E, EntId, EvtId, ImgId>
+impl<E, R: IdScheme> std::fmt::Display for SubmitCommitError<E, R>
 where
     E: std::fmt::Display,
-    EntId: std::fmt::Display,
-    EvtId: std::fmt::Display,
-    ImgId: std::fmt::Display,
+    R::Entity: std::fmt::Display,
+    R::Event: std::fmt::Display,
+    R::Image: std::fmt::Display,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -296,19 +262,17 @@ where
     }
 }
 
-impl<E, EntId, EvtId, ImgId> std::error::Error for SubmitCommitError<E, EntId, EvtId, ImgId>
+impl<E, R: IdScheme> std::error::Error for SubmitCommitError<E, R>
 where
     E: std::fmt::Debug + std::fmt::Display,
-    EntId: std::fmt::Debug + std::fmt::Display,
-    EvtId: std::fmt::Debug + std::fmt::Display,
-    ImgId: std::fmt::Debug + std::fmt::Display,
+    R::Entity: std::fmt::Display,
+    R::Event: std::fmt::Display,
+    R::Image: std::fmt::Display,
 {
 }
 
-impl<E, EntId, EvtId, ImgId> From<SubmitError<EntId, EvtId, ImgId>>
-    for SubmitCommitError<E, EntId, EvtId, ImgId>
-{
-    fn from(e: SubmitError<EntId, EvtId, ImgId>) -> Self {
+impl<E, R: IdScheme> From<SubmitError<R::Entity, R::Event, R::Image>> for SubmitCommitError<E, R> {
+    fn from(e: SubmitError<R::Entity, R::Event, R::Image>) -> Self {
         Self::Submit(NonEmptyVec::singleton(e))
     }
 }
@@ -376,8 +340,7 @@ pub enum FactPlacement {
 
 /// Store-pinned [`StoredFact`] alias, to keep signatures returning
 /// `FactPage` / `EdgeSubgraph` over a store's id shape readable.
-pub type StoredFactOf<S> =
-    StoredFact<<S as FactStore>::EntityId, <S as FactStore>::EventId, <S as FactStore>::ImageId>;
+pub type StoredFactOf<S> = StoredFact<<S as FactStore>::Ids>;
 
 // ============================================================================
 // EntityView — entity-parametric reads
@@ -392,15 +355,15 @@ pub trait EntityView<S: FactStore>: FactView<S> {
     /// is its own representative.
     fn entity_representative(
         &self,
-        member: &S::EntityId,
-    ) -> impl Future<Output = Result<S::EntityId, S::Error>> + Send;
+        member: &EntityIdOf<S>,
+    ) -> impl Future<Output = Result<EntityIdOf<S>, S::Error>> + Send;
 
     /// The full `SameEntity` equivalence class of `member` at this
     /// snapshot — representative plus every member.
     fn entity_class(
         &self,
-        member: &S::EntityId,
-    ) -> impl Future<Output = Result<EquivClass<S::EntityId>, S::Error>> + Send;
+        member: &EntityIdOf<S>,
+    ) -> impl Future<Output = Result<EquivClass<EntityIdOf<S>>, S::Error>> + Send;
 
     /// Walk entity-touching facts via an index, class-scoped by `SameEntity`.
     ///
@@ -412,17 +375,17 @@ pub trait EntityView<S: FactStore>: FactView<S> {
         stream: &'a EntityStream<'a>,
         cursor: FactId,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::EntityId>, S::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EntityIdOf<S>>, S::Error>> + Send + 'a;
 
     /// Paginated backlink walk — "which facts mention this entity?".
     /// `cursor` is an inclusive lower bound; pagination mirrors
     /// [`Self::walk_entities`].
     fn all_facts_about_entity(
         &self,
-        entity: &S::EntityId,
+        entity: &EntityIdOf<S>,
         cursor: FactId,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::EntityId>, S::Error>> + Send;
+    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EntityIdOf<S>>, S::Error>> + Send;
 
     /// Closure of edge facts reachable from `seed` via the `Topological`
     /// relation, one page at a time.
@@ -433,10 +396,10 @@ pub trait EntityView<S: FactStore>: FactView<S> {
     /// false` is the full closed subgraph.
     fn entity_topological_subgraph(
         &self,
-        seed: S::EntityId,
+        seed: EntityIdOf<S>,
         cursor: FactId,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<EdgeSubgraph<S::EntityId, StoredFactOf<S>>, S::Error>> + Send;
+    ) -> impl Future<Output = Result<EdgeSubgraph<EntityIdOf<S>, StoredFactOf<S>>, S::Error>> + Send;
 }
 
 // ============================================================================
@@ -450,14 +413,14 @@ pub trait EventView<S: FactStore>: FactView<S> {
     /// snapshot.
     fn event_representative(
         &self,
-        member: &S::EventId,
-    ) -> impl Future<Output = Result<S::EventId, S::Error>> + Send;
+        member: &EventIdOf<S>,
+    ) -> impl Future<Output = Result<EventIdOf<S>, S::Error>> + Send;
 
     /// The full `SameEvent` equivalence class of `member` at this snapshot.
     fn event_class(
         &self,
-        member: &S::EventId,
-    ) -> impl Future<Output = Result<EquivClass<S::EventId>, S::Error>> + Send;
+        member: &EventIdOf<S>,
+    ) -> impl Future<Output = Result<EquivClass<EventIdOf<S>>, S::Error>> + Send;
 
     /// Walk event-touching facts via an index, class-scoped by
     /// `SameEvent`. See [`EntityView::walk_entities`] for pagination.
@@ -466,15 +429,15 @@ pub trait EventView<S: FactStore>: FactView<S> {
         stream: &'a EventStream<'a>,
         cursor: FactId,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::EventId>, S::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EventIdOf<S>>, S::Error>> + Send + 'a;
 
     /// Paginated backlink walk — "which facts mention this event?".
     fn all_facts_about_event(
         &self,
-        event: &S::EventId,
+        event: &EventIdOf<S>,
         cursor: FactId,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::EventId>, S::Error>> + Send;
+    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EventIdOf<S>>, S::Error>> + Send;
 }
 
 // ============================================================================
@@ -488,15 +451,15 @@ pub trait ImageView<S: FactStore>: FactView<S> {
     /// snapshot.
     fn image_representative(
         &self,
-        member: &S::ImageId,
-    ) -> impl Future<Output = Result<S::ImageId, S::Error>> + Send;
+        member: &ImageIdOf<S>,
+    ) -> impl Future<Output = Result<ImageIdOf<S>, S::Error>> + Send;
 
     /// The full `SameArtifact` equivalence class of `member` at this
     /// snapshot.
     fn image_class(
         &self,
-        member: &S::ImageId,
-    ) -> impl Future<Output = Result<EquivClass<S::ImageId>, S::Error>> + Send;
+        member: &ImageIdOf<S>,
+    ) -> impl Future<Output = Result<EquivClass<ImageIdOf<S>>, S::Error>> + Send;
 
     /// Walk image-touching facts via an index, class-scoped by
     /// `SameArtifact`. See [`EntityView::walk_entities`] for pagination.
@@ -505,13 +468,13 @@ pub trait ImageView<S: FactStore>: FactView<S> {
         stream: &'a ImageStream<'a>,
         cursor: FactId,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::ImageId>, S::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, ImageIdOf<S>>, S::Error>> + Send + 'a;
 
     /// Paginated backlink walk — "which facts mention this image?".
     fn all_facts_about_image(
         &self,
-        image: &S::ImageId,
+        image: &ImageIdOf<S>,
         cursor: FactId,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, S::ImageId>, S::Error>> + Send;
+    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, ImageIdOf<S>>, S::Error>> + Send;
 }

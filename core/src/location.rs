@@ -21,8 +21,8 @@
 //! # Entity vs. region scope
 //!
 //! Entity-scale things — individual buildings, the Forbidden City as a complex,
-//! a fortress, a citadel — are first-class entities with their own
-//! [`crate::facts::ids::EntityId`]. Containment between them is expressed by
+//! a fortress, a citadel — are first-class entities with their own entity id.
+//! Containment between them is expressed by
 //! [`crate::facts::attribute::Fact::Relationship`] with
 //! [`crate::facts::attribute::EntityRelationType::Contains`], not by a location
 //! reference.

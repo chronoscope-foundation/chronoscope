@@ -33,7 +33,7 @@
 //! # Conflicts (surfaced at projection time)
 //!
 //! - **Multiple `Source` URLs.** Different ingestion runs may attribute the
-//!   same `ImageId` to different source URLs (different mirrors, the same image
+//!   same image id to different source URLs (different mirrors, the same image
 //!   found via different referers). All are preserved; downstream consumers
 //!   pick by recency or source reputation.
 //! - **Author / created-date / capture / medium disagreement.** Sources may
@@ -86,7 +86,7 @@ pub enum ImageMedium {
 #[schemars(bound = "ImgId: ::schemars::JsonSchema")]
 pub enum Fact<ImgId> {
     /// URL the image was sourced from. A re-scan or alternate-resolution
-    /// copy has a different `ImageId` and its own `Source` fact.
+    /// copy has a different image id and its own `Source` fact.
     Source {
         image: ImgId,
         #[schemars(with = "String")]

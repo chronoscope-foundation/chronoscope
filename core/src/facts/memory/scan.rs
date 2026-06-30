@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use url::Url;
 
 use super::equiv::EquivAdjacency;
-use super::{MemStoredFact, MemoryEntityId, MemoryEventId, MemoryImageId, ReadCore};
+use super::{MemStoredFact, MemoryEntityId, MemoryIds, MemoryImageId, ReadCore};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::facts::citations::{ExternalReference, Language};
 use crate::facts::ids::FactId;
@@ -16,8 +16,8 @@ use crate::facts::submit::result::{StoredFactualFact, StoredJudgmentFact};
 use crate::facts::{attribute, identity, image};
 
 // Aliases to keep the spellings short.
-type MemFactualAssertion = FactualAssertion<MemoryEntityId, MemoryEventId, MemoryImageId>;
-type MemJudgmentAssertion = JudgmentAssertion<MemoryEntityId, MemoryEventId, MemoryImageId>;
+type MemFactualAssertion = FactualAssertion<MemoryIds>;
+type MemJudgmentAssertion = JudgmentAssertion<MemoryIds>;
 
 // The stored-fact extractors below all unwrap the same wrapper layers before
 // their per-query predicates diverge, so the unwrapping lives once in

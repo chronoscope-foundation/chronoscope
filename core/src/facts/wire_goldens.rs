@@ -41,11 +41,10 @@ use crate::facts::event;
 use crate::facts::features::Feature;
 use crate::facts::geometry::{ImageGeometry, ProportionalPolyline};
 use crate::facts::identity;
-use crate::facts::ids::{
-    AnalyzerProcess, AnalyzerVersion, EntityId, FactId, ImageId, LifetimeEventId, UserId,
-};
+use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId, UserId};
 use crate::facts::image::{self, ImageMedium};
 use crate::facts::lifecycle::{DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod};
+use crate::facts::memory::{MemoryEntityId, MemoryEventId, MemoryIds, MemoryImageId};
 use crate::facts::observation;
 use crate::facts::spatial::TopologicalRel;
 use crate::facts::submit::{Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact};
@@ -54,14 +53,14 @@ use crate::location::Location;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-fn ent(s: &str) -> std::result::Result<EntityId, std::convert::Infallible> {
-    Ok(EntityId::new(s))
+fn ent(n: u64) -> std::result::Result<MemoryEntityId, std::convert::Infallible> {
+    Ok(MemoryEntityId(n))
 }
-fn evt(s: &str) -> std::result::Result<LifetimeEventId, std::convert::Infallible> {
-    Ok(LifetimeEventId::new(s))
+fn evt(n: u64) -> std::result::Result<MemoryEventId, std::convert::Infallible> {
+    Ok(MemoryEventId(n))
 }
-fn img(s: &str) -> std::result::Result<ImageId, std::convert::Infallible> {
-    Ok(ImageId::new(s))
+fn img(n: u64) -> std::result::Result<MemoryImageId, std::convert::Infallible> {
+    Ok(MemoryImageId(n))
 }
 
 fn en() -> std::result::Result<Language, Box<dyn std::error::Error>> {
@@ -162,8 +161,8 @@ where
 
 #[test]
 fn golden_attribute_fact_name() -> Result<()> {
-    let f: attribute::Fact<EntityId> = attribute::Fact::Name {
-        entity: ent("e-1")?,
+    let f: attribute::Fact<MemoryEntityId> = attribute::Fact::Name {
+        entity: ent(1)?,
         name: NameText::new("Pantheon"),
         language: en()?,
         name_type: NameType::Common,
@@ -172,102 +171,99 @@ fn golden_attribute_fact_name() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":"e-1","language":"en","name":"Pantheon","name_type":"common","type":"name","valid_from":null,"valid_to":null}"#,
+        r#"{"entity":1,"language":"en","name":"Pantheon","name_type":"common","type":"name","valid_from":null,"valid_to":null}"#,
     )
 }
 
 #[test]
 fn golden_attribute_fact_relationship() -> Result<()> {
-    let f = attribute::Fact::relationship(ent("e-1")?, ent("e-2")?, EntityRelationType::Contains)?;
+    let f = attribute::Fact::relationship(ent(1)?, ent(2)?, EntityRelationType::Contains)?;
     assert_golden_roundtrip(
         &f,
-        r#"{"pair":{"from":"e-1","to":"e-2"},"relation":"contains","type":"relationship"}"#,
+        r#"{"pair":{"from":1,"to":2},"relation":"contains","type":"relationship"}"#,
     )
 }
 
 #[test]
 fn golden_bookend_fact_started() -> Result<()> {
-    let f: bookend::Fact<EntityId> = bookend::Fact::Started {
-        entity: ent("e-1")?,
+    let f: bookend::Fact<MemoryEntityId> = bookend::Fact::Started {
+        entity: ent(1)?,
         bound: sample_date()?,
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":"e-1","type":"started"}"#,
+        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":1,"type":"started"}"#,
     )
 }
 
 #[test]
 fn golden_event_fact_durational_date() -> Result<()> {
-    let f: event::Fact<EntityId, LifetimeEventId> = event::Fact::DurationalDate {
-        event: evt("evt-1")?,
+    let f: event::Fact<MemoryEntityId, MemoryEventId> = event::Fact::DurationalDate {
+        event: evt(1)?,
         role: DurationalRole::Started,
         bound: sample_date()?,
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"event":"evt-1","role":"started","type":"durational_date"}"#,
+        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"event":1,"role":"started","type":"durational_date"}"#,
     )
 }
 
 #[test]
 fn golden_event_fact_has_event() -> Result<()> {
-    let f: event::Fact<EntityId, LifetimeEventId> = event::Fact::HasEvent {
-        entity: ent("e-1")?,
-        event: evt("evt-1")?,
+    let f: event::Fact<MemoryEntityId, MemoryEventId> = event::Fact::HasEvent {
+        entity: ent(1)?,
+        event: evt(1)?,
         kind: LifetimeEventKind::Durational {
             kind: DurationalKind::Damaged,
         },
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":"e-1","event":"evt-1","kind":{"kind":"damaged","type":"durational"},"type":"has_event"}"#,
+        r#"{"entity":1,"event":1,"kind":{"kind":"damaged","type":"durational"},"type":"has_event"}"#,
     )
 }
 
 #[test]
 fn golden_event_fact_move_method() -> Result<()> {
-    let f: event::Fact<EntityId, LifetimeEventId> = event::Fact::MoveMethod {
-        event: evt("evt-1")?,
+    let f: event::Fact<MemoryEntityId, MemoryEventId> = event::Fact::MoveMethod {
+        event: evt(1)?,
         method: MoveMethod::Whole,
     };
-    assert_golden_roundtrip(
-        &f,
-        r#"{"event":"evt-1","method":"whole","type":"move_method"}"#,
-    )
+    assert_golden_roundtrip(&f, r#"{"event":1,"method":"whole","type":"move_method"}"#)
 }
 
 #[test]
 fn golden_image_fact_source() -> Result<()> {
-    let f: image::Fact<ImageId> = image::Fact::Source {
-        image: img("img-1")?,
+    let f: image::Fact<MemoryImageId> = image::Fact::Source {
+        image: img(1)?,
         url: Url::parse("https://example.com/img")?,
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"image":"img-1","type":"source","url":"https://example.com/img"}"#,
+        r#"{"image":1,"type":"source","url":"https://example.com/img"}"#,
     )
 }
 
 #[test]
 fn golden_image_fact_medium() -> Result<()> {
-    let f: image::Fact<ImageId> = image::Fact::Medium {
-        image: img("img-1")?,
+    let f: image::Fact<MemoryImageId> = image::Fact::Medium {
+        image: img(1)?,
         medium: ImageMedium::PictorialMap,
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"image":"img-1","medium":"pictorial_map","type":"medium"}"#,
+        r#"{"image":1,"medium":"pictorial_map","type":"medium"}"#,
     )
 }
 
 #[test]
 fn golden_identity_fact_same_entity() -> Result<()> {
-    let f = identity::Fact::<EntityId, LifetimeEventId, ImageId>::same_entity(
-        ent("e-1")?,
-        ent("e-2")?,
+    let f = identity::Fact::<MemoryEntityId, MemoryEventId, MemoryImageId>::same_entity(
+        ent(1)?,
+        ent(2)?,
     )?;
-    assert_golden_roundtrip(&f, r#"{"pair":{"a":"e-1","b":"e-2"},"type":"same_entity"}"#)
+    assert_golden_roundtrip(&f, r#"{"pair":{"a":1,"b":2},"type":"same_entity"}"#)
 }
 
 #[test]
@@ -275,15 +271,15 @@ fn golden_depiction_fact_bare() -> Result<()> {
     // The common P18 case: an entity↔image link with no localization and no
     // perspective. The struct carries no inner tag — the
     // `JudgmentAssertion::Depiction` wrapper tags it.
-    let f: depiction::Fact<EntityId, ImageId> = depiction::Fact {
-        entity: ent("e-1")?,
-        image: img("img-1")?,
+    let f: depiction::Fact<MemoryEntityId, MemoryImageId> = depiction::Fact {
+        entity: ent(1)?,
+        image: img(1)?,
         localization: None,
         perspective: None,
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":"e-1","image":"img-1","localization":null,"perspective":null}"#,
+        r#"{"entity":1,"image":1,"localization":null,"perspective":null}"#,
     )
 }
 
@@ -291,15 +287,15 @@ fn golden_depiction_fact_bare() -> Result<()> {
 fn golden_depiction_fact_localized() -> Result<()> {
     // A localized, classified depiction: the `ImageGeometry` bbox rides under
     // `localization`, the leaf `Perspective` value under `perspective`.
-    let f: depiction::Fact<EntityId, ImageId> = depiction::Fact {
-        entity: ent("e-1")?,
-        image: img("img-1")?,
+    let f: depiction::Fact<MemoryEntityId, MemoryImageId> = depiction::Fact {
+        entity: ent(1)?,
+        image: img(1)?,
         localization: Some(ImageGeometry::bbox(0.1, 0.2, 0.3, 0.4)?),
         perspective: Some(Perspective::Interior),
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":"e-1","image":"img-1","localization":{"rect":{"max":{"x":0.30000001192092896,"y":0.4000000059604645},"min":{"x":0.10000000149011612,"y":0.20000000298023224}},"type":"bbox"},"perspective":"interior"}"#,
+        r#"{"entity":1,"image":1,"localization":{"rect":{"max":{"x":0.30000001192092896,"y":0.4000000059604645},"min":{"x":0.10000000149011612,"y":0.20000000298023224}},"type":"bbox"},"perspective":"interior"}"#,
     )
 }
 
@@ -309,38 +305,38 @@ fn golden_observation_fact_feature() -> Result<()> {
     // Naming the field lets internal tagging wrap a fieldless inner enum like
     // `RoofShape`; a bare newtype payload would flatten beside the tag and
     // collide.
-    let f: observation::Fact<EntityId> = observation::Fact::Feature {
-        entity: ent("e-1")?,
+    let f: observation::Fact<MemoryEntityId> = observation::Fact::Feature {
+        entity: ent(1)?,
         feature: crate::facts::features::Feature::RoofShape {
             shape: crate::facts::features::RoofShape::Gabled,
         },
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":"e-1","feature":{"shape":"gabled","type":"roof_shape"},"type":"feature"}"#,
+        r#"{"entity":1,"feature":{"shape":"gabled","type":"roof_shape"},"type":"feature"}"#,
     )
 }
 
 #[test]
 fn golden_observation_fact_spatial() -> Result<()> {
-    let f = observation::Fact::spatial(ent("e-1")?, ent("e-2")?, TopologicalRel::Adjacent)?;
+    let f = observation::Fact::spatial(ent(1)?, ent(2)?, TopologicalRel::Adjacent)?;
     assert_golden_roundtrip(
         &f,
-        r#"{"pair":{"from":"e-1","to":"e-2"},"relation":{"type":"adjacent"},"type":"spatial"}"#,
+        r#"{"pair":{"from":1,"to":2},"relation":{"type":"adjacent"},"type":"spatial"}"#,
     )
 }
 
 #[test]
 fn golden_composites_fact_is_subimage_of() -> Result<()> {
     let region = SubimageRegion::rect(0.0, 0.0, 0.5, 0.5)?;
-    let f: composites::Fact<ImageId> = composites::Fact::IsSubimageOf {
-        subimage: img("img-sub")?,
-        parent: img("img-par")?,
+    let f: composites::Fact<MemoryImageId> = composites::Fact::IsSubimageOf {
+        subimage: img(1)?,
+        parent: img(2)?,
         region,
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"parent":"img-par","region":{"rect":{"max":{"x":0.5,"y":0.5},"min":{"x":0,"y":0}},"type":"rect"},"subimage":"img-sub","type":"is_subimage_of"}"#,
+        r#"{"parent":2,"region":{"rect":{"max":{"x":0.5,"y":0.5},"min":{"x":0,"y":0}},"type":"rect"},"subimage":1,"type":"is_subimage_of"}"#,
     )
 }
 
@@ -365,8 +361,8 @@ fn golden_feature_story_count_locks_integer_payload() -> Result<()> {
 fn golden_decl_existing_locks_tagged_id_payload() -> Result<()> {
     // `Decl::Existing` carries an id, part of the commit address. Locks that
     // the `{"type":"existing","id":..}` tagging round-trips.
-    let decl: Decl<EntityId> = Decl::Existing { id: ent("e-5")? };
-    assert_golden_roundtrip(&decl, r#"{"id":"e-5","type":"existing"}"#)
+    let decl: Decl<MemoryEntityId> = Decl::Existing { id: ent(5)? };
+    assert_golden_roundtrip(&decl, r#"{"id":5,"type":"existing"}"#)
 }
 
 #[test]
@@ -535,7 +531,7 @@ fn golden_commit_canonical_jcs_full_bundle() -> Result<()> {
         citation: sample_judgment_source()?,
     });
 
-    let bundle: Commit<EntityId, LifetimeEventId, ImageId> = Commit {
+    let bundle: Commit<MemoryIds> = Commit {
         author: CommitAuthor::User(UserId::new("alice")),
         recorded_at: chrono::Utc
             .with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
@@ -583,7 +579,7 @@ fn golden_commit_canonical_jcs_analyzer_companion_bundle() -> Result<()> {
         citation: sample_derivation_source()?,
     });
 
-    let bundle: Commit<EntityId, LifetimeEventId, ImageId> = Commit {
+    let bundle: Commit<MemoryIds> = Commit {
         author: CommitAuthor::Analyzer {
             process: AnalyzerProcess::new("matcher"),
             version: AnalyzerVersion::new("test-version"),
@@ -593,8 +589,8 @@ fn golden_commit_canonical_jcs_analyzer_companion_bundle() -> Result<()> {
             .single()
             .ok_or("fixed time")?,
         entities: vec![
-            Decl::Existing { id: ent("e-1")? },
-            Decl::Existing { id: ent("e-2")? },
+            Decl::Existing { id: ent(1)? },
+            Decl::Existing { id: ent(2)? },
         ],
         events: Vec::new(),
         images: Vec::new(),
@@ -603,7 +599,7 @@ fn golden_commit_canonical_jcs_analyzer_companion_bundle() -> Result<()> {
 
     assert_golden(
         &bundle.canonical_jcs()?,
-        r#"{"author":"analyzer:matcher@test-version","entities":[{"id":"e-1","type":"existing"},{"id":"e-2","type":"existing"}],"events":[],"facts":[{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"basis":[3,5],"process":"matcher","snapshot":7,"type":"derivation","version":"test-version"},"type":"judgment"}],"images":[],"recorded_at":"2024-01-01T12:00:00+00:00"}"#,
+        r#"{"author":"analyzer:matcher@test-version","entities":[{"id":1,"type":"existing"},{"id":2,"type":"existing"}],"events":[],"facts":[{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"basis":[3,5],"process":"matcher","snapshot":7,"type":"derivation","version":"test-version"},"type":"judgment"}],"images":[],"recorded_at":"2024-01-01T12:00:00+00:00"}"#,
     );
     Ok(())
 }

@@ -5,9 +5,9 @@
 //! stacked before-and-after, a multi-up grid, an inset thumbnail overlaid on a
 //! wider view) is one image whose pixel area decomposes into sub-rectangles,
 //! each conceptually a different photo with its own capture date, citations,
-//! and depictions. The subimages are first-class
-//! [`crate::facts::ids::ImageId`]s; the link from a subimage to its parent
-//! travels through [`Fact::IsSubimageOf`], which carries a [`SubimageRegion`].
+//! and depictions. The subimages are first-class images with their own image
+//! ids; the link from a subimage to its parent travels through
+//! [`Fact::IsSubimageOf`], which carries a [`SubimageRegion`].
 //!
 //! Whether an image is a composite is derivable rather than marker-flagged: an
 //! image is a composite iff at least one `IsSubimageOf` fact names it as the

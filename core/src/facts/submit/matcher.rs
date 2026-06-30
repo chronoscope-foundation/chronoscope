@@ -21,7 +21,7 @@ use crate::facts::citations::{ExternalReference, Language};
 use crate::facts::drain::{DRAIN_PAGE, drain_pages};
 use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId};
 use crate::facts::schema::{EntityStream, FactPage, ImageStream, normalize_name};
-use crate::facts::store::{EntityView, FactStore, ImageView, StoredFactOf};
+use crate::facts::store::{EntityIdOf, EntityView, FactStore, ImageIdOf, ImageView, StoredFactOf};
 use crate::facts::{attribute, image};
 
 // ============================================================================
@@ -101,10 +101,10 @@ pub enum MatchOutcome<Id> {
 /// transient backend failure would leave the decl unclassed from the existing
 /// subject it should have matched.
 pub async fn match_entities<S: FactStore, V: EntityView<S>>(
-    decls: &[Decl<S::EntityId>],
+    decls: &[Decl<EntityIdOf<S>>],
     facts: &BTreeSet<SubmitFact>,
     view: &V,
-) -> Result<HashMap<EntityIdx, MatchOutcome<S::EntityId>>, S::Error> {
+) -> Result<HashMap<EntityIdx, MatchOutcome<EntityIdOf<S>>>, S::Error> {
     // Anchor values keyed by decl position, one pass over the bundle.
     let mut references: HashMap<EntityIdx, BTreeSet<&ExternalReference>> = HashMap::new();
     let mut names: HashMap<EntityIdx, BTreeSet<(String, &Language)>> = HashMap::new();
@@ -143,7 +143,7 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
             continue;
         }
         let idx = EntityIdx(i);
-        let mut candidates: BTreeMap<S::EntityId, BTreeSet<FactId>> = BTreeMap::new();
+        let mut candidates: BTreeMap<EntityIdOf<S>, BTreeSet<FactId>> = BTreeMap::new();
         for reference in references.get(&idx).into_iter().flatten() {
             let stream = EntityStream::ByExternalReference { reference };
             collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
@@ -174,10 +174,10 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
 /// carry, candidates canonicalised to their `SameArtifact` class
 /// representative.
 pub async fn match_images<S: FactStore, V: ImageView<S>>(
-    decls: &[Decl<S::ImageId>],
+    decls: &[Decl<ImageIdOf<S>>],
     facts: &BTreeSet<SubmitFact>,
     view: &V,
-) -> Result<HashMap<ImageIdx, MatchOutcome<S::ImageId>>, S::Error> {
+) -> Result<HashMap<ImageIdx, MatchOutcome<ImageIdOf<S>>>, S::Error> {
     let mut urls: HashMap<ImageIdx, BTreeSet<&Url>> = HashMap::new();
     for fact in facts {
         if let SubmitFact::Factual {
@@ -198,7 +198,7 @@ pub async fn match_images<S: FactStore, V: ImageView<S>>(
             continue;
         }
         let idx = ImageIdx(i);
-        let mut candidates: BTreeMap<S::ImageId, BTreeSet<FactId>> = BTreeMap::new();
+        let mut candidates: BTreeMap<ImageIdOf<S>, BTreeSet<FactId>> = BTreeMap::new();
         for url in urls.get(&idx).into_iter().flatten() {
             let stream = ImageStream::BySourceUrl { url };
             collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {

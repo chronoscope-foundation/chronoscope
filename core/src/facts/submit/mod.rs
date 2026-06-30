@@ -45,7 +45,7 @@ use sha2::{Digest, Sha256};
 
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use crate::facts::citations::{FactualCitation, JudgmentSource, MetaSource};
-use crate::facts::ids::CommitId;
+use crate::facts::ids::{CommitId, IdScheme};
 
 // ============================================================================
 // Bundle-local index newtypes
@@ -74,6 +74,18 @@ pub struct EventIdx(pub usize);
 )]
 #[serde(transparent)]
 pub struct ImageIdx(pub usize);
+
+/// The submission / index scheme: a fact's references are bundle-local indices
+/// into a [`Commit`]'s declaration lists, resolved to persistent ids at submit
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema)]
+pub struct BundleLocal;
+
+impl IdScheme for BundleLocal {
+    type Entity = EntityIdx;
+    type Event = EventIdx;
+    type Image = ImageIdx;
+}
 
 // ============================================================================
 // Decl
@@ -111,16 +123,16 @@ pub enum Decl<Id> {
 
 /// A submission-side factual assertion. The same
 /// [`FactualAssertion`](crate::facts::assertions::FactualAssertion) shape
-/// as storage, with the three id parameters bound to the bundle-local
-/// index newtypes.
-pub type SubmitFactualAssertion = FactualAssertion<EntityIdx, EventIdx, ImageIdx>;
+/// as storage, over the [`BundleLocal`] scheme (the bundle-local index
+/// newtypes).
+pub type SubmitFactualAssertion = FactualAssertion<BundleLocal>;
 
 /// A submission-side judgment assertion.
-pub type SubmitJudgmentAssertion = JudgmentAssertion<EntityIdx, EventIdx, ImageIdx>;
+pub type SubmitJudgmentAssertion = JudgmentAssertion<BundleLocal>;
 
-// SubmitFact and Commit are parameterised over the three persistent id
-// types so they pair with any backend's id types. The Decl side carries
-// persistent ids; the SubmitFact side carries bundle-local indices.
+// Commit is parameterised over a backend's id scheme so it pairs with any
+// backend. The Decl side carries that scheme's persistent ids; the SubmitFact
+// side carries bundle-local indices ([`BundleLocal`]).
 
 // ============================================================================
 // SubmitFact — sum-of-pairs
@@ -212,21 +224,21 @@ impl SubmitFact {
 /// commit is hashed, and its `SubmitFact: Ord` order makes the [`CommitId`]
 /// independent of submission order.
 ///
-/// Parameterised over the three persistent id types so any
+/// Parameterised over the id scheme `R` so any
 /// [`FactStore`](crate::facts::store::FactStore) backend pairs it with its own
 /// id types.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Commit<EntId, EvtId, ImgId> {
+pub struct Commit<R: IdScheme> {
     /// Who recorded the commit.
     pub author: CommitAuthor,
     /// When the commit was recorded.
     pub recorded_at: DateTime<Utc>,
     /// Entity declarations. [`EntityIdx(i)`] inside a fact indexes here.
-    pub entities: Vec<Decl<EntId>>,
+    pub entities: Vec<Decl<R::Entity>>,
     /// Event declarations. [`EventIdx(i)`] inside a fact indexes here.
-    pub events: Vec<Decl<EvtId>>,
+    pub events: Vec<Decl<R::Event>>,
     /// Image declarations. [`ImageIdx(i)`] inside a fact indexes here.
-    pub images: Vec<Decl<ImgId>>,
+    pub images: Vec<Decl<R::Image>>,
     pub facts: BTreeSet<SubmitFact>,
 }
 
@@ -256,12 +268,7 @@ struct CommitHashView<'a, EntId, EvtId, ImgId> {
     recorded_at: String,
 }
 
-impl<EntId, EvtId, ImgId> Commit<EntId, EvtId, ImgId>
-where
-    EntId: Serialize,
-    EvtId: Serialize,
-    ImgId: Serialize,
-{
+impl<R: IdScheme> Commit<R> {
     /// Derive the content-addressed [`CommitId`] for this commit.
     ///
     /// JCS-encodes the canonical projection (author canonical-string, the
@@ -314,6 +321,7 @@ mod tests {
     use crate::facts::attribute::{self, NameText, NameType};
     use crate::facts::citations::{Excerpt, ExternalSource, FactualCitation, Language};
     use crate::facts::ids::{IngesterRunId, UserId};
+    use crate::facts::memory::{MemoryEntityId, MemoryIds};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -364,11 +372,7 @@ mod tests {
         author: CommitAuthor,
         recorded_at: DateTime<Utc>,
         facts: Vec<SubmitFact>,
-    ) -> Commit<
-        crate::facts::ids::EntityId,
-        crate::facts::ids::LifetimeEventId,
-        crate::facts::ids::ImageId,
-    > {
+    ) -> Commit<MemoryIds> {
         Commit {
             author,
             recorded_at,
@@ -495,11 +499,7 @@ mod tests {
     #[test]
     fn commit_id_differs_for_local_vs_existing_decl() -> TestResult {
         let facts: BTreeSet<SubmitFact> = std::iter::once(named_fact("a")?).collect();
-        let local: Commit<
-            crate::facts::ids::EntityId,
-            crate::facts::ids::LifetimeEventId,
-            crate::facts::ids::ImageId,
-        > = Commit {
+        let local: Commit<MemoryIds> = Commit {
             author: alice_author(),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
@@ -507,15 +507,11 @@ mod tests {
             images: Vec::new(),
             facts: facts.clone(),
         };
-        let existing: Commit<
-            crate::facts::ids::EntityId,
-            crate::facts::ids::LifetimeEventId,
-            crate::facts::ids::ImageId,
-        > = Commit {
+        let existing: Commit<MemoryIds> = Commit {
             author: alice_author(),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Existing {
-                id: crate::facts::ids::EntityId::new("E5"),
+                id: MemoryEntityId(5),
             }],
             events: Vec::new(),
             images: Vec::new(),

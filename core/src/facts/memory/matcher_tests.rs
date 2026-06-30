@@ -10,7 +10,7 @@ use super::tests::{
     external_reference_fact, fixed_time, has_event_fact, image_source_fact, local_bundle,
     name_fact, name_fact_in_language, retract_commit_fact, same_entity_fact, user_author,
 };
-use super::{MemoryEntityId, MemoryEventId, MemoryFactStore, MemoryImageId};
+use super::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::facts::attribute;
 use crate::facts::citations::JudgmentSource;
@@ -55,10 +55,7 @@ async fn stored_commit(
 async fn sole_judgment_of(
     store: &MemoryFactStore,
     commit_id: &CommitId,
-) -> Result<
-    StoredJudgmentFact<MemoryEntityId, MemoryEventId, MemoryImageId>,
-    Box<dyn std::error::Error>,
-> {
+) -> Result<StoredJudgmentFact<MemoryIds>, Box<dyn std::error::Error>> {
     let commit = stored_commit(store, commit_id).await?;
     if commit.fact_ids.len() != 1 {
         return Err(format!("expected one fact, got {}", commit.fact_ids.len()).into());

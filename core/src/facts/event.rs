@@ -3,8 +3,7 @@
 //!
 //! Cluster module for the `Event` variant of
 //! [`crate::facts::assertions::FactualAssertion`]. Covers interior
-//! lifetime events keyed by
-//! [`crate::facts::ids::LifetimeEventId`]: dates (durational or point),
+//! lifetime events keyed by a lifetime-event id: dates (durational or point),
 //! locations, damage causes, move methods, usage transitions,
 //! designations, descriptions, and cross-event temporal gaps.
 //!
@@ -662,19 +661,19 @@ impl std::error::Error for GapBoundsError {}
 mod tests {
     use super::*;
     use crate::facts::identity::IdMapError;
-    use crate::facts::ids::{EntityId, LifetimeEventId};
+    use crate::facts::memory::{MemoryEntityId, MemoryEventId};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn anchor() -> OrderableEvent<EntityId, LifetimeEventId> {
+    fn anchor() -> OrderableEvent<MemoryEntityId, MemoryEventId> {
         OrderableEvent::ConstructionCompletion {
-            entity: EntityId::new("a"),
+            entity: MemoryEntityId(1),
         }
     }
 
-    fn other() -> OrderableEvent<EntityId, LifetimeEventId> {
+    fn other() -> OrderableEvent<MemoryEntityId, MemoryEventId> {
         OrderableEvent::DemolitionStart {
-            entity: EntityId::new("b"),
+            entity: MemoryEntityId(2),
         }
     }
 
@@ -711,7 +710,8 @@ mod tests {
         let mut wire = serde_json::to_value(&valid)?;
         wire["min_days"] = serde_json::Value::Null;
         wire["max_days"] = serde_json::Value::Null;
-        let result: Result<GapBounds<EntityId, LifetimeEventId>, _> = serde_json::from_value(wire);
+        let result: Result<GapBounds<MemoryEntityId, MemoryEventId>, _> =
+            serde_json::from_value(wire);
         assert!(
             result.is_err(),
             "both-open gap must fail at the deserialize boundary"
@@ -726,7 +726,7 @@ mod tests {
         // pins that the serialize shape the goldens hash still round-trips.
         let gap = GapBounds::new(anchor(), other(), Some(Days::new(2)), Some(Days::new(7)))?;
         let json = serde_json::to_string(&gap)?;
-        let parsed: GapBounds<EntityId, LifetimeEventId> = serde_json::from_str(&json)?;
+        let parsed: GapBounds<MemoryEntityId, MemoryEventId> = serde_json::from_str(&json)?;
         assert_eq!(parsed, gap);
         Ok(())
     }

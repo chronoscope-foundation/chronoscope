@@ -10,8 +10,8 @@
 //! string because its leading zeros and letter suffixes are part of its
 //! identity.
 //!
-//! Internal infrastructure IDs (`EntityId`, `LifetimeEventId`,
-//! `ImageId`, etc.) live in [`crate::facts::ids`] and follow the same
+//! Internal infrastructure IDs (`UserId`, `IngesterRunId`,
+//! `AnalyzerProcess`, etc.) live in [`crate::facts::ids`] and follow the same
 //! "parse at the wire boundary" pattern via the
 //! [`string_id_newtype`](crate::string_id_newtype) macro.
 

@@ -7,8 +7,7 @@
 //!
 //! Bookends are flat per-entity facts rather than event-mediated. Once-ness for
 //! these slots is structural — an entity has at most one construction and at
-//! most one demolition, modeled directly without minting a
-//! [`crate::facts::ids::LifetimeEventId`].
+//! most one demolition, modeled directly without minting a lifetime-event id.
 //!
 //! # Error states (rejected at submit time)
 //!

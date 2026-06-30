@@ -27,57 +27,58 @@
 //! | [`crate::facts::observation`]    | `JudgmentAssertion::Observation` |
 //! | [`crate::facts::composites`]     | `JudgmentAssertion::Composite`   |
 //!
-//! The outer variants are generic over reference shapes (`EntId`, `EvtId`,
-//! `ImgId`). Every image-level fact is keyed by `ImgId`. The same enum serves
-//! submission (bundle-local indices) and storage (persistent ids); call sites
-//! pick the parameters.
+//! The outer variants are generic over one id scheme `R: IdScheme`, reading
+//! `R::Entity` / `R::Event` / `R::Image` per cluster. Every image-level fact is
+//! keyed by `R::Image`. The same enum serves submission (`BundleLocal` indices)
+//! and storage (a backend's persistent-id scheme); call sites pick the scheme.
 
 use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::facts::ids::{CommitId, FactId};
+use crate::facts::ids::{CommitId, FactId, IdScheme};
 use crate::facts::{
     attribute, bookend, composites, depiction, event, identity, image, observation,
 };
+
+/// The id-traversal error over a scheme `R` — [`identity::IdMapError`] projected
+/// onto `R`'s three id kinds. Keeps the `try_map_ids` signatures readable.
+type IdMapErrorOf<R> =
+    identity::IdMapError<<R as IdScheme>::Entity, <R as IdScheme>::Event, <R as IdScheme>::Image>;
 
 /// Factual assertion — a claim about the external world.
 ///
 /// Construction and demolition are flat per-entity bookend facts, not
 /// event-mediated, so once-ness is structural. Other life-stage information
-/// attaches to a [`LifetimeEventId`](crate::facts::ids::LifetimeEventId) via the
-/// event cluster.
+/// attaches to a lifetime-event id via the event cluster.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::Serialize, bookend::Fact<EntId>: ::serde::Serialize, event::Fact<EntId, EvtId>: ::serde::Serialize, event::GapBounds<EntId, EvtId>: ::serde::Serialize, image::Fact<ImgId>: ::serde::Serialize",
-    deserialize = "EntId: Ord, EvtId: Ord, attribute::Fact<EntId>: ::serde::de::DeserializeOwned, bookend::Fact<EntId>: ::serde::de::DeserializeOwned, event::Fact<EntId, EvtId>: ::serde::de::DeserializeOwned, event::GapBounds<EntId, EvtId>: ::serde::de::DeserializeOwned, image::Fact<ImgId>: ::serde::de::DeserializeOwned"
-))]
-#[schemars(
-    bound = "EntId: ::schemars::JsonSchema + Ord, EvtId: ::schemars::JsonSchema + Ord, ImgId: ::schemars::JsonSchema, attribute::Fact<EntId>: ::schemars::JsonSchema, bookend::Fact<EntId>: ::schemars::JsonSchema, event::Fact<EntId, EvtId>: ::schemars::JsonSchema, event::GapBounds<EntId, EvtId>: ::schemars::JsonSchema, image::Fact<ImgId>: ::schemars::JsonSchema"
-)]
-pub enum FactualAssertion<EntId: Ord, EvtId: Ord, ImgId> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub enum FactualAssertion<R: IdScheme> {
     /// Entity-level attribute claims (names, external refs, relationships).
-    Attribute { fact: attribute::Fact<EntId> },
+    Attribute { fact: attribute::Fact<R::Entity> },
     /// Construction bookend (start / completion / location).
-    Construction { fact: bookend::Fact<EntId> },
+    Construction { fact: bookend::Fact<R::Entity> },
     /// Demolition bookend (start / completion / location).
-    Demolition { fact: bookend::Fact<EntId> },
+    Demolition { fact: bookend::Fact<R::Entity> },
     /// Interior-lifetime event facts.
-    Event { fact: event::Fact<EntId, EvtId> },
+    Event {
+        fact: event::Fact<R::Entity, R::Event>,
+    },
     /// A temporal-ordering relationship between two events or entity bookends.
     /// A gap names two endpoints rather than one event subject, so it sits
     /// beside the event cluster rather than inside [`event::Fact`].
     Gap {
         /// The cross-event gap bounds (endpoints plus day range).
-        bounds: event::GapBounds<EntId, EvtId>,
+        bounds: event::GapBounds<R::Entity, R::Event>,
     },
     /// Image-level facts: source URL, author, created / capture dates,
     /// capture location, and the descriptive medium.
-    Image { fact: image::Fact<ImgId> },
+    Image { fact: image::Fact<R::Image> },
 }
 
-impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
+impl<R: IdScheme> FactualAssertion<R> {
     /// Visit every id this assertion mentions, dispatching each to its kind's
     /// closure. The collector half of the id-traversal.
     ///
@@ -86,9 +87,9 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
     /// image gets image).
     pub fn for_each_id(
         &self,
-        fe: &mut impl FnMut(&EntId),
-        fv: &mut impl FnMut(&EvtId),
-        fi: &mut impl FnMut(&ImgId),
+        fe: &mut impl FnMut(&R::Entity),
+        fv: &mut impl FnMut(&R::Event),
+        fi: &mut impl FnMut(&R::Image),
     ) {
         match self {
             Self::Attribute { fact } => fact.for_each_id(fe),
@@ -100,24 +101,20 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
     }
 
     /// Relabel every id through the kind-matching fallible closure,
-    /// producing a `FactualAssertion<E2, V2, I2>`.
+    /// producing a `FactualAssertion<R2>`.
     ///
     /// Threads the three closures into each cluster's `try_map_ids`, names
-    /// the concrete error ([`crate::facts::identity::IdMapError<E2, V2, I2>`]),
-    /// and supplies the attribute `Relationship` arm's `on_self_loop`, which
+    /// the concrete error (`IdMapErrorOf<R2>`), and supplies the attribute
+    /// `Relationship` arm's `on_self_loop`, which
     /// wraps a pair collapse as
     /// [`crate::facts::identity::SelfLoop::Relationship`]. A leaf-lookup
     /// rejection or that collapse propagates as the `IdMapError`.
-    pub fn try_map_ids<E2, V2, I2>(
+    pub fn try_map_ids<R2: IdScheme>(
         &self,
-        fe: &mut impl FnMut(&EntId) -> Result<E2, crate::facts::identity::IdMapError<E2, V2, I2>>,
-        fv: &mut impl FnMut(&EvtId) -> Result<V2, crate::facts::identity::IdMapError<E2, V2, I2>>,
-        fi: &mut impl FnMut(&ImgId) -> Result<I2, crate::facts::identity::IdMapError<E2, V2, I2>>,
-    ) -> Result<FactualAssertion<E2, V2, I2>, crate::facts::identity::IdMapError<E2, V2, I2>>
-    where
-        E2: Ord,
-        V2: Ord,
-    {
+        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, IdMapErrorOf<R2>>,
+        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, IdMapErrorOf<R2>>,
+        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, IdMapErrorOf<R2>>,
+    ) -> Result<FactualAssertion<R2>, IdMapErrorOf<R2>> {
         use crate::facts::identity::{IdMapError, SelfLoop};
         match self {
             Self::Attribute { fact } => Ok(FactualAssertion::Attribute {
@@ -150,28 +147,25 @@ impl<EntId: Ord, EvtId: Ord, ImgId> FactualAssertion<EntId, EvtId, ImgId> {
 /// reads the content rather than recording a directly-observed fact.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "EntId: Ord, EvtId: Ord, ImgId: Ord, identity::Fact<EntId, EvtId, ImgId>: ::serde::Serialize, depiction::Fact<EntId, ImgId>: ::serde::Serialize, observation::Fact<EntId>: ::serde::Serialize, composites::Fact<ImgId>: ::serde::Serialize",
-    deserialize = "EntId: Ord, EvtId: Ord, ImgId: Ord, identity::Fact<EntId, EvtId, ImgId>: ::serde::de::DeserializeOwned, depiction::Fact<EntId, ImgId>: ::serde::de::DeserializeOwned, observation::Fact<EntId>: ::serde::de::DeserializeOwned, composites::Fact<ImgId>: ::serde::de::DeserializeOwned"
-))]
-#[schemars(
-    bound = "EntId: ::schemars::JsonSchema + Ord, EvtId: ::schemars::JsonSchema + Ord, ImgId: ::schemars::JsonSchema + Ord, identity::Fact<EntId, EvtId, ImgId>: ::schemars::JsonSchema, depiction::Fact<EntId, ImgId>: ::schemars::JsonSchema, observation::Fact<EntId>: ::schemars::JsonSchema, composites::Fact<ImgId>: ::schemars::JsonSchema"
-)]
-pub enum JudgmentAssertion<EntId: Ord, EvtId: Ord, ImgId: Ord> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub enum JudgmentAssertion<R: IdScheme> {
     /// Same-entity / same-artifact / same-event equivalence judgments.
     Identity {
-        fact: identity::Fact<EntId, EvtId, ImgId>,
+        fact: identity::Fact<R::Entity, R::Event, R::Image>,
     },
     /// Entity-in-image depiction judgments.
-    Depiction { fact: depiction::Fact<EntId, ImgId> },
+    Depiction {
+        fact: depiction::Fact<R::Entity, R::Image>,
+    },
     /// Feature and spatial-relation claims about entities (basis lives
     /// in the citation).
-    Observation { fact: observation::Fact<EntId> },
+    Observation { fact: observation::Fact<R::Entity> },
     /// Composite-image sub-region structural facts.
-    Composite { fact: composites::Fact<ImgId> },
+    Composite { fact: composites::Fact<R::Image> },
 }
 
-impl<EntId: Ord, EvtId: Ord, ImgId: Ord> JudgmentAssertion<EntId, EvtId, ImgId> {
+impl<R: IdScheme> JudgmentAssertion<R> {
     /// Visit every id this assertion mentions, dispatching each to its
     /// kind's closure. The collector half of the id-traversal.
     ///
@@ -180,9 +174,9 @@ impl<EntId: Ord, EvtId: Ord, ImgId: Ord> JudgmentAssertion<EntId, EvtId, ImgId> 
     /// gets entity, composite gets image.
     pub fn for_each_id(
         &self,
-        fe: &mut impl FnMut(&EntId),
-        fv: &mut impl FnMut(&EvtId),
-        fi: &mut impl FnMut(&ImgId),
+        fe: &mut impl FnMut(&R::Entity),
+        fv: &mut impl FnMut(&R::Event),
+        fi: &mut impl FnMut(&R::Image),
     ) {
         match self {
             Self::Identity { fact } => fact.for_each_id(fe, fv, fi),
@@ -193,27 +187,22 @@ impl<EntId: Ord, EvtId: Ord, ImgId: Ord> JudgmentAssertion<EntId, EvtId, ImgId> 
     }
 
     /// Relabel every id through the kind-matching fallible closure,
-    /// producing a `JudgmentAssertion<E2, V2, I2>`.
+    /// producing a `JudgmentAssertion<R2>`.
     ///
     /// Threads the three closures into each cluster's `try_map_ids` and
-    /// names the same [`crate::facts::identity::IdMapError<E2, V2, I2>`] the
+    /// names the same `IdMapErrorOf<R2>` the
     /// factual dispatch does. Identity builds its own
     /// [`crate::facts::identity::SelfLoop`] wrappers, so only the
     /// observation `Spatial` arm supplies an `on_self_loop` here (wrapping a
     /// collapse as [`crate::facts::identity::SelfLoop::Spatial`]). A
     /// leaf-lookup rejection or any pair collapse propagates as the
     /// `IdMapError`.
-    pub fn try_map_ids<E2, V2, I2>(
+    pub fn try_map_ids<R2: IdScheme>(
         &self,
-        fe: &mut impl FnMut(&EntId) -> Result<E2, crate::facts::identity::IdMapError<E2, V2, I2>>,
-        fv: &mut impl FnMut(&EvtId) -> Result<V2, crate::facts::identity::IdMapError<E2, V2, I2>>,
-        fi: &mut impl FnMut(&ImgId) -> Result<I2, crate::facts::identity::IdMapError<E2, V2, I2>>,
-    ) -> Result<JudgmentAssertion<E2, V2, I2>, crate::facts::identity::IdMapError<E2, V2, I2>>
-    where
-        E2: Ord,
-        V2: Ord,
-        I2: Ord,
-    {
+        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, IdMapErrorOf<R2>>,
+        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, IdMapErrorOf<R2>>,
+        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, IdMapErrorOf<R2>>,
+    ) -> Result<JudgmentAssertion<R2>, IdMapErrorOf<R2>> {
         use crate::facts::identity::{IdMapError, SelfLoop};
         match self {
             Self::Identity { fact } => Ok(JudgmentAssertion::Identity {
@@ -327,7 +316,7 @@ mod traversal_props {
         DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind,
         Usage,
     };
-    use crate::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
+    use crate::facts::memory::{MemoryEntityId, MemoryEventId, MemoryIds, MemoryImageId};
     use crate::facts::spatial::TopologicalRel;
     use crate::facts::{
         attribute, bookend, composites, depiction, event, identity, image, observation,
@@ -336,9 +325,9 @@ mod traversal_props {
 
     use super::{FactualAssertion, JudgmentAssertion};
 
-    // The three concrete id types under test.
-    type FactualA = FactualAssertion<MemoryEntityId, MemoryEventId, MemoryImageId>;
-    type JudgmentA = JudgmentAssertion<MemoryEntityId, MemoryEventId, MemoryImageId>;
+    // The in-memory scheme under test.
+    type FactualA = FactualAssertion<MemoryIds>;
+    type JudgmentA = JudgmentAssertion<MemoryIds>;
     // The traversal's error. The identity remaps below never produce it; naming
     // it keeps the helper return types concrete.
     type MapErr = IdMapError<MemoryEntityId, MemoryEventId, MemoryImageId>;

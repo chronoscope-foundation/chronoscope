@@ -3,7 +3,7 @@
 //! The fact store separates a building's life into two regions. The
 //! *bookends* — construction and demolition — hang directly off the entity
 //! as flat per-entity facts; they are structurally once-only and don't
-//! carry a [`LifetimeEventId`](crate::facts::ids::LifetimeEventId).
+//! carry a lifetime-event id.
 //! The *interior* of the lifetime is a sequence of events with their own
 //! identity: a single significant change like a renovation, fire, or
 //! adaptive-reuse moment is a [`LifetimeEventKind`] keyed by event id.

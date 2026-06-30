@@ -25,7 +25,7 @@ use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
 
 pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
-pub(super) type TestBundle = SubmitBundle<MemoryEntityId, MemoryEventId, MemoryImageId>;
+pub(super) type TestBundle = SubmitBundle<MemoryIds>;
 type SubmitErrorBatch = NonEmptyVec<SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>>;
 
 /// A page limit large enough to fit every fact the backlink tests submit.
@@ -3693,7 +3693,7 @@ mod props {
 
     use proptest::prelude::*;
 
-    use super::{EntityIdx, MemoryEntityId, MemoryFactStore, SubmitError, name_fact};
+    use super::{EntityIdx, MemoryEntityId, MemoryFactStore, MemoryIds, SubmitError, name_fact};
     use crate::facts::ids::FactId;
     use crate::facts::store::{EntityView, FactStore};
     use crate::facts::submit::pipeline::substitute_facts_accumulating;
@@ -3881,11 +3881,8 @@ mod props {
             let events = std::collections::HashMap::new();
             let images = std::collections::HashMap::new();
 
-            let (out, errors) = substitute_facts_accumulating::<
-                MemoryEntityId,
-                crate::facts::memory::MemoryEventId,
-                crate::facts::memory::MemoryImageId,
-            >(&facts, &entities, &events, &images);
+            let (out, errors) =
+                substitute_facts_accumulating::<MemoryIds>(&facts, &entities, &events, &images);
 
             let expected_errors = spec
                 .indices

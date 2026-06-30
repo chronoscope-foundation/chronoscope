@@ -22,9 +22,9 @@ use crate::facts::ids::{FactId, UserId};
 use crate::facts::lifecycle::{
     DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, PointKind,
 };
-use crate::facts::memory::{MemoryEntityId, MemoryFactStore};
+use crate::facts::memory::{MemoryEntityId, MemoryFactStore, MemoryIds};
 use crate::facts::schema::{FactPage, PageItem};
-use crate::facts::store::FactStore;
+use crate::facts::store::{EntityIdOf, EventIdOf, FactStore, ImageIdOf};
 use crate::facts::submit::{
     Commit as SubmitBundle, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, StoredFact,
     SubmitFact, commit_facts,
@@ -32,9 +32,9 @@ use crate::facts::submit::{
 use crate::location::ConflictStatus;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
-type MemEntId = <MemoryFactStore as FactStore>::EntityId;
-type MemEvtId = <MemoryFactStore as FactStore>::EventId;
-type MemImgId = <MemoryFactStore as FactStore>::ImageId;
+type MemEntId = EntityIdOf<MemoryFactStore>;
+type MemEvtId = EventIdOf<MemoryFactStore>;
+type MemImgId = ImageIdOf<MemoryFactStore>;
 type Lin = MemberLineage<MemEntId, MemImgId>;
 
 fn fixed_time() -> chrono::DateTime<chrono::Utc> {
@@ -167,11 +167,8 @@ async fn submit(
     store: &MemoryFactStore,
     entities: usize,
     facts: Vec<SubmitFact>,
-) -> Result<
-    crate::facts::submit::SubmitResult<MemEntId, MemEvtId, MemImgId>,
-    Box<dyn std::error::Error>,
-> {
-    let bundle: SubmitBundle<MemEntId, MemEvtId, MemImgId> = SubmitBundle {
+) -> Result<crate::facts::submit::SubmitResult<MemoryIds>, Box<dyn std::error::Error>> {
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
         author: CommitAuthor::User(UserId::new("alice")),
         recorded_at: fixed_time(),
         entities: (0..entities).map(|_| Decl::Local).collect(),
@@ -455,7 +452,7 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
         })
         .ok_or("Old name fact not found")?;
 
-    let retract_bundle: SubmitBundle<MemEntId, MemEvtId, MemImgId> = SubmitBundle {
+    let retract_bundle: SubmitBundle<MemoryIds> = SubmitBundle {
         author: CommitAuthor::User(UserId::new("alice")),
         recorded_at: fixed_time() + chrono::Duration::seconds(1),
         entities: Vec::new(),
@@ -624,7 +621,7 @@ async fn projection_drains_past_page_boundary() -> TestResult {
 /// can't produce a short-page-with-cursor, hence the stub.
 #[tokio::test]
 async fn drain_continues_past_short_page_with_cursor() -> TestResult {
-    type StubFact = StoredFact<MemEntId, MemEvtId, MemImgId>;
+    type StubFact = StoredFact<MemoryIds>;
     let item = |id: u64| -> Result<PageItem<StubFact, MemEntId>, Box<dyn std::error::Error>> {
         Ok(PageItem {
             fact_id: FactId::new(id),
@@ -694,7 +691,7 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
 // hands it.
 // ------------------------------------------------------------------
 
-type StoredEventFact = StoredFact<MemEntId, MemEvtId, MemImgId>;
+type StoredEventFact = StoredFact<MemoryIds>;
 
 fn ent(id: u64) -> MemEntId {
     MemoryEntityId(id)
@@ -751,7 +748,7 @@ async fn entity_projects_has_event_linked_event() -> TestResult {
     use crate::facts::event::Fact as EventFact;
 
     let store = MemoryFactStore::new();
-    let bundle: SubmitBundle<MemEntId, MemEvtId, MemImgId> = SubmitBundle {
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
         author: CommitAuthor::User(UserId::new("alice")),
         recorded_at: fixed_time(),
         entities: vec![Decl::Local],

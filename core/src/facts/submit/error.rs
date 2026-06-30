@@ -6,10 +6,11 @@
 //! `#[non_exhaustive]` so rule-specific variants can be added without breaking
 //! dependent matches.
 //!
-//! The id-carrying variants are typed by the three id kinds (`E` entity, `V`
-//! event, `I` image) — the offending id rides through typed from
-//! [`crate::facts::identity::IdMapError`]. The `#[error]` messages format it;
-//! thiserror infers the `Display` bounds.
+//! The id-carrying variants are typed by the three id kinds (`EntId`, `EvtId`,
+//! `ImgId`) — the offending id rides through typed from
+//! [`crate::facts::identity::IdMapError`]. Keeping these direct type parameters
+//! (rather than projecting through a bundled scheme) lets thiserror infer the
+//! `Display` bound its `#[error]` messages need on each id kind.
 
 use super::{EntityIdx, EventIdx, ImageIdx};
 use crate::facts::ids::{CommitId, FactId, SubjectKind};
@@ -78,11 +79,13 @@ impl std::fmt::Display for LocationRole {
 /// a default arm and rule-specific variants can be added without a breaking
 /// change.
 ///
-/// Generic over the three id kinds so the id-carrying variants carry the
-/// offending id typed rather than stringified.
+/// Parameterised directly by the three id kinds (`EntId` / `EvtId` / `ImgId`)
+/// so the id-carrying variants carry the offending id typed rather than
+/// stringified — and so thiserror infers the `Display` bound its `#[error]`
+/// messages need on each.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum SubmitError<E, V, I> {
+pub enum SubmitError<EntId, EvtId, ImgId> {
     /// An [`EntityIdx`](super::EntityIdx) inside a fact pointed
     /// past the end of the bundle's entity declarations.
     #[error("EntityIdx({idx}) out of range; bundle has {decl_count} entity declarations")]
@@ -144,7 +147,7 @@ pub enum SubmitError<E, V, I> {
     #[error("identity (entity) fact resolved to self-equivalence on id {id}")]
     IdentityEntitySelfEquivalence {
         /// The shared entity id both sides of the pair resolved to.
-        id: E,
+        id: EntId,
     },
     /// After bundle-local index substitution, an `identity::Fact::SameEvent`
     /// fact resolved to a self-equivalence (`a == b`). Symmetric to
@@ -152,7 +155,7 @@ pub enum SubmitError<E, V, I> {
     #[error("identity (event) fact resolved to self-equivalence on id {id}")]
     IdentityEventSelfEquivalence {
         /// The shared event id both sides of the pair resolved to.
-        id: V,
+        id: EvtId,
     },
     /// After bundle-local index substitution, an `identity::Fact::SameArtifact`
     /// fact resolved to a self-equivalence (`a == b`). Symmetric to
@@ -160,7 +163,7 @@ pub enum SubmitError<E, V, I> {
     #[error("identity (artifact) fact resolved to self-equivalence on id {id}")]
     IdentityArtifactSelfEquivalence {
         /// The shared image id both sides of the pair resolved to.
-        id: I,
+        id: ImgId,
     },
     /// A retraction or supersession target fact was not found at submit
     /// time.
@@ -198,14 +201,14 @@ pub enum SubmitError<E, V, I> {
     #[error("relationship resolved to self-reference on entity {id}")]
     SelfReferenceInRelationship {
         /// The shared entity id both sides resolved to.
-        id: E,
+        id: EntId,
     },
     /// An `observation::Fact::Spatial` resolved to a self-loop after id
     /// substitution. Symmetric to [`Self::SelfReferenceInRelationship`].
     #[error("spatial observation resolved to self-reference on entity {id}")]
     SelfReferenceInSpatial {
         /// The shared entity id both sides resolved to.
-        id: E,
+        id: EntId,
     },
     /// A declaration that no fact references. Rejected up-front so producers
     /// don't accumulate unused id mints.
@@ -222,28 +225,28 @@ pub enum SubmitError<E, V, I> {
     #[error("two entity declarations resolved to the same id {id}")]
     DuplicateEntityDecl {
         /// The id two entity declarations resolved to.
-        id: E,
+        id: EntId,
     },
     /// Two event declarations resolved to one persistent id. See
     /// [`Self::DuplicateEntityDecl`].
     #[error("two event declarations resolved to the same id {id}")]
     DuplicateEventDecl {
         /// The id two event declarations resolved to.
-        id: V,
+        id: EvtId,
     },
     /// Two image declarations resolved to one persistent id. See
     /// [`Self::DuplicateEntityDecl`].
     #[error("two image declarations resolved to the same id {id}")]
     DuplicateImageDecl {
         /// The id two image declarations resolved to.
-        id: I,
+        id: ImgId,
     },
     /// A `Demolition` bookend carries a location. Demolition location is
     /// derived from the entity's last known location, not separately asserted.
     #[error("demolition bookend carries a location for {entity}; demolition location is derived")]
     DemolitionLocation {
         /// The entity whose demolition bookend carried a location.
-        entity: E,
+        entity: EntId,
     },
     /// An event id carries no `HasEvent`. Every event has one subject entity
     /// and one declared kind, so each id needs exactly one `HasEvent` tying it
@@ -252,7 +255,7 @@ pub enum SubmitError<E, V, I> {
     #[error("event {event} carries no HasEvent; every event must declare its subject and kind")]
     EventMissingHasEvent {
         /// The event with no `HasEvent`.
-        event: V,
+        event: EvtId,
     },
     /// An event id carries more than one distinct `HasEvent` — a different
     /// subject entity or a different declared kind on one id. An event has one
@@ -265,7 +268,7 @@ pub enum SubmitError<E, V, I> {
     )]
     EventMultipleHasEvent {
         /// The event with conflicting `HasEvent` claims.
-        event: V,
+        event: EvtId,
     },
     /// A payload or date fact on an event doesn't suit the kind the same
     /// commit's `HasEvent` declares — a damage cause on a non-`Damaged` event, a
@@ -274,7 +277,7 @@ pub enum SubmitError<E, V, I> {
     #[error("event {event}: a {fact} fact does not match its declared kind {declared}")]
     EventFactKindMismatch {
         /// The event whose payload/date contradicts its declared kind.
-        event: V,
+        event: EvtId,
         /// The offending payload or date fact's variant name.
         fact: &'static str,
         /// The kind the event's `HasEvent` declares.
@@ -285,7 +288,7 @@ pub enum SubmitError<E, V, I> {
     #[error("name validity window for {entity} is inverted: valid_from is after valid_to")]
     NameWindowInverted {
         /// The entity whose name window is inverted.
-        entity: E,
+        entity: EntId,
     },
     /// A stored fact carries an [`UncertainDate`](crate::date::UncertainDate)
     /// that isn't a single non-empty interval — a disjunction or the empty
@@ -327,26 +330,26 @@ pub enum SubmitError<E, V, I> {
     #[error("image-observation references {entity} with no paired depiction on image {image}")]
     ObservationWithoutDepiction {
         /// The entity the observation names.
-        entity: E,
+        entity: EntId,
         /// The image the observation was made against.
-        image: I,
+        image: ImgId,
     },
     /// A composite subimage equals its own parent.
     #[error("subimage equals its parent: {image}")]
     CompositeSelfParent {
         /// The image named as both subimage and parent.
-        image: I,
+        image: ImgId,
     },
     /// A subimage is placed under more than one parent.
     #[error("subimage {subimage} is placed under more than one parent")]
     CompositeMultipleParents {
         /// The subimage with multiple parents.
-        subimage: I,
+        subimage: ImgId,
     },
     /// An image is both a subimage and a parent; composites are one layer deep.
     #[error("image {image} is both a subimage and a parent; composites are flat")]
     CompositeChain {
         /// The image forming the chain.
-        image: I,
+        image: ImgId,
     },
 }

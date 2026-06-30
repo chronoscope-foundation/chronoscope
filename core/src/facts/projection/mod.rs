@@ -31,7 +31,9 @@ use crate::algebra::semiring::{Lineage, Semiring};
 use crate::facts::drain::{DRAIN_PAGE, drain_id_facts};
 use crate::facts::ids::FactId;
 use crate::facts::schema::EquivClass;
-use crate::facts::store::{EntityView, EventView, FactStore, StoredFactOf};
+use crate::facts::store::{
+    EntityIdOf, EntityView, EventIdOf, EventView, FactStore, ImageIdOf, StoredFactOf,
+};
 
 /// The member-aware lineage closure: a `(source id, citation)` pair becomes the
 /// singleton atom `{(id, citation)}`. The provenance public callers pass to
@@ -65,9 +67,15 @@ where
 /// representative, the mention count, and the projection.
 pub async fn project_entity<S, V, T>(
     view: &V,
-    entity_id: S::EntityId,
-    provenance: impl Fn(&S::EntityId, &Citation<S::ImageId>) -> T,
-) -> Result<(EquivClass<S::EntityId>, Entity<S::EntityId, S::EventId, T>), S::Error>
+    entity_id: EntityIdOf<S>,
+    provenance: impl Fn(&EntityIdOf<S>, &Citation<ImageIdOf<S>>) -> T,
+) -> Result<
+    (
+        EquivClass<EntityIdOf<S>>,
+        Entity<EntityIdOf<S>, EventIdOf<S>, T>,
+    ),
+    S::Error,
+>
 where
     S: FactStore,
     V: EntityView<S> + EventView<S> + Sync,

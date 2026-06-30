@@ -161,9 +161,9 @@ pub enum ImageStream<'a> {
 /// [`representative`](Self::representative) the introducing fact belongs to.
 ///
 /// `F` is the stored-fact payload type (typically
-/// [`super::submit::StoredFact<EntId, EvtId, ImgId>`] for some backend's id
-/// types). `S` is the subject type (entity / event / image id). Both are
-/// ordinary type parameters so `#[derive]` emits the right bounds.
+/// [`StoredFact<R>`](super::submit::StoredFact) for some backend's id scheme).
+/// `S` is the subject type (entity / event / image id). Both are ordinary type
+/// parameters so `#[derive]` emits the right bounds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageItem<F, S> {
     pub fact_id: FactId,

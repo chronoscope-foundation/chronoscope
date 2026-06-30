@@ -82,11 +82,11 @@
 //!
 //! # Entities and resolution
 //!
-//! Every entity reference inside a fact is an [`ids::EntityId`] — there's no
+//! Every entity reference inside a fact is an entity id — there's no
 //! description-shaped reference at the fact-store layer. A submission that
 //! mentions an entity by name and disambiguators arrives at the submit layer as
-//! an already-shaped bundle: the submission layer mints a fresh
-//! [`ids::EntityId`] for every newly-mentioned entity and rewrites the
+//! an already-shaped bundle: the submission layer mints a fresh entity id for
+//! every newly-mentioned entity and rewrites the
 //! prose-style reference into a flat triple-set keyed by the fresh id
 //! ([`attribute::Fact::Name`], [`attribute::Fact::Relationship`], disambiguator
 //! facts on the same id).
@@ -101,7 +101,7 @@
 //!
 //! # One image, no roles
 //!
-//! [`ids::ImageId`] identifies an image — the bytes of a specific scan or
+//! An image id identifies an image — the bytes of a specific scan or
 //! capture. "Picture" (a figurative depiction: photograph, painting, drawing)
 //! and "map" (a cartographic representation) describe a medium, not a structural
 //! kind that gates which facts an image may carry. The grammar carries one image

@@ -7,7 +7,7 @@
 //! `SameArtifact` is conceptual identity across image realizations of one
 //! physical artifact — different scan resolutions, B&W vs colorized scans,
 //! separate ingestions of the same photograph or map sheet. The bytes differ
-//! (different `ImageId`s) but the artifact is the same. Byte equality is
+//! (different image ids) but the artifact is the same. Byte equality is
 //! hash-derivable and deduplicated before the fact layer, so these facts
 //! cover only what a hash can't decide. The equivalence forms a class;
 //! projection unions the metadata, so a low-resolution ingestion inherits the
@@ -502,73 +502,74 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facts::ids::{EntityId, ImageId, LifetimeEventId};
+    use crate::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type MemFact = Fact<MemoryEntityId, MemoryEventId, MemoryImageId>;
 
     #[test]
     fn same_entity_rejects_self_equivalence() -> TestResult {
-        let a = EntityId::new("e1");
-        let b = EntityId::new("e1");
-        let result = Fact::<EntityId, LifetimeEventId, ImageId>::same_entity(a, b);
+        let a = MemoryEntityId(1);
+        let b = MemoryEntityId(1);
+        let result = MemFact::same_entity(a, b);
         assert!(matches!(result, Err(SelfPairError { .. })));
         Ok(())
     }
 
     #[test]
     fn same_artifact_rejects_self_equivalence() -> TestResult {
-        let a = ImageId::new("img-1");
-        let b = ImageId::new("img-1");
-        let result = Fact::<EntityId, LifetimeEventId, ImageId>::same_artifact(a, b);
+        let a = MemoryImageId(1);
+        let b = MemoryImageId(1);
+        let result = MemFact::same_artifact(a, b);
         assert!(matches!(result, Err(SelfPairError { .. })));
         Ok(())
     }
 
     #[test]
     fn same_event_rejects_self_equivalence() -> TestResult {
-        let a = LifetimeEventId::new("evt-1");
-        let b = LifetimeEventId::new("evt-1");
-        let result = Fact::<EntityId, LifetimeEventId, ImageId>::same_event(a, b);
+        let a = MemoryEventId(1);
+        let b = MemoryEventId(1);
+        let result = MemFact::same_event(a, b);
         assert!(matches!(result, Err(SelfPairError { .. })));
         Ok(())
     }
 
     #[test]
     fn same_entity_canonicalises_pair_ordering() -> TestResult {
-        let big = EntityId::new("z-bigger");
-        let small = EntityId::new("a-smaller");
-        let f = Fact::<EntityId, LifetimeEventId, ImageId>::same_entity(big, small)?;
+        let big = MemoryEntityId(2);
+        let small = MemoryEntityId(1);
+        let f = MemFact::same_entity(big, small)?;
         let Fact::SameEntity { pair } = f else {
             return Err("expected SameEntity".into());
         };
-        assert_eq!(pair.a().as_str(), "a-smaller");
-        assert_eq!(pair.b().as_str(), "z-bigger");
+        assert_eq!(*pair.a(), MemoryEntityId(1));
+        assert_eq!(*pair.b(), MemoryEntityId(2));
         Ok(())
     }
 
     #[test]
     fn same_artifact_canonicalises_pair_ordering() -> TestResult {
-        let big = ImageId::new("img-z");
-        let small = ImageId::new("img-a");
-        let f = Fact::<EntityId, LifetimeEventId, ImageId>::same_artifact(big, small)?;
+        let big = MemoryImageId(2);
+        let small = MemoryImageId(1);
+        let f = MemFact::same_artifact(big, small)?;
         let Fact::SameArtifact { pair } = f else {
             return Err("expected SameArtifact".into());
         };
-        assert_eq!(pair.a().as_str(), "img-a");
-        assert_eq!(pair.b().as_str(), "img-z");
+        assert_eq!(*pair.a(), MemoryImageId(1));
+        assert_eq!(*pair.b(), MemoryImageId(2));
         Ok(())
     }
 
     #[test]
     fn deserialize_routes_through_smart_constructor_same_entity() -> TestResult {
-        // Inputs reversed, to check the parse canonicalises them.
-        let json = r#"{"type":"same_entity","pair":{"a":"z","b":"a"}}"#;
-        let parsed: Fact<EntityId, LifetimeEventId, ImageId> = serde_json::from_str(json)?;
+        // Inputs reversed (a > b), to check the parse canonicalises them.
+        let json = r#"{"type":"same_entity","pair":{"a":2,"b":1}}"#;
+        let parsed: MemFact = serde_json::from_str(json)?;
         let Fact::SameEntity { pair } = parsed else {
             return Err("expected SameEntity".into());
         };
-        assert_eq!(pair.a().as_str(), "a");
-        assert_eq!(pair.b().as_str(), "z");
+        assert_eq!(*pair.a(), MemoryEntityId(1));
+        assert_eq!(*pair.b(), MemoryEntityId(2));
         Ok(())
     }
 
@@ -580,25 +581,22 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_self_equivalence_same_entity() {
-        let json = r#"{"type":"same_entity","pair":{"a":"e1","b":"e1"}}"#;
-        let result: Result<Fact<EntityId, LifetimeEventId, ImageId>, _> =
-            serde_json::from_str(json);
+        let json = r#"{"type":"same_entity","pair":{"a":1,"b":1}}"#;
+        let result: Result<MemFact, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 
     #[test]
     fn deserialize_rejects_self_equivalence_same_artifact() {
-        let json = r#"{"type":"same_artifact","pair":{"a":"img-1","b":"img-1"}}"#;
-        let result: Result<Fact<EntityId, LifetimeEventId, ImageId>, _> =
-            serde_json::from_str(json);
+        let json = r#"{"type":"same_artifact","pair":{"a":1,"b":1}}"#;
+        let result: Result<MemFact, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 
     #[test]
     fn deserialize_rejects_self_equivalence_same_event() {
-        let json = r#"{"type":"same_event","pair":{"a":"evt-1","b":"evt-1"}}"#;
-        let result: Result<Fact<EntityId, LifetimeEventId, ImageId>, _> =
-            serde_json::from_str(json);
+        let json = r#"{"type":"same_event","pair":{"a":1,"b":1}}"#;
+        let result: Result<MemFact, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 
