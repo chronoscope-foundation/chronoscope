@@ -167,6 +167,10 @@ impl RunningDevServer {
         for handle in handles {
             let _ = handle.await;
         }
+
+        // Close the SQLite pool while the runtime is alive, so each
+        // connection's SpatiaLite `dlclose` completes before process exit.
+        self.db.close().await;
     }
 }
 

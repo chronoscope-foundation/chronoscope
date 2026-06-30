@@ -138,6 +138,15 @@ impl Database {
         &self.pool
     }
 
+    /// Close the connection pool, awaiting each connection's teardown.
+    ///
+    /// sqlx runs every SQLite connection on a detached OS thread whose
+    /// `sqlite3_close` `dlclose`s the SpatiaLite extension. Awaiting the close
+    /// keeps that teardown inside the live runtime, before process exit.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     /// Get the integration registry for URL routing.
     #[must_use]
     pub fn registry(&self) -> &IntegrationRegistry {
