@@ -1,10 +1,11 @@
-//! Read-side entity projection.
+//! Read-side projection.
 //!
-//! Reads one entity's `SameEntity` equivalence class back as a coherent value.
-//! [`project_entity`] resolves the class, drains every member's backlink facts,
-//! takes the entity→event hop to reach interior events, and merges them with one
-//! generic fold: every field is a [`Slot`], so the whole entity is
-//! `facts.map(inject).fold(identity, combine)`.
+//! Reads a subject's equivalence class back as a coherent value.
+//! [`project_entity`] resolves an entity's `SameEntity` class, drains every
+//! member's backlink facts, takes the entity→event hop to reach interior events,
+//! and merges them with one generic fold: every field is a [`Slot`], so the
+//! whole entity is `facts.map(inject).fold(identity, combine)`.
+//! [`project_image`] does the same over an image's `SameArtifact` class.
 //!
 //! Provenance is in-band — each bracket bound and each membership key carries its
 //! own support, threaded through a [`Semiring`](crate::algebra::semiring::Semiring).
@@ -21,8 +22,8 @@ pub use bracket::{Bracket, ConsensusConflict, MAX_PROJECTED_LOCATION_CIRCLES};
 pub use provenance::{Citation, Cited, MemberLineage};
 pub use slot::{FactMap, FactSet, Slot};
 pub use types::{
-    Bookend, Entity, Event, GlueEdge, NameKey, NameRecord, Sameness, connecting_glue,
-    sameness_summary,
+    Bookend, DepictionRecord, Entity, Event, GlueEdge, Image, NameKey, NameRecord, RegionRecord,
+    Sameness, connecting_glue, sameness_summary,
 };
 
 use std::collections::BTreeMap;
@@ -32,7 +33,7 @@ use crate::facts::drain::{DRAIN_PAGE, drain_id_facts};
 use crate::facts::ids::FactId;
 use crate::facts::schema::EquivClass;
 use crate::facts::store::{
-    EntityIdOf, EntityView, EventIdOf, EventView, FactStore, ImageIdOf, StoredFactOf,
+    EntityIdOf, EntityView, EventIdOf, EventView, FactStore, ImageIdOf, ImageView, StoredFactOf,
 };
 
 /// The member-aware lineage closure: a `(source id, citation)` pair becomes the
@@ -72,7 +73,7 @@ pub async fn project_entity<S, V, T>(
 ) -> Result<
     (
         EquivClass<EntityIdOf<S>>,
-        Entity<EntityIdOf<S>, EventIdOf<S>, T>,
+        Entity<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>, T>,
     ),
     S::Error,
 >
@@ -115,8 +116,49 @@ where
     Ok((class, entity))
 }
 
+/// Project an image's `SameArtifact` class as an [`Image`] over the
+/// `provenance` closure's semiring, returning the resolved [`EquivClass`]
+/// beside it.
+///
+/// Mirrors [`project_entity`]: resolves the class, drains every member's
+/// backlinks, and folds them per field with the no-winners join. Image-level
+/// facts tag their support against the member image they name; a composite
+/// `IsSubimageOf` edge routes by which end the class holds — the
+/// member-as-subimage records its parent, the member-as-parent records its
+/// subimage. All reads are snapshot-scoped and active-only.
+pub async fn project_image<S, V, T>(
+    view: &V,
+    image_id: ImageIdOf<S>,
+    provenance: impl Fn(&ImageIdOf<S>, &Citation<ImageIdOf<S>>) -> T,
+) -> Result<
+    (
+        EquivClass<ImageIdOf<S>>,
+        Image<EntityIdOf<S>, ImageIdOf<S>, T>,
+    ),
+    S::Error,
+>
+where
+    S: FactStore,
+    V: ImageView<S> + Sync,
+    T: Semiring + Clone,
+{
+    let class = view.image_class(&image_id).await?;
+
+    // A member's backlinks include every image-level fact naming it and every
+    // depiction / composite edge it sits on; one FactId keys each fact once.
+    let mut facts: BTreeMap<FactId, StoredFactOf<S>> = BTreeMap::new();
+    for member in &class.members {
+        let member_facts =
+            drain_id_facts(|cursor| view.all_facts_about_image(member, cursor, DRAIN_PAGE)).await?;
+        facts.extend(member_facts);
+    }
+
+    let image = merge::project_image_facts(&facts, &class.members, provenance);
+    Ok((class, image))
+}
+
 #[cfg(test)]
-use merge::{event_reachers, project_facts};
+use merge::{event_reachers, project_facts, project_image_facts};
 
 #[cfg(test)]
 mod tests;

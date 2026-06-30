@@ -3,12 +3,18 @@
 
 use std::collections::BTreeSet;
 
+use url::Url;
+
 use crate::algebra::semiring::Semiring;
 use crate::claimed::Claimed;
 use crate::date::UncertainDate;
 use crate::facts::attribute::{EntityRelationType, NameText, NameType};
 use crate::facts::citations::{ExternalReference, Language};
+use crate::facts::composites::SubimageRegion;
+use crate::facts::depiction::Perspective;
+use crate::facts::geometry::ImageGeometry;
 use crate::facts::identity::OrderedDistinctPair;
+use crate::facts::image::ImageMedium;
 use crate::facts::lifecycle::{DamageCause, LifetimeEventKind, MoveMethod, Usage};
 use crate::location::UnresolvedLocation;
 
@@ -38,6 +44,34 @@ pub struct NameRecord<T> {
 }
 
 derive_slot!(NameRecord<T: Semiring>, { valid_from, valid_to });
+
+/// One depiction's two annotation axes, each a restrictive bracket: where in the
+/// image's frame the entity sits, and the view classification.
+///
+/// Read from either subject — the entity's [`Entity::depictions`] keys it by
+/// image, the image's [`Image::depicts`] by entity. Both sides carry the same
+/// axis values; their support is subject-scoped — the entity side cites the
+/// entity, the image side the image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepictionRecord<T> {
+    /// Where in the image the entity sits, when a source localized it.
+    pub localization: Bracket<Claimed<ImageGeometry>, T>,
+    /// The view classification, when a source supplied one.
+    pub perspective: Bracket<Claimed<Perspective>, T>,
+}
+
+derive_slot!(DepictionRecord<T: Semiring>, { localization, perspective });
+
+/// A subimage edge's region: the restrictive bracket pinning where a subimage
+/// sits in its parent. Carried on both ends of the edge — the parent's
+/// [`Image::subimages`] and the subimage's [`Image::parent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionRecord<T> {
+    /// The proportional region of the parent the subimage occupies.
+    pub region: Bracket<Claimed<SubimageRegion>, T>,
+}
+
+derive_slot!(RegionRecord<T: Semiring>, { region });
 
 /// A bookend phase (construction or demolition): its endpoint dates and
 /// location, each a restrictive bracket.
@@ -157,7 +191,7 @@ where
 /// in `FactId` order — so this only matters to a consumer comparing projections
 /// built from different fact orders: compare those fields by denotation, not `==`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entity<EntId: Ord, EvtId: Ord, T> {
+pub struct Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T> {
     /// Name claims, deduped by triple, each with its validity window.
     pub names: FactMap<NameKey, NameRecord<T>, T>,
     /// Directed relationships: target entity → the coexisting relation kinds.
@@ -170,11 +204,52 @@ pub struct Entity<EntId: Ord, EvtId: Ord, T> {
     pub demolition: Bookend<T>,
     /// Interior lifetime events, keyed by `SameEvent` class.
     pub events: FactMap<EvtId, Event<T>, T>,
+    /// Images depicting this entity, keyed by image id, each with its
+    /// localization and perspective.
+    pub depictions: FactMap<ImgId, DepictionRecord<T>, T>,
     /// The class's `SameEntity` glue: each judgment's endpoint pair and support.
     /// The root summary and the per-field connecting edges derive from it.
     pub sameness: Sameness<EntId, T>,
 }
 
-derive_slot!(Entity<EntId: Ord, EvtId: Ord, T: Semiring>, {
-    names, relations, refs, construction, demolition, events, sameness
+derive_slot!(Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T: Semiring>, {
+    names, relations, refs, construction, demolition, events, depictions, sameness
+});
+
+/// A pure projected image: a product of slots over the image's `SameArtifact`
+/// class.
+///
+/// An image id is both the underlying artifact and a precise realization (scan)
+/// of it; the model keeps them as one, so a `SameArtifact` class folds its
+/// realizations into a single `Image`. That holds while the fields are
+/// artifact-level (medium, depictions, structure), though a realization-level
+/// attribute like a scan's capture date would want the two separated. Whether to
+/// separate them is an open question.
+///
+/// The medium is restrictive (one settled value once sources agree); the rest
+/// are additive memberships — source URLs, the entities depicted, the composite
+/// edges to a parent or held subimages, and the `SameArtifact` glue tying the
+/// realizations together (mirroring [`Entity`]'s `sameness`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image<EntId: Ord, ImgId: Ord, T> {
+    /// The descriptive medium — a single value once sources agree.
+    pub medium: Bracket<Claimed<ImageMedium>, T>,
+    /// Source URLs the image's bytes were fetched from.
+    pub urls: FactSet<Url, T>,
+    /// Entities depicted in this image, keyed by entity id, each with its
+    /// localization and perspective.
+    pub depicts: FactMap<EntId, DepictionRecord<T>, T>,
+    /// The composite this image is a panel of, keyed by parent id, with the
+    /// region this image occupies.
+    pub parent: FactMap<ImgId, RegionRecord<T>, T>,
+    /// The panels this composite holds, keyed by subimage id, each with its
+    /// region.
+    pub subimages: FactMap<ImgId, RegionRecord<T>, T>,
+    /// The class's `SameArtifact` glue: each judgment's endpoint pair and the
+    /// support behind it — why these realizations are held to be one artifact.
+    pub sameness: Sameness<ImgId, T>,
+}
+
+derive_slot!(Image<EntId: Ord, ImgId: Ord, T: Semiring>, {
+    medium, urls, depicts, parent, subimages, sameness
 });

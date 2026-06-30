@@ -23,15 +23,20 @@ use crate::date::UncertainDate;
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::facts::attribute;
 use crate::facts::bookend;
+use crate::facts::composites;
+use crate::facts::depiction;
 use crate::facts::event;
 use crate::facts::identity;
 use crate::facts::ids::{FactId, IdScheme};
+use crate::facts::image;
 use crate::facts::lifecycle::DurationalRole;
 use crate::facts::submit::StoredFact;
 
 use super::bracket::Bracket;
 use super::provenance::{Citation, Cited};
-use super::types::{Bookend, Entity, Event, NameKey, NameRecord};
+use super::types::{
+    Bookend, DepictionRecord, Entity, Event, Image, NameKey, NameRecord, RegionRecord,
+};
 
 /// The citation a single fact warrants, when it warrants one. A meta fact backs
 /// no value, so it cites nothing.
@@ -88,7 +93,7 @@ pub(crate) fn project_facts<R: IdScheme, T>(
     members: &BTreeSet<R::Entity>,
     reachers: &BTreeMap<R::Event, R::Entity>,
     provenance: impl Fn(&R::Entity, &Citation<R::Image>) -> T,
-) -> Entity<R::Entity, R::Event, T>
+) -> Entity<R::Entity, R::Event, R::Image, T>
 where
     T: Semiring + Clone,
 {
@@ -96,7 +101,7 @@ where
         .values()
         .map(|fact| inject(fact, members, reachers, &provenance))
         .fold(
-            <Entity<R::Entity, R::Event, T> as CommutativeMonoid>::identity(),
+            <Entity<R::Entity, R::Event, R::Image, T> as CommutativeMonoid>::identity(),
             CommutativeMonoid::combine,
         )
 }
@@ -104,13 +109,14 @@ where
 /// One fact as a sparse, mostly-identity entity. A factual fact lands a single
 /// leaf set, its support the fact's citation lifted through `provenance` against
 /// the source id the fact spoke to. A `SameEntity` judgment lands one `sameness`
-/// edge. A meta fact backs nothing.
+/// edge; a `Depiction` judgment lands one `depictions` edge keyed by image. A
+/// meta fact backs nothing.
 fn inject<R: IdScheme, T>(
     fact: &StoredFact<R>,
     members: &BTreeSet<R::Entity>,
     reachers: &BTreeMap<R::Event, R::Entity>,
     provenance: &impl Fn(&R::Entity, &Citation<R::Image>) -> T,
-) -> Entity<R::Entity, R::Event, T>
+) -> Entity<R::Entity, R::Event, R::Image, T>
 where
     T: Semiring + Clone,
 {
@@ -125,7 +131,7 @@ where
             let Some(citation) = citation_of(fact) else {
                 return Entity::identity();
             };
-            inject_judgment(&j.assertion, &citation, provenance)
+            inject_judgment(&j.assertion, members, &citation, provenance)
         }
         StoredFact::Meta(_) => Entity::identity(),
     }
@@ -140,7 +146,7 @@ fn inject_factual<R: IdScheme, T>(
     reachers: &BTreeMap<R::Event, R::Entity>,
     citation: &Citation<R::Image>,
     provenance: &impl Fn(&R::Entity, &Citation<R::Image>) -> T,
-) -> Entity<R::Entity, R::Event, T>
+) -> Entity<R::Entity, R::Event, R::Image, T>
 where
     T: Semiring + Clone,
 {
@@ -171,31 +177,49 @@ where
     }
 }
 
-/// A `SameEntity` judgment's contribution: one glue edge keyed by its endpoint
-/// pair. The judgment's support tags the edge symmetrically — against both `a`
-/// and `b` — so a field either endpoint asserted into can find the edge by id,
-/// and `Citation::Judgment` stays live. Every other judgment kind backs no
-/// entity field.
+/// A judgment's contribution to the entity. A `SameEntity` records one glue edge
+/// keyed by its endpoint pair, its support tagging both `a` and `b` symmetrically
+/// so a field either endpoint asserted into can find the edge by id and
+/// `Citation::Judgment` stays live. A `Depiction` folds into `depictions`, keyed
+/// by the depicted image, when this class is the depicted entity (its end of the
+/// cross-id-space edge is a member). Other judgment kinds contribute the identity
+/// entity.
 fn inject_judgment<R: IdScheme, T>(
     assertion: &JudgmentAssertion<R>,
+    members: &BTreeSet<R::Entity>,
     citation: &Citation<R::Image>,
     provenance: &impl Fn(&R::Entity, &Citation<R::Image>) -> T,
-) -> Entity<R::Entity, R::Event, T>
+) -> Entity<R::Entity, R::Event, R::Image, T>
 where
-    T: Semiring,
+    T: Semiring + Clone,
 {
-    let JudgmentAssertion::Identity {
-        fact: identity::Fact::SameEntity { pair },
-    } = assertion
-    else {
-        return Entity::identity();
-    };
-    let support = provenance(pair.a(), citation).plus(provenance(pair.b(), citation));
-    let mut entity = Entity::identity();
-    entity
-        .sameness
-        .insert(pair.clone(), Cited { value: (), support });
-    entity
+    match assertion {
+        JudgmentAssertion::Identity {
+            fact: identity::Fact::SameEntity { pair },
+        } => {
+            let support = provenance(pair.a(), citation).plus(provenance(pair.b(), citation));
+            let mut entity = Entity::identity();
+            entity
+                .sameness
+                .insert(pair.clone(), Cited { value: (), support });
+            entity
+        }
+        JudgmentAssertion::Depiction { fact } => {
+            let mut entity = Entity::identity();
+            if let Some((image, entry)) = depiction_edge(
+                fact,
+                &fact.entity,
+                &fact.image,
+                members,
+                citation,
+                provenance,
+            ) {
+                entity.depictions.insert(image.clone(), entry);
+            }
+            entity
+        }
+        _ => Entity::identity(),
+    }
 }
 
 /// The far endpoint to key an outgoing edge under, when `near → far` crosses
@@ -205,14 +229,22 @@ fn same_space_target<'a, N: Ord>(near: &N, far: &'a N, members: &BTreeSet<N>) ->
     (members.contains(near) && !members.contains(far)).then_some(far)
 }
 
-fn inject_attribute<EntId, EvtId, T>(
+/// The far endpoint to key a cross-id-space edge under: kept when `near` is a
+/// member. `far` lives in another id space, so it can never be a member — there
+/// is no self-edge to exclude, unlike `same_space_target`.
+fn cross_space_target<'a, N: Ord, F>(near: &N, far: &'a F, members: &BTreeSet<N>) -> Option<&'a F> {
+    members.contains(near).then_some(far)
+}
+
+fn inject_attribute<EntId, EvtId, ImgId, T>(
     fact: &attribute::Fact<EntId>,
     members: &BTreeSet<EntId>,
     support: T,
-    entity: &mut Entity<EntId, EvtId, T>,
+    entity: &mut Entity<EntId, EvtId, ImgId, T>,
 ) where
     EntId: Ord + Clone,
     EvtId: Ord,
+    ImgId: Ord,
     T: Semiring + Clone,
 {
     match fact {
@@ -293,7 +325,7 @@ fn inject_event_fact<EntId, EvtId, ImgId, T>(
     reachers: &BTreeMap<EvtId, EntId>,
     citation: &Citation<ImgId>,
     provenance: &impl Fn(&EntId, &Citation<ImgId>) -> T,
-) -> Entity<EntId, EvtId, T>
+) -> Entity<EntId, EvtId, ImgId, T>
 where
     EntId: Ord + Clone,
     EvtId: Ord + Clone,
@@ -309,13 +341,14 @@ where
     entity
 }
 
-fn inject_event<EntId, EvtId, T>(
+fn inject_event<EntId, EvtId, ImgId, T>(
     fact: &event::Fact<EntId, EvtId>,
     support: T,
-    entity: &mut Entity<EntId, EvtId, T>,
+    entity: &mut Entity<EntId, EvtId, ImgId, T>,
 ) where
     EntId: Ord,
     EvtId: Ord + Clone,
+    ImgId: Ord,
     T: Semiring + Clone,
 {
     let mut record = Event::identity();
@@ -398,4 +431,256 @@ where
         },
         support,
     ))
+}
+
+// ============================================================================
+// Image projection
+// ============================================================================
+
+/// One depiction fact as a [`DepictionRecord`]: each present axis pins its
+/// claimed value, an absent axis stays at the identity bracket. Shared by the
+/// entity-side `depictions` and the image-side `depicts`, so both views pin the
+/// same axes; each side's support cites its own subject.
+pub(super) fn inject_depiction<EntId, ImgId, T>(
+    fact: &depiction::Fact<EntId, ImgId>,
+    support: &T,
+) -> DepictionRecord<T>
+where
+    T: Semiring + Clone,
+{
+    let mut record = DepictionRecord::identity();
+    match (&fact.localization, &fact.perspective) {
+        (Some(geometry), Some(perspective)) => {
+            record.localization = claimed_of(geometry.clone(), support.clone());
+            record.perspective = claimed_of(*perspective, support.clone());
+        }
+        (Some(geometry), None) => {
+            record.localization = claimed_of(geometry.clone(), support.clone());
+        }
+        (None, Some(perspective)) => record.perspective = claimed_of(*perspective, support.clone()),
+        (None, None) => {}
+    }
+    record
+}
+
+/// One depiction edge, gated and supported once for both fold directions.
+///
+/// Yields the far endpoint to key the edge under and the [`Cited`]
+/// [`DepictionRecord`], kept only when `near` — the depiction end the projected
+/// class holds — is a member (see [`cross_space_target`]). The entity side
+/// passes `near = entity`, `far = image`; the image side swaps them. Both run
+/// through here so the gate, the support, and the pinned axes stay identical
+/// across the two views.
+fn depiction_edge<'f, EntId, ImgId, N, F, I, T>(
+    fact: &depiction::Fact<EntId, ImgId>,
+    near: &N,
+    far: &'f F,
+    members: &BTreeSet<N>,
+    citation: &Citation<I>,
+    provenance: &impl Fn(&N, &Citation<I>) -> T,
+) -> Option<(&'f F, Cited<DepictionRecord<T>, T>)>
+where
+    N: Ord,
+    T: Semiring + Clone,
+{
+    let far = cross_space_target(near, far, members)?;
+    let support = provenance(near, citation);
+    let record = inject_depiction(fact, &support);
+    Some((
+        far,
+        Cited {
+            value: record,
+            support,
+        },
+    ))
+}
+
+/// Merge an image's facts into an [`Image`] — the generic fold over the product
+/// of slots, mirroring [`project_facts`].
+///
+/// `members` is the projected `SameArtifact` class. Image-level facts tag their
+/// support with the image they name; a composite `IsSubimageOf` edge routes by
+/// which end the class holds (see [`inject_subimage`]); a `SameArtifact`
+/// judgment lands one `sameness` glue edge — the realizations' merge provenance,
+/// mirroring [`Entity`]'s `SameEntity` glue.
+pub(crate) fn project_image_facts<R: IdScheme, T>(
+    facts: &BTreeMap<FactId, StoredFact<R>>,
+    members: &BTreeSet<R::Image>,
+    provenance: impl Fn(&R::Image, &Citation<R::Image>) -> T,
+) -> Image<R::Entity, R::Image, T>
+where
+    T: Semiring + Clone,
+{
+    facts
+        .values()
+        .map(|fact| inject_image(fact, members, &provenance))
+        .fold(
+            <Image<R::Entity, R::Image, T> as CommutativeMonoid>::identity(),
+            CommutativeMonoid::combine,
+        )
+}
+
+/// One fact as a sparse, mostly-identity image. A factual image fact lands a
+/// single leaf; a depiction, composite, or `SameArtifact` judgment lands one
+/// edge; a meta fact backs nothing.
+fn inject_image<R: IdScheme, T>(
+    fact: &StoredFact<R>,
+    members: &BTreeSet<R::Image>,
+    provenance: &impl Fn(&R::Image, &Citation<R::Image>) -> T,
+) -> Image<R::Entity, R::Image, T>
+where
+    T: Semiring + Clone,
+{
+    match fact {
+        StoredFact::Factual(f) => {
+            let Some(citation) = citation_of(fact) else {
+                return Image::identity();
+            };
+            inject_image_factual(&f.assertion, &citation, provenance)
+        }
+        StoredFact::Judgment(j) => {
+            let Some(citation) = citation_of(fact) else {
+                return Image::identity();
+            };
+            inject_image_judgment(&j.assertion, members, &citation, provenance)
+        }
+        StoredFact::Meta(_) => Image::identity(),
+    }
+}
+
+/// The image-cluster facts of a factual assertion. Other factual clusters carry
+/// the entity projection's fields.
+fn inject_image_factual<R: IdScheme, T>(
+    assertion: &FactualAssertion<R>,
+    citation: &Citation<R::Image>,
+    provenance: &impl Fn(&R::Image, &Citation<R::Image>) -> T,
+) -> Image<R::Entity, R::Image, T>
+where
+    T: Semiring + Clone,
+{
+    match assertion {
+        FactualAssertion::Image { fact } => inject_image_fact(fact, citation, provenance),
+        _ => Image::identity(),
+    }
+}
+
+/// An image fact's contribution: only `Source` (→ `urls`) and `Medium` (→ the
+/// restrictive `medium`) carry image-field projections.
+fn inject_image_fact<EntId, ImgId, T>(
+    fact: &image::Fact<ImgId>,
+    citation: &Citation<ImgId>,
+    provenance: &impl Fn(&ImgId, &Citation<ImgId>) -> T,
+) -> Image<EntId, ImgId, T>
+where
+    EntId: Ord,
+    ImgId: Ord + Clone,
+    T: Semiring + Clone,
+{
+    let mut image = Image::identity();
+    match fact {
+        image::Fact::Source { image: id, url } => {
+            let support = provenance(id, citation);
+            image.urls.insert(url.clone(), Cited { value: (), support });
+        }
+        image::Fact::Medium { image: id, medium } => {
+            let support = provenance(id, citation);
+            image.medium = claimed_of(*medium, support);
+        }
+        image::Fact::Author { .. }
+        | image::Fact::CreatedDate { .. }
+        | image::Fact::CapturedDate { .. }
+        | image::Fact::CapturedLocation { .. } => {}
+    }
+    image
+}
+
+/// A judgment's contribution to the image. A `Depiction` folds into `depicts`,
+/// keyed by the depicted entity, when this class is the depicting image (its end
+/// of the cross-id-space edge is a member). A composite `IsSubimageOf` routes
+/// through [`inject_subimage`]. A `SameArtifact` judgment records one `sameness`
+/// glue edge.
+fn inject_image_judgment<R: IdScheme, T>(
+    assertion: &JudgmentAssertion<R>,
+    members: &BTreeSet<R::Image>,
+    citation: &Citation<R::Image>,
+    provenance: &impl Fn(&R::Image, &Citation<R::Image>) -> T,
+) -> Image<R::Entity, R::Image, T>
+where
+    T: Semiring + Clone,
+{
+    match assertion {
+        JudgmentAssertion::Depiction { fact } => {
+            let mut image = Image::identity();
+            if let Some((entity, entry)) = depiction_edge(
+                fact,
+                &fact.image,
+                &fact.entity,
+                members,
+                citation,
+                provenance,
+            ) {
+                image.depicts.insert(entity.clone(), entry);
+            }
+            image
+        }
+        JudgmentAssertion::Composite {
+            fact:
+                composites::Fact::IsSubimageOf {
+                    subimage,
+                    parent,
+                    region,
+                },
+        } => inject_subimage(subimage, parent, region, members, citation, provenance),
+        JudgmentAssertion::Identity {
+            fact: identity::Fact::SameArtifact { pair },
+        } => {
+            let support = provenance(pair.a(), citation).plus(provenance(pair.b(), citation));
+            let mut image = Image::identity();
+            image
+                .sameness
+                .insert(pair.clone(), Cited { value: (), support });
+            image
+        }
+        _ => Image::identity(),
+    }
+}
+
+/// One `IsSubimageOf` edge, routed by which end the projected class holds: a
+/// member-as-parent records the `subimage`, a member-as-subimage records the
+/// `parent`. A class holding both ends keys neither — each routing's far
+/// endpoint is itself a member, so [`same_space_target`] declines it.
+fn inject_subimage<EntId, ImgId, T>(
+    subimage: &ImgId,
+    parent: &ImgId,
+    region: &composites::SubimageRegion,
+    members: &BTreeSet<ImgId>,
+    citation: &Citation<ImgId>,
+    provenance: &impl Fn(&ImgId, &Citation<ImgId>) -> T,
+) -> Image<EntId, ImgId, T>
+where
+    EntId: Ord,
+    ImgId: Ord + Clone,
+    T: Semiring + Clone,
+{
+    let region_entry = |support: T| Cited {
+        value: RegionRecord {
+            region: claimed_of(*region, support.clone()),
+        },
+        support,
+    };
+    let mut image = Image::identity();
+    // member is the parent → the subimage is its child region
+    if let Some(child) = same_space_target(parent, subimage, members) {
+        image
+            .subimages
+            .insert(child.clone(), region_entry(provenance(parent, citation)));
+    }
+    // member is the subimage → the parent is its enclosing image
+    if let Some(enclosing) = same_space_target(subimage, parent, members) {
+        image.parent.insert(
+            enclosing.clone(),
+            region_entry(provenance(subimage, citation)),
+        );
+    }
+    image
 }

@@ -324,7 +324,7 @@ where
     /// Flatten a [`projection::Entity`] into its typed DTO. Pure over the flat
     /// member-aware lineage; the `EquivClass` carries `mention_count = members.len()`.
     pub fn parse(
-        projected: &projection::Entity<EntId, EvtId, MemberLineage<EntId, ImgId>>,
+        projected: &projection::Entity<EntId, EvtId, ImgId, MemberLineage<EntId, ImgId>>,
         class: &EquivClass<EntId>,
     ) -> Self {
         let names = display_names(&projected.names);
@@ -684,7 +684,7 @@ where
 /// Build the sorted timeline: construction first, demolition last, the interior
 /// events parsed and ordered by earliest known date with undated entries last.
 fn timeline<EntId, EvtId, ImgId>(
-    projected: &projection::Entity<EntId, EvtId, MemberLineage<EntId, ImgId>>,
+    projected: &projection::Entity<EntId, EvtId, ImgId, MemberLineage<EntId, ImgId>>,
 ) -> Vec<TimelineEntry<EvtId, ImgId>>
 where
     EntId: Ord + Clone,
@@ -907,7 +907,7 @@ mod tests {
     }
 
     /// An entity with empty everything — the per-test base to populate.
-    fn empty_entity() -> projection::Entity<EntId, EvtId, Lin> {
+    fn empty_entity() -> projection::Entity<EntId, EvtId, ImgId, Lin> {
         projection::Entity {
             names: FactMap::new(),
             relations: FactMap::new(),
@@ -915,6 +915,7 @@ mod tests {
             construction: empty_bookend(),
             demolition: empty_bookend(),
             events: FactMap::new(),
+            depictions: FactMap::new(),
             sameness: FactMap::new(),
         }
     }

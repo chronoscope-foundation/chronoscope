@@ -14,11 +14,15 @@ use crate::facts::attribute::{self, EntityRelationType, NameText, NameType};
 use crate::facts::bookend;
 use crate::facts::citations::{
     Excerpt, ExternalReference, ExternalSource, FactualCitation, JudgmentSource, Justification,
-    Language, MetaSource,
+    Language, MetaSource, Observer,
 };
+use crate::facts::composites::SubimageRegion;
+use crate::facts::depiction::Perspective;
 use crate::facts::event;
+use crate::facts::geometry::ImageGeometry;
 use crate::facts::identity::{self, OrderedDistinctPair};
 use crate::facts::ids::{FactId, UserId};
+use crate::facts::image::ImageMedium;
 use crate::facts::lifecycle::{
     DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, PointKind,
 };
@@ -37,6 +41,9 @@ type MemEntId = EntityIdOf<MemoryFactStore>;
 type MemEvtId = EventIdOf<MemoryFactStore>;
 type MemImgId = ImageIdOf<MemoryFactStore>;
 type Lin = MemberLineage<MemEntId, MemImgId>;
+/// The image projection's lineage: a `SameArtifact` class's members are image
+/// ids, so the source-id atom is an image id.
+type ImgLin = MemberLineage<MemImgId, MemImgId>;
 
 fn fixed_time() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc
@@ -46,14 +53,7 @@ fn fixed_time() -> chrono::DateTime<chrono::Utc> {
 }
 
 fn sample_citation() -> Result<FactualCitation, Box<dyn std::error::Error>> {
-    let source = ExternalSource::Url {
-        url: Url::parse("https://example.com/source")?,
-        published: None,
-    };
-    Ok(FactualCitation::new(
-        source,
-        vec![Excerpt::new("source-text")?],
-    )?)
+    factual_at("https://example.com/source")
 }
 
 fn judgment_source() -> Result<JudgmentSource<ImageIdx>, Box<dyn std::error::Error>> {
@@ -163,6 +163,15 @@ fn same_entity_fact(a: usize, b: usize) -> Result<SubmitFact, Box<dyn std::error
     })
 }
 
+fn same_artifact_fact(a: usize, b: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Identity {
+            fact: identity::Fact::same_artifact(ImageIdx(a), ImageIdx(b))?,
+        },
+        citation: judgment_source()?,
+    })
+}
+
 /// Submit one bundle, mapping the error into a boxed string so `?` works.
 async fn submit(
     store: &MemoryFactStore,
@@ -185,7 +194,7 @@ async fn submit(
 /// Look up a name entry's value record by language, for assertions that don't
 /// care about the full key.
 fn name_by_language<'e>(
-    entity: &'e Entity<MemEntId, MemEvtId, Lin>,
+    entity: &'e Entity<MemEntId, MemEvtId, MemImgId, Lin>,
     language: &str,
 ) -> Option<(&'e NameKey, &'e Cited<NameRecord<Lin>, Lin>)> {
     entity
@@ -745,13 +754,16 @@ fn has_event_stored(
 }
 
 /// Project a hand-built fact map through the member-aware lineage fold, the same
-/// merge the entity entry point runs. The reacher map comes from the `HasEvent`
-/// facts in the bag, exactly as the entry point derives it.
-fn project(facts: &BTreeMap<FactId, StoredEventFact>) -> Entity<MemEntId, MemEvtId, Lin> {
+/// merge the entity entry point runs. The caller supplies the projected entity's
+/// class — the same set the real entry point resolves from `SameEntity`. The
+/// reacher map comes from the `HasEvent` facts in the bag, exactly as the entry
+/// point derives it.
+fn project(
+    facts: &BTreeMap<FactId, StoredEventFact>,
+    members: &BTreeSet<MemEntId>,
+) -> Entity<MemEntId, MemEvtId, MemImgId, Lin> {
     let reachers = event_reachers(facts);
-    // The event-owning entities are the class these facts project.
-    let members: BTreeSet<MemEntId> = reachers.values().copied().collect();
-    project_facts(facts, &members, &reachers, member_lineage)
+    project_facts(facts, members, &reachers, member_lineage)
 }
 
 /// Mint an entity and an interior event tied to it by a `HasEvent`, plus a
@@ -871,7 +883,7 @@ fn durational_event_splits_start_and_completion() -> TestResult {
     .into_iter()
     .collect();
 
-    let entity = project(&facts);
+    let entity = project(&facts, &BTreeSet::from([ent(7)]));
     assert_eq!(entity.events.len(), 1);
     let (_, event) = entity.events.iter().next().ok_or("no event")?;
     let record = &event.value;
@@ -923,7 +935,7 @@ fn durational_kind_reads_off_has_event_not_payload() -> TestResult {
     .into_iter()
     .collect();
 
-    let entity = project(&facts);
+    let entity = project(&facts, &BTreeSet::from([ent(7)]));
     let (_, event) = entity.events.iter().next().ok_or("no event")?;
     assert_eq!(
         event.value.kind.consensus.value,
@@ -967,7 +979,7 @@ fn point_event_projects_kind_and_payloads() -> TestResult {
     .into_iter()
     .collect();
 
-    let entity = project(&facts);
+    let entity = project(&facts, &BTreeSet::from([ent(7)]));
     let (_, event) = entity.events.iter().next().ok_or("no event")?;
     let record = &event.value;
     assert_eq!(
@@ -1020,7 +1032,7 @@ fn disagreeing_damage_cause_is_a_value_mode_conflict() -> TestResult {
     .into_iter()
     .collect();
 
-    let entity = project(&facts);
+    let entity = project(&facts, &BTreeSet::from([ent(7)]));
     let (_, event) = entity.events.iter().next().ok_or("no event")?;
     assert_eq!(
         event.value.cause.conflict(),
@@ -1076,7 +1088,7 @@ fn unresolved_move_location_is_pending() -> TestResult {
     .into_iter()
     .collect();
 
-    let entity = project(&facts);
+    let entity = project(&facts, &BTreeSet::from([ent(7)]));
     let (_, event) = entity.events.iter().next().ok_or("no event")?;
     assert_eq!(
         event.value.location.conflict(),
@@ -1391,4 +1403,647 @@ proptest! {
             Ok(())
         })?;
     }
+}
+
+// ------------------------------------------------------------------
+// Image projection — the SameArtifact fold over image-level facts,
+// depictions, and composite edges.
+//
+// `project_image_facts` is the pure fold over a class's facts; the routing
+// tests drive it directly on a hand-built fact set with an explicit member set,
+// the same shape the image drain hands it.
+// ------------------------------------------------------------------
+
+fn img(id: u64) -> MemImgId {
+    crate::facts::memory::MemoryImageId(id)
+}
+
+/// A factual citation distinguished by source url, so two image facts on one
+/// image keep distinct lineage atoms.
+fn factual_at(url: &str) -> Result<FactualCitation, Box<dyn std::error::Error>> {
+    Ok(FactualCitation::new(
+        ExternalSource::Url {
+            url: Url::parse(url)?,
+            published: None,
+        },
+        vec![Excerpt::new("source-text")?],
+    )?)
+}
+
+/// A judgment source for a stored depiction / composite fact.
+fn stored_judgment_src() -> Result<JudgmentSource<MemImgId>, Box<dyn std::error::Error>> {
+    Ok(JudgmentSource::PersonalKnowledge {
+        user: UserId::new("alice"),
+        justification: Justification::new("an image judgment")?,
+    })
+}
+
+fn source_stored(
+    fact_id: u64,
+    image: MemImgId,
+    url: &str,
+) -> Result<(FactId, StoredEventFact), Box<dyn std::error::Error>> {
+    Ok((
+        FactId::new(fact_id),
+        StoredFact::Factual(crate::facts::submit::result::StoredFactualFact {
+            assertion: FactualAssertion::Image {
+                fact: crate::facts::image::Fact::Source {
+                    image,
+                    url: Url::parse(url)?,
+                },
+            },
+            citation: factual_at(url)?,
+        }),
+    ))
+}
+
+fn medium_stored(
+    fact_id: u64,
+    image: MemImgId,
+    medium: ImageMedium,
+    url: &str,
+) -> Result<(FactId, StoredEventFact), Box<dyn std::error::Error>> {
+    Ok((
+        FactId::new(fact_id),
+        StoredFact::Factual(crate::facts::submit::result::StoredFactualFact {
+            assertion: FactualAssertion::Image {
+                fact: crate::facts::image::Fact::Medium { image, medium },
+            },
+            citation: factual_at(url)?,
+        }),
+    ))
+}
+
+/// Wrap a judgment assertion as a stored judgment fact at the given id,
+/// mirroring [`event_stored`] for the factual side.
+fn judgment_stored(
+    fact_id: u64,
+    assertion: JudgmentAssertion<MemoryIds>,
+) -> Result<(FactId, StoredEventFact), Box<dyn std::error::Error>> {
+    Ok((
+        FactId::new(fact_id),
+        StoredFact::Judgment(crate::facts::submit::result::StoredJudgmentFact {
+            assertion,
+            source: stored_judgment_src()?,
+        }),
+    ))
+}
+
+fn depiction_stored(
+    fact_id: u64,
+    entity: MemEntId,
+    image: MemImgId,
+    localization: Option<ImageGeometry>,
+    perspective: Option<Perspective>,
+) -> Result<(FactId, StoredEventFact), Box<dyn std::error::Error>> {
+    judgment_stored(
+        fact_id,
+        JudgmentAssertion::Depiction {
+            fact: crate::facts::depiction::Fact {
+                entity,
+                image,
+                localization,
+                perspective,
+            },
+        },
+    )
+}
+
+fn subimage_stored(
+    fact_id: u64,
+    subimage: MemImgId,
+    parent: MemImgId,
+    region: SubimageRegion,
+) -> Result<(FactId, StoredEventFact), Box<dyn std::error::Error>> {
+    judgment_stored(
+        fact_id,
+        JudgmentAssertion::Composite {
+            fact: crate::facts::composites::Fact::IsSubimageOf {
+                subimage,
+                parent,
+                region,
+            },
+        },
+    )
+}
+
+/// Fold a hand-built fact map over the member-aware lineage, the same merge the
+/// image entry point runs.
+fn project_img(
+    facts: &BTreeMap<FactId, StoredEventFact>,
+    members: &BTreeSet<MemImgId>,
+) -> Image<MemEntId, MemImgId, ImgLin> {
+    project_image_facts(facts, members, member_lineage)
+}
+
+/// An image with a source, a medium, and a localized depiction projects each
+/// onto its slot: the url joins `urls`, the medium settles, and the depiction
+/// lands in `depicts` keyed by the entity with both axes pinned.
+#[test]
+fn image_projects_medium_urls_and_depiction() -> TestResult {
+    let geometry = ImageGeometry::bbox(0.1, 0.2, 0.4, 0.5)?;
+    let facts: BTreeMap<FactId, _> = [
+        source_stored(0, img(1), "https://example.com/photo.jpg")?,
+        medium_stored(
+            1,
+            img(1),
+            ImageMedium::Picture,
+            "https://example.com/catalog",
+        )?,
+        depiction_stored(
+            2,
+            ent(7),
+            img(1),
+            Some(geometry.clone()),
+            Some(Perspective::Exterior),
+        )?,
+    ]
+    .into_iter()
+    .collect();
+
+    let image = project_img(&facts, &BTreeSet::from([img(1)]));
+
+    assert_eq!(image.urls.len(), 1, "the source url joins urls");
+    assert_eq!(
+        image.medium.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([ImageMedium::Picture])
+        },
+        "the medium settles to Picture"
+    );
+
+    assert_eq!(image.depicts.len(), 1, "the depiction keys by entity");
+    let (entity_key, entry) = image.depicts.iter().next().ok_or("no depiction")?;
+    assert_eq!(entity_key, &ent(7));
+    assert_eq!(
+        entry.value.localization.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([geometry])
+        },
+        "the localization geometry pins the bracket"
+    );
+    assert_eq!(
+        entry.value.perspective.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([Perspective::Exterior])
+        },
+        "the perspective pins the bracket"
+    );
+    Ok(())
+}
+
+/// One `IsSubimageOf` edge routes by which end the projected class holds: the
+/// parent's class records the subimage under `subimages`; the subimage's class
+/// records the parent under `parent`.
+#[test]
+fn subimage_edge_routes_by_class_membership() -> TestResult {
+    let region = SubimageRegion::rect(0.0, 0.0, 0.5, 1.0)?;
+    let facts: BTreeMap<FactId, _> = [subimage_stored(0, img(2), img(1), region)?]
+        .into_iter()
+        .collect();
+
+    // Projecting the parent (image 1) records image 2 as a held subimage.
+    let parent_view = project_img(&facts, &BTreeSet::from([img(1)]));
+    assert!(
+        parent_view.parent.is_empty(),
+        "the parent has no parent of its own"
+    );
+    assert_eq!(
+        parent_view.subimages.len(),
+        1,
+        "the parent holds one subimage"
+    );
+    let (sub_key, sub_entry) = parent_view.subimages.iter().next().ok_or("no subimage")?;
+    assert_eq!(sub_key, &img(2));
+    assert_eq!(
+        sub_entry.value.region.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([region])
+        }
+    );
+
+    // Projecting the subimage (image 2) records image 1 as its parent.
+    let sub_view = project_img(&facts, &BTreeSet::from([img(2)]));
+    assert!(
+        sub_view.subimages.is_empty(),
+        "the subimage holds no panels"
+    );
+    assert_eq!(sub_view.parent.len(), 1, "the subimage names one parent");
+    let (parent_key, parent_entry) = sub_view.parent.iter().next().ok_or("no parent")?;
+    assert_eq!(parent_key, &img(1));
+    assert_eq!(
+        parent_entry.value.region.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([region])
+        }
+    );
+    Ok(())
+}
+
+/// Two sources disagree on the medium. The whole value is the atom, so the meet
+/// of `{Picture}` and `{Map}` empties — an over-determined conflict — while the
+/// extent keeps both.
+#[test]
+fn image_medium_disagreement_is_a_value_mode_conflict() -> TestResult {
+    let facts: BTreeMap<FactId, _> = [
+        medium_stored(0, img(1), ImageMedium::Picture, "https://a.example/src")?,
+        medium_stored(1, img(1), ImageMedium::Map, "https://b.example/src")?,
+    ]
+    .into_iter()
+    .collect();
+
+    let image = project_img(&facts, &BTreeSet::from([img(1)]));
+    assert_eq!(
+        image.medium.conflict(),
+        ConflictStatus::Conflict,
+        "disjoint media over-determine the consensus"
+    );
+    assert_eq!(
+        image.medium.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::new()
+        },
+        "the consensus meet of disjoint singletons is empty"
+    );
+    assert_eq!(
+        image.medium.extent.value,
+        Claimed::Of {
+            values: BTreeSet::from([ImageMedium::Picture, ImageMedium::Map])
+        },
+        "the extent keeps both claimed media"
+    );
+    Ok(())
+}
+
+/// A bare depiction — no localization, no perspective — still records the
+/// entity↔image membership, with both annotation axes left at the untouched
+/// bracket.
+#[test]
+fn bare_depiction_records_membership_with_untouched_axes() -> TestResult {
+    let facts: BTreeMap<FactId, _> = [depiction_stored(0, ent(7), img(1), None, None)?]
+        .into_iter()
+        .collect();
+
+    let image = project_img(&facts, &BTreeSet::from([img(1)]));
+    assert_eq!(
+        image.depicts.len(),
+        1,
+        "the depiction membership is recorded"
+    );
+    let (_, entry) = image.depicts.iter().next().ok_or("no depiction")?;
+    assert_eq!(
+        entry.support.iter().count(),
+        1,
+        "the membership cites the depiction fact"
+    );
+    assert_eq!(
+        entry.value.localization.extent.support.iter().count(),
+        0,
+        "an absent localization leaves its bracket untouched"
+    );
+    assert_eq!(
+        entry.value.perspective.extent.support.iter().count(),
+        0,
+        "an absent perspective leaves its bracket untouched"
+    );
+    Ok(())
+}
+
+/// A depiction fact mentions the entity, so the entity projection drains it and
+/// folds it into `depictions`, keyed by the depicted image.
+#[test]
+fn entity_projection_records_depiction() -> TestResult {
+    let geometry = ImageGeometry::bbox(0.1, 0.1, 0.2, 0.2)?;
+    let facts: BTreeMap<FactId, _> = [depiction_stored(
+        0,
+        ent(7),
+        img(1),
+        Some(geometry.clone()),
+        Some(Perspective::Interior),
+    )?]
+    .into_iter()
+    .collect();
+
+    let entity = project(&facts, &BTreeSet::from([ent(7)]));
+    assert_eq!(
+        entity.depictions.len(),
+        1,
+        "the depiction surfaces on the depicted entity, keyed by image"
+    );
+    let (image_key, entry) = entity.depictions.iter().next().ok_or("no depiction")?;
+    assert_eq!(image_key, &img(1));
+    assert_eq!(
+        entry.value.localization.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([geometry])
+        }
+    );
+    assert_eq!(
+        entry.value.perspective.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([Perspective::Interior])
+        }
+    );
+    Ok(())
+}
+
+/// End-to-end through the store: `project_image` resolves the `SameArtifact`
+/// class, drains its members' backlinks, and folds the image-level facts.
+#[tokio::test]
+async fn project_image_drains_class_and_folds_facts() -> TestResult {
+    let store = MemoryFactStore::new();
+    let url = "https://example.com/sheet.jpg";
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: crate::facts::image::Fact::Source {
+                        image: ImageIdx(0),
+                        url: Url::parse(url)?,
+                    },
+                },
+                citation: sample_citation()?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: crate::facts::image::Fact::Medium {
+                        image: ImageIdx(0),
+                        medium: ImageMedium::Map,
+                    },
+                },
+                citation: sample_citation()?,
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let id = result.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (class, image) = project_image::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+
+    assert!(
+        class.members.contains(&id),
+        "the class holds its own subject"
+    );
+    assert_eq!(image.urls.len(), 1, "the source url is drained and folded");
+    assert_eq!(
+        image.medium.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([ImageMedium::Map])
+        },
+        "the medium settles to Map"
+    );
+    Ok(())
+}
+
+/// A `SameArtifact` judgment surfaces as a `sameness` glue edge through the real
+/// `project_image` drain, mirroring the entity side's `SameEntity` glue.
+#[tokio::test]
+async fn project_image_records_same_artifact_glue() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local],
+        facts: [same_artifact_fact(0, 1)?].into_iter().collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let img0 = result.images.get(&ImageIdx(0)).ok_or("missing image 0")?.id;
+    let img1 = result.images.get(&ImageIdx(1)).ok_or("missing image 1")?.id;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (class, image) =
+        project_image::<MemoryFactStore, _, _>(&view, img0, member_lineage).await?;
+
+    // The judgment unions both realizations into one SameArtifact class.
+    assert!(
+        class.members.contains(&img0) && class.members.contains(&img1),
+        "the judgment merges both images into one SameArtifact class"
+    );
+
+    // The glue surfaces as exactly one sameness edge, keyed by the canonical
+    // endpoint pair and carrying the judgment's provenance.
+    assert_eq!(
+        image.sameness.len(),
+        1,
+        "the single merge judgment lands exactly one glue edge"
+    );
+    let (edge_key, entry) = image.sameness.iter().next().ok_or("no sameness edge")?;
+    assert_eq!(
+        edge_key,
+        &OrderedDistinctPair::new(img0, img1)?,
+        "the glue edge is keyed by the canonical-ordered endpoint pair"
+    );
+    assert!(
+        entry.support.iter().next().is_some(),
+        "the recorded glue edge carries the judgment's support"
+    );
+    Ok(())
+}
+
+/// End-to-end through the store: a submitted `Depiction` and an `IsSubimageOf`
+/// composite both surface through the real drains. `project_image` on the parent
+/// records the depicted entity under `depicts` and the panel under `subimages`;
+/// `project_image` on the subimage records the parent; `project_entity` on the
+/// depicted entity records the image under `depictions`.
+#[tokio::test]
+async fn project_drains_depiction_and_subimage_edges() -> TestResult {
+    let store = MemoryFactStore::new();
+    let geometry = ImageGeometry::bbox(0.1, 0.2, 0.4, 0.5)?;
+    let region = SubimageRegion::rect(0.0, 0.0, 0.5, 1.0)?;
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local],
+        facts: [
+            SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Depiction {
+                    fact: crate::facts::depiction::Fact {
+                        entity: EntityIdx(0),
+                        image: ImageIdx(0),
+                        localization: Some(geometry.clone()),
+                        perspective: Some(Perspective::Exterior),
+                    },
+                },
+                citation: judgment_source()?,
+            },
+            SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Composite {
+                    fact: crate::facts::composites::Fact::IsSubimageOf {
+                        subimage: ImageIdx(1),
+                        parent: ImageIdx(0),
+                        region,
+                    },
+                },
+                citation: judgment_source()?,
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity_id = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id;
+    let parent_id = result.images.get(&ImageIdx(0)).ok_or("missing parent")?.id;
+    let subimage_id = result
+        .images
+        .get(&ImageIdx(1))
+        .ok_or("missing subimage")?
+        .id;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+
+    // The parent image: the depicted entity under `depicts`, the panel under
+    // `subimages`, and no enclosing image of its own.
+    let (_, parent) =
+        project_image::<MemoryFactStore, _, _>(&view, parent_id, member_lineage).await?;
+    assert_eq!(
+        parent.depicts.len(),
+        1,
+        "the depiction drains onto the image"
+    );
+    let (depicted, depiction) = parent.depicts.iter().next().ok_or("no depiction")?;
+    assert_eq!(depicted, &entity_id);
+    assert_eq!(
+        depiction.value.localization.consensus.value,
+        Claimed::Of {
+            values: BTreeSet::from([geometry.clone()])
+        },
+        "the depiction's localization survives the drain"
+    );
+    assert_eq!(parent.subimages.len(), 1, "the composite panel drains in");
+    let (sub_key, _) = parent.subimages.iter().next().ok_or("no subimage")?;
+    assert_eq!(sub_key, &subimage_id);
+    assert!(
+        parent.parent.is_empty(),
+        "the parent has no enclosing image"
+    );
+
+    // The subimage end: the parent under `parent`, no panels of its own.
+    let (_, sub) =
+        project_image::<MemoryFactStore, _, _>(&view, subimage_id, member_lineage).await?;
+    assert_eq!(
+        sub.parent.len(),
+        1,
+        "the subimage names its enclosing image"
+    );
+    let (parent_key, _) = sub.parent.iter().next().ok_or("no parent")?;
+    assert_eq!(parent_key, &parent_id);
+    assert!(sub.subimages.is_empty(), "the subimage holds no panels");
+
+    // The entity side through its own drain: the depiction keyed by image.
+    let (_, entity) =
+        project_entity::<MemoryFactStore, _, _>(&view, entity_id, member_lineage).await?;
+    assert_eq!(
+        entity.depictions.len(),
+        1,
+        "the depiction drains onto the depicted entity, keyed by image"
+    );
+    let (image_key, _) = entity.depictions.iter().next().ok_or("no depiction")?;
+    assert_eq!(image_key, &parent_id);
+    Ok(())
+}
+
+/// A `Depiction` whose source observed THIS image while its `fact.image` is a
+/// DIFFERENT image must not surface in this image's `depicts`. The observed image
+/// rides the citation into this image's backlinks, so the drain hands the fact to
+/// the fold; the gate keys on `fact.image`, not on mere reachability, so the
+/// cross-image depiction is declined. The observed-image indexing this leans on
+/// is itself pinned by `for_each_id_visits_observed_image_of_judgment_citation`.
+#[tokio::test]
+async fn observed_image_does_not_leak_a_foreign_depiction() -> TestResult {
+    let store = MemoryFactStore::new();
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local],
+        facts: [
+            // Entity 0 depicted on image A (ImageIdx 0) — the one this image holds.
+            SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Depiction {
+                    fact: crate::facts::depiction::Fact {
+                        entity: EntityIdx(0),
+                        image: ImageIdx(0),
+                        localization: None,
+                        perspective: None,
+                    },
+                },
+                citation: judgment_source()?,
+            },
+            // Entity 1 depicted on image B (ImageIdx 1), but the observation
+            // looked at image A. The observed image pulls this fact into image
+            // A's backlinks even though its `fact.image` is image B.
+            SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Depiction {
+                    fact: crate::facts::depiction::Fact {
+                        entity: EntityIdx(1),
+                        image: ImageIdx(1),
+                        localization: None,
+                        perspective: None,
+                    },
+                },
+                citation: JudgmentSource::ImageObservation {
+                    image: ImageIdx(0),
+                    region: None,
+                    observer: Observer::User {
+                        user: UserId::new("alice"),
+                        justification: None,
+                    },
+                },
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity_a = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity 0")?
+        .id;
+    let entity_b = result
+        .entities
+        .get(&EntityIdx(1))
+        .ok_or("missing entity 1")?
+        .id;
+    let image_a = result.images.get(&ImageIdx(0)).ok_or("missing image A")?.id;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, image) = project_image::<MemoryFactStore, _, _>(&view, image_a, member_lineage).await?;
+
+    let depicted: BTreeSet<MemEntId> = image.depicts.keys().copied().collect();
+    assert_eq!(
+        depicted,
+        BTreeSet::from([entity_a]),
+        "only the depiction whose fact.image is this image surfaces"
+    );
+    assert!(
+        !image.depicts.contains_key(&entity_b),
+        "a cross-image depiction does not leak in via the citation's observed image"
+    );
+    Ok(())
 }
