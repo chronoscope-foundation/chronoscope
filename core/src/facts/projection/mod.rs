@@ -111,7 +111,8 @@ where
         facts.extend(event_facts);
     }
 
-    Ok((class, merge::project_facts(&facts, &reachers, provenance)))
+    let entity = merge::project_facts(&facts, &class.members, &reachers, provenance);
+    Ok((class, entity))
 }
 
 #[cfg(test)]

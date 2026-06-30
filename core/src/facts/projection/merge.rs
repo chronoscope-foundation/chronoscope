@@ -77,8 +77,15 @@ pub(crate) fn event_reachers<R: IdScheme>(
 ///
 /// `reachers` maps each interior event id to the one entity whose `HasEvent`
 /// named it (see [`event_reachers`]); that entity is the event fact's source id.
+///
+/// `members` is the class being projected. A binary-relation fact folds as an
+/// incident edge — keyed by its far endpoint, kept only when its near (subject)
+/// endpoint is a member (see [`same_space_target`]) — so a relationship drained
+/// through its target's backlinks lands on the source's projection, not as a
+/// self-loop on the target.
 pub(crate) fn project_facts<R: IdScheme, T>(
     facts: &BTreeMap<FactId, StoredFact<R>>,
+    members: &BTreeSet<R::Entity>,
     reachers: &BTreeMap<R::Event, R::Entity>,
     provenance: impl Fn(&R::Entity, &Citation<R::Image>) -> T,
 ) -> Entity<R::Entity, R::Event, T>
@@ -87,7 +94,7 @@ where
 {
     facts
         .values()
-        .map(|fact| inject(fact, reachers, &provenance))
+        .map(|fact| inject(fact, members, reachers, &provenance))
         .fold(
             <Entity<R::Entity, R::Event, T> as CommutativeMonoid>::identity(),
             CommutativeMonoid::combine,
@@ -100,6 +107,7 @@ where
 /// edge. A meta fact backs nothing.
 fn inject<R: IdScheme, T>(
     fact: &StoredFact<R>,
+    members: &BTreeSet<R::Entity>,
     reachers: &BTreeMap<R::Event, R::Entity>,
     provenance: &impl Fn(&R::Entity, &Citation<R::Image>) -> T,
 ) -> Entity<R::Entity, R::Event, T>
@@ -111,7 +119,7 @@ where
             let Some(citation) = citation_of(fact) else {
                 return Entity::identity();
             };
-            inject_factual(&f.assertion, reachers, &citation, provenance)
+            inject_factual(&f.assertion, members, reachers, &citation, provenance)
         }
         StoredFact::Judgment(j) => {
             let Some(citation) = citation_of(fact) else {
@@ -128,6 +136,7 @@ where
 /// whose `HasEvent` owns the event.
 fn inject_factual<R: IdScheme, T>(
     assertion: &FactualAssertion<R>,
+    members: &BTreeSet<R::Entity>,
     reachers: &BTreeMap<R::Event, R::Entity>,
     citation: &Citation<R::Image>,
     provenance: &impl Fn(&R::Entity, &Citation<R::Image>) -> T,
@@ -139,7 +148,7 @@ where
         FactualAssertion::Attribute { fact } => {
             let support = provenance(fact.subject(), citation);
             let mut entity = Entity::identity();
-            inject_attribute(fact, support, &mut entity);
+            inject_attribute(fact, members, support, &mut entity);
             entity
         }
         FactualAssertion::Construction { fact } => {
@@ -189,8 +198,16 @@ where
     entity
 }
 
+/// The far endpoint to key an outgoing edge under, when `near → far` crosses
+/// the class boundary: kept when `near` is a member and `far` is not. An edge
+/// with both ends in the class is a degenerate self-edge and folds to nothing.
+fn same_space_target<'a, N: Ord>(near: &N, far: &'a N, members: &BTreeSet<N>) -> Option<&'a N> {
+    (members.contains(near) && !members.contains(far)).then_some(far)
+}
+
 fn inject_attribute<EntId, EvtId, T>(
     fact: &attribute::Fact<EntId>,
+    members: &BTreeSet<EntId>,
     support: T,
     entity: &mut Entity<EntId, EvtId, T>,
 ) where
@@ -230,21 +247,23 @@ fn inject_attribute<EntId, EvtId, T>(
                 .insert(reference.clone(), Cited { value: (), support });
         }
         attribute::Fact::Relationship { pair, relation } => {
-            let mut kinds = BTreeMap::new();
-            kinds.insert(
-                *relation,
-                Cited {
-                    value: (),
-                    support: support.clone(),
-                },
-            );
-            entity.relations.insert(
-                pair.to().clone(),
-                Cited {
-                    value: kinds,
-                    support,
-                },
-            );
+            if let Some(target) = same_space_target(pair.from(), pair.to(), members) {
+                let mut kinds = BTreeMap::new();
+                kinds.insert(
+                    *relation,
+                    Cited {
+                        value: (),
+                        support: support.clone(),
+                    },
+                );
+                entity.relations.insert(
+                    target.clone(),
+                    Cited {
+                        value: kinds,
+                        support,
+                    },
+                );
+            }
         }
     }
 }

@@ -30,6 +30,7 @@ use crate::facts::submit::{
     SubmitFact, commit_facts,
 };
 use crate::location::ConflictStatus;
+use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type MemEntId = EntityIdOf<MemoryFactStore>;
@@ -501,22 +502,29 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
 #[tokio::test]
 async fn populated_fields_carry_factual_support() -> TestResult {
     let store = MemoryFactStore::new();
-    // Two entities so a relationship target exists, linked into one class.
-    // Names + a bookend + an external ref + a relation across all members.
+    // A SameEntity class {0,1} plus a third entity 2 the class points to. The
+    // relationship 0→2 is the class's outgoing edge — it crosses the class
+    // boundary, so it surfaces keyed by its external target rather than folding
+    // onto a member. Names + a bookend + an external ref round out the fields.
     let result = submit(
         &store,
-        2,
+        3,
         vec![
             name_fact(0, "Hall", "en")?,
             construction_started_fact(0, 1900)?,
             external_ref_fact(0, 7)?,
-            relationship_fact(0, 1)?,
+            relationship_fact(0, 2)?,
             name_fact(1, "Annex", "en")?,
             same_entity_fact(0, 1)?,
         ],
     )
     .await?;
     let a = result.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
+    let target = result
+        .entities
+        .get(&EntityIdx(2))
+        .ok_or("missing target")?
+        .id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
@@ -541,7 +549,11 @@ async fn populated_fields_carry_factual_support() -> TestResult {
     );
     let (_, ref_entry) = entity.refs.iter().next().ok_or("no ref")?;
     assert!(ref_entry.support.iter().next().is_some());
-    let (_, rel_entry) = entity.relations.iter().next().ok_or("no relation")?;
+    let (rel_key, rel_entry) = entity.relations.iter().next().ok_or("no relation")?;
+    assert_eq!(
+        *rel_key, target,
+        "the outgoing relation is keyed by its external target, not a class member"
+    );
     assert!(rel_entry.support.iter().next().is_some());
 
     // No field's support cites a meta fact — meta facts back no value. The
@@ -736,7 +748,10 @@ fn has_event_stored(
 /// merge the entity entry point runs. The reacher map comes from the `HasEvent`
 /// facts in the bag, exactly as the entry point derives it.
 fn project(facts: &BTreeMap<FactId, StoredEventFact>) -> Entity<MemEntId, MemEvtId, Lin> {
-    project_facts(facts, &event_reachers(facts), member_lineage)
+    let reachers = event_reachers(facts);
+    // The event-owning entities are the class these facts project.
+    let members: BTreeSet<MemEntId> = reachers.values().copied().collect();
+    project_facts(facts, &members, &reachers, member_lineage)
 }
 
 /// Mint an entity and an interior event tied to it by a `HasEvent`, plus a
@@ -1213,4 +1228,167 @@ async fn judgment_citation_is_live_in_provenance() -> TestResult {
         "the same judgment citation backs the recorded glue edge"
     );
     Ok(())
+}
+
+// ------------------------------------------------------------------
+// Relations — incident-edge projection across the class boundary
+//
+// `relations` holds the class's *outgoing* edges, keyed by the target. A
+// relationship Y→X mentions X, so draining X's backlinks pulls it in; keying it
+// unconditionally by its target would fold Y→X onto `relations[X]`, a self-loop
+// on X's own projection. The fold instead keeps an edge only when its source is
+// a class member, so the edge lands on Y's projection (keyed X), not X's.
+// ------------------------------------------------------------------
+
+#[tokio::test]
+async fn incoming_relationship_does_not_self_loop_the_target() -> TestResult {
+    let store = MemoryFactStore::new();
+    // Class {0,1} via SameEntity; entity 2 sits outside it. The edge 2→0 points
+    // into the class from outside.
+    let result = submit(
+        &store,
+        3,
+        vec![same_entity_fact(0, 1)?, relationship_fact(2, 0)?],
+    )
+    .await?;
+    let target = result.entities.get(&EntityIdx(0)).ok_or("missing 0")?.id;
+    let source = result.entities.get(&EntityIdx(2)).ok_or("missing 2")?.id;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+
+    // Projecting the class the edge points *into*: nothing, no self-loop.
+    let (class, projected_target) =
+        project_entity::<MemoryFactStore, _, _>(&view, target, member_lineage).await?;
+    assert!(
+        projected_target.relations.is_empty(),
+        "an edge pointing into the class is the source's outgoing relation, not the target's"
+    );
+    assert!(
+        projected_target
+            .relations
+            .keys()
+            .all(|k| !class.members.contains(k)),
+        "no relation key is a member of the projected class"
+    );
+
+    // Projecting the source end: the outgoing relation surfaces, keyed by its
+    // target endpoint.
+    let (_, projected_source) =
+        project_entity::<MemoryFactStore, _, _>(&view, source, member_lineage).await?;
+    assert_eq!(
+        projected_source.relations.len(),
+        1,
+        "the source carries its one outgoing relation"
+    );
+    let (key, _) = projected_source
+        .relations
+        .iter()
+        .next()
+        .ok_or("no relation")?;
+    assert_eq!(*key, target, "the relation is keyed by its target endpoint");
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Edge-field projection invariants over multi-member classes and edges
+    /// crossing the class boundary — the gap the per-field tests left open. For
+    /// every entity touched by an edge or a merge, its projected `relations` must
+    /// hold *exactly* the class's boundary-crossing outgoing targets: keyed by a
+    /// non-member target, sourced from a member.
+    ///
+    /// The single set-equality pins three invariants at once — every key is the
+    /// far endpoint of an edge whose near endpoint is in the class (far-keyed
+    /// correctness), no key is itself a member (no self-loop), and an edge with
+    /// neither endpoint in the class contributes nothing (no non-incident leak).
+    /// Pre-fix, an edge drained through its in-class target folded onto
+    /// `relations[target]` with `target` a member, breaking the no-self-loop and
+    /// the equality together.
+    #[test]
+    fn relations_project_as_outgoing_incident_edges(
+        n in 2usize..=5,
+        rel_seed in prop::collection::vec((0usize..5, 0usize..5), 0..=8),
+        same_seed in prop::collection::vec((0usize..5, 0usize..5), 0..=4),
+    ) {
+        let rels_seed: BTreeSet<(usize, usize)> = rel_seed
+            .into_iter()
+            .map(|(a, b)| (a % n, b % n))
+            .filter(|(a, b)| a != b)
+            .collect();
+        let sames_seed: BTreeSet<(usize, usize)> = same_seed
+            .into_iter()
+            .map(|(a, b)| (a % n, b % n))
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| if a < b { (a, b) } else { (b, a) })
+            .collect();
+
+        // Declare only the entities an edge or a merge references — the submit
+        // layer rejects an unused declaration — relabeled to a contiguous range.
+        let mut touched: BTreeSet<usize> = BTreeSet::new();
+        for &(a, b) in rels_seed.iter().chain(sames_seed.iter()) {
+            touched.insert(a);
+            touched.insert(b);
+        }
+        prop_assume!(!touched.is_empty());
+        let remap: BTreeMap<usize, usize> = touched
+            .iter()
+            .enumerate()
+            .map(|(slot, &old)| (old, slot))
+            .collect();
+        let relabel = |&(a, b): &(usize, usize)| (remap[&a], remap[&b]);
+        let rels: BTreeSet<(usize, usize)> = rels_seed.iter().map(relabel).collect();
+        let sames: BTreeSet<(usize, usize)> = sames_seed.iter().map(relabel).collect();
+        let entity_count = touched.len();
+
+        let mut facts: Vec<SubmitFact> = Vec::new();
+        for &(f, t) in &rels {
+            facts.push(relationship_fact(f, t).map_err(|e| TestCaseError::fail(format!("{e}")))?);
+        }
+        for &(a, b) in &sames {
+            facts.push(same_entity_fact(a, b).map_err(|e| TestCaseError::fail(format!("{e}")))?);
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| TestCaseError::fail(format!("runtime: {e}")))?;
+        rt.block_on(async move {
+            let store = MemoryFactStore::new();
+            let result = submit(&store, entity_count, facts)
+                .await
+                .map_err(|e| TestCaseError::fail(format!("submit: {e}")))?;
+            let id_of = |i: usize| result.entities.get(&EntityIdx(i)).map(|e| e.id);
+            let view = store
+                .now()
+                .await
+                .map_err(|e| TestCaseError::fail(format!("view: {e:?}")))?;
+
+            for idx in 0..entity_count {
+                let id = id_of(idx).ok_or_else(|| TestCaseError::fail("missing entity id"))?;
+                let (class, entity) =
+                    project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+                        .await
+                        .map_err(|e| TestCaseError::fail(format!("project: {e:?}")))?;
+                let members = &class.members;
+
+                let mut expected: BTreeSet<MemEntId> = BTreeSet::new();
+                for &(f, t) in &rels {
+                    let fid = id_of(f).ok_or_else(|| TestCaseError::fail("missing source"))?;
+                    let tid = id_of(t).ok_or_else(|| TestCaseError::fail("missing target"))?;
+                    if members.contains(&fid) && !members.contains(&tid) {
+                        expected.insert(tid);
+                    }
+                }
+                let actual: BTreeSet<MemEntId> = entity.relations.keys().copied().collect();
+
+                prop_assert_eq!(
+                    actual,
+                    expected,
+                    "relations are exactly the class's boundary-crossing outgoing targets"
+                );
+            }
+            Ok(())
+        })?;
+    }
 }
