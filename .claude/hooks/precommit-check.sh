@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# PreToolUse hook on Bash: when Claude runs `git commit`, advise re-running
-# `just check` if the working tree has drifted from the last successful run.
-# Always exit 0 — advisory, never blocking.
+# PreToolUse hook on Bash: when Claude runs `git commit`, prompt for
+# confirmation unless the full `just check` (target "all") has passed against
+# the current tree. It asks rather than hard-blocks, so a deliberate WIP
+# checkpoint can still go through — but skipping the full gate is a conscious
+# choice, never a silent one.
 
 set -uo pipefail
 
@@ -17,22 +19,23 @@ case "$INPUT" in
     *) exit 0 ;;
 esac
 
-advise() {
-    local message="$1"
+# Emit an "ask" decision (Claude Code prompts the user to confirm) and exit.
+ask() {
+    local reason="$1"
     cat <<EOF
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
-    "permissionDecision": "allow",
-    "additionalContext": "$message"
+    "permissionDecision": "ask",
+    "permissionDecisionReason": "$reason"
   }
 }
 EOF
+    exit 0
 }
 
 if [ ! -f "$MARKER" ]; then
-    advise "Note: no .claude/last-check.json was found — 'just check' has not been run in this checkout (or the marker was cleared). Consider running 'just check' before committing; it is the hermetic ground-truth gate."
-    exit 0
+    ask "No .claude/last-check.json — the full 'just check' has not been run in this checkout (or the marker was cleared). 'just check' (no target) is the hermetic ground-truth gate. Run it before committing, or confirm to commit anyway."
 fi
 
 # Read marker once; parse with bash regex. Field order in the JSON is
@@ -46,9 +49,14 @@ TIMESTAMP=""
 [[ "$MARKER_BODY" =~ \"timestamp\"[[:space:]]*:[[:space:]]*\"([^\"]+)\" ]] && TIMESTAMP="${BASH_REMATCH[1]}"
 
 CURRENT=$("$PROJECT_DIR/.claude/hooks/tree-hash.sh" "$PROJECT_DIR")
-if [ "$CURRENT" = "$RECORDED" ]; then
-    exit 0
+
+if [ "$CURRENT" != "$RECORDED" ]; then
+    ask "Working tree has changed since the last successful 'just check' (target: ${TARGET:-unknown}, at ${TIMESTAMP:-unknown}). Run 'just check' so the gate is confirmed against this exact tree, or confirm to commit anyway."
 fi
 
-advise "Note: working tree has changed since the last successful 'just check' (target: ${TARGET:-unknown}, at ${TIMESTAMP:-unknown}). Consider running 'just check' before committing — it is the hermetic ground-truth gate, and the marker is what confirms the gate passed against this exact tree state."
+if [ "$TARGET" != "all" ]; then
+    ask "The last 'just check' against this tree was the scoped '${TARGET:-unknown}' subset, not the full gate — some checks (notably the browser suite, web-test) run only in the full 'just check' (no target). Run 'just check' before committing, or confirm to commit anyway."
+fi
+
+# Full gate confirmed against the current tree — allow silently.
 exit 0

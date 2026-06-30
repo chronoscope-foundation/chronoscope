@@ -48,6 +48,35 @@ let
     cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { CARGO_PROFILE = "test"; });
   };
 
+  # Workspace test run. The `chronoscope-dev::tests/web.rs` target is
+  # gated behind a `required-features = ["browser-tests"]` entry in
+  # `dev/Cargo.toml`, so this run silently skips it — the dedicated
+  # `web-test` check picks it up with capped parallelism. Keeping the heavy
+  # Chrome-driven tests out of this derivation lets the rest of the
+  # workspace's tests run at full cargo parallelism without Chrome processes
+  # co-contending for the cores.
+  test = craneLib.cargoTest (checkArgs // testExtraEnv);
+
+  clippy = craneLib.cargoClippy (
+    checkArgs
+    // {
+      cargoClippyExtraArgs = "--all-targets -- -D warnings";
+    }
+  );
+
+  llvm-cov = craneLib.cargoLlvmCov (
+    checkArgs
+    // testExtraEnv
+    // {
+      # crane's cargoLlvmCov sets installPhaseCommand="" and expects the
+      # coverage command to write $out directly. --output-path $out writes
+      # the LCOV report as a file at $out (not a directory).
+      cargoLlvmCovExtraArgs = "--fail-under-lines 75 --lcov --output-path $out";
+      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
+        pkgs.cargo-llvm-cov
+      ];
+    }
+  );
 in
 {
   checks = {
@@ -57,47 +86,27 @@ in
       version = "0.1.0";
     };
 
-    clippy = craneLib.cargoClippy (
-      checkArgs
-      // {
-        cargoClippyExtraArgs = "--all-targets -- -D warnings";
-      }
-    );
-
-    # Workspace test run. The `chronoscope-dev::tests/web.rs` target is
-    # gated behind a `required-features = ["browser-tests"]` entry in
-    # `dev/Cargo.toml`, so this run silently skips it — the dedicated
-    # `web-test` check below picks it up with capped parallelism. Keeping
-    # the heavy Chrome-driven tests out of this derivation lets the rest
-    # of the workspace's tests run at full cargo parallelism without
-    # Chrome processes co-contending for the cores.
-    test = craneLib.cargoTest (checkArgs // testExtraEnv);
+    inherit test clippy llvm-cov;
 
     # Dedicated check for the browser test suite, with `--test-threads=4`.
     # More concurrent Chromes than that starve `chromiumoxide`'s CDP-response
-    # budget under the Nix sandbox and tests fail with "Error: Timeout"
-    # rather than an actual assertion. Four is the empirical sweet spot —
-    # single-digit Chromes per box, still ~4× faster than --test-threads=1.
+    # budget and tests fail with "Error: Timeout" rather than an actual
+    # assertion. Four is the empirical sweet spot — single-digit Chromes per
+    # box, still ~4× faster than --test-threads=1.
+    #
+    # That starvation also strikes *across* derivations: run concurrently with
+    # the compile- and coverage-heavy checks under `nix flake check`, the
+    # browser tests stall and time out (they pass reliably with the box to
+    # themselves — cf. `just test web`). Referencing those checks' outputs
+    # orders this derivation after them, so the browser tests run unstarved;
+    # the reference only establishes build order.
     web-test = craneLib.cargoTest (
       checkArgs
       // testExtraEnv
       // {
         pname = "chronoscope-web-tests";
         cargoTestExtraArgs = "-p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4";
-      }
-    );
-
-    llvm-cov = craneLib.cargoLlvmCov (
-      checkArgs
-      // testExtraEnv
-      // {
-        # crane's cargoLlvmCov sets installPhaseCommand="" and expects the
-        # coverage command to write $out directly. --output-path $out writes
-        # the LCOV report as a file at $out (not a directory).
-        cargoLlvmCovExtraArgs = "--fail-under-lines 75 --lcov --output-path $out";
-        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
-          pkgs.cargo-llvm-cov
-        ];
+        CHRONOSCOPE_RUN_AFTER = "${test} ${clippy} ${llvm-cov}";
       }
     );
   };

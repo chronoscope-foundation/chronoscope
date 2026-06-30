@@ -97,7 +97,11 @@ See [docs/development.md](docs/development.md) for detailed development practice
 ### Running Checks
 
 ```bash
-# Run everything: Nix linting, Rust (fmt, clippy, test, coverage), Python (ruff, mypy, pytest)
+# The commit gate: runs everything — Nix lint, Rust (fmt/clippy/test/coverage),
+# Python (ruff/mypy/pytest), and the headless-browser web tests. The targeted
+# `just check <rust|web|triton|nix>` subsets are for iteration and skip parts of
+# the gate (the browser suite runs only here), so run the full `just check`
+# before committing.
 just check
 
 # Auto-fix all formatting (Nix + Rust + Python)

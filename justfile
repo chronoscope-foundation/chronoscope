@@ -109,11 +109,14 @@ check target="all":
                 --no-link
             ;;
         web)
+            # web-test (the browser suite) is intentionally absent: it is
+            # ordered after the compile/coverage-heavy checks (see nix/rust.nix)
+            # so it runs unstarved, which makes it a whole-gate check. Run it via
+            # `just check` (full) or iterate with `just test web` in the web shell.
             nix build \
                 ".#checks.$SYS.web-build" \
                 ".#checks.$SYS.web-test-build" \
                 ".#checks.$SYS.web-clippy" \
-                ".#checks.$SYS.web-test" \
                 --no-link
             ;;
         triton)

@@ -75,17 +75,26 @@ Fetched data is pinned as GC roots under `.nix-gc-roots/` (gitignored).
 
 ## Commit gate: `just check`
 
-`just check` is the hermetic ground-truth gate for commits. It is
-equivalent to `nix flake check` (or a focused subset for `just check
-<target>`) and writes `.claude/last-check.json` on success — a marker
-that records the working-tree state at the moment of the check.
+The **full** `just check` (no target) is the hermetic ground-truth gate
+for commits — the complete `nix flake check`. It writes
+`.claude/last-check.json` on success, a marker recording the working-tree
+state at the moment of the check.
+
+**Run the full `just check` before committing.** `just check <target>`
+(rust/web/triton/nix) runs a faster scoped subset for iteration, but the
+subsets do not add up to the whole gate: the browser suite (`web-test`) is
+ordered after the heavy checks so its headless-Chrome event loop isn't
+starved, which means it runs **only** in the full `just check`. A scoped
+`just check web` builds the WASM but never launches the browser tests.
 
 A pre-commit hook at `.claude/hooks/precommit-check.sh` (registered in
 `.claude/settings.json`) checks the marker against the current tree on
-every `git commit`. If the tree has changed since the last successful
-`just check`, the hook injects an advisory reminder for Claude to
-re-run. The hook is non-blocking — you can still commit through it
-deliberately, but the reminder is there.
+every `git commit`. It **prompts for confirmation** unless the full
+`just check` (target `all`) passed against the current tree — that is, when
+the marker is missing, the tree has drifted, or the marker is from a scoped
+subset. Confirming still lets a deliberate commit (e.g. a WIP checkpoint)
+through; the prompt just keeps skipping the full gate a conscious choice
+rather than an accident.
 
 `just test`, `just clippy`, `just fmt` are the **fast inner loop**:
 cargo direct, dev shell, incremental compilation. They are deliberately
@@ -96,11 +105,14 @@ the pre-commit hook only honors the marker.
 
 ```bash
 # Hermetic gate (writes .claude/last-check.json on success)
-just check                  # everything (nix flake check)
+just check                  # everything incl. browser tests — the commit gate
 just check rust             # workspace fmt + clippy + test + coverage
 just check web              # WASM build + browser-test build + wasm clippy
+                            #   (browser tests run ONLY in the full `just check`)
 just check triton           # Python ruff + mypy + pytest
 just check nix              # Nix lint (nixfmt + statix + deadnix)
+# Targeted subsets are for iteration; only the full `just check` runs the
+# whole gate (web-test is ordered after the heavy checks, so it lives there).
 
 # Fast inner loop (cargo direct; do not satisfy the commit gate)
 just fmt   [target]         # apply formatting

@@ -12,8 +12,12 @@ The fast inner loop:
 
 - `just clippy web` — clippy against `wasm32-unknown-unknown` with `-D warnings`
 - `just test web` — browser tests (needs `test-hooks` cargo feature + a
-  pre-built `WEB_DIST`; both supplied by `devShells.web`)
-- `just check web` — hermetic version (web-build + web-test-build + web-clippy)
+  pre-built `WEB_DIST`; both supplied by `devShells.web`). This is the inner
+  loop for the browser suite.
+- `just check web` — hermetic build checks only (web-build + web-test-build +
+  web-clippy). The browser-test *run* (`web-test`) is **not** here: it's
+  ordered after the heavy checks to avoid CPU starvation, so it runs only in
+  the full `just check`. Iterate with `just test web`.
 
 ## OpenAPI-first
 

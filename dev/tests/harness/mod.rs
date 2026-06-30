@@ -82,6 +82,7 @@ async fn launch_browser() -> Result<
         .new_headless_mode()
         .no_sandbox()
         .window_size(1280, 800)
+        .request_timeout(CDP_REQUEST_TIMEOUT)
         .build()
         .map_err(|e| format!("failed to build browser config: {e}"))?;
 
@@ -721,10 +722,14 @@ pub async fn web_test(test: impl AsyncFnOnce(&WebTest) -> TestResult) -> TestRes
     result.and(close_result)
 }
 
-/// Wait timeout for test-hook async helpers.
+/// Deadline for test-hook async helpers — the harness's governing timeout.
 ///
-/// Sized for the worst case: `cargo llvm-cov` instrumentation under
-/// parallel test load on a saturated machine. Wait helpers short-circuit
-/// as soon as their condition is met, so this only affects the failure
-/// path — the happy path is still fast.
+/// Sized to absorb a slow headless-Chrome operation while still surfacing a
+/// genuine hang. Wait helpers short-circuit the instant their condition is met,
+/// so this only bounds the failure path — the happy path stays fast.
 pub const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// chromiumoxide's per-command eviction budget. Held above [`TIMEOUT`] so the
+/// harness wrapper is what fires first: a timeout then names the hook and its
+/// context instead of surfacing chromiumoxide's bare "Request timed out."
+const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
