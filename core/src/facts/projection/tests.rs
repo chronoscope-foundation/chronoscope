@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use chrono::TimeZone;
-use futures_util::TryStreamExt;
+use futures_util::{TryFutureExt, TryStreamExt};
 use url::Url;
 
 use super::*;
@@ -609,12 +609,14 @@ async fn projection_drains_past_page_boundary() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let tiny: NonZeroUsize = NonZeroUsize::new(3).ok_or("nonzero")?;
-    let drained: Vec<(FactId, StoredFact<MemoryIds>)> =
-        paginate(|cursor| view.all_facts_about_entity(&id, cursor, tiny))
-            .map_ok(|item| (item.fact_id, item.fact))
-            .try_collect()
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+    let drained: Vec<(FactId, StoredFact<MemoryIds>)> = paginate(|cursor| {
+        view.all_facts_about_entity(&id, cursor, tiny)
+            .map_ok(FactPage::into_parts)
+    })
+    .map_ok(|item| (item.fact_id, item.fact))
+    .try_collect()
+    .await
+    .map_err(|e| format!("{e:?}"))?;
 
     let name_count = drained
         .iter()
@@ -670,7 +672,7 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
     // Pages keyed by the cursor the drain passes in — `None` first, then each
     // page's `next_cursor`: None → item 0, resume at 1; 1 → EMPTY, resume at 2;
     // 2 → item 2, resume at 3; 3 → item 3, done.
-    let pages: Vec<FactPage<StubFact, MemEntId>> = vec![
+    let pages: Vec<FactPage<StubFact, MemEntId, FactId>> = vec![
         FactPage {
             items: vec![item(0)?],
             next_cursor: Some(FactId::new(1)),
@@ -694,6 +696,7 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
         async move {
             page.ok_or("stub page source: cursor out of range")
                 .map_err(|e: &str| e.to_owned())
+                .map(FactPage::into_parts)
         }
     })
     .map_ok(|item| (item.fact_id, item.fact))

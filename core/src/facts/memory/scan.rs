@@ -1,7 +1,8 @@
 //! Fact-bag scanning: the per-query extractors and the keyed walk behind the
 //! `walk_*` stream arms.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Bound;
 
 use url::Url;
 
@@ -10,7 +11,7 @@ use super::{MemStoredFact, MemoryEntityId, MemoryIds, MemoryImageId, ReadCore};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::facts::citations::{ExternalReference, Language};
 use crate::facts::ids::FactId;
-use crate::facts::schema::{FactPage, PageItem, normalize_name};
+use crate::facts::schema::{ClassPage, ClassRow, normalize_name};
 use crate::facts::submit::StoredFact;
 use crate::facts::submit::result::{StoredFactualFact, StoredJudgmentFact};
 use crate::facts::{attribute, identity, image};
@@ -112,6 +113,21 @@ pub(super) fn entity_referenced(
     }
 }
 
+/// Every entity id a stored fact mentions — the `All`-stream extractor, so a
+/// fact touching two entity classes lands under both.
+pub(super) fn entity_ids_of(fact: &MemStoredFact) -> Vec<MemoryEntityId> {
+    let mut ids = Vec::new();
+    fact.for_each_id(&mut |e| ids.push(*e), &mut |_| {}, &mut |_| {});
+    ids
+}
+
+/// Every image id a stored fact mentions — the image `All`-stream extractor.
+pub(super) fn image_ids_of(fact: &MemStoredFact) -> Vec<MemoryImageId> {
+    let mut ids = Vec::new();
+    fact.for_each_id(&mut |_| {}, &mut |_| {}, &mut |i| ids.push(*i));
+    ids
+}
+
 /// The image a stored `Source` fact names, when its source URL equals the
 /// query key.
 pub(super) fn image_sourced_from(fact: &MemStoredFact, url: &Url) -> Option<MemoryImageId> {
@@ -127,58 +143,76 @@ pub(super) fn image_sourced_from(fact: &MemStoredFact, url: &Url) -> Option<Memo
 }
 
 impl ReadCore<'_> {
-    /// A page of the visible facts `subject_of` accepts, active-only and
-    /// ascending by fact id from the pagination `cursor`, each row carrying
-    /// its subject's equivalence-class representative (the component
-    /// `edge_of`'s edges induce — see [`Self::equiv_class`]). The scan behind
-    /// the keyed `walk_*` stream arms; `cursor` is an inclusive lower bound,
-    /// filtering `id >= cursor`.
-    pub(super) fn walk_matching<S>(
+    /// A page of `(representative, fact_id)` rows ordered by
+    /// `(representative, fact_id)`, resuming strictly past `after` (`None` opens
+    /// the walk). `subjects_of` yields the subjects a visible, active fact
+    /// contributes under the stream; each resolves to its equivalence-class
+    /// representative (the component `edge_of`'s edges induce — see
+    /// [`Self::equiv_class`]) and the pair is emitted once, so a fact naming two
+    /// members of one class lands under a single row. The scan behind the class
+    /// `walk_*` stream arms.
+    ///
+    /// `next` is the last emitted `(representative, fact_id)` when more rows
+    /// remain past the page, else `None`. The adjacency is built once per call
+    /// and every representative lookup answers from it.
+    pub(super) fn walk_classes<S, I>(
         &self,
-        cursor: FactId,
+        after: Option<(S, FactId)>,
         limit: std::num::NonZeroUsize,
-        subject_of: impl Fn(&MemStoredFact) -> Option<S>,
+        subjects_of: impl Fn(&MemStoredFact) -> I,
         edge_of: impl Fn(&MemStoredFact) -> Option<(S, S)>,
-    ) -> FactPage<MemStoredFact, S>
+    ) -> ClassPage<S, (S, FactId)>
     where
         S: Copy + Ord + std::hash::Hash,
+        I: IntoIterator<Item = S>,
     {
-        let mut items = Vec::new();
-        let mut next_cursor = None;
-        // The adjacency is built at the first matching row and reused for
-        // every representative lookup on the page.
+        // The adjacency is built at the first membership lookup and reused.
         let mut adjacency: Option<EquivAdjacency<S>> = None;
-        // Representative cache: rows sharing a subject resolve its class once.
+        // Representative cache: the first subject of a component walks it, then
+        // every member is seeded here so the rest resolve without re-walking.
         let mut representatives: HashMap<S, S> = HashMap::new();
+        // A set keys the rows by `(representative, fact_id)`, giving the order
+        // and folding a fact's same-class subjects to one row.
+        let mut rows: BTreeSet<(S, FactId)> = BTreeSet::new();
         for (fid, fact) in self.visible_facts() {
-            if fid.get() < cursor.get() {
-                continue;
-            }
-            if items.len() == limit.get() {
-                next_cursor = Some(fid);
-                break;
-            }
-            let Some(subject) = subject_of(fact) else {
-                continue;
-            };
             if self.retracted_by(fid).is_some() {
                 continue;
             }
-            let representative = match representatives.get(&subject) {
-                Some(rep) => *rep,
-                None => {
-                    let adjacency = adjacency.get_or_insert_with(|| self.equiv_adjacency(&edge_of));
-                    let rep = adjacency.class_of(subject).representative;
-                    representatives.insert(subject, rep);
-                    rep
-                }
-            };
-            items.push(PageItem {
-                fact_id: fid,
-                fact: fact.clone(),
-                representative,
-            });
+            for subject in subjects_of(fact) {
+                let representative = match representatives.get(&subject) {
+                    Some(rep) => *rep,
+                    None => {
+                        let adjacency =
+                            adjacency.get_or_insert_with(|| self.equiv_adjacency(&edge_of));
+                        let class = adjacency.class_of(subject);
+                        let rep = class.representative;
+                        // Seed the whole component at once, so the other subjects
+                        // in it resolve from the cache instead of re-walking.
+                        for m in class.members {
+                            representatives.insert(m, rep);
+                        }
+                        rep
+                    }
+                };
+                rows.insert((representative, fid));
+            }
         }
-        FactPage { items, next_cursor }
+
+        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut remaining = rows.range((lower, Bound::Unbounded)).copied();
+        let page: Vec<ClassRow<S>> = remaining
+            .by_ref()
+            .take(limit.get())
+            .map(|(representative, fact_id)| ClassRow {
+                representative,
+                fact_id,
+            })
+            .collect();
+        let next = if remaining.next().is_some() {
+            page.last().map(|row| (row.representative, row.fact_id))
+        } else {
+            None
+        };
+        ClassPage { rows: page, next }
     }
 }

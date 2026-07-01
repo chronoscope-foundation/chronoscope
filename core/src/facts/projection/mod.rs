@@ -29,7 +29,7 @@ pub use types::{
 use std::collections::BTreeMap;
 use std::future::{Future, ready};
 
-use futures_util::TryStreamExt;
+use futures_util::{TryFutureExt, TryStreamExt};
 
 use crate::algebra::semiring::{Lineage, Semiring};
 use crate::facts::ids::FactId;
@@ -37,6 +37,7 @@ use crate::facts::pagination::{PAGE_SIZE, paginate};
 use crate::facts::schema::{EquivClass, FactPage};
 use crate::facts::store::{
     EntityIdOf, EntityView, EventIdOf, EventView, FactStore, ImageIdOf, ImageView, StoredFactOf,
+    WalkPage,
 };
 
 /// The member-aware lineage closure: a `(source id, citation)` pair becomes the
@@ -65,12 +66,12 @@ async fn collect_backlinks<S, Sub, Rep, F, Fut>(
 where
     S: FactStore,
     Sub: Copy,
-    F: FnMut(Sub, Option<FactId>) -> Fut,
-    Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Rep>, S::Error>>,
+    F: FnMut(Sub, Option<S::Cursor>) -> Fut,
+    Fut: Future<Output = Result<WalkPage<S, Rep>, S::Error>>,
 {
     let mut facts = BTreeMap::new();
     for subject in subjects {
-        paginate(|cursor| walk(subject, cursor))
+        paginate(|cursor| walk(subject, cursor).map_ok(FactPage::into_parts))
             .try_for_each(|item| {
                 facts.insert(item.fact_id, item.fact);
                 ready(Ok(()))

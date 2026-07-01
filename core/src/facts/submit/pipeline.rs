@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use futures_util::TryStreamExt;
+use futures_util::{TryFutureExt, TryStreamExt};
 
 use super::error::{DateRole, LocationRole, SubmitError};
 use super::result::{StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMetaFact};
@@ -42,6 +42,7 @@ use crate::facts::identity::{IdMapError, SelfLoop};
 use crate::facts::ids::{FactId, IdScheme, SubjectKind};
 use crate::facts::lifecycle::LifetimeEventKind;
 use crate::facts::pagination::{PAGE_SIZE, paginate};
+use crate::facts::schema::FactPage;
 use crate::facts::store::{
     EntityIdOf, EventIdOf, EventView, FactPlacement, FactStore, FactView, ImageIdOf, ImageView,
     StoredFactOf, SubmitCommitError, SubmitCommitInput, SubmitCommitOutput,
@@ -218,18 +219,24 @@ where
     }
     let mut event_facts: HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>> = HashMap::new();
     for e in events {
-        let facts = paginate(|cursor| view.all_facts_about_event(&e, cursor, PAGE_SIZE))
-            .map_ok(|item| item.fact)
-            .try_collect()
-            .await?;
+        let facts = paginate(|cursor| {
+            view.all_facts_about_event(&e, cursor, PAGE_SIZE)
+                .map_ok(FactPage::into_parts)
+        })
+        .map_ok(|item| item.fact)
+        .try_collect()
+        .await?;
         event_facts.insert(e, facts);
     }
     let mut image_facts: HashMap<ImageIdOf<S>, Vec<StoredFactOf<S>>> = HashMap::new();
     for i in images {
-        let facts = paginate(|cursor| view.all_facts_about_image(&i, cursor, PAGE_SIZE))
-            .map_ok(|item| item.fact)
-            .try_collect()
-            .await?;
+        let facts = paginate(|cursor| {
+            view.all_facts_about_image(&i, cursor, PAGE_SIZE)
+                .map_ok(FactPage::into_parts)
+        })
+        .map_ok(|item| item.fact)
+        .try_collect()
+        .await?;
         image_facts.insert(i, facts);
     }
     Ok((event_facts, image_facts))

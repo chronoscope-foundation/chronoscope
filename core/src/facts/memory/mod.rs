@@ -15,9 +15,10 @@
 //! - `next_fact_id` / `no_later_than` / `now` clock surface.
 //! - Per-subject view reads: `all_facts_about_*` page the backlink indexes;
 //!   the entity / image `*_representative` / `*_class` reads union-find over
-//!   the visible `SameEntity` / `SameArtifact` facts; `walk_entities` over
-//!   `ByName` / `ByExternalReference` and `walk_images` over `BySourceUrl`
-//!   scan the fact bag.
+//!   the visible `SameEntity` / `SameArtifact` facts; `walk_entity_classes`
+//!   over `ByName` / `ByExternalReference` / `All` and `walk_image_classes`
+//!   over `BySourceUrl` / `All` scan the fact bag into `(representative,
+//!   fact_id)` rows.
 //!
 //! ## Concrete id types
 //!
@@ -65,11 +66,12 @@ use crate::facts::citations::JudgmentSource;
 use crate::facts::identity;
 use crate::facts::ids::{CommitId, FactId, IdScheme};
 use crate::facts::schema::{
-    EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem, normalize_name,
+    ClassPage, EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem,
+    normalize_name,
 };
 use crate::facts::store::{
-    EntityView, EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf,
-    SubmitCommitError,
+    ClassWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView, ImageView,
+    StoredFactOf, SubmitCommitError,
 };
 use crate::facts::submit::matcher::{self, MatchOutcome};
 use crate::facts::submit::pipeline::{substitute_facts_accumulating, validate_submit};
@@ -83,7 +85,8 @@ mod equiv;
 mod scan;
 
 use self::scan::{
-    entity_named, entity_referenced, image_sourced_from, same_artifact_edge, same_entity_edge,
+    entity_ids_of, entity_named, entity_referenced, image_ids_of, image_sourced_from,
+    same_artifact_edge, same_entity_edge,
 };
 
 // ============================================================================
@@ -480,7 +483,7 @@ impl<'a> ReadCore<'a> {
         subject: &S,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
-    ) -> FactPage<MemStoredFact, S>
+    ) -> FactPage<MemStoredFact, S, FactId>
     where
         S: Copy + Ord + std::hash::Hash,
     {
@@ -841,19 +844,19 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
             .await)
     }
 
-    async fn walk_entities<'b>(
+    async fn walk_entity_classes<'b>(
         &'b self,
         stream: &'b EntityStream<'b>,
-        cursor: FactId,
+        after: Option<(MemoryEntityId, FactId)>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEntityId>, MemoryError> {
+    ) -> Result<ClassWalkPage<MemoryFactStore, MemoryEntityId>, MemoryError> {
         match stream {
             EntityStream::ByName { name, language } => {
                 let needle = normalize_name(name);
                 Ok(self
                     .with_core(move |core| {
-                        core.walk_matching(
-                            cursor,
+                        core.walk_classes(
+                            after,
                             limit,
                             |fact| entity_named(fact, &needle, language),
                             same_entity_edge,
@@ -863,20 +866,24 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
             }
             EntityStream::ByExternalReference { reference } => Ok(self
                 .with_core(move |core| {
-                    core.walk_matching(
-                        cursor,
+                    core.walk_classes(
+                        after,
                         limit,
                         |fact| entity_referenced(fact, reference),
                         same_entity_edge,
                     )
                 })
                 .await),
-            EntityStream::All
-            | EntityStream::InBbox(_)
+            EntityStream::All => Ok(self
+                .with_core(move |core| {
+                    core.walk_classes(after, limit, entity_ids_of, same_entity_edge)
+                })
+                .await),
+            EntityStream::InBbox(_)
             | EntityStream::InTimeRange(_)
-            | EntityStream::InBboxAndTimeRange { .. } => Ok(FactPage {
-                items: Vec::new(),
-                next_cursor: None,
+            | EntityStream::InBboxAndTimeRange { .. } => Ok(ClassPage {
+                rows: Vec::new(),
+                next: None,
             }),
         }
     }
@@ -886,7 +893,7 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
         entity: &MemoryEntityId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEntityId>, MemoryError> {
+    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEntityId, FactId>, MemoryError> {
         Ok(self
             .with_core(|c| {
                 c.facts_about(
@@ -924,7 +931,7 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
         _stream: &'b EventStream<'b>,
         _after: Option<FactId>,
         _limit: std::num::NonZeroUsize,
-    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId>, MemoryError> {
+    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId, FactId>, MemoryError> {
         Ok(FactPage {
             items: Vec::new(),
             next_cursor: None,
@@ -936,7 +943,7 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
         event: &MemoryEventId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId>, MemoryError> {
+    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId, FactId>, MemoryError> {
         Ok(self
             .with_core(|c| {
                 c.facts_about(
@@ -972,29 +979,33 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
             .await)
     }
 
-    async fn walk_images<'b>(
+    async fn walk_image_classes<'b>(
         &'b self,
         stream: &'b ImageStream<'b>,
-        cursor: FactId,
+        after: Option<(MemoryImageId, FactId)>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryImageId>, MemoryError> {
+    ) -> Result<ClassWalkPage<MemoryFactStore, MemoryImageId>, MemoryError> {
         match stream {
             ImageStream::BySourceUrl { url } => Ok(self
                 .with_core(move |core| {
-                    core.walk_matching(
-                        cursor,
+                    core.walk_classes(
+                        after,
                         limit,
                         |fact| image_sourced_from(fact, url),
                         same_artifact_edge,
                     )
                 })
                 .await),
-            ImageStream::All
-            | ImageStream::InBbox(_)
+            ImageStream::All => Ok(self
+                .with_core(move |core| {
+                    core.walk_classes(after, limit, image_ids_of, same_artifact_edge)
+                })
+                .await),
+            ImageStream::InBbox(_)
             | ImageStream::InTimeRange(_)
-            | ImageStream::InBboxAndTimeRange { .. } => Ok(FactPage {
-                items: Vec::new(),
-                next_cursor: None,
+            | ImageStream::InBboxAndTimeRange { .. } => Ok(ClassPage {
+                rows: Vec::new(),
+                next: None,
             }),
         }
     }
@@ -1004,7 +1015,7 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
         image: &MemoryImageId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryImageId>, MemoryError> {
+    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryImageId, FactId>, MemoryError> {
         Ok(self
             .with_core(|c| {
                 c.facts_about(
@@ -1150,6 +1161,11 @@ pub struct MemoryTx<'brand> {
 impl FactStore for MemoryFactStore {
     type Error = MemoryError;
     type Ids = MemoryIds;
+    type Cursor = FactId;
+    type ClassCursor<Rep>
+        = (Rep, FactId)
+    where
+        Rep: Send;
     type Tx<'brand> = MemoryTx<'brand>;
     type View<'a> = MemorySource<'a>;
 

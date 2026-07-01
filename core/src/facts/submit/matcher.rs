@@ -13,16 +13,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::{Future, ready};
 
-use futures_util::TryStreamExt;
+use futures_util::{TryFutureExt, TryStreamExt};
 use url::Url;
 
 use super::{Decl, EntityIdx, ImageIdx, SubmitFact};
 use crate::facts::assertions::FactualAssertion;
 use crate::facts::citations::{ExternalReference, Language};
 use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId};
-use crate::facts::pagination::{PAGE_SIZE, paginate};
-use crate::facts::schema::{EntityStream, FactPage, ImageStream, normalize_name};
-use crate::facts::store::{EntityIdOf, EntityView, FactStore, ImageIdOf, ImageView, StoredFactOf};
+use crate::facts::pagination::{PAGE_SIZE, group_classes, paginate};
+use crate::facts::schema::{ClassPage, EntityStream, ImageStream, normalize_name};
+use crate::facts::store::{ClassWalkPage, EntityIdOf, EntityView, FactStore, ImageIdOf, ImageView};
 use crate::facts::{attribute, image};
 
 // ============================================================================
@@ -148,7 +148,7 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
         for reference in references.get(&idx).into_iter().flatten() {
             let stream = EntityStream::ByExternalReference { reference };
             collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                view.walk_entities(&stream, cursor, PAGE_SIZE)
+                view.walk_entity_classes(&stream, cursor, PAGE_SIZE)
             })
             .await?;
         }
@@ -157,7 +157,7 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
             for (name, language) in names.get(&idx).into_iter().flatten() {
                 let stream = EntityStream::ByName { name, language };
                 collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                    view.walk_entities(&stream, cursor, PAGE_SIZE)
+                    view.walk_entity_classes(&stream, cursor, PAGE_SIZE)
                 })
                 .await?;
             }
@@ -203,7 +203,7 @@ pub async fn match_images<S: FactStore, V: ImageView<S>>(
         for url in urls.get(&idx).into_iter().flatten() {
             let stream = ImageStream::BySourceUrl { url };
             collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                view.walk_images(&stream, cursor, PAGE_SIZE)
+                view.walk_image_classes(&stream, cursor, PAGE_SIZE)
             })
             .await?;
         }
@@ -212,34 +212,36 @@ pub async fn match_images<S: FactStore, V: ImageView<S>>(
     Ok(out)
 }
 
-/// Drain a keyed walk to exhaustion, folding each row's class representative
-/// into `candidates` along with the row's fact id — the anchor evidence a
-/// match cites as its [`MatchOutcome::Matched::basis`]. Representatives come
-/// straight off
-/// [`PageItem::representative`](crate::facts::schema::PageItem::representative),
-/// so several hits inside one equivalence class collapse to one candidate
-/// instead of a spurious ambiguity.
+/// Drain a keyed class walk to exhaustion, unioning each class's fact ids into
+/// `candidates` under its representative — the anchor evidence a match cites as
+/// its [`MatchOutcome::Matched::basis`]. A whole
+/// [`Class`](crate::facts::schema::Class) arrives at once via
+/// [`group_classes`], and every hit inside one equivalence class already shares
+/// its representative, so several hits collapse to one candidate instead of a
+/// spurious ambiguity. Across a decl's keyed walks (each reference, each name)
+/// the same representative accumulates its fact ids, so the basis is the union
+/// of every anchor that reached the class.
 async fn collect_candidates<S, Sub, F, Fut>(
     candidates: &mut BTreeMap<Sub, BTreeSet<FactId>>,
     mut fetch: F,
 ) -> Result<(), S::Error>
 where
     S: FactStore,
-    Sub: Ord,
-    F: FnMut(FactId) -> Fut,
-    Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
+    Sub: Clone + Ord + Send,
+    F: FnMut(Option<S::ClassCursor<Sub>>) -> Fut,
+    Fut: Future<Output = Result<ClassWalkPage<S, Sub>, S::Error>>,
 {
-    // The keyed class walks seek from an inclusive `FactId`; paginate opens
-    // each walk with `None`, so the zero id starts the scan.
-    paginate(move |after| fetch(after.unwrap_or(FactId::new(0))))
-        .try_for_each(|item| {
-            candidates
-                .entry(item.representative)
-                .or_default()
-                .insert(item.fact_id);
-            ready(Ok(()))
-        })
-        .await
+    group_classes(paginate(move |cursor| {
+        fetch(cursor).map_ok(ClassPage::into_parts)
+    }))
+    .try_for_each(|class| {
+        candidates
+            .entry(class.representative)
+            .or_default()
+            .extend(class.fact_ids);
+        ready(Ok(()))
+    })
+    .await
 }
 
 /// Select the [`MatchOutcome`] for one decl's deduped candidate map: exactly

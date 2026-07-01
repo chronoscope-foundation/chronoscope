@@ -1,5 +1,6 @@
 use super::*;
 use chrono::TimeZone;
+use futures_util::{TryFutureExt, TryStreamExt};
 use url::Url;
 
 use crate::date::{DatePrecision, UncertainDate};
@@ -14,6 +15,8 @@ use crate::facts::ids::UserId;
 use crate::facts::lifecycle::{
     DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind,
 };
+use crate::facts::pagination::{group_classes, paginate};
+use crate::facts::schema::{Class, ClassPage};
 use crate::facts::submit::{
     Commit as SubmitBundle, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact,
 };
@@ -713,13 +716,10 @@ async fn local_decls_mint_distinct_newly_minted_ids() -> TestResult {
 
 // --- walk conformance ---
 
-/// A commit's entity-touching facts must appear in a `walk_entities(All,
-/// ...)` page — the walk-conformance check every backend owes. `#[ignore]`d
-/// while the non-keyed `walk_entities` arms return an empty stub; flips
-/// green once the `All` arm reads the fact bag.
+/// A commit's entity-touching facts fold into one class whose `fact_ids` are
+/// exactly the submitted set — the class-walk conformance every backend owes.
 #[tokio::test]
-#[ignore = "the non-keyed walk_entities arms (All / InBbox / InTimeRange / InBboxAndTimeRange) are stubbed to an empty page; only the keyed ByName / ByExternalReference arms read the fact bag. This pins the walk-returns-submitted-facts contract and flips green once the All arm is implemented (a backend stubbing/lying about walk support fails this check)"]
-async fn walk_entities_returns_submitted_entity_facts() -> TestResult {
+async fn walk_entity_classes_group_submitted_facts_into_one_class() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
         author: user_author()?,
@@ -739,17 +739,78 @@ async fn walk_entities_returns_submitted_entity_facts() -> TestResult {
     assert_eq!(submitted.len(), 2, "expected two submitted facts");
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = view
-        .walk_entities(&EntityStream::All, FactId::new(0), PAGE_100)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let classes: Vec<Class<MemoryEntityId>> = group_classes(paginate(|cursor| {
+        view.walk_entity_classes(&EntityStream::All, cursor, PAGE_100)
+            .map_ok(ClassPage::into_parts)
+    }))
+    .try_collect()
+    .await
+    .map_err(|e| format!("{e:?}"))?;
 
-    let returned: std::collections::BTreeSet<FactId> =
-        page.items.iter().map(|item| item.fact_id).collect();
-    assert!(
-        submitted.is_subset(&returned),
-        "walk_entities(All) must return every submitted entity-touching fact; \
-         submitted={submitted:?}, returned={returned:?}"
+    assert_eq!(
+        classes.len(),
+        1,
+        "one entity yields one class; got {classes:?}"
+    );
+    let class = classes.first().ok_or("missing class")?;
+    assert_eq!(
+        class.fact_ids, submitted,
+        "the class's fact_ids are exactly the submitted entity-touching facts"
+    );
+    Ok(())
+}
+
+/// Distinct entities page as distinct whole classes even at a one-row page
+/// limit: the walk orders rows by `(representative, fact_id)`, so
+/// `group_classes` never splits a class across a page boundary.
+#[tokio::test]
+async fn class_walk_pages_distinct_entities_as_whole_classes() -> TestResult {
+    let store = MemoryFactStore::new();
+    let first = commit_facts(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![name_fact(0, "Alpha")?, construction_started_in(0, 1700)?],
+        )?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let second = commit_facts(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![name_fact(0, "Beta")?, construction_started_in(0, 1800)?],
+        )?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let alpha: std::collections::BTreeSet<FactId> = first.fact_ids.iter().copied().collect();
+    let beta: std::collections::BTreeSet<FactId> = second.fact_ids.iter().copied().collect();
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    // One row per page forces each class to span page boundaries.
+    let one = std::num::NonZeroUsize::MIN;
+    let classes: Vec<Class<MemoryEntityId>> = group_classes(paginate(|cursor| {
+        view.walk_entity_classes(&EntityStream::All, cursor, one)
+            .map_ok(ClassPage::into_parts)
+    }))
+    .try_collect()
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+
+    let got: std::collections::BTreeSet<std::collections::BTreeSet<FactId>> =
+        classes.iter().map(|c| c.fact_ids.clone()).collect();
+    let want: std::collections::BTreeSet<std::collections::BTreeSet<FactId>> =
+        [alpha, beta].into_iter().collect();
+    assert_eq!(
+        got, want,
+        "each entity pages as its own whole class; got {classes:?}"
     );
     Ok(())
 }
@@ -799,7 +860,7 @@ async fn all_facts_about_entity_returns_facts_mentioning_it() -> TestResult {
     Ok(())
 }
 
-/// Event analogue of [`walk_entities_returns_submitted_entity_facts`].
+/// Event analogue of [`walk_entity_classes_group_submitted_facts_into_one_class`].
 /// `#[ignore]`d while stubbed; flips green once `walk_events` reads the
 /// fact bag.
 #[tokio::test]
@@ -887,12 +948,10 @@ async fn all_facts_about_event_returns_facts_mentioning_it() -> TestResult {
     Ok(())
 }
 
-/// Image analogue of [`walk_entities_returns_submitted_entity_facts`].
-/// `#[ignore]`d while the non-keyed `walk_images` arms return an empty
-/// stub; flips green once the `All` arm reads the fact bag.
+/// Image analogue of
+/// [`walk_entity_classes_group_submitted_facts_into_one_class`].
 #[tokio::test]
-#[ignore = "the non-keyed walk_images arms (All / InBbox / InTimeRange / InBboxAndTimeRange) are stubbed to an empty page; only the keyed BySourceUrl arm reads the fact bag. This pins the walk-returns-submitted-facts contract and flips green once the All arm is implemented"]
-async fn walk_images_returns_submitted_image_facts() -> TestResult {
+async fn walk_image_classes_group_submitted_facts_into_one_class() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
         author: user_author()?,
@@ -912,17 +971,23 @@ async fn walk_images_returns_submitted_image_facts() -> TestResult {
     assert_eq!(submitted.len(), 2, "expected two submitted facts");
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = view
-        .walk_images(&ImageStream::All, FactId::new(0), PAGE_100)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let classes: Vec<Class<MemoryImageId>> = group_classes(paginate(|cursor| {
+        view.walk_image_classes(&ImageStream::All, cursor, PAGE_100)
+            .map_ok(ClassPage::into_parts)
+    }))
+    .try_collect()
+    .await
+    .map_err(|e| format!("{e:?}"))?;
 
-    let returned: std::collections::BTreeSet<FactId> =
-        page.items.iter().map(|item| item.fact_id).collect();
-    assert!(
-        submitted.is_subset(&returned),
-        "walk_images(All) must return every submitted image-touching fact; \
-         submitted={submitted:?}, returned={returned:?}"
+    assert_eq!(
+        classes.len(),
+        1,
+        "one image yields one class; got {classes:?}"
+    );
+    let class = classes.first().ok_or("missing class")?;
+    assert_eq!(
+        class.fact_ids, submitted,
+        "the class's fact_ids are exactly the submitted image-touching facts"
     );
     Ok(())
 }

@@ -32,17 +32,17 @@
 //!   empty-store view; every lookup returns [`FactLookup::Future`] or
 //!   [`FactLookup::Unknown`].
 //! - [`FactView::snapshot`] returns the bound the view was pinned at.
-//! - The backlink and event walks (`all_facts_about_*`, `walk_events`) page on
-//!   an exclusive `after: Option<FactId>`: `None` opens the walk, `Some(id)`
-//!   resumes strictly past `id`. Each page's `next_cursor` is an opaque resume
-//!   token: `None` means the walk is exhausted, `Some(token)` means thread the
-//!   token back as the next `after` and there may be more — regardless of this
-//!   page's size, since a conforming backend may return a short or empty page
-//!   that still carries a token. Page size is never a completion signal; only
-//!   the token is.
-//! - The class walks (`walk_entities` / `walk_images`) page on an inclusive
-//!   `cursor: FactId`: `walk(cursor, ...)` filters `id >= cursor`, first page
-//!   passes `FactId::new(0)`.
+//! - Every paginated walk pages on an opaque resume token: `None` opens the
+//!   walk, `Some(token)` resumes at the previous page's token. The backlink
+//!   walks (`all_facts_about_*`) and `walk_events` page on
+//!   [`Cursor`](Self::Cursor); the class walks (`walk_entity_classes` /
+//!   `walk_image_classes`) page on [`ClassCursor`](Self::ClassCursor). A caller
+//!   threads the token back verbatim, never constructing or inspecting it, so a
+//!   walk's inclusive-vs-exclusive resume polarity stays the backend's own
+//!   business. A page's token is `None` when the walk is exhausted, `Some` when
+//!   there may be more, regardless of this page's size, since a conforming
+//!   backend may return a short or empty page that still carries a token. Page
+//!   size is never a completion signal; only the token is.
 //!
 //! [`Self::next_fact_id`] gives the scalar watermark; [`Self::now`] returns
 //! a snapshot view directly (its method doc says why it isn't a default
@@ -82,7 +82,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::facts::ids::{FactId, IdScheme};
-use crate::facts::schema::{EntityStream, EquivClass, EventStream, FactPage, ImageStream};
+use crate::facts::schema::{
+    ClassPage, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
+};
 use crate::facts::submit;
 use crate::facts::submit::{FactLookup, StoredFact, SubmitError, SubmitResult};
 use crate::nonempty::NonEmptyVec;
@@ -142,6 +144,29 @@ pub trait FactStore: Send + Sync + Sized {
     /// clone / order / hash / serde / schema / display bounds the store, view,
     /// and submit surface use.
     type Ids: IdScheme;
+
+    /// Opaque pagination cursor. Each page of a paginated walk
+    /// (`all_facts_about_*`, `walk_*`) reports a `next_cursor` of this type;
+    /// a generic caller threads it straight back as the next `after` without
+    /// constructing or inspecting it. Its shape is the backend's — a [`FactId`]
+    /// in-memory, a compound key for a SQL backend keying off several columns.
+    ///
+    /// `Send` because the walk futures are `Send` and the cursor rides inside
+    /// one, both in each page and in [`paginate`](crate::facts::pagination::paginate)'s
+    /// resume state.
+    type Cursor: Send;
+
+    /// Opaque cursor for a class walk over subject `Rep`. Kept apart from
+    /// [`Self::Cursor`] because a class walk pages a `(representative, fact_id)`
+    /// key, not a bare fact id — in-memory it is `(Rep, FactId)`, a SQL backend
+    /// a compound key over the same two columns. A generic caller threads it
+    /// straight back as the next `after` without inspecting it.
+    ///
+    /// `Send` for the same reason as [`Self::Cursor`]; `Rep: Send` since the
+    /// cursor embeds the representative.
+    type ClassCursor<Rep>: Send
+    where
+        Rep: Send;
 
     /// Branded transaction handle threaded through [`Self::submit_commit`].
     /// `'brand` is a fresh existential minted per [`Self::with_tx`] call; it
@@ -347,6 +372,16 @@ pub enum FactPlacement {
 /// `FactPage` over a store's id shape readable.
 pub type StoredFactOf<S> = StoredFact<<S as FactStore>::Ids>;
 
+/// One page of a store `S`'s paginated walk over subject `Subj`: rows of the
+/// store's stored facts resumed by its opaque [`FactStore::Cursor`]. An alias to
+/// keep the walk return types readable and clippy's `type_complexity` quiet.
+pub type WalkPage<S, Subj> = FactPage<StoredFactOf<S>, Subj, <S as FactStore>::Cursor>;
+
+/// One page of a store `S`'s class walk over subject `Subj`:
+/// `(representative, fact_id)` rows resumed by its opaque
+/// [`FactStore::ClassCursor`]. The class-walk analogue of [`WalkPage`].
+pub type ClassWalkPage<S, Subj> = ClassPage<Subj, <S as FactStore>::ClassCursor<Subj>>;
+
 // ============================================================================
 // EntityView — entity-parametric reads
 // ============================================================================
@@ -370,29 +405,32 @@ pub trait EntityView<S: FactStore>: FactView<S> {
         member: &EntityIdOf<S>,
     ) -> impl Future<Output = Result<EquivClass<EntityIdOf<S>>, S::Error>> + Send;
 
-    /// Walk entity-touching facts via an index, class-scoped by `SameEntity`.
+    /// Walk entity-touching facts via an index as `(representative, fact_id)`
+    /// rows, class-scoped by `SameEntity`.
     ///
-    /// `cursor` is an inclusive lower bound: only items with `id >= cursor`
-    /// are returned. First page passes `FactId::new(0)`; continuations pass
-    /// the previous page's returned cursor.
-    fn walk_entities<'a>(
+    /// `after` is a resume token: `None` opens the walk from the first row,
+    /// `Some(cursor)` resumes at the previous page's returned `next`. Rows come
+    /// ordered by `(representative, fact_id)`, so
+    /// [`group_classes`](crate::facts::pagination::group_classes) folds each
+    /// class's contiguous run into a whole [`Class`](crate::facts::schema::Class).
+    fn walk_entity_classes<'a>(
         &'a self,
         stream: &'a EntityStream<'a>,
-        cursor: FactId,
+        after: Option<S::ClassCursor<EntityIdOf<S>>>,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EntityIdOf<S>>, S::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<ClassWalkPage<S, EntityIdOf<S>>, S::Error>> + Send + 'a;
 
-    /// Paginated backlink walk — "which facts mention this entity?". `after`
-    /// is exclusive: `None` opens the walk, `Some(id)` resumes strictly past
-    /// `id`. Each page's `next_cursor` is an opaque resume token: `Some` means
-    /// thread it back as the next `after` — there may be more, regardless of
-    /// page size — and `None` means the walk is exhausted.
+    /// Paginated backlink walk — "which facts mention this entity?". `after` is
+    /// a resume token: `None` opens the walk, `Some(cursor)` resumes at the
+    /// previous page's returned `next_cursor`. Each page's `next_cursor` is an
+    /// opaque token: `Some` means thread it back as the next `after` — there may
+    /// be more, regardless of page size — and `None` means the walk is exhausted.
     fn all_facts_about_entity(
         &self,
         entity: &EntityIdOf<S>,
-        after: Option<FactId>,
+        after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EntityIdOf<S>>, S::Error>> + Send;
+    ) -> impl Future<Output = Result<WalkPage<S, EntityIdOf<S>>, S::Error>> + Send;
 }
 
 // ============================================================================
@@ -416,23 +454,24 @@ pub trait EventView<S: FactStore>: FactView<S> {
     ) -> impl Future<Output = Result<EquivClass<EventIdOf<S>>, S::Error>> + Send;
 
     /// Walk event-touching facts via an index, class-scoped by `SameEvent`.
-    /// `after` is exclusive — `None` opens the walk, `Some(id)` resumes
-    /// strictly past `id`.
+    /// `after` is a resume token — `None` opens the walk, `Some(cursor)` resumes
+    /// at the previous page's returned `next_cursor`.
     fn walk_events<'a>(
         &'a self,
         stream: &'a EventStream<'a>,
-        after: Option<FactId>,
+        after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EventIdOf<S>>, S::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<WalkPage<S, EventIdOf<S>>, S::Error>> + Send + 'a;
 
-    /// Paginated backlink walk — "which facts mention this event?". `after` is
-    /// exclusive: `None` opens the walk, `Some(id)` resumes strictly past `id`.
+    /// Paginated backlink walk — "which facts mention this event?". `after` is a
+    /// resume token: `None` opens the walk, `Some(cursor)` resumes at the
+    /// previous page's returned `next_cursor`.
     fn all_facts_about_event(
         &self,
         event: &EventIdOf<S>,
-        after: Option<FactId>,
+        after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EventIdOf<S>>, S::Error>> + Send;
+    ) -> impl Future<Output = Result<WalkPage<S, EventIdOf<S>>, S::Error>> + Send;
 }
 
 // ============================================================================
@@ -456,21 +495,23 @@ pub trait ImageView<S: FactStore>: FactView<S> {
         member: &ImageIdOf<S>,
     ) -> impl Future<Output = Result<EquivClass<ImageIdOf<S>>, S::Error>> + Send;
 
-    /// Walk image-touching facts via an index, class-scoped by
-    /// `SameArtifact`. See [`EntityView::walk_entities`] for pagination.
-    fn walk_images<'a>(
+    /// Walk image-touching facts via an index as `(representative, fact_id)`
+    /// rows, class-scoped by `SameArtifact`. See
+    /// [`EntityView::walk_entity_classes`] for the row shape and pagination.
+    fn walk_image_classes<'a>(
         &'a self,
         stream: &'a ImageStream<'a>,
-        cursor: FactId,
+        after: Option<S::ClassCursor<ImageIdOf<S>>>,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, ImageIdOf<S>>, S::Error>> + Send + 'a;
+    ) -> impl Future<Output = Result<ClassWalkPage<S, ImageIdOf<S>>, S::Error>> + Send + 'a;
 
-    /// Paginated backlink walk — "which facts mention this image?". `after` is
-    /// exclusive: `None` opens the walk, `Some(id)` resumes strictly past `id`.
+    /// Paginated backlink walk — "which facts mention this image?". `after` is a
+    /// resume token: `None` opens the walk, `Some(cursor)` resumes at the
+    /// previous page's returned `next_cursor`.
     fn all_facts_about_image(
         &self,
         image: &ImageIdOf<S>,
-        after: Option<FactId>,
+        after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, ImageIdOf<S>>, S::Error>> + Send;
+    ) -> impl Future<Output = Result<WalkPage<S, ImageIdOf<S>>, S::Error>> + Send;
 }
