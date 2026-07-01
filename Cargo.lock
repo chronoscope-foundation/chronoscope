@@ -806,6 +806,7 @@ dependencies = [
  "async-lock",
  "chrono",
  "chronoscope-macros",
+ "futures-util",
  "hex",
  "oxilangtag",
  "proptest",

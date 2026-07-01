@@ -52,6 +52,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::ops::Bound;
 
 use async_lock::{Mutex, MutexGuard};
 
@@ -64,8 +65,7 @@ use crate::facts::citations::JudgmentSource;
 use crate::facts::identity;
 use crate::facts::ids::{CommitId, FactId, IdScheme};
 use crate::facts::schema::{
-    EdgeSubgraph, EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem,
-    normalize_name,
+    EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem, normalize_name,
 };
 use crate::facts::store::{
     EntityView, EventView, FactPlacement, FactStore, FactView, ImageView, StoredFactOf,
@@ -195,7 +195,7 @@ struct Inner {
     /// Backlink indexes: each subject id → the ids of facts mentioning it.
     /// Grown alongside [`Self::retractors`] in [`apply_pending`]. The value is a
     /// [`BTreeSet`] so the ids stay sorted and deduped, and a paginated read
-    /// seeks to its cursor with `range(cursor..)` instead of skipping the
+    /// resumes with an exclusive `range` past its cursor instead of skipping the
     /// prefix. (The retractor index keeps a `Vec` — it is fully iterated with no
     /// cursor seek, so a sorted set buys it nothing.)
     entity_backlinks: HashMap<MemoryEntityId, BTreeSet<FactId>>,
@@ -455,22 +455,22 @@ impl<'a> ReadCore<'a> {
     }
 
     /// A page of the facts mentioning `subject`, active and below the snapshot,
-    /// starting at the pagination `cursor`. The one paginator behind every
-    /// `all_facts_about_*` read — pass the matching committed and pending
-    /// `*_backlinks` maps and subject id.
+    /// resuming strictly past `after` (`None` opens the walk). The one paginator
+    /// behind every `all_facts_about_*` read — pass the matching committed and
+    /// pending `*_backlinks` maps and subject id.
     ///
     /// The subject is its own `representative` — backlinks are literal, not
     /// scoped to an equivalence class. Both backlink sets are
     /// sorted, and committed fids (`0..committed.len()`) sit wholly below pending
     /// provisional fids (`committed.len()..`), so chaining the committed range
-    /// onto the pending range walks one ascending stream. `range(cursor..)` on
-    /// each seeks past already-paged facts and the snapshot bound breaks the scan
-    /// as soon as it is crossed. A committed-only source passes `None` for the
-    /// pending map, degrading to a committed-only walk.
+    /// onto the pending range walks one ascending stream. The exclusive `range`
+    /// on each seeks past already-paged facts and the snapshot bound breaks the
+    /// scan as soon as it is crossed. A committed-only source passes `None` for
+    /// the pending map, degrading to a committed-only walk.
     ///
-    /// `next_cursor` is `Some(fid)` at the id where the scan stopped while more
-    /// eligible ids remain — whether the page filled or the snapshot bound was
-    /// hit mid-range — and `None` once the backlink range is exhausted. A
+    /// `next_cursor` is `Some(last-emitted id)` when the page fills before the
+    /// range runs out, so the next walk resumes strictly past it; `None` once
+    /// the backlink range is exhausted or the snapshot bound ends the scan. A
     /// retracted fact is skipped without consuming a slot, so a page can come
     /// back short or empty yet still carry a resume cursor.
     fn facts_about<S>(
@@ -478,28 +478,30 @@ impl<'a> ReadCore<'a> {
         backlinks: &HashMap<S, BTreeSet<FactId>>,
         pending_backlinks: Option<&HashMap<S, BTreeSet<FactId>>>,
         subject: &S,
-        cursor: FactId,
+        after: Option<FactId>,
         limit: std::num::NonZeroUsize,
     ) -> FactPage<MemStoredFact, S>
     where
         S: Copy + Ord + std::hash::Hash,
     {
+        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
         let committed = backlinks
             .get(subject)
             .into_iter()
-            .flat_map(|ids| ids.range(cursor..));
+            .flat_map(|ids| ids.range((lower, Bound::Unbounded)));
         let pending = pending_backlinks
             .and_then(|m| m.get(subject))
             .into_iter()
-            .flat_map(|ids| ids.range(cursor..));
+            .flat_map(|ids| ids.range((lower, Bound::Unbounded)));
         let mut items = Vec::new();
+        let mut last_emitted: Option<FactId> = None;
         let mut next_cursor = None;
         for &fid in committed.chain(pending) {
             if fid.get() >= self.snapshot.get() {
                 break;
             }
             if items.len() == limit.get() {
-                next_cursor = Some(fid);
+                next_cursor = last_emitted;
                 break;
             }
             if self.retracted_by(fid).is_some() {
@@ -513,6 +515,7 @@ impl<'a> ReadCore<'a> {
                 fact: fact.clone(),
                 representative: *subject,
             });
+            last_emitted = Some(fid);
         }
         FactPage { items, next_cursor }
     }
@@ -881,7 +884,7 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
     async fn all_facts_about_entity(
         &self,
         entity: &MemoryEntityId,
-        cursor: FactId,
+        after: Option<FactId>,
         limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEntityId>, MemoryError> {
         Ok(self
@@ -890,24 +893,11 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
                     c.entity_backlinks,
                     c.pending_entity_backlinks,
                     entity,
-                    cursor,
+                    after,
                     limit,
                 )
             })
             .await)
-    }
-
-    async fn entity_topological_subgraph(
-        &self,
-        seed: MemoryEntityId,
-        _cursor: FactId,
-        _limit: std::num::NonZeroUsize,
-    ) -> Result<EdgeSubgraph<MemoryEntityId, StoredFactOf<MemoryFactStore>>, MemoryError> {
-        Ok(EdgeSubgraph {
-            subjects: vec![seed],
-            edge_facts: Vec::new(),
-            truncated: false,
-        })
     }
 }
 
@@ -932,7 +922,7 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
     async fn walk_events<'b>(
         &'b self,
         _stream: &'b EventStream<'b>,
-        _cursor: FactId,
+        _after: Option<FactId>,
         _limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId>, MemoryError> {
         Ok(FactPage {
@@ -944,7 +934,7 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
     async fn all_facts_about_event(
         &self,
         event: &MemoryEventId,
-        cursor: FactId,
+        after: Option<FactId>,
         limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId>, MemoryError> {
         Ok(self
@@ -953,7 +943,7 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
                     c.event_backlinks,
                     c.pending_event_backlinks,
                     event,
-                    cursor,
+                    after,
                     limit,
                 )
             })
@@ -1012,7 +1002,7 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
     async fn all_facts_about_image(
         &self,
         image: &MemoryImageId,
-        cursor: FactId,
+        after: Option<FactId>,
         limit: std::num::NonZeroUsize,
     ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryImageId>, MemoryError> {
         Ok(self
@@ -1021,7 +1011,7 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
                     c.image_backlinks,
                     c.pending_image_backlinks,
                     image,
-                    cursor,
+                    after,
                     limit,
                 )
             })

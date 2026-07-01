@@ -9,8 +9,7 @@
 //!
 //! Subject-parametric reads live on one companion trait per subject kind:
 //! [`EntityView`], [`EventView`], [`ImageView`]. Each does equivalence
-//! resolution, indexed walks, and backlink walks; [`EntityView`] adds
-//! closed-subgraph walks over the canonical entity edge relation.
+//! resolution, indexed walks, and backlink walks.
 //!
 //! The view traits are generic over the [`FactStore`] `S` and carry no
 //! associated types — they read the id kinds and error type off `S`, so a
@@ -33,8 +32,16 @@
 //!   empty-store view; every lookup returns [`FactLookup::Future`] or
 //!   [`FactLookup::Unknown`].
 //! - [`FactView::snapshot`] returns the bound the view was pinned at.
-//! - Pagination cursors on the `walk_*` methods are inclusive lower bounds
-//!   — `walk(cursor, ...)` filters items with `id >= cursor`. First page
+//! - The backlink and event walks (`all_facts_about_*`, `walk_events`) page on
+//!   an exclusive `after: Option<FactId>`: `None` opens the walk, `Some(id)`
+//!   resumes strictly past `id`. Each page's `next_cursor` is an opaque resume
+//!   token: `None` means the walk is exhausted, `Some(token)` means thread the
+//!   token back as the next `after` and there may be more — regardless of this
+//!   page's size, since a conforming backend may return a short or empty page
+//!   that still carries a token. Page size is never a completion signal; only
+//!   the token is.
+//! - The class walks (`walk_entities` / `walk_images`) page on an inclusive
+//!   `cursor: FactId`: `walk(cursor, ...)` filters `id >= cursor`, first page
 //!   passes `FactId::new(0)`.
 //!
 //! [`Self::next_fact_id`] gives the scalar watermark; [`Self::now`] returns
@@ -75,9 +82,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::facts::ids::{FactId, IdScheme};
-use crate::facts::schema::{
-    EdgeSubgraph, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
-};
+use crate::facts::schema::{EntityStream, EquivClass, EventStream, FactPage, ImageStream};
 use crate::facts::submit;
 use crate::facts::submit::{FactLookup, StoredFact, SubmitError, SubmitResult};
 use crate::nonempty::NonEmptyVec;
@@ -339,7 +344,7 @@ pub enum FactPlacement {
 }
 
 /// Store-pinned [`StoredFact`] alias, to keep signatures returning
-/// `FactPage` / `EdgeSubgraph` over a store's id shape readable.
+/// `FactPage` over a store's id shape readable.
 pub type StoredFactOf<S> = StoredFact<<S as FactStore>::Ids>;
 
 // ============================================================================
@@ -377,29 +382,17 @@ pub trait EntityView<S: FactStore>: FactView<S> {
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EntityIdOf<S>>, S::Error>> + Send + 'a;
 
-    /// Paginated backlink walk — "which facts mention this entity?".
-    /// `cursor` is an inclusive lower bound; pagination mirrors
-    /// [`Self::walk_entities`].
+    /// Paginated backlink walk — "which facts mention this entity?". `after`
+    /// is exclusive: `None` opens the walk, `Some(id)` resumes strictly past
+    /// `id`. Each page's `next_cursor` is an opaque resume token: `Some` means
+    /// thread it back as the next `after` — there may be more, regardless of
+    /// page size — and `None` means the walk is exhausted.
     fn all_facts_about_entity(
         &self,
         entity: &EntityIdOf<S>,
-        cursor: FactId,
+        after: Option<FactId>,
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EntityIdOf<S>>, S::Error>> + Send;
-
-    /// Closure of edge facts reachable from `seed` via the `Topological`
-    /// relation, one page at a time.
-    ///
-    /// `cursor` is an inclusive lower bound. The first call passes
-    /// `FactId::new(0)`; later calls pass one past the previous page's highest
-    /// fact id. The union of pages through [`EdgeSubgraph::truncated`] `==
-    /// false` is the full closed subgraph.
-    fn entity_topological_subgraph(
-        &self,
-        seed: EntityIdOf<S>,
-        cursor: FactId,
-        limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<EdgeSubgraph<EntityIdOf<S>, StoredFactOf<S>>, S::Error>> + Send;
 }
 
 // ============================================================================
@@ -422,20 +415,22 @@ pub trait EventView<S: FactStore>: FactView<S> {
         member: &EventIdOf<S>,
     ) -> impl Future<Output = Result<EquivClass<EventIdOf<S>>, S::Error>> + Send;
 
-    /// Walk event-touching facts via an index, class-scoped by
-    /// `SameEvent`. See [`EntityView::walk_entities`] for pagination.
+    /// Walk event-touching facts via an index, class-scoped by `SameEvent`.
+    /// `after` is exclusive — `None` opens the walk, `Some(id)` resumes
+    /// strictly past `id`.
     fn walk_events<'a>(
         &'a self,
         stream: &'a EventStream<'a>,
-        cursor: FactId,
+        after: Option<FactId>,
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EventIdOf<S>>, S::Error>> + Send + 'a;
 
-    /// Paginated backlink walk — "which facts mention this event?".
+    /// Paginated backlink walk — "which facts mention this event?". `after` is
+    /// exclusive: `None` opens the walk, `Some(id)` resumes strictly past `id`.
     fn all_facts_about_event(
         &self,
         event: &EventIdOf<S>,
-        cursor: FactId,
+        after: Option<FactId>,
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, EventIdOf<S>>, S::Error>> + Send;
 }
@@ -470,11 +465,12 @@ pub trait ImageView<S: FactStore>: FactView<S> {
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, ImageIdOf<S>>, S::Error>> + Send + 'a;
 
-    /// Paginated backlink walk — "which facts mention this image?".
+    /// Paginated backlink walk — "which facts mention this image?". `after` is
+    /// exclusive: `None` opens the walk, `Some(id)` resumes strictly past `id`.
     fn all_facts_about_image(
         &self,
         image: &ImageIdOf<S>,
-        cursor: FactId,
+        after: Option<FactId>,
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<FactPage<StoredFactOf<S>, ImageIdOf<S>>, S::Error>> + Send;
 }

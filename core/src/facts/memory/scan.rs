@@ -131,8 +131,8 @@ impl ReadCore<'_> {
     /// ascending by fact id from the pagination `cursor`, each row carrying
     /// its subject's equivalence-class representative (the component
     /// `edge_of`'s edges induce — see [`Self::equiv_class`]). The scan behind
-    /// the keyed `walk_*` stream arms; pagination mirrors
-    /// [`Self::facts_about`].
+    /// the keyed `walk_*` stream arms; `cursor` is an inclusive lower bound,
+    /// filtering `id >= cursor`.
     pub(super) fn walk_matching<S>(
         &self,
         cursor: FactId,

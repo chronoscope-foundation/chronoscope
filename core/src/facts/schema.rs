@@ -8,15 +8,14 @@
 //! relation enum to pass, because there's nothing to choose between. The query
 //! types here describe what to walk (the [`EntityStream`] / [`EventStream`] /
 //! [`ImageStream`] indices) and what comes back ([`FactPage`] / [`PageItem`],
-//! [`EquivClass`], [`EdgeSubgraph`]).
+//! [`EquivClass`]).
 //!
 //! ## Subject kinds
 //!
 //! Three subject kinds, one stream enum per kind:
 //!
 //! - **Entities** — [`EntityStream`]. Walked over the canonical `SameEntity`
-//!   equivalence; the canonical `Topological` edge relation feeds
-//!   [`EdgeSubgraph`].
+//!   equivalence.
 //! - **Lifetime events** — [`EventStream`]. Walked over the canonical
 //!   `SameEvent` equivalence. No edge relations today.
 //! - **Images** — [`ImageStream`]. Walked over the canonical `SameArtifact`
@@ -173,15 +172,18 @@ pub struct PageItem<F, S> {
     pub representative: S,
 }
 
-/// A page of walk results. `next_cursor = Some(c)` means more rows may exist
-/// past this page; the caller resumes the walk at cursor `c`. `None` means the
-/// walk is exhausted. A page can carry zero items yet still point at a next
-/// cursor — a backend filtering rows inside a window returns an empty page that
-/// resumes past the window it scanned.
+/// A page of walk results. `next_cursor` is an opaque resume token:
+/// `Some(token)` means thread it back as the walk's next `after`/`cursor` and
+/// more rows may exist; `None` means the walk is exhausted. A page can carry
+/// zero items yet still point at a next cursor, so page size is never a
+/// completion signal — only the token is. The consumer threads the token back
+/// verbatim; its value and inclusive/exclusive polarity are the walk's own
+/// business.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FactPage<F, S> {
     pub items: Vec<PageItem<F, S>>,
-    /// The cursor to resume at, or `None` when the walk is exhausted.
+    /// Opaque resume token: thread back as the walk's next cursor, or `None`
+    /// when the walk is exhausted.
     pub next_cursor: Option<FactId>,
 }
 
@@ -197,30 +199,4 @@ pub struct EquivClass<S: Ord> {
     pub representative: S,
     /// Every member of the class (including the representative).
     pub members: BTreeSet<S>,
-}
-
-// ============================================================================
-// Edge subgraph
-// ============================================================================
-
-/// A page of a closed-subgraph walk over a directed-edge relation (the
-/// canonical `Topological` relation over entities today; events / images have
-/// no edge relations).
-///
-/// Each call returns a partial closure of the connected component reachable
-/// from the seed: the subjects visited so far and the edge facts among them.
-/// `truncated = true` means more rows remain past this page. The walk cursor is
-/// an inclusive lower bound (filters `id >= cursor`), so the caller paginates
-/// by passing the id one past the highest [`FactId`] in `edge_facts` as the
-/// next `cursor`; passing the highest id itself would re-return that last row
-/// and never advance. The caller stops once `truncated = false`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct EdgeSubgraph<S, F> {
-    /// Subjects discovered in the connected component through this page.
-    pub subjects: Vec<S>,
-    /// Edge facts among `subjects` in this page, ordered by ascending
-    /// `FactId`.
-    pub edge_facts: Vec<(FactId, F)>,
-    /// Whether more pages remain past this one.
-    pub truncated: bool,
 }

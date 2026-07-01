@@ -785,7 +785,7 @@ async fn all_facts_about_entity_returns_facts_mentioning_it() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .all_facts_about_entity(&entity, FactId::new(0), PAGE_100)
+        .all_facts_about_entity(&entity, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -829,7 +829,7 @@ async fn walk_events_returns_submitted_event_facts() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .walk_events(&EventStream::All, FactId::new(0), PAGE_100)
+        .walk_events(&EventStream::All, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -873,7 +873,7 @@ async fn all_facts_about_event_returns_facts_mentioning_it() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .all_facts_about_event(&event, FactId::new(0), PAGE_100)
+        .all_facts_about_event(&event, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -953,7 +953,7 @@ async fn all_facts_about_image_returns_facts_mentioning_it() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .all_facts_about_image(&image, FactId::new(0), PAGE_100)
+        .all_facts_about_image(&image, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -1275,12 +1275,6 @@ async fn image_representative_is_canonical_across_same_artifact_members() -> Tes
     );
     Ok(())
 }
-
-// `entity_topological_subgraph` is not pinned here: the grammar has two
-// entity-to-entity edge relations — `attribute::Fact::Relationship` and
-// `observation::Fact::Spatial` — and which feeds the canonical `Topological`
-// walk isn't fixed yet. The two choices yield different pins, so pinning
-// either risks asserting the wrong contract.
 
 // --- canonical-form wire boundary ---
 //
@@ -2587,7 +2581,7 @@ async fn all_facts_about_image_excludes_retracted() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .all_facts_about_image(&image, FactId::new(0), PAGE_100)
+        .all_facts_about_image(&image, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
     assert!(
@@ -2628,7 +2622,7 @@ async fn all_facts_about_image_respects_snapshot() -> TestResult {
 
     let view = store.no_later_than(snapshot);
     let page = view
-        .all_facts_about_image(&image, FactId::new(0), PAGE_100)
+        .all_facts_about_image(&image, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let returned: std::collections::BTreeSet<FactId> =
@@ -3784,7 +3778,7 @@ mod props {
             .await
             .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
         let mut drained = Vec::new();
-        let mut cursor = FactId::new(0);
+        let mut cursor: Option<FactId> = None;
         let max_pages = spec.n + 2;
         let mut pages = 0;
         loop {
@@ -3800,7 +3794,7 @@ mod props {
                 .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
             drained.extend(page.items.iter().map(|item| item.fact_id));
             match page.next_cursor {
-                Some(next) => cursor = next,
+                Some(next) => cursor = Some(next),
                 None => break,
             }
         }

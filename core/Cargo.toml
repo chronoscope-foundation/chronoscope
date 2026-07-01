@@ -15,6 +15,7 @@ sqlx = ["dep:sqlx"]
 [dependencies]
 async-lock.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true

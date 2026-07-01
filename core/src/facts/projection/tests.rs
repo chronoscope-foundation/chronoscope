@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use chrono::TimeZone;
+use futures_util::TryStreamExt;
 use url::Url;
 
 use super::*;
@@ -445,7 +446,7 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
     // reading the active facts back.
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
-        .all_facts_about_entity(&id, FactId::new(0), DRAIN_PAGE)
+        .all_facts_about_entity(&id, None, PAGE_SIZE)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let old_fact_id = page
@@ -595,10 +596,10 @@ fn is_factual((_, citation): &(MemEntId, Citation<MemImgId>)) -> bool {
 #[tokio::test]
 async fn projection_drains_past_page_boundary() -> TestResult {
     let store = MemoryFactStore::new();
-    // Submit more names than a single page of the drain holds. The drain
-    // uses DRAIN_PAGE=256, so directly exercising the in-memory backend
-    // across pages would need >256 facts; instead drive the factored drain
-    // with a small limit against the real backend.
+    // Submit more names than a single page holds. paginate defaults to
+    // PAGE_SIZE=256, so exercising the in-memory backend across pages would
+    // need >256 facts; instead drive paginate with a small page limit against
+    // the real backend.
     let mut facts = Vec::new();
     for i in 0..10 {
         facts.push(name_fact(0, &format!("name-{i}"), "en")?);
@@ -608,9 +609,12 @@ async fn projection_drains_past_page_boundary() -> TestResult {
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let tiny: NonZeroUsize = NonZeroUsize::new(3).ok_or("nonzero")?;
-    let drained = drain_id_facts(|cursor| view.all_facts_about_entity(&id, cursor, tiny))
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let drained: Vec<(FactId, StoredFact<MemoryIds>)> =
+        paginate(|cursor| view.all_facts_about_entity(&id, cursor, tiny))
+            .map_ok(|item| (item.fact_id, item.fact))
+            .try_collect()
+            .await
+            .map_err(|e| format!("{e:?}"))?;
 
     let name_count = drained
         .iter()
@@ -663,9 +667,9 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
         })
     };
 
-    // Pages keyed by the cursor the drain passes in: cursor 0 → item 0,
-    // resume at 1; cursor 1 → EMPTY, resume at 2; cursor 2 → item 2, resume
-    // at 3; cursor 3 → item 3, done.
+    // Pages keyed by the cursor the drain passes in — `None` first, then each
+    // page's `next_cursor`: None → item 0, resume at 1; 1 → EMPTY, resume at 2;
+    // 2 → item 2, resume at 3; 3 → item 3, done.
     let pages: Vec<FactPage<StubFact, MemEntId>> = vec![
         FactPage {
             items: vec![item(0)?],
@@ -685,13 +689,15 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
         },
     ];
 
-    let drained: Vec<(FactId, StubFact)> = drain_id_facts(|cursor| {
-        let page = pages.get(cursor.get() as usize).cloned();
+    let drained: Vec<(FactId, StubFact)> = paginate(|cursor: Option<FactId>| {
+        let page = pages.get(cursor.map_or(0, |c| c.get() as usize)).cloned();
         async move {
             page.ok_or("stub page source: cursor out of range")
                 .map_err(|e: &str| e.to_owned())
         }
     })
+    .map_ok(|item| (item.fact_id, item.fact))
+    .try_collect()
     .await?;
 
     let ids: Vec<u64> = drained.iter().map(|(id, _)| id.get()).collect();

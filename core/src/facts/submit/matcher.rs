@@ -11,15 +11,16 @@
 //! index reads inside the transaction holding the commit.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::future::Future;
+use std::future::{Future, ready};
 
+use futures_util::TryStreamExt;
 use url::Url;
 
 use super::{Decl, EntityIdx, ImageIdx, SubmitFact};
 use crate::facts::assertions::FactualAssertion;
 use crate::facts::citations::{ExternalReference, Language};
-use crate::facts::drain::{DRAIN_PAGE, drain_pages};
 use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId};
+use crate::facts::pagination::{PAGE_SIZE, paginate};
 use crate::facts::schema::{EntityStream, FactPage, ImageStream, normalize_name};
 use crate::facts::store::{EntityIdOf, EntityView, FactStore, ImageIdOf, ImageView, StoredFactOf};
 use crate::facts::{attribute, image};
@@ -147,7 +148,7 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
         for reference in references.get(&idx).into_iter().flatten() {
             let stream = EntityStream::ByExternalReference { reference };
             collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                view.walk_entities(&stream, cursor, DRAIN_PAGE)
+                view.walk_entities(&stream, cursor, PAGE_SIZE)
             })
             .await?;
         }
@@ -156,7 +157,7 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
             for (name, language) in names.get(&idx).into_iter().flatten() {
                 let stream = EntityStream::ByName { name, language };
                 collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                    view.walk_entities(&stream, cursor, DRAIN_PAGE)
+                    view.walk_entities(&stream, cursor, PAGE_SIZE)
                 })
                 .await?;
             }
@@ -202,7 +203,7 @@ pub async fn match_images<S: FactStore, V: ImageView<S>>(
         for url in urls.get(&idx).into_iter().flatten() {
             let stream = ImageStream::BySourceUrl { url };
             collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                view.walk_images(&stream, cursor, DRAIN_PAGE)
+                view.walk_images(&stream, cursor, PAGE_SIZE)
             })
             .await?;
         }
@@ -220,7 +221,7 @@ pub async fn match_images<S: FactStore, V: ImageView<S>>(
 /// instead of a spurious ambiguity.
 async fn collect_candidates<S, Sub, F, Fut>(
     candidates: &mut BTreeMap<Sub, BTreeSet<FactId>>,
-    fetch: F,
+    mut fetch: F,
 ) -> Result<(), S::Error>
 where
     S: FactStore,
@@ -228,13 +229,17 @@ where
     F: FnMut(FactId) -> Fut,
     Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Sub>, S::Error>>,
 {
-    drain_pages(fetch, |item| {
-        candidates
-            .entry(item.representative)
-            .or_default()
-            .insert(item.fact_id);
-    })
-    .await
+    // The keyed class walks seek from an inclusive `FactId`; paginate opens
+    // each walk with `None`, so the zero id starts the scan.
+    paginate(move |after| fetch(after.unwrap_or(FactId::new(0))))
+        .try_for_each(|item| {
+            candidates
+                .entry(item.representative)
+                .or_default()
+                .insert(item.fact_id);
+            ready(Ok(()))
+        })
+        .await
 }
 
 /// Select the [`MatchOutcome`] for one decl's deduped candidate map: exactly

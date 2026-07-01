@@ -27,11 +27,14 @@ pub use types::{
 };
 
 use std::collections::BTreeMap;
+use std::future::{Future, ready};
+
+use futures_util::TryStreamExt;
 
 use crate::algebra::semiring::{Lineage, Semiring};
-use crate::facts::drain::{DRAIN_PAGE, drain_id_facts};
 use crate::facts::ids::FactId;
-use crate::facts::schema::EquivClass;
+use crate::facts::pagination::{PAGE_SIZE, paginate};
+use crate::facts::schema::{EquivClass, FactPage};
 use crate::facts::store::{
     EntityIdOf, EntityView, EventIdOf, EventView, FactStore, ImageIdOf, ImageView, StoredFactOf,
 };
@@ -49,6 +52,32 @@ where
     ImgId: Ord + Clone,
 {
     Lineage::Of([(id.clone(), citation.clone())].into_iter().collect())
+}
+
+/// Drain each subject's backlink walk into one `FactId`-keyed map. A fact
+/// mentioning several subjects lands under one key idempotently, so the map is
+/// the deduplicated union of the walks, ordered by `FactId` for a deterministic
+/// fold downstream.
+async fn collect_backlinks<S, Sub, Rep, F, Fut>(
+    subjects: impl IntoIterator<Item = Sub>,
+    mut walk: F,
+) -> Result<BTreeMap<FactId, StoredFactOf<S>>, S::Error>
+where
+    S: FactStore,
+    Sub: Copy,
+    F: FnMut(Sub, Option<FactId>) -> Fut,
+    Fut: Future<Output = Result<FactPage<StoredFactOf<S>, Rep>, S::Error>>,
+{
+    let mut facts = BTreeMap::new();
+    for subject in subjects {
+        paginate(|cursor| walk(subject, cursor))
+            .try_for_each(|item| {
+                facts.insert(item.fact_id, item.fact);
+                ready(Ok(()))
+            })
+            .await?;
+    }
+    Ok(facts)
 }
 
 /// Project an entity's `SameEntity` class as an [`Entity`] over the
@@ -88,13 +117,10 @@ where
     // HasEvent in both the entity and event backlink sets) lands under one
     // FactId key, idempotently; the BTreeMap keeps the set keyed and ordered by
     // FactId for a deterministic fold.
-    let mut facts: BTreeMap<FactId, StoredFactOf<S>> = BTreeMap::new();
-    for member in &class.members {
-        let member_facts =
-            drain_id_facts(|cursor| view.all_facts_about_entity(member, cursor, DRAIN_PAGE))
-                .await?;
-        facts.extend(member_facts);
-    }
+    let mut facts = collect_backlinks::<S, _, _, _, _>(class.members.iter(), |m, c| {
+        view.all_facts_about_entity(m, c, PAGE_SIZE)
+    })
+    .await?;
 
     // Interior event facts key off their event id, never the entity, so the
     // entity drain alone never reaches them. The `HasEvent` facts (in the entity
@@ -106,11 +132,12 @@ where
     // The `HasEvent` facts also name which member reaches each event; the merge
     // tags an interior event's facts with that member as their source id.
     let reachers = merge::event_reachers(&facts);
-    for event in reachers.keys() {
-        let event_facts =
-            drain_id_facts(|cursor| view.all_facts_about_event(event, cursor, DRAIN_PAGE)).await?;
-        facts.extend(event_facts);
-    }
+    facts.extend(
+        collect_backlinks::<S, _, _, _, _>(reachers.keys(), |e, c| {
+            view.all_facts_about_event(e, c, PAGE_SIZE)
+        })
+        .await?,
+    );
 
     let entity = merge::project_facts(&facts, &class.members, &reachers, provenance);
     Ok((class, entity))
@@ -146,12 +173,10 @@ where
 
     // A member's backlinks include every image-level fact naming it and every
     // depiction / composite edge it sits on; one FactId keys each fact once.
-    let mut facts: BTreeMap<FactId, StoredFactOf<S>> = BTreeMap::new();
-    for member in &class.members {
-        let member_facts =
-            drain_id_facts(|cursor| view.all_facts_about_image(member, cursor, DRAIN_PAGE)).await?;
-        facts.extend(member_facts);
-    }
+    let facts = collect_backlinks::<S, _, _, _, _>(class.members.iter(), |m, c| {
+        view.all_facts_about_image(m, c, PAGE_SIZE)
+    })
+    .await?;
 
     let image = merge::project_image_facts(&facts, &class.members, provenance);
     Ok((class, image))

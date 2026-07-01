@@ -30,8 +30,8 @@
 //!   per-subject view traits [`store::EntityView`] /
 //!   [`store::EventView`] / [`store::ImageView`].
 //! - [`schema`] — query types ([`schema::Bbox`], [`schema::TimeRange`],
-//!   [`schema::FactPage`], [`schema::PageItem`], [`schema::EquivClass`],
-//!   [`schema::EdgeSubgraph`]) and the per-subject stream enums
+//!   [`schema::FactPage`], [`schema::PageItem`], [`schema::EquivClass`]) and
+//!   the per-subject stream enums
 //!   ([`schema::EntityStream`] / [`schema::EventStream`] /
 //!   [`schema::ImageStream`]). Each subject kind has a single canonical
 //!   equivalence (and entities a single canonical edge relation), all
@@ -115,7 +115,6 @@ pub mod bookend;
 pub mod citations;
 pub mod composites;
 pub mod depiction;
-mod drain;
 pub mod event;
 pub mod features;
 pub mod geometry;
@@ -125,6 +124,7 @@ pub mod image;
 pub mod lifecycle;
 pub mod memory;
 pub mod observation;
+mod pagination;
 pub mod projection;
 pub mod schema;
 pub mod spatial;
