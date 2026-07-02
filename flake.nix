@@ -151,6 +151,7 @@
         apiRuntimeEnv = {
           SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
           WIKIDATA_TEST_DB = wikidata.bundles.curated.testDb;
+          WIKIDATA_ENTITIES_JSONL = "${wikidata.bundles.curated.entities}/entities.jsonl";
           REGIONS_DB = "${regions.regions.italy.db}/regions.sqlite";
         };
         backendEnv = apiRuntimeEnv // {
