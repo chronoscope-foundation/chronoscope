@@ -287,6 +287,9 @@ async fn run_dev_server(
         },
         dns_resolver: default_dns_resolver()
             .map_err(|e| format!("Failed to create DNS resolver: {e}"))?,
+        wikidata_entities_jsonl: std::env::var("WIKIDATA_ENTITIES_JSONL")
+            .ok()
+            .map(std::path::PathBuf::from),
     })
     .await
     .map_err(|e| format!("Failed to start dev server: {e}"))?;

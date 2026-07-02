@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chronoscope_api_client::client::{ApiError, AuthClient};
+use chronoscope_core::facts::memory::MemoryFactStore;
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{
@@ -190,10 +191,19 @@ impl TestContext {
         #[cfg(feature = "embedded-media")]
         let app_state = {
             let store = media_store.unwrap_or_else(|| Arc::new(InMemoryMediaStore::new()));
-            AppState::new(db, config, jwt, Box::new(resolver), store).await?
+            AppState::new(
+                db,
+                config,
+                jwt,
+                Box::new(resolver),
+                store,
+                MemoryFactStore::new(),
+            )
+            .await?
         };
         #[cfg(not(feature = "embedded-media"))]
-        let app_state = AppState::new(db, config, jwt, Box::new(resolver)).await?;
+        let app_state =
+            AppState::new(db, config, jwt, Box::new(resolver), MemoryFactStore::new()).await?;
 
         let app_state = Arc::new(app_state);
 

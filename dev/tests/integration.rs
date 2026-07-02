@@ -134,6 +134,8 @@ impl TestServer {
             apify_config,
             triton,
             dns_resolver: permissive_dns_resolver(),
+            // URL-fetch pipeline tests don't need fact-store data.
+            wikidata_entities_jsonl: None,
         })
         .await?;
 

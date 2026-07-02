@@ -76,6 +76,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
+# Fact-store types (for the curated-JSONL loader in `factstore`)
+chronoscope-core = { path = "../core" }
+chronoscope-ingestion = { path = "../ingestion" }
+chronoscope-integrations = { path = "../integrations" }
+serde_json.workspace = true
+
 [dev-dependencies]
 # API client (typed Client/AuthClient for integration tests)
 chronoscope-api-client = { path = "../api-client" }
@@ -87,10 +93,6 @@ chronoscope-db = { path = "../db", features = ["test-support"] }
 # Testing
 tokio-test = "0.4"
 test-with = "0.14"
-serde_json.workspace = true
-# For bundle loading e2e tests
-chronoscope-core = { path = "../core" }
-chronoscope-ingestion = { path = "../ingestion" }
 oxilangtag = { version = "0.1", features = ["serde"] }
 url.workspace = true
 

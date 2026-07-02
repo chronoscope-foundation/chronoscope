@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chronoscope_core::facts::memory::MemoryFactStore;
 use chronoscope_db::Database;
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::MediaStore;
@@ -171,6 +172,8 @@ pub struct AppState {
     pub config: Config,
     #[cfg(feature = "embedded-media")]
     pub media_store: Arc<dyn MediaStore>,
+    /// In-memory fact store of submitted entity and image facts.
+    pub facts: MemoryFactStore,
 }
 
 impl AppState {
@@ -185,6 +188,7 @@ impl AppState {
         jwt: JwtConfig,
         dns_resolver: Box<dyn DnsResolver>,
         #[cfg(feature = "embedded-media")] media_store: Arc<dyn MediaStore>,
+        facts: MemoryFactStore,
     ) -> Result<Self, AppStateError> {
         let rp_origin = Url::parse(&config.rp_origin)
             .map_err(|e| AppStateError::InvalidOrigin(format!("{e}")))?;
@@ -203,6 +207,7 @@ impl AppState {
             config,
             #[cfg(feature = "embedded-media")]
             media_store,
+            facts,
         })
     }
 }

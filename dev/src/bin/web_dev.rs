@@ -9,7 +9,7 @@
 //! Or via justfile:
 //!   just web-dev
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,6 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let database_url = web_dev_db.as_ref().map(|db| db.database_url.clone());
 
+    // 2b. Use a curated Wikidata entities.jsonl for the fact store if available.
+    let wikidata_entities_jsonl = std::env::var("WIKIDATA_ENTITIES_JSONL")
+        .ok()
+        .map(PathBuf::from);
+
     // 3. Start the API server
     let http_client =
         Arc::new(ReqwestClient::new().map_err(|e| format!("Failed to create HTTP client: {e}"))?);
@@ -97,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         apify_config: None,
         triton: None,
         dns_resolver: permissive_dns_resolver(),
+        wikidata_entities_jsonl,
     })
     .await
     .map_err(|e| format!("Failed to start API server: {e}"))?;

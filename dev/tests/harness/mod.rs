@@ -274,6 +274,10 @@ impl WebTest {
         let http_client: Arc<dyn chronoscope_workers::HttpClient> =
             Arc::new(chronoscope_workers::ReqwestClient::new()?);
 
+        let wikidata_entities_jsonl = std::env::var("WIKIDATA_ENTITIES_JSONL")
+            .ok()
+            .map(PathBuf::from);
+
         let server = start_dev_server(DevServerConfig {
             database_url,
             http_client,
@@ -288,6 +292,7 @@ impl WebTest {
             apify_config: None,
             triton: None,
             dns_resolver: chronoscope_api::state::permissive_dns_resolver(),
+            wikidata_entities_jsonl,
         })
         .await?;
 

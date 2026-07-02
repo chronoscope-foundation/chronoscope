@@ -9,12 +9,14 @@
 //! - Integration tests (with VCR HTTP client and localhost)
 
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config};
+use chronoscope_core::facts::memory::MemoryFactStore;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId};
 use chronoscope_workers::analysis::AnalysisWorker;
@@ -27,6 +29,10 @@ use dropshot::{ApiDescription, ConfigDropshot, HttpServerStarter};
 use slog::info;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+
+mod factstore;
+
+pub use factstore::{LoadError, load_curated_fact_store};
 
 /// Error type for dev server setup.
 #[derive(Debug, thiserror::Error)]
@@ -228,6 +234,11 @@ pub struct DevServerConfig {
     /// Use `default_dns_resolver()` for system DNS or `permissive_dns_resolver()`
     /// for offline environments (e.g., tests).
     pub dns_resolver: Box<dyn chronoscope_api::state::DnsResolver>,
+
+    /// Optional: path to a curated Wikidata `entities.jsonl` snapshot to
+    /// load into the in-memory fact store at startup. `None` starts with an
+    /// empty store.
+    pub wikidata_entities_jsonl: Option<PathBuf>,
 }
 
 /// Find an available port by binding to port 0 and reading the assigned port.
@@ -507,7 +518,24 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         ..Default::default()
     };
 
-    // Create AppState with our shared database and media store
+    // Load the curated fact store, if configured; otherwise start empty.
+    let facts = match &config.wikidata_entities_jsonl {
+        Some(path) => {
+            let (facts, stats) = load_curated_fact_store(path)
+                .await
+                .map_err(|e| format!("Failed to load curated fact store: {e}"))?;
+            info!(log, "Loaded curated fact store";
+                "entities" => stats.entities,
+                "commits" => stats.commits,
+                "facts" => stats.facts,
+                "skipped" => stats.skipped,
+            );
+            facts
+        }
+        None => MemoryFactStore::new(),
+    };
+
+    // Create AppState with our shared database, media store, and fact store
     let media_store_for_server = media_store.clone();
     let app_state = AppState::new(
         db.as_ref().clone(),
@@ -515,6 +543,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         jwt_config,
         config.dns_resolver,
         media_store,
+        facts,
     )
     .await
     .map_err(|e| format!("Failed to create app state: {e}"))?;

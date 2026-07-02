@@ -865,6 +865,7 @@ dependencies = [
  "chronoscope-core",
  "chronoscope-db",
  "chronoscope-ingestion",
+ "chronoscope-integrations",
  "chronoscope-workers",
  "dropshot",
  "futures 0.3.32",
