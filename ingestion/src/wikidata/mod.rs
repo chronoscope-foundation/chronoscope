@@ -15,6 +15,7 @@
 //! ingest::run(&config).await?;
 //! ```
 
+pub mod commits;
 pub mod filter;
 pub mod handlers;
 pub mod ingest;

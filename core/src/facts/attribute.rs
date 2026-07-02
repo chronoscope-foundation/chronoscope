@@ -48,12 +48,14 @@
 //!   separately asserted; an inverse assertion surfaces as a `MergedFrom` /
 //!   `SplitFrom` conflict.
 //!
-//! ## External references
+//! # External references
 //!
-//! - On [`Fact::ExternalReference`], the (system, identifier) pair must be
-//!   unique across entities — the same Wikidata QID resolving to two different
-//!   `EntId`s in the projection is an identity-merge conflict, not a
-//!   duplicate-fact tolerance.
+//! [`Fact::ExternalReference`] is a lookup pointer several entities may share:
+//! an external system's granularity can be coarser than ours — one Wikidata
+//! item spans an entity's demolish→rebuild splits — so a by-reference walk is a
+//! search over the matching set, and submit imposes no uniqueness rule. The
+//! matcher reads multiple hits on one reference as an ambiguous match (mint
+//! fresh, surface the candidates), leaving identity to an explicit judgment.
 
 use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
