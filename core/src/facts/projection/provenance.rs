@@ -6,7 +6,8 @@
 //! different semiring operations: the extent (join, `+`) and the consensus
 //! (meet, `·`).
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::algebra::semiring::Lineage;
 use crate::facts::citations::{FactualCitation, JudgmentSource};
@@ -28,8 +29,9 @@ pub struct Cited<V, T> {
 /// Two arms per stored-fact category that can warrant a value — a factual claim
 /// cites a [`FactualCitation`], a judgment a [`JudgmentSource`]. A meta fact
 /// never backs a value, so it has no arm here.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(bound(deserialize = "ImgId: ::serde::de::DeserializeOwned"))]
 pub enum Citation<ImgId> {
     /// A factual claim's citation.
     Factual { citation: FactualCitation },

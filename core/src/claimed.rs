@@ -8,7 +8,8 @@
 
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::algebra::lattice::{JoinSemilattice, MeetSemilattice};
 use crate::algebra::monoid::CommutativeMonoid;
@@ -21,8 +22,9 @@ use crate::algebra::monoid::CommutativeMonoid;
 /// consumer as the value lattice. The derived `Serialize` tags each variant with
 /// an internal `"type"` field (`of` / `any`) for the grammar's uniform
 /// internal-tag convention.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[serde(bound(deserialize = "A: ::serde::de::DeserializeOwned + Ord"))]
 pub enum Claimed<A: Ord> {
     /// Exactly these values have been asserted. The empty set is ⊥.
     Of { values: BTreeSet<A> },

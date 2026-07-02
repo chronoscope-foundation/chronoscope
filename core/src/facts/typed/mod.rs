@@ -9,7 +9,8 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::algebra::lattice::JoinSemilattice;
 use crate::algebra::semiring::Semiring;
@@ -32,7 +33,8 @@ pub use image::*;
 
 /// A value with the citations that attribute it — the additive-field mirror,
 /// where membership carries no consensus/extent split.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(deserialize = "V: ::serde::Deserialize<'de>, ImgId: ::serde::de::DeserializeOwned"))]
 pub struct Attributed<V, ImgId> {
     pub value: V,
     pub sources: Vec<Citation<ImgId>>,
@@ -41,7 +43,10 @@ pub struct Attributed<V, ImgId> {
 /// The `T`-flattened mirror of the projection's [`Bracket`], for any lattice
 /// `V`: the extent (`possible`), the citations behind it, and the consensus read
 /// off the bracket's conflict tri-state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "V: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub struct Bounded<V, ImgId> {
     /// The extent (join) — what any source allows, in the field's own lattice.
     pub possible: V,
@@ -51,8 +56,9 @@ pub struct Bounded<V, ImgId> {
 
 /// The consensus side of a flattened bracket: whether a claim settled the slot,
 /// over-determined it, was declined this layer, or never touched it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
+#[serde(bound(deserialize = "V: ::serde::de::DeserializeOwned"))]
 pub enum Consensus<V> {
     /// No claim touched this slot.
     Absent,
@@ -67,7 +73,7 @@ pub enum Consensus<V> {
 /// Why a consensus is [`Pending`](Consensus::Pending). One variant today — the
 /// location circle cap; the carrier is uniform across fields so a future
 /// undecidable date or discrete bound surfaces the same way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PendingReason {
     /// The merged region is too complex to run the emptiness check, or an
@@ -77,7 +83,10 @@ pub enum PendingReason {
 
 /// One `SameEntity` bridge: the ordered, distinct id pair a judgment unified and
 /// the citations behind it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "EntId: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub struct MergeBridge<EntId: Ord, ImgId> {
     pub endpoints: OrderedDistinctPair<EntId>,
     pub judgment: Vec<Citation<ImgId>>,
@@ -85,7 +94,10 @@ pub struct MergeBridge<EntId: Ord, ImgId> {
 
 /// How an entity's class was assembled: the mention count (always ≥1, the class
 /// includes its own subject) and the bridges that merged its mentions.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "EntId: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub struct MergeProvenance<EntId: Ord, ImgId> {
     pub mention_count: NonZeroUsize,
     pub bridges: Vec<MergeBridge<EntId, ImgId>>,
@@ -99,7 +111,10 @@ pub struct MergeProvenance<EntId: Ord, ImgId> {
 /// [`Entity::depictions`] by image — so the one type carries both views. A bare
 /// depiction (no localization, no perspective) flattens both bracket fields to
 /// `Absent`; `sources` keeps the link's attribution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "OtherId: ::serde::Deserialize<'de>, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub struct Depiction<OtherId, ImgId> {
     /// The depiction's far end — the depicted entity in [`Image::depicts`], the
     /// depicting image in [`Entity::depictions`]; the one generic type serves

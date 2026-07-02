@@ -12,7 +12,10 @@ use super::*;
 /// The typed DTO for one image: each source URL attributed, the medium
 /// flattened to a [`Bounded`], the depicted entities with their per-depiction
 /// linkage, and the composite links up to parents and down to subimages.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "EntId: ::serde::Deserialize<'de>, ImgId: ::serde::de::DeserializeOwned + Ord + std::fmt::Debug"
+))]
 pub struct Image<EntId, ImgId: Ord> {
     pub id: ImgId,
     /// Each source URL with the citations behind it.
@@ -34,7 +37,8 @@ pub struct Image<EntId, ImgId: Ord> {
 
 /// One composite link, in either direction. `region` always means the subimage
 /// end's rectangle within the parent end.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(deserialize = "ImgId: ::serde::de::DeserializeOwned"))]
 pub struct CompositeLink<ImgId> {
     pub image: ImgId,
     pub region: Bounded<Claimed<SubimageRegion>, ImgId>,

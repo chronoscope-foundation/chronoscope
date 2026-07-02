@@ -16,6 +16,8 @@
 use std::num::NonZeroUsize;
 
 use chrono::NaiveDate;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::facts::ids::FactId;
 use crate::facts::projection::{member_lineage, project_entity};
@@ -36,7 +38,10 @@ pub fn extract_point<EntId: Ord, EvtId, ImgId>(
 
 /// One placeable entity in a viewport: its id, names, current marker, and the
 /// date span of its timeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "EntId: ::serde::Deserialize<'de>, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub struct EntitySummary<EntId, ImgId> {
     pub id: EntId,
     pub names: Vec<typed::Name<ImgId>>,
@@ -52,7 +57,7 @@ pub struct EntitySummary<EntId, ImgId> {
 /// A resume token for [`summaries_in_bbox`]: the snapshot it was minted against
 /// and the walk cursor to continue past. Pinning the snapshot lets a resume
 /// reject a token from a different view rather than silently mixing states.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ListCursor<Cur> {
     pub snapshot: FactId,
     pub walk: Cur,
@@ -60,7 +65,10 @@ pub struct ListCursor<Cur> {
 
 /// One page of a viewport listing: the summaries gathered this page and the
 /// cursor to fetch the next, `None` once the viewport is exhausted.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "EntId: ::serde::Deserialize<'de>, ImgId: ::serde::de::DeserializeOwned, Cur: ::serde::Deserialize<'de>"
+))]
 pub struct EntityListPage<EntId, ImgId, Cur> {
     pub summaries: Vec<EntitySummary<EntId, ImgId>>,
     pub next: Option<ListCursor<Cur>>,

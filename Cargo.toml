@@ -36,7 +36,7 @@ serde_json = "1.0"
 serde_with = { version = "3", default-features = false, features = ["macros"] }
 
 # Schema generation for OpenAPI
-schemars = { version = "0.8", features = ["chrono"] }
+schemars = { version = "0.8", features = ["chrono", "url"] }
 
 # Common utilities
 chrono = { version = "0.4", features = ["serde"] }

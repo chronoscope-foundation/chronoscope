@@ -21,7 +21,8 @@ use super::*;
 
 /// A name claim, flattened: the dedup triple plus its validity window and the
 /// citations behind its presence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(deserialize = "ImgId: ::serde::de::DeserializeOwned"))]
 pub struct Name<ImgId> {
     pub text: String,
     pub language: Language,
@@ -33,7 +34,10 @@ pub struct Name<ImgId> {
 
 /// A directed relationship to a neighbor: the bare target id plus the relation
 /// kinds asserted, each attributed. Label resolution is a later ids→names pass.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "EntId: ::serde::Deserialize<'de>, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub struct Relation<EntId, ImgId> {
     pub other: EntId,
     pub kinds: Vec<Attributed<EntityRelationType, ImgId>>,
@@ -41,7 +45,8 @@ pub struct Relation<EntId, ImgId> {
 
 /// A start/completion span over two independently-bounded endpoints — a consumer
 /// renders the span rather than collapsing it into one range.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(deserialize = "ImgId: ::serde::de::DeserializeOwned"))]
 pub struct Period<ImgId> {
     pub started: Bounded<UncertainDate, ImgId>,
     pub completed: Bounded<UncertainDate, ImgId>,
@@ -49,7 +54,8 @@ pub struct Period<ImgId> {
 
 /// The flattened mirror of [`projection::Event`] (the semiring param removed), kept
 /// whole on an [`InteriorEvent::Ambiguous`] entry whose kind didn't settle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(deserialize = "ImgId: ::serde::de::DeserializeOwned"))]
 pub struct EventFacts<ImgId> {
     pub started: Bounded<UncertainDate, ImgId>,
     pub completed: Bounded<UncertainDate, ImgId>,
@@ -63,8 +69,11 @@ pub struct EventFacts<ImgId> {
 
 /// One lifecycle timeline entry: a bookend (construction/demolition) or an
 /// interior event with its id, descriptions, and parsed kind.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "phase", rename_all = "snake_case")]
+#[serde(bound(
+    deserialize = "EvtId: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub enum EventDetail<EvtId, ImgId> {
     /// Synthesized from the `construction` bookend, with its own location slot.
     Constructed {
@@ -85,8 +94,9 @@ pub enum EventDetail<EvtId, ImgId> {
 
 /// One interior event's kind, parsed into a typed variant when its kind settled
 /// to a singleton, else [`Ambiguous`](InteriorEvent::Ambiguous).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(bound(deserialize = "ImgId: ::serde::de::DeserializeOwned"))]
 pub enum InteriorEvent<ImgId> {
     Modified {
         period: Period<ImgId>,
@@ -126,7 +136,10 @@ pub enum InteriorEvent<ImgId> {
 /// `sources` is universal: an interior event carries its kind/existence
 /// citations (so a bare `Modified` with no dates keeps its attribution); a
 /// bookend carries the union of its date and location bracket citations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "EvtId: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub struct TimelineEntry<EvtId, ImgId> {
     pub detail: EventDetail<EvtId, ImgId>,
     pub sources: Vec<Citation<ImgId>>,
@@ -135,7 +148,10 @@ pub struct TimelineEntry<EvtId, ImgId> {
 /// The typed DTO for one entity: every restrictive field flattened to a
 /// [`Bounded`], every membership attributed, the interior events parsed into a
 /// sorted timeline, and the merge lineage surfaced.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(
+    deserialize = "EntId: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, EvtId: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
+))]
 pub struct Entity<EntId: Ord, EvtId, ImgId> {
     pub id: EntId,
     pub names: Vec<Name<ImgId>>,
