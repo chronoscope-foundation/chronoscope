@@ -27,6 +27,7 @@
 //! parameters on `FactualAssertion` / `JudgmentAssertion` are instantiated
 //! with the index newtypes instead of persistent ids.
 
+pub(crate) mod driver;
 pub mod error;
 pub mod matcher;
 pub mod pipeline;

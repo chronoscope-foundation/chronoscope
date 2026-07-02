@@ -1,8 +1,9 @@
 //! Shared submit-pipeline machinery.
 //!
-//! [`FactStore::submit_commit`](crate::store::FactStore::submit_commit) is
-//! thin; each backend composes the free functions here with its own minting +
-//! insertion, so SQLite / Postgres reuse the orchestration.
+//! [`FactStore::submit_commit`](crate::store::FactStore::submit_commit)
+//! is provided: the shared driver composes the free functions here with the
+//! [`FactWrite`](crate::store::FactWrite) primitives a backend's
+//! transaction supplies, so every backend reuses the orchestration.
 //!
 //! The module provides:
 //!
@@ -222,7 +223,7 @@ where
         let facts = paginate(&mut *view, |v, cursor| async move {
             let page = v.all_facts_about_event(event, cursor, PAGE_SIZE).await?;
             let (rows, next) = page.into_parts();
-            Ok((rows, next, v))
+            Ok::<_, S::Error>((rows, next, v))
         })
         .map_ok(|item| item.fact)
         .try_collect()
@@ -235,7 +236,7 @@ where
         let facts = paginate(&mut *view, |v, cursor| async move {
             let page = v.all_facts_about_image(image, cursor, PAGE_SIZE).await?;
             let (rows, next) = page.into_parts();
-            Ok((rows, next, v))
+            Ok::<_, S::Error>((rows, next, v))
         })
         .map_ok(|item| item.fact)
         .try_collect()

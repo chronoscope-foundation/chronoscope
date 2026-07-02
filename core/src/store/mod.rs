@@ -78,12 +78,24 @@
 //!
 //! Callers enter a transaction via [`Self::with_tx`], submit commits through
 //! the supplied [`Self::Tx`] handle, and return `Ok` to commit or
-//! `Err`/panic to roll back. The submit sequence is match → resolve/mint →
-//! validate → insert. It reads existing state to match declarations and
-//! check cross-fact rules before inserting, so the whole sequence runs under
-//! one transaction — a held mutex for the in-memory backend, a SQL
-//! transaction for a SQL backend — to keep a concurrent writer from slipping
-//! between the reads and the insert.
+//! `Err`/panic to roll back. The transaction is the unit of atomicity: every
+//! commit submitted through the handle applies together on `Ok`, and none of
+//! them on `Err` — a multi-commit closure that fails partway leaves the
+//! store untouched.
+//!
+//! The handle implements [`FactWrite`]: the full read surface over
+//! committed ∪ staged state plus the primitives only a live transaction can
+//! offer (minting, staging, commit recording). [`Self::submit_commit`] is a
+//! provided method — the shared submit driver — built on those primitives,
+//! so a backend implements the primitives and inherits the orchestration.
+//! The submit sequence is match → resolve/mint → validate → stage. It reads
+//! existing state to match declarations and check cross-fact rules before
+//! staging, so the whole sequence runs under one transaction — a held mutex
+//! for the in-memory backend, a SQL transaction for a SQL backend — to keep
+//! a concurrent writer from slipping between the reads and the insert. A
+//! failed submit poisons the transaction ([`FactWrite::poison`]): later
+//! writes and the commit step refuse, so a rejection can't smuggle its
+//! staging into history.
 //!
 //! The closure-scoped `with_tx` shape (rather than `begin_tx` / `commit_tx`)
 //! lets the trait carry the brand-pattern `for<'brand>` HRTB.
@@ -98,10 +110,12 @@
 //! invariant. The closure is the only way to name a `Tx<'brand>`, and the
 //! returned future is bounded by `'brand`, so handles can't leak past it.
 //!
-//! `'brand` is a type-level marker, not a borrow; backends carry their state
-//! on `&self`. [`MemoryTx`](crate::store::memory::MemoryTx) is a zero-size
-//! sentinel. A SQL backend puts a `sqlx::Transaction` inside `Tx<'brand>`;
-//! the brand still gates which `with_tx` body it threads through.
+//! `'brand`'s role is the type-level tag; whether it doubles as a real
+//! borrow is the backend's business.
+//! [`MemoryTx`](crate::store::memory::MemoryTx) borrows the state its
+//! `with_tx` frame holds; a SQL backend puts an owned `sqlx::Transaction`
+//! inside `Tx<'brand>`. Either way the brand gates which `with_tx` body the
+//! handle threads through.
 
 pub mod memory;
 pub(crate) mod pagination;
@@ -111,13 +125,13 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::grammar::ids::{FactId, IdScheme};
+use crate::grammar::ids::{CommitId, FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
 use crate::store::schema::{
     ClassPage, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
 };
 use crate::submit;
-use crate::submit::{FactLookup, StoredFact, SubmitError, SubmitResult};
+use crate::submit::{FactLookup, StoredCommit, StoredFact, SubmitError, SubmitResult};
 
 // ============================================================================
 // Store id-projection aliases
@@ -203,10 +217,15 @@ pub trait FactStore: Send + Sync + Sized {
     /// tags handles to their call site so the type system can refuse
     /// cross-instance misuse, and has no runtime role.
     ///
-    /// In-memory backends hold a `MutexGuard` in the handle; SQL backends
-    /// hold a `sqlx::Transaction`. Dropping the handle before
-    /// [`Self::with_tx`]'s closure completes rolls back.
-    type Tx<'brand>: Send + 'brand
+    /// [`FactWrite`] because the handle is the write surface the provided
+    /// [`Self::submit_commit`] drives: reads over committed ∪ staged state
+    /// plus minting, staging, and commit recording. The in-memory backend's
+    /// handle borrows transaction state held by its `with_tx` frame — an
+    /// owned guard in the handle would keep the closure's borrow alive past
+    /// the apply step. A SQL backend can own its `sqlx::Transaction` in the
+    /// handle. Dropping the handle before [`Self::with_tx`]'s closure
+    /// completes rolls back.
+    type Tx<'brand>: FactWrite<Self> + Send + 'brand
     where
         Self: 'brand;
 
@@ -227,27 +246,50 @@ pub trait FactStore: Send + Sync + Sized {
     /// would force an externally-captured `&self` to be `'static`, so the
     /// store reference is threaded in instead.
     ///
-    /// The store opens the transaction, runs `f`, commits on `Ok` and rolls
-    /// back on `Err`. Backend-level failures (`begin`, `commit`) flow through
-    /// `Result<R, Self::Error>`; submit-pipeline errors live inside `R` —
-    /// typically `R = Result<T, SubmitCommitError<Self::Error>>`.
-    fn with_tx<F, R>(&self, f: F) -> impl Future<Output = Result<R, Self::Error>> + Send
+    /// The store opens the transaction, runs `f`, commits on `Ok(_)` and
+    /// rolls back on `Err(_)` — the closure's `Result` is the commit
+    /// decision, which is why the signature pins it rather than an opaque
+    /// output. Everything staged through the handle applies together or not
+    /// at all. Backend-level failures (`begin`, `commit`) flow through the
+    /// outer `Result`; the closure's own outcome comes back inside it —
+    /// typically `E = SubmitCommitError<Self::Error>`.
+    ///
+    /// Every read inside the closure goes through the tx handle. The store's
+    /// own read surface is off-limits for the closure's duration: the
+    /// in-memory backend holds the writer lock, so a store-level read inside
+    /// the closure deadlocks, and a SQL backend's store-level reads see only
+    /// committed state — a torn view of the transaction.
+    fn with_tx<F, T, E>(
+        &self,
+        f: F,
+    ) -> impl Future<Output = Result<Result<T, E>, Self::Error>> + Send
     where
         F: for<'brand> FnOnce(
                 &'brand Self,
                 &'brand mut Self::Tx<'brand>,
-            ) -> Pin<Box<dyn Future<Output = R> + Send + 'brand>>
+            )
+                -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'brand>>
             + Send,
-        R: Send;
+        T: Send,
+        E: Send;
 
     /// Submit a commit bundle inside the supplied transaction. Derives the
-    /// [`CommitId`](crate::grammar::ids::CommitId) via `Commit::id()` (JCS +
-    /// SHA-256) and dedups against the commit cache, resolves every
-    /// declaration to a persistent id (`Existing` passes through, `Local`
-    /// mints fresh), rewrites each fact's bundle-local indices to the
-    /// resolved ids, and inserts. A matcher match on a `Local` decl is
-    /// persisted as a machine-authored identity judgment in a companion
-    /// commit, reported via `SubmitResult::companion_commit_id`.
+    /// [`CommitId`] via `Commit::id()` (JCS + SHA-256) and dedups against the
+    /// commit cache, resolves every declaration to a persistent id
+    /// (`Existing` passes through, `Local` mints fresh), rewrites each fact's
+    /// bundle-local indices to the resolved ids, and stages. A matcher match
+    /// on a `Local` decl is persisted as a machine-authored identity judgment
+    /// in a companion commit, reported via
+    /// `SubmitResult::companion_commit_id`.
+    ///
+    /// Provided: the default body is the shared submit driver over the
+    /// [`FactWrite`] primitives on [`Self::Tx`], so backends implement the
+    /// primitives and inherit the orchestration.
+    ///
+    /// Any error poisons the transaction (see [`FactWrite::poison`]): a
+    /// failed submit may leave staging and mints the backend cannot unwind,
+    /// so the transaction is void — return `Err` from the `with_tx` closure
+    /// and retry in a fresh one.
     ///
     /// The `tx` borrow is `&mut` so the caller can't overlap two
     /// `submit_commit` calls on one handle; sequential commits inside one
@@ -259,7 +301,10 @@ pub trait FactStore: Send + Sync + Sized {
     ) -> impl Future<Output = SubmitCommitOutput<Self>> + Send + 'tx
     where
         Self: 'brand,
-        'brand: 'tx;
+        'brand: 'tx,
+    {
+        submit::driver::drive_submit::<Self, Self::Tx<'brand>>(tx, commit)
+    }
 
     /// The next [`FactId`] this store would mint — one past the highest
     /// stored fact, or `FactId::new(0)` on an empty store (the value
@@ -280,14 +325,16 @@ pub trait FactStore: Send + Sync + Sized {
     fn now(&self) -> impl Future<Output = Result<Self::View<'_>, Self::Error>> + Send;
 }
 
-/// Aggregate error for `submit_commit`: a submit-pipeline domain error or a
-/// backend failure, in one enum so the return type stays `Result<_, _>`.
-/// `Submit` carries every rule violation the pipeline found in one batch;
-/// backend failures carry backend diagnostics.
+/// Aggregate error for `submit_commit`: a submit-pipeline domain error, a
+/// backend failure, or a driver-level failure, in one enum so the return
+/// type stays `Result<_, _>`. `Submit` carries every rule violation the
+/// pipeline found in one batch; backend failures carry backend diagnostics.
 ///
 /// `E` is the backend error; `R` is the backend's id scheme, threaded into
 /// [`SubmitError`] so a rejection carries the offending id typed. The scheme
-/// appears only in the `Submit` arm.
+/// appears only in the `Submit` arm. The driver arms hold rendered `String`
+/// messages: their sources (`serde_json::Error`, formatted diagnoses) aren't
+/// `Clone`/`Eq`, and this type is value-compared in tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitCommitError<E, R: IdScheme> {
     /// A submit-pipeline run rejected the bundle, carrying the non-empty
@@ -295,6 +342,17 @@ pub enum SubmitCommitError<E, R: IdScheme> {
     Submit(NonEmptyVec<SubmitError<R::Entity, R::Event, R::Image>>),
     /// A backend failure (I/O, transaction abort, etc.).
     Backend(E),
+    /// Commit-id derivation failed — JCS encoding or digest parse.
+    Hashing {
+        /// The rendered encoding failure.
+        message: String,
+    },
+    /// The submit driver detected a broken invariant of its own — a store
+    /// bug, surfaced loudly rather than persisted.
+    Internal {
+        /// The rendered diagnosis, with context from the detection site.
+        message: String,
+    },
 }
 
 impl<E, R: IdScheme> std::fmt::Display for SubmitCommitError<E, R>
@@ -318,6 +376,10 @@ where
                 Ok(())
             }
             Self::Backend(e) => write!(f, "backend failure: {e}"),
+            Self::Hashing { message } => write!(f, "commit hash encoding failed: {message}"),
+            Self::Internal { message } => {
+                write!(f, "submit driver invariant violated: {message}")
+            }
         }
     }
 }
@@ -556,4 +618,90 @@ pub trait ImageView<S: FactStore>: FactView<S> {
         after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<WalkPage<S, ImageIdOf<S>>, S::Error>> + Send;
+}
+
+// ============================================================================
+// FactWrite — transaction-scoped write surface
+// ============================================================================
+
+/// The write surface a live transaction offers: the full read surface over
+/// committed ∪ staged state (the view supertraits) plus the primitives only
+/// an open transaction can supply — minting, staging, and commit recording.
+///
+/// Bound on [`FactStore::Tx`], so the provided
+/// [`submit_commit`](FactStore::submit_commit) — the shared submit driver —
+/// runs against any backend's transaction. Reads through the handle see
+/// committed facts plus everything staged earlier in the same transaction; a
+/// staged fact's id is provisional only in that the transaction may roll
+/// back — commit assigns it unchanged.
+pub trait FactWrite<S: FactStore>:
+    FactView<S> + EntityView<S> + EventView<S> + ImageView<S>
+{
+    /// Mint a fresh entity id. Durable only if the transaction commits.
+    fn mint_entity(&mut self) -> impl Future<Output = Result<EntityIdOf<S>, S::Error>> + Send;
+
+    /// Mint a fresh lifetime-event id. Durable only if the transaction
+    /// commits.
+    fn mint_event(&mut self) -> impl Future<Output = Result<EventIdOf<S>, S::Error>> + Send;
+
+    /// Mint a fresh image id. Durable only if the transaction commits.
+    fn mint_image(&mut self) -> impl Future<Output = Result<ImageIdOf<S>, S::Error>> + Send;
+
+    /// Whether `id` was minted by this store — committed or earlier in this
+    /// transaction. Gates a `Decl::Existing` before resolution.
+    fn entity_known(
+        &mut self,
+        id: &EntityIdOf<S>,
+    ) -> impl Future<Output = Result<bool, S::Error>> + Send;
+
+    /// The event analogue of [`Self::entity_known`].
+    fn event_known(
+        &mut self,
+        id: &EventIdOf<S>,
+    ) -> impl Future<Output = Result<bool, S::Error>> + Send;
+
+    /// The image analogue of [`Self::entity_known`].
+    fn image_known(
+        &mut self,
+        id: &ImageIdOf<S>,
+    ) -> impl Future<Output = Result<bool, S::Error>> + Send;
+
+    /// Stage a substituted fact, returning the [`FactId`] it holds from here
+    /// on — visible to every read through this handle immediately, durable
+    /// when the transaction commits. Ids ascend in staging order.
+    fn stage_fact(
+        &mut self,
+        fact: StoredFactOf<S>,
+    ) -> impl Future<Output = Result<FactId, S::Error>> + Send;
+
+    /// The cached [`SubmitResult`] under a [`CommitId`], from committed state
+    /// or a commit recorded earlier in this transaction. Content-address
+    /// dedup reads this so a re-submitted bundle replays its original result
+    /// instead of re-running the pipeline.
+    fn cached_result(
+        &mut self,
+        id: &CommitId,
+    ) -> impl Future<Output = Result<Option<SubmitResult<S::Ids>>, S::Error>> + Send;
+
+    /// Record a commit's metadata and cache its result for dedup. Recording
+    /// also moves exactly the commit's own staged facts (its
+    /// `StoredCommit::fact_ids`) behind the committed/in-flight boundary
+    /// [`FactView::placement`] reports, so a later commit in the same
+    /// transaction can retract them; other staged facts stay in flight until
+    /// their own commit records.
+    fn record_commit(
+        &mut self,
+        commit: StoredCommit,
+        result: &SubmitResult<S::Ids>,
+    ) -> impl Future<Output = Result<(), S::Error>> + Send;
+
+    /// Mark the transaction permanently unusable, recording `cause`. The
+    /// submit driver calls this on any failed submit: staging and mints from
+    /// the failure may remain in the transaction, so it must not commit.
+    /// After it, every write primitive on this handle and the `with_tx`
+    /// commit step fail with a backend error naming the cause; the read
+    /// surface keeps answering, void along with the transaction. Retrying
+    /// means a fresh [`FactStore::with_tx`]. The first cause wins — later
+    /// failures descend from it.
+    fn poison(&mut self, cause: String);
 }

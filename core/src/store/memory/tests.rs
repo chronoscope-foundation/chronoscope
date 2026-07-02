@@ -18,15 +18,18 @@ use crate::grammar::lifecycle::{
 };
 use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
+use crate::store::SubmitCommitError;
 use crate::store::pagination::paginate;
 use crate::store::schema::ClassRow;
 use crate::submit::{Commit as SubmitBundle, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::submit::{
-    CommitAuthor, DateRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError, commit_facts,
+    CommitAuthor, DateRole, ResolutionOrigin, StoredCommit, StoredFact, SubjectKind, SubmitError,
+    commit_facts,
 };
 
 pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
 pub(super) type TestBundle = SubmitBundle<MemoryIds>;
+type MemSubmitCommitError = SubmitCommitError<MemoryError, MemoryIds>;
 type SubmitErrorBatch = NonEmptyVec<SubmitError<MemoryEntityId, MemoryEventId, MemoryImageId>>;
 
 /// A page limit large enough to fit every fact the backlink tests submit.
@@ -1779,17 +1782,18 @@ async fn two_commits_share_one_with_tx_brand() -> TestResult {
     Ok(())
 }
 
-// --- UnionSource internals ---
+// --- transaction semantics ---
 
-/// Stage a fact via the [`UnionSource`] + [`Pending`] + [`apply_pending`]
-/// path and verify it lands.
+/// Stage a fact through the [`FactWrite`] primitives and verify it lands.
 ///
-/// Starts with one committed fact, builds a [`UnionSource`], mints one id of
-/// each kind, stages a fact, drains, and applies. Verifies `apply_pending`
-/// assigns the staged fact the slot one past the committed facts
-/// (`committed.len()`) and advances the counters by the mints.
+/// Starts with one committed fact; inside a transaction, mints one id of each
+/// kind, stages a clone of the seed fact, and records a synthetic commit
+/// covering it. The staged fact's id is the slot one past the committed
+/// facts, `placement` flips from `InFlight` to `Committed` at
+/// `record_commit`, and the apply grows the fact bag and counters by exactly
+/// the staged delta.
 #[tokio::test]
-async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult {
+async fn tx_stage_and_record_lands_at_provisional_fact_id() -> TestResult {
     // Commit one fact so the store has committed state to union over.
     let store = MemoryFactStore::new();
     let bundle: TestBundle = SubmitBundle {
@@ -1805,9 +1809,8 @@ async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult 
         .map_err(|e| format!("{e:?}"))?;
     assert_eq!(seed_result.fact_ids.len(), 1);
 
-    // Clone the committed fact's body to re-push as the pending fact, avoiding a
-    // freshly synthesised StoredFact. Drop the guard before the UnionSource
-    // interaction to control re-acquisition.
+    // Clone the committed fact's body to re-stage, avoiding a freshly
+    // synthesised StoredFact.
     let (
         committed_len_before,
         next_entity_before,
@@ -1830,56 +1833,422 @@ async fn union_source_mint_push_apply_lands_at_expected_fact_id() -> TestResult 
         )
     };
 
-    // The slot the staged fact will occupy: one past the committed facts.
+    // The slot the staged fact takes: one past the committed facts.
     let expected_fact_id = FactId::new(committed_len_before as u64);
 
-    // Mint one of each kind, stage the seed fact, drain to Pending.
-    let pending = {
-        let guard = store.lock_inner().await;
-        let mut source = UnionSource::from_inner(&guard);
+    let synthetic_id = CommitId::parse("ab".repeat(32))?;
+    let recorded_commit_id = synthetic_id.clone();
+    let author = user_author()?;
+    store
+        .with_tx(|_s, tx| {
+            Box::pin(async move {
+                tx.mint_entity().await.map_err(|e| format!("{e:?}"))?;
+                tx.mint_event().await.map_err(|e| format!("{e:?}"))?;
+                tx.mint_image().await.map_err(|e| format!("{e:?}"))?;
 
-        source.mint_entity();
-        source.mint_event();
-        source.mint_image();
+                let fid = tx
+                    .stage_fact(seed_stored)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                assert_eq!(fid, expected_fact_id);
 
-        source.push_fact(seed_stored.clone());
+                // Staged fact is visible at its slot, in flight until recorded.
+                let lookup = tx.fact(fid).await.map_err(|e| format!("{e:?}"))?;
+                let FactLookup::Active(_) = lookup else {
+                    return Err(format!("staged fact must read Active; got {lookup:?}"));
+                };
+                let placement = tx.placement(fid).await.map_err(|e| format!("{e:?}"))?;
+                assert_eq!(placement, FactPlacement::InFlight);
 
-        // Staged fact is visible at its slot. `with_core` awaits nothing
-        // for a `UnionSource` but is async to match the trait.
-        let lookup = source
-            .with_core(|core| core.fact_at(expected_fact_id))
-            .await;
-        let FactLookup::Active(_) = lookup else {
-            return Err(format!("pending fact must read Active; got {lookup:?}").into());
-        };
+                let stored = StoredCommit {
+                    commit_id: synthetic_id.clone(),
+                    author,
+                    recorded_at: fixed_time(),
+                    fact_ids: vec![fid],
+                };
+                let result = MemSubmitResult {
+                    commit_id: synthetic_id,
+                    previously_committed: false,
+                    fact_ids: vec![fid],
+                    entities: HashMap::new(),
+                    events: HashMap::new(),
+                    images: HashMap::new(),
+                    companion_commit_id: None,
+                };
+                tx.record_commit(stored, &result)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
 
-        source.into_pending()
-    }; // guard dropped here
+                // Recording moves the fact behind the in-flight boundary.
+                let placement = tx.placement(fid).await.map_err(|e| format!("{e:?}"))?;
+                assert_eq!(placement, FactPlacement::Committed);
+                Ok::<_, String>(())
+            })
+        })
+        .await
+        .map_err(|e| format!("{e:?}"))??;
 
-    // Apply the pending payload mutably.
-    let commit_id = seed_result.commit_id.clone();
-    let assigned = {
-        let mut guard = store.lock_inner().await;
-        apply_pending(&mut guard, pending, commit_id)
-    };
-
-    assert_eq!(assigned.len(), 1);
-    assert_eq!(
-        assigned.first().copied(),
-        Some(expected_fact_id),
-        "apply_pending must assign the staged fact its slot's FactId"
-    );
-
-    // After apply: facts vec grew by one, counters advanced by the mints.
+    // After apply: fact bag grew by one at the promised slot, counters
+    // advanced by the mints, and the fact belongs to the recorded commit.
     {
         let guard = store.lock_inner().await;
         assert_eq!(guard.facts.len(), committed_len_before + 1);
         assert_eq!(guard.next_entity_id, next_entity_before + 1);
         assert_eq!(guard.next_event_id, next_event_before + 1);
         assert_eq!(guard.next_image_id, next_image_before + 1);
+        assert_eq!(guard.fact_commits.last(), Some(&recorded_commit_id));
+        assert!(guard.commits.contains_key(&recorded_commit_id));
     }
 
     Ok(())
+}
+
+/// A `with_tx` closure that fails after a successful submit rolls the whole
+/// transaction back: the store is unchanged and a later resubmit of the same
+/// bundle is a first commit, not a replay.
+#[tokio::test]
+async fn err_from_with_tx_closure_rolls_back_submitted_commit() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_name(&store, "prior").await?;
+    let watermark = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let bundle: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "rolled-back")?].into_iter().collect(),
+    };
+    let replay = bundle.clone();
+
+    let outcome: Result<(), String> = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                let result = s
+                    .submit_commit(tx, bundle)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                assert!(!result.previously_committed);
+                Err("deliberate failure after the submit".to_owned())
+            })
+        })
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(outcome.is_err());
+
+    // The submitted fact never landed and the clock never advanced.
+    let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(after, watermark);
+    let mut view = store.no_later_than(FactId::new(watermark.get() + 1));
+    let lookup = view.fact(watermark).await.map_err(|e| format!("{e:?}"))?;
+    assert!(matches!(lookup, FactLookup::Unknown), "got {lookup:?}");
+
+    // Resubmitting is a first commit — the rolled-back result cache is gone.
+    let result = commit_facts(&store, replay)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(!result.previously_committed);
+    Ok(())
+}
+
+/// A commit recorded earlier in the same transaction is a valid
+/// `RetractCommit` target: its staged metadata is visible to the second
+/// submit's validation and retractor expansion, so the retraction lands and
+/// takes effect.
+#[tokio::test]
+async fn retract_commit_of_earlier_commit_in_same_tx_lands() -> TestResult {
+    let store = MemoryFactStore::new();
+    let first: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "retracted-in-tx")?].into_iter().collect(),
+    };
+
+    let (first_result, second_result) = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                let first_result = s
+                    .submit_commit(tx, first)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                let retraction: TestBundle = SubmitBundle {
+                    author: user_author().map_err(|e| e.to_string())?,
+                    recorded_at: fixed_time() + chrono::Duration::seconds(10),
+                    entities: Vec::new(),
+                    events: Vec::new(),
+                    images: Vec::new(),
+                    facts: [retract_commit_fact(first_result.commit_id.clone())
+                        .map_err(|e| e.to_string())?]
+                    .into_iter()
+                    .collect(),
+                };
+                let second_result = s
+                    .submit_commit(tx, retraction)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                Ok::<_, String>((first_result, second_result))
+            })
+        })
+        .await
+        .map_err(|e| format!("{e:?}"))??;
+
+    let target_fid = *first_result
+        .fact_ids
+        .first()
+        .ok_or("first commit minted no fact")?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = view.fact(target_fid).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = lookup else {
+        return Err(format!("expected Retracted, got {lookup:?}").into());
+    };
+    assert_eq!(Some(&by), second_result.fact_ids.first());
+    Ok(())
+}
+
+/// A rejected submit poisons the transaction: a later submit on the same
+/// handle fails fast with the poison cause instead of validating against the
+/// rejected staging, and a closure that swallows the rejection and returns
+/// `Ok` fails at apply rather than committing the leftovers.
+#[tokio::test]
+async fn swallowed_submit_rejection_poisons_the_transaction() -> TestResult {
+    let store = MemoryFactStore::new();
+    // Decl 1 is never referenced: the bundle stages its one fact, then
+    // rejects with UnusedDeclaration.
+    let doomed: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "staged-then-rejected")?]
+            .into_iter()
+            .collect(),
+    };
+    let healthy: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "after-the-rejection")?].into_iter().collect(),
+    };
+    let outcome = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                if s.submit_commit(tx, doomed).await.is_ok() {
+                    return Err("expected the submit to be rejected".to_owned());
+                }
+                // The poison surfaces on the next use of the handle.
+                let Err(SubmitCommitError::Backend(e)) = s.submit_commit(tx, healthy).await else {
+                    return Err("expected a backend error from the poisoned tx".to_owned());
+                };
+                if !format!("{e}").contains("poisoned") {
+                    return Err(format!("expected a poison error, got {e}"));
+                }
+                Ok::<_, String>(())
+            })
+        })
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a poisoned transaction must fail at apply, got {outcome:?}"
+    );
+    // Nothing landed.
+    let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(after, FactId::new(0));
+    Ok(())
+}
+
+/// A swallowed rejection that minted ids but staged no facts cannot burn
+/// counters: the poison stops the transaction from applying, so no phantom
+/// id becomes durable or satisfies a later commit's `Decl::Existing`.
+#[tokio::test]
+async fn swallowed_zero_staged_rejection_cannot_burn_counters() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_name(&store, "anchor").await?;
+    let next_entity_before = store.lock_inner().await.next_entity_id;
+
+    // Two `Existing` decls of one id make the identity fact a substitution
+    // self-loop, so it never stages; the `Local` decl still mints. The batch
+    // also carries DuplicateEntityDecl and UnusedDeclaration — rejected
+    // either way, with one burned counter and zero staged facts.
+    let doomed: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![
+            Decl::Existing {
+                id: MemoryEntityId(0),
+            },
+            Decl::Existing {
+                id: MemoryEntityId(0),
+            },
+            Decl::Local,
+        ],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [same_entity_fact(0, 1)?].into_iter().collect(),
+    };
+    let outcome = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                match s.submit_commit(tx, doomed).await {
+                    Err(_) => Ok::<_, String>(()),
+                    Ok(_) => Err("expected the submit to be rejected".to_owned()),
+                }
+            })
+        })
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a poisoned transaction must fail at apply, got {outcome:?}"
+    );
+
+    // The rejected submit's mint never became durable.
+    assert_eq!(store.lock_inner().await.next_entity_id, next_entity_before);
+
+    // The phantom id fails a later commit's Existing check.
+    let phantom: TestBundle = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: vec![Decl::Existing {
+            id: MemoryEntityId(next_entity_before),
+        }],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "phantom")?].into_iter().collect(),
+    };
+    let err = match commit_facts(&store, phantom).await {
+        Ok(_) => return Err("expected UnknownExistingEntity".into()),
+        Err(e) => e,
+    };
+    let errs = submit_batch(err)?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::UnknownExistingEntity { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// `record_commit` marks exactly its own commit's facts committed: another
+/// commit's staged facts stay `InFlight` until their own record, even after
+/// a later-staged commit records first.
+#[tokio::test]
+async fn record_commit_marks_only_its_own_facts_committed() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_name(&store, "seed").await?;
+    let seed_stored = {
+        let guard = store.lock_inner().await;
+        guard
+            .facts
+            .first()
+            .ok_or("seed fact missing from inner")?
+            .clone()
+    };
+
+    let author = user_author()?;
+    store
+        .with_tx(|_s, tx| {
+            Box::pin(async move {
+                let fid_a = tx
+                    .stage_fact(seed_stored.clone())
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                let fid_b = tx
+                    .stage_fact(seed_stored)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+
+                // Recording B's commit leaves the earlier-staged A in flight.
+                record_synthetic(tx, "cd", author.clone(), fid_b).await?;
+                let a = tx.placement(fid_a).await.map_err(|e| format!("{e:?}"))?;
+                let b = tx.placement(fid_b).await.map_err(|e| format!("{e:?}"))?;
+                assert_eq!(a, FactPlacement::InFlight);
+                assert_eq!(b, FactPlacement::Committed);
+
+                record_synthetic(tx, "ef", author, fid_a).await?;
+                let a = tx.placement(fid_a).await.map_err(|e| format!("{e:?}"))?;
+                assert_eq!(a, FactPlacement::Committed);
+                Ok::<_, String>(())
+            })
+        })
+        .await
+        .map_err(|e| format!("{e:?}"))??;
+    Ok(())
+}
+
+/// Two recorded commits claiming one staged fact fail the transaction at
+/// apply: a fact belongs to exactly one commit, and a double claim would
+/// otherwise resolve by map-iteration order.
+#[tokio::test]
+async fn overlapping_recorded_commits_fail_the_transaction_at_apply() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_name(&store, "seed").await?;
+    let watermark = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    let seed_stored = {
+        let guard = store.lock_inner().await;
+        guard
+            .facts
+            .first()
+            .ok_or("seed fact missing from inner")?
+            .clone()
+    };
+
+    let author = user_author()?;
+    let outcome = store
+        .with_tx(|_s, tx| {
+            Box::pin(async move {
+                let fid = tx
+                    .stage_fact(seed_stored)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                record_synthetic(tx, "cd", author.clone(), fid).await?;
+                record_synthetic(tx, "ef", author, fid).await?;
+                Ok::<_, String>(())
+            })
+        })
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a doubly-claimed staged fact must fail the transaction, got {outcome:?}"
+    );
+    // Nothing landed.
+    let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(after, watermark);
+    Ok(())
+}
+
+/// Record a synthetic single-fact commit through the [`FactWrite`] surface,
+/// with `byte` repeated as the commit id.
+async fn record_synthetic(
+    tx: &mut MemoryTx<'_>,
+    byte: &str,
+    author: CommitAuthor,
+    fid: FactId,
+) -> Result<(), String> {
+    let commit_id = CommitId::parse(byte.repeat(32)).map_err(|e| format!("{e:?}"))?;
+    let stored = StoredCommit {
+        commit_id: commit_id.clone(),
+        author,
+        recorded_at: fixed_time(),
+        fact_ids: vec![fid],
+    };
+    let result = MemSubmitResult {
+        commit_id,
+        previously_committed: false,
+        fact_ids: vec![fid],
+        entities: HashMap::new(),
+        events: HashMap::new(),
+        images: HashMap::new(),
+        companion_commit_id: None,
+    };
+    tx.record_commit(stored, &result)
+        .await
+        .map_err(|e| format!("{e:?}"))
 }
 
 // --- self-referential meta rules + retraction visibility ---
