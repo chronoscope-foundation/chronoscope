@@ -241,13 +241,6 @@ pub enum SubmitError<EntId, EvtId, ImgId> {
         /// The id two image declarations resolved to.
         id: ImgId,
     },
-    /// A `Demolition` bookend carries a location. Demolition location is
-    /// derived from the entity's last known location, not separately asserted.
-    #[error("demolition bookend carries a location for {entity}; demolition location is derived")]
-    DemolitionLocation {
-        /// The entity whose demolition bookend carried a location.
-        entity: EntId,
-    },
     /// An event id carries no `HasEvent`. Every event has one subject entity
     /// and one declared kind, so each id needs exactly one `HasEvent` tying it
     /// to its entity; a minted event without one is typeless and can't be

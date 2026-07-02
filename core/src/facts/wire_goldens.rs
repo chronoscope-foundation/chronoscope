@@ -185,8 +185,20 @@ fn golden_attribute_fact_relationship() -> Result<()> {
 }
 
 #[test]
-fn golden_bookend_fact_started() -> Result<()> {
-    let f: bookend::Fact<MemoryEntityId> = bookend::Fact::Started {
+fn golden_construction_fact_started() -> Result<()> {
+    let f: bookend::ConstructionFact<MemoryEntityId> = bookend::ConstructionFact::Started {
+        entity: ent(1)?,
+        bound: sample_date()?,
+    };
+    assert_golden_roundtrip(
+        &f,
+        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":1,"type":"started"}"#,
+    )
+}
+
+#[test]
+fn golden_demolition_fact_started() -> Result<()> {
+    let f: bookend::DemolitionFact<MemoryEntityId> = bookend::DemolitionFact::Started {
         entity: ent(1)?,
         bound: sample_date()?,
     };

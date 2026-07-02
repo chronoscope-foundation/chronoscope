@@ -59,9 +59,13 @@ pub enum FactualAssertion<R: IdScheme> {
     /// Entity-level attribute claims (names, external refs, relationships).
     Attribute { fact: attribute::Fact<R::Entity> },
     /// Construction bookend (start / completion / location).
-    Construction { fact: bookend::Fact<R::Entity> },
-    /// Demolition bookend (start / completion / location).
-    Demolition { fact: bookend::Fact<R::Entity> },
+    Construction {
+        fact: bookend::ConstructionFact<R::Entity>,
+    },
+    /// Demolition bookend (start / completion).
+    Demolition {
+        fact: bookend::DemolitionFact<R::Entity>,
+    },
     /// Interior-lifetime event facts.
     Event {
         fact: event::Fact<R::Entity, R::Event>,
@@ -93,7 +97,8 @@ impl<R: IdScheme> FactualAssertion<R> {
     ) {
         match self {
             Self::Attribute { fact } => fact.for_each_id(fe),
-            Self::Construction { fact } | Self::Demolition { fact } => fact.for_each_id(fe),
+            Self::Construction { fact } => fact.for_each_id(fe),
+            Self::Demolition { fact } => fact.for_each_id(fe),
             Self::Event { fact } => fact.for_each_id(fe, fv),
             Self::Gap { bounds } => bounds.for_each_id(fe, fv),
             Self::Image { fact } => fact.for_each_id(fi),
@@ -462,18 +467,29 @@ mod traversal_props {
         ]
     }
 
-    /// `bookend::Fact` — all three variants. Shared by the `Construction`
-    /// and `Demolition` arms, both generated in `arb_factual_assertion`.
-    fn arb_bookend() -> impl Strategy<Value = bookend::Fact<MemoryEntityId>> {
+    /// `bookend::ConstructionFact` — all three variants, backing the
+    /// `Construction` arm in `arb_factual_assertion`.
+    fn arb_construction_fact() -> impl Strategy<Value = bookend::ConstructionFact<MemoryEntityId>> {
         prop_oneof![
             (arb_entity(), sentinel_date())
-                .prop_map(|(entity, bound)| bookend::Fact::Started { entity, bound }),
+                .prop_map(|(entity, bound)| bookend::ConstructionFact::Started { entity, bound }),
             (arb_entity(), sentinel_date())
-                .prop_map(|(entity, bound)| bookend::Fact::Completed { entity, bound }),
-            arb_entity().prop_map(|entity| bookend::Fact::Location {
+                .prop_map(|(entity, bound)| bookend::ConstructionFact::Completed { entity, bound }),
+            arb_entity().prop_map(|entity| bookend::ConstructionFact::Location {
                 entity,
                 location: sentinel_location(),
             }),
+        ]
+    }
+
+    /// `bookend::DemolitionFact` — start and completion, backing the
+    /// `Demolition` arm in `arb_factual_assertion`.
+    fn arb_demolition_fact() -> impl Strategy<Value = bookend::DemolitionFact<MemoryEntityId>> {
+        prop_oneof![
+            (arb_entity(), sentinel_date())
+                .prop_map(|(entity, bound)| bookend::DemolitionFact::Started { entity, bound }),
+            (arb_entity(), sentinel_date())
+                .prop_map(|(entity, bound)| bookend::DemolitionFact::Completed { entity, bound }),
         ]
     }
 
@@ -689,13 +705,14 @@ mod traversal_props {
     // Assertion-level strategies — `prop_oneof!` over every cluster
     // ------------------------------------------------------------------
 
-    /// Covers every factual cluster. Bookend appears twice — `Construction`
-    /// and `Demolition` — to exercise both dispatch arms.
+    /// Covers every factual cluster. The two bookend phases feed distinct
+    /// enums — `ConstructionFact` and `DemolitionFact` — exercising both
+    /// dispatch arms.
     fn arb_factual_assertion() -> impl Strategy<Value = FactualA> {
         prop_oneof![
             arb_attribute().prop_map(|fact| FactualAssertion::Attribute { fact }),
-            arb_bookend().prop_map(|fact| FactualAssertion::Construction { fact }),
-            arb_bookend().prop_map(|fact| FactualAssertion::Demolition { fact }),
+            arb_construction_fact().prop_map(|fact| FactualAssertion::Construction { fact }),
+            arb_demolition_fact().prop_map(|fact| FactualAssertion::Demolition { fact }),
             arb_event_fact().prop_map(|fact| FactualAssertion::Event { fact }),
             arb_gap_bounds().prop_map(|bounds| FactualAssertion::Gap { bounds }),
             arb_image_fact().prop_map(|fact| FactualAssertion::Image { fact }),

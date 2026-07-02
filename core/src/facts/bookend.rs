@@ -1,28 +1,19 @@
 //! Bookend cluster — flat per-entity construction and demolition facts.
 //!
-//! Shared between the `Construction` and `Demolition` variants of
-//! [`crate::facts::assertions::FactualAssertion`]: both bookends carry the same
-//! shape (start date, completion date, location), so one cluster module covers
-//! both. The outer variant tag distinguishes the two phases.
+//! [`ConstructionFact`] backs
+//! [`FactualAssertion::Construction`](crate::facts::assertions::FactualAssertion::Construction)
+//! and [`DemolitionFact`] backs
+//! [`FactualAssertion::Demolition`](crate::facts::assertions::FactualAssertion::Demolition).
+//! Construction carries a start date, a completion date, and a location;
+//! demolition carries a start and a completion date. Demolition location is
+//! derived from the entity's last known location — the most recent
+//! [`crate::facts::event::Fact::MovedToLocation`], falling back to
+//! [`ConstructionFact::Location`] — so the two phases are distinct types free to
+//! evolve apart.
 //!
 //! Bookends are flat per-entity facts rather than event-mediated. Once-ness for
 //! these slots is structural — an entity has at most one construction and at
 //! most one demolition, modeled directly without minting a lifetime-event id.
-//!
-//! # Error states (rejected at submit time)
-//!
-//! Combinations the grammar permits structurally but the fact-store layer
-//! rejects at submit time — bugs in caller code, not outside-world uncertainty.
-//!
-//! - **`Demolition::Location` is invalid.** The variant is structurally
-//!   reachable (bookend [`Fact`] is shared between phases) but the submit layer
-//!   rejects any [`Fact::Location`] whose outer variant is
-//!   `FactualAssertion::Demolition`. Demolition location is derived from the
-//!   entity's last known location — the most recent
-//!   [`crate::facts::event::Fact::MovedToLocation`], falling back to
-//!   [`Fact::Location`] on the `Construction` phase. A separately asserted
-//!   demolition location would duplicate that derivation (when it agrees) or
-//!   contradict it (when it doesn't), neither a useful slot to maintain.
 //!
 //! # Conflicts (surfaced at projection time)
 //!
@@ -36,21 +27,21 @@
 //!
 //! ## Slot unification
 //!
-//! Two or more [`Fact::Started`] facts on the same entity-phase pair are not a
+//! Two or more `Started` facts on the same entity-phase pair are not a
 //! cardinality conflict. The projection unifies their bounds via interval meet
 //! (the intersection of the source-claimed intervals). A `Temporal` conflict
 //! surfaces only when the meet is empty — when the source claims are mutually
-//! contradictory. Same for [`Fact::Completed`].
+//! contradictory. Same for `Completed`.
 //!
-//! [`Fact::Location`] (on the `Construction` phase only) unifies via the
+//! [`ConstructionFact::Location`] unifies via the
 //! [`crate::location::Location`] subsumption lattice: containment collapses to
 //! the tighter region; disjoint regions produce a `OneOf` ("one of these is
 //! true").
 //!
 //! ## Intra-phase ordering
 //!
-//! - For a single phase, [`Fact::Started`]'s unified interval must not end
-//!   strictly after [`Fact::Completed`]'s unified interval ends.
+//! - For a single phase, `Started`'s unified interval must not end strictly
+//!   after `Completed`'s unified interval ends.
 //!
 //! ## Inter-phase ordering
 //!
@@ -76,12 +67,10 @@ use chronoscope_macros::grammar_type;
 use crate::date::UncertainDate;
 use crate::location::UnresolvedLocation;
 
-/// Bookend-cluster fact (construction or demolition; the phase is the
-/// outer variant tag on
-/// [`crate::facts::assertions::FactualAssertion`]).
+/// Construction bookend fact — start date, completion date, or location.
 ///
-/// Generic over the entity reference type `EntId`. See the module-level
-/// "Error states" section for the `Demolition::Location` rejection rule.
+/// Generic over the entity reference type `EntId`. Backs
+/// [`FactualAssertion::Construction`](crate::facts::assertions::FactualAssertion::Construction).
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(bound(
@@ -89,30 +78,29 @@ use crate::location::UnresolvedLocation;
     deserialize = "EntId: ::serde::de::DeserializeOwned"
 ))]
 #[schemars(bound = "EntId: ::schemars::JsonSchema")]
-pub enum Fact<EntId> {
-    /// When the bookend phase started, as an uncertain interval.
+pub enum ConstructionFact<EntId> {
+    /// When construction started, as an uncertain interval.
     Started {
         entity: EntId,
         /// The source-claimed interval for the start.
         bound: UncertainDate,
     },
-    /// When the bookend phase completed, as an uncertain interval.
+    /// When construction completed, as an uncertain interval.
     Completed {
         entity: EntId,
         /// The source-claimed interval for the completion.
         bound: UncertainDate,
     },
-    /// Where the bookend phase took place. Valid only on the
-    /// `Construction` outer variant — see the module-level
-    /// "Error states" section for the demolition rejection rule.
+    /// Where the entity was built — its default location until a subsequent
+    /// `Moved` event overrides it.
     Location {
         entity: EntId,
         location: UnresolvedLocation,
     },
 }
 
-impl<EntId> Fact<EntId> {
-    /// The entity this bookend fact is a claim about.
+impl<EntId> ConstructionFact<EntId> {
+    /// The entity this construction fact is a claim about.
     pub fn subject(&self) -> &EntId {
         match self {
             Self::Started { entity, .. }
@@ -130,29 +118,91 @@ impl<EntId> Fact<EntId> {
         }
     }
 
-    /// Relabel the single entity id through the fallible closure,
-    /// producing a `Fact<E2>`.
+    /// Relabel the single entity id through the fallible closure, producing a
+    /// `ConstructionFact<E2>`.
     ///
-    /// No distinct-pair payload, so no `on_self_loop` collapse closure: the
-    /// only failure is the leaf closure rejecting a reference. Generic over
-    /// the error type `Err` so the cluster never names the concrete error the
-    /// assertion layer chooses.
+    /// No distinct-pair payload, so no `on_self_loop` collapse closure: the only
+    /// failure is the leaf closure rejecting a reference. Generic over the error
+    /// type `Err` so the cluster never names the concrete error the assertion
+    /// layer chooses.
     pub fn try_map_ids<E2, Err>(
         &self,
         fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
-    ) -> Result<Fact<E2>, Err> {
+    ) -> Result<ConstructionFact<E2>, Err> {
         match self {
-            Self::Started { entity, bound } => Ok(Fact::Started {
+            Self::Started { entity, bound } => Ok(ConstructionFact::Started {
                 entity: fe(entity)?,
                 bound: bound.clone(),
             }),
-            Self::Completed { entity, bound } => Ok(Fact::Completed {
+            Self::Completed { entity, bound } => Ok(ConstructionFact::Completed {
                 entity: fe(entity)?,
                 bound: bound.clone(),
             }),
-            Self::Location { entity, location } => Ok(Fact::Location {
+            Self::Location { entity, location } => Ok(ConstructionFact::Location {
                 entity: fe(entity)?,
                 location: location.clone(),
+            }),
+        }
+    }
+}
+
+/// Demolition bookend fact — start date or completion date.
+///
+/// Generic over the entity reference type `EntId`. Backs
+/// [`FactualAssertion::Demolition`](crate::facts::assertions::FactualAssertion::Demolition).
+/// Demolition location is derived from the entity's last known location, so it
+/// has no location slot.
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(bound(
+    serialize = "EntId: ::serde::Serialize",
+    deserialize = "EntId: ::serde::de::DeserializeOwned"
+))]
+#[schemars(bound = "EntId: ::schemars::JsonSchema")]
+pub enum DemolitionFact<EntId> {
+    /// When demolition started, as an uncertain interval.
+    Started {
+        entity: EntId,
+        /// The source-claimed interval for the start.
+        bound: UncertainDate,
+    },
+    /// When demolition completed, as an uncertain interval.
+    Completed {
+        entity: EntId,
+        /// The source-claimed interval for the completion.
+        bound: UncertainDate,
+    },
+}
+
+impl<EntId> DemolitionFact<EntId> {
+    /// The entity this demolition fact is a claim about.
+    pub fn subject(&self) -> &EntId {
+        match self {
+            Self::Started { entity, .. } | Self::Completed { entity, .. } => entity,
+        }
+    }
+
+    /// Visit the single entity id this fact mentions.
+    pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId)) {
+        match self {
+            Self::Started { entity, .. } | Self::Completed { entity, .. } => fe(entity),
+        }
+    }
+
+    /// Relabel the single entity id through the fallible closure, producing a
+    /// `DemolitionFact<E2>`. See [`ConstructionFact::try_map_ids`].
+    pub fn try_map_ids<E2, Err>(
+        &self,
+        fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
+    ) -> Result<DemolitionFact<E2>, Err> {
+        match self {
+            Self::Started { entity, bound } => Ok(DemolitionFact::Started {
+                entity: fe(entity)?,
+                bound: bound.clone(),
+            }),
+            Self::Completed { entity, bound } => Ok(DemolitionFact::Completed {
+                entity: fe(entity)?,
+                bound: bound.clone(),
             }),
         }
     }

@@ -155,7 +155,7 @@ pub(super) fn entity_in_bbox(
 ) -> Option<MemoryEntityId> {
     match factual_assertion(fact)? {
         FactualAssertion::Construction {
-            fact: bookend::Fact::Location { entity, location },
+            fact: bookend::ConstructionFact::Location { entity, location },
         } => bbox.contains(location.point()?).then_some(*entity),
         FactualAssertion::Event {
             fact: event::Fact::MovedToLocation { event, location },

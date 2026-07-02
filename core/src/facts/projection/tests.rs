@@ -146,7 +146,7 @@ fn construction_started_fact(
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Started {
+            fact: bookend::ConstructionFact::Started {
                 entity: EntityIdx(entity_idx),
                 bound: year_date(year)?,
             },
@@ -376,7 +376,7 @@ fn started_fact(
     )?;
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Started {
+            fact: bookend::ConstructionFact::Started {
                 entity: EntityIdx(entity_idx),
                 bound,
             },

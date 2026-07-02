@@ -160,13 +160,13 @@ where
         FactualAssertion::Construction { fact } => {
             let support = provenance(fact.subject(), citation);
             let mut entity = Entity::identity();
-            inject_bookend(fact, support, &mut entity.construction);
+            inject_construction(fact, support, &mut entity.construction);
             entity
         }
         FactualAssertion::Demolition { fact } => {
             let support = provenance(fact.subject(), citation);
             let mut entity = Entity::identity();
-            inject_bookend(fact, support, &mut entity.demolition);
+            inject_demolition(fact, support, &mut entity.demolition);
             entity
         }
         FactualAssertion::Event { fact } => inject_event_fact(fact, reachers, citation, provenance),
@@ -300,19 +300,39 @@ fn inject_attribute<EntId, EvtId, ImgId, T>(
     }
 }
 
-fn inject_bookend<EntId, T>(fact: &bookend::Fact<EntId>, support: T, bookend: &mut Bookend<T>)
-where
+fn inject_construction<EntId, T>(
+    fact: &bookend::ConstructionFact<EntId>,
+    support: T,
+    bookend: &mut Bookend<T>,
+) where
     T: Semiring + Clone,
 {
     match fact {
-        bookend::Fact::Started { bound, .. } => {
+        bookend::ConstructionFact::Started { bound, .. } => {
             bookend.started_at = Bracket::from((bound.clone(), support));
         }
-        bookend::Fact::Completed { bound, .. } => {
+        bookend::ConstructionFact::Completed { bound, .. } => {
             bookend.completed_at = Bracket::from((bound.clone(), support));
         }
-        bookend::Fact::Location { location, .. } => {
+        bookend::ConstructionFact::Location { location, .. } => {
             bookend.location = Bracket::from((location.clone(), support));
+        }
+    }
+}
+
+fn inject_demolition<EntId, T>(
+    fact: &bookend::DemolitionFact<EntId>,
+    support: T,
+    bookend: &mut Bookend<T>,
+) where
+    T: Semiring + Clone,
+{
+    match fact {
+        bookend::DemolitionFact::Started { bound, .. } => {
+            bookend.started_at = Bracket::from((bound.clone(), support));
+        }
+        bookend::DemolitionFact::Completed { bound, .. } => {
+            bookend.completed_at = Bracket::from((bound.clone(), support));
         }
     }
 }

@@ -81,7 +81,8 @@ pub struct Bookend<T> {
     pub started_at: Bracket<UncertainDate, T>,
     /// When the phase completed.
     pub completed_at: Bracket<UncertainDate, T>,
-    /// Where the phase took place.
+    /// Where the phase took place — populated only for the construction
+    /// phase, since demolition facts carry no location.
     pub location: Bracket<UnresolvedLocation, T>,
 }
 

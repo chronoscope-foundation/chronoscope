@@ -520,7 +520,6 @@ fn run_cluster_rules<S>(
 ) where
     S: FactStore,
 {
-    rule_demolition_location::<S>(candidates, errors);
     rule_event_has_one_kind::<S>(candidates, event_facts, errors);
     rule_event_fact_kind_consistency::<S>(candidates, event_facts, errors);
     rule_name_window::<S>(candidates, errors);
@@ -530,30 +529,6 @@ fn run_cluster_rules<S>(
     rule_composite_self_parent::<S>(candidates, errors);
     rule_composite_multiple_parents::<S>(candidates, image_facts, errors);
     rule_composite_chain::<S>(candidates, image_facts, errors);
-}
-
-/// A `Demolition` bookend may not carry a location — demolition location is
-/// derived from the entity's last known location.
-fn rule_demolition_location<S: FactStore>(
-    candidates: &[StoredFactOf<S>],
-    errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
-) {
-    let mut offending: BTreeSet<EntityIdOf<S>> = BTreeSet::new();
-    for fact in candidates {
-        if let StoredFact::Factual(StoredFactualFact {
-            assertion:
-                FactualAssertion::Demolition {
-                    fact: bookend::Fact::Location { entity, .. },
-                },
-            ..
-        }) = fact
-        {
-            offending.insert(entity.clone());
-        }
-    }
-    for entity in offending {
-        errors.push(SubmitError::DemolitionLocation { entity });
-    }
 }
 
 /// The distinct `{entity, kind}` `HasEvent` claims an event carries in the
@@ -812,12 +787,17 @@ fn for_each_assertion_date<R: IdScheme>(
                 visit(DateRole::NameValidTo, date);
             }
         }
-        FactualAssertion::Construction { fact } | FactualAssertion::Demolition { fact } => {
-            if let bookend::Fact::Started { bound, .. } | bookend::Fact::Completed { bound, .. } =
-                fact
-            {
+        FactualAssertion::Construction { fact } => match fact {
+            bookend::ConstructionFact::Started { bound, .. }
+            | bookend::ConstructionFact::Completed { bound, .. } => {
                 visit(DateRole::BookendBound, bound);
             }
+            bookend::ConstructionFact::Location { .. } => {}
+        },
+        FactualAssertion::Demolition { fact } => {
+            let (bookend::DemolitionFact::Started { bound, .. }
+            | bookend::DemolitionFact::Completed { bound, .. }) = fact;
+            visit(DateRole::BookendBound, bound);
         }
         FactualAssertion::Event { fact } => {
             if let event::Fact::PointDate { bound, .. }
@@ -909,13 +889,8 @@ fn for_each_stored_location<R: IdScheme>(
         return;
     };
     match assertion {
-        // Demolition location is rejected outright by `rule_demolition_location`,
-        // so only the construction phase contributes a bookend location here.
         FactualAssertion::Construction {
-            fact: bookend::Fact::Location { location, .. },
-        }
-        | FactualAssertion::Demolition {
-            fact: bookend::Fact::Location { location, .. },
+            fact: bookend::ConstructionFact::Location { location, .. },
         } => visit(LocationRole::BookendLocation, location),
         FactualAssertion::Event {
             fact: event::Fact::MovedToLocation { location, .. },

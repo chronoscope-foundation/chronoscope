@@ -110,7 +110,7 @@ pub(super) fn construction_started_in(
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Started {
+            fact: bookend::ConstructionFact::Started {
                 entity: EntityIdx(entity_idx),
                 bound: year_date(year)?,
             },
@@ -126,7 +126,7 @@ pub(super) fn demolition_completed_in(
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Demolition {
-            fact: bookend::Fact::Completed {
+            fact: bookend::DemolitionFact::Completed {
                 entity: EntityIdx(entity_idx),
                 bound: year_date(year)?,
             },
@@ -142,7 +142,7 @@ pub(super) fn construction_location_in(
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Location {
+            fact: bookend::ConstructionFact::Location {
                 entity: EntityIdx(entity_idx),
                 location: UnresolvedLocation::Reference(LocationReference::NamedPlace {
                     name: place.to_owned(),
@@ -2351,24 +2351,11 @@ fn judgment_citation() -> Result<JudgmentSource<ImageIdx>, Box<dyn std::error::E
     })
 }
 
-/// A `Demolition` bookend carrying a location — the rejected shape.
-fn demolition_location_fact(entity_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
-    Ok(SubmitFact::Factual {
-        assertion: FactualAssertion::Demolition {
-            fact: bookend::Fact::Location {
-                entity: EntityIdx(entity_idx),
-                location: sample_location(),
-            },
-        },
-        citation: sample_citation()?,
-    })
-}
-
-/// A `Construction` bookend carrying a location — accepted, unlike demolition.
+/// A `Construction` bookend carrying a location.
 fn construction_location_fact(entity_idx: usize) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Location {
+            fact: bookend::ConstructionFact::Location {
                 entity: EntityIdx(entity_idx),
                 location: sample_location(),
             },
@@ -2385,7 +2372,7 @@ fn construction_with_location(
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Location {
+            fact: bookend::ConstructionFact::Location {
                 entity: EntityIdx(entity_idx),
                 location,
             },
@@ -2550,7 +2537,7 @@ fn depiction_fact(
 
 // --- accumulation ---
 
-/// One bundle violating three independent rules — a demolition location, an
+/// One bundle violating three independent rules — a disjunctive stored date, an
 /// inverted name window, and a self-parent subimage — is rejected with all three
 /// in a single batch, accumulation rather than first-failure.
 #[tokio::test]
@@ -2562,7 +2549,7 @@ async fn multi_rule_violations_accumulate_in_one_batch() -> TestResult {
         1,
         0,
         vec![
-            demolition_location_fact(0)?,
+            started_with_date(0, disjunctive_date()?)?,
             name_window_fact(1, Some(1900), Some(1800))?,
             subimage_fact(0, 0)?,
         ],
@@ -2575,8 +2562,8 @@ async fn multi_rule_violations_accumulate_in_one_batch() -> TestResult {
     );
     assert!(
         errs.iter()
-            .any(|e| matches!(e, SubmitError::DemolitionLocation { .. })),
-        "missing DemolitionLocation: {errs:?}"
+            .any(|e| matches!(e, SubmitError::NonSingleIntervalDate { .. })),
+        "missing NonSingleIntervalDate: {errs:?}"
     );
     assert!(
         errs.iter()
@@ -2608,7 +2595,7 @@ async fn resolvability_gate_batches_and_skips_rules() -> TestResult {
         facts: [
             name_fact(5, "out-of-range-entity")?,
             medium_picture_fact(7)?,
-            demolition_location_fact(0)?,
+            started_with_date(0, disjunctive_date()?)?,
         ]
         .into_iter()
         .collect(),
@@ -2634,12 +2621,12 @@ async fn resolvability_gate_batches_and_skips_rules() -> TestResult {
             .any(|e| matches!(e, SubmitError::UnknownExistingEntity { .. })),
         "missing UnknownExistingEntity: {errs:?}"
     );
-    // The would-be demolition-location and unused-declaration violations only
+    // The would-be single-interval-date and unused-declaration violations only
     // run after resolvability passes, so the early return suppresses them.
     assert!(
         !errs
             .iter()
-            .any(|e| matches!(e, SubmitError::DemolitionLocation { .. })),
+            .any(|e| matches!(e, SubmitError::NonSingleIntervalDate { .. })),
         "a rule fired despite the resolvability gate: {errs:?}"
     );
     Ok(())
@@ -2730,23 +2717,6 @@ async fn all_facts_about_image_respects_snapshot() -> TestResult {
 }
 
 // --- cluster rules ---
-
-/// A demolition bookend carrying a location is rejected.
-#[tokio::test]
-async fn demolition_location_rejected() -> TestResult {
-    let store = MemoryFactStore::new();
-    let errs = commit_err(
-        &store,
-        local_bundle(1, 0, 0, 0, vec![demolition_location_fact(0)?])?,
-    )
-    .await?;
-    assert!(
-        errs.iter()
-            .any(|e| matches!(e, SubmitError::DemolitionLocation { .. })),
-        "got {errs:?}"
-    );
-    Ok(())
-}
 
 /// A construction bookend carrying a location is accepted.
 #[tokio::test]
@@ -3611,7 +3581,7 @@ fn started_with_date(
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Started {
+            fact: bookend::ConstructionFact::Started {
                 entity: EntityIdx(entity_idx),
                 bound,
             },
@@ -3788,7 +3758,7 @@ fn construction_at(
 ) -> Result<SubmitFact, Box<dyn std::error::Error>> {
     Ok(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
-            fact: bookend::Fact::Location {
+            fact: bookend::ConstructionFact::Location {
                 entity: EntityIdx(entity_idx),
                 location: UnresolvedLocation::Resolved(Location::point(GeoPoint::new(lat, lon)?)),
             },

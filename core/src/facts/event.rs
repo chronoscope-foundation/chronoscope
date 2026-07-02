@@ -55,8 +55,8 @@
 //! happens *at* a building but doesn't change its location, so spatial facts
 //! about other interior events belong on the entity (via bookends) or a
 //! depiction. Construction location lives on the bookend cluster (see
-//! [`crate::facts::bookend::Fact::Location`]); demolition location is derived
-//! (see [`crate::facts::bookend`]'s error-states section).
+//! [`crate::facts::bookend::ConstructionFact::Location`]); demolition location
+//! is derived (see [`crate::facts::bookend`]).
 //!
 //! ## Reference invariants
 //!
@@ -116,8 +116,8 @@
 //!   latest-vs-earliest, not strict containment.
 //! - Every interior event keyed by an event id must fall within
 //!   the entity's lifetime window: not before the entity's
-//!   [`crate::facts::bookend::Fact::Started`] for construction, not
-//!   after its [`crate::facts::bookend::Fact::Started`] for demolition.
+//!   [`crate::facts::bookend::ConstructionFact::Started`], not after its
+//!   [`crate::facts::bookend::DemolitionFact::Started`].
 
 use std::collections::BTreeSet;
 
