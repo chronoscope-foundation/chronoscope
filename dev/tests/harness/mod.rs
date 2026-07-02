@@ -237,6 +237,7 @@ impl WebTest {
         self.handler_handle
             .await
             .map_err(|e| format!("handler join: {e}"))?;
+        self.server.shutdown().await;
         Ok(())
     }
 

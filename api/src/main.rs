@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use chronoscope_db::media_store::InMemoryMediaStore;
         Arc::new(
             AppState::new(
-                db,
+                db.clone(),
                 config,
                 jwt,
                 dns_resolver,
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
     };
     #[cfg(not(feature = "embedded-media"))]
-    let app_state = Arc::new(AppState::new(db, config, jwt, dns_resolver, facts).await?);
+    let app_state = Arc::new(AppState::new(db.clone(), config, jwt, dns_resolver, facts).await?);
 
     // Configure Dropshot
     let config_dropshot = ConfigDropshot {
@@ -72,6 +72,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Start server
     let server = HttpServerStarter::new(&config_dropshot, api, app_state, &log)?.start();
-
-    server.await.map_err(Into::into)
+    let result = server.await;
+    // Close the SpatiaLite-loaded pool inside the live runtime, so each
+    // connection's dlclose completes before process exit.
+    db.close().await;
+    result.map_err(Into::into)
 }
