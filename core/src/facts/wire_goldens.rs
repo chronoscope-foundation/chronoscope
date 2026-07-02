@@ -33,7 +33,7 @@ use crate::facts::attribute::{self, EntityRelationType, NameText, NameType};
 use crate::facts::bookend;
 use crate::facts::citations::{
     Excerpt, ExternalReference, ExternalSource, FactualCitation, JudgmentSource, Language,
-    MetaSource, Observer,
+    MetaSource, Observer, WikidataField,
 };
 use crate::facts::composites::{self, SubimageRegion};
 use crate::facts::depiction::{self, Perspective};
@@ -49,6 +49,7 @@ use crate::facts::observation;
 use crate::facts::spatial::TopologicalRel;
 use crate::facts::submit::{Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact};
 use crate::geo::{GeoPoint, Meters};
+use crate::ids::{WikidataEntityId, WikidataPropertyId};
 use crate::location::Location;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -385,6 +386,78 @@ fn golden_external_reference_unmodeled_url_locks_variant() -> Result<()> {
     assert_golden_roundtrip(
         &reference,
         r#"{"type":"unmodeled_url","url":"https://example.com/some/path"}"#,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// ExternalSource::Wikidata — one golden per WikidataField variant
+// ---------------------------------------------------------------------------
+//
+// The `field` descriptor is a tagged enum nested inside the tagged
+// `ExternalSource`, so the two `type` keys must stay in separate maps. Each
+// golden fixes the wire shape of one variant (statement / label / sitelink /
+// item) and proves it survives the streaming round-trip.
+
+#[test]
+fn golden_external_source_wikidata_statement() -> Result<()> {
+    let source = ExternalSource::Wikidata {
+        entity_id: WikidataEntityId::new(243),
+        field: WikidataField::Statement {
+            property_id: WikidataPropertyId::new(571),
+        },
+        revision_id: 123456789,
+        value: "1889-03-31".to_string(),
+    };
+    assert_golden_roundtrip(
+        &source,
+        r#"{"entity_id":"Q243","field":{"property_id":"P571","type":"statement"},"revision_id":123456789,"type":"wikidata","value":"1889-03-31"}"#,
+    )
+}
+
+#[test]
+fn golden_external_source_wikidata_label() -> Result<()> {
+    let source = ExternalSource::Wikidata {
+        entity_id: WikidataEntityId::new(243),
+        field: WikidataField::Label { language: en()? },
+        revision_id: 123456789,
+        value: "Eiffel Tower".to_string(),
+    };
+    assert_golden_roundtrip(
+        &source,
+        r#"{"entity_id":"Q243","field":{"language":"en","type":"label"},"revision_id":123456789,"type":"wikidata","value":"Eiffel Tower"}"#,
+    )
+}
+
+#[test]
+fn golden_external_source_wikidata_sitelink() -> Result<()> {
+    let source = ExternalSource::Wikidata {
+        entity_id: WikidataEntityId::new(243),
+        field: WikidataField::Sitelink {
+            site: "enwiki".to_owned(),
+        },
+        revision_id: 123456789,
+        value: "Eiffel Tower".to_string(),
+    };
+    assert_golden_roundtrip(
+        &source,
+        r#"{"entity_id":"Q243","field":{"site":"enwiki","type":"sitelink"},"revision_id":123456789,"type":"wikidata","value":"Eiffel Tower"}"#,
+    )
+}
+
+#[test]
+fn golden_external_source_wikidata_item() -> Result<()> {
+    // `Item` is a unit variant: it tags to a bare `{"type":"item"}` map nested
+    // beside the outer `type`, so the round-trip proves the fieldless inner
+    // variant survives streaming serialize.
+    let source = ExternalSource::Wikidata {
+        entity_id: WikidataEntityId::new(243),
+        field: WikidataField::Item,
+        revision_id: 123456789,
+        value: "Q243".to_string(),
+    };
+    assert_golden_roundtrip(
+        &source,
+        r#"{"entity_id":"Q243","field":{"type":"item"},"revision_id":123456789,"type":"wikidata","value":"Q243"}"#,
     )
 }
 

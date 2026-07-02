@@ -435,6 +435,27 @@ impl std::fmt::Display for CitationError {
 impl std::error::Error for CitationError {}
 
 // ============================================================================
+// WikidataField
+// ============================================================================
+
+/// Which part of a Wikidata item a claim was read from — the fact-store
+/// analogue of "which field", so a label- or sitelink-sourced claim needn't
+/// fake a property id.
+#[grammar_type]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WikidataField {
+    /// A property statement (P571, P625, P18, P1448, …).
+    Statement { property_id: WikidataPropertyId },
+    /// An entity label in a given language.
+    Label { language: Language },
+    /// A sitelink to another wiki (enwiki, commonswiki, …).
+    Sitelink { site: String },
+    /// The item record as a whole — its existence/identity (backs the
+    /// entity's own QID `ExternalReference` fact).
+    Item,
+}
+
+// ============================================================================
 // ExternalSource
 // ============================================================================
 
@@ -471,17 +492,18 @@ pub enum ExternalSource {
         /// signal.
         published: Option<UncertainDate>,
     },
-    /// A Wikidata statement pinned to a revision id, re-fetchable for
-    /// verification. `value` carries the property value at ingest time so a
+    /// A Wikidata claim pinned to a revision id, re-fetchable for
+    /// verification. `value` carries the read value at ingest time so a
     /// check needs no network round-trip.
     Wikidata {
-        /// The Wikidata entity that bears the statement.
+        /// The Wikidata entity the claim was read from.
         entity_id: WikidataEntityId,
-        /// The Wikidata property the statement asserts.
-        property_id: WikidataPropertyId,
-        /// The pinned revision id; lets us re-fetch the exact statement.
+        /// Which part of the item the claim came from — a statement, a
+        /// label, a sitelink, or the item record itself.
+        field: WikidataField,
+        /// The pinned revision id; lets us re-fetch the exact claim.
         revision_id: u64,
-        /// The property value as observed at ingest time.
+        /// The read value as observed at ingest time.
         value: String,
     },
     /// A specific DBpedia triple pinned to a snapshot version. RDF-style
