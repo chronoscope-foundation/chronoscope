@@ -22,7 +22,7 @@ use crate::grammar::citations::{ExternalReference, Language};
 use crate::grammar::ids::{AnalyzerProcess, AnalyzerVersion, FactId};
 use crate::grammar::{attribute, image};
 use crate::store::pagination::{PAGE_SIZE, paginate};
-use crate::store::schema::{ClassPage, EntityStream, ImageStream, normalize_name};
+use crate::store::schema::{EntityStream, ImageStream, normalize_name};
 use crate::store::{ClassWalkPage, EntityIdOf, EntityView, FactStore, ImageIdOf, ImageView};
 
 // ============================================================================
@@ -104,7 +104,7 @@ pub enum MatchOutcome<Id> {
 pub async fn match_entities<S: FactStore, V: EntityView<S>>(
     decls: &[Decl<EntityIdOf<S>>],
     facts: &BTreeSet<SubmitFact>,
-    view: &V,
+    view: &mut V,
 ) -> Result<HashMap<EntityIdx, MatchOutcome<EntityIdOf<S>>>, S::Error> {
     // Anchor values keyed by decl position, one pass over the bundle.
     let mut references: HashMap<EntityIdx, BTreeSet<&ExternalReference>> = HashMap::new();
@@ -147,8 +147,12 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
         let mut candidates: BTreeMap<EntityIdOf<S>, BTreeSet<FactId>> = BTreeMap::new();
         for reference in references.get(&idx).into_iter().flatten() {
             let stream = EntityStream::ByExternalReference { reference };
-            collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                view.walk_entity_classes(&stream, cursor, PAGE_SIZE)
+            collect_candidates::<S, _, _, _, _>(&mut candidates, &mut *view, |v, cursor| {
+                let stream = &stream;
+                async move {
+                    let page = v.walk_entity_classes(stream, cursor, PAGE_SIZE).await?;
+                    Ok((page, v))
+                }
             })
             .await?;
         }
@@ -156,8 +160,12 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
         if candidates.is_empty() {
             for (name, language) in names.get(&idx).into_iter().flatten() {
                 let stream = EntityStream::ByName { name, language };
-                collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                    view.walk_entity_classes(&stream, cursor, PAGE_SIZE)
+                collect_candidates::<S, _, _, _, _>(&mut candidates, &mut *view, |v, cursor| {
+                    let stream = &stream;
+                    async move {
+                        let page = v.walk_entity_classes(stream, cursor, PAGE_SIZE).await?;
+                        Ok((page, v))
+                    }
                 })
                 .await?;
             }
@@ -177,7 +185,7 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
 pub async fn match_images<S: FactStore, V: ImageView<S>>(
     decls: &[Decl<ImageIdOf<S>>],
     facts: &BTreeSet<SubmitFact>,
-    view: &V,
+    view: &mut V,
 ) -> Result<HashMap<ImageIdx, MatchOutcome<ImageIdOf<S>>>, S::Error> {
     let mut urls: HashMap<ImageIdx, BTreeSet<&Url>> = HashMap::new();
     for fact in facts {
@@ -202,8 +210,12 @@ pub async fn match_images<S: FactStore, V: ImageView<S>>(
         let mut candidates: BTreeMap<ImageIdOf<S>, BTreeSet<FactId>> = BTreeMap::new();
         for url in urls.get(&idx).into_iter().flatten() {
             let stream = ImageStream::BySourceUrl { url };
-            collect_candidates::<S, _, _, _>(&mut candidates, |cursor| {
-                view.walk_image_classes(&stream, cursor, PAGE_SIZE)
+            collect_candidates::<S, _, _, _, _>(&mut candidates, &mut *view, |v, cursor| {
+                let stream = &stream;
+                async move {
+                    let page = v.walk_image_classes(stream, cursor, PAGE_SIZE).await?;
+                    Ok((page, v))
+                }
             })
             .await?;
         }
@@ -218,26 +230,33 @@ pub async fn match_images<S: FactStore, V: ImageView<S>>(
 /// a representative, so several collapse to one candidate rather than a spurious
 /// ambiguity. Across a decl's keyed walks (each reference, each name) the same
 /// representative accumulates its fact ids, so the basis is the union of every
-/// anchor that reached the class.
-async fn collect_candidates<S, Sub, F, Fut>(
+/// anchor that reached the class. `fetch` threads the exclusive view through
+/// each page read as [`paginate`]'s walk state.
+async fn collect_candidates<S, St, Sub, F, Fut>(
     candidates: &mut BTreeMap<Sub, BTreeSet<FactId>>,
+    state: St,
     mut fetch: F,
 ) -> Result<(), S::Error>
 where
     S: FactStore,
     Sub: Clone + Ord + Send,
-    F: FnMut(Option<S::ClassCursor<Sub>>) -> Fut,
-    Fut: Future<Output = Result<ClassWalkPage<S, Sub>, S::Error>>,
+    F: FnMut(St, Option<S::ClassCursor<Sub>>) -> Fut,
+    Fut: Future<Output = Result<(ClassWalkPage<S, Sub>, St), S::Error>>,
 {
-    paginate(move |cursor| fetch(cursor).map_ok(ClassPage::into_parts))
-        .try_for_each(|row| {
-            candidates
-                .entry(row.representative)
-                .or_default()
-                .insert(row.fact_id);
-            ready(Ok(()))
+    paginate(state, move |st, cursor| {
+        fetch(st, cursor).map_ok(|(page, st)| {
+            let (rows, next) = page.into_parts();
+            (rows, next, st)
         })
-        .await
+    })
+    .try_for_each(|row| {
+        candidates
+            .entry(row.representative)
+            .or_default()
+            .insert(row.fact_id);
+        ready(Ok(()))
+    })
+    .await
 }
 
 /// Select the [`MatchOutcome`] for one decl's deduped candidate map: exactly

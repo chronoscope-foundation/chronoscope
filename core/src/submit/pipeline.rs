@@ -19,8 +19,8 @@
 //! The validator is async so a SQL backend can `.await` reads (index lookups,
 //! rule reads) inside the transaction holding the commit; the in-memory
 //! backend reads its unified view through the same async [`FactView`]
-//! surface. It takes a `&V` bounded by the view traits it reads and returns a
-//! future.
+//! surface. It takes a `&mut V` bounded by the view traits it reads and
+//! returns a future.
 //! The in-memory backend's [`async_lock::Mutex`] guard is `Send`, so holding
 //! it across these awaits keeps the future `Send`. The validator awaits even
 //! in-memory — resolving each retraction target through `view.fact(...)` and
@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use futures_util::{TryFutureExt, TryStreamExt};
+use futures_util::TryStreamExt;
 
 use super::error::{DateRole, LocationRole, SubmitError};
 use super::result::{StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMetaFact};
@@ -44,7 +44,6 @@ use crate::grammar::lifecycle::LifetimeEventKind;
 use crate::grammar::{attribute, bookend, composites, event, image};
 use crate::location::{ConflictStatus, UnresolvedLocation};
 use crate::store::pagination::{PAGE_SIZE, paginate};
-use crate::store::schema::FactPage;
 use crate::store::{
     EntityIdOf, EventIdOf, EventView, FactPlacement, FactStore, FactView, ImageIdOf, ImageView,
     StoredFactOf, SubmitCommitError, SubmitCommitInput, SubmitCommitOutput,
@@ -133,7 +132,7 @@ pub async fn commit_facts<S: FactStore>(
 /// build the subject neighbourhood the cluster rules read.
 pub async fn validate_submit<S: FactStore, V: FactView<S> + EventView<S> + ImageView<S>>(
     candidates: &[StoredFactOf<S>],
-    view: &V,
+    view: &mut V,
 ) -> Result<Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>, S::Error> {
     let mut errors = Vec::new();
     for fact in candidates {
@@ -143,7 +142,7 @@ pub async fn validate_submit<S: FactStore, V: FactView<S> + EventView<S> + Image
         // Exhaustive so a new MetaAssertion variant forces a decision here.
         match &meta.assertion {
             MetaAssertion::RetractFact { target, .. } => {
-                if let Some(e) = check_meta_fact_target::<S, V>(view, *target).await? {
+                if let Some(e) = check_meta_fact_target::<S, V>(&mut *view, *target).await? {
                     errors.push(e);
                 }
             }
@@ -157,7 +156,7 @@ pub async fn validate_submit<S: FactStore, V: FactView<S> + EventView<S> + Image
                     // target/replacement existence checks would be redundant.
                     errors.push(SubmitError::SupersedeReplacementEqualsTarget { target: *target });
                 } else {
-                    if let Some(e) = check_meta_fact_target::<S, V>(view, *target).await? {
+                    if let Some(e) = check_meta_fact_target::<S, V>(&mut *view, *target).await? {
                         errors.push(e);
                     }
                     // The replacement is the corrected fact; require only that it
@@ -192,7 +191,7 @@ pub async fn validate_submit<S: FactStore, V: FactView<S> + EventView<S> + Image
 /// determinism.
 async fn gather_subject_neighborhood<S, V>(
     candidates: &[StoredFactOf<S>],
-    view: &V,
+    view: &mut V,
 ) -> Result<
     (
         HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
@@ -219,9 +218,11 @@ where
     }
     let mut event_facts: HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>> = HashMap::new();
     for e in events {
-        let facts = paginate(|cursor| {
-            view.all_facts_about_event(&e, cursor, PAGE_SIZE)
-                .map_ok(FactPage::into_parts)
+        let event = &e;
+        let facts = paginate(&mut *view, |v, cursor| async move {
+            let page = v.all_facts_about_event(event, cursor, PAGE_SIZE).await?;
+            let (rows, next) = page.into_parts();
+            Ok((rows, next, v))
         })
         .map_ok(|item| item.fact)
         .try_collect()
@@ -230,9 +231,11 @@ where
     }
     let mut image_facts: HashMap<ImageIdOf<S>, Vec<StoredFactOf<S>>> = HashMap::new();
     for i in images {
-        let facts = paginate(|cursor| {
-            view.all_facts_about_image(&i, cursor, PAGE_SIZE)
-                .map_ok(FactPage::into_parts)
+        let image = &i;
+        let facts = paginate(&mut *view, |v, cursor| async move {
+            let page = v.all_facts_about_image(image, cursor, PAGE_SIZE).await?;
+            let (rows, next) = page.into_parts();
+            Ok((rows, next, v))
         })
         .map_ok(|item| item.fact)
         .try_collect()
@@ -250,7 +253,7 @@ where
 /// was never minted ([`SubmitError::FactNotFound`]). `Ok(None)` means the
 /// target passes; only a backend read failure short-circuits as `Err`.
 async fn check_meta_fact_target<S: FactStore, V: FactView<S>>(
-    view: &V,
+    view: &mut V,
     target: FactId,
 ) -> Result<Option<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>, S::Error> {
     Ok(match view.placement(target).await? {

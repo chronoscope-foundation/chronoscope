@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use chrono::TimeZone;
-use futures_util::{TryFutureExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use url::Url;
 
 use super::*;
@@ -28,7 +28,8 @@ use crate::grammar::lifecycle::{
 };
 use crate::location::ConflictStatus;
 use crate::projection::Claimed;
-use crate::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds};
+use crate::store::memory::{MemoryEntityId, MemoryError, MemoryFactStore, MemoryIds};
+use crate::store::pagination::paginate;
 use crate::store::schema::{FactPage, PageItem};
 use crate::store::{EntityIdOf, EventIdOf, FactStore, ImageIdOf};
 use crate::submit::{
@@ -214,8 +215,8 @@ async fn single_name_projects_one_slot() -> TestResult {
     let result = submit(&store, 1, vec![name_fact(0, "Pantheon", "en")?]).await?;
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -248,8 +249,8 @@ async fn multiple_names_all_languages_preserved() -> TestResult {
     .await?;
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -297,8 +298,8 @@ async fn two_overlapping_date_claims_tighten_the_consensus() -> TestResult {
     .await?;
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -343,8 +344,8 @@ async fn disjoint_date_claims_conflict_with_a_disjunction_extent() -> TestResult
     .await?;
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -414,8 +415,8 @@ async fn same_entity_class_unions_members() -> TestResult {
     .await?;
     let a = result.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, a, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -454,7 +455,7 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
 
     // Retract the "Old" name fact in a second commit. Find its FactId by
     // reading the active facts back.
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
         .all_facts_about_entity(&id, None, PAGE_SIZE)
         .await
@@ -497,8 +498,8 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
         .map_err(|e| format!("{e:?}"))?;
 
     // At now(): one name.
-    let view_now = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, after) = project_entity::<MemoryFactStore, _, _>(&view_now, id, member_lineage)
+    let mut view_now = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, after) = project_entity::<MemoryFactStore, _, _>(&mut view_now, id, member_lineage)
         .await?
         .ok_or("known id should project")?;
     assert_eq!(after.names.len(), 1, "the retracted name is gone at now()");
@@ -506,8 +507,8 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
     assert_eq!(key.name.as_str(), "New");
 
     // At the pre-retraction snapshot: both names.
-    let view_before = store.no_later_than(snapshot_before);
-    let (_, before) = project_entity::<MemoryFactStore, _, _>(&view_before, id, member_lineage)
+    let mut view_before = store.no_later_than(snapshot_before);
+    let (_, before) = project_entity::<MemoryFactStore, _, _>(&mut view_before, id, member_lineage)
         .await?
         .ok_or("known id should project")?;
     assert_eq!(
@@ -549,8 +550,8 @@ async fn populated_fields_carry_factual_support() -> TestResult {
         .ok_or("missing target")?
         .id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, a, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -622,16 +623,18 @@ async fn projection_drains_past_page_boundary() -> TestResult {
     let result = submit(&store, 1, facts).await?;
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let tiny: NonZeroUsize = NonZeroUsize::new(3).ok_or("nonzero")?;
-    let drained: Vec<(FactId, StoredFact<MemoryIds>)> = paginate(|cursor| {
-        view.all_facts_about_entity(&id, cursor, tiny)
-            .map_ok(FactPage::into_parts)
-    })
-    .map_ok(|item| (item.fact_id, item.fact))
-    .try_collect()
-    .await
-    .map_err(|e| format!("{e:?}"))?;
+    let drained: Vec<(FactId, StoredFact<MemoryIds>)> =
+        paginate(&mut view, |v, cursor| async move {
+            let page = v.all_facts_about_entity(&id, cursor, tiny).await?;
+            let (rows, next) = page.into_parts();
+            Ok::<_, MemoryError>((rows, next, v))
+        })
+        .map_ok(|item| (item.fact_id, item.fact))
+        .try_collect()
+        .await
+        .map_err(|e| format!("{e:?}"))?;
 
     let name_count = drained
         .iter()
@@ -706,12 +709,14 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
         },
     ];
 
-    let drained: Vec<(FactId, StubFact)> = paginate(|cursor: Option<FactId>| {
+    let drained: Vec<(FactId, StubFact)> = paginate((), |(), cursor: Option<FactId>| {
         let page = pages.get(cursor.map_or(0, |c| c.get() as usize)).cloned();
         async move {
-            page.ok_or("stub page source: cursor out of range")
-                .map_err(|e: &str| e.to_owned())
-                .map(FactPage::into_parts)
+            let page = page
+                .ok_or("stub page source: cursor out of range")
+                .map_err(|e: &str| e.to_owned())?;
+            let (rows, next) = page.into_parts();
+            Ok::<_, String>((rows, next, ()))
         }
     })
     .map_ok(|item| (item.fact_id, item.fact))
@@ -846,8 +851,8 @@ async fn entity_projects_has_event_linked_event() -> TestResult {
         .map_err(|e| format!("{e:?}"))?;
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -1168,8 +1173,8 @@ async fn shared_field_surfaces_the_connecting_glue() -> TestResult {
     let store = MemoryFactStore::new();
     let MergedClass { x, y } = merged_class(&store).await?;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, x, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -1203,8 +1208,8 @@ async fn single_member_field_has_no_glue() -> TestResult {
     let store = MemoryFactStore::new();
     let MergedClass { x, .. } = merged_class(&store).await?;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, x, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -1229,8 +1234,8 @@ async fn identity_root_accumulates_the_merge_judgment() -> TestResult {
     let store = MemoryFactStore::new();
     let MergedClass { x, y } = merged_class(&store).await?;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, x, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -1252,8 +1257,8 @@ async fn judgment_citation_is_live_in_provenance() -> TestResult {
     let store = MemoryFactStore::new();
     let MergedClass { x, y } = merged_class(&store).await?;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, x, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -1300,11 +1305,11 @@ async fn incoming_relationship_does_not_self_loop_the_target() -> TestResult {
     let target = result.entities.get(&EntityIdx(0)).ok_or("missing 0")?.id;
     let source = result.entities.get(&EntityIdx(2)).ok_or("missing 2")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
     // Projecting the class the edge points *into*: nothing, no self-loop.
     let (class, projected_target) =
-        project_entity::<MemoryFactStore, _, _>(&view, target, member_lineage)
+        project_entity::<MemoryFactStore, _, _>(&mut view, target, member_lineage)
             .await?
             .ok_or("known id should project")?;
     assert!(
@@ -1322,7 +1327,7 @@ async fn incoming_relationship_does_not_self_loop_the_target() -> TestResult {
     // Projecting the source end: the outgoing relation surfaces, keyed by its
     // target endpoint.
     let (_, projected_source) =
-        project_entity::<MemoryFactStore, _, _>(&view, source, member_lineage)
+        project_entity::<MemoryFactStore, _, _>(&mut view, source, member_lineage)
             .await?
             .ok_or("known id should project")?;
     assert_eq!(
@@ -1409,7 +1414,7 @@ proptest! {
                 .await
                 .map_err(|e| TestCaseError::fail(format!("submit: {e}")))?;
             let id_of = |i: usize| result.entities.get(&EntityIdx(i)).map(|e| e.id);
-            let view = store
+            let mut view = store
                 .now()
                 .await
                 .map_err(|e| TestCaseError::fail(format!("view: {e:?}")))?;
@@ -1417,7 +1422,7 @@ proptest! {
             for idx in 0..entity_count {
                 let id = id_of(idx).ok_or_else(|| TestCaseError::fail("missing entity id"))?;
                 let (class, entity) =
-                    project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+                    project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
                         .await
                         .map_err(|e| TestCaseError::fail(format!("project: {e:?}")))?
                         .ok_or_else(|| TestCaseError::fail("known id should project"))?;
@@ -1826,8 +1831,8 @@ async fn project_image_drains_class_and_folds_facts() -> TestResult {
         .map_err(|e| format!("{e:?}"))?;
     let id = result.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (class, image) = project_image::<MemoryFactStore, _, _>(&view, id, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (class, image) = project_image::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -1865,8 +1870,8 @@ async fn project_image_records_same_artifact_glue() -> TestResult {
     let img0 = result.images.get(&ImageIdx(0)).ok_or("missing image 0")?.id;
     let img1 = result.images.get(&ImageIdx(1)).ok_or("missing image 1")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (class, image) = project_image::<MemoryFactStore, _, _>(&view, img0, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (class, image) = project_image::<MemoryFactStore, _, _>(&mut view, img0, member_lineage)
         .await?
         .ok_or("known id should project")?;
 
@@ -1953,11 +1958,11 @@ async fn project_drains_depiction_and_subimage_edges() -> TestResult {
         .ok_or("missing subimage")?
         .id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
     // The parent image: the depicted entity under `depicts`, the panel under
     // `subimages`, and no enclosing image of its own.
-    let (_, parent) = project_image::<MemoryFactStore, _, _>(&view, parent_id, member_lineage)
+    let (_, parent) = project_image::<MemoryFactStore, _, _>(&mut view, parent_id, member_lineage)
         .await?
         .ok_or("known id should project")?;
     assert_eq!(
@@ -1983,7 +1988,7 @@ async fn project_drains_depiction_and_subimage_edges() -> TestResult {
     );
 
     // The subimage end: the parent under `parent`, no panels of its own.
-    let (_, sub) = project_image::<MemoryFactStore, _, _>(&view, subimage_id, member_lineage)
+    let (_, sub) = project_image::<MemoryFactStore, _, _>(&mut view, subimage_id, member_lineage)
         .await?
         .ok_or("known id should project")?;
     assert_eq!(
@@ -1996,7 +2001,7 @@ async fn project_drains_depiction_and_subimage_edges() -> TestResult {
     assert!(sub.subimages.is_empty(), "the subimage holds no panels");
 
     // The entity side through its own drain: the depiction keyed by image.
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, entity_id, member_lineage)
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, entity_id, member_lineage)
         .await?
         .ok_or("known id should project")?;
     assert_eq!(
@@ -2077,8 +2082,8 @@ async fn observed_image_does_not_leak_a_foreign_depiction() -> TestResult {
         .id;
     let image_a = result.images.get(&ImageIdx(0)).ok_or("missing image A")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, image) = project_image::<MemoryFactStore, _, _>(&view, image_a, member_lineage)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, image) = project_image::<MemoryFactStore, _, _>(&mut view, image_a, member_lineage)
         .await?
         .ok_or("known id should project")?;
 

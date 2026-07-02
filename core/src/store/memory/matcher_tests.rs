@@ -61,7 +61,7 @@ async fn sole_judgment_of(
         return Err(format!("expected one fact, got {}", commit.fact_ids.len()).into());
     }
     let fid = *commit.fact_ids.first().ok_or("missing fact id")?;
-    let view = store.now().await?;
+    let mut view = store.now().await?;
     let FactLookup::Active(stored) = view.fact(fid).await? else {
         return Err("judgment must be active".into());
     };
@@ -77,7 +77,7 @@ async fn external_ref_fact_id(
     store: &MemoryFactStore,
     candidates: &[FactId],
 ) -> Result<FactId, Box<dyn std::error::Error>> {
-    let view = store.now().await?;
+    let mut view = store.now().await?;
     for &fid in candidates {
         if let FactLookup::Active(stored) = view.fact(fid).await?
             && matches!(

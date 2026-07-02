@@ -28,24 +28,33 @@ pub(crate) const PAGE_SIZE: NonZeroUsize = match NonZeroUsize::new(256) {
 /// reports `None`. Termination is on the cursor alone: a backend filtering
 /// after the page cut may return a short or empty page that still carries a
 /// cursor, and the walk continues past it.
-pub(crate) fn paginate<Row, Cur, E, F, Fut>(mut fetch: F) -> impl TryStream<Ok = Row, Error = E>
+///
+/// Views are exclusive (`&mut`) read handles, so `fetch` takes the walk state
+/// — typically the `&mut` view — by value and returns it beside each page.
+/// The state rides in the stream's own unfold state rather than being lent
+/// out of a capture; dropping the stream releases it.
+pub(crate) fn paginate<St, Row, Cur, E, F, Fut>(
+    state: St,
+    mut fetch: F,
+) -> impl TryStream<Ok = Row, Error = E>
 where
-    F: FnMut(Option<Cur>) -> Fut,
-    Fut: Future<Output = Result<(Vec<Row>, Option<Cur>), E>>,
+    F: FnMut(St, Option<Cur>) -> Fut,
+    Fut: Future<Output = Result<(Vec<Row>, Option<Cur>, St), E>>,
 {
-    // State `Some(cursor)` fetches the next page; `None` stops. `Some(None)`
-    // opens the walk with no cursor. A page's `Some(c)` cursor becomes the
-    // `Some(Some(c))` state, its `None` cursor the stopping `None`.
-    let init: Option<Option<Cur>> = Some(None);
-    stream::try_unfold(init, move |state| {
-        let pending = state.map(&mut fetch);
+    // Unfold state `Some((state, cursor))` fetches the next page; `None`
+    // stops. `Some((state, None))` opens the walk with no cursor. A page's
+    // `Some(c)` cursor becomes the `Some((state, Some(c)))` state, its `None`
+    // cursor the stopping `None`.
+    let init: Option<(St, Option<Cur>)> = Some((state, None));
+    stream::try_unfold(init, move |step| {
+        let pending = step.map(|(state, cursor)| fetch(state, cursor));
         async move {
             match pending {
                 None => Ok(None),
                 Some(fut) => {
-                    let (rows, next) = fut.await?;
+                    let (rows, next, state) = fut.await?;
                     let rows = stream::iter(rows.into_iter().map(Ok::<_, E>));
-                    Ok(Some((rows, next.map(Some))))
+                    Ok(Some((rows, next.map(|cursor| (state, Some(cursor))))))
                 }
             }
         }

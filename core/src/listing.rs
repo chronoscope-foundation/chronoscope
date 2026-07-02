@@ -131,7 +131,7 @@ pub enum ListError<E> {
 /// A `cursor` from a different snapshot yields [`ListError::SnapshotMismatch`];
 /// a fresh listing passes `None`.
 pub async fn summaries_in_bbox<S, V>(
-    view: &V,
+    view: &mut V,
     bbox: &Bbox,
     cursor: Option<ListCursor<S::ClassCursor<EntityIdOf<S>>>>,
     limit: NonZeroUsize,
@@ -172,7 +172,7 @@ where
             // A representative surfaced by the walk was named by the fact that
             // placed it, so it always projects; skip a `None` rather than panic.
             let Some((class, projected)) =
-                project_entity::<S, V, _>(view, row.representative.clone(), member_lineage)
+                project_entity::<S, V, _>(&mut *view, row.representative.clone(), member_lineage)
                     .await
                     .map_err(ListError::Backend)?
             else {

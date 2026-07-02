@@ -102,7 +102,7 @@ pub async fn resolve_fact_store_images(
 ) -> HashMap<MemoryImageId, ResolvedImageMedia> {
     let mut resolved = HashMap::new();
 
-    let view = match store.now().await {
+    let mut view = match store.now().await {
         Ok(view) => view,
         Err(e) => {
             tracing::warn!(error = %e, "fact-store image resolve: snapshot unavailable");
@@ -110,7 +110,7 @@ pub async fn resolve_fact_store_images(
         }
     };
 
-    let image_ids = match image_representatives(&view).await {
+    let image_ids = match image_representatives(&mut view).await {
         Ok(ids) => ids,
         Err(e) => {
             tracing::warn!(error = %e, "fact-store image resolve: enumeration failed");
@@ -122,7 +122,7 @@ pub async fn resolve_fact_store_images(
     let mut no_source = 0usize;
     let mut failed = 0usize;
     for image_id in image_ids {
-        match resolve_one(&view, image_id, media_store, http_client, mode).await {
+        match resolve_one(&mut view, image_id, media_store, http_client, mode).await {
             Ok(Some(media)) => {
                 resolved.insert(image_id, media);
             }
@@ -149,7 +149,7 @@ pub async fn resolve_fact_store_images(
 /// Every image's `SameArtifact` representative, deduplicated. Paging by
 /// `next_class` visits each class once; consecutive-row dedup collapses a
 /// class's multiple rows within a page.
-async fn image_representatives<V>(view: &V) -> Result<Vec<MemoryImageId>, MemoryError>
+async fn image_representatives<V>(view: &mut V) -> Result<Vec<MemoryImageId>, MemoryError>
 where
     V: ImageView<MemoryFactStore> + Sync,
 {
@@ -175,7 +175,7 @@ where
 /// Resolve one image to its media keys, or `None` when it carries no source URL
 /// to serve.
 async fn resolve_one<V>(
-    view: &V,
+    view: &mut V,
     image_id: MemoryImageId,
     media_store: &Arc<dyn MediaStore>,
     http_client: &Arc<dyn HttpClient>,
@@ -185,7 +185,7 @@ where
     V: ImageView<MemoryFactStore> + Sync,
 {
     let Some((class, projected)) =
-        project_image::<MemoryFactStore, _, _>(view, image_id, member_lineage).await?
+        project_image::<MemoryFactStore, _, _>(&mut *view, image_id, member_lineage).await?
     else {
         return Ok(None);
     };

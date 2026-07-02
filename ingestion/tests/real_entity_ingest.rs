@@ -87,10 +87,10 @@ async fn placeable_in(
     sw: (f64, f64),
     ne: (f64, f64),
 ) -> Result<Vec<EntitySummary<MemoryEntityId, MemoryImageId>>, BoxError> {
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let bbox = Bbox::new(GeoPoint::new(sw.0, sw.1)?, GeoPoint::new(ne.0, ne.1)?)?;
     let limit = NonZeroUsize::new(64).ok_or("nonzero limit")?;
-    let page = summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, limit)
+    let page = summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, limit)
         .await
         .map_err(|e| format!("{e:?}"))?;
     for s in &page.summaries {

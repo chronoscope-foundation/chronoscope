@@ -32,6 +32,11 @@
 //! [`EntityView`], [`EventView`], [`ImageView`]. Each does equivalence
 //! resolution, indexed walks, and backlink walks.
 //!
+//! A view is an exclusive read handle: every reading method takes `&mut self`
+//! so a backend can drive a connection that serialises its reads (a `sqlx`
+//! executor is `&mut`). Concurrent reads are spelled as additional views
+//! pinned at the same snapshot — `no_later_than(view.snapshot())`.
+//!
 //! The view traits are generic over the [`FactStore`] `S` and carry no
 //! associated types — they read the id kinds and error type off `S`, so a
 //! store and its views share one id vocabulary and one error type.
@@ -342,16 +347,21 @@ impl<E, R: IdScheme> From<SubmitError<R::Entity, R::Event, R::Image>> for Submit
 /// Every method here and on the companion traits is filtered to facts with
 /// `id < snapshot()` not retracted by any fact below that bound.
 ///
+/// The handle is exclusive: reads take `&mut self` so a backend can serve
+/// them off a `&mut` connection or transaction. For concurrent reads, pin
+/// more views at the same snapshot via `no_later_than(view.snapshot())`.
+///
 /// Generic over the [`FactStore`] `S`: id kinds and error type come from `S`,
 /// so the trait has no associated types of its own.
 pub trait FactView<S: FactStore>: Send + Sync {
     /// The exclusive-upper-bound [`FactId`] this view is pinned at; it exposes
     /// facts with `id < snapshot()`. `FactId::new(0)` is the empty-store view.
+    /// `&self`: the bound is pinned metadata, no I/O behind it.
     fn snapshot(&self) -> FactId;
 
     /// Look up a fact by id, preserving the four outcomes (active, retracted,
     /// future, unknown).
-    fn fact(&self, fact_id: FactId) -> impl Future<Output = FactLookupOutput<S>> + Send;
+    fn fact(&mut self, fact_id: FactId) -> impl Future<Output = FactLookupOutput<S>> + Send;
 
     /// Whether a commit with `id` was recorded at-or-before this snapshot. A
     /// retracted commit still counts as existing — it was once recorded, so
@@ -365,7 +375,7 @@ pub trait FactView<S: FactStore>: Send + Sync {
     /// validator uses this to reject a retraction whose target was never
     /// recorded ([`SubmitError::CommitNotFound`]).
     fn commit_known(
-        &self,
+        &mut self,
         id: &crate::grammar::ids::CommitId,
     ) -> impl Future<Output = Result<bool, S::Error>> + Send;
 
@@ -374,8 +384,10 @@ pub trait FactView<S: FactStore>: Send + Sync {
     /// A read snapshot has no in-flight commit, so it never reports `InFlight`
     /// — only `Committed` or `Absent`. A commit-in-preparation view (the submit
     /// union view) additionally reports `InFlight` for facts this commit mints.
-    fn placement(&self, id: FactId)
-    -> impl Future<Output = Result<FactPlacement, S::Error>> + Send;
+    fn placement(
+        &mut self,
+        id: FactId,
+    ) -> impl Future<Output = Result<FactPlacement, S::Error>> + Send;
 }
 
 /// Where a [`FactId`] sits relative to the commit a view is preparing.
@@ -419,14 +431,14 @@ pub trait EntityView<S: FactStore>: FactView<S> {
     /// snapshot. A member with no incident edges (or unknown to the store)
     /// is its own representative.
     fn entity_representative(
-        &self,
+        &mut self,
         member: &EntityIdOf<S>,
     ) -> impl Future<Output = Result<EntityIdOf<S>, S::Error>> + Send;
 
     /// The full `SameEntity` equivalence class of `member` at this
     /// snapshot — representative plus every member.
     fn entity_class(
-        &self,
+        &mut self,
         member: &EntityIdOf<S>,
     ) -> impl Future<Output = Result<EquivClass<EntityIdOf<S>>, S::Error>> + Send;
 
@@ -444,7 +456,7 @@ pub trait EntityView<S: FactStore>: FactView<S> {
     /// walk by `next_class` to visit each class once, so a backend that reports
     /// `None` while a greater representative remains truncates that consumer.
     fn walk_entity_classes<'a>(
-        &'a self,
+        &'a mut self,
         stream: &'a EntityStream<'a>,
         after: Option<S::ClassCursor<EntityIdOf<S>>>,
         limit: std::num::NonZeroUsize,
@@ -456,7 +468,7 @@ pub trait EntityView<S: FactStore>: FactView<S> {
     /// opaque token: `Some` means thread it back as the next `after` — there may
     /// be more, regardless of page size — and `None` means the walk is exhausted.
     fn all_facts_about_entity(
-        &self,
+        &mut self,
         entity: &EntityIdOf<S>,
         after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
@@ -473,13 +485,13 @@ pub trait EventView<S: FactStore>: FactView<S> {
     /// The class representative of `member` under `SameEvent` at this
     /// snapshot.
     fn event_representative(
-        &self,
+        &mut self,
         member: &EventIdOf<S>,
     ) -> impl Future<Output = Result<EventIdOf<S>, S::Error>> + Send;
 
     /// The full `SameEvent` equivalence class of `member` at this snapshot.
     fn event_class(
-        &self,
+        &mut self,
         member: &EventIdOf<S>,
     ) -> impl Future<Output = Result<EquivClass<EventIdOf<S>>, S::Error>> + Send;
 
@@ -487,7 +499,7 @@ pub trait EventView<S: FactStore>: FactView<S> {
     /// `after` is a resume token — `None` opens the walk, `Some(cursor)` resumes
     /// at the previous page's returned `next_cursor`.
     fn walk_events<'a>(
-        &'a self,
+        &'a mut self,
         stream: &'a EventStream<'a>,
         after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
@@ -497,7 +509,7 @@ pub trait EventView<S: FactStore>: FactView<S> {
     /// resume token: `None` opens the walk, `Some(cursor)` resumes at the
     /// previous page's returned `next_cursor`.
     fn all_facts_about_event(
-        &self,
+        &mut self,
         event: &EventIdOf<S>,
         after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
@@ -514,14 +526,14 @@ pub trait ImageView<S: FactStore>: FactView<S> {
     /// The class representative of `member` under `SameArtifact` at this
     /// snapshot.
     fn image_representative(
-        &self,
+        &mut self,
         member: &ImageIdOf<S>,
     ) -> impl Future<Output = Result<ImageIdOf<S>, S::Error>> + Send;
 
     /// The full `SameArtifact` equivalence class of `member` at this
     /// snapshot.
     fn image_class(
-        &self,
+        &mut self,
         member: &ImageIdOf<S>,
     ) -> impl Future<Output = Result<EquivClass<ImageIdOf<S>>, S::Error>> + Send;
 
@@ -529,7 +541,7 @@ pub trait ImageView<S: FactStore>: FactView<S> {
     /// rows, class-scoped by `SameArtifact`. See
     /// [`EntityView::walk_entity_classes`] for the row shape and pagination.
     fn walk_image_classes<'a>(
-        &'a self,
+        &'a mut self,
         stream: &'a ImageStream<'a>,
         after: Option<S::ClassCursor<ImageIdOf<S>>>,
         limit: std::num::NonZeroUsize,
@@ -539,7 +551,7 @@ pub trait ImageView<S: FactStore>: FactView<S> {
     /// resume token: `None` opens the walk, `Some(cursor)` resumes at the
     /// previous page's returned `next_cursor`.
     fn all_facts_about_image(
-        &self,
+        &mut self,
         image: &ImageIdOf<S>,
         after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,

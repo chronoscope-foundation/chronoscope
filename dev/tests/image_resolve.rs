@@ -45,7 +45,7 @@ fn page() -> Result<NonZeroUsize, BoxError> {
 /// Every image representative in the store that projects to at least one source
 /// URL — the set the resolver is expected to serve.
 async fn image_reps_with_url(store: &MemoryFactStore) -> Result<BTreeSet<MemoryImageId>, BoxError> {
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let limit = page()?;
 
     let mut reps = BTreeSet::new();
@@ -67,7 +67,7 @@ async fn image_reps_with_url(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
     let mut with_url = BTreeSet::new();
     for rep in reps {
         let Some((class, projected)) =
-            project_image::<MemoryFactStore, _, _>(&view, rep, member_lineage)
+            project_image::<MemoryFactStore, _, _>(&mut view, rep, member_lineage)
                 .await
                 .map_err(|e| format!("{e:?}"))?
         else {
@@ -83,7 +83,7 @@ async fn image_reps_with_url(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
 /// The `SameArtifact` representative of every depicted image across all
 /// entities — the exact keys the marker/detail read path looks images up by.
 async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryImageId>, BoxError> {
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let limit = page()?;
 
     let mut reps = BTreeSet::new();
@@ -100,7 +100,7 @@ async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
             }
             last = Some(row.representative);
             let Some((class, projected)) =
-                project_entity::<MemoryFactStore, _, _>(&view, row.representative, member_lineage)
+                project_entity::<MemoryFactStore, _, _>(&mut view, row.representative, member_lineage)
                     .await
                     .map_err(|e| format!("{e:?}"))?
             else {

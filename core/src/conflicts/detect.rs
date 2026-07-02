@@ -369,8 +369,8 @@ mod tests {
         store: &MemoryFactStore,
         id: MemEntId,
     ) -> Result<CitedEntity<MemoryIds>, Box<dyn std::error::Error>> {
-        let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-        let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, cited_lineage)
+        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, id, cited_lineage)
             .await?
             .ok_or("known id should project")?;
         Ok(entity)

@@ -29,17 +29,14 @@ pub use types::{
 };
 
 use std::collections::BTreeMap;
-use std::future::{Future, ready};
-
-use futures_util::{TryFutureExt, TryStreamExt};
+use std::future::Future;
 
 use crate::algebra::semiring::{Lineage, Semiring};
 use crate::grammar::ids::{FactId, IdScheme};
-use crate::store::pagination::{PAGE_SIZE, paginate};
-use crate::store::schema::{EquivClass, FactPage};
+use crate::store::pagination::PAGE_SIZE;
+use crate::store::schema::{EquivClass, PageItem};
 use crate::store::{
     EntityIdOf, EntityView, EventIdOf, EventView, FactStore, ImageIdOf, ImageView, StoredFactOf,
-    WalkPage,
 };
 use crate::submit::StoredFact;
 
@@ -64,30 +61,45 @@ where
     }
 }
 
-/// Drain each subject's backlink walk into one `FactId`-keyed map. A fact
-/// mentioning several subjects lands under one key idempotently, so the map is
-/// the deduplicated union of the walks, ordered by `FactId` for a deterministic
-/// fold downstream.
-async fn collect_backlinks<S, Sub, Rep, F, Fut>(
+/// Drain each subject's backlink walk into the shared `FactId`-keyed map. A
+/// fact mentioning several subjects lands under one key idempotently, so the
+/// map accumulates the walks' deduplicated union, ordered by `FactId` for a
+/// deterministic fold downstream.
+///
+/// A fold terminal: every walk drains to exhaustion by design, so `paginate`
+/// stays the streaming surface. `fetch` follows its contract — the walk state
+/// (the `&mut` view reborrow) goes in by value and comes back beside each
+/// page — but the resume loop is hand-rolled here because a generic `St`
+/// can't be reborrowed per subject.
+async fn collect_backlinks<S, St, Sub, Rep, F, Fut>(
+    facts: &mut BTreeMap<FactId, StoredFactOf<S>>,
+    mut state: St,
     subjects: impl IntoIterator<Item = Sub>,
-    mut walk: F,
-) -> Result<BTreeMap<FactId, StoredFactOf<S>>, S::Error>
+    mut fetch: F,
+) -> Result<(), S::Error>
 where
     S: FactStore,
     Sub: Copy,
-    F: FnMut(Sub, Option<S::Cursor>) -> Fut,
-    Fut: Future<Output = Result<WalkPage<S, Rep>, S::Error>>,
+    F: FnMut(St, Sub, Option<S::Cursor>) -> Fut,
+    Fut: Future<
+        Output = Result<(Vec<PageItem<StoredFactOf<S>, Rep>>, Option<S::Cursor>, St), S::Error>,
+    >,
 {
-    let mut facts = BTreeMap::new();
     for subject in subjects {
-        paginate(|cursor| walk(subject, cursor).map_ok(FactPage::into_parts))
-            .try_for_each(|item| {
+        let mut cursor = None;
+        loop {
+            let (rows, next, returned) = fetch(state, subject, cursor).await?;
+            state = returned;
+            for item in rows {
                 facts.insert(item.fact_id, item.fact);
-                ready(Ok(()))
-            })
-            .await?;
+            }
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
     }
-    Ok(facts)
+    Ok(())
 }
 
 /// Project an entity's `SameEntity` class as an [`Entity`] over the
@@ -113,7 +125,7 @@ where
 /// transform, sparing a second `entity_class` read — one resolution covers the
 /// representative, the mention count, and the projection.
 pub async fn project_entity<S, V, T>(
-    view: &V,
+    view: &mut V,
     entity_id: EntityIdOf<S>,
     provenance: impl Fn(&FactId, &EntityIdOf<S>, &StoredFactOf<S>) -> T,
 ) -> Result<
@@ -134,9 +146,17 @@ where
     // HasEvent in both the entity and event backlink sets) lands under one
     // FactId key, idempotently; the BTreeMap keeps the set keyed and ordered by
     // FactId for a deterministic fold.
-    let mut facts = collect_backlinks::<S, _, _, _, _>(class.members.iter(), |m, c| {
-        view.all_facts_about_entity(m, c, PAGE_SIZE)
-    })
+    let mut facts = BTreeMap::new();
+    collect_backlinks::<S, _, _, _, _, _>(
+        &mut facts,
+        &mut *view,
+        class.members.iter(),
+        |v, m, c| async move {
+            let page = v.all_facts_about_entity(m, c, PAGE_SIZE).await?;
+            let (rows, next) = page.into_parts();
+            Ok((rows, next, v))
+        },
+    )
     .await?;
 
     if facts.is_empty() {
@@ -153,12 +173,17 @@ where
     // The `HasEvent` facts also name which member reaches each event; the merge
     // tags an interior event's facts with that member as their source id.
     let reachers = merge::event_reachers(&facts);
-    facts.extend(
-        collect_backlinks::<S, _, _, _, _>(reachers.keys(), |e, c| {
-            view.all_facts_about_event(e, c, PAGE_SIZE)
-        })
-        .await?,
-    );
+    collect_backlinks::<S, _, _, _, _, _>(
+        &mut facts,
+        &mut *view,
+        reachers.keys(),
+        |v, e, c| async move {
+            let page = v.all_facts_about_event(e, c, PAGE_SIZE).await?;
+            let (rows, next) = page.into_parts();
+            Ok((rows, next, v))
+        },
+    )
+    .await?;
 
     let entity = merge::project_facts(&facts, &class.members, &reachers, provenance);
     Ok(Some((class, entity)))
@@ -177,7 +202,7 @@ where
 /// fact names drains to an empty backlink set and projects as `Ok(None)`,
 /// distinct from an `Err` backend failure.
 pub async fn project_image<S, V, T>(
-    view: &V,
+    view: &mut V,
     image_id: ImageIdOf<S>,
     provenance: impl Fn(&FactId, &ImageIdOf<S>, &StoredFactOf<S>) -> T,
 ) -> Result<
@@ -196,9 +221,17 @@ where
 
     // A member's backlinks include every image-level fact naming it and every
     // depiction / composite edge it sits on; one FactId keys each fact once.
-    let facts = collect_backlinks::<S, _, _, _, _>(class.members.iter(), |m, c| {
-        view.all_facts_about_image(m, c, PAGE_SIZE)
-    })
+    let mut facts = BTreeMap::new();
+    collect_backlinks::<S, _, _, _, _, _>(
+        &mut facts,
+        &mut *view,
+        class.members.iter(),
+        |v, m, c| async move {
+            let page = v.all_facts_about_image(m, c, PAGE_SIZE).await?;
+            let (rows, next) = page.into_parts();
+            Ok((rows, next, v))
+        },
+    )
     .await?;
 
     if facts.is_empty() {

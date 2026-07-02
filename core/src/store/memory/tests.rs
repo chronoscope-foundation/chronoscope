@@ -1,6 +1,6 @@
 use super::*;
 use chrono::TimeZone;
-use futures_util::{TryFutureExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use url::Url;
 
 use crate::date::{DatePrecision, UncertainDate};
@@ -19,7 +19,7 @@ use crate::grammar::lifecycle::{
 use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
 use crate::store::pagination::paginate;
-use crate::store::schema::{ClassPage, ClassRow};
+use crate::store::schema::ClassRow;
 use crate::submit::{Commit as SubmitBundle, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::submit::{
     CommitAuthor, DateRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError, commit_facts,
@@ -34,6 +34,37 @@ const PAGE_100: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(100) 
     Some(n) => n,
     None => std::num::NonZeroUsize::MIN,
 };
+
+/// Drain an entity class walk over `stream` to its rows at the given page
+/// limit, threading the exclusive view through [`paginate`]'s walk state.
+async fn drain_entity_classes(
+    view: &mut MemorySource<'_>,
+    stream: &EntityStream<'_>,
+    limit: std::num::NonZeroUsize,
+) -> Result<Vec<ClassRow<MemoryEntityId>>, MemoryError> {
+    paginate(view, |v, cursor| async move {
+        let page = v.walk_entity_classes(stream, cursor, limit).await?;
+        let (rows, next) = page.into_parts();
+        Ok::<_, MemoryError>((rows, next, v))
+    })
+    .try_collect()
+    .await
+}
+
+/// The image analogue of [`drain_entity_classes`].
+async fn drain_image_classes(
+    view: &mut MemorySource<'_>,
+    stream: &ImageStream<'_>,
+    limit: std::num::NonZeroUsize,
+) -> Result<Vec<ClassRow<MemoryImageId>>, MemoryError> {
+    paginate(view, |v, cursor| async move {
+        let page = v.walk_image_classes(stream, cursor, limit).await?;
+        let (rows, next) = page.into_parts();
+        Ok::<_, MemoryError>((rows, next, v))
+    })
+    .try_collect()
+    .await
+}
 
 /// The batch of `SubmitError`s a rejected submit carries, or a test failure if
 /// the error was a `Backend` failure. The single entry point every error-path
@@ -604,7 +635,7 @@ async fn roundtrip_small_commit_through_fact_lookup() -> TestResult {
     assert_eq!(result.fact_ids.len(), 2);
     assert!(!result.previously_committed);
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let resolved_entity = result
         .entities
         .get(&EntityIdx(0))
@@ -737,14 +768,11 @@ async fn walk_entity_classes_group_submitted_facts_into_one_class() -> TestResul
     let submitted: std::collections::BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
     assert_eq!(submitted.len(), 2, "expected two submitted facts");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let rows: Vec<ClassRow<MemoryEntityId>> = paginate(|cursor| {
-        view.walk_entity_classes(&EntityStream::All, cursor, PAGE_100)
-            .map_ok(ClassPage::into_parts)
-    })
-    .try_collect()
-    .await
-    .map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<MemoryEntityId>> =
+        drain_entity_classes(&mut view, &EntityStream::All, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
 
     let reps: std::collections::BTreeSet<MemoryEntityId> =
         rows.iter().map(|r| r.representative).collect();
@@ -794,16 +822,13 @@ async fn class_walk_pages_distinct_entities_as_contiguous_runs() -> TestResult {
     let alpha: std::collections::BTreeSet<FactId> = first.fact_ids.iter().copied().collect();
     let beta: std::collections::BTreeSet<FactId> = second.fact_ids.iter().copied().collect();
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     // One row per page forces each class to span page boundaries.
     let one = std::num::NonZeroUsize::MIN;
-    let rows: Vec<ClassRow<MemoryEntityId>> = paginate(|cursor| {
-        view.walk_entity_classes(&EntityStream::All, cursor, one)
-            .map_ok(ClassPage::into_parts)
-    })
-    .try_collect()
-    .await
-    .map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<MemoryEntityId>> =
+        drain_entity_classes(&mut view, &EntityStream::All, one)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
 
     // Compress rows to their representative runs; a contiguous walk visits each
     // representative in exactly one run.
@@ -869,7 +894,7 @@ async fn all_facts_about_entity_returns_facts_mentioning_it() -> TestResult {
         .ok_or("missing entity")?
         .id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
         .all_facts_about_entity(&entity, None, PAGE_100)
         .await
@@ -913,7 +938,7 @@ async fn walk_events_returns_submitted_event_facts() -> TestResult {
     let submitted: std::collections::BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
     assert_eq!(submitted.len(), 3, "expected three submitted facts");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
         .walk_events(&EventStream::All, None, PAGE_100)
         .await
@@ -957,7 +982,7 @@ async fn all_facts_about_event_returns_facts_mentioning_it() -> TestResult {
     assert_eq!(submitted.len(), 3, "expected three submitted facts");
     let event = result.events.get(&EventIdx(0)).ok_or("missing event")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
         .all_facts_about_event(&event, None, PAGE_100)
         .await
@@ -995,14 +1020,11 @@ async fn walk_image_classes_group_submitted_facts_into_one_class() -> TestResult
     let submitted: std::collections::BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
     assert_eq!(submitted.len(), 2, "expected two submitted facts");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let rows: Vec<ClassRow<MemoryImageId>> = paginate(|cursor| {
-        view.walk_image_classes(&ImageStream::All, cursor, PAGE_100)
-            .map_ok(ClassPage::into_parts)
-    })
-    .try_collect()
-    .await
-    .map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<MemoryImageId>> =
+        drain_image_classes(&mut view, &ImageStream::All, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
 
     let reps: std::collections::BTreeSet<MemoryImageId> =
         rows.iter().map(|r| r.representative).collect();
@@ -1043,7 +1065,7 @@ async fn all_facts_about_image_returns_facts_mentioning_it() -> TestResult {
     assert_eq!(submitted.len(), 2, "expected two submitted facts");
     let image = result.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
         .all_facts_about_image(&image, None, PAGE_100)
         .await
@@ -1098,7 +1120,7 @@ async fn entity_class_contains_both_same_entity_members() -> TestResult {
     let b = result.entities.get(&EntityIdx(1)).ok_or("missing b")?.id;
     assert_ne!(a, b, "the two Local decls must mint distinct ids");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let class = view.entity_class(&a).await.map_err(|e| format!("{e:?}"))?;
     assert!(
         class.members.contains(&a) && class.members.contains(&b),
@@ -1141,7 +1163,7 @@ async fn entity_representative_is_canonical_across_same_entity_members() -> Test
     let b = result.entities.get(&EntityIdx(1)).ok_or("missing b")?.id;
     assert_ne!(a, b, "the two Local decls must mint distinct ids");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let rep_a = view
         .entity_representative(&a)
         .await
@@ -1200,7 +1222,7 @@ async fn event_class_contains_both_same_event_members() -> TestResult {
     let b = result.events.get(&EventIdx(1)).ok_or("missing b")?.id;
     assert_ne!(a, b, "the two Local decls must mint distinct ids");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let class = view.event_class(&a).await.map_err(|e| format!("{e:?}"))?;
     assert!(
         class.members.contains(&a) && class.members.contains(&b),
@@ -1245,7 +1267,7 @@ async fn event_representative_is_canonical_across_same_event_members() -> TestRe
     let b = result.events.get(&EventIdx(1)).ok_or("missing b")?.id;
     assert_ne!(a, b, "the two Local decls must mint distinct ids");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let rep_a = view
         .event_representative(&a)
         .await
@@ -1301,7 +1323,7 @@ async fn image_class_contains_both_same_artifact_members() -> TestResult {
     let b = result.images.get(&ImageIdx(1)).ok_or("missing b")?.id;
     assert_ne!(a, b, "the two Local decls must mint distinct ids");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let class = view.image_class(&a).await.map_err(|e| format!("{e:?}"))?;
     assert!(
         class.members.contains(&a) && class.members.contains(&b),
@@ -1343,7 +1365,7 @@ async fn image_representative_is_canonical_across_same_artifact_members() -> Tes
     let b = result.images.get(&ImageIdx(1)).ok_or("missing b")?.id;
     assert_ne!(a, b, "the two Local decls must mint distinct ids");
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let rep_a = view
         .image_representative(&a)
         .await
@@ -2004,13 +2026,13 @@ async fn retract_fact_hides_target_only_after_its_commit() -> TestResult {
         .map_err(|e| format!("{e:?}"))?;
     let retractor = *retraction.fact_ids.first().ok_or("no retractor fact id")?;
 
-    let before = store.no_later_than(retractor);
+    let mut before = store.no_later_than(retractor);
     let lookup = before.fact(target).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Active(_) = lookup else {
         return Err(format!("expected Active before retraction, got {lookup:?}").into());
     };
 
-    let after = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut after = store.now().await.map_err(|e| format!("{e:?}"))?;
     let lookup = after.fact(target).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Retracted { by } = lookup else {
         return Err(format!("expected Retracted after retraction, got {lookup:?}").into());
@@ -2028,7 +2050,7 @@ async fn read_snapshot_placement_is_committed_or_absent() -> TestResult {
     let first = commit_name(&store, "alpha").await?;
     let committed = *first.fact_ids.first().ok_or("no committed fact id")?;
     let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
     assert_eq!(
         view.placement(committed)
@@ -2059,7 +2081,7 @@ async fn read_snapshot_placement_never_inflight_past_watermark() -> TestResult {
     assert_eq!(committed_count, crate::grammar::ids::FactId::new(2));
 
     // An "everything" view whose watermark is well past the committed count.
-    let view = store.no_later_than(crate::grammar::ids::FactId::new(1_000));
+    let mut view = store.no_later_than(crate::grammar::ids::FactId::new(1_000));
 
     // An id between the committed count and the watermark names no fact — the
     // old lower-bound-only `InFlight` branch wrongly reported `InFlight` here.
@@ -2112,7 +2134,7 @@ async fn retract_commit_hides_every_fact_of_target() -> TestResult {
         .map_err(|e| format!("{e:?}"))?;
     let retractor = *retraction.fact_ids.first().ok_or("no retractor fact id")?;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     for fact_id in &original.fact_ids {
         let lookup = view.fact(*fact_id).await.map_err(|e| format!("{e:?}"))?;
         let FactLookup::Retracted { by } = lookup else {
@@ -2151,7 +2173,7 @@ async fn supersede_fact_hides_target_and_keeps_replacement() -> TestResult {
         .first()
         .ok_or("no supersede fact id")?;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let target_lookup = view.fact(target).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Retracted { by } = target_lookup else {
         return Err(format!("expected superseded target Retracted, got {target_lookup:?}").into());
@@ -2200,20 +2222,20 @@ async fn retraction_of_retraction_restores_visibility() -> TestResult {
         .map_err(|e| format!("{e:?}"))?;
     let r2 = *c3.fact_ids.first().ok_or("no r2 id")?;
 
-    let era1 = store.no_later_than(r1);
+    let mut era1 = store.no_later_than(r1);
     let lookup = era1.fact(f1).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Active(_) = lookup else {
         return Err(format!("C1-era: expected Active, got {lookup:?}").into());
     };
 
-    let era2 = store.no_later_than(r2);
+    let mut era2 = store.no_later_than(r2);
     let lookup = era2.fact(f1).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Retracted { by } = lookup else {
         return Err(format!("C2-era: expected Retracted, got {lookup:?}").into());
     };
     assert_eq!(by, r1);
 
-    let era3 = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut era3 = store.now().await.map_err(|e| format!("{e:?}"))?;
     let lookup = era3.fact(f1).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Active(_) = lookup else {
         return Err(format!("C3-era: expected Active again, got {lookup:?}").into());
@@ -2267,7 +2289,7 @@ async fn retracted_by_reports_lowest_still_effective_retractor() -> TestResult {
     // Retract ra, cancelling it.
     commit_retract(&store, ra, 30).await?;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let lookup = view.fact(f).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Retracted { by } = lookup else {
         return Err(format!("expected Retracted, got {lookup:?}").into());
@@ -2658,7 +2680,7 @@ async fn all_facts_about_image_excludes_retracted() -> TestResult {
         .await
         .map_err(|e| format!("{e:?}"))?;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let page = view
         .all_facts_about_image(&image, None, PAGE_100)
         .await
@@ -2699,7 +2721,7 @@ async fn all_facts_about_image_respects_snapshot() -> TestResult {
         .map_err(|e| format!("{e:?}"))?;
     let late = *c2.fact_ids.first().ok_or("no fact id")?;
 
-    let view = store.no_later_than(snapshot);
+    let mut view = store.no_later_than(snapshot);
     let page = view
         .all_facts_about_image(&image, None, PAGE_100)
         .await
@@ -3843,7 +3865,7 @@ async fn walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities() ->
     )
     .await?;
     let d_event = d.events.get(&EventIdx(0)).ok_or("missing d event")?.id;
-    let pre_retract = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut pre_retract = store.now().await.map_err(|e| format!("{e:?}"))?;
     let d_facts = pre_retract
         .all_facts_about_event(&d_event, None, PAGE_100)
         .await
@@ -3863,14 +3885,10 @@ async fn walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities() ->
 
     let bbox = sample_bbox()?;
     let stream = EntityStream::InBbox(&bbox);
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let rows: Vec<ClassRow<MemoryEntityId>> = paginate(|cursor| {
-        view.walk_entity_classes(&stream, cursor, PAGE_100)
-            .map_ok(ClassPage::into_parts)
-    })
-    .try_collect()
-    .await
-    .map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<MemoryEntityId>> = drain_entity_classes(&mut view, &stream, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
 
     let reps: std::collections::BTreeSet<MemoryEntityId> =
         rows.iter().map(|r| r.representative).collect();
@@ -3925,7 +3943,7 @@ async fn class_walk_next_class_cursor_skips_to_the_next_representative() -> Test
 
     let bbox = sample_bbox()?;
     let stream = EntityStream::InBbox(&bbox);
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let one = std::num::NonZeroUsize::MIN;
 
     // First page: one row under A, with both cursors live.
@@ -3973,14 +3991,12 @@ async fn class_walk_next_class_cursor_skips_to_the_next_representative() -> Test
     assert_eq!(page_class.next_class, None, "B is the last representative");
 
     // The row cursor walks every row: A, A, B, B.
-    let by_row: Vec<MemoryEntityId> = paginate(|cursor| {
-        view.walk_entity_classes(&stream, cursor, one)
-            .map_ok(ClassPage::into_parts)
-    })
-    .map_ok(|row| row.representative)
-    .try_collect()
-    .await
-    .map_err(|e| format!("{e:?}"))?;
+    let by_row: Vec<MemoryEntityId> = drain_entity_classes(&mut view, &stream, one)
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .into_iter()
+        .map(|row| row.representative)
+        .collect();
     assert_eq!(
         by_row,
         vec![a_id, a_id, b_id, b_id],
@@ -4110,7 +4126,7 @@ mod props {
         }
 
         // Drive the cursor loop. Cap iterations so a cursor bug can't hang.
-        let view = store
+        let mut view = store
             .now()
             .await
             .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
@@ -4282,10 +4298,10 @@ async fn extract_point_reads_resolved_circle_and_skips_reference() -> TestResult
         .ok_or("missing symbolic")?
         .id;
 
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
     let (class, projected) =
-        project_entity::<MemoryFactStore, _, _>(&view, placed_id, member_lineage)
+        project_entity::<MemoryFactStore, _, _>(&mut view, placed_id, member_lineage)
             .await?
             .ok_or("placed entity should project")?;
     let entity = crate::typed::Entity::parse(&projected, &class);
@@ -4296,7 +4312,7 @@ async fn extract_point_reads_resolved_circle_and_skips_reference() -> TestResult
     );
 
     let (class, projected) =
-        project_entity::<MemoryFactStore, _, _>(&view, symbolic_id, member_lineage)
+        project_entity::<MemoryFactStore, _, _>(&mut view, symbolic_id, member_lineage)
             .await?
             .ok_or("symbolic entity should project")?;
     let entity = crate::typed::Entity::parse(&projected, &class);
@@ -4334,8 +4350,8 @@ async fn summaries_in_bbox_surfaces_located_excludes_reference() -> TestResult {
     let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id;
 
     let bbox = sample_bbox()?;
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, PAGE_100)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -4385,8 +4401,8 @@ async fn summaries_in_bbox_surfaces_moved_in_entity_at_current_marker() -> TestR
     let moved_id = moved.entities.get(&EntityIdx(0)).ok_or("missing moved")?.id;
 
     let bbox = sample_bbox()?;
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, PAGE_100)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -4430,8 +4446,8 @@ async fn summaries_in_bbox_excludes_built_in_moved_out_entity() -> TestResult {
     let moved_id = moved.entities.get(&EntityIdx(0)).ok_or("missing moved")?.id;
 
     let bbox = sample_bbox()?;
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, PAGE_100)
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
 
@@ -4465,19 +4481,20 @@ async fn summaries_in_bbox_paginates_each_entity_once() -> TestResult {
     }
 
     let bbox = sample_bbox()?;
-    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let limit = std::num::NonZeroUsize::new(2).ok_or("nonzero limit")?;
 
-    let page1 = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, limit)
+    let page1 = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, limit)
         .await
         .map_err(|e| format!("{e:?}"))?;
     let cursor = page1
         .next
         .clone()
         .ok_or("limit below the count, so the first page carries a cursor")?;
-    let page2 = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, Some(cursor), limit)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let page2 =
+        listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, Some(cursor), limit)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
 
     let mut all: Vec<MemoryEntityId> = page1.summaries.iter().map(|s| s.id).collect();
     all.extend(page2.summaries.iter().map(|s| s.id));
@@ -4506,7 +4523,7 @@ async fn summaries_in_bbox_pins_snapshot() -> TestResult {
     )
     .await?;
     let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
-    let view = store.no_later_than(snapshot);
+    let mut view = store.no_later_than(snapshot);
 
     // A second in-box entity lands after the snapshot; the pinned view can't see it.
     commit_result(
@@ -4516,7 +4533,7 @@ async fn summaries_in_bbox_pins_snapshot() -> TestResult {
     .await?;
 
     let bbox = sample_bbox()?;
-    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, PAGE_100)
+    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, PAGE_100)
         .await
         .map_err(|e| format!("{e:?}"))?;
     assert_eq!(
@@ -4530,7 +4547,8 @@ async fn summaries_in_bbox_pins_snapshot() -> TestResult {
         walk: (MemoryEntityId(0), FactId::new(0)),
     };
     let replayed =
-        listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, Some(stale), PAGE_100).await;
+        listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, Some(stale), PAGE_100)
+            .await;
     assert!(
         matches!(replayed, Err(ListError::SnapshotMismatch)),
         "a cursor from a foreign snapshot is refused"

@@ -1052,10 +1052,11 @@ mod tests {
             .ok_or("entity 0 resolved")?
             .id;
 
-        let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-        let (class, projected) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
-            .await?
-            .ok_or("entity should project")?;
+        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let (class, projected) =
+            project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
+                .await?
+                .ok_or("entity should project")?;
         let entity = typed::Entity::parse(&projected, &class);
 
         let texts: BTreeSet<&str> = entity.names.iter().map(|n| n.text.as_str()).collect();
@@ -1203,12 +1204,12 @@ mod tests {
     #[tokio::test]
     async fn bbox_listing_surfaces_pantheon_at_its_coordinate() -> TestResult {
         let (store, id) = committed_pantheon().await?;
-        let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
         // A box around central Rome, comfortably covering the P625 point.
         let bbox = Bbox::new(GeoPoint::new(41.8, 12.4)?, GeoPoint::new(42.0, 12.6)?)?;
         let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
-        let page = summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, limit)
+        let page = summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, limit)
             .await
             .map_err(|e| format!("{e:?}"))?;
 
@@ -1238,12 +1239,12 @@ mod tests {
     #[tokio::test]
     async fn bbox_listing_omits_pantheon_from_a_faraway_box() -> TestResult {
         let (store, id) = committed_pantheon().await?;
-        let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
         // A box over the mid-Atlantic — nowhere near Rome.
         let bbox = Bbox::new(GeoPoint::new(0.0, -40.0)?, GeoPoint::new(10.0, -30.0)?)?;
         let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
-        let page = summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, limit)
+        let page = summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, limit)
             .await
             .map_err(|e| format!("{e:?}"))?;
 

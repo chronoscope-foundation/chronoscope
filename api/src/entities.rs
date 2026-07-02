@@ -101,14 +101,14 @@ fn request_bbox(
 /// no fact ever named the id. Shared by the detail grid and the marker thumbnail
 /// path; a backend error maps to a 500.
 async fn typed_image<V>(
-    view: &V,
+    view: &mut V,
     image_id: MemoryImageId,
 ) -> Result<Option<typed::Image<MemoryEntityId, MemoryImageId>>, HttpError>
 where
     V: ImageView<MemoryFactStore> + Sync,
 {
     let Some((class, projected)) =
-        project_image::<MemoryFactStore, _, _>(view, image_id, member_lineage)
+        project_image::<MemoryFactStore, _, _>(&mut *view, image_id, member_lineage)
             .await
             .map_err(fact_store_err)?
     else {
@@ -195,8 +195,9 @@ pub async fn list_entities(
         Some(c) => Some(decode_cursor(&c)?),
     };
 
-    let view = state.facts.now().await.map_err(fact_store_err)?;
-    let page = match summaries_in_bbox::<MemoryFactStore, _>(&view, &core_bbox, cursor, limit).await
+    let mut view = state.facts.now().await.map_err(fact_store_err)?;
+    let page =
+        match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, cursor, limit).await
     {
         Ok(p) => p,
         Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
@@ -233,11 +234,11 @@ pub async fn get_entity(
     let state = ctx.context();
     let id = path.into_inner().id;
 
-    let view = state.facts.now().await.map_err(fact_store_err)?;
+    let mut view = state.facts.now().await.map_err(fact_store_err)?;
     // An id no committed fact ever named projects as `None` — the fact store's
     // "not found", since a real entity carries at least the fact that minted it.
     let Some((class, projected)) =
-        project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+        project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
             .await
             .map_err(fact_store_err)?
     else {
@@ -252,7 +253,7 @@ pub async fn get_entity(
     // grid tile — a tile that can't load is worse than an absent one.
     let mut images = Vec::new();
     for dep in &entity.depictions {
-        let Some(image) = typed_image(&view, dep.other).await? else {
+        let Some(image) = typed_image(&mut view, dep.other).await? else {
             continue;
         };
         let Some(source_url) = image.urls.first().map(|a| a.value.clone()) else {
@@ -276,7 +277,7 @@ pub async fn get_entity(
     // facts, so the same class is projected again under `cited_lineage`. The id
     // already projected `Some` above, so the cited projection matches; a `None`
     // means the class emptied between the two reads, which carries no conflicts.
-    let conflicts = match project_entity::<MemoryFactStore, _, _>(&view, id, cited_lineage)
+    let conflicts = match project_entity::<MemoryFactStore, _, _>(&mut view, id, cited_lineage)
         .await
         .map_err(fact_store_err)?
     {
@@ -334,8 +335,9 @@ pub async fn list_markers(
 
     let limit = entity_types::max_page_limit()?;
 
-    let view = state.facts.now().await.map_err(fact_store_err)?;
-    let page = match summaries_in_bbox::<MemoryFactStore, _>(&view, &core_bbox, None, limit).await {
+    let mut view = state.facts.now().await.map_err(fact_store_err)?;
+    let page =
+        match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, None, limit).await {
         Ok(p) => p,
         Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
         // No cursor is ever passed here, and `summaries_in_bbox` only checks

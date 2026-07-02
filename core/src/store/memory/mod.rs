@@ -37,7 +37,7 @@
 //! rule.
 //!
 //! The [`async_lock::Mutex`] guard is `Send`, so it spans the `.await`s on the
-//! async matcher and validator (the pipeline takes `&V: FactView<S>` and
+//! async matcher and validator (the pipeline takes `&mut V: FactView<S>` and
 //! awaits, since a SQL backend awaits DB reads inside its own transaction).
 //! Here those futures are always ready — the [`UnionSource`] accumulates mints
 //! in owned state and the drain runs on the same task — so the held lock never
@@ -792,8 +792,8 @@ impl CoreSource for UnionSource<'_> {
 // the impls hang off `Src: CoreSource` via blanket impls, parameterised by
 // `MemoryFactStore`. Both `MemorySource` and `UnionSource` gain the read
 // surface with no wrapper type, and the lookup logic lives once in `ReadCore`.
-// The submit pipeline reads through a `&V: FactView<S>` to an owned source, so
-// only the blanket impl on `Src` is exercised. The id kinds and error type
+// The submit pipeline reads through a `&mut V: FactView<S>` to an owned
+// source, so only the blanket impl on `Src` is exercised. The id kinds and error type
 // come from `MemoryFactStore`, so the bodies name `Memory*Id` / `MemoryError`
 // directly.
 
@@ -802,15 +802,15 @@ impl<Src: CoreSource + Send + Sync> FactView<MemoryFactStore> for Src {
         CoreSource::snapshot(self)
     }
 
-    async fn fact(&self, fact_id: FactId) -> Result<MemFactLookup, MemoryError> {
+    async fn fact(&mut self, fact_id: FactId) -> Result<MemFactLookup, MemoryError> {
         Ok(self.with_core(|core| core.fact_at(fact_id)).await)
     }
 
-    async fn commit_known(&self, id: &CommitId) -> Result<bool, MemoryError> {
+    async fn commit_known(&mut self, id: &CommitId) -> Result<bool, MemoryError> {
         Ok(self.with_core(|core| core.commit_known_at(id)).await)
     }
 
-    async fn placement(&self, id: FactId) -> Result<FactPlacement, MemoryError> {
+    async fn placement(&mut self, id: FactId) -> Result<FactPlacement, MemoryError> {
         Ok(self.with_core(|core| core.placement_at(id)).await)
     }
 }
@@ -825,7 +825,7 @@ impl<Src: CoreSource + Send + Sync> FactView<MemoryFactStore> for Src {
 
 impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
     async fn entity_representative(
-        &self,
+        &mut self,
         member: &MemoryEntityId,
     ) -> Result<MemoryEntityId, MemoryError> {
         let member = *member;
@@ -835,7 +835,7 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
     }
 
     async fn entity_class(
-        &self,
+        &mut self,
         member: &MemoryEntityId,
     ) -> Result<EquivClass<MemoryEntityId>, MemoryError> {
         let member = *member;
@@ -845,7 +845,7 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
     }
 
     async fn walk_entity_classes<'b>(
-        &'b self,
+        &'b mut self,
         stream: &'b EntityStream<'b>,
         after: Option<(MemoryEntityId, FactId)>,
         limit: std::num::NonZeroUsize,
@@ -904,7 +904,7 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
     }
 
     async fn all_facts_about_entity(
-        &self,
+        &mut self,
         entity: &MemoryEntityId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
@@ -925,14 +925,14 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
 
 impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
     async fn event_representative(
-        &self,
+        &mut self,
         member: &MemoryEventId,
     ) -> Result<MemoryEventId, MemoryError> {
         Ok(*member)
     }
 
     async fn event_class(
-        &self,
+        &mut self,
         member: &MemoryEventId,
     ) -> Result<EquivClass<MemoryEventId>, MemoryError> {
         Ok(EquivClass {
@@ -942,7 +942,7 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
     }
 
     async fn walk_events<'b>(
-        &'b self,
+        &'b mut self,
         _stream: &'b EventStream<'b>,
         _after: Option<FactId>,
         _limit: std::num::NonZeroUsize,
@@ -954,7 +954,7 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
     }
 
     async fn all_facts_about_event(
-        &self,
+        &mut self,
         event: &MemoryEventId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
@@ -975,7 +975,7 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
 
 impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
     async fn image_representative(
-        &self,
+        &mut self,
         member: &MemoryImageId,
     ) -> Result<MemoryImageId, MemoryError> {
         let member = *member;
@@ -985,7 +985,7 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
     }
 
     async fn image_class(
-        &self,
+        &mut self,
         member: &MemoryImageId,
     ) -> Result<EquivClass<MemoryImageId>, MemoryError> {
         let member = *member;
@@ -995,7 +995,7 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
     }
 
     async fn walk_image_classes<'b>(
-        &'b self,
+        &'b mut self,
         stream: &'b ImageStream<'b>,
         after: Option<(MemoryImageId, FactId)>,
         limit: std::num::NonZeroUsize,
@@ -1027,7 +1027,7 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
     }
 
     async fn all_facts_about_image(
-        &self,
+        &mut self,
         image: &MemoryImageId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
@@ -1393,12 +1393,11 @@ async fn submit_locked(
     // Judge each Local decl against the view; every Local mints below, and
     // a match becomes an identity judgment in the companion commit. Events
     // are never matched, so each Local event decl gets a synthesised
-    // unmatched outcome. The `&source` borrows end before the `&mut source`
-    // mints.
-    let entity_outcomes = matcher::match_entities(&commit.entities, &commit.facts, &source)
+    // unmatched outcome.
+    let entity_outcomes = matcher::match_entities(&commit.entities, &commit.facts, &mut source)
         .await
         .map_err(SubmitCommitError::Backend)?;
-    let image_outcomes = matcher::match_images(&commit.images, &commit.facts, &source)
+    let image_outcomes = matcher::match_images(&commit.images, &commit.facts, &mut source)
         .await
         .map_err(SubmitCommitError::Backend)?;
     let event_outcomes: HashMap<EventIdx, MatchOutcome<MemoryEventId>> = commit
@@ -1530,7 +1529,7 @@ async fn submit_locked(
     // its batch in. Only a backend read failure short-circuits; a rule
     // violation joins the batch.
     validation_errors.extend(
-        validate_submit(&stored_facts, &source)
+        validate_submit(&stored_facts, &mut source)
             .await
             .map_err(SubmitCommitError::Backend)?,
     );
