@@ -85,8 +85,8 @@ mod equiv;
 mod scan;
 
 use self::scan::{
-    entity_ids_of, entity_named, entity_referenced, image_ids_of, image_sourced_from,
-    same_artifact_edge, same_entity_edge,
+    entity_ids_of, entity_in_bbox, entity_named, entity_referenced, image_ids_of,
+    image_sourced_from, same_artifact_edge, same_entity_edge,
 };
 
 // ============================================================================
@@ -879,12 +879,27 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
                     core.walk_classes(after, limit, entity_ids_of, same_entity_edge)
                 })
                 .await),
-            EntityStream::InBbox(_)
-            | EntityStream::InTimeRange(_)
-            | EntityStream::InBboxAndTimeRange { .. } => Ok(ClassPage {
-                rows: Vec::new(),
-                next: None,
-            }),
+            EntityStream::InBbox(bbox) => Ok(self
+                .with_core(move |core| {
+                    // The event→entity owner map is built once for the walk; the
+                    // predicate reads it to attribute a `MovedToLocation` to the
+                    // entity its `HasEvent` owns.
+                    let owners = core.event_entity_map();
+                    core.walk_classes(
+                        after,
+                        limit,
+                        |fact| entity_in_bbox(fact, bbox, &owners),
+                        same_entity_edge,
+                    )
+                })
+                .await),
+            EntityStream::InTimeRange(_) | EntityStream::InBboxAndTimeRange { .. } => {
+                Ok(ClassPage {
+                    rows: Vec::new(),
+                    next: None,
+                    next_class: None,
+                })
+            }
         }
     }
 
@@ -1006,6 +1021,7 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
             | ImageStream::InBboxAndTimeRange { .. } => Ok(ClassPage {
                 rows: Vec::new(),
                 next: None,
+                next_class: None,
             }),
         }
     }

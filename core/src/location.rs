@@ -853,6 +853,17 @@ impl UnresolvedLocation {
         }
     }
 
+    /// The center of a resolved circle — the one point this location pins down.
+    /// A combinator denotes a region and a symbolic `Reference` an unresolved
+    /// place, so both answer `None`; a spatial index reads the point off a
+    /// circle and leaves the rest to the geometry-aware layers.
+    pub fn point(&self) -> Option<&GeoPoint> {
+        match self {
+            Self::Resolved(Location::Circle { center, .. }) => Some(center),
+            _ => None,
+        }
+    }
+
     /// The number of `Circle` leaves reachable through the combinators. A
     /// `Reference` is one opaque place, not a circle, so it counts zero. This is
     /// the same leaf set the emptiness check enumerates, so it bounds that

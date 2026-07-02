@@ -15,15 +15,15 @@ use crate::facts::ids::UserId;
 use crate::facts::lifecycle::{
     DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind,
 };
-use crate::facts::pagination::{group_classes, paginate};
-use crate::facts::schema::{Class, ClassPage};
+use crate::facts::pagination::paginate;
+use crate::facts::schema::{ClassPage, ClassRow};
 use crate::facts::submit::{
     Commit as SubmitBundle, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact,
 };
 use crate::facts::submit::{
     CommitAuthor, DateRole, ResolutionOrigin, StoredFact, SubjectKind, SubmitError, commit_facts,
 };
-use crate::geo::{GeoPoint, Meters};
+use crate::geo::{Bbox, GeoPoint, Meters};
 use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
 
@@ -716,8 +716,9 @@ async fn local_decls_mint_distinct_newly_minted_ids() -> TestResult {
 
 // --- walk conformance ---
 
-/// A commit's entity-touching facts fold into one class whose `fact_ids` are
-/// exactly the submitted set — the class-walk conformance every backend owes.
+/// A commit's entity-touching facts walk as rows under a single representative
+/// whose fact ids are exactly the submitted set — the class-walk conformance
+/// every backend owes.
 #[tokio::test]
 async fn walk_entity_classes_group_submitted_facts_into_one_class() -> TestResult {
     let store = MemoryFactStore::new();
@@ -739,32 +740,34 @@ async fn walk_entity_classes_group_submitted_facts_into_one_class() -> TestResul
     assert_eq!(submitted.len(), 2, "expected two submitted facts");
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let classes: Vec<Class<MemoryEntityId>> = group_classes(paginate(|cursor| {
+    let rows: Vec<ClassRow<MemoryEntityId>> = paginate(|cursor| {
         view.walk_entity_classes(&EntityStream::All, cursor, PAGE_100)
             .map_ok(ClassPage::into_parts)
-    }))
+    })
     .try_collect()
     .await
     .map_err(|e| format!("{e:?}"))?;
 
+    let reps: std::collections::BTreeSet<MemoryEntityId> =
+        rows.iter().map(|r| r.representative).collect();
     assert_eq!(
-        classes.len(),
+        reps.len(),
         1,
-        "one entity yields one class; got {classes:?}"
+        "one entity yields one representative; got {rows:?}"
     );
-    let class = classes.first().ok_or("missing class")?;
+    let walked: std::collections::BTreeSet<FactId> = rows.iter().map(|r| r.fact_id).collect();
     assert_eq!(
-        class.fact_ids, submitted,
-        "the class's fact_ids are exactly the submitted entity-touching facts"
+        walked, submitted,
+        "the walk's fact ids are exactly the submitted entity-touching facts"
     );
     Ok(())
 }
 
-/// Distinct entities page as distinct whole classes even at a one-row page
-/// limit: the walk orders rows by `(representative, fact_id)`, so
-/// `group_classes` never splits a class across a page boundary.
+/// At a one-row page limit two entities' rows still page correctly: the walk
+/// orders rows by `(representative, fact_id)`, so each entity's rows form one
+/// contiguous run across page boundaries, carrying exactly its submitted facts.
 #[tokio::test]
-async fn class_walk_pages_distinct_entities_as_whole_classes() -> TestResult {
+async fn class_walk_pages_distinct_entities_as_contiguous_runs() -> TestResult {
     let store = MemoryFactStore::new();
     let first = commit_facts(
         &store,
@@ -796,21 +799,45 @@ async fn class_walk_pages_distinct_entities_as_whole_classes() -> TestResult {
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
     // One row per page forces each class to span page boundaries.
     let one = std::num::NonZeroUsize::MIN;
-    let classes: Vec<Class<MemoryEntityId>> = group_classes(paginate(|cursor| {
+    let rows: Vec<ClassRow<MemoryEntityId>> = paginate(|cursor| {
         view.walk_entity_classes(&EntityStream::All, cursor, one)
             .map_ok(ClassPage::into_parts)
-    }))
+    })
     .try_collect()
     .await
     .map_err(|e| format!("{e:?}"))?;
 
+    // Compress rows to their representative runs; a contiguous walk visits each
+    // representative in exactly one run.
+    let mut runs: Vec<MemoryEntityId> = Vec::new();
+    for row in &rows {
+        if runs.last() != Some(&row.representative) {
+            runs.push(row.representative);
+        }
+    }
+    let distinct: std::collections::BTreeSet<MemoryEntityId> = runs.iter().copied().collect();
+    assert_eq!(
+        runs.len(),
+        distinct.len(),
+        "each entity's rows form one run; a representative recurs across runs in {rows:?}"
+    );
+
+    // Each representative's run carries exactly its submitted facts.
+    let mut by_rep: std::collections::BTreeMap<MemoryEntityId, std::collections::BTreeSet<FactId>> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        by_rep
+            .entry(row.representative)
+            .or_default()
+            .insert(row.fact_id);
+    }
     let got: std::collections::BTreeSet<std::collections::BTreeSet<FactId>> =
-        classes.iter().map(|c| c.fact_ids.clone()).collect();
+        by_rep.into_values().collect();
     let want: std::collections::BTreeSet<std::collections::BTreeSet<FactId>> =
         [alpha, beta].into_iter().collect();
     assert_eq!(
         got, want,
-        "each entity pages as its own whole class; got {classes:?}"
+        "each entity's rows carry exactly its submitted facts; got {rows:?}"
     );
     Ok(())
 }
@@ -971,23 +998,25 @@ async fn walk_image_classes_group_submitted_facts_into_one_class() -> TestResult
     assert_eq!(submitted.len(), 2, "expected two submitted facts");
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let classes: Vec<Class<MemoryImageId>> = group_classes(paginate(|cursor| {
+    let rows: Vec<ClassRow<MemoryImageId>> = paginate(|cursor| {
         view.walk_image_classes(&ImageStream::All, cursor, PAGE_100)
             .map_ok(ClassPage::into_parts)
-    }))
+    })
     .try_collect()
     .await
     .map_err(|e| format!("{e:?}"))?;
 
+    let reps: std::collections::BTreeSet<MemoryImageId> =
+        rows.iter().map(|r| r.representative).collect();
     assert_eq!(
-        classes.len(),
+        reps.len(),
         1,
-        "one image yields one class; got {classes:?}"
+        "one image yields one representative; got {rows:?}"
     );
-    let class = classes.first().ok_or("missing class")?;
+    let walked: std::collections::BTreeSet<FactId> = rows.iter().map(|r| r.fact_id).collect();
     assert_eq!(
-        class.fact_ids, submitted,
-        "the class's fact_ids are exactly the submitted image-touching facts"
+        walked, submitted,
+        "the walk's fact ids are exactly the submitted image-touching facts"
     );
     Ok(())
 }
@@ -3740,6 +3769,281 @@ async fn disjunctive_meta_citation_date_rejected() -> TestResult {
     Ok(())
 }
 
+// --- spatial class walk (InBbox) ---
+
+/// The NYC-ish box the spatial walk tests query: lat `[40, 41]`, lon
+/// `[-74, -73]`.
+fn sample_bbox() -> Result<Bbox, Box<dyn std::error::Error>> {
+    Ok(Bbox::new(
+        GeoPoint::new(40.0, -74.0)?,
+        GeoPoint::new(41.0, -73.0)?,
+    )?)
+}
+
+/// A construction `Location` bookend pinning the entity at a resolved point.
+fn construction_at(
+    entity_idx: usize,
+    lat: f64,
+    lon: f64,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: bookend::Fact::Location {
+                entity: EntityIdx(entity_idx),
+                location: UnresolvedLocation::Resolved(Location::point(GeoPoint::new(lat, lon)?)),
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// A `MovedToLocation` payload landing the event's `Moved` at a resolved point.
+fn moved_to(
+    event_idx: usize,
+    lat: f64,
+    lon: f64,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Event {
+            fact: crate::facts::event::Fact::MovedToLocation {
+                event: EventIdx(event_idx),
+                location: UnresolvedLocation::Resolved(Location::point(GeoPoint::new(lat, lon)?)),
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// `InBbox` surfaces every entity the box holds — a construction bookend inside
+/// it, or a `MovedToLocation` inside it attributed through its `HasEvent` owner —
+/// and nothing else. An out-of-box construction is excluded, and a move whose
+/// `HasEvent` owner is retracted attributes to no entity.
+#[tokio::test]
+async fn walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities() -> TestResult {
+    let store = MemoryFactStore::new();
+    let inside = (40.5, -73.5);
+    let outside = (10.0, 10.0);
+
+    // A: built inside the box.
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, inside.0, inside.1)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
+
+    // B: built outside the box.
+    let b = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, outside.0, outside.1)?])?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id;
+
+    // C: built outside, then a `Moved` event lands it inside the box.
+    let c = commit_result(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            20,
+            vec![
+                construction_at(0, outside.0, outside.1)?,
+                has_event_fact(0, 0, moved_kind())?,
+                moved_to(0, inside.0, inside.1)?,
+            ],
+        )?,
+    )
+    .await?;
+    let c_id = c.entities.get(&EntityIdx(0)).ok_or("missing c")?.id;
+
+    // D: a `Moved` inside the box whose `HasEvent` owner is retracted below, so
+    // the orphaned move attributes to no entity.
+    let d = commit_result(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            30,
+            vec![
+                has_event_fact(0, 0, moved_kind())?,
+                moved_to(0, inside.0, inside.1)?,
+            ],
+        )?,
+    )
+    .await?;
+    let d_event = d.events.get(&EventIdx(0)).ok_or("missing d event")?.id;
+    let pre_retract = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let d_facts = pre_retract
+        .all_facts_about_event(&d_event, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let has_event_fid = d_facts
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.fact.event_fact(),
+                Some(crate::facts::event::Fact::HasEvent { .. })
+            )
+        })
+        .ok_or("D's HasEvent is missing")?
+        .fact_id;
+    commit_retract(&store, has_event_fid, 40).await?;
+
+    let bbox = sample_bbox()?;
+    let stream = EntityStream::InBbox(&bbox);
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<MemoryEntityId>> = paginate(|cursor| {
+        view.walk_entity_classes(&stream, cursor, PAGE_100)
+            .map_ok(ClassPage::into_parts)
+    })
+    .try_collect()
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+
+    let reps: std::collections::BTreeSet<MemoryEntityId> =
+        rows.iter().map(|r| r.representative).collect();
+    let want: std::collections::BTreeSet<MemoryEntityId> = [a_id, c_id].into_iter().collect();
+    assert_eq!(
+        reps, want,
+        "InBbox surfaces the in-box construction (a={a_id:?}) and the moved-in entity \
+         (c={c_id:?}); the out-of-box construction (b={b_id:?}) and the orphaned move \
+         (d's event={d_event:?}) are excluded; got {rows:?}"
+    );
+    Ok(())
+}
+
+/// Two entities, each with two in-box construction `Location`s, paged one row at
+/// a time. `next` walks every row (each representative twice); `next_class`
+/// skips the emitted representative's remaining rows, so paging on it visits
+/// each representative once.
+#[tokio::test]
+async fn class_walk_next_class_cursor_skips_to_the_next_representative() -> TestResult {
+    let store = MemoryFactStore::new();
+    let a = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![
+                construction_at(0, 40.2, -73.8)?,
+                construction_at(0, 40.3, -73.7)?,
+            ],
+        )?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
+    let b = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![
+                construction_at(0, 40.6, -73.4)?,
+                construction_at(0, 40.7, -73.3)?,
+            ],
+        )?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id;
+    assert!(a_id < b_id, "A must mint the lower id so it sorts first");
+
+    let bbox = sample_bbox()?;
+    let stream = EntityStream::InBbox(&bbox);
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let one = std::num::NonZeroUsize::MIN;
+
+    // First page: one row under A, with both cursors live.
+    let page1 = view
+        .walk_entity_classes(&stream, None, one)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(page1.rows.len(), 1);
+    assert_eq!(page1.rows[0].representative, a_id);
+    let next = page1.next.ok_or("page1 has more rows, so next is set")?;
+    assert_eq!(
+        next,
+        (a_id, page1.rows[0].fact_id),
+        "next steps to A's next row"
+    );
+    let next_class = page1.next_class.ok_or("B remains, so next_class is set")?;
+    assert_eq!(
+        next_class,
+        (a_id, FactId::new(u64::MAX)),
+        "next_class resumes past all of A's rows"
+    );
+
+    // Resuming on `next` stays within A (its second row).
+    let page_next = view
+        .walk_entity_classes(&stream, Some(next), one)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(page_next.rows.len(), 1);
+    assert_eq!(
+        page_next.rows[0].representative, a_id,
+        "next stays within A"
+    );
+
+    // Resuming on `next_class` skips A's tail and lands on B; B is the final
+    // class, so its `next_class` is exhausted.
+    let page_class = view
+        .walk_entity_classes(&stream, Some(next_class), one)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(page_class.rows.len(), 1);
+    assert_eq!(
+        page_class.rows[0].representative, b_id,
+        "next_class skips to B"
+    );
+    assert_eq!(page_class.next_class, None, "B is the last representative");
+
+    // The row cursor walks every row: A, A, B, B.
+    let by_row: Vec<MemoryEntityId> = paginate(|cursor| {
+        view.walk_entity_classes(&stream, cursor, one)
+            .map_ok(ClassPage::into_parts)
+    })
+    .map_ok(|row| row.representative)
+    .try_collect()
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        by_row,
+        vec![a_id, a_id, b_id, b_id],
+        "the row cursor walks every row"
+    );
+
+    // The class cursor visits each representative once: A, B.
+    let mut by_class: Vec<MemoryEntityId> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = view
+            .walk_entity_classes(&stream, cursor, one)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let Some(row) = page.rows.first() else {
+            break;
+        };
+        by_class.push(row.representative);
+        match page.next_class {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(
+        by_class,
+        vec![a_id, b_id],
+        "the class cursor visits each representative once"
+    );
+    Ok(())
+}
+
 // --- property tests ---
 
 mod props {
@@ -3971,4 +4275,293 @@ mod props {
             prop_assert_eq!(out.len() + errors.len(), total);
         }
     }
+}
+
+// --- entity listing (summaries_in_bbox) ---
+
+use crate::facts::listing::{self, ListCursor, ListError};
+use crate::facts::projection::{member_lineage, project_entity};
+
+/// `extract_point` reads a resolved circle's center and declines a symbolic
+/// reference — the placeability test the listing filters on.
+#[tokio::test]
+async fn extract_point_reads_resolved_circle_and_skips_reference() -> TestResult {
+    let store = MemoryFactStore::new();
+    let placed = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, 40.5, -73.5)?])?,
+    )
+    .await?;
+    let placed_id = placed
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing placed")?
+        .id;
+    let symbolic = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![construction_location_in(0, "Springfield")?],
+        )?,
+    )
+    .await?;
+    let symbolic_id = symbolic
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing symbolic")?
+        .id;
+
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+
+    let (class, projected) =
+        project_entity::<MemoryFactStore, _, _>(&view, placed_id, member_lineage).await?;
+    let entity = crate::facts::typed::Entity::parse(&projected, &class);
+    assert_eq!(
+        listing::extract_point(&entity),
+        Some(GeoPoint::new(40.5, -73.5)?),
+        "a resolved circle yields its center"
+    );
+
+    let (class, projected) =
+        project_entity::<MemoryFactStore, _, _>(&view, symbolic_id, member_lineage).await?;
+    let entity = crate::facts::typed::Entity::parse(&projected, &class);
+    assert_eq!(
+        listing::extract_point(&entity),
+        None,
+        "a symbolic reference has no resolvable point"
+    );
+    Ok(())
+}
+
+/// A located entity surfaces at its point; a `Reference`-only entity, with no
+/// resolvable circle, never enters the viewport.
+#[tokio::test]
+async fn summaries_in_bbox_surfaces_located_excludes_reference() -> TestResult {
+    let store = MemoryFactStore::new();
+    let inside = (40.5, -73.5);
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, inside.0, inside.1)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
+    let b = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![construction_location_in(0, "Springfield")?],
+        )?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id;
+
+    let bbox = sample_bbox()?;
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let ids: std::collections::BTreeSet<MemoryEntityId> =
+        page.summaries.iter().map(|s| s.id).collect();
+    assert!(ids.contains(&a_id), "the located entity surfaces: {ids:?}");
+    assert!(
+        !ids.contains(&b_id),
+        "the Reference-only entity is excluded: {ids:?}"
+    );
+    let a_summary = page
+        .summaries
+        .iter()
+        .find(|s| s.id == a_id)
+        .ok_or("A missing from summaries")?;
+    assert_eq!(
+        a_summary.point,
+        GeoPoint::new(inside.0, inside.1)?,
+        "A surfaces at its construction point"
+    );
+    assert_eq!(page.next, None, "one page holds every in-box entity");
+    Ok(())
+}
+
+/// An entity built outside the box but moved into it lists at its current
+/// (moved-to) marker, not its construction site.
+#[tokio::test]
+async fn summaries_in_bbox_surfaces_moved_in_entity_at_current_marker() -> TestResult {
+    let store = MemoryFactStore::new();
+    let outside = (10.0, 10.0);
+    let inside = (40.5, -73.5);
+    let moved = commit_result(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                construction_at(0, outside.0, outside.1)?,
+                has_event_fact(0, 0, moved_kind())?,
+                moved_to(0, inside.0, inside.1)?,
+            ],
+        )?,
+    )
+    .await?;
+    let moved_id = moved.entities.get(&EntityIdx(0)).ok_or("missing moved")?.id;
+
+    let bbox = sample_bbox()?;
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let summary = page
+        .summaries
+        .iter()
+        .find(|s| s.id == moved_id)
+        .ok_or("the moved-in entity must surface")?;
+    assert_eq!(
+        summary.point,
+        GeoPoint::new(inside.0, inside.1)?,
+        "the moved-in entity lists at its current marker, not its construction site"
+    );
+    Ok(())
+}
+
+/// An entity built inside the box but moved out of it drops from the listing:
+/// the spatial walk still surfaces it (its construction sits in-box), but its
+/// current marker is now outside, so a listed pin would fall out of view. The
+/// mirror of the built-outside/moved-in case.
+#[tokio::test]
+async fn summaries_in_bbox_excludes_built_in_moved_out_entity() -> TestResult {
+    let store = MemoryFactStore::new();
+    let inside = (40.5, -73.5);
+    let outside = (10.0, 10.0);
+    let moved = commit_result(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                construction_at(0, inside.0, inside.1)?,
+                has_event_fact(0, 0, moved_kind())?,
+                moved_to(0, outside.0, outside.1)?,
+            ],
+        )?,
+    )
+    .await?;
+    let moved_id = moved.entities.get(&EntityIdx(0)).ok_or("missing moved")?.id;
+
+    let bbox = sample_bbox()?;
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    assert!(
+        page.summaries.iter().all(|s| s.id != moved_id),
+        "an entity moved out of the box is not listed — its current pin sits \
+         outside the viewport; got {:?}",
+        page.summaries
+    );
+    Ok(())
+}
+
+/// With `limit` below the in-box count, the first page carries a resume cursor;
+/// replaying it yields the rest, each entity exactly once with no overlap.
+#[tokio::test]
+async fn summaries_in_bbox_paginates_each_entity_once() -> TestResult {
+    let store = MemoryFactStore::new();
+    let points = [(40.2, -73.8), (40.5, -73.5), (40.8, -73.2)];
+    for (i, (lat, lon)) in points.into_iter().enumerate() {
+        commit_result(
+            &store,
+            local_bundle(
+                1,
+                0,
+                0,
+                (i as i64) * 10,
+                vec![construction_at(0, lat, lon)?],
+            )?,
+        )
+        .await?;
+    }
+
+    let bbox = sample_bbox()?;
+    let view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let limit = std::num::NonZeroUsize::new(2).ok_or("nonzero limit")?;
+
+    let page1 = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, limit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let cursor = page1
+        .next
+        .clone()
+        .ok_or("limit below the count, so the first page carries a cursor")?;
+    let page2 = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, Some(cursor), limit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let mut all: Vec<MemoryEntityId> = page1.summaries.iter().map(|s| s.id).collect();
+    all.extend(page2.summaries.iter().map(|s| s.id));
+    let unique: std::collections::BTreeSet<MemoryEntityId> = all.iter().copied().collect();
+    assert_eq!(
+        all.len(),
+        unique.len(),
+        "no entity appears on both pages: {all:?}"
+    );
+    assert_eq!(
+        unique.len(),
+        3,
+        "the two pages together cover every in-box entity: {all:?}"
+    );
+    Ok(())
+}
+
+/// A view pinned before a later commit never sees it, and a cursor from a
+/// different snapshot is refused rather than replayed against the wrong state.
+#[tokio::test]
+async fn summaries_in_bbox_pins_snapshot() -> TestResult {
+    let store = MemoryFactStore::new();
+    commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, 40.3, -73.7)?])?,
+    )
+    .await?;
+    let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    let view = store.no_later_than(snapshot);
+
+    // A second in-box entity lands after the snapshot; the pinned view can't see it.
+    commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, 40.6, -73.4)?])?,
+    )
+    .await?;
+
+    let bbox = sample_bbox()?;
+    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        page.summaries.len(),
+        1,
+        "the fact committed after the snapshot is invisible"
+    );
+
+    let stale = ListCursor {
+        snapshot: FactId::new(u64::MAX),
+        walk: (MemoryEntityId(0), FactId::new(0)),
+    };
+    let replayed =
+        listing::summaries_in_bbox::<MemoryFactStore, _>(&view, &bbox, Some(stale), PAGE_100).await;
+    assert!(
+        matches!(replayed, Err(ListError::SnapshotMismatch)),
+        "a cursor from a foreign snapshot is refused"
+    );
+    Ok(())
 }

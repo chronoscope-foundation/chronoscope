@@ -122,6 +122,7 @@ pub mod identity;
 pub mod ids;
 pub mod image;
 pub mod lifecycle;
+pub mod listing;
 pub mod memory;
 pub mod observation;
 mod pagination;

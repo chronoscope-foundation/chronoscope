@@ -452,31 +452,45 @@ where
         .collect()
 }
 
-/// An interior event's best-known date — started, falling back to completed,
-/// falling back to occurred — for ordering. The bookends carry none; they anchor
-/// by lifecycle position instead.
-fn interior_date<ImgId>(kind: &InteriorEvent<ImgId>) -> Option<NaiveDate> {
-    let period_date = |p: &Period<ImgId>| {
-        p.started
-            .possible
-            .earliest()
-            .or_else(|| p.completed.possible.earliest())
-    };
+/// The date bounds one interior event carries, in representative-first order: a
+/// period's start then completion, a point event's instant, an ambiguous event's
+/// start/completion/occurrence. [`interior_date`] reads the first with a known
+/// lower bound; [`timeline_span`](crate::facts::listing) folds them all.
+pub(crate) fn interior_event_bounds<ImgId>(
+    kind: &InteriorEvent<ImgId>,
+) -> Vec<&Bounded<UncertainDate, ImgId>> {
     match kind {
         InteriorEvent::Modified { period }
         | InteriorEvent::Repaired { period }
         | InteriorEvent::Damaged { period, .. }
-        | InteriorEvent::Moved { period, .. } => period_date(period),
-        InteriorEvent::UsageChanged { at, .. } | InteriorEvent::Designated { at, .. } => {
-            at.possible.earliest()
+        | InteriorEvent::Moved { period, .. } => vec![&period.started, &period.completed],
+        InteriorEvent::UsageChanged { at, .. } | InteriorEvent::Designated { at, .. } => vec![at],
+        InteriorEvent::Ambiguous { facts, .. } => {
+            vec![&facts.started, &facts.completed, &facts.occurred]
         }
-        InteriorEvent::Ambiguous { facts, .. } => facts
-            .started
-            .possible
-            .earliest()
-            .or_else(|| facts.completed.possible.earliest())
-            .or_else(|| facts.occurred.possible.earliest()),
     }
+}
+
+/// The date bounds one timeline entry carries: a bookend or durational span's
+/// endpoints, or an interior event's bounds (see [`interior_event_bounds`]).
+pub(crate) fn entry_date_bounds<EvtId, ImgId>(
+    detail: &EventDetail<EvtId, ImgId>,
+) -> Vec<&Bounded<UncertainDate, ImgId>> {
+    match detail {
+        EventDetail::Constructed { period, .. } | EventDetail::Demolished { period } => {
+            vec![&period.started, &period.completed]
+        }
+        EventDetail::Interior { kind, .. } => interior_event_bounds(kind),
+    }
+}
+
+/// An interior event's best-known date — started, falling back to completed,
+/// falling back to occurred — for ordering. The bookends carry none; they anchor
+/// by lifecycle position instead.
+fn interior_date<ImgId>(kind: &InteriorEvent<ImgId>) -> Option<NaiveDate> {
+    interior_event_bounds(kind)
+        .into_iter()
+        .find_map(|bound| bound.possible.earliest())
 }
 
 /// The total timeline order: construction first, demolition last, interior by

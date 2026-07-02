@@ -63,7 +63,7 @@ pub(crate) fn event_reachers<R: IdScheme>(
 ) -> BTreeMap<R::Event, R::Entity> {
     let mut reachers: BTreeMap<R::Event, R::Entity> = BTreeMap::new();
     for fact in facts.values() {
-        if let Some(event::Fact::HasEvent { entity, event, .. }) = fact.event_fact() {
+        if let Some((event, entity)) = fact.has_event_owner() {
             reachers.insert(event.clone(), entity.clone());
         }
     }

@@ -241,6 +241,17 @@ impl<R: IdScheme> StoredFact<R> {
             _ => None,
         }
     }
+
+    /// The `(event, owning entity)` a `HasEvent` fact names. The projection's
+    /// `event_reachers` and the spatial walk's `event_entity_map` both key an
+    /// event to its owner through this, so the owner rule reads as one shape.
+    pub fn has_event_owner(&self) -> Option<(&R::Event, &R::Entity)> {
+        if let crate::facts::event::Fact::HasEvent { entity, event, .. } = self.event_fact()? {
+            Some((event, entity))
+        } else {
+            None
+        }
+    }
 }
 
 // ============================================================================

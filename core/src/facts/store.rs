@@ -410,9 +410,14 @@ pub trait EntityView<S: FactStore>: FactView<S> {
     ///
     /// `after` is a resume token: `None` opens the walk from the first row,
     /// `Some(cursor)` resumes at the previous page's returned `next`. Rows come
-    /// ordered by `(representative, fact_id)`, so
-    /// [`group_classes`](crate::facts::pagination::group_classes) folds each
-    /// class's contiguous run into a whole [`Class`](crate::facts::schema::Class).
+    /// ordered by `(representative, fact_id)`, so a class's rows stay contiguous
+    /// across page boundaries.
+    ///
+    /// A page's `next_class` must resume the walk strictly past the last row's
+    /// representative, and must be `Some` whenever a representative greater than
+    /// it remains. A rep-enumerating consumer (the viewport listing) drives the
+    /// walk by `next_class` to visit each class once, so a backend that reports
+    /// `None` while a greater representative remains truncates that consumer.
     fn walk_entity_classes<'a>(
         &'a self,
         stream: &'a EntityStream<'a>,

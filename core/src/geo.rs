@@ -228,6 +228,16 @@ impl Bbox {
     pub fn ne(&self) -> &GeoPoint {
         &self.ne
     }
+
+    /// Whether `p` lies within the box, inclusive on every edge. Corner
+    /// construction rejects inverted and antimeridian spans, so both axes are
+    /// plain interval tests.
+    pub fn contains(&self, p: &GeoPoint) -> bool {
+        self.sw.lat() <= p.lat()
+            && p.lat() <= self.ne.lat()
+            && self.sw.lon() <= p.lon()
+            && p.lon() <= self.ne.lon()
+    }
 }
 
 // ============================================================================
@@ -545,6 +555,20 @@ mod tests {
             Bbox::new(sw, ne),
             Err(BboxError::SwNotSouthwestOfNe { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn bbox_contains_is_edge_inclusive() -> TestResult {
+        let b = Bbox::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(41.0, -73.0)?)?;
+        assert!(b.contains(&GeoPoint::new(40.5, -73.5)?), "interior point");
+        assert!(b.contains(&GeoPoint::new(40.0, -74.0)?), "sw corner is in");
+        assert!(b.contains(&GeoPoint::new(41.0, -73.0)?), "ne corner is in");
+        assert!(
+            !b.contains(&GeoPoint::new(41.5, -73.5)?),
+            "north of the box"
+        );
+        assert!(!b.contains(&GeoPoint::new(40.5, -72.5)?), "east of the box");
         Ok(())
     }
 

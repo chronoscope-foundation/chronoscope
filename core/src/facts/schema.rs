@@ -8,8 +8,8 @@
 //! relation enum to pass, because there's nothing to choose between. The query
 //! types here describe what to walk (the [`EntityStream`] / [`EventStream`] /
 //! [`ImageStream`] indices) and what comes back — [`FactPage`] / [`PageItem`]
-//! for the backlink walks, [`ClassPage`] / [`ClassRow`] / [`Class`] for the
-//! class walks, and [`EquivClass`] for a single subject's class.
+//! for the backlink walks, [`ClassPage`] / [`ClassRow`] for the class walks,
+//! and [`EquivClass`] for a single subject's class.
 //!
 //! ## Subject kinds
 //!
@@ -25,12 +25,11 @@
 //! ## Walk semantics
 //!
 //! A class `walk_*` pages `(representative, fact_id)` rows ([`ClassRow`]),
-//! ordered by `(representative, fact_id)` so a class's rows are contiguous
-//! across page boundaries. [`group_classes`](super::pagination::group_classes)
-//! regroups the contiguous run into a whole [`Class`] — the representative and
-//! every `fact_id` under it. A fact naming two members of one class contributes
-//! one row; the representative comes from the subject kind's canonical
-//! equivalence, so there's no grouping choice.
+//! ordered by `(representative, fact_id)` so a class's rows stay contiguous
+//! across page boundaries — a consumer keying by representative sees each
+//! class's rows arrive as one run. A fact naming two members of one class
+//! contributes one row; the representative comes from the subject kind's
+//! canonical equivalence, so there's no grouping choice.
 //!
 //! ## Backlinks
 //!
@@ -216,34 +215,30 @@ pub struct ClassRow<Rep> {
     pub fact_id: FactId,
 }
 
-/// A page of class-walk rows, ordered by `(representative, fact_id)`. `next` is
-/// the store's opaque class cursor, threaded back verbatim as the walk's next
-/// `after`; `None` once the walk is exhausted.
+/// A page of class-walk rows, ordered by `(representative, fact_id)`. Two opaque
+/// resume tokens page the same walk at different granularities: [`next`](Self::next)
+/// steps one row, [`next_class`](Self::next_class) steps one representative. A
+/// caller threads whichever it wants back verbatim as the walk's next `after`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassPage<Rep, Cur> {
     pub rows: Vec<ClassRow<Rep>>,
-    /// Opaque resume token: thread back as the walk's next cursor, or `None`
-    /// when the walk is exhausted.
+    /// Resume at the next row — more of the last row's representative, or the
+    /// first row of the next one. The row cursor the matcher's drain follows.
+    /// `None` once the walk is exhausted.
     pub next: Option<Cur>,
+    /// Resume at the next representative, skipping the last row's
+    /// representative's remaining rows, so a rep-enumerating consumer sees each
+    /// representative once. `None` when the last row's representative is the
+    /// final class.
+    pub next_class: Option<Cur>,
 }
 
 impl<Rep, Cur> ClassPage<Rep, Cur> {
-    /// The rows and resume token as a tuple, for `paginate`'s tuple form.
+    /// The rows and row cursor as a tuple, for `paginate`'s tuple form. The
+    /// class cursor is read off [`Self::next_class`] directly.
     pub(crate) fn into_parts(self) -> (Vec<ClassRow<Rep>>, Option<Cur>) {
         (self.rows, self.next)
     }
-}
-
-/// A whole equivalence class from a class walk: the representative and every
-/// `fact_id` that fell under it. The product
-/// [`group_classes`](super::pagination::group_classes) folds a class's
-/// contiguous [`ClassRow`]s into.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Class<Rep> {
-    /// The canonical representative of the class.
-    pub representative: Rep,
-    /// Every fact id the walk found under this class.
-    pub fact_ids: BTreeSet<FactId>,
 }
 
 // ============================================================================

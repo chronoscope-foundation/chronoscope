@@ -1,20 +1,21 @@
 //! Fact-bag scanning: the per-query extractors and the keyed walk behind the
 //! `walk_*` stream arms.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 
 use url::Url;
 
 use super::equiv::EquivAdjacency;
-use super::{MemStoredFact, MemoryEntityId, MemoryIds, MemoryImageId, ReadCore};
+use super::{MemStoredFact, MemoryEntityId, MemoryEventId, MemoryIds, MemoryImageId, ReadCore};
 use crate::facts::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::facts::citations::{ExternalReference, Language};
 use crate::facts::ids::FactId;
 use crate::facts::schema::{ClassPage, ClassRow, normalize_name};
 use crate::facts::submit::StoredFact;
 use crate::facts::submit::result::{StoredFactualFact, StoredJudgmentFact};
-use crate::facts::{attribute, identity, image};
+use crate::facts::{attribute, bookend, event, identity, image};
+use crate::geo::Bbox;
 
 // Aliases to keep the spellings short.
 type MemFactualAssertion = FactualAssertion<MemoryIds>;
@@ -142,7 +143,48 @@ pub(super) fn image_sourced_from(fact: &MemStoredFact, url: &Url) -> Option<Memo
     }
 }
 
+/// The entity a stored fact places inside `bbox`, if any — the `InBbox` stream
+/// extractor. A construction bookend yields its own entity; a `MovedToLocation`
+/// yields the entity its event's `HasEvent` owns, read from `owners` (see
+/// [`ReadCore::event_entity_map`]). Only a resolved circle carries a point, so a
+/// symbolic or combinator location contributes nothing.
+pub(super) fn entity_in_bbox(
+    fact: &MemStoredFact,
+    bbox: &Bbox,
+    owners: &BTreeMap<MemoryEventId, MemoryEntityId>,
+) -> Option<MemoryEntityId> {
+    match factual_assertion(fact)? {
+        FactualAssertion::Construction {
+            fact: bookend::Fact::Location { entity, location },
+        } => bbox.contains(location.point()?).then_some(*entity),
+        FactualAssertion::Event {
+            fact: event::Fact::MovedToLocation { event, location },
+        } => bbox
+            .contains(location.point()?)
+            .then(|| owners.get(event).copied())
+            .flatten(),
+        _ => None,
+    }
+}
+
 impl ReadCore<'_> {
+    /// Each lifetime event's owning entity, from the active `HasEvent` facts at
+    /// this snapshot — the global analogue of the projection's `event_reachers`,
+    /// scoped to one walk. A retracted `HasEvent` is no owner edge, so its event
+    /// resolves to nothing and a `MovedToLocation` under it stays unattributed.
+    pub(super) fn event_entity_map(&self) -> BTreeMap<MemoryEventId, MemoryEntityId> {
+        let mut owners = BTreeMap::new();
+        for (fid, fact) in self.visible_facts() {
+            if self.retracted_by(fid).is_some() {
+                continue;
+            }
+            if let Some((event, entity)) = fact.has_event_owner() {
+                owners.insert(*event, *entity);
+            }
+        }
+        owners
+    }
+
     /// A page of `(representative, fact_id)` rows ordered by
     /// `(representative, fact_id)`, resuming strictly past `after` (`None` opens
     /// the walk). `subjects_of` yields the subjects a visible, active fact
@@ -153,7 +195,11 @@ impl ReadCore<'_> {
     /// `walk_*` stream arms.
     ///
     /// `next` is the last emitted `(representative, fact_id)` when more rows
-    /// remain past the page, else `None`. The adjacency is built once per call
+    /// remain past the page, else `None`. `next_class` resumes past the last
+    /// row's representative — an opaque `(last_rep, u64::MAX)` that sorts after
+    /// every real `(last_rep, fid)`, so a resume strictly past it lands on the
+    /// first row of the next class — and is live only while a greater
+    /// representative remains in the set. The adjacency is built once per call
     /// and every representative lookup answers from it.
     pub(super) fn walk_classes<S, I>(
         &self,
@@ -213,6 +259,18 @@ impl ReadCore<'_> {
         } else {
             None
         };
-        ClassPage { rows: page, next }
+        // The set's maximum row carries the maximum representative; when the
+        // page's last rep falls short of it, a later class remains to skip to.
+        let next_class = page.last().and_then(|last| {
+            rows.iter()
+                .next_back()
+                .filter(|(max_rep, _)| *max_rep > last.representative)
+                .map(|_| (last.representative, FactId::new(u64::MAX)))
+        });
+        ClassPage {
+            rows: page,
+            next,
+            next_class,
+        }
     }
 }

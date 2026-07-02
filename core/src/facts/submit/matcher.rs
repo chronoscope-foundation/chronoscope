@@ -20,7 +20,7 @@ use super::{Decl, EntityIdx, ImageIdx, SubmitFact};
 use crate::facts::assertions::FactualAssertion;
 use crate::facts::citations::{ExternalReference, Language};
 use crate::facts::ids::{AnalyzerProcess, AnalyzerVersion, FactId};
-use crate::facts::pagination::{PAGE_SIZE, group_classes, paginate};
+use crate::facts::pagination::{PAGE_SIZE, paginate};
 use crate::facts::schema::{ClassPage, EntityStream, ImageStream, normalize_name};
 use crate::facts::store::{ClassWalkPage, EntityIdOf, EntityView, FactStore, ImageIdOf, ImageView};
 use crate::facts::{attribute, image};
@@ -212,15 +212,13 @@ pub async fn match_images<S: FactStore, V: ImageView<S>>(
     Ok(out)
 }
 
-/// Drain a keyed class walk to exhaustion, unioning each class's fact ids into
+/// Drain a keyed class walk to exhaustion, unioning each row's fact id into
 /// `candidates` under its representative — the anchor evidence a match cites as
-/// its [`MatchOutcome::Matched::basis`]. A whole
-/// [`Class`](crate::facts::schema::Class) arrives at once via
-/// [`group_classes`], and every hit inside one equivalence class already shares
-/// its representative, so several hits collapse to one candidate instead of a
-/// spurious ambiguity. Across a decl's keyed walks (each reference, each name)
-/// the same representative accumulates its fact ids, so the basis is the union
-/// of every anchor that reached the class.
+/// its [`MatchOutcome::Matched::basis`]. Hits inside one equivalence class share
+/// a representative, so several collapse to one candidate rather than a spurious
+/// ambiguity. Across a decl's keyed walks (each reference, each name) the same
+/// representative accumulates its fact ids, so the basis is the union of every
+/// anchor that reached the class.
 async fn collect_candidates<S, Sub, F, Fut>(
     candidates: &mut BTreeMap<Sub, BTreeSet<FactId>>,
     mut fetch: F,
@@ -231,17 +229,15 @@ where
     F: FnMut(Option<S::ClassCursor<Sub>>) -> Fut,
     Fut: Future<Output = Result<ClassWalkPage<S, Sub>, S::Error>>,
 {
-    group_classes(paginate(move |cursor| {
-        fetch(cursor).map_ok(ClassPage::into_parts)
-    }))
-    .try_for_each(|class| {
-        candidates
-            .entry(class.representative)
-            .or_default()
-            .extend(class.fact_ids);
-        ready(Ok(()))
-    })
-    .await
+    paginate(move |cursor| fetch(cursor).map_ok(ClassPage::into_parts))
+        .try_for_each(|row| {
+            candidates
+                .entry(row.representative)
+                .or_default()
+                .insert(row.fact_id);
+            ready(Ok(()))
+        })
+        .await
 }
 
 /// Select the [`MatchOutcome`] for one decl's deduped candidate map: exactly
