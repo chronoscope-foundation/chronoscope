@@ -10,7 +10,7 @@ use crate::SourceIdx;
 use chrono::NaiveDate;
 use chronoscope_core::{
     Cited, DamageCause, EntityTransition, Location, TriggerEventId, UncertainDate,
-    UnresolvedLocation, Usage,
+    UnresolvedLocation, Usage, WikidataPropertyId,
 };
 use chronoscope_integrations::wikidata::{Claim, PropertyId};
 
@@ -181,6 +181,25 @@ fn cite_all(
         .collect()
 }
 
+/// Cite `value` under `prop`, the property it was read from.
+///
+/// A malformed `prop` warns and falls back to the context's property.
+fn cite_under_prop<T>(
+    prop: &str,
+    raw: String,
+    value: T,
+    ctx: &PropertyContext,
+    warnings: &mut Vec<String>,
+) -> Cited<T, SourceIdx> {
+    match WikidataPropertyId::parse(prop) {
+        Ok(property_id) => ctx.cited_under(property_id, raw, value),
+        Err(e) => {
+            warnings.push(format!("{prop}: invalid property id: {e}"));
+            ctx.cited(raw, value)
+        }
+    }
+}
+
 // =============================================================================
 // PROPERTY EXTRACTION HELPERS
 // =============================================================================
@@ -207,7 +226,7 @@ fn extract_property_time(
     let (time, w) = extract::mainsnak_time(claim);
     warnings.extend(w);
 
-    let cited = time.map(|(date, raw)| ctx.cited(raw, date));
+    let cited = time.map(|(date, raw)| cite_under_prop(prop, raw, date, ctx, &mut warnings));
     (cited, warnings)
 }
 
@@ -239,7 +258,7 @@ fn extract_property_location(
         } else {
             "location".to_string()
         };
-        ctx.cited(raw, loc)
+        ctx.cited_under(WikidataPropertyId::new(625), raw, loc)
     });
 
     (cited, warnings)
@@ -761,7 +780,9 @@ fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransiti
 mod tests {
     use super::*;
     use chrono::Datelike;
-    use chronoscope_core::{GeoPoint, WikidataEntityId, WikidataPropertyId};
+    use chronoscope_core::{
+        Evidence, GeoPoint, WikidataEntityId, WikidataField, WikidataPropertyId,
+    };
     use chronoscope_integrations::wikidata::{
         CoordinateValue, DataValue, EntityRefValue, PropertyId, Rank, Snak, TimeValue, WikidataId,
         WikidataPrecision, WikidataTimestamp,
@@ -779,6 +800,17 @@ mod tests {
 
     fn ymd(y: i32, m: u32, d: u32) -> Option<NaiveDate> {
         NaiveDate::from_ymd_opt(y, m, d)
+    }
+
+    /// Property id cited by the first evidence of a lifecycle value.
+    fn evidence_property<T>(cited: &Cited<T, SourceIdx>) -> Result<WikidataPropertyId, String> {
+        match cited.evidence.first() {
+            Some(Evidence::Wikidata {
+                field: WikidataField::Statement { property_id },
+                ..
+            }) => Ok(*property_id),
+            _ => Err("expected Wikidata statement evidence".to_string()),
+        }
     }
 
     fn time_claim(time_str: &str, precision: WikidataPrecision) -> Result<Claim, String> {
@@ -1045,8 +1077,9 @@ mod tests {
     // =========================================================================
 
     fn ctx() -> PropertyContext {
-        // Mirrors production: lifecycle evidence is attributed to P793
-        // (significant event), the property that drives transitions.
+        // Mirrors production: P793 (significant event) is the context
+        // property for the P793-event path; top-level properties cite
+        // their own.
         PropertyContext::with_property(
             WikidataEntityId::new(12345),
             100,
@@ -1084,6 +1117,7 @@ mod tests {
                 date.value.earliest().ok_or("expected earliest")?.year(),
                 1920
             );
+            assert_eq!(evidence_property(date)?, WikidataPropertyId::new(571));
             assert!(started_at.is_none());
             assert!(location.is_none());
         } else {
@@ -1114,8 +1148,10 @@ mod tests {
             ..
         } = &lifecycles[0][0]
         {
-            assert!(completed_at.is_some());
+            let date = completed_at.as_ref().ok_or("expected completed_at")?;
+            assert_eq!(evidence_property(date)?, WikidataPropertyId::new(571));
             let loc = location.as_ref().ok_or("expected location")?;
+            assert_eq!(evidence_property(loc)?, WikidataPropertyId::new(625));
             if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &loc.value {
                 assert!((center.lat() - 48.8584).abs() < 0.001);
                 assert!((center.lon() - 2.2945).abs() < 0.001);
@@ -1153,15 +1189,18 @@ mod tests {
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
-        // Sorted chronologically: Constructed 1900, Demolished 1960
-        assert!(matches!(
-            &lifecycles[0][0],
-            EntityTransition::Constructed { .. }
-        ));
-        assert!(matches!(
-            &lifecycles[0][1],
-            EntityTransition::Demolished { .. }
-        ));
+        // Sorted chronologically: Constructed (P571) 1900, Demolished (P576) 1960
+        let EntityTransition::Constructed { completed_at, .. } = &lifecycles[0][0] else {
+            return Err("expected Constructed".into());
+        };
+        let inception = completed_at.as_ref().ok_or("expected completed_at")?;
+        assert_eq!(evidence_property(inception)?, WikidataPropertyId::new(571));
+
+        let EntityTransition::Demolished { completed_at, .. } = &lifecycles[0][1] else {
+            return Err("expected Demolished".into());
+        };
+        let demolition = completed_at.as_ref().ok_or("expected completed_at")?;
+        assert_eq!(evidence_property(demolition)?, WikidataPropertyId::new(576));
         Ok(())
     }
 
@@ -1198,6 +1237,10 @@ mod tests {
                 end.value.earliest().ok_or("expected earliest")?.year(),
                 1889
             );
+            // Dates come from P580/P582 qualifiers; the honest source is
+            // the P793 significant-event statement.
+            assert_eq!(evidence_property(start)?, WikidataPropertyId::new(793));
+            assert_eq!(evidence_property(end)?, WikidataPropertyId::new(793));
         } else {
             return Err("expected Constructed".into());
         }
@@ -1396,8 +1439,9 @@ mod tests {
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
-        // Service entry -> Transportation usage
+        // Service entry (P729) -> Transportation usage
         if let EntityTransition::UsageModified {
+            occurred_at,
             new_usages,
             description,
             ..
@@ -1405,12 +1449,15 @@ mod tests {
         {
             assert!(new_usages.contains(&Usage::Transportation));
             assert_eq!(description.as_deref(), Some("Service entry"));
+            let entry = occurred_at.as_ref().ok_or("expected occurred_at")?;
+            assert_eq!(evidence_property(entry)?, WikidataPropertyId::new(729));
         } else {
             return Err("expected UsageModified for service entry".into());
         }
 
-        // Service retirement -> empty usage (closed)
+        // Service retirement (P730) -> empty usage (closed)
         if let EntityTransition::UsageModified {
+            occurred_at,
             new_usages,
             description,
             ..
@@ -1421,6 +1468,8 @@ mod tests {
                 "retired service should have empty usage set"
             );
             assert_eq!(description.as_deref(), Some("Service retirement"));
+            let retirement = occurred_at.as_ref().ok_or("expected occurred_at")?;
+            assert_eq!(evidence_property(retirement)?, WikidataPropertyId::new(730));
         } else {
             return Err("expected UsageModified for service retirement".into());
         }
@@ -1445,6 +1494,7 @@ mod tests {
         assert_eq!(lifecycles[0].len(), 1);
 
         if let EntityTransition::UsageModified {
+            occurred_at,
             new_usages,
             description,
             ..
@@ -1452,6 +1502,12 @@ mod tests {
         {
             assert!(new_usages.contains(&Usage::Religious));
             assert_eq!(description.as_deref(), Some("Consecration"));
+            // P585 point-in-time qualifier; cited under the P793 statement.
+            let consecrated = occurred_at.as_ref().ok_or("expected occurred_at")?;
+            assert_eq!(
+                evidence_property(consecrated)?,
+                WikidataPropertyId::new(793)
+            );
         } else {
             return Err("expected UsageModified for consecration".into());
         }

@@ -254,17 +254,28 @@ mod entity_accumulator {
             }
         }
 
-        /// Create a cited value with Wikidata evidence for this property.
+        /// Create a cited value with Wikidata evidence for this
+        /// context's property.
         #[must_use]
         pub fn cited<T>(&self, raw: impl Into<String>, value: T) -> Cited<T, SourceIdx> {
+            self.cited_under(self.property_id, raw, value)
+        }
+
+        /// Create a cited value attributing evidence to `property_id`,
+        /// for a value read from a property other than the context's own.
+        #[must_use]
+        pub fn cited_under<T>(
+            &self,
+            property_id: WikidataPropertyId,
+            raw: impl Into<String>,
+            value: T,
+        ) -> Cited<T, SourceIdx> {
             Cited::new(
                 value,
                 vec![Evidence::Wikidata {
                     entity_id: self.entity_id,
                     revision_id: self.revision_id,
-                    field: WikidataField::Statement {
-                        property_id: self.property_id,
-                    },
+                    field: WikidataField::Statement { property_id },
                     observed_value: raw.into(),
                 }],
             )
@@ -620,15 +631,9 @@ fn process_entity(
 
     let mut acc = EntityAccumulator::new(entity_idx, wikidata_id.clone(), revision_id);
 
-    // Build lifecycle transitions.
-    // FIXME(old-model): KNOWN-WRONG — this attributes ALL lifecycle-transition
-    // evidence to P793 (significant event), but transitions sourced from
-    // P571/P576/P625/P1619 are NOT P793; their real property survives only in
-    // each evidence's `observed_value`. This over-claims provenance. Tolerated
-    // only because this old-model path is slated for deletion. Do not trust
-    // lifecycle `property_id`; before relying on it or deleting this code, thread
-    // the real per-transition property through `build_lifecycles` (or drop the
-    // lifecycle evidence as the Replaces block was dropped).
+    // Build lifecycle transitions. The context carries P793 for
+    // significant-event transitions; P571/P576/P625 and the other
+    // top-level properties cite their own property per extraction.
     let lifecycle_ctx =
         PropertyContext::with_property(entity_id, revision_id.0, WikidataPropertyId::new(793));
     let (entity_lifecycles, lifecycle_warnings) =
