@@ -11,6 +11,9 @@ workspace = true
 
 [features]
 sqlx = ["dep:sqlx"]
+# Exposes store::conformance (the backend-agnostic FactStore suite) to other
+# crates' tests; core's own tests reach it through cfg(test).
+test-support = []
 
 [dependencies]
 async-lock.workspace = true

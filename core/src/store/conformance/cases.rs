@@ -1,0 +1,3444 @@
+//! The generic conformance cases. Each is an `async fn` over `S: FactStore`
+//! taking a fresh empty store;
+//! [`fact_store_conformance!`](crate::fact_store_conformance) stamps one
+//! `#[tokio::test]` per case in the instantiating crate.
+//!
+//! Ids are captured from each submit's resolutions and threaded through the
+//! later assertions; the walk-order checks lean only on the `Ord` the id
+//! scheme carries. Pagination cursors stay opaque — a case resumes on a
+//! cursor and asserts where the walk lands, never the cursor's shape.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use crate::date::{DatePrecision, UncertainDate};
+use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
+use crate::grammar::attribute;
+use crate::grammar::citations::{ExternalSource, JudgmentSource, Justification};
+use crate::grammar::identity;
+use crate::grammar::ids::{CommitId, FactId, UserId};
+use crate::store::schema::{ClassRow, EntityStream, EventStream, ImageStream};
+use crate::store::{
+    EntityIdOf, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageIdOf,
+    ImageView, SubmitCommitError, SubmitCommitInput,
+};
+use crate::submit::{
+    Commit as SubmitBundle, CommitAuthor, DateRole, Decl, EntityIdx, EventIdx, FactLookup,
+    ImageIdx, ResolutionOrigin, StoredCommit, StoredFact, SubjectKind, SubmitError, SubmitResult,
+    commit_facts,
+};
+use crate::geo::{GeoPoint, Meters};
+use crate::location::{Location, LocationReference, UnresolvedLocation};
+
+use super::fixtures::{
+    PAGE_100, captured_date_fact, commit_err, commit_name, commit_ok, commit_result,
+    commit_retract, construction_at, construction_location_fact, construction_started_fact,
+    construction_started_in, construction_with_location, damaged_kind, depiction_fact,
+    designated_kind, disjunctive_date, drain_entity_classes, drain_image_classes,
+    event_damage_cause_fact, event_description_fact, event_durational_date_fact,
+    event_move_method_fact, event_moved_to_location_fact, event_point_date_fact,
+    external_judgment_citation, fixed_time, gap_from_event_fact, has_event_fact,
+    image_observation_citation, judgment_citation, local_bundle, map_medium_fact,
+    medium_picture_fact, moved_kind, moved_to, n_circle_location, name_fact, name_window_fact,
+    observation_external_published, observation_feature_fact, retract_commit_fact, retract_fact,
+    sample_bbox, sample_citation, started_with_date, subimage_fact, submit_batch, supersede_fact,
+    user_author, year_date,
+};
+use super::{TestResult, UnmintedIds};
+
+// --- roundtrip & resolution ---
+
+/// A small commit round-trips: the stored fact carries the resolved entity id
+/// and the submitted payload.
+pub async fn roundtrip_small_commit_through_fact_lookup<S: FactStore>(store: S) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "Pantheon")?, construction_started_fact(0)?]
+            .into_iter()
+            .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(result.fact_ids.len(), 2);
+    assert!(!result.previously_committed);
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let resolved_entity = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity resolution missing")?
+        .id
+        .clone();
+
+    let first_id = *result.fact_ids.first().ok_or("no fact ids")?;
+    let lookup = view.fact(first_id).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(stored) = lookup else {
+        return Err(format!("expected Active, got {lookup:?}").into());
+    };
+    let StoredFact::Factual(stored_factual) = stored.as_ref() else {
+        return Err("expected factual stored fact".into());
+    };
+    let FactualAssertion::Attribute {
+        fact:
+            attribute::Fact::Name {
+                entity,
+                name,
+                name_type,
+                ..
+            },
+    } = &stored_factual.assertion
+    else {
+        return Err("expected Name attribute".into());
+    };
+    assert_eq!(entity, &resolved_entity);
+    assert_eq!(name.as_str(), "Pantheon");
+    assert_eq!(*name_type, attribute::NameType::Common);
+
+    Ok(())
+}
+
+/// A `Decl::Existing` resolves to exactly the supplied id, with
+/// `DeclaredExisting` provenance.
+pub async fn existing_decl_passes_through_to_supplied_id<S: FactStore>(store: S) -> TestResult {
+    let first: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "first")?].into_iter().collect(),
+    };
+    let first_result = commit_facts(&store, first)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let minted_entity = first_result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing")?
+        .id
+        .clone();
+
+    let second: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing {
+            id: minted_entity.clone(),
+        }],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "second")?].into_iter().collect(),
+    };
+    let second_result = commit_facts(&store, second)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let resolution = second_result.entities.get(&EntityIdx(0)).ok_or("missing")?;
+    assert_eq!(resolution.id, minted_entity);
+    assert_eq!(resolution.origin, ResolutionOrigin::DeclaredExisting);
+
+    Ok(())
+}
+
+/// Three `Decl::Local`s mint three distinct ids, each with `NewlyMinted`
+/// provenance.
+pub async fn local_decls_mint_distinct_newly_minted_ids<S: FactStore>(store: S) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "a")?, name_fact(1, "b")?, name_fact(2, "c")?]
+            .into_iter()
+            .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(result.entities.len(), 3);
+
+    let mut seen_ids = HashSet::new();
+    for idx in 0..3 {
+        let resolution = result.entities.get(&EntityIdx(idx)).ok_or("missing")?;
+        assert_eq!(resolution.origin, ResolutionOrigin::NewlyMinted);
+        assert!(
+            seen_ids.insert(resolution.id.clone()),
+            "minted ids must be distinct; got duplicate {:?}",
+            resolution.id
+        );
+    }
+
+    Ok(())
+}
+
+// --- walk conformance ---
+
+/// A commit's entity-touching facts walk as rows under a single representative
+/// whose fact ids are exactly the submitted set — the class-walk conformance
+/// every backend owes.
+pub async fn walk_entity_classes_group_submitted_facts_into_one_class<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "Pantheon")?, construction_started_fact(0)?]
+            .into_iter()
+            .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let submitted: BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
+    assert_eq!(submitted.len(), 2, "expected two submitted facts");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<EntityIdOf<S>>> =
+        drain_entity_classes::<S, _>(&mut view, &EntityStream::All, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+    let reps: BTreeSet<EntityIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+    assert_eq!(
+        reps.len(),
+        1,
+        "one entity yields one representative; got {rows:?}"
+    );
+    let walked: BTreeSet<FactId> = rows.iter().map(|r| r.fact_id).collect();
+    assert_eq!(
+        walked, submitted,
+        "the walk's fact ids are exactly the submitted entity-touching facts"
+    );
+    Ok(())
+}
+
+/// At a one-row page limit two entities' rows still page correctly: the walk
+/// orders rows by `(representative, fact_id)`, so each entity's rows form one
+/// contiguous run across page boundaries, carrying exactly its submitted facts.
+pub async fn class_walk_pages_distinct_entities_as_contiguous_runs<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let first = commit_facts(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![name_fact(0, "Alpha")?, construction_started_in(0, 1700)?],
+        )?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let second = commit_facts(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![name_fact(0, "Beta")?, construction_started_in(0, 1800)?],
+        )?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let alpha: BTreeSet<FactId> = first.fact_ids.iter().copied().collect();
+    let beta: BTreeSet<FactId> = second.fact_ids.iter().copied().collect();
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    // One row per page forces each class to span page boundaries.
+    let one = std::num::NonZeroUsize::MIN;
+    let rows: Vec<ClassRow<EntityIdOf<S>>> =
+        drain_entity_classes::<S, _>(&mut view, &EntityStream::All, one)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+    // Compress rows to their representative runs; a contiguous walk visits each
+    // representative in exactly one run.
+    let mut runs: Vec<EntityIdOf<S>> = Vec::new();
+    for row in &rows {
+        if runs.last() != Some(&row.representative) {
+            runs.push(row.representative.clone());
+        }
+    }
+    let distinct: BTreeSet<EntityIdOf<S>> = runs.iter().cloned().collect();
+    assert_eq!(
+        runs.len(),
+        distinct.len(),
+        "each entity's rows form one run; a representative recurs across runs in {rows:?}"
+    );
+
+    // Each representative's run carries exactly its submitted facts.
+    let mut by_rep: BTreeMap<EntityIdOf<S>, BTreeSet<FactId>> = BTreeMap::new();
+    for row in &rows {
+        by_rep
+            .entry(row.representative.clone())
+            .or_default()
+            .insert(row.fact_id);
+    }
+    let got: BTreeSet<BTreeSet<FactId>> = by_rep.into_values().collect();
+    let want: BTreeSet<BTreeSet<FactId>> = [alpha, beta].into_iter().collect();
+    assert_eq!(
+        got, want,
+        "each entity's rows carry exactly its submitted facts; got {rows:?}"
+    );
+    Ok(())
+}
+
+/// Every fact mentioning an entity must appear in
+/// `all_facts_about_entity(entity, ...)`. Commits two entity-touching facts
+/// on one entity and asserts both come back.
+pub async fn all_facts_about_entity_returns_facts_mentioning_it<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "Pantheon")?, construction_started_fact(0)?]
+            .into_iter()
+            .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let submitted: BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
+    assert_eq!(submitted.len(), 2, "expected two submitted facts");
+    let entity = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id
+        .clone();
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = view
+        .all_facts_about_entity(&entity, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let returned: BTreeSet<FactId> = page.items.iter().map(|item| item.fact_id).collect();
+    assert!(
+        submitted.is_subset(&returned),
+        "all_facts_about_entity must return every fact mentioning the entity; \
+         submitted={submitted:?}, returned={returned:?}"
+    );
+    Ok(())
+}
+
+/// Event analogue of [`walk_entity_classes_group_submitted_facts_into_one_class`].
+/// Stamped `#[ignore]`d while `walk_events` is stubbed; flips green once the
+/// walk reads the fact bag.
+pub async fn walk_events_returns_submitted_event_facts<S: FactStore>(store: S) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: vec![Decl::Local],
+        images: Vec::new(),
+        facts: [
+            has_event_fact(0, 0, designated_kind())?,
+            event_point_date_fact(0)?,
+            event_description_fact(0)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let submitted: BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
+    assert_eq!(submitted.len(), 3, "expected three submitted facts");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = view
+        .walk_events(&EventStream::All, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let returned: BTreeSet<FactId> = page.items.iter().map(|item| item.fact_id).collect();
+    assert!(
+        submitted.is_subset(&returned),
+        "walk_events(All) must return every submitted event-touching fact; \
+         submitted={submitted:?}, returned={returned:?}"
+    );
+    Ok(())
+}
+
+/// Every fact mentioning an event must appear in
+/// `all_facts_about_event(event, ...)`.
+pub async fn all_facts_about_event_returns_facts_mentioning_it<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: vec![Decl::Local],
+        images: Vec::new(),
+        facts: [
+            has_event_fact(0, 0, designated_kind())?,
+            event_point_date_fact(0)?,
+            event_description_fact(0)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let submitted: BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
+    assert_eq!(submitted.len(), 3, "expected three submitted facts");
+    let event = result
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing event")?
+        .id
+        .clone();
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = view
+        .all_facts_about_event(&event, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let returned: BTreeSet<FactId> = page.items.iter().map(|item| item.fact_id).collect();
+    assert!(
+        submitted.is_subset(&returned),
+        "all_facts_about_event must return every fact mentioning the event; \
+         submitted={submitted:?}, returned={returned:?}"
+    );
+    Ok(())
+}
+
+/// Image analogue of
+/// [`walk_entity_classes_group_submitted_facts_into_one_class`].
+pub async fn walk_image_classes_group_submitted_facts_into_one_class<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [medium_picture_fact(0)?, captured_date_fact(0)?]
+            .into_iter()
+            .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let submitted: BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
+    assert_eq!(submitted.len(), 2, "expected two submitted facts");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<ImageIdOf<S>>> =
+        drain_image_classes::<S, _>(&mut view, &ImageStream::All, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+    let reps: BTreeSet<ImageIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+    assert_eq!(
+        reps.len(),
+        1,
+        "one image yields one representative; got {rows:?}"
+    );
+    let walked: BTreeSet<FactId> = rows.iter().map(|r| r.fact_id).collect();
+    assert_eq!(
+        walked, submitted,
+        "the walk's fact ids are exactly the submitted image-touching facts"
+    );
+    Ok(())
+}
+
+/// Every fact mentioning an image must appear in
+/// `all_facts_about_image(image, ...)`.
+pub async fn all_facts_about_image_returns_facts_mentioning_it<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [medium_picture_fact(0)?, captured_date_fact(0)?]
+            .into_iter()
+            .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let submitted: BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
+    assert_eq!(submitted.len(), 2, "expected two submitted facts");
+    let image = result
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing image")?
+        .id
+        .clone();
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = view
+        .all_facts_about_image(&image, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let returned: BTreeSet<FactId> = page.items.iter().map(|item| item.fact_id).collect();
+    assert!(
+        submitted.is_subset(&returned),
+        "all_facts_about_image must return every fact mentioning the image; \
+         submitted={submitted:?}, returned={returned:?}"
+    );
+    Ok(())
+}
+
+// --- equivalence-class conformance ---
+//
+// These exercise the `*_class` / `*_representative` view methods. Each
+// commits a `Same*` fact between two freshly-minted ids, so the stored
+// fact carries two distinct ids in one class.
+
+/// After a `SameEntity` fact links two ids, `entity_class` of either member
+/// must contain both.
+pub async fn entity_class_contains_both_same_entity_members<S: FactStore>(store: S) -> TestResult {
+    let identity_pair = identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [crate::submit::SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity {
+                fact: identity_pair,
+            },
+            citation: JudgmentSource::PersonalKnowledge {
+                user: UserId::new("alice"),
+                justification: Justification::new("These two refer to the same entity.")?,
+            },
+        }]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let a = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing a")?
+        .id
+        .clone();
+    let b = result
+        .entities
+        .get(&EntityIdx(1))
+        .ok_or("missing b")?
+        .id
+        .clone();
+    assert_ne!(a, b, "the two Local decls must mint distinct ids");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let class = view.entity_class(&a).await.map_err(|e| format!("{e:?}"))?;
+    assert!(
+        class.members.contains(&a) && class.members.contains(&b),
+        "entity_class(a) must contain both equivalence members; got {:?}",
+        class.members
+    );
+    Ok(())
+}
+
+/// A `SameEntity`-linked pair must resolve to one representative whichever
+/// member is queried, and it must be a class member agreeing with
+/// `entity_class(..).representative`.
+pub async fn entity_representative_is_canonical_across_same_entity_members<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let identity_pair = identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [crate::submit::SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity {
+                fact: identity_pair,
+            },
+            citation: JudgmentSource::PersonalKnowledge {
+                user: UserId::new("alice"),
+                justification: Justification::new("These two refer to the same entity.")?,
+            },
+        }]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let a = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing a")?
+        .id
+        .clone();
+    let b = result
+        .entities
+        .get(&EntityIdx(1))
+        .ok_or("missing b")?
+        .id
+        .clone();
+    assert_ne!(a, b, "the two Local decls must mint distinct ids");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rep_a = view
+        .entity_representative(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let rep_b = view
+        .entity_representative(&b)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        rep_a, rep_b,
+        "both members of a SameEntity class must share one representative"
+    );
+    assert!(
+        rep_a == a || rep_a == b,
+        "the representative must be a member of the class; got {rep_a:?} for {{{a:?}, {b:?}}}"
+    );
+    let class = view.entity_class(&a).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        class.representative, rep_a,
+        "entity_class.representative must agree with entity_representative"
+    );
+    Ok(())
+}
+
+/// Event analogue of [`entity_class_contains_both_same_entity_members`].
+/// Stamped `#[ignore]`d while the class read is stubbed.
+pub async fn event_class_contains_both_same_event_members<S: FactStore>(store: S) -> TestResult {
+    let identity_pair = identity::Fact::same_event(EventIdx(0), EventIdx(1))?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: vec![Decl::Local, Decl::Local],
+        images: Vec::new(),
+        facts: [crate::submit::SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity {
+                fact: identity_pair,
+            },
+            citation: JudgmentSource::PersonalKnowledge {
+                user: UserId::new("alice"),
+                justification: Justification::new("These two refer to the same event.")?,
+            },
+        }]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let a = result
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing a")?
+        .id
+        .clone();
+    let b = result
+        .events
+        .get(&EventIdx(1))
+        .ok_or("missing b")?
+        .id
+        .clone();
+    assert_ne!(a, b, "the two Local decls must mint distinct ids");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let class = view.event_class(&a).await.map_err(|e| format!("{e:?}"))?;
+    assert!(
+        class.members.contains(&a) && class.members.contains(&b),
+        "event_class(a) must contain both equivalence members; got {:?}",
+        class.members
+    );
+    Ok(())
+}
+
+/// Event analogue of
+/// [`entity_representative_is_canonical_across_same_entity_members`].
+/// Stamped `#[ignore]`d while representative selection is stubbed.
+pub async fn event_representative_is_canonical_across_same_event_members<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let identity_pair = identity::Fact::same_event(EventIdx(0), EventIdx(1))?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: vec![Decl::Local, Decl::Local],
+        images: Vec::new(),
+        facts: [crate::submit::SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity {
+                fact: identity_pair,
+            },
+            citation: JudgmentSource::PersonalKnowledge {
+                user: UserId::new("alice"),
+                justification: Justification::new("These two refer to the same event.")?,
+            },
+        }]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let a = result
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing a")?
+        .id
+        .clone();
+    let b = result
+        .events
+        .get(&EventIdx(1))
+        .ok_or("missing b")?
+        .id
+        .clone();
+    assert_ne!(a, b, "the two Local decls must mint distinct ids");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rep_a = view
+        .event_representative(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let rep_b = view
+        .event_representative(&b)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        rep_a, rep_b,
+        "both members of a SameEvent class must share one representative"
+    );
+    assert!(
+        rep_a == a || rep_a == b,
+        "the representative must be a member of the class; got {rep_a:?} for {{{a:?}, {b:?}}}"
+    );
+    let class = view.event_class(&a).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        class.representative, rep_a,
+        "event_class.representative must agree with event_representative"
+    );
+    Ok(())
+}
+
+/// Image analogue of [`entity_class_contains_both_same_entity_members`].
+pub async fn image_class_contains_both_same_artifact_members<S: FactStore>(store: S) -> TestResult {
+    let identity_pair = identity::Fact::same_artifact(ImageIdx(0), ImageIdx(1))?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local],
+        facts: [crate::submit::SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity {
+                fact: identity_pair,
+            },
+            citation: JudgmentSource::PersonalKnowledge {
+                user: UserId::new("alice"),
+                justification: Justification::new("These two scans are the same artifact.")?,
+            },
+        }]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let a = result
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing a")?
+        .id
+        .clone();
+    let b = result
+        .images
+        .get(&ImageIdx(1))
+        .ok_or("missing b")?
+        .id
+        .clone();
+    assert_ne!(a, b, "the two Local decls must mint distinct ids");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let class = view.image_class(&a).await.map_err(|e| format!("{e:?}"))?;
+    assert!(
+        class.members.contains(&a) && class.members.contains(&b),
+        "image_class(a) must contain both equivalence members; got {:?}",
+        class.members
+    );
+    Ok(())
+}
+
+/// Image analogue of
+/// [`entity_representative_is_canonical_across_same_entity_members`].
+pub async fn image_representative_is_canonical_across_same_artifact_members<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let identity_pair = identity::Fact::same_artifact(ImageIdx(0), ImageIdx(1))?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local],
+        facts: [crate::submit::SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity {
+                fact: identity_pair,
+            },
+            citation: JudgmentSource::PersonalKnowledge {
+                user: UserId::new("alice"),
+                justification: Justification::new("These two scans are the same artifact.")?,
+            },
+        }]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let a = result
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing a")?
+        .id
+        .clone();
+    let b = result
+        .images
+        .get(&ImageIdx(1))
+        .ok_or("missing b")?
+        .id
+        .clone();
+    assert_ne!(a, b, "the two Local decls must mint distinct ids");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rep_a = view
+        .image_representative(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let rep_b = view
+        .image_representative(&b)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        rep_a, rep_b,
+        "both members of a SameArtifact class must share one representative"
+    );
+    assert!(
+        rep_a == a || rep_a == b,
+        "the representative must be a member of the class; got {rep_a:?} for {{{a:?}, {b:?}}}"
+    );
+    let class = view.image_class(&a).await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        class.representative, rep_a,
+        "image_class.representative must agree with image_representative"
+    );
+    Ok(())
+}
+
+// --- index-reference error paths ---
+
+#[derive(Debug, Clone, Copy)]
+enum ExpectedKind {
+    Entity,
+    Event,
+    Image,
+}
+
+async fn assert_idx_out_of_range<S: FactStore>(
+    store: S,
+    decl_count: usize,
+    bad_idx: usize,
+    kind: ExpectedKind,
+) -> TestResult {
+    let bundle: SubmitCommitInput<S> = match kind {
+        ExpectedKind::Entity => SubmitBundle {
+            author: user_author()?,
+            recorded_at: fixed_time(),
+            entities: (0..decl_count).map(|_| Decl::Local).collect(),
+            events: Vec::new(),
+            images: Vec::new(),
+            facts: [name_fact(bad_idx, "out-of-range")?].into_iter().collect(),
+        },
+        ExpectedKind::Event => SubmitBundle {
+            author: user_author()?,
+            recorded_at: fixed_time(),
+            entities: Vec::new(),
+            events: (0..decl_count).map(|_| Decl::Local).collect(),
+            images: Vec::new(),
+            facts: [crate::submit::SubmitFact::Factual {
+                assertion: FactualAssertion::Event {
+                    fact: crate::grammar::event::Fact::PointDate {
+                        event: EventIdx(bad_idx),
+                        bound: UncertainDate::with_precision(
+                            chrono::NaiveDate::from_ymd_opt(1700, 1, 1).ok_or("date")?,
+                            DatePrecision::Year,
+                        )?,
+                    },
+                },
+                citation: sample_citation()?,
+            }]
+            .into_iter()
+            .collect(),
+        },
+        ExpectedKind::Image => SubmitBundle {
+            author: user_author()?,
+            recorded_at: fixed_time(),
+            entities: Vec::new(),
+            events: Vec::new(),
+            images: (0..decl_count).map(|_| Decl::Local).collect(),
+            facts: [crate::submit::SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: crate::grammar::image::Fact::Medium {
+                        image: ImageIdx(bad_idx),
+                        medium: crate::grammar::image::ImageMedium::Picture,
+                    },
+                },
+                citation: sample_citation()?,
+            }]
+            .into_iter()
+            .collect(),
+        },
+    };
+
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected SubmitError".into()),
+        Err(e) => e,
+    };
+
+    let errs = submit_batch(err)?;
+    assert_eq!(
+        errs.len().get(),
+        1,
+        "expected exactly one out-of-range error"
+    );
+    match (kind, errs.first()) {
+        (
+            ExpectedKind::Entity,
+            SubmitError::EntityIdxOutOfRange {
+                idx,
+                decl_count: got,
+            },
+        ) => {
+            assert_eq!(*idx, bad_idx);
+            assert_eq!(*got, decl_count);
+        }
+        (
+            ExpectedKind::Event,
+            SubmitError::EventIdxOutOfRange {
+                idx,
+                decl_count: got,
+            },
+        ) => {
+            assert_eq!(*idx, bad_idx);
+            assert_eq!(*got, decl_count);
+        }
+        (
+            ExpectedKind::Image,
+            SubmitError::ImageIdxOutOfRange {
+                idx,
+                decl_count: got,
+            },
+        ) => {
+            assert_eq!(*idx, bad_idx);
+            assert_eq!(*got, decl_count);
+        }
+        (k, other) => {
+            return Err(format!("expected {k:?} out-of-range error, got {other:?}").into());
+        }
+    }
+    Ok(())
+}
+
+/// An entity index past the declaration list is rejected as out of range.
+pub async fn fact_referencing_out_of_range_entity_idx_returns_error<S: FactStore>(
+    store: S,
+) -> TestResult {
+    assert_idx_out_of_range(store, 3, 5, ExpectedKind::Entity).await
+}
+
+/// The event analogue of
+/// [`fact_referencing_out_of_range_entity_idx_returns_error`].
+pub async fn fact_referencing_out_of_range_event_idx_returns_error<S: FactStore>(
+    store: S,
+) -> TestResult {
+    assert_idx_out_of_range(store, 3, 5, ExpectedKind::Event).await
+}
+
+/// The image analogue of
+/// [`fact_referencing_out_of_range_entity_idx_returns_error`].
+pub async fn fact_referencing_out_of_range_image_idx_returns_error<S: FactStore>(
+    store: S,
+) -> TestResult {
+    assert_idx_out_of_range(store, 3, 5, ExpectedKind::Image).await
+}
+
+/// The first invalid index — `idx == decl_count` — is the boundary the
+/// range check guards. With three entity decls (valid indices 0..=2), index
+/// 3 is rejected with `EntityIdxOutOfRange`. Entity kind alone pins the
+/// boundary; the three out-of-range tests above share the dispatch.
+pub async fn entity_idx_at_decl_count_is_first_rejected<S: FactStore>(store: S) -> TestResult {
+    assert_idx_out_of_range(store, 3, 3, ExpectedKind::Entity).await
+}
+
+/// The last valid index — `idx == decl_count - 1` — is accepted. With three
+/// entity decls, index 2 resolves; all three decls are referenced so the
+/// only thing under test is the upper bound, not `UnusedDeclaration`.
+pub async fn entity_idx_at_decl_count_minus_one_is_accepted<S: FactStore>(store: S) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [
+            name_fact(0, "a")?,
+            name_fact(1, "b")?,
+            name_fact(2, "last-valid")?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    commit_ok(&store, bundle).await
+}
+
+// --- unused-declaration error path ---
+
+/// A declared entity that no fact references is rejected with
+/// `UnusedDeclaration` naming its position. The bundle pairs the unused decl
+/// (position 0) with a referenced one (position 1) so the only complaint is
+/// the unreferenced decl.
+pub async fn unreferenced_entity_decl_rejected_as_unused<S: FactStore>(store: S) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        // Decl 0 is never referenced; decl 1 is.
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(1, "referenced")?].into_iter().collect(),
+    };
+    let errs = commit_err(&store, bundle).await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::UnusedDeclaration {
+                kind: SubjectKind::Entity,
+                position: 0,
+            }
+        )),
+        "expected UnusedDeclaration for entity decl 0, got {errs:?}"
+    );
+    Ok(())
+}
+
+// --- unknown-existing-id error paths ---
+
+/// Phantom-id rejection kinds; the shared helper dispatches its assertion
+/// on this tag.
+#[derive(Debug, Clone, Copy)]
+enum UnknownKind {
+    Entity,
+    Event,
+    Image,
+}
+
+/// Submit a bundle with one `Decl::Existing` naming an id the store never
+/// mints (the [`UnmintedIds`] fixture) and a fact referencing it. Asserts the
+/// matching `UnknownExisting*` variant at decl position 0.
+async fn assert_unknown_existing<S: UnmintedIds>(store: S, kind: UnknownKind) -> TestResult {
+    let bundle: SubmitCommitInput<S> = match kind {
+        UnknownKind::Entity => SubmitBundle {
+            author: user_author()?,
+            recorded_at: fixed_time(),
+            entities: vec![Decl::Existing {
+                id: S::unminted_entity(),
+            }],
+            events: Vec::new(),
+            images: Vec::new(),
+            facts: [name_fact(0, "phantom-name")?].into_iter().collect(),
+        },
+        UnknownKind::Event => SubmitBundle {
+            author: user_author()?,
+            recorded_at: fixed_time(),
+            entities: Vec::new(),
+            events: vec![Decl::Existing {
+                id: S::unminted_event(),
+            }],
+            images: Vec::new(),
+            facts: [crate::submit::SubmitFact::Factual {
+                assertion: FactualAssertion::Event {
+                    fact: crate::grammar::event::Fact::PointDate {
+                        event: EventIdx(0),
+                        bound: UncertainDate::with_precision(
+                            chrono::NaiveDate::from_ymd_opt(1700, 1, 1).ok_or("date")?,
+                            DatePrecision::Year,
+                        )?,
+                    },
+                },
+                citation: sample_citation()?,
+            }]
+            .into_iter()
+            .collect(),
+        },
+        UnknownKind::Image => SubmitBundle {
+            author: user_author()?,
+            recorded_at: fixed_time(),
+            entities: Vec::new(),
+            events: Vec::new(),
+            images: vec![Decl::Existing {
+                id: S::unminted_image(),
+            }],
+            facts: [crate::submit::SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: crate::grammar::image::Fact::Medium {
+                        image: ImageIdx(0),
+                        medium: crate::grammar::image::ImageMedium::Picture,
+                    },
+                },
+                citation: sample_citation()?,
+            }]
+            .into_iter()
+            .collect(),
+        },
+    };
+
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected SubmitError".into()),
+        Err(e) => e,
+    };
+
+    let errs = submit_batch(err)?;
+    assert_eq!(
+        errs.len().get(),
+        1,
+        "expected exactly one UnknownExisting* error"
+    );
+    match (kind, errs.first()) {
+        (UnknownKind::Entity, SubmitError::UnknownExistingEntity { decl_position }) => {
+            assert_eq!(*decl_position, EntityIdx(0));
+        }
+        (UnknownKind::Event, SubmitError::UnknownExistingEvent { decl_position }) => {
+            assert_eq!(*decl_position, EventIdx(0));
+        }
+        (UnknownKind::Image, SubmitError::UnknownExistingImage { decl_position }) => {
+            assert_eq!(*decl_position, ImageIdx(0));
+        }
+        (k, other) => {
+            return Err(format!("expected {k:?} UnknownExisting* error, got {other:?}").into());
+        }
+    }
+    Ok(())
+}
+
+/// A `Decl::Existing` naming an entity id the store never minted is rejected.
+pub async fn decl_existing_unknown_entity_id_rejected<S: UnmintedIds>(store: S) -> TestResult {
+    assert_unknown_existing(store, UnknownKind::Entity).await
+}
+
+/// The event analogue of [`decl_existing_unknown_entity_id_rejected`].
+pub async fn decl_existing_unknown_event_id_rejected<S: UnmintedIds>(store: S) -> TestResult {
+    assert_unknown_existing(store, UnknownKind::Event).await
+}
+
+/// The image analogue of [`decl_existing_unknown_entity_id_rejected`].
+pub async fn decl_existing_unknown_image_id_rejected<S: UnmintedIds>(store: S) -> TestResult {
+    assert_unknown_existing(store, UnknownKind::Image).await
+}
+
+// --- substitution-time rejection ---
+
+/// Two `Decl::Existing(same_id)` slots resolving to one persistent entity
+/// id, plus an identity fact over the two indices, are rejected. The shared id
+/// trips two independent guards that accumulate together: the substitution-time
+/// `IdentityEntitySelfEquivalence` (the identity fact collapsed) and the
+/// decl-distinctness `DuplicateEntityDecl`, both carrying the shared typed id.
+pub async fn same_entity_resolving_to_one_id_rejected_at_substitution<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let mint: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "real-entity")?].into_iter().collect(),
+    };
+    let minted = commit_facts(&store, mint)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity_id = minted
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("expected mint")?
+        .id
+        .clone();
+
+    let identity_pair = identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?;
+    let user = UserId::new("alice");
+    let justification =
+        Justification::new("Two existing decls collapse to the same id after resolution.")?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![
+            Decl::Existing {
+                id: entity_id.clone(),
+            },
+            Decl::Existing {
+                id: entity_id.clone(),
+            },
+        ],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [crate::submit::SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Identity {
+                fact: identity_pair,
+            },
+            citation: JudgmentSource::PersonalKnowledge {
+                user,
+                justification,
+            },
+        }]
+        .into_iter()
+        .collect(),
+    };
+
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected IdentityEntitySelfEquivalence rejection".into()),
+        Err(e) => e,
+    };
+
+    let errs = submit_batch(err)?;
+    assert!(
+        errs.iter().any(
+            |e| matches!(e, SubmitError::IdentityEntitySelfEquivalence { id } if *id == entity_id)
+        ),
+        "expected IdentityEntitySelfEquivalence on {entity_id:?}, got {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::DuplicateEntityDecl { id } if *id == entity_id)),
+        "expected DuplicateEntityDecl on {entity_id:?}, got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Two `Decl::Existing { id: X }` slots on one minted entity, each referenced by
+/// a distinct fact, resolve to the same persistent id and are rejected with
+/// `DuplicateEntityDecl` carrying that id. Both decls are referenced, so the
+/// rejection is the distinctness guard, not `UnusedDeclaration`.
+pub async fn two_entity_decls_resolving_to_one_id_rejected<S: FactStore>(store: S) -> TestResult {
+    let mint: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "real-entity")?].into_iter().collect(),
+    };
+    let minted = commit_facts(&store, mint)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity_id = minted
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("expected mint")?
+        .id
+        .clone();
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![
+            Decl::Existing {
+                id: entity_id.clone(),
+            },
+            Decl::Existing {
+                id: entity_id.clone(),
+            },
+        ],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "via-decl-0")?, name_fact(1, "via-decl-1")?]
+            .into_iter()
+            .collect(),
+    };
+    let errs = commit_err(&store, bundle).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::DuplicateEntityDecl { id } if *id == entity_id)),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+// --- retract-commit target existence ---
+
+/// A `RetractCommit` whose target was never recorded is rejected with
+/// `CommitNotFound` carrying the id. The id is a valid 64-char hex
+/// `CommitId` no commit hashes to in an empty store, so it exercises the
+/// `commit_known(...) == false` arm rather than a structural pre-check.
+pub async fn retract_commit_targeting_unrecorded_commit_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let phantom = CommitId::parse("0".repeat(64))?;
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_commit_fact(phantom.clone())?]
+            .into_iter()
+            .collect(),
+    };
+
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected CommitNotFound rejection".into()),
+        Err(e) => e,
+    };
+
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::CommitNotFound { id } = errs.first() else {
+        return Err(format!("expected CommitNotFound, got {:?}", errs.first()).into());
+    };
+    assert_eq!(*id, phantom);
+    Ok(())
+}
+
+/// A `RetractCommit` targeting an already-recorded commit succeeds.
+/// Commits a fact-bearing bundle for a real `CommitId`, then retracts it;
+/// the `commit_known` check passes because the first commit recorded it.
+pub async fn retract_commit_targeting_recorded_commit_succeeds<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let first: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "to-be-retracted")?].into_iter().collect(),
+    };
+    let first_result = commit_facts(&store, first)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let target = first_result.commit_id.clone();
+
+    let retraction: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_commit_fact(target)?].into_iter().collect(),
+    };
+    let retraction_result = commit_facts(&store, retraction)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        retraction_result.fact_ids.len(),
+        1,
+        "the retraction's meta-fact must be recorded"
+    );
+    assert!(!retraction_result.previously_committed);
+    Ok(())
+}
+
+// --- transaction brand ---
+
+/// Positive control for the brand pattern: a tx handle is usable across
+/// multiple `submit_commit` calls inside its own closure. The pattern
+/// blocks cross-instance misuse, not within-instance re-use.
+pub async fn two_commits_share_one_with_tx_brand<S: FactStore>(store: S) -> TestResult {
+    let bundle1: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "first")?].into_iter().collect(),
+    };
+    let bundle2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "second")?].into_iter().collect(),
+    };
+
+    let (r1, r2) = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                let r1 = s
+                    .submit_commit(tx, bundle1)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                let r2 = s
+                    .submit_commit(tx, bundle2)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                Ok::<_, String>((r1, r2))
+            })
+        })
+        .await
+        .map_err(|e| format!("{e:?}"))??;
+
+    assert_eq!(r1.fact_ids.len(), 1);
+    assert_eq!(r2.fact_ids.len(), 1);
+    assert_ne!(r1.commit_id, r2.commit_id);
+    Ok(())
+}
+
+// --- transaction semantics ---
+
+/// A `with_tx` closure that fails after a successful submit rolls the whole
+/// transaction back: the store is unchanged and a later resubmit of the same
+/// bundle is a first commit, not a replay.
+pub async fn err_from_with_tx_closure_rolls_back_submitted_commit<S: FactStore>(
+    store: S,
+) -> TestResult {
+    commit_name(&store, "prior").await?;
+    let watermark = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "rolled-back")?].into_iter().collect(),
+    };
+    let replay = bundle.clone();
+
+    let outcome: Result<(), String> = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                let result = s
+                    .submit_commit(tx, bundle)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                assert!(!result.previously_committed);
+                Err("deliberate failure after the submit".to_owned())
+            })
+        })
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(outcome.is_err());
+
+    // The submitted fact never landed and the clock never advanced.
+    let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(after, watermark);
+    let mut view = store.no_later_than(FactId::new(watermark.get() + 1));
+    let lookup = view.fact(watermark).await.map_err(|e| format!("{e:?}"))?;
+    assert!(matches!(lookup, FactLookup::Unknown), "got {lookup:?}");
+
+    // Resubmitting is a first commit — the rolled-back result cache is gone.
+    let result = commit_facts(&store, replay)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(!result.previously_committed);
+    Ok(())
+}
+
+/// A commit recorded earlier in the same transaction is a valid
+/// `RetractCommit` target: its staged metadata is visible to the second
+/// submit's validation and retractor expansion, so the retraction lands and
+/// takes effect.
+pub async fn retract_commit_of_earlier_commit_in_same_tx_lands<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let first: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "retracted-in-tx")?].into_iter().collect(),
+    };
+
+    let (first_result, second_result) = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                let first_result = s
+                    .submit_commit(tx, first)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                let retraction: SubmitCommitInput<S> = SubmitBundle {
+                    author: user_author().map_err(|e| e.to_string())?,
+                    recorded_at: fixed_time() + chrono::Duration::seconds(10),
+                    entities: Vec::new(),
+                    events: Vec::new(),
+                    images: Vec::new(),
+                    facts: [retract_commit_fact(first_result.commit_id.clone())
+                        .map_err(|e| e.to_string())?]
+                    .into_iter()
+                    .collect(),
+                };
+                let second_result = s
+                    .submit_commit(tx, retraction)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                Ok::<_, String>((first_result, second_result))
+            })
+        })
+        .await
+        .map_err(|e| format!("{e:?}"))??;
+
+    let target_fid = *first_result
+        .fact_ids
+        .first()
+        .ok_or("first commit minted no fact")?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = view.fact(target_fid).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = lookup else {
+        return Err(format!("expected Retracted, got {lookup:?}").into());
+    };
+    assert_eq!(Some(&by), second_result.fact_ids.first());
+    Ok(())
+}
+
+/// A rejected submit poisons the transaction: a later submit on the same
+/// handle fails fast with the poison cause instead of validating against the
+/// rejected staging, and a closure that swallows the rejection and returns
+/// `Ok` fails at apply rather than committing the leftovers.
+pub async fn swallowed_submit_rejection_poisons_the_transaction<S: FactStore>(
+    store: S,
+) -> TestResult {
+    // Decl 1 is never referenced: the bundle stages its one fact, then
+    // rejects with UnusedDeclaration.
+    let doomed: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "staged-then-rejected")?]
+            .into_iter()
+            .collect(),
+    };
+    let healthy: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "after-the-rejection")?].into_iter().collect(),
+    };
+    let outcome = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                if s.submit_commit(tx, doomed).await.is_ok() {
+                    return Err("expected the submit to be rejected".to_owned());
+                }
+                // The poison surfaces on the next use of the handle, as a
+                // backend error naming the driver's cause.
+                let Err(SubmitCommitError::Backend(e)) = s.submit_commit(tx, healthy).await else {
+                    return Err("expected a backend error from the poisoned tx".to_owned());
+                };
+                let rendered = format!("{e:?}");
+                if !rendered.contains("earlier submit_commit was rejected") {
+                    return Err(format!("expected the poison cause named, got {rendered}"));
+                }
+                Ok::<_, String>(())
+            })
+        })
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a poisoned transaction must fail at apply, got {outcome:?}"
+    );
+    // Nothing landed.
+    let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(after, FactId::new(0));
+    Ok(())
+}
+
+/// Record a synthetic single-fact commit through the [`FactWrite`] surface,
+/// with `byte` repeated as the commit id.
+async fn record_synthetic<S, W>(
+    tx: &mut W,
+    byte: &str,
+    author: CommitAuthor,
+    fid: FactId,
+) -> Result<(), String>
+where
+    S: FactStore,
+    W: FactWrite<S>,
+{
+    let commit_id = CommitId::parse(byte.repeat(32)).map_err(|e| format!("{e:?}"))?;
+    let stored = StoredCommit {
+        commit_id: commit_id.clone(),
+        author,
+        recorded_at: fixed_time(),
+        fact_ids: vec![fid],
+    };
+    let result = SubmitResult::<S::Ids> {
+        commit_id,
+        previously_committed: false,
+        fact_ids: vec![fid],
+        entities: HashMap::new(),
+        events: HashMap::new(),
+        images: HashMap::new(),
+        companion_commit_id: None,
+    };
+    tx.record_commit(stored, &result)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Read back a committed fact's stored body, to re-stage through the
+/// [`FactWrite`] primitives without synthesising a fresh `StoredFact`.
+async fn stored_fact_of<S: FactStore>(
+    store: &S,
+    fid: FactId,
+) -> Result<crate::store::StoredFactOf<S>, super::TestError> {
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = view.fact(fid).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(stored) = lookup else {
+        return Err(format!("expected the seed fact Active, got {lookup:?}").into());
+    };
+    Ok(*stored)
+}
+
+/// `record_commit` marks exactly its own commit's facts committed: another
+/// commit's staged facts stay `InFlight` until their own record, even after
+/// a later-staged commit records first.
+pub async fn record_commit_marks_only_its_own_facts_committed<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let seed = commit_name(&store, "seed").await?;
+    let seed_fid = *seed.fact_ids.first().ok_or("no seed fact id")?;
+    let seed_stored = stored_fact_of(&store, seed_fid).await?;
+
+    let author = user_author()?;
+    store
+        .with_tx(|_s, tx| {
+            Box::pin(async move {
+                let fid_a = tx
+                    .stage_fact(seed_stored.clone())
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                let fid_b = tx
+                    .stage_fact(seed_stored)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+
+                // Recording B's commit leaves the earlier-staged A in flight.
+                record_synthetic::<S, _>(tx, "cd", author.clone(), fid_b).await?;
+                let a = tx.placement(fid_a).await.map_err(|e| format!("{e:?}"))?;
+                let b = tx.placement(fid_b).await.map_err(|e| format!("{e:?}"))?;
+                assert_eq!(a, FactPlacement::InFlight);
+                assert_eq!(b, FactPlacement::Committed);
+
+                record_synthetic::<S, _>(tx, "ef", author, fid_a).await?;
+                let a = tx.placement(fid_a).await.map_err(|e| format!("{e:?}"))?;
+                assert_eq!(a, FactPlacement::Committed);
+                Ok::<_, String>(())
+            })
+        })
+        .await
+        .map_err(|e| format!("{e:?}"))??;
+    Ok(())
+}
+
+/// Two recorded commits claiming one staged fact fail the transaction at
+/// apply: a fact belongs to exactly one commit, and a double claim would
+/// otherwise resolve arbitrarily.
+pub async fn overlapping_recorded_commits_fail_the_transaction_at_apply<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let seed = commit_name(&store, "seed").await?;
+    let seed_fid = *seed.fact_ids.first().ok_or("no seed fact id")?;
+    let watermark = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    let seed_stored = stored_fact_of(&store, seed_fid).await?;
+
+    let author = user_author()?;
+    let outcome = store
+        .with_tx(|_s, tx| {
+            Box::pin(async move {
+                let fid = tx
+                    .stage_fact(seed_stored)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
+                record_synthetic::<S, _>(tx, "cd", author.clone(), fid).await?;
+                record_synthetic::<S, _>(tx, "ef", author, fid).await?;
+                Ok::<_, String>(())
+            })
+        })
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a doubly-claimed staged fact must fail the transaction, got {outcome:?}"
+    );
+    // Nothing landed.
+    let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(after, watermark);
+    Ok(())
+}
+
+// --- self-referential meta rules + retraction visibility ---
+
+/// A `RetractFact` whose target is a fact in the same commit (its own
+/// meta-fact id) is rejected with `MetaTargetInSameCommit`.
+pub async fn retract_fact_targeting_same_commit_fact_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    commit_name(&store, "prior").await?;
+    // The id this retraction's own meta-fact will take — an in-commit target.
+    let in_commit = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(in_commit)?].into_iter().collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected MetaTargetInSameCommit".into()),
+        Err(e) => e,
+    };
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::MetaTargetInSameCommit { target } = errs.first() else {
+        return Err(format!("expected MetaTargetInSameCommit, got {:?}", errs.first()).into());
+    };
+    assert_eq!(*target, in_commit);
+    Ok(())
+}
+
+/// A `RetractFact` targeting a prior committed fact is accepted.
+pub async fn retract_fact_targeting_prior_fact_accepted<S: FactStore>(store: S) -> TestResult {
+    let prior = commit_name(&store, "to-retract").await?;
+    let target = *prior.fact_ids.first().ok_or("no prior fact id")?;
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(target)?].into_iter().collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        result.fact_ids.len(),
+        1,
+        "the retraction meta-fact must be recorded"
+    );
+    Ok(())
+}
+
+/// A `SupersedeFact` whose target is in the same commit (with a prior
+/// replacement) is rejected with `MetaTargetInSameCommit`.
+pub async fn supersede_fact_targeting_same_commit_fact_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let prior = commit_name(&store, "replacement").await?;
+    let replacement = *prior.fact_ids.first().ok_or("no prior fact id")?;
+    let in_commit = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [supersede_fact(in_commit, replacement)?]
+            .into_iter()
+            .collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected MetaTargetInSameCommit".into()),
+        Err(e) => e,
+    };
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::MetaTargetInSameCommit { target } = errs.first() else {
+        return Err(format!("expected MetaTargetInSameCommit, got {:?}", errs.first()).into());
+    };
+    assert_eq!(*target, in_commit);
+    Ok(())
+}
+
+/// A `SupersedeFact` whose target equals its replacement is rejected with
+/// `SupersedeReplacementEqualsTarget`, before any target existence lookup.
+pub async fn supersede_fact_with_equal_target_and_replacement_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let prior = commit_name(&store, "self-target").await?;
+    let fact_id = *prior.fact_ids.first().ok_or("no prior fact id")?;
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [supersede_fact(fact_id, fact_id)?].into_iter().collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected SupersedeReplacementEqualsTarget".into()),
+        Err(e) => e,
+    };
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::SupersedeReplacementEqualsTarget { target } = errs.first() else {
+        return Err(format!(
+            "expected SupersedeReplacementEqualsTarget, got {:?}",
+            errs.first()
+        )
+        .into());
+    };
+    assert_eq!(*target, fact_id);
+    Ok(())
+}
+
+/// A retracted fact reads `Active` at a snapshot before the retraction and
+/// `Retracted` by it once the retraction is visible.
+pub async fn retract_fact_hides_target_only_after_its_commit<S: FactStore>(store: S) -> TestResult {
+    let original = commit_name(&store, "fact-x").await?;
+    let target = *original.fact_ids.first().ok_or("no original fact id")?;
+
+    let retraction_bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(target)?].into_iter().collect(),
+    };
+    let retraction = commit_facts(&store, retraction_bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let retractor = *retraction.fact_ids.first().ok_or("no retractor fact id")?;
+
+    let mut before = store.no_later_than(retractor);
+    let lookup = before.fact(target).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(_) = lookup else {
+        return Err(format!("expected Active before retraction, got {lookup:?}").into());
+    };
+
+    let mut after = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = after.fact(target).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = lookup else {
+        return Err(format!("expected Retracted after retraction, got {lookup:?}").into());
+    };
+    assert_eq!(by, retractor);
+    Ok(())
+}
+
+/// A read snapshot classifies a committed fact as `Committed` and an id at or
+/// past the snapshot as `Absent`, and never reports `InFlight` — it has no
+/// in-flight commit.
+pub async fn read_snapshot_placement_is_committed_or_absent<S: FactStore>(store: S) -> TestResult {
+    let first = commit_name(&store, "alpha").await?;
+    let committed = *first.fact_ids.first().ok_or("no committed fact id")?;
+    let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+
+    assert_eq!(
+        view.placement(committed)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        FactPlacement::Committed
+    );
+    // The next id to be minted is past the snapshot — no fact lives there yet.
+    assert_eq!(
+        view.placement(snapshot)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        FactPlacement::Absent
+    );
+    Ok(())
+}
+
+/// A read snapshot whose watermark sits far past the committed fact count
+/// reports `Absent`, not `InFlight`, for ids between the committed count and the
+/// watermark — a read view has no in-flight commit, so `InFlight` is
+/// structurally unreachable.
+pub async fn read_snapshot_placement_never_inflight_past_watermark<S: FactStore>(
+    store: S,
+) -> TestResult {
+    commit_name(&store, "alpha").await?;
+    commit_name(&store, "beta").await?;
+    let committed_count = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(committed_count, FactId::new(2));
+
+    // An "everything" view whose watermark is well past the committed count.
+    let mut view = store.no_later_than(FactId::new(1_000));
+
+    // An id between the committed count and the watermark names no fact — the
+    // old lower-bound-only `InFlight` branch wrongly reported `InFlight` here.
+    assert_eq!(
+        view.placement(FactId::new(500))
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        FactPlacement::Absent
+    );
+    // An id below the committed count is `Committed`.
+    assert_eq!(
+        view.placement(FactId::new(0))
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        FactPlacement::Committed
+    );
+    Ok(())
+}
+
+/// A `RetractCommit` hides every fact of its target commit.
+pub async fn retract_commit_hides_every_fact_of_target<S: FactStore>(store: S) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [name_fact(0, "Pantheon")?, construction_started_fact(0)?]
+            .into_iter()
+            .collect(),
+    };
+    let original = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(original.fact_ids.len(), 2);
+    let target_commit = original.commit_id.clone();
+
+    let retraction_bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_commit_fact(target_commit)?].into_iter().collect(),
+    };
+    let retraction = commit_facts(&store, retraction_bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let retractor = *retraction.fact_ids.first().ok_or("no retractor fact id")?;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    for fact_id in &original.fact_ids {
+        let lookup = view.fact(*fact_id).await.map_err(|e| format!("{e:?}"))?;
+        let FactLookup::Retracted { by } = lookup else {
+            return Err(format!("expected Retracted for {fact_id:?}, got {lookup:?}").into());
+        };
+        assert_eq!(by, retractor);
+    }
+    Ok(())
+}
+
+/// A `SupersedeFact` hides its target but leaves the replacement `Active`.
+pub async fn supersede_fact_hides_target_and_keeps_replacement<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let original = commit_name(&store, "old-value").await?;
+    let target = *original.fact_ids.first().ok_or("no target fact id")?;
+    let replacement_result = commit_name(&store, "new-value").await?;
+    let replacement = *replacement_result
+        .fact_ids
+        .first()
+        .ok_or("no replacement fact id")?;
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [supersede_fact(target, replacement)?].into_iter().collect(),
+    };
+    let supersession = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let supersede_id = *supersession
+        .fact_ids
+        .first()
+        .ok_or("no supersede fact id")?;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let target_lookup = view.fact(target).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = target_lookup else {
+        return Err(format!("expected superseded target Retracted, got {target_lookup:?}").into());
+    };
+    assert_eq!(by, supersede_id);
+
+    let replacement_lookup = view.fact(replacement).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(_) = replacement_lookup else {
+        return Err(format!("expected replacement Active, got {replacement_lookup:?}").into());
+    };
+    Ok(())
+}
+
+/// Retracting a retraction restores the original fact's visibility. F1 is
+/// active at a C1-era snapshot, retracted at a C2-era snapshot, and active
+/// again at a C3-era snapshot once the retraction is itself retracted.
+pub async fn retraction_of_retraction_restores_visibility<S: FactStore>(store: S) -> TestResult {
+    let c1 = commit_name(&store, "f1").await?;
+    let f1 = *c1.fact_ids.first().ok_or("no f1 id")?;
+
+    let c2_bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(f1)?].into_iter().collect(),
+    };
+    let c2 = commit_facts(&store, c2_bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let r1 = *c2.fact_ids.first().ok_or("no r1 id")?;
+
+    let c3_bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(r1)?].into_iter().collect(),
+    };
+    let c3 = commit_facts(&store, c3_bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let r2 = *c3.fact_ids.first().ok_or("no r2 id")?;
+
+    let mut era1 = store.no_later_than(r1);
+    let lookup = era1.fact(f1).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(_) = lookup else {
+        return Err(format!("C1-era: expected Active, got {lookup:?}").into());
+    };
+
+    let mut era2 = store.no_later_than(r2);
+    let lookup = era2.fact(f1).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = lookup else {
+        return Err(format!("C2-era: expected Retracted, got {lookup:?}").into());
+    };
+    assert_eq!(by, r1);
+
+    let mut era3 = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = era3.fact(f1).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Active(_) = lookup else {
+        return Err(format!("C3-era: expected Active again, got {lookup:?}").into());
+    };
+    Ok(())
+}
+
+/// A `SupersedeFact` naming a never-minted replacement is rejected with
+/// `FactNotFound` for the dangling replacement id.
+pub async fn supersede_fact_with_unminted_replacement_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let prior = commit_name(&store, "supersede-target").await?;
+    let target = *prior.fact_ids.first().ok_or("no prior fact id")?;
+    let phantom = FactId::new(999_999);
+
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [supersede_fact(target, phantom)?].into_iter().collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("expected FactNotFound for replacement".into()),
+        Err(e) => e,
+    };
+    let errs = submit_batch(err)?;
+    assert_eq!(errs.len().get(), 1);
+    let SubmitError::FactNotFound { id } = errs.first() else {
+        return Err(format!("expected FactNotFound, got {:?}", errs.first()).into());
+    };
+    assert_eq!(*id, phantom);
+    Ok(())
+}
+
+/// When a fact has several retractors and the lowest-id one is itself
+/// retracted, `fact()` reports the lowest STILL-effective retractor.
+pub async fn retracted_by_reports_lowest_still_effective_retractor<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let original = commit_name(&store, "multiply-retracted").await?;
+    let f = *original.fact_ids.first().ok_or("no original fact id")?;
+
+    // Two independent retractions of F (ra has the lower id).
+    let first = commit_retract(&store, f, 10).await?;
+    let ra = *first.fact_ids.first().ok_or("no ra id")?;
+    let second = commit_retract(&store, f, 20).await?;
+    let rb = *second.fact_ids.first().ok_or("no rb id")?;
+    // Retract ra, cancelling it.
+    commit_retract(&store, ra, 30).await?;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = view.fact(f).await.map_err(|e| format!("{e:?}"))?;
+    let FactLookup::Retracted { by } = lookup else {
+        return Err(format!("expected Retracted, got {lookup:?}").into());
+    };
+    assert_eq!(
+        by, rb,
+        "ra is cancelled, so rb is the lowest still-effective retractor"
+    );
+    Ok(())
+}
+
+// --- accumulation ---
+
+/// One bundle violating three independent rules — a disjunctive stored date, an
+/// inverted name window, and a self-parent subimage — is rejected with all three
+/// in a single batch, accumulation rather than first-failure.
+pub async fn multi_rule_violations_accumulate_in_one_batch<S: FactStore>(store: S) -> TestResult {
+    let bundle = local_bundle(
+        2,
+        0,
+        1,
+        0,
+        vec![
+            started_with_date(0, disjunctive_date()?)?,
+            name_window_fact(1, Some(1900), Some(1800))?,
+            subimage_fact(0, 0)?,
+        ],
+    )?;
+    let errs = commit_err(&store, bundle).await?;
+    assert_eq!(
+        errs.len().get(),
+        3,
+        "expected three rule violations, got {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::NonSingleIntervalDate { .. })),
+        "missing NonSingleIntervalDate: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::NameWindowInverted { .. })),
+        "missing NameWindowInverted: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeSelfParent { .. })),
+        "missing CompositeSelfParent: {errs:?}"
+    );
+    Ok(())
+}
+
+/// The resolvability check batches every out-of-range index and unknown
+/// `Decl::Existing` together and gates the rules out: a rule-violating fact in
+/// the same bundle is not reported, because its references can't resolve.
+pub async fn resolvability_gate_batches_and_skips_rules<S: UnmintedIds>(store: S) -> TestResult {
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Existing {
+            id: S::unminted_entity(),
+        }],
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [
+            name_fact(5, "out-of-range-entity")?,
+            medium_picture_fact(7)?,
+            started_with_date(0, disjunctive_date()?)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let errs = commit_err(&store, bundle).await?;
+    assert_eq!(
+        errs.len().get(),
+        3,
+        "expected three resolvability errors only, got {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EntityIdxOutOfRange { idx: 5, .. })),
+        "missing EntityIdxOutOfRange: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::ImageIdxOutOfRange { idx: 7, .. })),
+        "missing ImageIdxOutOfRange: {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::UnknownExistingEntity { .. })),
+        "missing UnknownExistingEntity: {errs:?}"
+    );
+    // The would-be single-interval-date and unused-declaration violations only
+    // run after resolvability passes, so the early return suppresses them.
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, SubmitError::NonSingleIntervalDate { .. })),
+        "a rule fired despite the resolvability gate: {errs:?}"
+    );
+    Ok(())
+}
+
+// --- backlink reads (active-only, snapshot-scoped) ---
+
+/// `all_facts_about_image` returns only active facts: a retracted fact about
+/// the image is excluded.
+pub async fn all_facts_about_image_excludes_retracted<S: FactStore>(store: S) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![medium_picture_fact(0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let image = c1
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing image")?
+        .id
+        .clone();
+    let target = *c1.fact_ids.first().ok_or("no fact id")?;
+
+    let retraction: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retract_fact(target)?].into_iter().collect(),
+    };
+    commit_facts(&store, retraction)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = view
+        .all_facts_about_image(&image, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        !page.items.iter().any(|item| item.fact_id == target),
+        "retracted fact must not appear in all_facts_about_image; got {:?}",
+        page.items
+    );
+    Ok(())
+}
+
+/// `all_facts_about_image` is snapshot-scoped: a fact about the image committed
+/// after the snapshot is absent from a view pinned at it.
+pub async fn all_facts_about_image_respects_snapshot<S: FactStore>(store: S) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![medium_picture_fact(0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let image = c1
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing image")?
+        .id
+        .clone();
+    let early = *c1.fact_ids.first().ok_or("no fact id")?;
+    let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: image.clone() }],
+        facts: [captured_date_fact(0)?].into_iter().collect(),
+    };
+    let c2 = commit_facts(&store, c2)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let late = *c2.fact_ids.first().ok_or("no fact id")?;
+
+    let mut view = store.no_later_than(snapshot);
+    let page = view
+        .all_facts_about_image(&image, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let returned: BTreeSet<FactId> = page.items.iter().map(|item| item.fact_id).collect();
+    assert!(returned.contains(&early), "pre-snapshot fact must appear");
+    assert!(
+        !returned.contains(&late),
+        "post-snapshot fact must be absent; got {returned:?}"
+    );
+    Ok(())
+}
+
+// --- cluster rules ---
+
+/// A construction bookend carrying a location is accepted.
+pub async fn construction_location_accepted<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_location_fact(0)?])?,
+    )
+    .await
+}
+
+/// A stored location that conjoins two far-apart resolved circles denotes
+/// nothing — its `conflict_status` is `Conflict` — and is rejected as an empty
+/// location, the geometric extension of the bare-`Empty` guard.
+pub async fn disjoint_conjunction_location_rejected<S: FactStore>(store: S) -> TestResult {
+    let paris = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(48.8566, 2.3522)?,
+        Meters(1000.0),
+    )?);
+    let tokyo = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(35.6762, 139.6503)?,
+        Meters(1000.0),
+    )?);
+    let disjoint = UnresolvedLocation::all_of(vec![paris, tokyo])?;
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, disjoint)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EmptyLocation { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A stored location conjoining a circle with an unresolved reference is
+/// `Pending` — its emptiness can't be decided before the reference resolves — so
+/// the guard accepts it.
+pub async fn pending_conjunction_location_accepted<S: FactStore>(store: S) -> TestResult {
+    let circle = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(40.0, -74.0)?,
+        Meters(1000.0),
+    )?);
+    let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+        name: "Paris".to_owned(),
+    });
+    let pending = UnresolvedLocation::all_of(vec![circle, reference])?;
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, pending)?])?,
+    )
+    .await
+}
+
+/// A stored location conjoining two overlapping resolved circles is
+/// `Consistent` and accepted.
+pub async fn consistent_conjunction_location_accepted<S: FactStore>(store: S) -> TestResult {
+    let a = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(40.0, -74.0)?,
+        Meters(5000.0),
+    )?);
+    let b = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(40.005, -74.0)?,
+        Meters(5000.0),
+    )?);
+    let consistent = UnresolvedLocation::all_of(vec![a, b])?;
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, consistent)?])?,
+    )
+    .await
+}
+
+/// A stored location naming more than `MAX_LOCATION_CIRCLES` circles is rejected;
+/// one exactly at the cap commits. The bound guards the emptiness check's
+/// candidate-point cost against machine-generated junk.
+pub async fn over_complex_location_rejected_at_cap_accepted<S: FactStore>(store: S) -> TestResult {
+    use crate::submit::pipeline::MAX_LOCATION_CIRCLES;
+
+    let over = n_circle_location(MAX_LOCATION_CIRCLES + 1)?;
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, over)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::LocationTooComplex { circles, limit, .. }
+                if *circles == MAX_LOCATION_CIRCLES + 1 && *limit == MAX_LOCATION_CIRCLES
+        )),
+        "got {errs:?}"
+    );
+
+    let at_cap = n_circle_location(MAX_LOCATION_CIRCLES)?;
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_with_location(0, at_cap)?])?,
+    )
+    .await
+}
+
+/// A minted event with one `HasEvent` and payloads consistent with its declared
+/// kind commits and stores.
+pub async fn event_with_has_event_and_consistent_payloads_stored<S: FactStore>(
+    store: S,
+) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                event_damage_cause_fact(0)?,
+                event_durational_date_fact(0)?,
+            ],
+        )?,
+    )
+    .await
+}
+
+/// A minted event with no `HasEvent` is typeless and rejected: a payload alone
+/// doesn't declare the event's subject or kind.
+pub async fn event_without_has_event_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![event_durational_date_fact(0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventMissingHasEvent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// An event referenced only as a `Gap` endpoint, with no `HasEvent`, is still
+/// rejected as typeless: the rule's event set spans every referenced id, not
+/// just typing/payload subjects, so a gap endpoint can't smuggle in an untyped
+/// event.
+pub async fn event_referenced_only_as_gap_endpoint_without_has_event_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![gap_from_event_fact(0, 0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventMissingHasEvent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Two `HasEvent` facts of different kinds on one minted event id is a
+/// self-contradiction — an event has one kind — and is rejected, not stored.
+/// Disagreement belongs on separate `SameEvent`-linked event ids.
+pub async fn event_two_has_event_kinds_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                has_event_fact(0, 0, moved_kind())?,
+            ],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventMultipleHasEvent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Two `HasEvent` facts naming different subject entities on one event id is the
+/// same self-contradiction over the entity rather than the kind: an event has
+/// one subject. Rejected as `EventMultipleHasEvent`.
+pub async fn event_two_has_event_entities_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            2,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                has_event_fact(0, 1, damaged_kind())?,
+            ],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventMultipleHasEvent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A payload contradicting the commit's `HasEvent` kind is rejected: a
+/// `MoveMethod` on a `Damaged` event doesn't suit the declared kind.
+pub async fn event_payload_contradicts_declared_kind_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                event_move_method_fact(0)?,
+            ],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventFactKindMismatch { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A `PointDate` on a durational-kinded event is a category mismatch, rejected
+/// the same way a typed payload mismatch is.
+pub async fn event_date_contradicts_declared_category_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, damaged_kind())?,
+                event_point_date_fact(0)?,
+            ],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventFactKindMismatch { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Two sources disagreeing on an event's kind store fine as *separate* events
+/// linked by `SameEvent`: C1 mints event E `Damaged`, C2 mints event F `Moved`
+/// and judges `SameEvent(E, F)`. Each commit carries one `HasEvent` per minted
+/// id, so neither is rejected; the disagreement sits in the store as a
+/// class-level conflict, read back per id.
+pub async fn cross_source_kind_conflict_via_same_event_stored<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, damaged_kind())?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id
+        .clone();
+    let event_e = c1
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing event")?
+        .id
+        .clone();
+
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: vec![Decl::Local, Decl::Existing { id: event_e }],
+        images: Vec::new(),
+        facts: [
+            has_event_fact(0, 0, moved_kind())?,
+            crate::submit::SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Identity {
+                    fact: identity::Fact::same_event(EventIdx(0), EventIdx(1))?,
+                },
+                citation: judgment_citation()?,
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+    commit_ok(&store, c2).await
+}
+
+/// A same-commit retraction is visible to the exactly-one rule's read: C1 puts a
+/// `HasEvent { Moved }` on event E; C2 retracts it and adds a
+/// `HasEvent { Damaged }`. The retraction is visible, so the surviving claim
+/// count is one and the commit is accepted — without the pending-retractor
+/// overlay the stale `Moved` claim would read active alongside the new one,
+/// tripping `EventMultipleHasEvent`.
+pub async fn event_kind_rule_sees_same_commit_retraction<S: FactStore>(store: S) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, moved_kind())?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id
+        .clone();
+    let event = c1
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing event")?
+        .id
+        .clone();
+    let has_event_moved = *c1.fact_ids.first().ok_or("no has-event fact id")?;
+
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [
+            retract_fact(has_event_moved)?,
+            has_event_fact(0, 0, damaged_kind())?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    commit_ok(&store, c2).await
+}
+
+/// Re-typing an event must atomically retract the payloads the new kind doesn't
+/// admit. C1 mints event E `Moved` with a `MovedToLocation` payload; C2 retracts
+/// the `HasEvent { Moved }` and adds `HasEvent { Damaged }` but leaves the
+/// `MovedToLocation` active. The consistency rule reads the cumulative active
+/// payloads — not just C2's candidates — so the orphaned `MovedToLocation` meets
+/// the newly-declared `Damaged` kind and the commit is rejected. Without the
+/// cumulative read the stale payload would never be re-checked.
+pub async fn event_retype_without_retracting_stale_payload_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, moved_kind())?,
+                event_moved_to_location_fact(0)?,
+            ],
+        )?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id
+        .clone();
+    let event = c1
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing event")?
+        .id
+        .clone();
+    let has_event_moved = *c1.fact_ids.first().ok_or("no has-event fact id")?;
+
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [
+            retract_fact(has_event_moved)?,
+            has_event_fact(0, 0, damaged_kind())?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventFactKindMismatch { .. })),
+        "the stale MovedToLocation must mismatch the new Damaged kind: {errs:?}"
+    );
+    Ok(())
+}
+
+/// A same-commit retraction of the only depiction unmasks the gap: C1 records
+/// the sole depiction tying X to I; C2 retracts it and adds an
+/// `ImageObservation` of X on I. The retraction is visible to the rule read in
+/// C2, so the depiction no longer satisfies the pairing and the commit is
+/// rejected as `ObservationWithoutDepiction`. Without the pending-retractor
+/// overlay the doomed depiction reads active and the commit is falsely accepted.
+pub async fn observation_depiction_retracted_in_same_commit_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 0, 1, 0, vec![depiction_fact(0, 0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id
+        .clone();
+    let image = c1
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing image")?
+        .id
+        .clone();
+    let depiction = *c1.fact_ids.first().ok_or("no depiction fact id")?;
+
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: image }],
+        facts: [
+            retract_fact(depiction)?,
+            observation_feature_fact(0, image_observation_citation(0)?)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::ObservationWithoutDepiction { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// An inverted name window is rejected.
+pub async fn name_window_inverted_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![name_window_fact(0, Some(1900), Some(1800))?],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::NameWindowInverted { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// An equal-bound window (earliest == latest year) is accepted.
+pub async fn name_window_equal_accepted<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![name_window_fact(0, Some(1850), Some(1850))?],
+        )?,
+    )
+    .await
+}
+
+/// An open upper bound can't prove inversion, so it's accepted.
+pub async fn name_window_open_bound_accepted<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![name_window_fact(0, Some(1900), None)?])?,
+    )
+    .await
+}
+
+/// A subimage that is its own parent is rejected.
+pub async fn composite_self_parent_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![subimage_fact(0, 0)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeSelfParent { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// Distinct subimage and parent are accepted.
+pub async fn composite_distinct_accepted<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(0, 0, 2, 0, vec![subimage_fact(0, 1)?])?,
+    )
+    .await
+}
+
+/// A second parent for the same subimage, arriving in a later commit, is
+/// rejected via the image backlink.
+pub async fn composite_multiple_parents_across_commits_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 0, 2, 0, vec![subimage_fact(0, 1)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let subimage = c1
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing subimage")?
+        .id
+        .clone();
+
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: subimage }, Decl::Local],
+        facts: [subimage_fact(0, 1)?].into_iter().collect(),
+    };
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeMultipleParents { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A self-loop edge `{s←s}` isn't a genuine parent, so `{s←s}` alongside `{s←p}`
+/// reports only the self-parent error, not a spurious multiple-parents error.
+/// `s` has exactly one real parent, `p`.
+pub async fn composite_self_loop_does_not_trip_multiple_parents<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(0, 0, 2, 0, vec![subimage_fact(0, 0)?, subimage_fact(0, 1)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeSelfParent { .. })),
+        "expected the self-parent error: {errs:?}"
+    );
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, SubmitError::CompositeMultipleParents { .. })),
+        "self-loop must not count as a second parent: {errs:?}"
+    );
+    Ok(())
+}
+
+/// A chain formed across commits (A←X in C1, then X←B in C2) is rejected: X is
+/// both a subimage and a parent.
+pub async fn composite_chain_across_commits_rejected<S: FactStore>(store: S) -> TestResult {
+    // C1: A (img 0) is a subimage of X (img 1).
+    let c1 = commit_facts(
+        &store,
+        local_bundle(0, 0, 2, 0, vec![subimage_fact(0, 1)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let x = c1.images.get(&ImageIdx(1)).ok_or("missing X")?.id.clone();
+
+    // C2: X is a subimage of a fresh B (img 1).
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: x }, Decl::Local],
+        facts: [subimage_fact(0, 1)?].into_iter().collect(),
+    };
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::CompositeChain { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A capture date submits cleanly — capture metadata is a general image
+/// attribute, gated by no medium.
+pub async fn captured_date_submits_cleanly<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![captured_date_fact(0)?])?,
+    )
+    .await
+}
+
+/// A depiction alongside a `Medium` on the same image submits cleanly: the
+/// medium is a non-gating render hint, constraining no other fact.
+pub async fn depiction_with_medium_submits_cleanly<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(
+            1,
+            0,
+            1,
+            0,
+            vec![medium_picture_fact(0)?, depiction_fact(0, 0)?],
+        )?,
+    )
+    .await
+}
+
+/// A combination the former role-coherence rule rejected — a map-medium image
+/// also carrying a capture date and a depiction — now submits. Medium gates
+/// nothing, so the bundle is well-formed; any tension is the projection's to
+/// surface, not submit's to reject.
+pub async fn former_role_conflict_combination_now_submits<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(
+            1,
+            0,
+            1,
+            0,
+            vec![
+                map_medium_fact(0)?,
+                captured_date_fact(0)?,
+                depiction_fact(0, 0)?,
+            ],
+        )?,
+    )
+    .await
+}
+
+/// Two disagreeing media on one image submit cleanly — `Medium` gates nothing,
+/// even self-contradicting, so the conflict surfaces at projection.
+pub async fn disagreeing_media_submit_cleanly<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(
+            0,
+            0,
+            1,
+            0,
+            vec![medium_picture_fact(0)?, map_medium_fact(0)?],
+        )?,
+    )
+    .await
+}
+
+// --- observation -> depiction pairing ---
+
+/// An image-observation of an entity with no paired depiction is rejected.
+pub async fn observation_without_depiction_rejected<S: FactStore>(store: S) -> TestResult {
+    let bundle = local_bundle(
+        1,
+        0,
+        1,
+        0,
+        vec![observation_feature_fact(0, image_observation_citation(0)?)?],
+    )?;
+    let errs = commit_err(&store, bundle).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::ObservationWithoutDepiction { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A depiction of the entity on the observed image, in the same commit,
+/// satisfies the pairing.
+pub async fn observation_with_same_commit_depiction_accepted<S: FactStore>(store: S) -> TestResult {
+    let bundle = local_bundle(
+        1,
+        0,
+        1,
+        0,
+        vec![
+            observation_feature_fact(0, image_observation_citation(0)?)?,
+            depiction_fact(0, 0)?,
+        ],
+    )?;
+    commit_ok(&store, bundle).await
+}
+
+/// A depiction in a prior commit satisfies the pairing, via the image backlink.
+pub async fn observation_with_prior_commit_depiction_accepted<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 0, 1, 0, vec![depiction_fact(0, 0)?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id
+        .clone();
+    let image = c1
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing image")?
+        .id
+        .clone();
+
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: Vec::new(),
+        images: vec![Decl::Existing { id: image }],
+        facts: [observation_feature_fact(0, image_observation_citation(0)?)?]
+            .into_iter()
+            .collect(),
+    };
+    commit_ok(&store, c2).await
+}
+
+/// An observation cited by `External` carries no observed image, so the pairing
+/// requirement doesn't apply.
+pub async fn observation_cited_external_accepted<S: FactStore>(store: S) -> TestResult {
+    let bundle = local_bundle(
+        1,
+        0,
+        0,
+        0,
+        vec![observation_feature_fact(0, external_judgment_citation()?)?],
+    )?;
+    commit_ok(&store, bundle).await
+}
+
+// --- single-interval stored-date rule ---
+
+/// A bookend carrying a single interval is accepted (the storable shape).
+pub async fn single_interval_bookend_accepted<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![started_with_date(0, year_date(1900)?)?])?,
+    )
+    .await
+}
+
+/// A bookend carrying a disjunction is rejected at the fact-payload host.
+pub async fn disjunctive_bookend_date_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![started_with_date(0, disjunctive_date()?)?])?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::NonSingleIntervalDate {
+                role: DateRole::BookendBound
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A bookend carrying the empty date (⊥) is rejected — ⊥ is no honest claim.
+pub async fn empty_bookend_date_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![started_with_date(0, UncertainDate::empty())?],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::NonSingleIntervalDate { .. })),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A `JudgmentSource::External` citation carrying a disjunctive `published`
+/// date is rejected — the rule reaches citation dates, not just fact payloads.
+pub async fn disjunctive_judgment_citation_date_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![observation_external_published(
+                0,
+                Some(disjunctive_date()?),
+            )?],
+        )?,
+    )
+    .await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::NonSingleIntervalDate {
+                role: DateRole::CitationDate
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+/// A `MetaSource::External` citation carrying a disjunctive `created` date is
+/// rejected — the third `ExternalSource` host the traversal must reach.
+pub async fn disjunctive_meta_citation_date_rejected<S: FactStore>(store: S) -> TestResult {
+    // Seed a commit so the retraction has a real target.
+    let seed = commit_facts(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![name_fact(0, "seed")?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+
+    let retraction = crate::submit::SubmitFact::Meta {
+        assertion: crate::grammar::assertions::MetaAssertion::RetractCommit {
+            target: seed.commit_id,
+            reason: crate::grammar::assertions::RetractionReason::FactualError,
+        },
+        citation: crate::grammar::citations::MetaSource::External {
+            source: ExternalSource::Archive {
+                collection: "fonds".to_owned(),
+                catalog_id: None,
+                created: Some(disjunctive_date()?),
+            },
+        },
+    };
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [retraction].into_iter().collect(),
+    };
+    let errs = commit_err(&store, bundle).await?;
+    assert!(
+        errs.iter().any(|e| matches!(
+            e,
+            SubmitError::NonSingleIntervalDate {
+                role: DateRole::CitationDate
+            }
+        )),
+        "got {errs:?}"
+    );
+    Ok(())
+}
+
+// --- spatial class walk (InBbox) ---
+
+/// `InBbox` surfaces every entity the box holds — a construction bookend inside
+/// it, or a `MovedToLocation` inside it attributed through its `HasEvent` owner —
+/// and nothing else. An out-of-box construction is excluded, and a move whose
+/// `HasEvent` owner is retracted attributes to no entity.
+pub async fn walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let inside = (40.5, -73.5);
+    let outside = (10.0, 10.0);
+
+    // A: built inside the box.
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, inside.0, inside.1)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+
+    // B: built outside the box.
+    let b = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, outside.0, outside.1)?])?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id.clone();
+
+    // C: built outside, then a `Moved` event lands it inside the box.
+    let c = commit_result(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            20,
+            vec![
+                construction_at(0, outside.0, outside.1)?,
+                has_event_fact(0, 0, moved_kind())?,
+                moved_to(0, inside.0, inside.1)?,
+            ],
+        )?,
+    )
+    .await?;
+    let c_id = c.entities.get(&EntityIdx(0)).ok_or("missing c")?.id.clone();
+
+    // D: a `Moved` inside the box whose `HasEvent` owner is retracted below, so
+    // the orphaned move attributes to no entity.
+    let d = commit_result(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            30,
+            vec![
+                has_event_fact(0, 0, moved_kind())?,
+                moved_to(0, inside.0, inside.1)?,
+            ],
+        )?,
+    )
+    .await?;
+    let d_event = d
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing d event")?
+        .id
+        .clone();
+    let mut pre_retract = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let d_facts = pre_retract
+        .all_facts_about_event(&d_event, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let has_event_fid = d_facts
+        .items
+        .iter()
+        .find(|item| {
+            matches!(
+                item.fact.event_fact(),
+                Some(crate::grammar::event::Fact::HasEvent { .. })
+            )
+        })
+        .ok_or("D's HasEvent is missing")?
+        .fact_id;
+    commit_retract(&store, has_event_fid, 40).await?;
+
+    let bbox = sample_bbox()?;
+    let stream = EntityStream::InBbox(&bbox);
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<EntityIdOf<S>>> =
+        drain_entity_classes::<S, _>(&mut view, &stream, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+    let reps: BTreeSet<EntityIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+    let want: BTreeSet<EntityIdOf<S>> = [a_id.clone(), c_id.clone()].into_iter().collect();
+    assert_eq!(
+        reps, want,
+        "InBbox surfaces the in-box construction (a={a_id:?}) and the moved-in entity \
+         (c={c_id:?}); the out-of-box construction (b={b_id:?}) and the orphaned move \
+         (d's event={d_event:?}) are excluded; got {rows:?}"
+    );
+    Ok(())
+}
+
+/// Two entities, each with two in-box construction `Location`s, paged one row at
+/// a time. `next` walks every row (each representative twice); `next_class`
+/// skips the emitted representative's remaining rows, so paging on it visits
+/// each representative once. Row order follows the representative's `Ord`, so
+/// the two minted ids are sorted into walk order first.
+pub async fn class_walk_next_class_cursor_skips_to_the_next_representative<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let a = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![
+                construction_at(0, 40.2, -73.8)?,
+                construction_at(0, 40.3, -73.7)?,
+            ],
+        )?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+    let b = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![
+                construction_at(0, 40.6, -73.4)?,
+                construction_at(0, 40.7, -73.3)?,
+            ],
+        )?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id.clone();
+    assert_ne!(a_id, b_id, "the two commits must mint distinct entities");
+    let (first, second) = if a_id < b_id {
+        (a_id, b_id)
+    } else {
+        (b_id, a_id)
+    };
+
+    let bbox = sample_bbox()?;
+    let stream = EntityStream::InBbox(&bbox);
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let one = std::num::NonZeroUsize::MIN;
+
+    // First page: one row under the first representative, with both cursors
+    // live.
+    let page1 = view
+        .walk_entity_classes(&stream, None, one)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(page1.rows.len(), 1);
+    assert_eq!(page1.rows[0].representative, first);
+    let next = page1.next.ok_or("page1 has more rows, so next is set")?;
+    let next_class = page1
+        .next_class
+        .ok_or("the second entity remains, so next_class is set")?;
+
+    // Resuming on `next` stays within the first representative (its second
+    // row).
+    let page_next = view
+        .walk_entity_classes(&stream, Some(next), one)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(page_next.rows.len(), 1);
+    assert_eq!(
+        page_next.rows[0].representative, first,
+        "next stays within the first representative"
+    );
+
+    // Resuming on `next_class` skips the first representative's tail and lands
+    // on the second; it is the final class, so its `next_class` is exhausted.
+    let page_class = view
+        .walk_entity_classes(&stream, Some(next_class), one)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(page_class.rows.len(), 1);
+    assert_eq!(
+        page_class.rows[0].representative, second,
+        "next_class skips to the second representative"
+    );
+    assert!(
+        page_class.next_class.is_none(),
+        "the second representative is the last"
+    );
+
+    // The row cursor walks every row: first, first, second, second.
+    let by_row: Vec<EntityIdOf<S>> = drain_entity_classes::<S, _>(&mut view, &stream, one)
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .into_iter()
+        .map(|row| row.representative)
+        .collect();
+    assert_eq!(
+        by_row,
+        vec![first.clone(), first.clone(), second.clone(), second.clone()],
+        "the row cursor walks every row"
+    );
+
+    // The class cursor visits each representative once: first, second.
+    let mut by_class: Vec<EntityIdOf<S>> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = view
+            .walk_entity_classes(&stream, cursor, one)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let Some(row) = page.rows.first() else {
+            break;
+        };
+        by_class.push(row.representative.clone());
+        match page.next_class {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(
+        by_class,
+        vec![first, second],
+        "the class cursor visits each representative once"
+    );
+    Ok(())
+}

@@ -4,18 +4,19 @@
 
 use std::collections::BTreeSet;
 
-use super::tests::{
-    TestBundle, TestResult, commit_result, construction_location_in, construction_started_fact,
-    construction_started_in, demolition_completed_in, designated_kind, event_point_date_fact,
-    external_reference_fact, fixed_time, has_event_fact, image_source_fact, local_bundle,
-    name_fact, name_fact_in_language, retract_commit_fact, same_entity_fact, user_author,
-};
 use super::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::grammar::attribute;
 use crate::grammar::citations::JudgmentSource;
 use crate::grammar::identity;
 use crate::grammar::ids::{CommitId, FactId};
+use crate::store::conformance::TestResult;
+use crate::store::conformance::fixtures::{
+    commit_result, construction_location_in, construction_started_fact, construction_started_in,
+    demolition_completed_in, designated_kind, event_point_date_fact, external_reference_fact,
+    fixed_time, has_event_fact, image_source_fact, local_bundle, name_fact, name_fact_in_language,
+    retract_commit_fact, same_entity_fact, user_author,
+};
 use crate::store::schema::EquivClass;
 use crate::store::{EntityView, FactStore, FactView, ImageView};
 use crate::submit::result::{StoredFactualFact, StoredJudgmentFact};
@@ -23,6 +24,8 @@ use crate::submit::{
     Commit as SubmitBundle, CommitAuthor, Decl, EntityIdx, EventIdx, FactLookup, ImageIdx,
     ResolutionOrigin, StoredCommit, StoredFact, matcher,
 };
+
+type TestBundle = SubmitBundle<MemoryIds>;
 
 // --- read helpers ---
 

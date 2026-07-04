@@ -11,6 +11,8 @@
 //!   relation), all implicit — there are no per-subject relation enums.
 //! - [`pagination`] — the generic cursor→stream adapter every walk pages on.
 //! - [`memory`] — the in-memory [`memory::MemoryFactStore`] backend.
+//! - `conformance` — backend-agnostic [`FactStore`] test suite, available to
+//!   other crates behind the `test-support` feature.
 //!
 //! The store trait's associated types are written in [`submit`](crate::submit)'s
 //! data types ([`Commit`](crate::submit::Commit),
@@ -117,6 +119,8 @@
 //! inside `Tx<'brand>`. Either way the brand gates which `with_tx` body the
 //! handle threads through.
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
 pub mod memory;
 pub(crate) mod pagination;
 pub mod schema;
