@@ -207,8 +207,7 @@ impl<S> EntityTransition<S> {
     /// date fields. Returns `None` only when no dates are set at all.
     ///
     /// Relies on the domain invariant that `started_at ≤ completed_at` for
-    /// durational transitions; violations are surfaced separately by
-    /// [`crate::consistency::ConsistencyWarning::CompletionBeforeStart`].
+    /// durational transitions.
     #[must_use]
     pub fn earliest_known_date(&self) -> Option<&Cited<UncertainDate, S>> {
         let (start, end) = self.date_range();

@@ -762,19 +762,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_bundles_pass_consistency_checks() -> Result<(), Box<dyn std::error::Error>> {
+    fn all_bundles_pass_reference_checks() -> Result<(), Box<dyn std::error::Error>> {
         let mut failures = Vec::new();
 
         for (bundle_name, bundle) in &all_bundles()? {
-            for (entity_key, entity) in &bundle.entities {
-                let warnings = entity.check_consistency();
-                if !warnings.is_empty() {
-                    failures.push(format!(
-                        "Bundle '{bundle_name}', entity '{entity_key}': {warnings:?}"
-                    ));
-                }
-            }
-
             if let Err(errors) = bundle.validate_references() {
                 failures.push(format!(
                     "Bundle '{bundle_name}' reference errors: {errors:?}"

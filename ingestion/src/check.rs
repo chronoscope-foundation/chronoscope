@@ -1,13 +1,12 @@
 //! Ingestion output analysis and validation.
 //!
-//! Analyzes `IngestionOutput` for consistency, distributions, and interesting entities.
+//! Analyzes `IngestionOutput` for distributions and interesting entities.
 //! Source-agnostic - works with output from any ingestion pathway.
 
 use crate::{EntityIdx, IngestionOutput, SourceIdx};
 use chrono::Datelike;
 use chronoscope_core::{
-    ConsistencyWarning, Entity, EntityTransition, LinkTarget, Location, UncertainDate,
-    UnresolvedLocation,
+    Entity, EntityTransition, LinkTarget, Location, UncertainDate, UnresolvedLocation,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -27,7 +26,6 @@ type IngestionLocation = UnresolvedLocation;
 pub struct AnalysisReport {
     pub summary: Summary,
     pub distributions: Distributions,
-    pub consistency: ConsistencyAnalysis,
     pub interesting_entities: Vec<InterestingEntity>,
 }
 
@@ -57,21 +55,6 @@ pub struct Distributions {
 }
 
 #[derive(Serialize)]
-pub struct ConsistencyAnalysis {
-    pub total_warnings: usize,
-    pub entities_with_warnings: usize,
-    pub warnings_by_code: BTreeMap<String, usize>,
-    pub sample_warnings: Vec<SampleWarning>,
-}
-
-#[derive(Serialize)]
-pub struct SampleWarning {
-    pub entity_name: String,
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Serialize)]
 pub struct InterestingEntity {
     pub reason: String,
     pub name: String,
@@ -89,13 +72,11 @@ pub struct InterestingEntity {
 pub fn analyze(output: &IngestionOutput) -> AnalysisReport {
     let summary = compute_summary(output);
     let distributions = compute_distributions(output);
-    let consistency = analyze_consistency(output);
     let interesting_entities = find_interesting_entities(output);
 
     AnalysisReport {
         summary,
         distributions,
-        consistency,
         interesting_entities,
     }
 }
@@ -225,44 +206,6 @@ fn compute_distributions(output: &IngestionOutput) -> Distributions {
     }
 }
 
-fn analyze_consistency(output: &IngestionOutput) -> ConsistencyAnalysis {
-    let mut total_warnings = 0;
-    let mut entities_with_warnings = 0;
-    let mut warnings_by_code: BTreeMap<String, usize> = BTreeMap::new();
-    let mut sample_warnings: Vec<SampleWarning> = Vec::new();
-
-    for entity in output.entities.values() {
-        let warnings = entity.check_consistency();
-        if !warnings.is_empty() {
-            entities_with_warnings += 1;
-            let name = get_entity_name(entity);
-
-            for warning in &warnings {
-                total_warnings += 1;
-                let code = warning_code(warning).to_string();
-                *warnings_by_code.entry(code.clone()).or_default() += 1;
-
-                // Collect samples (up to 5 per code)
-                let code_count = sample_warnings.iter().filter(|w| w.code == code).count();
-                if code_count < 5 {
-                    sample_warnings.push(SampleWarning {
-                        entity_name: name.clone(),
-                        code,
-                        message: format!("{warning:?}"),
-                    });
-                }
-            }
-        }
-    }
-
-    ConsistencyAnalysis {
-        total_warnings,
-        entities_with_warnings,
-        warnings_by_code,
-        sample_warnings,
-    }
-}
-
 fn find_interesting_entities(output: &IngestionOutput) -> Vec<InterestingEntity> {
     let mut interesting = Vec::new();
 
@@ -364,25 +307,6 @@ fn find_interesting_entities(output: &IngestionOutput) -> Vec<InterestingEntity>
                     break 'outer;
                 }
             }
-        }
-
-        // Entities with consistency warnings
-        let warnings = entity.check_consistency();
-        if !warnings.is_empty() && interesting.len() < 50 {
-            interesting.push(InterestingEntity {
-                reason: "Has consistency warnings".to_string(),
-                name: name.clone(),
-                wikidata_id: wikidata_id.clone(),
-                entity_index: *entity_key,
-                details: serde_json::json!({
-                    "warnings": warnings.iter()
-                        .map(|w| serde_json::json!({
-                            "code": warning_code(w),
-                            "message": format!("{w:?}")
-                        }))
-                        .collect::<Vec<_>>()
-                }),
-            });
         }
 
         // Cap total interesting entities
@@ -501,16 +425,6 @@ fn get_date_precision(date: &UncertainDate) -> String {
     match bound {
         Some(b) => format!("{:?}", b.precision()),
         None => "Unknown".to_string(),
-    }
-}
-
-fn warning_code(w: &ConsistencyWarning) -> &'static str {
-    match w {
-        ConsistencyWarning::CompletionBeforeStart { .. } => "CompletionBeforeStart",
-        ConsistencyWarning::EventsOutOfOrder { .. } => "EventsOutOfOrder",
-        ConsistencyWarning::EventAfterDemolished { .. } => "EventAfterDemolished",
-        ConsistencyWarning::MultipleConstructions { .. } => "MultipleConstructions",
-        ConsistencyWarning::NameValidityInverted { .. } => "NameValidityInverted",
     }
 }
 

@@ -37,7 +37,6 @@ const _: () = assert!(
 pub mod algebra;
 pub mod annotation;
 pub mod claimed;
-pub mod consistency;
 pub mod date;
 pub mod entity;
 pub mod evidence;
@@ -55,7 +54,6 @@ pub use algebra::lattice::{BoundedLattice, JoinSemilattice, MeetSemilattice};
 pub use algebra::monoid::CommutativeMonoid;
 pub use annotation::{Annotation, AnnotationKind};
 pub use claimed::Claimed;
-pub use consistency::ConsistencyWarning;
 pub use date::{DateBound, DateError, DatePrecision, UncertainDate};
 pub use entity::{
     DamageCause, Entity, EntityName, EntityRelation, EntityRelationType, EntityTransition,
