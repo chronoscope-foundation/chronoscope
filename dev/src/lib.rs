@@ -31,8 +31,32 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 mod factstore;
+mod image_resolve;
 
 pub use factstore::{LoadError, load_curated_fact_store};
+pub use image_resolve::{ImageResolveMode, resolve_fact_store_images};
+
+/// The pixel dimension of the shared placeholder JPEG — an 8x8 solid-copper tile.
+const PLACEHOLDER_DIM: u32 = 8;
+
+/// Encode the shared placeholder image: a small solid-copper JPEG. One image
+/// stands in for every fact-store image under [`ImageResolveMode::Placeholder`]
+/// and for every seeded research-URL thumbnail, so both paths draw from this
+/// single encoder and can't drift.
+fn placeholder_jpeg() -> Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    use image::ImageEncoder;
+
+    let rgb_data: Vec<u8> =
+        [0x8Bu8, 0x5E, 0x3C].repeat((PLACEHOLDER_DIM * PLACEHOLDER_DIM) as usize);
+    let mut jpeg_buf = std::io::Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new(&mut jpeg_buf).write_image(
+        &rgb_data,
+        PLACEHOLDER_DIM,
+        PLACEHOLDER_DIM,
+        image::ExtendedColorType::Rgb8,
+    )?;
+    Ok(bytes::Bytes::from(jpeg_buf.into_inner()))
+}
 
 /// Error type for dev server setup.
 #[derive(Debug, thiserror::Error)]
@@ -91,20 +115,10 @@ impl RunningDevServer {
     ///
     /// Returns the number of media items created.
     pub async fn seed_test_media(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        use image::ImageEncoder;
         use sha2::{Digest, Sha256};
 
-        // Generate a small placeholder JPEG (8x8 solid copper).
-        let (w, h) = (8u32, 8u32);
-        let rgb_data: Vec<u8> = [0x8Bu8, 0x5E, 0x3C].repeat((w * h) as usize);
-        let mut jpeg_buf = std::io::Cursor::new(Vec::new());
-        image::codecs::jpeg::JpegEncoder::new(&mut jpeg_buf).write_image(
-            &rgb_data,
-            w,
-            h,
-            image::ExtendedColorType::Rgb8,
-        )?;
-        let jpeg_bytes = bytes::Bytes::from(jpeg_buf.into_inner());
+        let (w, h) = (PLACEHOLDER_DIM, PLACEHOLDER_DIM);
+        let jpeg_bytes = placeholder_jpeg()?;
 
         // Find all unresolved research URLs that have annotations.
         // URLs may be 'pending' or 'processing' (workers can claim them
@@ -212,6 +226,13 @@ pub struct DevServerConfig {
 
     /// Base URL for CDN/media assets (e.g., ngrok URL or localhost)
     pub cdn_base_url: String,
+
+    /// How to resolve fact-store images into the media store at startup.
+    /// [`ImageResolveMode::Placeholder`] gives browser tests deterministic,
+    /// same-origin images (CORS-safe canvas draws, no network);
+    /// [`ImageResolveMode::Fetch`] downloads the real Commons originals for
+    /// interactive `web-dev` / ngrok runs.
+    pub image_resolve: ImageResolveMode,
 
     /// Optional: RP ID for WebAuthn (defaults to "localhost")
     pub rp_id: Option<String>,
@@ -535,6 +556,20 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         None => MemoryFactStore::new(),
     };
 
+    // Resolve every fact-store image into the media store, so the read path
+    // serves thumbnails and detail images from our own `/media/{key}` rather
+    // than pointing browsers at upstream Commons.
+    let image_media = Arc::new(
+        resolve_fact_store_images(
+            &facts,
+            &media_store,
+            &config.http_client,
+            config.image_resolve,
+        )
+        .await,
+    );
+    info!(log, "Resolved fact-store images"; "count" => image_media.len());
+
     // Create AppState with our shared database, media store, and fact store
     let media_store_for_server = media_store.clone();
     let app_state = AppState::new(
@@ -544,6 +579,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         config.dns_resolver,
         media_store,
         facts,
+        image_media,
     )
     .await
     .map_err(|e| format!("Failed to create app state: {e}"))?;

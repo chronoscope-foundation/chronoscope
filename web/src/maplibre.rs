@@ -110,11 +110,6 @@ extern "C" {
     #[wasm_bindgen(method, js_name = flyTo)]
     pub fn fly_to(this: &Map, options: &JsValue);
 
-    /// Fit the map to a bounding box with optional padding.
-    /// `bounds` is `[[west, south], [east, north]]`.
-    #[wasm_bindgen(method, js_name = fitBounds)]
-    pub fn fit_bounds(this: &Map, bounds: &JsValue, options: &JsValue);
-
     /// Set state on a feature. The feature is identified by `{source, id}`.
     /// State is merged (not replaced) on each call. Used for selection
     /// highlighting without rebuilding the entire GeoJSON.

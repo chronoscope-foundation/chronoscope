@@ -13,12 +13,14 @@ use std::pin::Pin;
 use futures_util::FutureExt;
 use futures_util::stream::{self, Stream};
 
+use chronoscope_core::facts::memory::MemoryEntityId;
+
 use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-use crate::entities::{EntityResponse, EntitySummary};
-use crate::ids::{Email, EntityId, ResearchUrlId};
+use crate::entities::EntityDetail;
+use crate::ids::{Email, ResearchUrlId};
 use crate::pagination::{PageToken, ResultsPage};
 use crate::types::Bbox;
 use crate::users::{UpdateUserRequest, UserResponse};
@@ -26,17 +28,6 @@ use crate::webauthn_types::{
     CredentialCreationOptions, CredentialRequestOptions, PublicKeyCredentialAssertion,
     PublicKeyCredentialAttestation,
 };
-
-// Conditional `Send` bound for pagination return types. See `define_paginate!`
-// below for a detailed explanation of why this is needed.
-#[cfg(not(target_arch = "wasm32"))]
-macro_rules! maybe_send {
-    ($lt:lifetime, $T:ty) => { Pin<Box<dyn Stream<Item = Result<$T, ApiError>> + Send + $lt>> };
-}
-#[cfg(target_arch = "wasm32")]
-macro_rules! maybe_send {
-    ($lt:lifetime, $T:ty) => { Pin<Box<dyn Stream<Item = Result<$T, ApiError>> + $lt>> };
-}
 
 // ==================== Error ====================
 
@@ -111,43 +102,17 @@ impl Client {
 
     // ==================== Entity endpoints (public) ====================
 
-    /// Stream entities within a geographic bounding box, one item at a time.
-    ///
-    /// `page_size` controls how many items are fetched per HTTP request.
-    pub fn list_entities_pages(
-        &self,
-        bbox: &Bbox,
-        page_size: u32,
-    ) -> maybe_send!('_, EntitySummary) {
-        let first_url = format!(
-            "{}/entities?min_lat={}&max_lat={}&min_lon={}&max_lon={}&limit={page_size}",
-            self.base_url,
-            bbox.min_lat(),
-            bbox.max_lat(),
-            bbox.min_lon(),
-            bbox.max_lon(),
-        );
-        let base_url = self.base_url.clone();
-        paginate(move |page_token| {
-            let url = match page_token {
-                None => first_url.clone(),
-                Some(token) => {
-                    format!("{base_url}/entities?page_token={token}&limit={page_size}")
-                }
-            };
-            let client = self.clone();
-            async move { client.get_json(&url).await }
-        })
-    }
-
-    /// Fetch a single entity by ID.
-    pub async fn get_entity(&self, id: &EntityId) -> Result<EntityResponse, ApiError> {
-        let url = format!("{}/entities/{}", self.base_url, id);
+    /// Fetch a single entity by ID, with its resolved detail image grid.
+    pub async fn get_entity(&self, id: &MemoryEntityId) -> Result<EntityDetail, ApiError> {
+        // `MemoryEntityId`'s `Display` renders the debug form `entity-{n}`;
+        // the URL path segment must be the bare wire integer the server's
+        // path deserializer expects.
+        let url = format!("{}/entities/{}", self.base_url, id.0);
         self.get_json(&url).await
     }
 
-    /// Fetch map markers for a bounding box. The server decides whether to
-    /// return individual entities or region clusters based on data density.
+    /// Fetch map markers for a bounding box. Co-located entities (same point)
+    /// collapse into one disambiguation marker.
     pub async fn list_markers(&self, bbox: &Bbox) -> Result<crate::MarkersResponse, ApiError> {
         let url = format!(
             "{}/markers?min_lat={}&max_lat={}&min_lon={}&max_lon={}",

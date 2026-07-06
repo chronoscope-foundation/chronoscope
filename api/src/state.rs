@@ -1,9 +1,9 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-#[cfg(feature = "embedded-media")]
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chronoscope_core::facts::memory::MemoryFactStore;
+use chronoscope_core::facts::memory::{MemoryFactStore, MemoryImageId};
 use chronoscope_db::Database;
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::MediaStore;
@@ -102,6 +102,18 @@ impl Config {
     }
 }
 
+/// The media-store keys a fact-store image resolved to: the full-resolution
+/// original and its JPEG thumbnail. Both are served from our own host via
+/// `GET /media/{key}`, so the read path builds `display_url`/`thumbnail_url`
+/// with [`crate::cdn::full_url`] over these keys rather than pointing the
+/// browser at the upstream source. Built at startup (see the `dev` crate's
+/// resolver) and shared read-only through [`AppState::image_media`].
+#[derive(Debug, Clone)]
+pub struct ResolvedImageMedia {
+    pub storage_key: String,
+    pub thumbnail_key: String,
+}
+
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("Invalid bind address: {0}")]
@@ -174,6 +186,10 @@ pub struct AppState {
     pub media_store: Arc<dyn MediaStore>,
     /// In-memory fact store of submitted entity and image facts.
     pub facts: MemoryFactStore,
+    /// Resolved media keys for every fact-store image, keyed by image id. The
+    /// entity read path serves thumbnails and detail images from these keys; an
+    /// image absent from the map is unresolved and contributes no thumbnail/tile.
+    pub image_media: Arc<HashMap<MemoryImageId, ResolvedImageMedia>>,
 }
 
 impl AppState {
@@ -189,6 +205,7 @@ impl AppState {
         dns_resolver: Box<dyn DnsResolver>,
         #[cfg(feature = "embedded-media")] media_store: Arc<dyn MediaStore>,
         facts: MemoryFactStore,
+        image_media: Arc<HashMap<MemoryImageId, ResolvedImageMedia>>,
     ) -> Result<Self, AppStateError> {
         let rp_origin = Url::parse(&config.rp_origin)
             .map_err(|e| AppStateError::InvalidOrigin(format!("{e}")))?;
@@ -208,6 +225,7 @@ impl AppState {
             #[cfg(feature = "embedded-media")]
             media_store,
             facts,
+            image_media,
         })
     }
 }

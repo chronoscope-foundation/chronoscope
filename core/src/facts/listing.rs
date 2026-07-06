@@ -19,6 +19,8 @@ use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::claimed::Claimed;
+use crate::facts::depiction::Perspective;
 use crate::facts::ids::FactId;
 use crate::facts::projection::{member_lineage, project_entity};
 use crate::facts::schema::EntityStream;
@@ -34,6 +36,34 @@ pub fn extract_point<EntId: Ord, EvtId, ImgId>(
     entity: &typed::Entity<EntId, EvtId, ImgId>,
 ) -> Option<GeoPoint> {
     entity.location.possible.point().cloned()
+}
+
+/// The image whose thumbnail represents this entity on the map: the first
+/// depiction classified `Exterior`, else the first depiction, `None` when the
+/// entity has none. Exterior is read off the depiction's own perspective —
+/// cheap — so the marker listing settles on a representative without
+/// re-projecting the image.
+fn representative_image<EntId, EvtId, ImgId>(
+    entity: &typed::Entity<EntId, EvtId, ImgId>,
+) -> Option<ImgId>
+where
+    EntId: Ord,
+    ImgId: Clone,
+{
+    entity
+        .depictions
+        .iter()
+        .find(|d| is_exterior(&d.perspective))
+        .or_else(|| entity.depictions.first())
+        .map(|d| d.other.clone())
+}
+
+/// Whether a depiction's perspective settled to `Exterior`.
+fn is_exterior<ImgId>(perspective: &typed::Bounded<Claimed<Perspective>, ImgId>) -> bool {
+    perspective
+        .settled()
+        .map(|p| *p == Perspective::Exterior)
+        .unwrap_or(false)
 }
 
 /// One placeable entity in a viewport: its id, names, current marker, and the
@@ -52,6 +82,10 @@ pub struct EntitySummary<EntId, ImgId> {
     /// The latest upper date bound across the timeline, or `None` when the
     /// entity is undated.
     pub latest: Option<NaiveDate>,
+    /// The image whose thumbnail stands in for this entity on the map, or
+    /// `None` when the entity has no depiction. The marker read path resolves
+    /// it to a URL; see [`representative_image`].
+    pub thumbnail: Option<ImgId>,
 }
 
 /// A resume token for [`summaries_in_bbox`]: the snapshot it was minted against
@@ -135,21 +169,28 @@ where
             }
             last_rep = Some(row.representative.clone());
 
-            let (class, projected) =
+            // A representative surfaced by the walk was named by the fact that
+            // placed it, so it always projects; skip a `None` rather than panic.
+            let Some((class, projected)) =
                 project_entity::<S, V, _>(view, row.representative.clone(), member_lineage)
                     .await
-                    .map_err(ListError::Backend)?;
+                    .map_err(ListError::Backend)?
+            else {
+                continue;
+            };
             let entity = typed::Entity::parse(&projected, &class);
             if let Some(point) = extract_point(&entity)
                 && bbox.contains(&point)
             {
                 let (earliest, latest) = timeline_span(&entity.timeline);
+                let thumbnail = representative_image(&entity);
                 summaries.push(EntitySummary {
                     id: entity.id,
                     names: entity.names,
                     point,
                     earliest,
                     latest,
+                    thumbnail,
                 });
             }
         }

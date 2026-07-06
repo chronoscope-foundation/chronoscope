@@ -10,6 +10,8 @@ use serde_json::json;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+use chronoscope_core::facts::memory::MemoryEntityId;
+
 use crate::api;
 use crate::maplibre;
 
@@ -138,10 +140,19 @@ const THUMBNAIL_SIZE: u32 = 96;
 /// What the user has selected on the map.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntitySelection {
-    /// A single entity — show detail panel directly.
-    /// The optional second field carries the previous `Multiple` entries
-    /// so the user can navigate back to the disambiguation list.
-    Single(String, Option<Vec<EntityPickerEntry>>),
+    /// A single entity's detail.
+    Single {
+        /// The entity whose detail panel to show.
+        detail: MemoryEntityId,
+        /// The marker to highlight — its co-located group's representative.
+        /// Equals `detail` for a plain marker click; differs when a
+        /// non-representative member of a disambiguation group is picked,
+        /// since map features are keyed on the representative's id.
+        feature: MemoryEntityId,
+        /// The co-located group to return to, when this came from a
+        /// disambiguation pick.
+        back: Option<Vec<EntityPickerEntry>>,
+    },
     /// Multiple co-located entities — show disambiguation list.
     Multiple(Vec<EntityPickerEntry>),
 }
@@ -149,12 +160,14 @@ pub enum EntitySelection {
 /// Re-export the picker entry type from the API client.
 pub use chronoscope_api_client::EntityPickerEntry;
 
-/// A map marker — the map component's uniform view of anything rendered
-/// on the map. The server decides whether to return individual entities or
-/// region clusters; the map just renders markers with positions, labels,
-/// counts, thumbnails, and click actions.
+/// A map marker — the map component's uniform view of every entity rendered
+/// on the map. No region clustering — every marker is either a single entity
+/// or a co-located disambiguation group, optionally carrying a thumbnail.
 #[derive(Clone, Debug)]
 struct MapMarker {
+    /// String form of the representative entity's numeric id — the stable
+    /// key MapLibre uses for the GeoJSON feature (`promoteId`) and for
+    /// selection-state tracking.
     id: String,
     /// Geographic position as `(latitude, longitude)`.
     position: (f64, f64),
@@ -210,20 +223,14 @@ fn build_markers_geojson(markers: &[MapMarker]) -> Option<JsValue> {
                 props.insert("name".into(), label.clone().into());
             }
 
+            // Every marker is an entity marker (no clusters) — "kind" stays
+            // a fixed property rather than derived from `click_action`.
+            props.insert("kind".into(), "entity".into());
             match &marker.click_action {
                 api::ClickAction::Select { entity_id } => {
-                    props.insert("kind".into(), "entity".into());
-                    props.insert("id".into(), entity_id.to_string().into());
-                }
-                api::ClickAction::ZoomTo { bbox } => {
-                    props.insert("kind".into(), "cluster".into());
-                    props.insert("bbox_min_lat".into(), bbox.min_lat().into());
-                    props.insert("bbox_max_lat".into(), bbox.max_lat().into());
-                    props.insert("bbox_min_lon".into(), bbox.min_lon().into());
-                    props.insert("bbox_max_lon".into(), bbox.max_lon().into());
+                    props.insert("id".into(), entity_id.0.into());
                 }
                 api::ClickAction::Disambiguate { entries } => {
-                    props.insert("kind".into(), "entity".into());
                     if let Ok(json) = serde_json::to_string(entries) {
                         props.insert("group".into(), json.into());
                     }
@@ -328,9 +335,6 @@ fn init_source_and_layers(map: &maplibre::Map) {
 
     // Symbol layer for marker labels — added BEFORE thumbnails so thumbnails
     // render on top and aren't occluded by neighboring labels.
-    // - Co-located entity groups show the count.
-    // - Clusters show the region name and count.
-    // - Single entities show no label (the thumbnail or circle is enough).
     // Read label styling from the basemap's city label layer so our markers
     // match the basemap visually, regardless of which style is loaded.
     let basemap = "label_city";
@@ -494,7 +498,7 @@ async fn load_entities_for_viewport(
                 .filter_map(|m| {
                     m.thumbnail_url
                         .as_ref()
-                        .map(|url| (m.id.to_string(), url.clone()))
+                        .map(|url| (m.id.0.to_string(), url.clone()))
                 })
                 .collect();
 
@@ -506,7 +510,7 @@ async fn load_entities_for_viewport(
                 .map(|m| {
                     let has_thumbnail = m.thumbnail_url.is_some();
                     MapMarker {
-                        id: m.id.to_string(),
+                        id: m.id.0.to_string(),
                         position: (m.latitude, m.longitude),
                         label: m.label,
                         click_action: m.click_action,
@@ -639,11 +643,6 @@ const DOT_RADIUS: f64 = 7.0;
 /// Vertical gap between the thumbnail circle and the location dot.
 const STEM_LENGTH: f64 = 8.0;
 
-/// Draw a thumbnail "pin": a circular photo on top, a short stem, and a small
-/// dot at the bottom marking the actual geographic location.
-///
-/// The canvas is sized so the dot sits at the bottom center — use
-/// `icon-anchor: "bottom"` in MapLibre so the dot aligns with the coordinate.
 /// Get the device pixel ratio, defaulting to 1.0 if unavailable.
 fn device_pixel_ratio() -> f64 {
     web_sys::window()
@@ -651,6 +650,11 @@ fn device_pixel_ratio() -> f64 {
         .unwrap_or(1.0)
 }
 
+/// Draw a thumbnail "pin": a circular photo on top, a short stem, and a small
+/// dot at the bottom marking the actual geographic location.
+///
+/// The canvas is sized so the dot sits at the bottom center — use
+/// `icon-anchor: "bottom"` in MapLibre so the dot aligns with the coordinate.
 fn draw_circular_thumbnail(
     img: &web_sys::HtmlImageElement,
     dpr: f64,
@@ -802,59 +806,35 @@ async fn load_image(url: &str) -> Result<web_sys::HtmlImageElement, String> {
 /// What a click on a marker resolves to.
 ///
 /// Parsed from the flat GeoJSON feature properties (set in
-/// `build_markers_geojson`) into a proper discriminated type.
+/// `build_markers_geojson`) into a proper discriminated type. No cluster
+/// variant — text-only slice, no region clustering.
 enum ClickTarget {
-    /// Zoom to a region bounding box (cluster click).
-    ZoomTo {
-        bbox_min_lat: f64,
-        bbox_max_lat: f64,
-        bbox_min_lon: f64,
-        bbox_max_lon: f64,
-    },
     /// Select a single entity.
-    Select(String),
+    Select(MemoryEntityId),
     /// Disambiguate co-located entities.
     Disambiguate(Vec<EntityPickerEntry>),
 }
 
 /// Raw deserialization target for GeoJSON feature properties.
 /// Immediately converted to [`ClickTarget`] — never used directly.
+/// `id` deserializes straight from the numeric `id` property
+/// (`MemoryEntityId` is `#[serde(transparent)]` over `u64`).
 #[derive(serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum RawMarkerProps {
-    Entity {
-        id: Option<String>,
-        group: Option<String>,
-    },
-    Cluster {
-        bbox_min_lat: f64,
-        bbox_max_lat: f64,
-        bbox_min_lon: f64,
-        bbox_max_lon: f64,
-    },
+struct RawMarkerProps {
+    id: Option<MemoryEntityId>,
+    group: Option<String>,
 }
 
 impl RawMarkerProps {
     fn into_click_target(self) -> Option<ClickTarget> {
         match self {
-            Self::Cluster {
-                bbox_min_lat,
-                bbox_max_lat,
-                bbox_min_lon,
-                bbox_max_lon,
-            } => Some(ClickTarget::ZoomTo {
-                bbox_min_lat,
-                bbox_max_lat,
-                bbox_min_lon,
-                bbox_max_lon,
-            }),
-            Self::Entity {
+            Self {
                 group: Some(json), ..
             } => serde_json::from_str::<Vec<EntityPickerEntry>>(&json)
                 .ok()
                 .map(ClickTarget::Disambiguate),
-            Self::Entity { id: Some(id), .. } => Some(ClickTarget::Select(id)),
-            Self::Entity {
+            Self { id: Some(id), .. } => Some(ClickTarget::Select(id)),
+            Self {
                 id: None,
                 group: None,
             } => None,
@@ -862,12 +842,9 @@ impl RawMarkerProps {
     }
 }
 
-/// Handle a click on a marker (entity or cluster), dispatching on `kind`.
-fn handle_marker_click(
-    event: JsValue,
-    map: &maplibre::Map,
-    set_selected: WriteSignal<Option<EntitySelection>>,
-) {
+/// Handle a click on an entity marker, dispatching on whether it resolves
+/// to a single entity or a co-located disambiguation group.
+fn handle_marker_click(event: JsValue, set_selected: WriteSignal<Option<EntitySelection>>) {
     let features = js_sys::Reflect::get(&event, &"features".into()).ok();
     let features = features.and_then(|f| f.dyn_into::<js_sys::Array>().ok());
     let Some(features) = features else { return };
@@ -892,28 +869,12 @@ fn handle_marker_click(
     };
 
     match target {
-        ClickTarget::ZoomTo {
-            bbox_min_lat,
-            bbox_max_lat,
-            bbox_min_lon,
-            bbox_max_lon,
-        } => {
-            let sw = js_sys::Array::new();
-            sw.push(&bbox_min_lon.into());
-            sw.push(&bbox_min_lat.into());
-            let ne = js_sys::Array::new();
-            ne.push(&bbox_max_lon.into());
-            ne.push(&bbox_max_lat.into());
-            let bounds = js_sys::Array::new();
-            bounds.push(&sw);
-            bounds.push(&ne);
-
-            let opts = js_sys::Object::new();
-            let _ = js_sys::Reflect::set(&opts, &"padding".into(), &50.into());
-            map.fit_bounds(&bounds, &opts);
-        }
         ClickTarget::Select(id) => {
-            set_selected.set(Some(EntitySelection::Single(id, None)));
+            set_selected.set(Some(EntitySelection::Single {
+                detail: id,
+                feature: id,
+                back: None,
+            }));
         }
         ClickTarget::Disambiguate(entries) => {
             set_selected.set(Some(EntitySelection::Multiple(entries)));
@@ -962,9 +923,8 @@ fn register_marker_layer(
     set_selected: WriteSignal<Option<EntitySelection>>,
     closures: &mut Vec<Box<dyn std::any::Any>>,
 ) {
-    let map_for_click = map.clone();
     let click_cb = Closure::<dyn Fn(JsValue)>::new(move |event: JsValue| {
-        handle_marker_click(event, &map_for_click, set_selected);
+        handle_marker_click(event, set_selected);
     });
     map.on_layer("click", layer, click_cb.as_ref());
     closures.push(Box::new(click_cb));
@@ -1282,8 +1242,13 @@ fn effect_selection(
     let prev_id: Rc<Cell<Option<String>>> = Rc::new(Cell::new(None));
 
     Effect::new(move || {
+        // Feature ids are the marker's numeric-string form (see
+        // `MapMarker::id` / `build_markers_geojson`), not `MemoryEntityId`'s
+        // debug-shaped `Display`. Highlight the marker the selection belongs
+        // to — its representative `feature` id — which for a disambiguation
+        // pick differs from the picked member's detail id.
         let new_id = match signals.selected.get() {
-            Some(EntitySelection::Single(id, _)) => Some(id),
+            Some(EntitySelection::Single { feature, .. }) => Some(feature.0.to_string()),
             _ => None,
         };
 

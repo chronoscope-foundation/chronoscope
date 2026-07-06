@@ -19,7 +19,9 @@ use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverridePar
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
 use chromiumoxide::page::ScreenshotParams;
-use chronoscope_dev::{DevServerConfig, RunningDevServer, find_available_port, start_dev_server};
+use chronoscope_dev::{
+    DevServerConfig, ImageResolveMode, RunningDevServer, find_available_port, start_dev_server,
+};
 use chronoscope_workers::RetryConfig;
 use dropshot::ConfigLogging;
 use futures::StreamExt;
@@ -287,6 +289,8 @@ impl WebTest {
             log,
             port,
             cdn_base_url: base_url.clone(),
+            // Browser thumbnail tests need deterministic, same-origin images.
+            image_resolve: ImageResolveMode::Placeholder,
             rp_id: None,
             rp_origin: None,
             ios_app_id: None,
@@ -610,7 +614,6 @@ impl WebTest {
         pub query map_cursor() -> String;
         pub query marker_properties() -> Vec<serde_json::Value>;
         pub query layer_order() -> Vec<String>;
-        pub query zoom() -> f64;
 
         // Actions (public). The raw `jump_to`/`fire_map_click` primitives
         // aren't exposed — tests use `pan_map_to` / `click_map_at`, which
@@ -625,12 +628,8 @@ impl WebTest {
         pub wait pan_map_to(lng: f64, lat: f64, zoom: f64);
         pub wait click_and_wait_for_fetch(selector: &str);
 
-        // Internal: consumed only by bespoke composers below.
-        // `get_center` returns a Vec<f64>; the bespoke `center()` unpacks
-        // it into a `(f64, f64)` tuple. The counter family is invoked via
-        // `fetch_around` / `goto_map_with_thumbnails`.
-        pub query get_center() -> Vec<f64>;
-        pub query current_fetch_settled() -> f64;
+        // Internal: the thumbnails-loaded counter is consumed only by the
+        // bespoke `goto_map_with_thumbnails` composer below.
         pub query current_thumbnails_loaded() -> f64;
         pub wait wait_for_fetch_settled_after(prev: f64);
         pub wait wait_for_thumbnails_loaded_after(prev: f64);
@@ -648,32 +647,6 @@ impl WebTest {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let n: f64 = self.call_hook("thumbnail_marker_count", &[]).await?;
         Ok(n as usize)
-    }
-
-    /// Map center as (lng, lat). The hook returns the pair as a `Vec<f64>`
-    /// for FFI simplicity; this wrapper unpacks to a typed tuple.
-    pub async fn center(&self) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
-        let arr = self.get_center().await?;
-        if arr.len() != 2 {
-            return Err(format!("expected [lng, lat], got {arr:?}").into());
-        }
-        Ok((arr[0], arr[1]))
-    }
-
-    /// Run `action` between sampling the fetch-settled counter and awaiting
-    /// the next settle event. Closes the listener-attach race (the early
-    /// return in `wait_for_fetch_settled_after` covers any settle that lands
-    /// between the sample and the await). Used by tests that need to compose
-    /// a dynamic action (closure) with the fetch-settle wait — for the fixed
-    /// `pan` and `click+fetch` patterns, see `pan_map_to` and
-    /// `click_and_wait_for_fetch` which are baked WASM-side.
-    pub async fn fetch_around<F>(&self, action: F) -> TestResult
-    where
-        F: AsyncFnOnce(&Self) -> TestResult,
-    {
-        let prev = self.current_fetch_settled().await?;
-        action(self).await?;
-        self.wait_for_fetch_settled_after(prev).await
     }
 
     /// Navigate to the map page, drain the mount fetch, then pan.

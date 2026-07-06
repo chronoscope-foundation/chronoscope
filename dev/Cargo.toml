@@ -86,6 +86,13 @@ serde_json.workspace = true
 # API client (typed Client/AuthClient for integration tests)
 chronoscope-api-client = { path = "../api-client" }
 
+# MockHttpClient for the fetch-retry unit test (deterministic, no network)
+chronoscope-integrations = { path = "../integrations", features = ["testing"] }
+
+# `test-util` powers `#[tokio::test(start_paused)]`, so the retry backoff waits
+# advance in virtual time instead of really sleeping.
+tokio = { workspace = true, features = ["test-util"] }
+
 # Test builds want `Database::worker_progress`. Cargo unions this with the
 # regular dep above so the feature only applies to test targets.
 chronoscope-db = { path = "../db", features = ["test-support"] }

@@ -4,6 +4,7 @@
 //! using the `SoftPasskey` authenticator.
 
 mod auth;
+mod entities;
 #[cfg(feature = "embedded-media")]
 mod media;
 mod research;
@@ -18,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chronoscope_api_client::client::{ApiError, AuthClient};
-use chronoscope_core::facts::memory::MemoryFactStore;
+use chronoscope_core::facts::memory::{MemoryFactStore, MemoryImageId};
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{
@@ -43,7 +44,7 @@ use crate::auth::{
 use crate::jwt::JwtConfig;
 use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
 use crate::research_types::{FollowedUrlSummary, ResearchUrlDossier, ResearchUrlSummary};
-use crate::state::{AppState, Config, DnsResolver, SAFE_PUBLIC_IP};
+use crate::state::{AppState, Config, DnsResolver, ResolvedImageMedia, SAFE_PUBLIC_IP};
 
 // ==================== Test Utilities ====================
 
@@ -141,7 +142,15 @@ impl TestContext {
     async fn with_media_store()
     -> Result<(Self, Arc<InMemoryMediaStore>), Box<dyn std::error::Error + Send + Sync>> {
         let media_store = Arc::new(InMemoryMediaStore::new());
-        let ctx = Self::with_options_and_media(None, None, None, Some(media_store.clone())).await?;
+        let ctx = Self::with_options_and_media(
+            None,
+            None,
+            None,
+            Some(media_store.clone()),
+            MemoryFactStore::new(),
+            Arc::new(HashMap::new()),
+        )
+        .await?;
         Ok((ctx, media_store))
     }
 
@@ -150,10 +159,42 @@ impl TestContext {
         jwt_config: Option<JwtConfig>,
         dns_resolver: Option<TestResolver>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let facts = MemoryFactStore::new();
+        let image_media = Arc::new(HashMap::new());
         #[cfg(feature = "embedded-media")]
-        return Self::with_options_and_media(ios_app_id, jwt_config, dns_resolver, None).await;
+        return Self::with_options_and_media(
+            ios_app_id,
+            jwt_config,
+            dns_resolver,
+            None,
+            facts,
+            image_media,
+        )
+        .await;
         #[cfg(not(feature = "embedded-media"))]
-        return Self::with_options_and_media(ios_app_id, jwt_config, dns_resolver).await;
+        return Self::with_options_and_media(
+            ios_app_id,
+            jwt_config,
+            dns_resolver,
+            facts,
+            image_media,
+        )
+        .await;
+    }
+
+    /// Build a context around a pre-populated fact store and its resolved image
+    /// media map. Image-resolution tests commit their facts (and mint image ids)
+    /// before the server exists, then hand the store and a matching media map in
+    /// — mirroring the startup path where images resolve before `AppState`.
+    async fn with_facts_and_image_media(
+        facts: MemoryFactStore,
+        image_media: HashMap<MemoryImageId, ResolvedImageMedia>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let image_media = Arc::new(image_media);
+        #[cfg(feature = "embedded-media")]
+        return Self::with_options_and_media(None, None, None, None, facts, image_media).await;
+        #[cfg(not(feature = "embedded-media"))]
+        return Self::with_options_and_media(None, None, None, facts, image_media).await;
     }
 
     async fn with_options_and_media(
@@ -161,6 +202,8 @@ impl TestContext {
         jwt_config: Option<JwtConfig>,
         dns_resolver: Option<TestResolver>,
         #[cfg(feature = "embedded-media")] media_store: Option<Arc<InMemoryMediaStore>>,
+        facts: MemoryFactStore,
+        image_media: Arc<HashMap<MemoryImageId, ResolvedImageMedia>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = jwt_config.unwrap_or_else(|| {
             JwtConfig::new(
@@ -197,13 +240,14 @@ impl TestContext {
                 jwt,
                 Box::new(resolver),
                 store,
-                MemoryFactStore::new(),
+                facts,
+                image_media,
             )
             .await?
         };
         #[cfg(not(feature = "embedded-media"))]
         let app_state =
-            AppState::new(db, config, jwt, Box::new(resolver), MemoryFactStore::new()).await?;
+            AppState::new(db, config, jwt, Box::new(resolver), facts, image_media).await?;
 
         let app_state = Arc::new(app_state);
 

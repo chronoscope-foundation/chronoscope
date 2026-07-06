@@ -1,0 +1,503 @@
+//! Tests for the fact-store-backed entity read endpoints.
+//!
+//! Facts are committed directly against `ctx.app_state.facts` (there's no
+//! write endpoint yet) and then read back over HTTP, exercising the real
+//! Dropshot path/query extraction and JSON wire shapes — including the
+//! `MemoryEntityId` path-param round trip (numeric wire form vs. the
+//! `entity-{n}` `Display` form).
+
+use std::collections::HashMap;
+
+use chrono::{DateTime, TimeZone, Utc};
+
+use chronoscope_api_client::{ClickAction, client::ApiError};
+use chronoscope_core::facts::assertions::{FactualAssertion, JudgmentAssertion};
+use chronoscope_core::facts::attribute::{self, NameText, NameType};
+use chronoscope_core::facts::bookend::ConstructionFact;
+use chronoscope_core::facts::citations::{
+    Excerpt, ExternalSource, FactualCitation, JudgmentSource, Language,
+};
+use chronoscope_core::facts::depiction::{self, Perspective};
+use chronoscope_core::facts::ids::UserId;
+use chronoscope_core::facts::image::{self, ImageMedium};
+use chronoscope_core::facts::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
+use chronoscope_core::facts::submit::{
+    Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact, commit_facts,
+};
+use chronoscope_core::geo::{GeoPoint, Meters};
+use chronoscope_core::location::{Location, UnresolvedLocation};
+
+use super::TestContext;
+use crate::cdn::tests::TEST_CDN_BASE_URL;
+use crate::state::ResolvedImageMedia;
+
+type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+fn fixed_time() -> Result<DateTime<Utc>, &'static str> {
+    Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
+        .single()
+        .ok_or("fixed timestamp is unambiguous")
+}
+
+fn citation(url: &str) -> Result<FactualCitation, Box<dyn std::error::Error + Send + Sync>> {
+    let source = ExternalSource::Url {
+        url: url::Url::parse(url)?,
+        published: None,
+    };
+    Ok(FactualCitation::new(
+        source,
+        vec![Excerpt::new("source-text")?],
+    )?)
+}
+
+fn resolved_point(
+    lat: f64,
+    lon: f64,
+) -> Result<UnresolvedLocation, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(lat, lon)?,
+        Meters(10.0),
+    )?))
+}
+
+/// Commit a fresh single-entity, single-fact-set bundle: one name and one
+/// construction location. Enough to make the entity placeable (for
+/// `/markers` and `/entities`) and nameable (for `get_entity`).
+async fn commit_named_entity_at(
+    facts: &MemoryFactStore,
+    name: &str,
+    lat: f64,
+    lon: f64,
+) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<MemoryIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name {
+                        entity: EntityIdx(0),
+                        name: NameText::new(name),
+                        language: Language::new("en")?,
+                        name_type: NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                },
+                citation: citation("https://example.com/name")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Location {
+                        entity: EntityIdx(0),
+                        location: resolved_point(lat, lon)?,
+                    },
+                },
+                citation: citation("https://example.com/location")?,
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(facts, commit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let id = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity 0 resolved")?
+        .id;
+    Ok(id)
+}
+
+/// Commit a named, placeable entity depicted by one image: an exterior-picture
+/// depiction whose image carries a Commons `Source` URL and a `Picture` medium.
+/// Exercises the image read path (`get_entity` grid, `/markers` thumbnail).
+async fn commit_entity_with_depicted_image(
+    facts: &MemoryFactStore,
+    name: &str,
+    lat: f64,
+    lon: f64,
+    image_source_url: &str,
+) -> Result<(MemoryEntityId, MemoryImageId), Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<MemoryIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name {
+                        entity: EntityIdx(0),
+                        name: NameText::new(name),
+                        language: Language::new("en")?,
+                        name_type: NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                },
+                citation: citation("https://example.com/name")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Location {
+                        entity: EntityIdx(0),
+                        location: resolved_point(lat, lon)?,
+                    },
+                },
+                citation: citation("https://example.com/location")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: image::Fact::Source {
+                        image: ImageIdx(0),
+                        url: url::Url::parse(image_source_url)?,
+                    },
+                },
+                citation: citation("https://commons.wikimedia.org/source")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: image::Fact::Medium {
+                        image: ImageIdx(0),
+                        medium: ImageMedium::Picture,
+                    },
+                },
+                citation: citation("https://commons.wikimedia.org/medium")?,
+            },
+            SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Depiction {
+                    fact: depiction::Fact {
+                        entity: EntityIdx(0),
+                        image: ImageIdx(0),
+                        localization: None,
+                        perspective: Some(Perspective::Exterior),
+                    },
+                },
+                citation: JudgmentSource::External {
+                    source: ExternalSource::Url {
+                        url: url::Url::parse("https://commons.wikimedia.org/depiction")?,
+                        published: None,
+                    },
+                },
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(facts, commit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity_id = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity 0 resolved")?
+        .id;
+    let image_id = result
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("image 0 resolved")?
+        .id;
+    Ok((entity_id, image_id))
+}
+
+// ==================== get_entity ====================
+
+#[tokio::test]
+async fn get_entity_returns_the_typed_projection_for_a_known_id() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Pantheon", 41.8986, 12.4769).await?;
+
+    let detail = ctx.client.get_entity(&id).await?;
+
+    assert_eq!(detail.entity.id, id);
+    assert!(
+        detail.entity.names.iter().any(|n| n.text == "Pantheon"),
+        "expected the committed name to round-trip, got {:?}",
+        detail.entity.names
+    );
+    assert!(
+        detail.images.is_empty(),
+        "an entity with no depiction carries no detail images"
+    );
+    Ok(())
+}
+
+/// Media keys a fact-store image resolves to, mirroring the `dev` resolver's
+/// placeholder layout: single path segments under `media/` so `/media/{key}`
+/// serves them, distinct per image.
+fn resolved_media(image_id: MemoryImageId) -> ResolvedImageMedia {
+    ResolvedImageMedia {
+        storage_key: format!("media/factimg-{}.jpg", image_id.0),
+        thumbnail_key: format!("media/factimg-{}-thumb.jpg", image_id.0),
+    }
+}
+
+#[tokio::test]
+async fn get_entity_resolves_a_depicted_image_into_the_detail_grid() -> TestResult {
+    let facts = MemoryFactStore::new();
+    let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Pantheon.jpg";
+    let (id, image_id) =
+        commit_entity_with_depicted_image(&facts, "Pantheon", 41.8986, 12.4769, src).await?;
+
+    // The depicted image is resolved into media; the read path serves its
+    // original from our own /media/{key}, not from upstream Commons.
+    let media = resolved_media(image_id);
+    let expected_display = format!("{TEST_CDN_BASE_URL}/{}", media.storage_key);
+    let ctx =
+        TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
+
+    let detail = ctx.client.get_entity(&id).await?;
+
+    assert_eq!(detail.entity.id, id);
+    let image = detail.images.first().ok_or("expected one detail image")?;
+    assert_eq!(
+        image.source_url, src,
+        "source_url preserves the real Commons URL for the lightbox link"
+    );
+    assert_eq!(
+        image.display_url, expected_display,
+        "display_url serves the resolved original from our own media host"
+    );
+    assert_eq!(
+        image.label, "Exterior picture",
+        "label combines the exterior perspective and picture medium"
+    );
+    assert!(
+        !image.label.contains("view"),
+        "the web appends ' view' to form the aria-label, so label must not \
+         already contain 'view'"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_skips_a_depiction_whose_image_is_unresolved() -> TestResult {
+    // The image has a Source fact but no entry in the media map — a tile that
+    // can't load is worse than an absent one, so the grid drops it.
+    let facts = MemoryFactStore::new();
+    let src = "https://upload.wikimedia.org/wikipedia/commons/c/c3/Unresolved.jpg";
+    let (id, _image_id) =
+        commit_entity_with_depicted_image(&facts, "Unresolved", 41.9, 12.5, src).await?;
+
+    let ctx = TestContext::with_facts_and_image_media(facts, HashMap::new()).await?;
+
+    let detail = ctx.client.get_entity(&id).await?;
+    assert!(
+        detail.images.is_empty(),
+        "an unresolved depiction contributes no grid tile, got {:?}",
+        detail.images
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_404s_for_an_id_no_fact_ever_named() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // A fresh store mints entity ids from 0; this id was never declared by
+    // any commit, so no fact anywhere mentions it.
+    let unknown = MemoryEntityId(999_999);
+
+    match ctx.client.get_entity(&unknown).await {
+        Ok(entity) => {
+            return Err(format!(
+                "an unnamed id must 404, not project as an empty entity: {entity:?}"
+            )
+            .into());
+        }
+        Err(ApiError::Api { status, .. }) => assert_eq!(status, 404),
+        Err(ApiError::Request(e)) => {
+            return Err(format!("expected an API error, got a transport error: {e}").into());
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_404_carries_cors_headers() -> TestResult {
+    // The web detail panel calls this cross-origin; a 404 without CORS headers
+    // is blocked by the browser, so the panel sees an opaque transport error
+    // instead of a clean "not found".
+    let ctx = TestContext::new().await?;
+    let resp = ctx.get("/entities/999999").await?;
+    assert_eq!(resp.status(), 404, "an unnamed id must 404");
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "the 404 must carry CORS so a cross-origin client can read it"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_path_param_round_trips_the_numeric_wire_form() -> TestResult {
+    // `MemoryEntityId`'s `Display` renders the debug form `entity-{n}`, not
+    // the wire form the path deserializer parses. Hitting the raw HTTP path
+    // with the bare integer (what `Client::get_entity` sends) pins that the
+    // server-side path extraction actually accepts it.
+    let ctx = TestContext::new().await?;
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Bare Numeric Path", 10.0, 10.0).await?;
+
+    let resp = ctx.get(&format!("/entities/{}", id.0)).await?;
+    assert_eq!(
+        resp.status(),
+        200,
+        "a bare numeric path segment must resolve"
+    );
+    Ok(())
+}
+
+// ==================== list_markers ====================
+
+#[tokio::test]
+async fn list_markers_selects_a_lone_entity() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Colosseum", 41.8902, 12.4922).await?;
+
+    let bbox = chronoscope_api_client::Bbox::new(41.8, 42.0, 12.4, 12.6)?;
+    let response = ctx.client.list_markers(&bbox).await?;
+
+    assert_eq!(response.markers.len(), 1, "expected exactly one marker");
+    let marker = &response.markers[0];
+    assert_eq!(marker.id, id);
+    assert_eq!(marker.label.as_deref(), Some("Colosseum"));
+    assert!(
+        marker.thumbnail_url.is_none(),
+        "an entity with no depiction has no marker thumbnail"
+    );
+    match &marker.click_action {
+        ClickAction::Select { entity_id } => assert_eq!(*entity_id, id),
+        other => return Err(format!("expected Select, got {other:?}").into()),
+    }
+    assert!(!response.truncated);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_markers_carries_a_thumbnail_for_a_depicted_entity() -> TestResult {
+    let facts = MemoryFactStore::new();
+    let src = "https://upload.wikimedia.org/wikipedia/commons/b/b2/Colosseum.jpg";
+    let (id, image_id) =
+        commit_entity_with_depicted_image(&facts, "Colosseum", 41.8902, 12.4922, src).await?;
+
+    let media = resolved_media(image_id);
+    let expected_thumb = format!("{TEST_CDN_BASE_URL}/{}", media.thumbnail_key);
+    let ctx =
+        TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
+
+    let bbox = chronoscope_api_client::Bbox::new(41.8, 42.0, 12.4, 12.6)?;
+    let response = ctx.client.list_markers(&bbox).await?;
+
+    let marker = response
+        .markers
+        .iter()
+        .find(|m| m.id == id)
+        .ok_or("expected a marker for the depicted entity")?;
+    assert_eq!(
+        marker.thumbnail_url.as_deref(),
+        Some(expected_thumb.as_str()),
+        "the marker thumbnail serves the resolved image's thumbnail from our media host"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_markers_disambiguates_colocated_entities() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // Two entities declared at the exact same point.
+    let a = commit_named_entity_at(&ctx.app_state.facts, "Old Chapel", 45.2, 12.27).await?;
+    let b = commit_named_entity_at(&ctx.app_state.facts, "New Chapel", 45.2, 12.27).await?;
+
+    let bbox = chronoscope_api_client::Bbox::new(45.0, 45.4, 12.0, 12.5)?;
+    let response = ctx.client.list_markers(&bbox).await?;
+
+    assert_eq!(
+        response.markers.len(),
+        1,
+        "co-located entities collapse into one marker"
+    );
+    match &response.markers[0].click_action {
+        ClickAction::Disambiguate { entries } => {
+            let ids: std::collections::BTreeSet<_> = entries.iter().map(|e| e.id).collect();
+            assert_eq!(ids, [a, b].into_iter().collect());
+        }
+        other => return Err(format!("expected Disambiguate, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_markers_omits_entities_outside_the_bbox() -> TestResult {
+    let ctx = TestContext::new().await?;
+    commit_named_entity_at(&ctx.app_state.facts, "Eiffel Tower", 48.8584, 2.2945).await?;
+
+    // A box nowhere near Paris.
+    let bbox = chronoscope_api_client::Bbox::new(41.8, 42.0, 12.4, 12.6)?;
+    let response = ctx.client.list_markers(&bbox).await?;
+
+    assert!(response.markers.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_markers_accepts_an_antimeridian_bbox() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // An entity just west of the antimeridian.
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Dateline Light", 0.0, 179.5).await?;
+
+    // A box that wraps across the antimeridian: min_lon (170) > max_lon (-170).
+    // The whole path — client Bbox, the server's `request_bbox`, and the core
+    // spatial walk — must accept the wrap rather than 400, and surface the
+    // entity inside it.
+    let bbox = chronoscope_api_client::Bbox::new(-1.0, 1.0, 170.0, -170.0)?;
+    let response = ctx.client.list_markers(&bbox).await?;
+
+    let marker = response
+        .markers
+        .iter()
+        .find(|m| m.id == id)
+        .ok_or("expected the antimeridian entity inside the wrapping box")?;
+    assert_eq!(marker.label.as_deref(), Some("Dateline Light"));
+    Ok(())
+}
+
+// ==================== list_entities ====================
+
+#[tokio::test]
+async fn list_entities_lists_placeable_entities_in_the_bbox() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Duomo", 43.7731, 11.2560).await?;
+
+    let resp = ctx
+        .get("/entities?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3")
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let page: chronoscope_api_client::EntityListPage = resp.json().await?;
+
+    assert!(
+        page.summaries.iter().any(|s| s.id == id),
+        "expected the committed entity in the page, got {:?}",
+        page.summaries.iter().map(|s| s.id).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_entities_rejects_a_page_size_over_the_max() -> TestResult {
+    let ctx = TestContext::new().await?;
+
+    let resp = ctx
+        .get("/entities?min_lat=0&max_lat=1&min_lon=0&max_lon=1&limit=100000")
+        .await?;
+    assert_eq!(resp.status(), 400);
+    Ok(())
+}

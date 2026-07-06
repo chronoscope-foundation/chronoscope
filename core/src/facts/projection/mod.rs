@@ -83,7 +83,7 @@ where
 
 /// Project an entity's `SameEntity` class as an [`Entity`] over the
 /// `provenance` closure's semiring, returning the resolved [`EquivClass`]
-/// beside it.
+/// beside it, or `Ok(None)` when no committed fact ever named the id.
 ///
 /// Resolves the class, drains every member's backlinks (aggregation is
 /// class-level — each source's facts stay on its own id), takes the entity→event
@@ -93,6 +93,12 @@ where
 /// interior event. All reads are snapshot-scoped and active-only, so the
 /// projection carries no retraction logic of its own.
 ///
+/// An id no committed fact names drains to an empty backlink set: the class is a
+/// lone singleton with nothing to fold, so the entity does not exist at this
+/// snapshot and the projection is `Ok(None)`. That is distinct from an `Err`,
+/// which signals a backend failure. A real entity is declared alongside at least
+/// one fact naming it, so "zero contributing facts" is the honest absence signal.
+///
 /// Handing the class back lets a caller thread it straight into the typed
 /// transform, sparing a second `entity_class` read — one resolution covers the
 /// representative, the mention count, and the projection.
@@ -101,10 +107,10 @@ pub async fn project_entity<S, V, T>(
     entity_id: EntityIdOf<S>,
     provenance: impl Fn(&EntityIdOf<S>, &Citation<ImageIdOf<S>>) -> T,
 ) -> Result<
-    (
+    Option<(
         EquivClass<EntityIdOf<S>>,
         Entity<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>, T>,
-    ),
+    )>,
     S::Error,
 >
 where
@@ -122,6 +128,10 @@ where
         view.all_facts_about_entity(m, c, PAGE_SIZE)
     })
     .await?;
+
+    if facts.is_empty() {
+        return Ok(None);
+    }
 
     // Interior event facts key off their event id, never the entity, so the
     // entity drain alone never reaches them. The `HasEvent` facts (in the entity
@@ -141,28 +151,30 @@ where
     );
 
     let entity = merge::project_facts(&facts, &class.members, &reachers, provenance);
-    Ok((class, entity))
+    Ok(Some((class, entity)))
 }
 
 /// Project an image's `SameArtifact` class as an [`Image`] over the
 /// `provenance` closure's semiring, returning the resolved [`EquivClass`]
-/// beside it.
+/// beside it, or `Ok(None)` when no committed fact ever named the id.
 ///
 /// Mirrors [`project_entity`]: resolves the class, drains every member's
 /// backlinks, and folds them per field with the no-winners join. Image-level
 /// facts tag their support against the member image they name; a composite
 /// `IsSubimageOf` edge routes by which end the class holds — the
 /// member-as-subimage records its parent, the member-as-parent records its
-/// subimage. All reads are snapshot-scoped and active-only.
+/// subimage. All reads are snapshot-scoped and active-only. An id no committed
+/// fact names drains to an empty backlink set and projects as `Ok(None)`,
+/// distinct from an `Err` backend failure.
 pub async fn project_image<S, V, T>(
     view: &V,
     image_id: ImageIdOf<S>,
     provenance: impl Fn(&ImageIdOf<S>, &Citation<ImageIdOf<S>>) -> T,
 ) -> Result<
-    (
+    Option<(
         EquivClass<ImageIdOf<S>>,
         Image<EntityIdOf<S>, ImageIdOf<S>, T>,
-    ),
+    )>,
     S::Error,
 >
 where
@@ -179,8 +191,12 @@ where
     })
     .await?;
 
+    if facts.is_empty() {
+        return Ok(None);
+    }
+
     let image = merge::project_image_facts(&facts, &class.members, provenance);
-    Ok((class, image))
+    Ok(Some((class, image)))
 }
 
 #[cfg(test)]

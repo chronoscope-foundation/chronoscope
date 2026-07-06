@@ -5,7 +5,7 @@
 
 use wasm_bindgen::JsCast;
 
-pub use chronoscope_api_client::{ClickAction, Client};
+pub use chronoscope_api_client::{ClickAction, Client, EntityDetail};
 
 // ==================== Runtime Configuration ====================
 

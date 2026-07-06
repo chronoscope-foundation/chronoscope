@@ -32,7 +32,10 @@ use url::Url;
 
 use crate::worker::{ItemResult, Worker};
 
-pub use content::{ContentType, ImageFormat, VideoFormat, content_hash, storage_key};
+pub use content::{
+    ContentType, ImageFormat, StoreImageError, StoredImage, VideoFormat, content_hash,
+    detect_content_type, generate_thumbnail, storage_key, store_image, thumbnail_key,
+};
 pub use fetcher::{FetchContext, FetchError, FetchOutcome, FetchResult, FetcherConfig};
 pub use generic::GenericFetcher;
 

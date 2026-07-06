@@ -20,7 +20,7 @@ use chronoscope_api::state::permissive_dns_resolver;
 use chronoscope_api_client::Client;
 use chronoscope_api_client::client::AuthClient;
 use chronoscope_db::{MediaType, ResearchUrlStatus};
-use chronoscope_dev::{DevServerConfig, RunningDevServer, start_dev_server};
+use chronoscope_dev::{DevServerConfig, ImageResolveMode, RunningDevServer, start_dev_server};
 use chronoscope_workers::RetryConfig;
 use chronoscope_workers::{ApifyConfig, CacheMode, CachingClient, HttpClient};
 use dropshot::ConfigLogging;
@@ -128,6 +128,9 @@ impl TestServer {
             log,
             port,
             cdn_base_url: base_url.clone(),
+            // These tests exercise the URL-fetch pipeline, not fact-store images
+            // (the fact store starts empty here, so no images are resolved).
+            image_resolve: ImageResolveMode::Placeholder,
             rp_id: None,
             rp_origin: None,
             ios_app_id: None,

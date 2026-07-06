@@ -32,6 +32,19 @@ pub struct Name<ImgId> {
     pub sources: Vec<Citation<ImgId>>,
 }
 
+/// The best display name for a language preference: the first name whose
+/// language tag starts with `lang_prefix`, else the first name, `None` for an
+/// empty list. `lang_prefix` is a primary subtag like `"en"` or `"it"`.
+pub fn best_name<'a, ImgId>(
+    names: &'a [Name<ImgId>],
+    lang_prefix: &str,
+) -> Option<&'a Name<ImgId>> {
+    names
+        .iter()
+        .find(|n| n.language.as_str().starts_with(lang_prefix))
+        .or_else(|| names.first())
+}
+
 /// A directed relationship to a neighbor: the bare target id plus the relation
 /// kinds asserted, each attributed. Label resolution is a later ids→names pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -701,6 +714,55 @@ mod tests {
             representative: id,
             members: [id].into_iter().collect(),
         }
+    }
+
+    // ---- best display name ----
+
+    /// A name in the given language, its validity endpoints absent — enough to
+    /// exercise the language-preference pick.
+    fn named(text: &str, lang: &str) -> Result<Name<ImgId>, Box<dyn std::error::Error>> {
+        let absent: Bounded<UncertainDate, ImgId> = Bounded {
+            possible: year(2000)?,
+            sources: Vec::new(),
+            consensus: Consensus::Absent,
+        };
+        Ok(Name {
+            text: text.to_owned(),
+            language: Language::new(lang)?,
+            name_type: NameType::Common,
+            valid_from: absent.clone(),
+            valid_to: absent,
+            sources: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn best_name_prefers_language_prefix_else_first() -> TestResult {
+        let names = vec![
+            named("Roma", "it")?,
+            named("Rome", "en")?,
+            named("Rome (fr)", "fr")?,
+        ];
+        assert_eq!(
+            best_name(&names, "it").ok_or("no it match")?.text,
+            "Roma",
+            "the Italian tag is picked for an 'it' preference"
+        );
+        assert_eq!(
+            best_name(&names, "en").ok_or("no en match")?.text,
+            "Rome",
+            "the English tag is picked for an 'en' preference"
+        );
+        assert_eq!(
+            best_name(&names, "de").ok_or("no fallback")?.text,
+            "Roma",
+            "an unmatched preference falls back to the first name"
+        );
+        assert!(
+            best_name::<ImgId>(&[], "en").is_none(),
+            "an empty list has no best name"
+        );
+        Ok(())
     }
 
     // ---- the kind parse ----

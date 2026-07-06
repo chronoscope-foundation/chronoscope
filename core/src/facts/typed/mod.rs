@@ -54,6 +54,26 @@ pub struct Bounded<V, ImgId> {
     pub consensus: Consensus<V>,
 }
 
+impl<X: Ord, ImgId> Bounded<Claimed<X>, ImgId> {
+    /// The lone settled value: `Some(x)` when consensus reached a
+    /// `Claimed::Of` holding exactly one value `x`. Absent, conflicting,
+    /// pending, `Any`, an empty set, and a multi-value set each yield `None`.
+    pub fn settled(&self) -> Option<&X> {
+        let Consensus::Reached {
+            value: Claimed::Of { values },
+        } = &self.consensus
+        else {
+            return None;
+        };
+        let mut it = values.iter();
+        let first = it.next()?;
+        match it.next() {
+            Some(_) => None,
+            None => Some(first),
+        }
+    }
+}
+
 /// The consensus side of a flattened bracket: whether a claim settled the slot,
 /// over-determined it, was declined this layer, or never touched it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -383,6 +403,58 @@ mod tests {
 
     use super::test_support::*;
     use super::*;
+
+    // ---- Bounded::settled ----
+
+    #[test]
+    fn settled_returns_lone_value_else_none() -> TestResult {
+        fn of(values: &[u8]) -> Claimed<u8> {
+            Claimed::Of {
+                values: values.iter().copied().collect(),
+            }
+        }
+        fn with_consensus(consensus: Consensus<Claimed<u8>>) -> Bounded<Claimed<u8>, ImgId> {
+            Bounded {
+                possible: Claimed::Any,
+                sources: Vec::new(),
+                consensus,
+            }
+        }
+
+        assert_eq!(
+            with_consensus(Consensus::Reached { value: of(&[7]) }).settled(),
+            Some(&7),
+            "a settled singleton yields its value"
+        );
+        assert_eq!(with_consensus(Consensus::Absent).settled(), None);
+        assert_eq!(with_consensus(Consensus::Conflict).settled(), None);
+        assert_eq!(
+            with_consensus(Consensus::Pending {
+                reason: PendingReason::Unresolved
+            })
+            .settled(),
+            None
+        );
+        assert_eq!(
+            with_consensus(Consensus::Reached { value: of(&[]) }).settled(),
+            None,
+            "an empty Of is not a settled value"
+        );
+        assert_eq!(
+            with_consensus(Consensus::Reached { value: of(&[1, 2]) }).settled(),
+            None,
+            "a multi-value Of has no lone value"
+        );
+        assert_eq!(
+            with_consensus(Consensus::Reached {
+                value: Claimed::Any
+            })
+            .settled(),
+            None,
+            "Any is not a settled value"
+        );
+        Ok(())
+    }
 
     // ---- bracket flatten arms ----
 

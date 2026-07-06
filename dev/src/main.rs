@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_api::state::default_dns_resolver;
-use chronoscope_dev::{DevServerConfig, start_dev_server};
+use chronoscope_dev::{DevServerConfig, ImageResolveMode, start_dev_server};
 use chronoscope_workers::{ApifyConfig, ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::{error, info, warn};
@@ -272,6 +272,8 @@ async fn run_dev_server(
         log: log.clone(),
         port,
         cdn_base_url: ngrok_url.clone(),
+        // Serve the real Commons images over ngrok.
+        image_resolve: ImageResolveMode::Fetch,
         rp_id: Some(ngrok_domain.clone()),
         rp_origin: Some(ngrok_url.clone()),
         ios_app_id,

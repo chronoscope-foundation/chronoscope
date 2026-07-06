@@ -1,113 +1,186 @@
 //! Entity API endpoints.
+//!
+//! Read side of the fact store, with resolved image URLs: markers carry a
+//! representative thumbnail and entity detail carries an image grid, both
+//! projected from `AppState.facts` (a `MemoryFactStore`) — the single read
+//! source. No region clustering.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use chrono::NaiveDateTime;
-use chronoscope_db::EntityId;
-use dropshot::{
-    Body, HttpError, PaginationParams, Query, RequestContext, ResultsPage, WhichPage, endpoint,
-};
+use dropshot::{Body, HttpError, Query, RequestContext, endpoint};
 use http::Response;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use chronoscope_api_client::Bbox;
+use chronoscope_api_client::{Bbox, DetailImage, EntityDetail, EntityListCursor, MarkersResponse};
+use chronoscope_core::facts::listing::{self, ListCursor, summaries_in_bbox};
+use chronoscope_core::facts::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
+use chronoscope_core::facts::projection::{member_lineage, project_entity, project_image};
+use chronoscope_core::facts::store::{FactStore, ImageView};
+use chronoscope_core::facts::typed;
+use chronoscope_core::geo;
 
-use crate::entity_types::{self, EntityResponse, EntitySummary};
+use crate::cdn;
+use crate::entity_types;
 use crate::limits;
 use crate::state::AppState;
-use crate::validation::{cors_preflight, db_err, error_with_cors, json_with_cors};
+use crate::validation::{
+    bad_request_with_cors, cors_preflight, error_with_cors, fact_store_err, json_with_cors,
+};
 
-// ==================== Pagination ====================
+/// A `GET /entities` resume cursor: the fact-store snapshot it was minted
+/// against plus the walk position, JSON-encoded into the `cursor` query
+/// parameter (opaque to the client, round-tripped verbatim).
+type Cursor = ListCursor<EntityListCursor>;
 
-/// Page selector for entity pagination (cursor-based).
+/// Parse the four viewport query fields into the fact store's `Bbox`.
 ///
-/// Encodes both the keyset cursor and the bbox, since Dropshot only provides
-/// scan params on the first page. Subsequent pages need the bbox to filter.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
-pub struct EntityPageSelector {
-    pub updated_at: NaiveDateTime,
-    pub id: EntityId,
-    #[serde(flatten)]
-    pub bbox: Bbox,
+/// Shared by `/entities` and `/markers`, whose query params carry the same
+/// bbox corners. `chronoscope_api_client::Bbox` range-validates the
+/// coordinates (admitting an antimeridian-crossing `min_lon > max_lon` box);
+/// the core conversion then only rejects inverted latitude. Either rejection
+/// surfaces as a CORS-tagged 400 the browser can read.
+fn request_bbox(
+    min_lat: f64,
+    max_lat: f64,
+    min_lon: f64,
+    max_lon: f64,
+) -> Result<geo::Bbox, HttpError> {
+    let bbox = Bbox::new(min_lat, max_lat, min_lon, max_lon)
+        .map_err(|e| bad_request_with_cors(format!("Invalid bbox: {e}")))?;
+    entity_types::to_core_bbox(&bbox)
+        .map_err(|e| bad_request_with_cors(format!("Invalid bbox: {e}")))
+}
+
+/// Project an image's `SameArtifact` class to its typed read DTO, or `None` when
+/// no fact ever named the id. Shared by the detail grid and the marker thumbnail
+/// path; a backend error maps to a 500.
+async fn typed_image<V>(
+    view: &V,
+    image_id: MemoryImageId,
+) -> Result<Option<typed::Image<MemoryEntityId, MemoryImageId>>, HttpError>
+where
+    V: ImageView<MemoryFactStore> + Sync,
+{
+    let Some((class, projected)) =
+        project_image::<MemoryFactStore, _, _>(view, image_id, member_lineage)
+            .await
+            .map_err(fact_store_err)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(typed::Image::parse(&projected, &class)))
 }
 
 // ==================== Path params ====================
 
 // EntityIdPath is required by Dropshot — Path<T> needs a struct with named
-// fields matching the URL template parameter.
+// fields matching the URL template parameter. Dropshot's path/query
+// deserializer parses each segment via `FromStr` per target type, so a plain
+// numeric path segment like `/entities/5` deserializes straight into
+// `MemoryEntityId`'s `#[serde(transparent)]` `u64` — no string-path adapter
+// needed. (Its `Display` renders the unrelated debug form `entity-5`; that
+// never enters the path-parsing path.)
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EntityIdPath {
-    pub id: EntityId,
+    pub id: MemoryEntityId,
 }
 
 // ==================== Endpoints ====================
 
+/// Query parameters for the entity viewport listing endpoint.
+///
+/// Bbox fields are declared inline because Dropshot's query parameter
+/// deserializer doesn't support `serde(flatten)`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EntitiesQueryParams {
+    pub min_lat: f64,
+    pub max_lat: f64,
+    pub min_lon: f64,
+    pub max_lon: f64,
+    /// Page size; server clamps to `limits::ENTITY_LIST_MAX_PAGE_SIZE`.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Resume cursor from a previous page's `next`, JSON-encoded. Absent for
+    /// the first page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
 /// List entities within a geographic bounding box (public, no authentication required).
 ///
-/// All four bounding box parameters are required. Returns entities that have
-/// coordinates within the specified rectangle, ordered by most recently updated.
+/// Returns the placeable entities (those whose current marker resolves to a
+/// point) in `bbox`, ordered by the underlying fact-store walk. The primary
+/// live consumer of viewport data is `/markers`; this endpoint keeps a
+/// straightforward first-page-plus-cursor shape rather than fully general
+/// pagination.
 #[endpoint {
     method = GET,
     path = "/entities",
 }]
 pub async fn list_entities(
     ctx: RequestContext<Arc<AppState>>,
-    query: Query<PaginationParams<Bbox, EntityPageSelector>>,
+    query: Query<EntitiesQueryParams>,
 ) -> Result<Response<Body>, HttpError> {
     let state = ctx.context();
-    let pag_params = query.into_inner();
+    let params = query.into_inner();
 
-    let limit = ctx.page_limit(&pag_params)?.get();
-    if limit > limits::ENTITY_LIST_MAX_PAGE_SIZE {
+    let core_bbox = request_bbox(
+        params.min_lat,
+        params.max_lat,
+        params.min_lon,
+        params.max_lon,
+    )?;
+
+    let requested_limit = params.limit.unwrap_or(limits::ENTITY_LIST_MAX_PAGE_SIZE);
+    if requested_limit > limits::ENTITY_LIST_MAX_PAGE_SIZE {
         return error_with_cors(
             http::StatusCode::BAD_REQUEST,
             &format!(
-                "Requested page size {} exceeds maximum {}",
-                limit,
+                "Requested page size {requested_limit} exceeds maximum {}",
                 limits::ENTITY_LIST_MAX_PAGE_SIZE
             ),
         );
     }
-    let limit_i64 = i64::from(limit);
+    let limit = NonZeroUsize::new(requested_limit as usize)
+        .ok_or_else(|| bad_request_with_cors("limit must be at least 1".to_string()))?;
 
-    let (bbox, cursor) = match &pag_params.page {
-        WhichPage::First(bbox) => (bbox.clone(), None),
-        WhichPage::Next(selector) => (
-            selector.bbox.clone(),
-            Some((selector.updated_at, &selector.id)),
-        ),
+    let cursor: Option<Cursor> = match params.cursor {
+        None => None,
+        Some(s) => match serde_json::from_str(&s) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                return error_with_cors(
+                    http::StatusCode::BAD_REQUEST,
+                    &format!("Invalid cursor: {e}"),
+                );
+            }
+        },
     };
 
-    let entities = state
-        .db
-        .list_entities_in_bbox(&bbox, limit_i64, cursor)
-        .await
-        .map_err(db_err)?;
-
-    let items: Vec<EntitySummary> = entities
-        .iter()
-        .map(|e| {
-            e.to_summary().ok_or_else(|| {
-                HttpError::for_internal_error("entity missing coordinates".to_string())
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let page = ResultsPage::new(items, &pag_params, |item: &EntitySummary, _| {
-        EntityPageSelector {
-            updated_at: item.updated_at,
-            id: item.id.clone(),
-            bbox: bbox.clone(),
+    let view = state.facts.now().await.map_err(fact_store_err)?;
+    let page = match summaries_in_bbox::<MemoryFactStore, _>(&view, &core_bbox, cursor, limit).await
+    {
+        Ok(p) => p,
+        Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
+        Err(listing::ListError::SnapshotMismatch) => {
+            return error_with_cors(
+                http::StatusCode::BAD_REQUEST,
+                "cursor is from a stale snapshot; restart the listing without a cursor",
+            );
         }
-    })
-    .map_err(|e| HttpError::for_internal_error(format!("Failed to build results page: {e}")))?;
+    };
 
     json_with_cors(&page)
 }
 
 /// Get a single entity with full detail (public, no authentication required).
+///
+/// The response is the fact store's typed entity projection wrapped alongside
+/// its resolved detail image grid: each depicted image is projected for its
+/// source URL and rendered into a [`DetailImage`]. External links live in
+/// `entity.external_refs`.
 #[endpoint {
     method = GET,
     path = "/entities/{id}",
@@ -117,64 +190,51 @@ pub async fn get_entity(
     path: dropshot::Path<EntityIdPath>,
 ) -> Result<Response<Body>, HttpError> {
     let state = ctx.context();
-    let id = &path.into_inner().id;
+    let id = path.into_inner().id;
 
-    let (entity_opt, links, annotations, media) = tokio::try_join!(
-        async { state.db.find_entity_by_id(id).await.map_err(db_err) },
-        async { state.db.find_entity_links(id).await.map_err(db_err) },
-        async {
-            state
-                .db
-                .find_annotations_by_entity(id)
-                .await
-                .map_err(db_err)
-        },
-        async { state.db.find_media_by_entity(id).await.map_err(db_err) },
-    )?;
-
-    let entity =
-        entity_opt.ok_or_else(|| HttpError::for_not_found(None, "Entity not found".to_string()))?;
-
-    let cdn_base = &state.config.cdn_base_url;
-    let detail = EntityResponse {
-        id: entity.id,
-        created_at: entity.created_at,
-        updated_at: entity.updated_at,
-        entity: entity.entity,
-        links: links
-            .into_iter()
-            .map(entity_types::entity_link_summary)
-            .collect(),
-        annotations: annotations
-            .into_iter()
-            .map(entity_types::annotation_summary)
-            .collect(),
-        media: media
-            .into_iter()
-            .map(|m| entity_types::media_summary(m, cdn_base))
-            .collect(),
+    let view = state.facts.now().await.map_err(fact_store_err)?;
+    // An id no committed fact ever named projects as `None` — the fact store's
+    // "not found", since a real entity carries at least the fact that minted it.
+    let Some((class, projected)) =
+        project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+            .await
+            .map_err(fact_store_err)?
+    else {
+        return error_with_cors(http::StatusCode::NOT_FOUND, "Entity not found");
     };
+    let entity = typed::Entity::parse(&projected, &class);
 
+    // Each depicted image serves its full-resolution original from our own
+    // `/media/{key}` as `display_url`, keeping the upstream Commons URL as
+    // `source_url` for the "open original" link. A depiction whose image lacks
+    // a `Source` fact, or whose image the resolver never stored, contributes no
+    // grid tile — a tile that can't load is worse than an absent one.
+    let mut images = Vec::new();
+    for dep in &entity.depictions {
+        let Some(image) = typed_image(&view, dep.other).await? else {
+            continue;
+        };
+        let Some(source_url) = image.urls.first().map(|a| a.value.to_string()) else {
+            continue;
+        };
+        let Some(media) = state.image_media.get(&image.id) else {
+            continue;
+        };
+        let display_url = cdn::full_url(&state.config.cdn_base_url, &media.storage_key);
+        let label = entity_types::image_label(&dep.perspective, &image.medium);
+        images.push(DetailImage {
+            id: dep.other,
+            display_url,
+            source_url,
+            label,
+        });
+    }
+
+    let detail = EntityDetail { entity, images };
     json_with_cors(&detail)
 }
 
 // ==================== Unified Markers ====================
-
-/// Maximum number of individual entity markers before switching to clusters.
-/// Keep low during development (test corpus has 22 entities in ~13 Italian
-/// regions); tune upward with real data density.
-const ENTITY_MARKER_THRESHOLD: i64 = 10;
-
-/// Maximum number of clusters before trying a coarser zone type.
-const CLUSTER_MARKER_LIMIT: i64 = 50;
-
-/// Zone types ordered from coarsest to finest.
-const ZONE_TYPES: &[chronoscope_api_client::ZoneType] = &[
-    chronoscope_api_client::ZoneType::Country,
-    chronoscope_api_client::ZoneType::State,
-    chronoscope_api_client::ZoneType::StateDistrict,
-    chronoscope_api_client::ZoneType::City,
-];
 
 /// Query parameters for the unified markers endpoint.
 ///
@@ -190,11 +250,10 @@ pub struct MarkersQueryParams {
 
 /// Unified map markers endpoint (public, no authentication required).
 ///
-/// The server decides whether to return individual entities or region clusters
-/// based on data density in the requested bounding box:
-/// - If the bbox contains fewer than 10 entities, return them individually.
-/// - Otherwise, try cluster zone types from coarsest to finest until one
-///   fits under 50 clusters.
+/// No clustering: every placeable entity in `bbox` becomes a marker, up to
+/// `limits::ENTITY_LIST_MAX_PAGE_SIZE`, each carrying its representative's
+/// thumbnail URL when it depicts an image. Co-located entities (identical
+/// point) collapse into one disambiguation marker.
 #[endpoint {
     method = GET,
     path = "/markers",
@@ -206,97 +265,54 @@ pub async fn list_markers(
     let state = ctx.context();
     let params = query.into_inner();
 
-    let bbox = match Bbox::new(
+    let core_bbox = request_bbox(
         params.min_lat,
         params.max_lat,
         params.min_lon,
         params.max_lon,
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            return error_with_cors(http::StatusCode::BAD_REQUEST, &format!("Invalid bbox: {e}"));
+    )?;
+
+    let limit = entity_types::max_page_limit()?;
+
+    let view = state.facts.now().await.map_err(fact_store_err)?;
+    let page = match summaries_in_bbox::<MemoryFactStore, _>(&view, &core_bbox, None, limit).await {
+        Ok(p) => p,
+        Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
+        // No cursor is ever passed here, and `summaries_in_bbox` only checks
+        // snapshot staleness against a supplied cursor — unreachable in
+        // practice, handled rather than assumed away.
+        Err(listing::ListError::SnapshotMismatch) => {
+            return Err(HttpError::for_internal_error(
+                "unexpected snapshot mismatch with no cursor".to_string(),
+            ));
         }
     };
 
-    // Check entity density with a cheap threshold count (no full rows).
-    let entity_count = state
-        .db
-        .count_entities_in_bbox(&bbox, ENTITY_MARKER_THRESHOLD)
-        .await
-        .map_err(db_err)?;
-
-    let (mut markers, rep_map, truncated) = if entity_count < ENTITY_MARKER_THRESHOLD {
-        // Few enough — fetch the actual entities as markers.
-        let (markers, rep_map) = state
-            .db
-            .list_entities_as_markers(&bbox, ENTITY_MARKER_THRESHOLD)
-            .await
-            .map_err(db_err)?;
-        (markers, rep_map, false)
-    } else {
-        // Too many entities — find the finest cluster granularity that fits
-        // under the limit. Iterate coarse→fine, tracking the last level that
-        // fits. Stop when a level exceeds the limit (finer levels will only
-        // produce more clusters). This gives the finest useful granularity.
-        // TODO: this is up to 4 sequential count queries. Could be optimized
-        // with a single query that counts all zone types at once, or by
-        // caching zone type distributions per bbox.
-        let mut chosen: Option<chronoscope_api_client::ZoneType> = None;
-        for &zone_type in ZONE_TYPES {
-            let count = state
-                .db
-                .count_clusters_in_bbox(&zone_type, &bbox, CLUSTER_MARKER_LIMIT)
+    // Serve each marker's representative thumbnail from our own `/media/{key}`.
+    // The summary's thumbnail id is a class member; resolving it to the
+    // `SameArtifact` representative matches the key the resolver stored under.
+    // An unresolved representative leaves the marker with no thumbnail. Marker
+    // assembly is pure; the fact-store read lives here.
+    let assembled = entity_types::markers_from_summaries(page.summaries);
+    let mut markers = Vec::with_capacity(assembled.len());
+    for (mut marker, thumbnail) in assembled {
+        if let Some(image_id) = thumbnail {
+            let representative = view
+                .image_representative(&image_id)
                 .await
-                .map_err(db_err)?;
-            if count < CLUSTER_MARKER_LIMIT {
-                chosen = Some(zone_type);
-            } else {
-                break;
+                .map_err(fact_store_err)?;
+            if let Some(media) = state.image_media.get(&representative) {
+                marker.thumbnail_url = Some(cdn::full_url(
+                    &state.config.cdn_base_url,
+                    &media.thumbnail_key,
+                ));
             }
         }
-
-        // If no zone type fits (even country has too many clusters), use the
-        // coarsest level anyway — it'll be truncated but better than nothing.
-        let zone_type = chosen.unwrap_or(ZONE_TYPES[0]);
-        let (markers, rep_map) = state
-            .db
-            .list_clusters_as_markers(&zone_type, &bbox)
-            .await
-            .map_err(db_err)?;
-        let truncated = markers.len() as i64 >= CLUSTER_MARKER_LIMIT;
-        (markers, rep_map, truncated)
-    };
-
-    // Resolve thumbnail URLs for all markers (entity and cluster alike).
-    let entity_ids: Vec<&str> = rep_map.values().map(|id| id.as_str()).collect();
-    if !entity_ids.is_empty() {
-        let ids_json = serde_json::to_string(&entity_ids)
-            .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize IDs: {e}")))?;
-
-        let thumbnails = state
-            .db
-            .find_thumbnails_for_entities(&ids_json)
-            .await
-            .map_err(db_err)?;
-
-        let cdn_base = &state.config.cdn_base_url;
-        let thumb_map: HashMap<String, String> = thumbnails
-            .into_iter()
-            .map(|t| {
-                let (eid, info) = entity_types::thumbnail_entry(t, cdn_base);
-                (eid.to_string(), info.url)
-            })
-            .collect();
-
-        // Assign thumbnail URLs to markers.
-        for marker in &mut markers {
-            if let Some(entity_id) = rep_map.get(&marker.id) {
-                marker.thumbnail_url = thumb_map.get(&entity_id.to_string()).cloned();
-            }
-        }
+        markers.push(marker);
     }
+    let truncated = page.next.is_some();
 
-    let response = chronoscope_api_client::MarkersResponse { markers, truncated };
+    let response = MarkersResponse { markers, truncated };
     json_with_cors(&response)
 }
 

@@ -215,7 +215,9 @@ async fn single_name_projects_one_slot() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     assert_eq!(entity.names.len(), 1);
     let (key, entry) = entity.names.iter().next().ok_or("no name")?;
@@ -247,7 +249,9 @@ async fn multiple_names_all_languages_preserved() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     assert_eq!(
         entity.names.len(),
@@ -294,7 +298,9 @@ async fn two_overlapping_date_claims_tighten_the_consensus() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     let started = &entity.construction.started_at;
     assert_eq!(
@@ -338,7 +344,9 @@ async fn disjoint_date_claims_conflict_with_a_disjunction_extent() -> TestResult
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     let started = &entity.construction.started_at;
     assert_eq!(
@@ -407,7 +415,9 @@ async fn same_entity_class_unions_members() -> TestResult {
     let a = result.entities.get(&EntityIdx(0)).ok_or("missing a")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     let names: BTreeSet<&str> = entity.names.keys().map(|k| k.name.as_str()).collect();
     assert_eq!(
@@ -488,15 +498,18 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
 
     // At now(): one name.
     let view_now = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, after) = project_entity::<MemoryFactStore, _, _>(&view_now, id, member_lineage).await?;
+    let (_, after) = project_entity::<MemoryFactStore, _, _>(&view_now, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
     assert_eq!(after.names.len(), 1, "the retracted name is gone at now()");
     let (key, _) = after.names.iter().next().ok_or("no name")?;
     assert_eq!(key.name.as_str(), "New");
 
     // At the pre-retraction snapshot: both names.
     let view_before = store.no_later_than(snapshot_before);
-    let (_, before) =
-        project_entity::<MemoryFactStore, _, _>(&view_before, id, member_lineage).await?;
+    let (_, before) = project_entity::<MemoryFactStore, _, _>(&view_before, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
     assert_eq!(
         before.names.len(),
         2,
@@ -537,7 +550,9 @@ async fn populated_fields_carry_factual_support() -> TestResult {
         .id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, a, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     // Every populated value field carries its in-band support.
     for entry in entity.names.values() {
@@ -832,7 +847,9 @@ async fn entity_projects_has_event_linked_event() -> TestResult {
     let id = result.entities.get(&EntityIdx(0)).ok_or("missing")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     assert_eq!(
         entity.events.len(),
@@ -1152,7 +1169,9 @@ async fn shared_field_surfaces_the_connecting_glue() -> TestResult {
     let MergedClass { x, y } = merged_class(&store).await?;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     // The construction-start field was asserted by both members, so its
     // support carries both ids and the connecting judgment is load-bearing.
@@ -1185,7 +1204,9 @@ async fn single_member_field_has_no_glue() -> TestResult {
     let MergedClass { x, .. } = merged_class(&store).await?;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     // The name was asserted by one member only; no SameEntity edge fits
     // inside a single-id support set, so nothing is load-bearing for it.
@@ -1209,7 +1230,9 @@ async fn identity_root_accumulates_the_merge_judgment() -> TestResult {
     let MergedClass { x, y } = merged_class(&store).await?;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     // The derived root summary is the ⊔ of the class's edge supports. The one
     // SameEntity edge is tagged symmetrically, so the root carries both
@@ -1230,7 +1253,9 @@ async fn judgment_citation_is_live_in_provenance() -> TestResult {
     let MergedClass { x, y } = merged_class(&store).await?;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, x, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     // `Citation::Judgment` reaches projected provenance only because the merge
     // no longer drops judgments: it lands on the `sameness` edge.
@@ -1279,7 +1304,9 @@ async fn incoming_relationship_does_not_self_loop_the_target() -> TestResult {
 
     // Projecting the class the edge points *into*: nothing, no self-loop.
     let (class, projected_target) =
-        project_entity::<MemoryFactStore, _, _>(&view, target, member_lineage).await?;
+        project_entity::<MemoryFactStore, _, _>(&view, target, member_lineage)
+            .await?
+            .ok_or("known id should project")?;
     assert!(
         projected_target.relations.is_empty(),
         "an edge pointing into the class is the source's outgoing relation, not the target's"
@@ -1295,7 +1322,9 @@ async fn incoming_relationship_does_not_self_loop_the_target() -> TestResult {
     // Projecting the source end: the outgoing relation surfaces, keyed by its
     // target endpoint.
     let (_, projected_source) =
-        project_entity::<MemoryFactStore, _, _>(&view, source, member_lineage).await?;
+        project_entity::<MemoryFactStore, _, _>(&view, source, member_lineage)
+            .await?
+            .ok_or("known id should project")?;
     assert_eq!(
         projected_source.relations.len(),
         1,
@@ -1390,7 +1419,8 @@ proptest! {
                 let (class, entity) =
                     project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
                         .await
-                        .map_err(|e| TestCaseError::fail(format!("project: {e:?}")))?;
+                        .map_err(|e| TestCaseError::fail(format!("project: {e:?}")))?
+                        .ok_or_else(|| TestCaseError::fail("known id should project"))?;
                 let members = &class.members;
 
                 let mut expected: BTreeSet<MemEntId> = BTreeSet::new();
@@ -1797,7 +1827,9 @@ async fn project_image_drains_class_and_folds_facts() -> TestResult {
     let id = result.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (class, image) = project_image::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+    let (class, image) = project_image::<MemoryFactStore, _, _>(&view, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     assert!(
         class.members.contains(&id),
@@ -1834,8 +1866,9 @@ async fn project_image_records_same_artifact_glue() -> TestResult {
     let img1 = result.images.get(&ImageIdx(1)).ok_or("missing image 1")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (class, image) =
-        project_image::<MemoryFactStore, _, _>(&view, img0, member_lineage).await?;
+    let (class, image) = project_image::<MemoryFactStore, _, _>(&view, img0, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     // The judgment unions both realizations into one SameArtifact class.
     assert!(
@@ -1924,8 +1957,9 @@ async fn project_drains_depiction_and_subimage_edges() -> TestResult {
 
     // The parent image: the depicted entity under `depicts`, the panel under
     // `subimages`, and no enclosing image of its own.
-    let (_, parent) =
-        project_image::<MemoryFactStore, _, _>(&view, parent_id, member_lineage).await?;
+    let (_, parent) = project_image::<MemoryFactStore, _, _>(&view, parent_id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
     assert_eq!(
         parent.depicts.len(),
         1,
@@ -1949,8 +1983,9 @@ async fn project_drains_depiction_and_subimage_edges() -> TestResult {
     );
 
     // The subimage end: the parent under `parent`, no panels of its own.
-    let (_, sub) =
-        project_image::<MemoryFactStore, _, _>(&view, subimage_id, member_lineage).await?;
+    let (_, sub) = project_image::<MemoryFactStore, _, _>(&view, subimage_id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
     assert_eq!(
         sub.parent.len(),
         1,
@@ -1961,8 +1996,9 @@ async fn project_drains_depiction_and_subimage_edges() -> TestResult {
     assert!(sub.subimages.is_empty(), "the subimage holds no panels");
 
     // The entity side through its own drain: the depiction keyed by image.
-    let (_, entity) =
-        project_entity::<MemoryFactStore, _, _>(&view, entity_id, member_lineage).await?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&view, entity_id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
     assert_eq!(
         entity.depictions.len(),
         1,
@@ -2042,7 +2078,9 @@ async fn observed_image_does_not_leak_a_foreign_depiction() -> TestResult {
     let image_a = result.images.get(&ImageIdx(0)).ok_or("missing image A")?.id;
 
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, image) = project_image::<MemoryFactStore, _, _>(&view, image_a, member_lineage).await?;
+    let (_, image) = project_image::<MemoryFactStore, _, _>(&view, image_a, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
 
     let depicted: BTreeSet<MemEntId> = image.depicts.keys().copied().collect();
     assert_eq!(

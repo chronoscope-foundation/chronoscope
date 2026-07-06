@@ -733,23 +733,21 @@ async fn find_entity_with_media(
     use chronoscope_api_client::{Bbox, Client};
 
     let client = Client::new(t.api_base_url());
-    // Use a bbox small enough that the server returns individual entity
-    // markers (not clusters). Centered on Rome where we have 4 entities
-    // — well below the ENTITY_MARKER_THRESHOLD.
+    // Rome's bbox — the 4 Roman entities sit here, several with seeded media.
     let bbox = Bbox::new(41.5, 42.5, 12.0, 13.0)?;
     let response = client.list_markers(&bbox).await?;
 
-    // 2. Find markers with thumbnails (indicating resolved media)
+    // Pick the entity with the most resolved media among those whose marker
+    // carries a thumbnail.
     let mut best: Option<(f64, f64, usize, String)> = None;
     for marker in &response.markers {
         if marker.thumbnail_url.is_some() {
-            // Get the entity ID from the click action
             let entity_id = match &marker.click_action {
-                chronoscope_api_client::ClickAction::Select { entity_id, .. } => entity_id.clone(),
+                chronoscope_api_client::ClickAction::Select { entity_id } => *entity_id,
                 _ => continue,
             };
             let detail = client.get_entity(&entity_id).await?;
-            let count = detail.media.len();
+            let count = detail.images.len();
             if best.as_ref().is_none_or(|b| count > b.2) {
                 best = Some((
                     marker.longitude,
@@ -954,21 +952,22 @@ async fn test_thumbnail_click_opens_detail() -> TestResult {
     .await
 }
 
-// ==================== Cluster Tests ====================
+// ==================== Entity Listing Tests ====================
 //
 // These tests rely on the curated wikidata bundle (see nix/wikidata.nix), which
 // includes 13 Italian entities spread across 8 regions plus the existing
-// Chioggia Cathedral. The expected counts and region names match the data
-// produced by `cosmogony` from a pinned OSM Italy snapshot.
+// Chioggia Cathedral. The expected counts and names match the data produced
+// by the Wikidata ingester. Text-only slice: no region clustering — every
+// marker is an individual (or co-located-disambiguation) entity marker.
 
-/// Italy center — for cluster tests at country/state zoom levels.
-const ITALY_LNG: f64 = 12.5;
-const ITALY_LAT: f64 = 42.5;
 /// Rome — for testing zoomed-in views with 4 distinct entities.
 const ROME_LNG: f64 = 12.48;
 const ROME_LAT: f64 = 41.9;
 
-/// Get markers of a given kind ("entity" or "cluster"), keyed by their `name`.
+/// Get markers of a given kind. Clustering is gone, so every marker's
+/// `kind` is `"entity"` — kept as a filter (rather than dropped) so this
+/// test's assertions about absent clusters stay meaningful if clustering
+/// ever returns.
 fn markers_by_name(
     markers: &[serde_json::Value],
     kind: &str,
@@ -981,94 +980,6 @@ fn markers_by_name(
             Some((name, m.clone()))
         })
         .collect()
-}
-
-#[tokio::test]
-async fn test_clusters_have_expected_properties() -> TestResult {
-    web_test(async |t| {
-        // Wide viewport over Italy at zoom 5 — enough entities (>10) to
-        // trigger server-side clustering at some granularity.
-        t.goto_map_at(ITALY_LNG, ITALY_LAT, 5.0).await?;
-
-        let markers = t.marker_properties().await?;
-        let clusters = markers_by_name(&markers, "cluster");
-        let entities = markers_by_name(&markers, "entity");
-
-        check(
-            entities.is_empty(),
-            format!("expected only clusters (no entities) in wide viewport, got {entities:?}"),
-        )?;
-        check(
-            !clusters.is_empty(),
-            "expected clusters in wide viewport, got none".to_string(),
-        )?;
-
-        // Each cluster needs a bbox for fitBounds when clicked.
-        for (name, cluster) in &clusters {
-            check(
-                cluster.get("bbox_min_lat").is_some(),
-                format!("cluster '{name}' should have bbox for fitBounds"),
-            )?;
-        }
-        Ok(())
-    })
-    .await
-}
-
-#[tokio::test]
-async fn test_cluster_click_zooms_in() -> TestResult {
-    web_test(async |t| {
-        t.goto_map_at(ITALY_LNG, ITALY_LAT, 5.0).await?;
-        let zoom_before = t.zoom().await?;
-
-        // Find any cluster's rendered coordinates. The server picks the
-        // finest granularity that fits — we don't assume a specific level.
-        let markers = t.marker_properties().await?;
-        let first_cluster = markers
-            .iter()
-            .find(|m| m.get("kind").and_then(|k| k.as_str()) == Some("cluster"))
-            .ok_or("no clusters found at zoom 5")?;
-        let lng = first_cluster
-            .get("_lng")
-            .and_then(|v| v.as_f64())
-            .ok_or("cluster has no _lng")?;
-        let lat = first_cluster
-            .get("_lat")
-            .and_then(|v| v.as_f64())
-            .ok_or("cluster has no _lat")?;
-
-        t.fetch_around(async |t| t.click_map_at(lng, lat).await)
-            .await?;
-        t.wait_for_map_idle().await?;
-
-        let zoom_after = t.zoom().await?;
-        check(
-            zoom_after > zoom_before,
-            format!(
-                "clicking cluster should increase zoom, before={zoom_before}, after={zoom_after}"
-            ),
-        )?;
-
-        let (cx, cy) = t.center().await?;
-        // After fitBounds, the center should be within the clicked cluster's region.
-        // The fit targets the region's bbox, so the center won't be exactly
-        // at the clicked centroid — allow generous slack.
-        check(
-            (cx - lng).abs() < 5.0 && (cy - lat).abs() < 5.0,
-            format!("after click, map center should be near ({lng}, {lat}), got ({cx}, {cy})"),
-        )?;
-
-        // After fitBounds into cluster, we should see markers (either
-        // deeper clusters at state_district/city level, or entities if the
-        // region is small enough to land past the cluster threshold).
-        let after_markers = t.marker_properties().await?;
-        check(
-            !after_markers.is_empty(),
-            "expected markers after clicking cluster".to_string(),
-        )?;
-        Ok(())
-    })
-    .await
 }
 
 #[tokio::test]
@@ -1137,78 +1048,6 @@ async fn test_rome_entities_have_thumbnails() -> TestResult {
             format!(
                 "expected at least one Rome entity with a thumbnail, got: {:?}",
                 entities.keys()
-            ),
-        )?;
-        Ok(())
-    })
-    .await
-}
-
-#[tokio::test]
-async fn test_cluster_thumbnail_shows_representative() -> TestResult {
-    web_test(async |t| {
-        // At zoom 5, the Lazio cluster's representative is one of the 4 Roman
-        // entities. Since Rome has the most entities, at least one should have
-        // resolved media (via seed_test_media), giving Lazio a thumbnail.
-        t.goto_map_with_thumbnails(ITALY_LNG, ITALY_LAT, 5.0)
-            .await?;
-
-        let markers = t.marker_properties().await?;
-        let clusters = markers_by_name(&markers, "cluster");
-        // Find any cluster with a thumbnail (representative has resolved media).
-        let with_thumbnail = clusters.values().find(|c| c.get("thumbnail").is_some());
-        check(
-            with_thumbnail.is_some(),
-            format!(
-                "expected at least one cluster with a thumbnail, got: {:?}",
-                clusters.keys()
-            ),
-        )?;
-        Ok(())
-    })
-    .await
-}
-
-/// Verify the cluster→entity mode transition.
-///
-/// At zoom 9 over Rome the server should return clusters (many entities
-/// in the wider bbox); at zoom 11 centered tightly on Rome it should
-/// return individual entities (few enough in the bbox). This test ensures
-/// the transition happens without errors and the marker types change.
-#[tokio::test]
-async fn test_density_based_cluster_transition() -> TestResult {
-    web_test(async |t| {
-        // Wide viewport over Italy — server returns clusters (>10 entities).
-        t.goto_map_at(ITALY_LNG, ITALY_LAT, 5.0).await?;
-
-        let wide_markers = t.marker_properties().await?;
-        let wide_clusters = markers_by_name(&wide_markers, "cluster");
-        check(
-            !wide_clusters.is_empty(),
-            format!(
-                "expected clusters in wide viewport, got: {:?}",
-                wide_markers
-            ),
-        )?;
-
-        // Narrow viewport over Rome — server returns entities (4 < threshold).
-        t.goto_map_at(ROME_LNG, ROME_LAT, 13.0).await?;
-
-        let narrow_markers = t.marker_properties().await?;
-        let narrow_entities = markers_by_name(&narrow_markers, "entity");
-        let narrow_clusters = markers_by_name(&narrow_markers, "cluster");
-        check(
-            narrow_clusters.is_empty(),
-            format!(
-                "expected no clusters in narrow viewport, got: {:?}",
-                narrow_clusters.keys()
-            ),
-        )?;
-        check(
-            !narrow_entities.is_empty(),
-            format!(
-                "expected entities in narrow viewport, got: {:?}",
-                narrow_markers
             ),
         )?;
         Ok(())

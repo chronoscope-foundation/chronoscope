@@ -160,27 +160,43 @@ impl std::error::Error for GeoPointError {}
 // ============================================================================
 
 /// A bounding box for spatial queries, built from a southwest and a
-/// northeast [`GeoPoint`]. [`Bbox::new`] enforces ordering
-/// (`sw.lat() <= ne.lat()` and `sw.lon() <= ne.lon()`) so downstream
-/// "is this point inside?" checks can't silently fail closed when callers
-/// transposed the corners. Coordinate range and finiteness are already
-/// enforced by [`GeoPoint::new`], so corner construction is the only
-/// place those validations live.
+/// northeast [`GeoPoint`].
+///
+/// Latitude is a plain interval `[sw.lat(), ne.lat()]`. Longitude follows the
+/// viewport wrap convention: when `sw.lon() <= ne.lon()` the box spans the
+/// interval `[sw.lon(), ne.lon()]`; when `sw.lon() > ne.lon()` the box wraps
+/// across the ±180° antimeridian, covering `[sw.lon(), 180]` together with
+/// `[-180, ne.lon()]`. [`Bbox::contains`] is the single membership test that
+/// honors the wrap, so spatial queries read it rather than the raw corners.
+///
+/// [`Bbox::new`] enforces latitude ordering so a transposed corner pair is
+/// caught at construction. Coordinate range and finiteness are already
+/// enforced by [`GeoPoint::new`], so corner construction is the only place
+/// those validations live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Bbox {
-    /// Southwest corner (minimum latitude, minimum longitude).
+    /// Southwest corner: the minimum latitude and the western longitude edge
+    /// (numerically the greater value on an antimeridian-wrapping box).
     sw: GeoPoint,
-    /// Northeast corner (maximum latitude, maximum longitude).
+    /// Northeast corner: the maximum latitude and the eastern longitude edge.
     ne: GeoPoint,
 }
 
 /// Errors from [`Bbox::new`].
+///
+/// Only latitude can be checked for corner transposition. Latitude has no wrap,
+/// so `sw.lat() > ne.lat()` is a *provable* transposed corner pair. Longitude's
+/// `sw.lon() > ne.lon()` is instead the deliberate antimeridian-wrap convention
+/// (see [`Bbox`]), so it can't be canonicalized: reordering the corners would
+/// turn a transposition into a bogus wrap box, silently corrupting the lon axis.
+/// The lat guard is the one transposition symptom we can prove, so we reject it
+/// rather than construct a wrong box.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BboxError {
-    /// `sw` is not actually southwest of `ne` — either its latitude is
-    /// greater than `ne`'s, or its longitude is. Antimeridian-crossing
-    /// boxes are not supported here; callers split into two.
-    SwNotSouthwestOfNe {
+    /// `sw`'s latitude exceeds `ne`'s — the box is inverted north-to-south.
+    /// Longitude ordering is free: `sw.lon() > ne.lon()` denotes an
+    /// antimeridian-wrapping box (see [`Bbox`]).
+    LatitudeInverted {
         /// The southwest corner as supplied.
         sw: GeoPoint,
         /// The northeast corner as supplied.
@@ -191,14 +207,11 @@ pub enum BboxError {
 impl std::fmt::Display for BboxError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SwNotSouthwestOfNe { sw, ne } => write!(
+            Self::LatitudeInverted { sw, ne } => write!(
                 f,
-                "bbox sw corner ({}, {}) must be south of and west of ne corner ({}, {}); \
-                 antimeridian-crossing boxes must be split",
+                "bbox sw latitude ({}) must be at or below ne latitude ({})",
                 sw.lat(),
-                sw.lon(),
                 ne.lat(),
-                ne.lon(),
             ),
         }
     }
@@ -207,14 +220,14 @@ impl std::fmt::Display for BboxError {
 impl std::error::Error for BboxError {}
 
 impl Bbox {
-    /// Construct a bbox from southwest and northeast corners. Returns an
-    /// error if `sw` is not actually southwest of `ne`
-    /// (`sw.lat() > ne.lat()` or `sw.lon() > ne.lon()`). Coordinate range
-    /// and finiteness validation lives on [`GeoPoint::new`] — both
-    /// arguments are already-validated points.
+    /// Construct a bbox from southwest and northeast corners. Rejects an
+    /// inverted latitude span (`sw.lat() > ne.lat()`); a westward longitude
+    /// span (`sw.lon() > ne.lon()`) is accepted as an antimeridian wrap (see
+    /// [`Bbox`]). Coordinate range and finiteness validation lives on
+    /// [`GeoPoint::new`] — both arguments are already-validated points.
     pub fn new(sw: GeoPoint, ne: GeoPoint) -> Result<Self, BboxError> {
-        if sw.lat() > ne.lat() || sw.lon() > ne.lon() {
-            return Err(BboxError::SwNotSouthwestOfNe { sw, ne });
+        if sw.lat() > ne.lat() {
+            return Err(BboxError::LatitudeInverted { sw, ne });
         }
         Ok(Self { sw, ne })
     }
@@ -229,14 +242,22 @@ impl Bbox {
         &self.ne
     }
 
-    /// Whether `p` lies within the box, inclusive on every edge. Corner
-    /// construction rejects inverted and antimeridian spans, so both axes are
-    /// plain interval tests.
+    /// Whether `p` lies within the box, inclusive on every edge.
+    ///
+    /// Latitude is a plain interval test. Longitude honors the wrap
+    /// convention: a normal box (`sw.lon() <= ne.lon()`) tests the interval
+    /// `[sw.lon(), ne.lon()]`; a wrapped box (`sw.lon() > ne.lon()`) admits a
+    /// point at or east of `sw.lon()` or at or west of `ne.lon()`, the two
+    /// arcs meeting across the ±180° seam.
     pub fn contains(&self, p: &GeoPoint) -> bool {
-        self.sw.lat() <= p.lat()
-            && p.lat() <= self.ne.lat()
-            && self.sw.lon() <= p.lon()
-            && p.lon() <= self.ne.lon()
+        let lat_in = self.sw.lat() <= p.lat() && p.lat() <= self.ne.lat();
+        let (min_lon, max_lon) = (self.sw.lon(), self.ne.lon());
+        let lon_in = if min_lon <= max_lon {
+            min_lon <= p.lon() && p.lon() <= max_lon
+        } else {
+            p.lon() >= min_lon || p.lon() <= max_lon
+        };
+        lat_in && lon_in
     }
 }
 
@@ -540,21 +561,21 @@ mod tests {
         let ne = GeoPoint::new(30.0, 1.0)?;
         assert!(matches!(
             Bbox::new(sw, ne),
-            Err(BboxError::SwNotSouthwestOfNe { .. })
+            Err(BboxError::LatitudeInverted { .. })
         ));
         Ok(())
     }
 
     #[test]
-    fn bbox_rejects_sw_east_of_ne() -> TestResult {
-        // sw.lon (5) > ne.lon (1) — sw is east of ne. (Antimeridian-
-        // crossing boxes must be split into two, not folded here.)
-        let sw = GeoPoint::new(0.0, 5.0)?;
-        let ne = GeoPoint::new(1.0, 1.0)?;
-        assert!(matches!(
-            Bbox::new(sw, ne),
-            Err(BboxError::SwNotSouthwestOfNe { .. })
-        ));
+    fn bbox_accepts_westward_longitude_as_antimeridian_wrap() -> TestResult {
+        // sw.lon (170) > ne.lon (-170): a 20°-wide box straddling the
+        // antimeridian, so construction accepts it — the wrap convention, not
+        // a transposition.
+        let sw = GeoPoint::new(0.0, 170.0)?;
+        let ne = GeoPoint::new(1.0, -170.0)?;
+        let b = Bbox::new(sw, ne)?;
+        assert_eq!(b.sw(), &sw);
+        assert_eq!(b.ne(), &ne);
         Ok(())
     }
 
@@ -569,6 +590,39 @@ mod tests {
             "north of the box"
         );
         assert!(!b.contains(&GeoPoint::new(40.5, -72.5)?), "east of the box");
+        Ok(())
+    }
+
+    #[test]
+    fn bbox_contains_wrapped_box_spans_the_seam() -> TestResult {
+        // A box from 170°E eastward across ±180° to 170°W (a 20° span).
+        let b = Bbox::new(GeoPoint::new(0.0, 170.0)?, GeoPoint::new(10.0, -170.0)?)?;
+        assert!(b.contains(&GeoPoint::new(5.0, 175.0)?), "175°E is inside");
+        assert!(b.contains(&GeoPoint::new(5.0, -175.0)?), "175°W is inside");
+        assert!(
+            b.contains(&GeoPoint::new(5.0, 180.0)?),
+            "the seam itself is inside"
+        );
+        assert!(
+            b.contains(&GeoPoint::new(5.0, 170.0)?),
+            "the west edge is inclusive"
+        );
+        assert!(
+            b.contains(&GeoPoint::new(5.0, -170.0)?),
+            "the east edge is inclusive"
+        );
+        assert!(
+            !b.contains(&GeoPoint::new(5.0, 0.0)?),
+            "the far meridian is outside"
+        );
+        assert!(
+            !b.contains(&GeoPoint::new(5.0, 160.0)?),
+            "just west of the box is outside"
+        );
+        assert!(
+            !b.contains(&GeoPoint::new(15.0, 175.0)?),
+            "north of the box is outside even at an in-range longitude"
+        );
         Ok(())
     }
 

@@ -94,6 +94,19 @@ pub enum FetchError {
     BatchNotImplemented(String),
 }
 
+impl From<super::content::StoreImageError> for FetchError {
+    /// Preserve retry semantics: the original `put` failing stays retriable,
+    /// while an undecodable image is permanent content processing.
+    fn from(e: super::content::StoreImageError) -> Self {
+        match e {
+            super::content::StoreImageError::MediaStore(m) => Self::MediaStore(m),
+            decode @ super::content::StoreImageError::Decode(_) => {
+                Self::ContentProcessing(decode.to_string())
+            }
+        }
+    }
+}
+
 impl FetchError {
     /// Convert an HTTP error to a [`FetchError`].
     ///

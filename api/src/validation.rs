@@ -18,6 +18,25 @@ pub fn db_err(e: DbError) -> HttpError {
     err
 }
 
+/// Convert a fact-store backend error to an `HttpError`, mirroring [`db_err`].
+///
+/// Covers both `MemoryFactStore`'s own `Error` and the `listing`/`projection`
+/// module wrapper errors (`ListError<E>` and friends) — none of them impl
+/// `Display`, so this formats via `Debug`.
+pub fn fact_store_err(e: impl std::fmt::Debug) -> HttpError {
+    let mut err = HttpError::for_internal_error(format!("{e:?}"));
+    add_cors_headers(&mut err);
+    err
+}
+
+/// A `400 Bad Request` carrying CORS headers, for the public no-auth endpoints
+/// whose malformed-input rejections a browser must be able to read cross-origin.
+pub fn bad_request_with_cors(message: String) -> HttpError {
+    let mut err = HttpError::for_bad_request(None, message);
+    add_cors_headers(&mut err);
+    err
+}
+
 /// CORS headers applied to all cross-origin responses — defined once,
 /// used by both success responses (via `cors_builder`) and error
 /// responses (via `add_cors_headers`).

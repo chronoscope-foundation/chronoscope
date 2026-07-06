@@ -1,165 +1,84 @@
-//! Entity API response types.
+//! Entity API response types — read side of the fact store.
 //!
-//! These are the wire-format types for entity endpoints. They're projections
-//! and summaries of core domain types, not domain types themselves.
+//! These are thin aliases over the fact store's own `typed`/`listing` DTOs
+//! (`chronoscope_core::facts::*`), concretized to the in-memory backend's id
+//! scheme. The server projects a `MemoryFactStore` snapshot straight into
+//! these shapes; there's no separate wire-format translation layer.
 
-use chrono::{NaiveDate, NaiveDateTime};
-use chronoscope_core::{AnnotationKind, Entity, LinkTarget, LinkType, UncertainDate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use std::fmt;
+use chronoscope_core::facts::ids::FactId;
+use chronoscope_core::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
+use chronoscope_core::facts::{listing, typed};
 
-use crate::ids::{AnnotationId, EntityId, EntityLinkId, MediaId, SourceId};
+/// Full entity detail — the fact store's typed projection, concretized to the
+/// in-memory backend's id scheme. Wrapped in [`EntityDetail`] by
+/// `GET /entities/{id}`; no infrastructure envelope (no `created_at`/`updated_at`
+/// — the fact store has no row-level timestamps, only per-fact provenance
+/// already carried inside the typed fields).
+pub type Entity = typed::Entity<MemoryEntityId, MemoryEventId, MemoryImageId>;
 
-/// Lightweight entity summary for map markers and list views.
+/// The `GET /entities/{id}` response: the typed entity plus the resolved image
+/// grid the detail panel renders. The entity's `depictions` name the images by
+/// id; `images` carries each depicted image's resolved URLs and label so the
+/// client renders the grid without a second round-trip per image.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct EntitySummary {
-    pub id: EntityId,
-    /// Best available name (English preferred, then first available).
-    pub name: Option<String>,
-    /// Latitude of the entity. Non-optional because this type is only returned
-    /// by spatial (bounding box) queries, which inherently filter to entities
-    /// with known coordinates.
-    pub latitude: f64,
-    pub longitude: f64,
-    /// Earliest known date across all transitions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub earliest_date: Option<NaiveDate>,
-    /// Latest known date across all transitions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latest_date: Option<NaiveDate>,
-    pub updated_at: NaiveDateTime,
+pub struct EntityDetail {
+    pub entity: Entity,
+    pub images: Vec<DetailImage>,
 }
 
-/// Full entity response — the core `Entity` plus associated metadata.
+/// One image in an entity's detail grid: the id it is keyed by, the URL the
+/// client actually loads (`display_url`), the real provenance URL for the
+/// lightbox's "open original" link (`source_url`), and a short human label.
 ///
-/// This is a response envelope, not a domain type. The `entity` field contains
-/// the actual domain data; the rest is infrastructure metadata.
+/// `display_url` always loads from our own `/media/{key}` host — same-origin,
+/// so the canvas thumbnail draw stays CORS-safe — while `source_url` keeps the
+/// upstream provenance URL for the lightbox's "open original". In placeholder
+/// mode (dev/test) `display_url` is one shared local placeholder; otherwise
+/// it's the resolver's stored copy of the source.
+///
+/// `label` is a short grid caption built from the depiction's perspective and
+/// the image's medium (e.g. "Exterior picture", "Map"). It is always non-empty
+/// and never contains the word "view"; the web appends " view" to form the
+/// image's aria-label.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct EntityResponse {
-    pub id: EntityId,
-    pub entity: Entity<SourceId>,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-    pub links: Vec<EntityLinkSummary>,
-    pub annotations: Vec<AnnotationSummary>,
-    /// Resolved media items associated with this entity (images, videos).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub media: Vec<MediaSummary>,
-}
-
-/// An external link attached to an entity.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct EntityLinkSummary {
-    pub id: EntityLinkId,
-    pub link_type: LinkType,
-    pub target: LinkTarget,
-}
-
-/// An annotation linking an entity to a source image region.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AnnotationSummary {
-    pub id: AnnotationId,
-    pub kind: AnnotationKind,
-    pub created_at: NaiveDateTime,
-}
-
-/// A media item associated with an entity, for the detail panel image grid.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MediaSummary {
-    pub id: MediaId,
-    /// Ready-to-use URL for fetching the image (e.g., `/media/abc123.jpg` or CDN URL).
-    pub url: String,
-    /// Original upstream URL where this media was found.
+pub struct DetailImage {
+    pub id: MemoryImageId,
+    pub display_url: String,
     pub source_url: String,
-    pub width: i32,
-    pub height: i32,
-    /// When the image was captured (may be uncertain / a range).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub captured: Option<UncertainDate>,
-    pub annotation_kind: AnnotationKind,
+    pub label: String,
 }
 
-/// Lightweight thumbnail info for map markers (one per entity).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ThumbnailInfo {
-    /// Ready-to-use URL for fetching the thumbnail image.
-    pub url: String,
-    pub width: i32,
-    pub height: i32,
-}
+/// One placeable entity in a viewport listing: id, names, current marker, and
+/// timeline date span. Returned by `GET /entities`.
+pub type EntitySummary = listing::EntitySummary<MemoryEntityId, MemoryImageId>;
+
+/// The resume cursor threaded through `GET /entities` pagination: the walk
+/// position `summaries_in_bbox` hands back, JSON-encoded into the `cursor`
+/// query parameter for the next request.
+pub type EntityListCursor = (MemoryEntityId, FactId);
+
+/// One page of a `GET /entities` viewport listing.
+pub type EntityListPage = listing::EntityListPage<MemoryEntityId, MemoryImageId, EntityListCursor>;
 
 // ==================== Unified Markers ====================
 
-/// Typed marker identifier — either an entity UUID or a cluster OSM ID.
-///
-/// Serializes to/from a string: entity UUIDs serialize as-is, cluster IDs
-/// as `"cluster-{osm_id}"`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum MarkerId {
-    Entity(EntityId),
-    Cluster(i64),
-}
-
-const CLUSTER_ID_PREFIX: &str = "cluster-";
-
-impl fmt::Display for MarkerId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Entity(id) => write!(f, "{id}"),
-            Self::Cluster(osm_id) => write!(f, "{CLUSTER_ID_PREFIX}{osm_id}"),
-        }
-    }
-}
-
-impl Serialize for MarkerId {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> Deserialize<'de> for MarkerId {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        if let Some(osm_str) = s.strip_prefix(CLUSTER_ID_PREFIX) {
-            let osm_id = osm_str.parse::<i64>().map_err(serde::de::Error::custom)?;
-            Ok(Self::Cluster(osm_id))
-        } else {
-            Ok(Self::Entity(EntityId::new(s)))
-        }
-    }
-}
-
-impl JsonSchema for MarkerId {
-    fn schema_name() -> String {
-        "MarkerId".to_string()
-    }
-
-    fn json_schema(_generator: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-        schemars::schema::SchemaObject {
-            instance_type: Some(schemars::schema::InstanceType::String.into()),
-            ..Default::default()
-        }
-        .into()
-    }
-}
-
-/// A map marker — either an individual entity or a cluster of entities
-/// in an administrative region. The server decides which to return based
-/// on entity density in the requested bounding box.
+/// A map marker for one entity (or a co-located group of entities).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Marker {
-    /// Stable identifier. Entity UUID for individual entities,
-    /// `"cluster-{osm_id}"` for region clusters.
-    pub id: MarkerId,
+    /// The entity id — for a co-located group, the group's first member
+    /// (sorted by earliest date). `click_action` carries every member.
+    pub id: MemoryEntityId,
     pub latitude: f64,
     pub longitude: f64,
-    /// Display label (entity name or region name).
+    /// Display label (best-language entity name).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Ready-to-use thumbnail URL, resolved server-side. `None` if the
-    /// entity (or cluster representative) has no resolved media.
+    /// The representative entity's thumbnail URL, when it has a depicted image.
+    /// Same `display_url` semantics as [`DetailImage`]: served from our own
+    /// `/media/{key}` host, or the shared placeholder in dev/test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
     /// What happens when the user clicks this marker.
@@ -170,16 +89,10 @@ pub struct Marker {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
 pub enum ClickAction {
-    /// Zoom the map to this bounding box (cluster markers).
-    #[serde(rename = "zoom_to")]
-    ZoomTo {
-        #[serde(flatten)]
-        bbox: crate::types::Bbox,
-    },
-    /// Open the entity detail panel (individual entity markers).
+    /// Open the entity detail panel.
     #[serde(rename = "select")]
-    Select { entity_id: EntityId },
-    /// Show a disambiguation picker (co-located entities at the same coordinates).
+    Select { entity_id: MemoryEntityId },
+    /// Show a disambiguation picker (co-located entities at the same point).
     #[serde(rename = "disambiguate")]
     Disambiguate { entries: Vec<EntityPickerEntry> },
 }
@@ -187,7 +100,7 @@ pub enum ClickAction {
 /// One entry in a co-located entity disambiguation picker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct EntityPickerEntry {
-    pub id: String,
+    pub id: MemoryEntityId,
     pub name: Option<String>,
 }
 

@@ -4287,7 +4287,9 @@ async fn extract_point_reads_resolved_circle_and_skips_reference() -> TestResult
     let view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
     let (class, projected) =
-        project_entity::<MemoryFactStore, _, _>(&view, placed_id, member_lineage).await?;
+        project_entity::<MemoryFactStore, _, _>(&view, placed_id, member_lineage)
+            .await?
+            .ok_or("placed entity should project")?;
     let entity = crate::facts::typed::Entity::parse(&projected, &class);
     assert_eq!(
         listing::extract_point(&entity),
@@ -4296,7 +4298,9 @@ async fn extract_point_reads_resolved_circle_and_skips_reference() -> TestResult
     );
 
     let (class, projected) =
-        project_entity::<MemoryFactStore, _, _>(&view, symbolic_id, member_lineage).await?;
+        project_entity::<MemoryFactStore, _, _>(&view, symbolic_id, member_lineage)
+            .await?
+            .ok_or("symbolic entity should project")?;
     let entity = crate::facts::typed::Entity::parse(&projected, &class);
     assert_eq!(
         listing::extract_point(&entity),

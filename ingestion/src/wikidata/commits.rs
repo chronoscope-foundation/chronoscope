@@ -1273,8 +1273,9 @@ mod tests {
             .id;
 
         let view = store.now().await.map_err(|e| format!("{e:?}"))?;
-        let (class, projected) =
-            project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage).await?;
+        let (class, projected) = project_entity::<MemoryFactStore, _, _>(&view, id, member_lineage)
+            .await?
+            .ok_or("entity should project")?;
         let entity = typed::Entity::parse(&projected, &class);
 
         let texts: BTreeSet<&str> = entity.names.iter().map(|n| n.text.as_str()).collect();

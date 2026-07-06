@@ -9,19 +9,13 @@ use bytes::Bytes;
 use chrono::Utc;
 use chronoscope_core::{GeoPoint, Location, UncertainDate, UnresolvedLocation};
 use chronoscope_db::{MediaData, MediaType, ResearchUrl};
-use image::{GenericImageView, ImageEncoder};
+use image::GenericImageView;
 use image_hasher::{HashAlg, HasherConfig};
 use tracing::instrument;
 use url::Url;
 
-use crate::url_fetcher::content::{ImageFormat, content_hash, storage_key, thumbnail_key};
+use crate::url_fetcher::content::{ImageFormat, store_image};
 use crate::url_fetcher::fetcher::{FetchContext, FetchError, FetchOutcome, FetchResult};
-
-/// Maximum dimension (width or height) for thumbnails.
-const THUMBNAIL_SIZE: u32 = 512;
-
-/// JPEG quality for thumbnails (0-100).
-const THUMBNAIL_QUALITY: u8 = 80;
 
 /// Process image content: decode, extract EXIF, compute perceptual hash, store.
 #[instrument(skip_all, fields(media_id, width, height))]
@@ -32,13 +26,10 @@ pub async fn process(
     body: &Bytes,
     format: ImageFormat,
 ) -> Result<FetchResult, FetchError> {
-    // Compute exact hash
-    let exact_hash = content_hash(body);
-
-    // Decode image to get dimensions
-    let img = image::load_from_memory(body)
-        .map_err(|e| FetchError::ContentProcessing(format!("failed to decode image: {e}")))?;
-    let (width, height) = img.dimensions();
+    // Content-address, decode, and store the original + thumbnail (shared with
+    // the fact-store image resolver so the key scheme and thumbnail can't drift).
+    let stored = store_image(&ctx.media_store, body, format).await?;
+    let (width, height) = stored.image.dimensions();
 
     // Record dimensions in current span
     let span = tracing::Span::current();
@@ -46,41 +37,16 @@ pub async fn process(
     span.record("height", height);
 
     // Compute perceptual hash (Option because videos don't have one, not because this can fail)
-    let perceptual_hash = Some(compute_perceptual_hash(&img));
+    let perceptual_hash = Some(compute_perceptual_hash(&stored.image));
 
     // Extract EXIF data
     let (captured, location) = extract_exif(body);
 
-    // Generate storage key based on exact hash
-    let storage_key = storage_key(&exact_hash, format.extension());
-
-    // Store in media store
-    ctx.media_store
-        .put(&storage_key, body.clone(), format.mime_type())
-        .await?;
-
-    // Generate and store thumbnail (failures don't fail the fetch)
-    let thumb_key = thumbnail_key(&exact_hash);
-    match generate_thumbnail(&img) {
-        Ok(thumb_bytes) => {
-            if let Err(e) = ctx
-                .media_store
-                .put(&thumb_key, thumb_bytes, "image/jpeg")
-                .await
-            {
-                tracing::warn!(error = %e, "failed to store thumbnail");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to generate thumbnail");
-        }
-    }
-
     // Create media data
     let media_data = MediaData {
-        exact_hash,
+        exact_hash: stored.exact_hash,
         perceptual_hash,
-        storage_key,
+        storage_key: stored.storage_key,
         media_type: MediaType::Image,
         width: i32::try_from(width).unwrap_or(i32::MAX),
         height: i32::try_from(height).unwrap_or(i32::MAX),
@@ -127,29 +93,6 @@ fn compute_perceptual_hash(img: &image::DynamicImage) -> Vec<u8> {
 
     let hash = hasher.hash_image(img);
     hash.as_bytes().to_vec()
-}
-
-/// Generate a thumbnail from an image.
-///
-/// Resizes the image so the longest edge is at most [`THUMBNAIL_SIZE`] pixels,
-/// then encodes as JPEG with quality [`THUMBNAIL_QUALITY`].
-fn generate_thumbnail(img: &image::DynamicImage) -> Result<Bytes, String> {
-    let thumb = img.thumbnail(THUMBNAIL_SIZE, THUMBNAIL_SIZE);
-    let rgb = thumb.to_rgb8();
-
-    let mut buffer = Vec::new();
-    let encoder =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buffer, THUMBNAIL_QUALITY);
-    encoder
-        .write_image(
-            rgb.as_raw(),
-            rgb.width(),
-            rgb.height(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .map_err(|e| format!("failed to encode thumbnail: {e}"))?;
-
-    Ok(Bytes::from(buffer))
 }
 
 // ==================== EXIF Extraction ====================

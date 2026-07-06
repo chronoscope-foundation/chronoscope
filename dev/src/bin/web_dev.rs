@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_api::state::permissive_dns_resolver;
-use chronoscope_dev::{DevServerConfig, find_available_port, start_dev_server};
+use chronoscope_dev::{DevServerConfig, ImageResolveMode, find_available_port, start_dev_server};
 use chronoscope_workers::{ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::info;
@@ -31,6 +31,13 @@ struct WebDevDb {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Workers and the fact-store image resolver report via `tracing`; without a
+    // subscriber their warnings (e.g. a skipped image fetch) vanish silently.
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .init();
+
     let config_logging = ConfigLogging::StderrTerminal {
         level: ConfigLoggingLevel::Info,
     };
@@ -96,6 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log: log.clone(),
         port: api_port,
         cdn_base_url: format!("http://127.0.0.1:{api_port}"),
+        // Interactive dev serves the real Commons images from our media store.
+        image_resolve: ImageResolveMode::Fetch,
         rp_id: None,
         rp_origin: None,
         ios_app_id: None,

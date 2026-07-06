@@ -19,8 +19,8 @@ pub use auth::{
 };
 pub use client::{ApiError, AuthClient, AuthError, Client, login, paginate, register};
 pub use entities::{
-    AnnotationSummary, ClickAction, EntityLinkSummary, EntityPickerEntry, EntityResponse,
-    EntitySummary, Marker, MarkerId, MarkersResponse, MediaSummary, ThumbnailInfo,
+    ClickAction, DetailImage, Entity, EntityDetail, EntityListCursor, EntityListPage,
+    EntityPickerEntry, EntitySummary, Marker, MarkersResponse,
 };
 pub use ids::{
     AnnotationId, Email, EntityId, EntityLinkId, MediaId, ResearchUrlId, SourceId, UserId,

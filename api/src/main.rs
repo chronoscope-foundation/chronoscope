@@ -34,9 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dns_resolver = default_dns_resolver()?;
 
     // No production data source feeds the fact store yet — it starts empty.
-    // The SQLite-backed store still serves reads; this will populate once a
-    // fact-store-backed read path lands.
+    // The entity read endpoints project from it directly; the SQLite
+    // `Database` still exists (auth, research, media) but no longer backs
+    // entity reads. With no images to resolve, the media map is empty.
     let facts = MemoryFactStore::new();
+    let image_media = Arc::new(std::collections::HashMap::new());
 
     // When embedded-media feature is enabled (e.g., dev builds), we need a media store.
     // Production builds without the feature don't need one.
@@ -51,12 +53,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 dns_resolver,
                 std::sync::Arc::new(InMemoryMediaStore::new()),
                 facts,
+                image_media,
             )
             .await?,
         )
     };
     #[cfg(not(feature = "embedded-media"))]
-    let app_state = Arc::new(AppState::new(db.clone(), config, jwt, dns_resolver, facts).await?);
+    let app_state =
+        Arc::new(AppState::new(db.clone(), config, jwt, dns_resolver, facts, image_media).await?);
 
     // Configure Dropshot
     let config_dropshot = ConfigDropshot {

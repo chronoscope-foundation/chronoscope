@@ -12,11 +12,11 @@ use crate::components::map::{EntityPickerEntry, EntitySelection, SelectedEntity}
 /// Content currently displayed in the lightbox overlay.
 #[derive(Clone, Debug)]
 pub struct LightboxContent {
-    /// CDN URL for the full image.
+    /// URL the overlay `<img>` loads (the resolved `display_url`).
     pub url: String,
     /// Alt text for accessibility.
     pub alt: String,
-    /// Original upstream URL (for "Open original" link).
+    /// Real upstream URL, for the "Open original" link.
     pub source_url: String,
 }
 
@@ -99,7 +99,7 @@ pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::Client>>>) -> impl I
             {move || {
                 selected.get().map(|selection| {
                     let title = match &selection {
-                        EntitySelection::Single(_, _) => "Entity Details",
+                        EntitySelection::Single { .. } => "Entity Details",
                         EntitySelection::Multiple(_) => "Multiple Entities",
                     };
                     view! {
@@ -109,7 +109,7 @@ pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::Client>>>) -> impl I
                                 <DismissButton on_click=dismiss extra_class="ml-4"/>
                             </div>
                             {match selection {
-                                EntitySelection::Single(id, back_entries) => view! {
+                                EntitySelection::Single { detail: id, back: back_entries, .. } => view! {
                                     <div>
                                         {back_entries.map(|entries| {
                                             let go_back = move |_| {
@@ -124,7 +124,7 @@ pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::Client>>>) -> impl I
                                                 </button>
                                             }
                                         })}
-                                        <EntityDetailContent id=id.clone() api_client=Rc::clone(&api_client)/>
+                                        <EntityDetailContent id=id api_client=Rc::clone(&api_client)/>
                                     </div>
                                 }.into_any(),
                                 EntitySelection::Multiple(entries) => view! {
@@ -151,10 +151,18 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
         </p>
         <ul class="space-y-2">
             {entries.into_iter().map(|entry| {
-                let id = entry.id.clone();
+                let id = entry.id;
                 let back = Rc::clone(&all_entries);
                 let select = move |_| {
-                    set_selected.set(Some(EntitySelection::Single(id.clone(), Some((*back).clone()))));
+                    // The marker's feature id is its representative — the first
+                    // (earliest) entry the server sorted the group by, which is
+                    // also `marker.id`. Highlight that, whichever member is picked.
+                    let feature = back.first().map(|e| e.id).unwrap_or(id);
+                    set_selected.set(Some(EntitySelection::Single {
+                        detail: id,
+                        feature,
+                        back: Some((*back).clone()),
+                    }));
                 };
                 let display_name = entry.name.as_deref().unwrap_or("Unknown");
                 let aria = display_name.to_string();
@@ -177,13 +185,14 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
 
 /// Fetches and displays entity detail content.
 #[component]
-fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>) -> impl IntoView {
-    let id_clone = id.clone();
+fn EntityDetailContent(
+    id: MemoryEntityId,
+    api_client: Rc<RefCell<Option<api::Client>>>,
+) -> impl IntoView {
     let (retry_count, set_retry_count) = signal(0u32);
     let detail = LocalResource::new(move || {
         // Include retry_count in the dependency so incrementing it re-fetches.
         let _retry = retry_count.get();
-        let id = id_clone.clone();
         let api = api_client.clone();
         async move {
             let client = crate::api::get_or_init_client(&api)
@@ -204,7 +213,7 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                         Ok(entity) => view! {
                             <div>
                                 <h3 class="text-base font-semibold text-ink mb-3">
-                                    {entity.name.unwrap_or_else(|| "Unnamed entity".to_string())}
+                                    {entity.name.clone().unwrap_or_else(|| "Unnamed entity".to_string())}
                                 </h3>
 
                                 // Timeline
@@ -231,7 +240,7 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                                                 };
                                                 view! {
                                                     <li class="pl-2 border-l-2 border-copper/30">
-                                                        <span class="font-semibold">{r.label}</span>
+                                                        <span class="font-semibold">{r.label.clone()}</span>
                                                         {date_view}
                                                         {r.description.as_ref().map(|desc| view! {
                                                             <p class="text-xs text-sepia/70 mt-0.5">{desc.clone()}</p>
@@ -256,10 +265,10 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                                             </p>
                                             <ul class="grid grid-cols-2 gap-2" role="list">
                                                 {entity.media.iter().map(|m| {
-                                                    let alt = format!("{} view", m.kind_label);
-                                                    let aria = format!("{} — opens preview", alt);
+                                                    let alt = format!("{} view", m.label);
+                                                    let aria = format!("{alt} \u{2014} opens preview");
                                                     let content = LightboxContent {
-                                                        url: m.url.clone(),
+                                                        url: m.display_url.clone(),
                                                         alt: alt.clone(),
                                                         source_url: m.source_url.clone(),
                                                     };
@@ -279,24 +288,16 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
                                                                 // Loading placeholder (visible until image loads)
                                                                 <div class="w-full aspect-square bg-sepia/10 animate-pulse absolute inset-0"/>
                                                                 <img
-                                                                    src={m.url.clone()}
+                                                                    src={m.display_url.clone()}
                                                                     alt=alt
                                                                     loading="lazy"
                                                                     class="w-full aspect-square object-cover relative"
                                                                 />
-                                                                // Date as primary badge (top-left pill)
-                                                                {m.date_label.as_ref().map(|d| view! {
-                                                                    <span class="absolute top-1 left-1 px-1.5 py-0.5 \
-                                                                                 bg-ink/70 text-white text-xs font-sans \
-                                                                                 rounded-full">
-                                                                        {d.clone()}
-                                                                    </span>
-                                                                })}
-                                                                // Kind badge (bottom-right pill)
+                                                                // Caption badge (bottom-right pill)
                                                                 <span class="absolute bottom-1 right-1 px-1.5 py-0.5 \
                                                                              bg-ink/70 text-white text-xs font-sans \
                                                                              rounded-full">
-                                                                    {m.kind_label.clone()}
+                                                                    {m.label.clone()}
                                                                 </span>
                                                             </button>
                                                         </li>
@@ -362,23 +363,20 @@ fn EntityDetailContent(id: String, api_client: Rc<RefCell<Option<api::Client>>>)
 
 /// One row in the rendered entity timeline.
 ///
-/// Each row corresponds to one [`chronoscope_core::Moment`] — a per-endpoint
-/// projection of an `EntityTransition`. A `Constructed` with both
-/// `started_at` and `completed_at` becomes two rows ("Construction started"
-/// and "Construction completed"), each sortable independently by its own
-/// date.
-///
-/// We hold an `UncertainDate` rather than a pre-formatted string so the
-/// renderer can decide presentation (precision, range collapsing) at the
-/// point of use, and so the sort key derives from the same value the
-/// renderer displays.
+/// Each row corresponds to one dated (or dateless) endpoint of a
+/// [`TimelineEntry`]: a period-shaped phase (construction, demolition, an
+/// interior span like modification or repair) contributes one row per
+/// endpoint that actually carries a date, collapsing to a single dateless
+/// row when neither endpoint does; a point-shaped interior event (usage
+/// change, designation) contributes one row for its instant.
 #[derive(Debug, Clone)]
 struct TimelineRow {
-    label: &'static str,
-    /// `None` when the date for this endpoint is unknown.
+    label: String,
+    /// `None` when the date for this row is unknown.
     date: Option<UncertainDate>,
-    /// Optional secondary text shown beneath the row (e.g. the description
-    /// on `UsageModified` or `Modified`).
+    /// Optional secondary text shown beneath the row (free-text
+    /// descriptions authored on the underlying event, plus — for
+    /// `Designated` — the settled designation text).
     description: Option<String>,
 }
 
@@ -388,12 +386,14 @@ struct LinkInfo {
     url: String,
 }
 
+/// One image in the detail grid: the URL the grid/lightbox load
+/// (`display_url`), the real upstream URL for the "Open original" link
+/// (`source_url`), and a short caption.
 #[derive(Debug, Clone)]
 struct MediaInfo {
-    url: String,
+    display_url: String,
     source_url: String,
-    kind_label: String,
-    date_label: Option<String>,
+    label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -404,61 +404,41 @@ struct EntityDetailView {
     media: Vec<MediaInfo>,
 }
 
-/// Return the browser's preferred language prefix (e.g. "en" from "en-US"),
-/// falling back to "en" if the navigator API is unavailable.
-fn browser_language_prefix() -> String {
-    web_sys::window()
-        .map(|w| w.navigator().language().unwrap_or_default())
-        .and_then(|lang| lang.split('-').next().map(String::from))
-        .unwrap_or_else(|| "en".to_string())
-}
+use std::collections::BTreeSet;
 
-use chronoscope_api_client::EntityId;
-use chronoscope_core::AnnotationKind;
+use chronoscope_core::Claimed;
 use chronoscope_core::date::{DateBound, DatePrecision, UncertainDate};
-use chronoscope_core::entity::EntityTransition;
-use chronoscope_core::links::{LinkTarget, LinkType};
-use chronoscope_core::moment::{Moment, TransitionRole, decompose, topological_order};
+use chronoscope_core::facts::citations::ExternalReference;
+use chronoscope_core::facts::lifecycle::{DamageCause, MoveMethod, Usage};
+use chronoscope_core::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
+use chronoscope_core::facts::typed::{
+    Attributed, Bounded, Consensus, EventDetail, InteriorEvent, Period, TimelineEntry, best_name,
+};
+use chronoscope_core::ids::OsmElementType;
+use chronoscope_core::location::{LocationReference, UnresolvedLocation};
 
-/// Fetch entity detail using the typed API client.
-async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDetailView, String> {
-    let entity_id = EntityId::new(id);
-    let resp = client
-        .get_entity(&entity_id)
-        .await
-        .map_err(|e| e.to_string())?;
+/// Fetch entity detail using the typed API client and flatten it into the
+/// view model the panel renders.
+async fn fetch_entity_detail(
+    id: &MemoryEntityId,
+    client: &api::Client,
+) -> Result<EntityDetailView, String> {
+    let api::EntityDetail { entity, images } =
+        client.get_entity(id).await.map_err(|e| e.to_string())?;
 
-    let name = resp
-        .entity
-        .best_name(&browser_language_prefix())
-        .map(String::from);
-
-    // Decompose into per-endpoint moments and sort using core's topological
-    // order, then map each Moment to a display row. The sort respects both
-    // structural edges (construction-end before demolition-start) and date
-    // edges, so the Mole Antonelliana case (Construction completed 1889 +
-    // UsageModified 1888) renders the usage change between the unknown
-    // construction start and the dated construction completion.
-    let moments = topological_order(decompose(&resp.entity.transitions));
-    let timeline: Vec<TimelineRow> = moments.iter().map(moment_to_row).collect();
-
-    let links = resp
-        .links
+    let name = best_name(&entity.names, &browser_language_prefix()).map(|n| n.text.clone());
+    let timeline = entity.timeline.iter().flat_map(timeline_rows).collect();
+    let links = entity
+        .external_refs
         .iter()
-        .filter_map(|link| {
-            let (url, label) = format_link(&link.link_type, &link.target)?;
-            Some(LinkInfo { label, url })
-        })
+        .filter_map(|r| link_info(&r.value))
         .collect();
-
-    let media = resp
-        .media
-        .iter()
-        .map(|m| MediaInfo {
-            url: m.url.clone(),
-            source_url: m.source_url.clone(),
-            kind_label: format_annotation_kind(&m.annotation_kind),
-            date_label: m.captured.as_ref().map(format_uncertain_date),
+    let media = images
+        .into_iter()
+        .map(|img| MediaInfo {
+            display_url: img.display_url,
+            source_url: img.source_url,
+            label: img.label,
         })
         .collect();
 
@@ -470,66 +450,306 @@ async fn fetch_entity_detail(id: &str, client: &api::Client) -> Result<EntityDet
     })
 }
 
-/// Map a [`Moment`] to a display row.
-fn moment_to_row(m: &Moment<'_, chronoscope_api_client::SourceId>) -> TimelineRow {
-    TimelineRow {
-        label: role_label(m.role, m.collapsed),
-        date: m.date.map(|c| c.value.clone()),
-        description: moment_description(m),
+/// The browser's preferred language prefix (e.g. "en" from "en-US"), falling
+/// back to "en" when the navigator API is unavailable. Feeds the display-name
+/// choice so the detail heading prefers the viewer's own language.
+fn browser_language_prefix() -> String {
+    web_sys::window()
+        .map(|w| w.navigator().language().unwrap_or_default())
+        .and_then(|lang| lang.split('-').next().map(String::from))
+        .unwrap_or_else(|| "en".to_string())
+}
+
+// ==================== Timeline flattening ====================
+
+/// The endpoint-specific and bare labels for one period-shaped lifecycle
+/// phase (construction, demolition, or a durational interior event).
+struct PhaseLabels {
+    started: &'static str,
+    completed: &'static str,
+    /// Used when neither endpoint carries a date.
+    bare: &'static str,
+}
+
+/// Flatten one timeline entry into its display row(s).
+fn timeline_rows(entry: &TimelineEntry<MemoryEventId, MemoryImageId>) -> Vec<TimelineRow> {
+    match &entry.detail {
+        EventDetail::Constructed { period, .. } => period_rows(
+            PhaseLabels {
+                started: "Construction started",
+                completed: "Construction completed",
+                bare: "Constructed",
+            },
+            period,
+            None,
+        ),
+        EventDetail::Demolished { period } => period_rows(
+            PhaseLabels {
+                started: "Demolition started",
+                completed: "Demolition completed",
+                bare: "Demolished",
+            },
+            period,
+            None,
+        ),
+        EventDetail::Interior {
+            descriptions, kind, ..
+        } => interior_rows(kind, join_descriptions(descriptions)),
     }
 }
 
-/// Human-readable label for a transition role. Uses the bare form
-/// ("Constructed") when the moment was collapsed from a both-undated
-/// durational, otherwise the endpoint-specific form ("Construction started").
-fn role_label(role: TransitionRole, collapsed: bool) -> &'static str {
-    if collapsed {
-        match role {
-            TransitionRole::ConstructionStart => "Constructed",
-            TransitionRole::ModificationStart => "Modified",
-            TransitionRole::RepairStart => "Repaired",
-            TransitionRole::DemolitionStart => "Demolished",
-            _ => role_label(role, false),
-        }
-    } else {
-        match role {
-            TransitionRole::ConstructionStart => "Construction started",
-            TransitionRole::ConstructionEnd => "Construction completed",
-            TransitionRole::ModificationStart => "Modification started",
-            TransitionRole::ModificationEnd => "Modification completed",
-            TransitionRole::RepairStart => "Repair started",
-            TransitionRole::RepairEnd => "Repair completed",
-            TransitionRole::Damaged => "Damaged",
-            TransitionRole::Moved => "Moved",
-            TransitionRole::UsageModified => "Usage modified",
-            TransitionRole::Designated => "Designated",
-            TransitionRole::DemolitionStart => "Demolition started",
-            TransitionRole::DemolitionEnd => "Demolition completed",
-        }
-    }
-}
-
-/// Secondary display text for a moment, extracted from the parent transition.
-fn moment_description<S>(m: &Moment<'_, S>) -> Option<String> {
-    match m.transition {
-        EntityTransition::Modified { description, .. }
-        | EntityTransition::Repaired { description, .. }
-        | EntityTransition::Damaged { description, .. }
-        | EntityTransition::UsageModified { description, .. } => description.clone(),
-        EntityTransition::Demolished { cause, .. } | EntityTransition::Moved { cause, .. } => {
-            cause.clone()
-        }
-        EntityTransition::Designated {
-            designation,
+/// Flatten one interior event's kind into its display row(s), threading
+/// through the entry-level free-text descriptions.
+fn interior_rows(
+    kind: &InteriorEvent<MemoryImageId>,
+    description: Option<String>,
+) -> Vec<TimelineRow> {
+    match kind {
+        InteriorEvent::Modified { period } => period_rows(
+            PhaseLabels {
+                started: "Modification started",
+                completed: "Modification completed",
+                bare: "Modified",
+            },
+            period,
             description,
-            ..
-        } => Some(match description {
-            Some(extra) => format!("{designation} \u{2014} {extra}"),
-            None => designation.clone(),
-        }),
-        EntityTransition::Constructed { .. } => None,
+        ),
+        InteriorEvent::Repaired { period } => period_rows(
+            PhaseLabels {
+                started: "Repair started",
+                completed: "Repair completed",
+                bare: "Repaired",
+            },
+            period,
+            description,
+        ),
+        InteriorEvent::Damaged { period, cause } => period_rows(
+            PhaseLabels {
+                started: "Damage started",
+                completed: "Damage completed",
+                bare: "Damaged",
+            },
+            period,
+            combine_description(cause.settled().map(damage_cause_label), description),
+        ),
+        InteriorEvent::Moved { period, method, to } => period_rows(
+            PhaseLabels {
+                started: "Move started",
+                completed: "Move completed",
+                bare: "Moved",
+            },
+            period,
+            combine_description(move_summary(method, to), description),
+        ),
+        InteriorEvent::UsageChanged { at, usages } => vec![point_row(
+            "Usage changed",
+            at,
+            combine_description(usages.settled().map(usage_set_label), description),
+        )],
+        InteriorEvent::Designated { at, designation } => vec![point_row(
+            "Designated",
+            at,
+            combine_description(settled_designation(designation), description),
+        )],
+        InteriorEvent::Ambiguous { facts, .. } => vec![TimelineRow {
+            label: "Event".to_string(),
+            date: best_bound(&[&facts.started, &facts.completed, &facts.occurred]),
+            description,
+        }],
     }
 }
+
+/// Flatten a period into one row per dated endpoint, or a single bare row
+/// with "date unknown" when neither endpoint carries a date. `description`
+/// attaches to the terminal-most row present (completed over started).
+fn period_rows(
+    labels: PhaseLabels,
+    period: &Period<MemoryImageId>,
+    description: Option<String>,
+) -> Vec<TimelineRow> {
+    let started = has_date(&period.started).then(|| period.started.possible.clone());
+    let completed = has_date(&period.completed).then(|| period.completed.possible.clone());
+
+    match (started, completed) {
+        (None, None) => vec![TimelineRow {
+            label: labels.bare.to_string(),
+            date: None,
+            description,
+        }],
+        (Some(s), None) => vec![TimelineRow {
+            label: labels.started.to_string(),
+            date: Some(s),
+            description,
+        }],
+        (None, Some(c)) => vec![TimelineRow {
+            label: labels.completed.to_string(),
+            date: Some(c),
+            description,
+        }],
+        (Some(s), Some(c)) => vec![
+            TimelineRow {
+                label: labels.started.to_string(),
+                date: Some(s),
+                description: None,
+            },
+            TimelineRow {
+                label: labels.completed.to_string(),
+                date: Some(c),
+                description,
+            },
+        ],
+    }
+}
+
+/// One point-shaped interior event's row.
+fn point_row(
+    label: &str,
+    at: &Bounded<UncertainDate, MemoryImageId>,
+    description: Option<String>,
+) -> TimelineRow {
+    TimelineRow {
+        label: label.to_string(),
+        date: has_date(at).then(|| at.possible.clone()),
+        description,
+    }
+}
+
+/// Whether a claim actually touched this date slot — `Absent` means no
+/// source ever asserted it, so the row renders "date unknown" rather than
+/// the honest-but-meaningless bottom value.
+fn has_date(bounded: &Bounded<UncertainDate, MemoryImageId>) -> bool {
+    !matches!(bounded.consensus, Consensus::Absent)
+}
+
+/// The first dated bound among several candidates, in priority order. Used
+/// for `Ambiguous` events, whose kind (and thus which date field is
+/// authoritative) never settled.
+fn best_bound(bounds: &[&Bounded<UncertainDate, MemoryImageId>]) -> Option<UncertainDate> {
+    bounds
+        .iter()
+        .find_map(|b| has_date(b).then(|| b.possible.clone()))
+}
+
+/// Join an interior event's free-text descriptions into one secondary line.
+fn join_descriptions(descriptions: &[Attributed<String, MemoryImageId>]) -> Option<String> {
+    if descriptions.is_empty() {
+        return None;
+    }
+    Some(
+        descriptions
+            .iter()
+            .map(|d| d.value.as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// The designation text when the claim settled to exactly one value —
+/// conflicting or unsettled designations render dateless label + date only,
+/// rather than guessing among rivals.
+fn settled_designation(designation: &Bounded<Claimed<String>, MemoryImageId>) -> Option<String> {
+    designation.settled().cloned()
+}
+
+/// Combine a structured primary description (e.g. a settled designation)
+/// with the entry's free-text descriptions.
+fn combine_description(primary: Option<String>, extra: Option<String>) -> Option<String> {
+    match (primary, extra) {
+        (Some(a), Some(b)) => Some(format!("{a} \u{2014} {b}")),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// A human-readable label for a settled damage cause. `Other` surfaces its
+/// authored free-text description verbatim.
+fn damage_cause_label(cause: &DamageCause) -> String {
+    match cause {
+        DamageCause::Earthquake => "Earthquake".to_string(),
+        DamageCause::Fire => "Fire".to_string(),
+        DamageCause::Flood => "Flood".to_string(),
+        DamageCause::Neglect => "Neglect".to_string(),
+        DamageCause::Structural => "Structural failure".to_string(),
+        DamageCause::Vandalism => "Vandalism".to_string(),
+        DamageCause::War => "War".to_string(),
+        DamageCause::Weather => "Weather".to_string(),
+        DamageCause::Other { description } => description.clone(),
+    }
+}
+
+/// A human-readable label for one usage category. `Other` surfaces its authored
+/// free-text description verbatim.
+fn usage_label(usage: &Usage) -> String {
+    match usage {
+        Usage::Unknown => "In use".to_string(),
+        Usage::Agricultural => "Agricultural".to_string(),
+        Usage::Commercial => "Commercial".to_string(),
+        Usage::Cultural => "Cultural".to_string(),
+        Usage::Educational => "Educational".to_string(),
+        Usage::Healthcare => "Healthcare".to_string(),
+        Usage::Industrial => "Industrial".to_string(),
+        Usage::Infrastructure => "Infrastructure".to_string(),
+        Usage::Institutional => "Institutional".to_string(),
+        Usage::Military => "Military".to_string(),
+        Usage::Recreational => "Recreational".to_string(),
+        Usage::Religious => "Religious".to_string(),
+        Usage::Residential => "Residential".to_string(),
+        Usage::Transportation => "Transportation".to_string(),
+        Usage::Other { description } => description.clone(),
+    }
+}
+
+/// The new usage set a `UsageChanged` event settled on, joined for display. An
+/// empty set is the type's documented "vacant or closed" state.
+fn usage_set_label(usages: &BTreeSet<Usage>) -> String {
+    if usages.is_empty() {
+        return "Vacant or closed".to_string();
+    }
+    usages
+        .iter()
+        .map(usage_label)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A settled move method as a short phrase for the timeline's secondary line.
+fn move_method_label(method: &MoveMethod) -> &'static str {
+    match method {
+        MoveMethod::Disassembled => "Disassembled",
+        MoveMethod::Whole => "Moved intact",
+    }
+}
+
+/// The destination of a move when it names a displayable place — a named place
+/// or a street address. A bare coordinate, a symbolic reference, or a region
+/// combinator yields `None` rather than a fabricated label.
+fn location_display(location: &UnresolvedLocation) -> Option<String> {
+    match location {
+        UnresolvedLocation::Reference(LocationReference::NamedPlace { name }) => Some(name.clone()),
+        UnresolvedLocation::Reference(LocationReference::Address { address_text }) => {
+            Some(address_text.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The secondary line for a `Moved` event: its settled method and, when the
+/// destination names a place, where it went.
+fn move_summary(
+    method: &Bounded<Claimed<MoveMethod>, MemoryImageId>,
+    to: &Bounded<UnresolvedLocation, MemoryImageId>,
+) -> Option<String> {
+    let method = method.settled().map(move_method_label);
+    let destination = location_display(&to.possible);
+    match (method, destination) {
+        (Some(m), Some(d)) => Some(format!("{m}, to {d}")),
+        (Some(m), None) => Some(m.to_string()),
+        (None, Some(d)) => Some(format!("Moved to {d}")),
+        (None, None) => None,
+    }
+}
+
+// ==================== Date formatting ====================
 
 /// Format a [`DateBound`] for display, truncating to the appropriate precision.
 fn format_date_bound(bound: &DateBound) -> String {
@@ -566,51 +786,79 @@ fn format_uncertain_date(date: &UncertainDate) -> String {
     }
 }
 
-/// Format an annotation kind into a short display label.
-fn format_annotation_kind(kind: &AnnotationKind) -> String {
-    match kind {
-        AnnotationKind::SpatialTrace { .. } => "Spatial".to_string(),
-        AnnotationKind::ExteriorView { .. } => "Exterior".to_string(),
-        AnnotationKind::InteriorView { .. } => "Interior".to_string(),
-        AnnotationKind::TextualNote { .. } => "Note".to_string(),
+// ==================== External links ====================
+
+/// Build a display link for one external reference. `Wikidata` is the
+/// common case (every Wikidata-sourced entity carries one); the rest cover
+/// the full [`ExternalReference`] vocabulary with the same host/path shapes
+/// [`ExternalReference::from_url`] recognizes, so a reference round-trips
+/// back to the URL it was likely parsed from.
+fn link_info(reference: &ExternalReference) -> Option<LinkInfo> {
+    match reference {
+        ExternalReference::Wikidata { qid } => Some(LinkInfo {
+            label: "Wikidata".to_string(),
+            url: format!("https://www.wikidata.org/wiki/{qid}"),
+        }),
+        ExternalReference::Wikipedia { language, title } => Some(LinkInfo {
+            label: format!("Wikipedia ({})", language.as_str()),
+            url: format!(
+                "https://{}.wikipedia.org/wiki/{}",
+                language.as_str(),
+                title.replace(' ', "_")
+            ),
+        }),
+        ExternalReference::OpenStreetMap { element_type, id } => Some(LinkInfo {
+            label: "OpenStreetMap".to_string(),
+            url: format!(
+                "https://www.openstreetmap.org/{}/{id}",
+                osm_element_path(*element_type)
+            ),
+        }),
+        ExternalReference::OpenHistoricalMap { element_type, id } => Some(LinkInfo {
+            label: "OpenHistoricalMap".to_string(),
+            url: format!(
+                "https://www.openhistoricalmap.org/{}/{id}",
+                osm_element_path(*element_type)
+            ),
+        }),
+        ExternalReference::GeoNames { id } => Some(LinkInfo {
+            label: "GeoNames".to_string(),
+            url: format!("https://www.geonames.org/{id}"),
+        }),
+        ExternalReference::GettyTgn { id } => Some(LinkInfo {
+            label: "Getty TGN".to_string(),
+            url: format!("https://vocab.getty.edu/tgn/{id}"),
+        }),
+        ExternalReference::Pleiades { place_id } => Some(LinkInfo {
+            label: "Pleiades".to_string(),
+            url: format!("https://pleiades.stoa.org/places/{place_id}"),
+        }),
+        ExternalReference::Nrhp { reference_number } => Some(LinkInfo {
+            label: "NRHP".to_string(),
+            url: format!("https://npgallery.nps.gov/NRHP/AssetDetail?assetID={reference_number}"),
+        }),
+        ExternalReference::WikimediaCommonsCategory { category } => Some(LinkInfo {
+            label: "Wikimedia Commons".to_string(),
+            url: format!(
+                "https://commons.wikimedia.org/wiki/Category:{}",
+                category.as_str().replace(' ', "_")
+            ),
+        }),
+        ExternalReference::UnmodeledUrl { url } => {
+            extract_domain(url.as_str()).map(|domain| LinkInfo {
+                label: domain,
+                url: url.to_string(),
+            })
+        }
     }
 }
 
-/// Format a link target into a URL and human-readable label.
-fn format_link(link_type: &LinkType, target: &LinkTarget) -> Option<(String, String)> {
-    let url = target.to_url().to_string();
-
-    // Filter out non-HTTP URLs (e.g., javascript:)
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return None;
+fn osm_element_path(element_type: OsmElementType) -> &'static str {
+    match element_type {
+        OsmElementType::Node => "node",
+        OsmElementType::Way => "way",
+        OsmElementType::Relation => "relation",
     }
-
-    let target_label = match target {
-        LinkTarget::Wikidata { .. } => "Wikidata".to_string(),
-        LinkTarget::Wikipedia { language, .. } => format!("Wikipedia ({})", language.as_str()),
-        LinkTarget::Pleiades { .. } => "Pleiades".to_string(),
-        LinkTarget::OpenStreetMap { .. } => "OpenStreetMap".to_string(),
-        LinkTarget::WikimediaCommons { .. } => "Wikimedia Commons".to_string(),
-        LinkTarget::Nrhp { .. } => "NRHP".to_string(),
-        LinkTarget::GeoNames { .. } => "GeoNames".to_string(),
-        LinkTarget::GettyTgn { .. } => "Getty TGN".to_string(),
-        LinkTarget::Sanborn { .. } => "Sanborn Maps".to_string(),
-        LinkTarget::Url { url } => {
-            extract_domain(url.as_str()).unwrap_or_else(|| "Link".to_string())
-        }
-    };
-
-    // For same_as links, just show the target name.
-    // For other relationship types, prefix with the relationship.
-    let label = match link_type {
-        LinkType::SameAs => target_label,
-        _ => {
-            let rel = link_type.as_ref().replace('_', " ");
-            format!("{rel}: {target_label}")
-        }
-    };
-
-    Some((url, label))
 }
 
 /// Extract the domain from a URL string (e.g., `"https://example.com/path"` -> `"example.com"`).
