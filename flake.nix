@@ -70,8 +70,8 @@
             lib
             src
             ;
-          # Lazy: only `test`/`llvm-cov` force these, so the regions/wikidata/
-          # web cycle stays unresolved at eval time.
+          # Lazy: only `test`/`llvm-cov` force these, so the wikidata/web
+          # cycle stays unresolved at eval time.
           testExtraEnv = apiRuntimeEnv // webEnv;
         };
 
@@ -104,7 +104,6 @@
             ;
           rustCommonArgs = rust.commonArgs;
           inherit (rust) cargoArtifacts;
-          regionsDb = regions.regions.italy.db;
         };
 
         web = import ./nix/web.nix {
@@ -150,9 +149,7 @@
         # backend/web dev shells AND by the hermetic test/llvm-cov checks).
         apiRuntimeEnv = {
           SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
-          WIKIDATA_TEST_DB = wikidata.bundles.curated.testDb;
           WIKIDATA_ENTITIES_JSONL = "${wikidata.bundles.curated.entities}/entities.jsonl";
-          REGIONS_DB = "${regions.regions.italy.db}/regions.sqlite";
         };
         backendEnv = apiRuntimeEnv // {
           PROTOC = "${pkgs.protobuf}/bin/protoc";
@@ -231,8 +228,7 @@
             fi
           }
         '';
-        pinWikidataRoot = "_pin wikidata-test-db ${wikidata.bundles.curated.testDb}";
-        pinRegionsItaly = "_pin regions-italy-db ${regions.regions.italy.db}";
+        pinWikidataRoot = "_pin wikidata-entities ${wikidata.bundles.curated.entities}";
         pinWeights = ''
           _pin dinov3-weights ${pythonEnvs.dinov3Repo}
           _pin sam3-weights ${pythonEnvs.sam3Cache}
@@ -278,8 +274,7 @@
           rust.packages
           // web.packages
           // {
-            api-italy = api.mkApi { regions = regions.regions.italy; };
-            api-world = api.mkApi { regions = regions.regions.world; };
+            inherit (api) api;
 
             corpus-images = corpus.corpusImages;
             corpus-fetch = corpus.corpusFetchBin;
@@ -291,8 +286,6 @@
             sam3-weights = pythonEnvs.sam3Cache;
 
             wikidata-curated-entities = wikidata.bundles.curated.entities;
-            wikidata-curated-bundle = wikidata.bundles.curated.ingestionBundle;
-            wikidata-curated-db = wikidata.bundles.curated.testDb;
 
             regions-italy-db = regions.regions.italy.db;
             regions-world-db = regions.regions.world.db;
@@ -324,7 +317,6 @@
             shellHook = ''
               ${gcRootsPrelude}
               ${pinWikidataRoot}
-              ${pinRegionsItaly}
               ${mkBanner "api" ""}
             '';
           };
@@ -345,7 +337,6 @@
             shellHook = ''
               ${gcRootsPrelude}
               ${pinWikidataRoot}
-              ${pinRegionsItaly}
               ${mkBanner "web" ""}
             '';
           };
@@ -372,7 +363,6 @@
             shellHook = ''
               ${gcRootsPrelude}
               ${pinWikidataRoot}
-              ${pinRegionsItaly}
               ${pinWeights}
               ${pinCorpus}
               ${mkBanner "analysis" ''

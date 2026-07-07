@@ -46,7 +46,6 @@ pub mod ids;
 pub mod ingestion;
 pub mod links;
 pub mod location;
-pub mod merge;
 pub mod moment;
 pub mod nonempty;
 

@@ -219,7 +219,7 @@ pub struct WebTest {
     // drops. Underscore prefix tells rustc the read-only nature is intentional.
     _tmp_dir: tempfile::TempDir,
     _browser_data_dir: tempfile::TempDir,
-    _db_tmp: tempfile::TempDir,
+    _db_dir: tempfile::TempDir,
 }
 
 #[derive(Debug, Clone)]
@@ -243,27 +243,12 @@ impl WebTest {
         Ok(())
     }
 
-    /// Create a new test backed by the Wikidata test database. Called by
-    /// `web_test()`; tests go through that runner rather than constructing
-    /// `WebTest` directly.
+    /// Create a new test backed by a fresh throwaway database and the curated
+    /// fact store. Called by `web_test()`; tests go through that runner rather
+    /// than constructing `WebTest` directly.
     async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let dist_dir = web_dist()?;
         let (browser, handler_handle, browser_data_dir) = launch_browser().await?;
-
-        // Copy the Wikidata test DB to a writable temp dir (Nix store is read-only,
-        // SQLite needs write access for WAL).
-        let db_tmp = tempfile::tempdir()?;
-        let wikidata_db = std::env::var("WIKIDATA_TEST_DB")
-            .map_err(|_| "WIKIDATA_TEST_DB not set \u{2014} run inside nix develop")?;
-        let src_db = PathBuf::from(&wikidata_db).join("wikidata.db");
-        let dst_db = db_tmp.path().join("wikidata.db");
-        std::fs::copy(&src_db, &dst_db)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dst_db, std::fs::Permissions::from_mode(0o644))?;
-        }
-        let database_url = Some(format!("sqlite:{}", dst_db.display()));
 
         // Start API server
         let port = find_available_port()?;
@@ -277,12 +262,20 @@ impl WebTest {
         let http_client: Arc<dyn chronoscope_workers::HttpClient> =
             Arc::new(chronoscope_workers::ReqwestClient::new()?);
 
-        let wikidata_entities_jsonl = std::env::var("WIKIDATA_ENTITIES_JSONL")
-            .ok()
-            .map(PathBuf::from);
+        // Fresh file-backed SQLite DB per test — the pool reaps idle
+        // connections, and a shared-cache in-memory DB would vanish with its
+        // last one during a long suite run. TempDir so the -wal/-shm siblings
+        // SQLite writes next to the .db are cleaned up together.
+        let db_dir = tempfile::tempdir()?;
+        let database_url = format!("sqlite:{}", db_dir.path().join("web-test.db").display());
+
+        let wikidata_entities_jsonl = PathBuf::from(
+            std::env::var("WIKIDATA_ENTITIES_JSONL")
+                .map_err(|_| "WIKIDATA_ENTITIES_JSONL not set \u{2014} run inside nix develop")?,
+        );
 
         let server = start_dev_server(DevServerConfig {
-            database_url,
+            database_url: Some(database_url),
             http_client,
             worker_idle_backoff: Duration::from_secs(60), // Workers not needed for frontend tests
             retry_config: RetryConfig::default(),
@@ -297,14 +290,9 @@ impl WebTest {
             apify_config: None,
             triton: None,
             dns_resolver: chronoscope_api::state::permissive_dns_resolver(),
-            wikidata_entities_jsonl,
+            wikidata_entities_jsonl: Some(wikidata_entities_jsonl),
         })
         .await?;
-
-        // Seed placeholder images for all annotated URLs so image tests
-        // have resolved media to work with.
-        let seeded = server.seed_test_media().await?;
-        eprintln!("Seeded {seeded} test media items");
 
         // Create temp dir with config.json + symlinks to dist/
         let tmp_dir = tempfile::tempdir()?;
@@ -396,7 +384,7 @@ impl WebTest {
             server,
             _tmp_dir: tmp_dir,
             _browser_data_dir: browser_data_dir,
-            _db_tmp: db_tmp,
+            _db_dir: db_dir,
         })
     }
 

@@ -63,18 +63,13 @@ url.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 
-# Temp files (for copying read-only Nix store DBs)
-tempfile = "3"
-
 # Logging
 slog = "2"
 
-# Used by seed_test_media to generate placeholder images + hash + DB inserts
+# Used by the placeholder-image encoder and the curated fact-store loader
 bytes = "1"
 chrono.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
-sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 
 # Fact-store types (for the curated-JSONL loader in `factstore`)
 chronoscope-core = { path = "../core" }
@@ -100,6 +95,9 @@ chronoscope-db = { path = "../db", features = ["test-support"] }
 # Testing
 tokio-test = "0.4"
 test-with = "0.14"
+
+# Temp dirs (browser profiles, frontend serve dirs)
+tempfile = "3"
 oxilangtag = { version = "0.1", features = ["serde"] }
 url.workspace = true
 

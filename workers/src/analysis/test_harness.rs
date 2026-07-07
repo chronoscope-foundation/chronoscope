@@ -97,9 +97,7 @@ pub struct AnalysisTestHarness {
 impl AnalysisTestHarness {
     /// Create a new test harness with an in-memory database.
     pub async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let db = Arc::new(
-            Database::new("sqlite::memory:", &chronoscope_db::resolve_regions_db()?).await?,
-        );
+        let db = Arc::new(Database::new("sqlite::memory:").await?);
         let user_id = UserId::generate();
         db.create_user(&user_id, "testuser", &Email::new("test@example.com"))
             .await?;

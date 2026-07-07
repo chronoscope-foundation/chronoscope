@@ -24,31 +24,16 @@ binary writes the JSON. iOS, web, and CLI clients all read from this.
 
 The API server reads at startup:
 
-- `REGIONS_DB` — path to the SpatiaLite regions database. Required.
 - `SPATIALITE_LIBRARY_PATH` — directory containing libspatialite. Required;
-  loaded at runtime via `SELECT load_extension()` for region assignment +
-  point-in-polygon queries. Outside the shell, spatial queries fail at
-  runtime, not compile time.
-- `WIKIDATA_TEST_DB` — path to a curated test database (dev only).
+  loaded into every SQLite connection at pool creation. Outside the shell,
+  database startup fails at runtime, not compile time.
 
-Both `REGIONS_DB` and `SPATIALITE_LIBRARY_PATH` are set automatically by
-`devShells.api` (and by the `mkApi`-wrapped binaries), and threaded into
-the hermetic `test` / `llvm-cov` flake checks via `testExtraEnv` in
-`nix/rust.nix`.
+It is set automatically by `devShells.api` (and baked into the wrapped
+`packages.api` binary), and threaded into the hermetic `test` / `llvm-cov`
+flake checks via `testExtraEnv` in `nix/rust.nix`.
 
 ## Tests use real DB + simulated passkeys
 
 In-memory SQLite per test. Passkeys are simulated (no real authenticator).
 Production runs Postgres — **don't introduce single-writer assumptions**
 that work in SQLite but break under Postgres concurrency.
-
-## Italy / world variants
-
-After the dev-UX refactor:
-
-- `nix/api.nix` exposes `mkApi { regions }` — the function shape.
-- `flake.nix` instantiates two: `packages.api-italy` (dev default, ~2GB)
-  and `packages.api-world` (prod, ~86GB).
-- Adding a new variant (e.g. EU-only) is two changes: a new entry in
-  `nix/regions.nix` (using `mkRegions`), and a named instance in
-  `flake.nix`'s `packages` block.

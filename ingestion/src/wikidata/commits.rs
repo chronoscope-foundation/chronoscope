@@ -34,8 +34,8 @@ use chronoscope_core::{
 use chronoscope_integrations::wikidata::{CommonsFilename, WikidataEntity, url_for_filename};
 
 use crate::SourceIdx;
+use crate::wikidata::PropertyContext;
 use crate::wikidata::handlers::PROPERTY_HANDLERS;
-use crate::wikidata::ingest::PropertyContext;
 use crate::wikidata::lifecycle::build_lifecycles;
 use crate::wikidata::parsing::{extract_names, parse_sitelink};
 use crate::wikidata::usage;

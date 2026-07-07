@@ -720,8 +720,8 @@ async fn test_detail_panel_focus() -> TestResult {
 
 // ==================== Image & Thumbnail Tests ====================
 //
-// These tests rely on seed_test_media() having resolved pending research URLs
-// with placeholder images during WebTest setup.
+// These tests rely on the dev server having resolved every fact-store image
+// to a placeholder in the media store during WebTest setup.
 
 /// Find an entity that has resolved media via the typed API client, returning its (lng, lat).
 ///
@@ -760,7 +760,7 @@ async fn find_entity_with_media(
     }
 
     let (lng, lat, count, id) =
-        best.ok_or("No entity with resolved media found — did seed_test_media run?")?;
+        best.ok_or("No entity with resolved media found — did placeholder image resolution run?")?;
     eprintln!("Found entity {id} with {count} media at ({lng}, {lat})");
     Ok((lng, lat))
 }

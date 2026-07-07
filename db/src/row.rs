@@ -4,19 +4,15 @@
 //! They never escape the crate; every `Database` method converts them
 //! into domain types via `into_domain()` before returning.
 
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
 use chronoscope_core::UncertainDate;
-use chronoscope_core::links::LinkType;
 use sqlx::FromRow;
 
 use crate::error::DbError;
 use crate::models;
 use chronoscope_integrations::IntegrationName;
 
-use crate::types::{
-    AnalysisStatus, AnnotationId, AnnotationKindTag, EntityId, EntityLinkId, MediaAnalysisState,
-    MediaId, MediaType, PageId, ResearchUrlId, SourceId,
-};
+use crate::types::{AnalysisStatus, MediaAnalysisState, MediaId, MediaType, PageId};
 
 /// Construct analysis state from raw DB fields.
 ///
@@ -208,163 +204,5 @@ impl PageMedia {
             analysis_result: self.analysis_result,
             analysis_error: self.analysis_error,
         }))
-    }
-}
-
-// ==================== EntityMedia (annotation → media join) ====================
-
-#[derive(Debug, FromRow)]
-pub struct EntityMedia {
-    pub id: MediaId,
-    pub storage_key: String,
-    pub media_type: MediaType,
-    pub width: i32,
-    pub height: i32,
-    #[sqlx(json(nullable), rename = "captured_meta")]
-    pub captured: Option<UncertainDate>,
-    #[sqlx(json, rename = "kind_json")]
-    pub annotation_kind: chronoscope_core::annotation::AnnotationKind,
-    pub source_url: String,
-}
-
-impl EntityMedia {
-    pub fn into_domain(self) -> models::EntityMedia {
-        models::EntityMedia {
-            id: self.id,
-            storage_key: self.storage_key,
-            media_type: self.media_type,
-            width: self.width,
-            height: self.height,
-            captured: self.captured,
-            annotation_kind: self.annotation_kind,
-            source_url: self.source_url,
-        }
-    }
-}
-
-// ==================== EntityThumbnail (batch thumbnail lookup) ====================
-
-#[derive(Debug, FromRow)]
-pub struct EntityThumbnail {
-    pub entity_id: EntityId,
-    pub storage_key: String,
-    pub width: i32,
-    pub height: i32,
-}
-
-impl EntityThumbnail {
-    pub fn into_domain(self) -> models::EntityThumbnail {
-        models::EntityThumbnail {
-            entity_id: self.entity_id,
-            storage_key: self.storage_key,
-            width: self.width,
-            height: self.height,
-        }
-    }
-}
-
-// ==================== Entity ====================
-
-#[derive(Debug, FromRow)]
-pub struct Entity {
-    pub id: EntityId,
-    pub entity_json: String,
-    pub earliest_date: Option<NaiveDate>,
-    pub latest_date: Option<NaiveDate>,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub created_at: NaiveDateTime,
-    pub updated_at: NaiveDateTime,
-}
-
-impl Entity {
-    pub fn into_domain(self) -> Result<models::Entity, DbError> {
-        let entity: chronoscope_core::entity::Entity<SourceId> =
-            serde_json::from_str(&self.entity_json)?;
-
-        let id = self.id;
-
-        let temporal_bounds = match (self.earliest_date, self.latest_date) {
-            (Some(earliest), Some(latest)) => Some(models::DateRange { earliest, latest }),
-            (None, None) => None,
-            _ => {
-                return Err(DbError::InconsistentRow(format!(
-                    "entity {} has mismatched temporal shadow columns",
-                    id
-                )));
-            }
-        };
-
-        let location = match (self.latitude, self.longitude) {
-            (Some(lat), Some(lon)) => Some(models::Coordinates { lat, lon }),
-            (None, None) => None,
-            _ => {
-                return Err(DbError::InconsistentRow(format!(
-                    "entity {} has latitude without longitude or vice versa",
-                    id
-                )));
-            }
-        };
-
-        Ok(models::Entity {
-            id,
-            entity,
-            temporal_bounds,
-            location,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
-        })
-    }
-}
-
-// ==================== EntityLink ====================
-
-#[derive(Debug, Clone, FromRow)]
-pub struct EntityLink {
-    pub id: EntityLinkId,
-    pub entity_id: EntityId,
-    pub link_type: LinkType,
-    pub target_json: String,
-    /// Shadow column for dedup/display — domain type derives this from `target`.
-    #[allow(dead_code)]
-    pub target_url: String,
-}
-
-impl EntityLink {
-    pub fn into_domain(self) -> Result<models::EntityLink, DbError> {
-        let target = serde_json::from_str(&self.target_json)?;
-        Ok(models::EntityLink {
-            id: self.id,
-            entity_id: self.entity_id,
-            link_type: self.link_type,
-            target,
-        })
-    }
-}
-
-// ==================== Annotation ====================
-
-#[derive(Debug, Clone, FromRow)]
-pub struct Annotation {
-    pub id: AnnotationId,
-    pub entity_id: EntityId,
-    pub url_id: ResearchUrlId,
-    /// Shadow column (generated from `kind_json`) — domain type has the parsed `AnnotationKind`.
-    #[allow(dead_code)]
-    pub kind: AnnotationKindTag,
-    pub kind_json: String,
-    pub created_at: NaiveDateTime,
-}
-
-impl Annotation {
-    pub fn into_domain(self) -> Result<models::Annotation, DbError> {
-        let kind = serde_json::from_str(&self.kind_json)?;
-        Ok(models::Annotation {
-            id: self.id,
-            entity_id: self.entity_id,
-            url_id: self.url_id,
-            kind,
-            created_at: self.created_at,
-        })
     }
 }

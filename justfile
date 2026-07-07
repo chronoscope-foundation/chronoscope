@@ -314,11 +314,11 @@ fetch-regions variant="italy":
         *) echo "error: unknown variant {{ variant }}; valid: italy, world" >&2; exit 1 ;;
     esac
     echo "==> Building regions database ({{ variant }})..."
-    REGIONS_DB=$(nix build ".#regions-{{ variant }}-db" --no-link --print-out-paths)
+    regions_out=$(nix build ".#regions-{{ variant }}-db" --no-link --print-out-paths)
     _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
     mkdir -p "$_gc_root_dir"
-    nix-store --realise "$REGIONS_DB" --add-root "$_gc_root_dir/regions-{{ variant }}-db" > /dev/null 2>&1
-    echo "Done. Regions DB at: $REGIONS_DB/regions.sqlite"
+    nix-store --realise "$regions_out" --add-root "$_gc_root_dir/regions-{{ variant }}-db" > /dev/null 2>&1
+    echo "Done. Regions DB at: $regions_out/regions.sqlite"
 
 # Fetch everything: model weights + corpus images + italy regions.
 # Single nix build so all four FODs fetch in parallel (different hosts —

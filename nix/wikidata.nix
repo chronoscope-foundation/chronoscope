@@ -1,9 +1,7 @@
 # Wikidata entity pipeline as Nix derivations.
 #
-# Three layers per bundle:
-#   1. Entity fetch (FOD) — resolve + fetch entities at a pinned timestamp
-#   2. Bundle creation    — pure transform: JSONL → IngestionBundle
-#   3. Test database      — pure: load bundle into SQLite
+# One layer per bundle: an entity fetch (FOD) that resolves + fetches
+# entities at a pinned timestamp, producing entities.jsonl.
 #
 # Bundle data is inline below. Each bundle is { timestamp, hash, entities }
 # where entities maps Q-IDs to expected English labels. The fetch command
@@ -16,7 +14,6 @@
   craneLib,
   rustCommonArgs,
   cargoArtifacts,
-  regionsDb,
 }:
 
 let
@@ -82,7 +79,7 @@ let
     }
   );
 
-  # Build the derivation chain for a single bundle.
+  # Build the derivation for a single bundle.
   mkBundle =
     name: bundle:
     let
@@ -91,7 +88,7 @@ let
         lib.mapAttrsToList (qid: label: "--entity ${lib.escapeShellArg "${qid}=${label}"}") bundle.entities
       );
 
-      # Layer 1: FOD — fetch entities from Wikidata API.
+      # FOD — fetch entities from Wikidata API.
       entities = pkgs.stdenvNoCC.mkDerivation {
         name = "chronoscope-wikidata-${name}-entities";
         outputHashMode = "recursive";
@@ -110,42 +107,9 @@ let
             --output $out/entities.jsonl
         '';
       };
-
-      # Layer 2: Pure — transform JSONL to IngestionBundle + validate.
-      ingestionBundle = pkgs.stdenvNoCC.mkDerivation {
-        name = "chronoscope-wikidata-${name}-bundle";
-        nativeBuildInputs = [ ingestBin ];
-        buildCommand = ''
-          mkdir -p $out
-          ingest bundle \
-            --input ${entities}/entities.jsonl \
-            --output $out/bundle.json
-          ingest check --input $out/bundle.json > $out/check-report.json
-        '';
-      };
-
-      # Layer 3: Pure — load bundle into SQLite database.
-      testDb = pkgs.stdenvNoCC.mkDerivation {
-        name = "chronoscope-wikidata-${name}-db";
-        nativeBuildInputs = [
-          ingestBin
-          pkgs.sqlite
-        ];
-        REGIONS_DB = "${regionsDb}/regions.sqlite";
-        SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
-        buildCommand = ''
-          mkdir -p $out
-          ingest load \
-            --db $out/wikidata.db \
-            --input ${ingestionBundle}/bundle.json
-          # Checkpoint WAL into main DB file so the output is self-contained.
-          sqlite3 $out/wikidata.db "PRAGMA wal_checkpoint(TRUNCATE);"
-          rm -f $out/wikidata.db-wal $out/wikidata.db-shm
-        '';
-      };
     in
     {
-      inherit entities ingestionBundle testDb;
+      inherit entities;
     };
 
   # Build all bundles.

@@ -1,7 +1,8 @@
 //! Lightweight web development server.
 //!
-//! Starts the API server (with test DB) and Trunk live-reload server.
-//! No ngrok, no workers, no iOS config — just what's needed for web frontend dev.
+//! Starts the API server (with a fresh throwaway SQLite DB) and Trunk
+//! live-reload server. No ngrok, no workers, no iOS config — just what's
+//! needed for web frontend dev.
 //!
 //! Usage:
 //!   cargo run -p chronoscope-dev --bin web-dev
@@ -20,14 +21,6 @@ use chronoscope_workers::{ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::info;
 use tokio::signal;
-
-/// Holds the temporary directory containing the writable copy of the Wikidata
-/// test database. The `TempDir` is kept alive alongside the database URL so
-/// cleanup happens on drop rather than leaking via `mem::forget`.
-struct WebDevDb {
-    database_url: String,
-    _tmp_dir: tempfile::TempDir,
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -49,54 +42,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(log, "API server will bind to port {}", api_port);
     info!(log, "Trunk will bind to port {}", trunk_port);
 
-    // 2. Use Wikidata test DB if available (set by nix develop), else in-memory
-    let web_dev_db = match std::env::var("WIKIDATA_TEST_DB") {
-        Ok(path) => {
-            let db_path = Path::new(&path).join("wikidata.db");
-            if db_path.exists() {
-                // Copy to a temp dir so we can write to it (the Nix store is read-only).
-                // A TempDir (not TempFile) because SQLite creates -wal and -shm
-                // sibling files alongside the main .db — they all need to live
-                // in the same directory and be cleaned up together.
-                let tmp_dir = tempfile::tempdir()?;
-                let tmp_db = tmp_dir.path().join("wikidata.db");
-                std::fs::copy(&db_path, &tmp_db)?;
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o644);
-                std::fs::set_permissions(&tmp_db, perms)?;
-                let url = format!("sqlite:{}", tmp_db.display());
-                info!(log, "Loaded Wikidata test DB from {}", db_path.display());
-                Some(WebDevDb {
-                    database_url: url,
-                    _tmp_dir: tmp_dir,
-                })
-            } else {
-                return Err(format!(
-                    "WIKIDATA_TEST_DB is set but {} does not exist",
-                    db_path.display()
-                )
-                .into());
-            }
-        }
-        Err(_) => {
-            info!(log, "No WIKIDATA_TEST_DB found, using empty in-memory DB");
-            None
-        }
-    };
+    // 2. Curated Wikidata entities.jsonl for the fact store.
+    let wikidata_entities_jsonl = PathBuf::from(
+        std::env::var("WIKIDATA_ENTITIES_JSONL")
+            .map_err(|_| "WIKIDATA_ENTITIES_JSONL not set — run inside nix develop")?,
+    );
 
-    let database_url = web_dev_db.as_ref().map(|db| db.database_url.clone());
+    // 3. Fresh file-backed SQLite DB for this run — the pool reaps idle
+    // connections, and a shared-cache in-memory DB would vanish with its last
+    // one during a quiet stretch. A dedicated directory because SQLite writes
+    // -wal/-shm siblings next to the .db; removed on shutdown.
+    let db_dir = std::env::temp_dir().join(format!("chronoscope-web-dev-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&db_dir)?;
+    let database_url = format!("sqlite:{}", db_dir.join("web-dev.db").display());
+    info!(log, "Database at {}", db_dir.join("web-dev.db").display());
 
-    // 2b. Use a curated Wikidata entities.jsonl for the fact store if available.
-    let wikidata_entities_jsonl = std::env::var("WIKIDATA_ENTITIES_JSONL")
-        .ok()
-        .map(PathBuf::from);
-
-    // 3. Start the API server
+    // 4. Start the API server
     let http_client =
         Arc::new(ReqwestClient::new().map_err(|e| format!("Failed to create HTTP client: {e}"))?);
 
     let server = start_dev_server(DevServerConfig {
-        database_url,
+        database_url: Some(database_url),
         http_client,
         worker_idle_backoff: Duration::from_secs(60),
         retry_config: RetryConfig::default(),
@@ -111,12 +77,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         apify_config: None,
         triton: None,
         dns_resolver: permissive_dns_resolver(),
-        wikidata_entities_jsonl,
+        wikidata_entities_jsonl: Some(wikidata_entities_jsonl),
     })
     .await
     .map_err(|e| format!("Failed to start API server: {e}"))?;
 
-    // 4. Start Trunk with CHRONOSCOPE_API_URL set.
+    // 5. Start Trunk with CHRONOSCOPE_API_URL set.
     // Trunk's post_build hook writes config.json to dist/ using this env var.
     let web_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -140,11 +106,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(log, "========================================");
     info!(log, "");
 
-    // 5. Wait for Ctrl+C
+    // 6. Wait for Ctrl+C
     signal::ctrl_c().await.ok();
     info!(log, "Shutting down...");
     trunk.kill().ok();
     server.shutdown().await;
+    std::fs::remove_dir_all(&db_dir).ok();
 
     Ok(())
 }

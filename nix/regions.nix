@@ -48,15 +48,15 @@ let
 
   # ======================== OSM PBF extracts (FODs) ========================
 
-  # Italy extract for development iteration (~2 GB). Default for `api-italy`
-  # and the dev shell. To bump: change the date, set hash to lib.fakeHash,
+  # Italy extract for development iteration (~2 GB). Powers `regions-italy-db`
+  # (`just fetch-regions`). To bump: change the date, set hash to lib.fakeHash,
   # rebuild — Nix reports the correct hash.
   italyPbf = pkgs.fetchurl {
     url = "https://download.geofabrik.de/europe/italy-260624.osm.pbf";
     hash = "sha256-0UkvTrLN5JZX6gd7jkzcmzvK0x8tRoD6CJaAD9kqZfY=";
   };
 
-  # Full planet PBF for production (~86 GB). Powers `api-world`.
+  # Full planet PBF for production (~86 GB). Powers `regions-world-db`.
   planetPbf = pkgs.fetchurl {
     url = "https://planet.openstreetmap.org/pbf/planet-260420.osm.pbf";
     hash = "sha256-JQLKwBNSd+GPvepmKnYArCQNYwbUrXwnz477o+2AN88=";

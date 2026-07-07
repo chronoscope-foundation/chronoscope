@@ -40,9 +40,7 @@ pub use image_resolve::{ImageResolveMode, resolve_fact_store_images};
 const PLACEHOLDER_DIM: u32 = 8;
 
 /// Encode the shared placeholder image: a small solid-copper JPEG. One image
-/// stands in for every fact-store image under [`ImageResolveMode::Placeholder`]
-/// and for every seeded research-URL thumbnail, so both paths draw from this
-/// single encoder and can't drift.
+/// stands in for every fact-store image under [`ImageResolveMode::Placeholder`].
 fn placeholder_jpeg() -> Result<bytes::Bytes, Box<dyn std::error::Error + Send + Sync>> {
     use image::ImageEncoder;
 
@@ -83,11 +81,8 @@ pub struct RunningDevServer {
     /// User ID of the test user
     pub test_user_id: UserId,
 
-    /// Database pool for direct access (e.g., loading ingestion bundles in tests)
+    /// Database pool for direct access in tests
     db: Arc<Database>,
-
-    /// Media store for seeding test images.
-    media_store: Arc<dyn MediaStore>,
 
     /// Send `true` to trigger graceful shutdown of workers
     shutdown_tx: watch::Sender<bool>,
@@ -99,81 +94,11 @@ pub struct RunningDevServer {
 impl RunningDevServer {
     /// Get the database for direct access.
     ///
-    /// Used by integration tests to load ingestion bundles or query DB state
-    /// directly, bypassing the HTTP API layer.
+    /// Used by integration tests to query DB state directly, bypassing the
+    /// HTTP API layer.
     #[must_use]
     pub fn db(&self) -> &Database {
         &self.db
-    }
-
-    /// Seed test media by resolving all pending research URLs with placeholder images.
-    ///
-    /// For each pending URL that has an annotation, generates a small solid-color
-    /// JPEG, stores it in the media store, and marks the URL as resolved. This
-    /// makes image-dependent features (detail panel grid, map thumbnails,
-    /// lightbox) testable without running actual fetch workers.
-    ///
-    /// Returns the number of media items created.
-    pub async fn seed_test_media(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        use sha2::{Digest, Sha256};
-
-        let (w, h) = (PLACEHOLDER_DIM, PLACEHOLDER_DIM);
-        let jpeg_bytes = placeholder_jpeg()?;
-
-        // Find all unresolved research URLs that have annotations.
-        // URLs may be 'pending' or 'processing' (workers can claim them
-        // before we seed, even with a long idle backoff).
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT r.id, r.url FROM research_urls r \
-             JOIN annotations a ON a.url_id = r.id \
-             WHERE r.media_id IS NULL \
-             GROUP BY r.id",
-        )
-        .fetch_all(self.db.pool_ref())
-        .await?;
-
-        let now = chrono::Utc::now().naive_utc();
-        let mut count = 0;
-
-        for (url_id, source_url) in &rows {
-            let exact_hash = Sha256::digest(source_url.as_bytes()).to_vec();
-            let url_id = chronoscope_db::ResearchUrlId::new(url_id.clone());
-            let storage_key = format!("media/{}.jpg", uuid::Uuid::now_v7());
-
-            // Store full image + thumbnail variant in the media store
-            self.media_store
-                .put(&storage_key, jpeg_bytes.clone(), "image/jpeg")
-                .await?;
-            self.media_store
-                .put(
-                    &storage_key.replace(".jpg", "_thumb.jpg"),
-                    jpeg_bytes.clone(),
-                    "image/jpeg",
-                )
-                .await?;
-
-            let media_data = chronoscope_db::MediaData {
-                exact_hash,
-                perceptual_hash: None,
-                storage_key,
-                media_type: chronoscope_db::MediaType::Image,
-                width: w as i32,
-                height: h as i32,
-                duration_seconds: None,
-                captured: None,
-                location: None,
-                source_metadata: None,
-                fetched_at: now,
-            };
-            let media_id = self.db.get_or_create_media(&media_data).await?;
-            self.db
-                .mark_url_resolved_to_media(&url_id, &media_id)
-                .await?;
-
-            count += 1;
-        }
-
-        Ok(count)
     }
 
     /// Gracefully shut down the server and wait for all workers to stop.
@@ -206,7 +131,6 @@ impl Drop for RunningDevServer {
 /// Configuration for starting the dev server.
 pub struct DevServerConfig {
     /// Optional database URL. If `None`, uses `sqlite::memory:`.
-    /// The server creates a writable copy if the source is read-only.
     pub database_url: Option<String>,
 
     /// HTTP client for workers to use (real or VCR)
@@ -421,13 +345,9 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
     // Create shared database (includes default integration registry)
     let db_url = config.database_url.as_deref().unwrap_or("sqlite::memory:");
     let db = Arc::new(
-        Database::new(
-            db_url,
-            &chronoscope_db::resolve_regions_db()
-                .map_err(|e| format!("Failed to resolve regions DB path: {e}"))?,
-        )
-        .await
-        .map_err(|e| format!("Failed to create database: {e}"))?,
+        Database::new(db_url)
+            .await
+            .map_err(|e| format!("Failed to create database: {e}"))?,
     );
 
     // Create shared media store
@@ -571,7 +491,6 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
     info!(log, "Resolved fact-store images"; "count" => image_media.len());
 
     // Create AppState with our shared database, media store, and fact store
-    let media_store_for_server = media_store.clone();
     let app_state = AppState::new(
         db.as_ref().clone(),
         api_config,
@@ -612,7 +531,6 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         auth_token,
         test_user_id,
         db,
-        media_store: media_store_for_server,
         shutdown_tx,
         worker_handles,
     })

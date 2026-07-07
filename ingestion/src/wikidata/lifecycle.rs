@@ -14,7 +14,7 @@ use chronoscope_core::{
 };
 use chronoscope_integrations::wikidata::{Claim, PropertyId};
 
-use crate::wikidata::ingest::PropertyContext;
+use crate::wikidata::PropertyContext;
 
 // =============================================================================
 // EXTRACTION COMBINATORS

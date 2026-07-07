@@ -44,7 +44,7 @@ each other beyond what they explicitly compose.
 | Shell      | What's in it                                                     | When to use                                  |
 |------------|------------------------------------------------------------------|----------------------------------------------|
 | `default`  | rust toolchain + just + nix lint tools                           | Poking at the project, running `just <recipe>` |
-| `api`      | default + sqlite/openssl/spatialite/protobuf + WIKIDATA + REGIONS | Backend / API server work                    |
+| `api`      | default + sqlite/openssl/spatialite/protobuf + WIKIDATA         | Backend / API server work                    |
 | `web`      | api + wasm toolchain + trunk + tailwind + chromium + WEB_DIST    | Frontend; running `web-dev`; browser tests   |
 | `analysis` | api + Python analysis env + weights + corpus                     | Iterating on `chronoscope-analysis` correctness |
 | `triton`   | Python analysis env + weights + rust toolchain (for schematool)  | Triton harness / serving config              |

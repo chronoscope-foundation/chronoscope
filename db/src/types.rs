@@ -6,8 +6,7 @@ use std::fmt;
 
 // Re-export ID types and enums from api-client for convenience.
 pub use chronoscope_api_client::{
-    AnnotationId, Email, EntityId, EntityLinkId, MediaId, MediaType, ResearchUrlId,
-    ResearchUrlStatus, SourceId, UserId,
+    Email, MediaId, MediaType, ResearchUrlId, ResearchUrlStatus, UserId,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema, sqlx::Type)]
@@ -39,93 +38,6 @@ impl fmt::Display for PageId {
 impl AsRef<str> for PageId {
     fn as_ref(&self) -> &str {
         &self.0
-    }
-}
-
-/// External ID source type for entity deduplication.
-///
-/// Must stay in sync with the CHECK constraint on `entity_external_ids.id_type`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, strum::Display, strum::AsRefStr)]
-#[sqlx(type_name = "TEXT")]
-#[strum(serialize_all = "snake_case")]
-pub enum ExternalIdType {
-    #[sqlx(rename = "wikidata")]
-    Wikidata,
-    #[sqlx(rename = "osm_node")]
-    OsmNode,
-    #[sqlx(rename = "osm_way")]
-    OsmWay,
-    #[sqlx(rename = "osm_relation")]
-    OsmRelation,
-    #[sqlx(rename = "geonames")]
-    #[strum(serialize = "geonames")]
-    GeoNames,
-    #[sqlx(rename = "pleiades")]
-    Pleiades,
-    #[sqlx(rename = "getty_tgn")]
-    GettyTgn,
-    #[sqlx(rename = "nrhp")]
-    Nrhp,
-}
-
-impl ExternalIdType {
-    /// All variants, for exhaustive testing against DB CHECK constraints.
-    #[must_use]
-    pub fn all() -> &'static [Self] {
-        &[
-            Self::Wikidata,
-            Self::OsmNode,
-            Self::OsmWay,
-            Self::OsmRelation,
-            Self::GeoNames,
-            Self::Pleiades,
-            Self::GettyTgn,
-            Self::Nrhp,
-        ]
-    }
-}
-
-/// Annotation kind discriminant as stored in the database.
-///
-/// This is the tag-only version of `chronoscope_core::annotation::AnnotationKind`
-/// (which is a data-carrying enum). The full JSON lives in `kind_json`; this enum
-/// maps the generated `kind` column used for indexing.
-///
-/// Mirrors the discriminant tag of `chronoscope_core::annotation::AnnotationKind`
-/// with `sqlx::Type` support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::Type, strum::Display)]
-#[sqlx(type_name = "TEXT", rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum AnnotationKindTag {
-    SpatialTrace,
-    ExteriorView,
-    InteriorView,
-    TextualNote,
-}
-
-impl AnnotationKindTag {
-    /// All variants, for exhaustive testing against DB CHECK constraints.
-    #[must_use]
-    pub fn all() -> &'static [Self] {
-        &[
-            Self::SpatialTrace,
-            Self::ExteriorView,
-            Self::InteriorView,
-            Self::TextualNote,
-        ]
-    }
-}
-
-/// Exhaustive match ensures adding a variant to
-/// `chronoscope_core::annotation::AnnotationKind` forces a db-side update.
-impl From<&chronoscope_core::annotation::AnnotationKind> for AnnotationKindTag {
-    fn from(kind: &chronoscope_core::annotation::AnnotationKind) -> Self {
-        match kind {
-            chronoscope_core::annotation::AnnotationKind::SpatialTrace { .. } => Self::SpatialTrace,
-            chronoscope_core::annotation::AnnotationKind::ExteriorView { .. } => Self::ExteriorView,
-            chronoscope_core::annotation::AnnotationKind::InteriorView { .. } => Self::InteriorView,
-            chronoscope_core::annotation::AnnotationKind::TextualNote { .. } => Self::TextualNote,
-        }
     }
 }
 

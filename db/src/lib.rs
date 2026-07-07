@@ -4,7 +4,6 @@
 //! It is used by both the API server and background workers.
 
 pub mod error;
-pub mod ingestion;
 pub mod media_store;
 pub mod models;
 pub mod queries;
@@ -14,32 +13,26 @@ pub mod types;
 pub mod url;
 pub mod workers;
 
-use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{NaiveDateTime, Utc};
-use sqlx::Executor;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 #[cfg(any(test, feature = "test-support"))]
 use tokio::sync::watch;
 
 use chronoscope_integrations::IntegrationRegistry;
 
-pub use chronoscope_core::entity::EntityRelationType;
-pub use chronoscope_core::links::LinkType;
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
-    Annotation, Coordinates, DateRange, Entity, EntityLink, EntityMedia, EntityThumbnail,
     FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
     ResolvedContent, ResolvedTarget, User,
 };
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use types::{
-    AnalysisStatus, AnnotationId, AnnotationKindTag, Email, EntityId, EntityLinkId, ExternalIdType,
-    MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId, ResearchUrlStatus, SourceId,
-    UserId,
+    AnalysisStatus, Email, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
+    ResearchUrlStatus, UserId,
 };
 
 pub use workers::MediaForAnalysis;
@@ -47,59 +40,6 @@ pub use workers::MediaForAnalysis;
 /// Get the current UTC timestamp as `NaiveDateTime` for database storage.
 pub(crate) fn now() -> NaiveDateTime {
     Utc::now().naive_utc()
-}
-
-/// Environment variable name for the regions database path.
-///
-/// The regions DB is a SpatiaLite database built by Nix containing administrative
-/// boundaries from OpenStreetMap. The env var points directly to the `.sqlite` file.
-/// Callers should resolve this once at startup and pass the path to `Database::new`.
-pub const REGIONS_DB_ENV: &str = "REGIONS_DB";
-
-/// Resolve `REGIONS_DB` from the environment.
-///
-/// Intended to be called once at program startup, not on every request.
-///
-/// # Errors
-/// Returns `DbError::Config` if `REGIONS_DB` is not set.
-pub fn resolve_regions_db() -> DbResult<std::path::PathBuf> {
-    std::env::var(REGIONS_DB_ENV)
-        .map(std::path::PathBuf::from)
-        .map_err(|_| DbError::Config(format!("{REGIONS_DB_ENV} must be set")))
-}
-
-/// Split a bbox's longitude range for SQL binding.
-/// Returns `(min_lon_a, max_lon_a, min_lon_b, max_lon_b)` — identical ranges
-/// for non-crossing bboxes, split halves for antimeridian-crossing.
-fn bbox_lon_ranges(bbox: &chronoscope_api_client::Bbox) -> (f64, f64, f64, f64) {
-    if bbox.min_lon() > bbox.max_lon() {
-        (bbox.min_lon(), 180.0, -180.0, bbox.max_lon())
-    } else {
-        (
-            bbox.min_lon(),
-            bbox.max_lon(),
-            bbox.min_lon(),
-            bbox.max_lon(),
-        )
-    }
-}
-
-/// Bind a Bbox's 6 parameters to a `query_as` in canonical order:
-/// `min_lat`, `max_lat`, `min_lon_a`, `max_lon_a`, `min_lon_b`, `max_lon_b`.
-///
-/// SQL should use: `lat BETWEEN ?N AND ?N+1 AND (lon BETWEEN ?N+2 AND ?N+3 OR lon BETWEEN ?N+4 AND ?N+5)`.
-fn bind_bbox<'q, T>(
-    query: sqlx::query::QueryAs<'q, sqlx::Sqlite, T, sqlx::sqlite::SqliteArguments<'q>>,
-    bbox: &chronoscope_api_client::Bbox,
-) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, T, sqlx::sqlite::SqliteArguments<'q>> {
-    let (a_min, a_max, b_min, b_max) = bbox_lon_ranges(bbox);
-    query
-        .bind(bbox.min_lat())
-        .bind(bbox.max_lat())
-        .bind(a_min)
-        .bind(a_max)
-        .bind(b_min)
-        .bind(b_max)
 }
 
 // ==================== Database ====================
@@ -230,8 +170,8 @@ impl Database {
     /// # Errors
     /// Returns `DbError::Sqlx` if connection fails, `DbError::Migrate` if migrations fail,
     /// or `DbError::QueryPlan` if any query would cause a full table scan.
-    pub async fn new(database_url: &str, regions_db_path: &Path) -> DbResult<Self> {
-        let db = Self::new_without_plan_verification(database_url, regions_db_path).await?;
+    pub async fn new(database_url: &str) -> DbResult<Self> {
+        let db = Self::new_without_plan_verification(database_url).await?;
         db.verify_all_query_plans().await?;
         Ok(db)
     }
@@ -239,12 +179,9 @@ impl Database {
     /// Create a new database connection pool and run migrations, but skip query plan verification.
     ///
     /// This is used by tests that want to verify query plans themselves (to avoid circular dependency).
-    pub async fn new_without_plan_verification(
-        database_url: &str,
-        regions_db_path: &Path,
-    ) -> DbResult<Self> {
+    pub async fn new_without_plan_verification(database_url: &str) -> DbResult<Self> {
         let registry = chronoscope_integrations::create_registry(None)?;
-        let pool = Self::create_pool(database_url, regions_db_path).await?;
+        let pool = Self::create_pool(database_url).await?;
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -278,20 +215,15 @@ impl Database {
         })
     }
 
-    /// Create the SQLite connection pool with SpatiaLite and attached regions DB.
-    async fn create_pool(database_url: &str, regions_db_path: &Path) -> DbResult<SqlitePool> {
+    /// Create the SQLite connection pool with SpatiaLite loaded.
+    async fn create_pool(database_url: &str) -> DbResult<SqlitePool> {
         let spatialite_dir = std::env::var("SPATIALITE_LIBRARY_PATH")
             .map_err(|_| DbError::Config("SPATIALITE_LIBRARY_PATH must be set".to_string()))?;
 
-        // Avoid SqliteConnectOptions::from_str("sqlite::memory:") because it
-        // sets in_memory(true), which adds SQLITE_OPEN_MEMORY. That flag
-        // propagates to ATTACH DATABASE, causing file paths to be ignored
-        // (attached DBs become empty in-memory instead of opening the file).
-        //
-        // For in-memory DBs, we replicate from_str's naming scheme (a unique
-        // URI per pool) with ?mode=memory&cache=shared, which achieves shared
-        // in-memory behavior through the URI parameter rather than the open
-        // flag. For file-backed DBs, we use from_str normally.
+        // Pooled in-memory SQLite needs a shared-cache URI: each pooled
+        // connection opens the filename independently, and without
+        // cache=shared every connection would see its own empty database.
+        // The per-pool sequence number keeps separate pools isolated.
         let options = if database_url == "sqlite::memory:" {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -308,27 +240,8 @@ impl Database {
         .busy_timeout(Duration::from_secs(5))
         .extension(format!("{spatialite_dir}/mod_spatialite"));
 
-        // ATTACH the regions DB on each new connection. Uses a file: URI with
-        // immutable=1 since the DB lives in the read-only Nix store; without
-        // this, SQLite tries to acquire file locks on a read-only mount and
-        // can fail.
-        //
-        // Only `'` needs escaping (SQL-literal safety). Path separators must
-        // NOT be percent-encoded — SQLite expects a literal filesystem path
-        // after the `file:` prefix.
-        let regions_path = regions_db_path.display().to_string();
-        let escaped = regions_path.replace('\'', "''");
-        let attach_sql = format!("ATTACH DATABASE 'file:{escaped}?immutable=1' AS regions_db");
-
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .after_connect(move |conn, _meta| {
-                let sql = attach_sql.clone();
-                Box::pin(async move {
-                    conn.execute(sql.as_str()).await?;
-                    Ok(())
-                })
-            })
             .connect_with(options)
             .await?;
 
@@ -703,164 +616,6 @@ impl Database {
             .rows_affected();
 
         Ok(rows_affected > 0)
-    }
-
-    // ==================== Entities ====================
-
-    /// Find an entity by its database ID.
-    pub async fn find_entity_by_id(&self, id: &EntityId) -> DbResult<Option<Entity>> {
-        let row: Option<row::Entity> = sqlx::query_as(queries::FIND_ENTITY_BY_ID.sql)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(|r| r.into_domain()).transpose()
-    }
-
-    /// Find entities by an external ID (e.g., Wikidata Q-ID).
-    pub async fn find_entities_by_external_id(
-        &self,
-        id_type: &ExternalIdType,
-        external_id: &str,
-    ) -> DbResult<Vec<Entity>> {
-        let rows: Vec<row::Entity> = sqlx::query_as(queries::FIND_ENTITIES_BY_EXTERNAL_ID.sql)
-            .bind(id_type)
-            .bind(external_id)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(|r| r.into_domain()).collect()
-    }
-
-    /// Get all links for an entity.
-    pub async fn find_entity_links(&self, entity_id: &EntityId) -> DbResult<Vec<EntityLink>> {
-        let rows: Vec<row::EntityLink> = sqlx::query_as(queries::FIND_ENTITY_LINKS.sql)
-            .bind(entity_id)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(|r| r.into_domain()).collect()
-    }
-
-    /// Get all annotations for an entity.
-    pub async fn find_annotations_by_entity(
-        &self,
-        entity_id: &EntityId,
-    ) -> DbResult<Vec<Annotation>> {
-        let rows: Vec<row::Annotation> = sqlx::query_as(queries::FIND_ANNOTATIONS_BY_ENTITY.sql)
-            .bind(entity_id)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(|r| r.into_domain()).collect()
-    }
-
-    /// Get all resolved media for an entity (via annotations → `research_urls` → media).
-    ///
-    /// Returns media items that have been fully resolved (research URL → media).
-    /// Unresolved annotations (where the URL hasn't been fetched yet) are excluded.
-    pub async fn find_media_by_entity(&self, entity_id: &EntityId) -> DbResult<Vec<EntityMedia>> {
-        let rows: Vec<row::EntityMedia> = sqlx::query_as(queries::FIND_MEDIA_BY_ENTITY.sql)
-            .bind(entity_id)
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.into_iter().map(|r| r.into_domain()).collect())
-    }
-
-    /// Get one representative thumbnail per entity for a batch of entity IDs.
-    ///
-    /// Entities without any resolved media are omitted from the result.
-    /// The parameter is a JSON-serialized array of entity ID strings.
-    pub async fn find_thumbnails_for_entities(
-        &self,
-        entity_ids_json: &str,
-    ) -> DbResult<Vec<EntityThumbnail>> {
-        let rows: Vec<row::EntityThumbnail> =
-            sqlx::query_as(queries::FIND_THUMBNAILS_FOR_ENTITIES.sql)
-                .bind(entity_ids_json)
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(rows.into_iter().map(|r| r.into_domain()).collect())
-    }
-
-    /// List entities within a geographic bounding box (keyset pagination).
-    ///
-    /// Antimeridian-crossing viewports are handled in SQL by OR'ing two
-    /// longitude ranges — no Rust-side splitting or dedup needed.
-    ///
-    /// # Errors
-    /// Returns `DbError::Sqlx` if the database operation fails.
-    pub async fn list_entities_in_bbox(
-        &self,
-        bbox: &chronoscope_api_client::Bbox,
-        limit: i64,
-        cursor: Option<(NaiveDateTime, &EntityId)>,
-    ) -> DbResult<Vec<Entity>> {
-        let rows: Vec<row::Entity> = match cursor {
-            None => {
-                bind_bbox(
-                    sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_FIRST.sql),
-                    bbox,
-                )
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            Some((updated_at, id)) => {
-                bind_bbox(
-                    sqlx::query_as(queries::LIST_ENTITIES_IN_BBOX_PAGE.sql),
-                    bbox,
-                )
-                .bind(updated_at)
-                .bind(id)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-        rows.into_iter().map(|r| r.into_domain()).collect()
-    }
-
-    /// Count entities in a bounding box, up to a threshold limit.
-    ///
-    /// Returns at most `limit` — useful for deciding whether to show
-    /// individual entities or clusters without fetching full rows.
-    pub async fn count_entities_in_bbox(
-        &self,
-        bbox: &chronoscope_api_client::Bbox,
-        limit: i64,
-    ) -> DbResult<i64> {
-        let (count,): (i64,) = bind_bbox(sqlx::query_as(queries::COUNT_ENTITIES_IN_BBOX.sql), bbox)
-            .bind(limit)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count)
-    }
-
-    /// Count clusters at a given zone type in a bounding box, up to a threshold limit.
-    pub async fn count_clusters_in_bbox(
-        &self,
-        zone_type: &chronoscope_api_client::ZoneType,
-        bbox: &chronoscope_api_client::Bbox,
-        limit: i64,
-    ) -> DbResult<i64> {
-        let zone_type = zone_type.as_ref();
-        let (count,): (i64,) = bind_bbox(
-            sqlx::query_as::<_, (i64,)>(queries::COUNT_CLUSTERS_IN_BBOX.sql).bind(zone_type),
-            bbox,
-        )
-        .bind(limit)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count)
-    }
-
-    /// Get all annotations for a research URL.
-    pub async fn find_annotations_by_url(
-        &self,
-        url_id: &ResearchUrlId,
-    ) -> DbResult<Vec<Annotation>> {
-        let rows: Vec<row::Annotation> = sqlx::query_as(queries::FIND_ANNOTATIONS_BY_URL.sql)
-            .bind(url_id)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter().map(|r| r.into_domain()).collect()
     }
 
     // ==================== Dossier ====================

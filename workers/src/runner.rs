@@ -453,9 +453,7 @@ mod tests {
     }
 
     async fn setup_test_db() -> Result<Arc<Database>, chronoscope_db::DbError> {
-        Ok(Arc::new(
-            Database::new("sqlite::memory:", &chronoscope_db::resolve_regions_db()?).await?,
-        ))
+        Ok(Arc::new(Database::new("sqlite::memory:").await?))
     }
 
     async fn create_test_url(

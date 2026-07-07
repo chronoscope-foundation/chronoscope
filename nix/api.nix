@@ -16,23 +16,20 @@ let
     }
   );
 
-  mkApi =
-    { regions }:
-    pkgs.symlinkJoin {
-      name = "chronoscope-api-${regions.name}";
-      paths = [ apiBin ];
-      nativeBuildInputs = [ pkgs.makeWrapper ];
-      postBuild = ''
-        wrapProgram $out/bin/chronoscope-api \
-          --set REGIONS_DB "${regions.db}/regions.sqlite" \
-          --set SPATIALITE_LIBRARY_PATH "${pkgs.libspatialite}/lib"
-      '';
-      meta = {
-        description = "Chronoscope API server (regions: ${regions.name})";
-      };
+  api = pkgs.symlinkJoin {
+    name = "chronoscope-api";
+    paths = [ apiBin ];
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    postBuild = ''
+      wrapProgram $out/bin/chronoscope-api \
+        --set SPATIALITE_LIBRARY_PATH "${pkgs.libspatialite}/lib"
+    '';
+    meta = {
+      description = "Chronoscope API server";
     };
+  };
 
 in
 {
-  inherit mkApi;
+  inherit api;
 }

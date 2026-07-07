@@ -3,7 +3,7 @@
   craneLib,
   lib,
   src,
-  # Defaulting to {} keeps this module loadable before regions/wikidata exist
+  # Defaulting to {} keeps this module loadable before wikidata/web exist
   # — see flake.nix for how the lazy cycle resolves.
   testExtraEnv ? { },
 }:

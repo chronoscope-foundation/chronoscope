@@ -228,8 +228,7 @@ impl TestContext {
             cdn_base_url: crate::cdn::tests::TEST_CDN_BASE_URL.to_string(),
         };
 
-        let db =
-            Database::new(&config.database_url, &chronoscope_db::resolve_regions_db()?).await?;
+        let db = Database::new(&config.database_url).await?;
 
         #[cfg(feature = "embedded-media")]
         let app_state = {

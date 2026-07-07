@@ -2,8 +2,7 @@
 //!
 //! Maps Wikidata Q-IDs to Chronoscope Usage types.
 
-use crate::SourceIdx;
-use chronoscope_core::{Entity, EntityTransition, Usage};
+use chronoscope_core::Usage;
 use chronoscope_integrations::wikidata::WikidataEntity;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
@@ -147,23 +146,9 @@ pub fn infer(wd_entity: &WikidataEntity) -> BTreeSet<Usage> {
     usages
 }
 
-/// Replace `Usage::Unknown` in `UsageModified` transitions with inferred usages.
-pub fn replace_unknown(entity: &mut Entity<SourceIdx>, inferred_usages: &BTreeSet<Usage>) {
-    for transition in &mut entity.transitions {
-        if let EntityTransition::UsageModified { new_usages, .. } = transition {
-            // Only replace if there's exactly one Unknown usage (the placeholder)
-            if new_usages.len() == 1 && new_usages.contains(&Usage::Unknown) {
-                *new_usages = inferred_usages.clone();
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    type TestEntity = Entity<SourceIdx>;
 
     use chronoscope_integrations::wikidata::{
         Claim, DataValue, EntityRefValue, PropertyId, RevisionId, Snak, WikidataEntityType,
@@ -334,105 +319,6 @@ mod tests {
                 "P31 QID {qid} should map to {expected_usage:?}, got {result:?}"
             );
         }
-        Ok(())
-    }
-
-    // =========================================================================
-    // replace_unknown() tests
-    // =========================================================================
-
-    #[test]
-    fn replace_unknown_replaces_placeholder() -> TestResult {
-        let mut entity: TestEntity = Entity {
-            names: vec![],
-            transitions: vec![EntityTransition::UsageModified {
-                occurred_at: None,
-                new_usages: BTreeSet::from([Usage::Unknown]),
-                description: None,
-                trigger_event: None,
-            }],
-        };
-        let inferred = BTreeSet::from([Usage::Religious, Usage::Cultural]);
-        replace_unknown(&mut entity, &inferred);
-
-        if let EntityTransition::UsageModified { new_usages, .. } = &entity.transitions[0] {
-            assert_eq!(new_usages.len(), 2);
-            assert!(new_usages.contains(&Usage::Religious));
-            assert!(new_usages.contains(&Usage::Cultural));
-        } else {
-            return Err("expected UsageModified transition".into());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn replace_unknown_preserves_known_usages() -> TestResult {
-        let mut entity: TestEntity = Entity {
-            names: vec![],
-            transitions: vec![EntityTransition::UsageModified {
-                occurred_at: None,
-                new_usages: BTreeSet::from([Usage::Residential]),
-                description: None,
-                trigger_event: None,
-            }],
-        };
-        let inferred = BTreeSet::from([Usage::Commercial]);
-        replace_unknown(&mut entity, &inferred);
-
-        if let EntityTransition::UsageModified { new_usages, .. } = &entity.transitions[0] {
-            // Should NOT be replaced since it wasn't Unknown
-            assert_eq!(new_usages.len(), 1);
-            assert!(new_usages.contains(&Usage::Residential));
-        } else {
-            return Err("expected UsageModified transition".into());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn replace_unknown_preserves_multi_usage() -> TestResult {
-        // If there are multiple usages including Unknown, don't replace
-        let mut entity: TestEntity = Entity {
-            names: vec![],
-            transitions: vec![EntityTransition::UsageModified {
-                occurred_at: None,
-                new_usages: BTreeSet::from([Usage::Unknown, Usage::Residential]),
-                description: None,
-                trigger_event: None,
-            }],
-        };
-        let inferred = BTreeSet::from([Usage::Commercial]);
-        replace_unknown(&mut entity, &inferred);
-
-        if let EntityTransition::UsageModified { new_usages, .. } = &entity.transitions[0] {
-            // Should NOT be replaced since there were multiple usages
-            assert_eq!(new_usages.len(), 2);
-            assert!(new_usages.contains(&Usage::Unknown));
-            assert!(new_usages.contains(&Usage::Residential));
-        } else {
-            return Err("expected UsageModified transition".into());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn replace_unknown_ignores_non_usage_transitions() -> TestResult {
-        let mut entity: TestEntity = Entity {
-            names: vec![],
-            transitions: vec![EntityTransition::Constructed {
-                started_at: None,
-                completed_at: None,
-                location: None,
-                trigger_event: None,
-            }],
-        };
-        let inferred = BTreeSet::from([Usage::Commercial]);
-        // Should not panic or modify the Constructed transition
-        replace_unknown(&mut entity, &inferred);
-        assert!(matches!(
-            &entity.transitions[0],
-            EntityTransition::Constructed { .. }
-        ));
         Ok(())
     }
 }

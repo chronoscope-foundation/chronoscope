@@ -3,11 +3,7 @@
 //! Subcommands for the Wikidata ingestion pipeline:
 //! - `fetch`: Fetch entities at a timestamp (resolves revisions, produces JSONL)
 //! - `filter`: Filter a Wikidata dump for architectural entities
-//! - `bundle`: Transform JSONL into an `IngestionBundle`
-//! - `check`: Analyze an `IngestionBundle` for consistency
-//! - `load`: Load an `IngestionBundle` into a SQLite database
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -102,49 +98,6 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
-
-    /// Transform JSONL into an `IngestionBundle`.
-    ///
-    /// Reads pre-filtered JSONL (from `fetch` or `filter`), processes each
-    /// entity concurrently, and writes a complete `IngestionBundle` as JSON.
-    Bundle {
-        /// Input JSONL file path
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Output `IngestionBundle` JSON file path
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Print progress information
-        #[arg(short, long)]
-        verbose: bool,
-    },
-
-    /// Analyze an `IngestionBundle` for consistency and distributions.
-    ///
-    /// Reads an `IngestionBundle` JSON file and prints an analysis report
-    /// including summary statistics, distribution histograms, consistency
-    /// warnings, and interesting entities.
-    Check {
-        /// Input `IngestionBundle` JSON file path
-        #[arg(short, long)]
-        input: PathBuf,
-    },
-
-    /// Load an `IngestionBundle` into a SQLite database.
-    ///
-    /// Creates or opens the database, runs migrations, and loads all
-    /// entities, images, relations, and annotations from the bundle.
-    Load {
-        /// Path to SQLite database file (created if missing)
-        #[arg(short, long)]
-        db: PathBuf,
-
-        /// Input `IngestionBundle` JSON file path
-        #[arg(short, long)]
-        input: PathBuf,
-    },
 }
 
 fn main() -> Result<()> {
@@ -170,13 +123,6 @@ async fn run(cli: Cli) -> Result<()> {
             limit,
             verbose,
         } => cmd_filter(&input, &output, limit, verbose).await,
-        Command::Bundle {
-            input,
-            output,
-            verbose,
-        } => cmd_bundle(&input, &output, verbose).await,
-        Command::Check { input } => cmd_check(&input),
-        Command::Load { db, input } => cmd_load(&db, &input).await,
     }
 }
 
@@ -272,76 +218,5 @@ async fn cmd_filter(input: &Path, output: &Path, limit: Option<u64>, verbose: bo
 
     chronoscope_ingestion::wikidata::filter::filter_dump(&client, input, output, limit, verbose)
         .await?;
-    Ok(())
-}
-
-// =============================================================================
-// BUNDLE
-// =============================================================================
-
-async fn cmd_bundle(input: &Path, output: &Path, verbose: bool) -> Result<()> {
-    let config = chronoscope_ingestion::wikidata::ingest::Config {
-        input_path: input.to_path_buf(),
-        output_path: output.to_path_buf(),
-        verbose,
-    };
-
-    // Gallery media is not resolved at bundle time — gallery images will be
-    // handled by a dedicated Commons worker in a future commit.
-    let gallery_media = HashMap::new();
-    chronoscope_ingestion::wikidata::ingest::run(&config, &gallery_media).await
-}
-
-// =============================================================================
-// CHECK
-// =============================================================================
-
-fn cmd_check(input: &Path) -> Result<()> {
-    let data = std::fs::read_to_string(input)
-        .with_context(|| format!("Failed to read {}", input.display()))?;
-    let bundle: chronoscope_ingestion::IngestionOutput =
-        serde_json::from_str(&data).context("Failed to parse IngestionBundle")?;
-
-    let report = chronoscope_ingestion::check::analyze(&bundle);
-    let json = serde_json::to_string_pretty(&report).context("Failed to serialize report")?;
-    println!("{json}");
-    Ok(())
-}
-
-// =============================================================================
-// LOAD
-// =============================================================================
-
-async fn cmd_load(db_path: &Path, input: &Path) -> Result<()> {
-    let data = std::fs::read_to_string(input)
-        .with_context(|| format!("Failed to read {}", input.display()))?;
-    let bundle: chronoscope_ingestion::IngestionOutput =
-        serde_json::from_str(&data).context("Failed to parse IngestionBundle")?;
-
-    eprintln!(
-        "Loading bundle: {} entities, {} images, {} relations, {} annotations",
-        bundle.entities.len(),
-        bundle.images.len(),
-        bundle.entity_relations.len(),
-        bundle.annotations.len(),
-    );
-
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let db = chronoscope_db::Database::new(&db_url, &chronoscope_db::resolve_regions_db()?)
-        .await
-        .context("Failed to open database")?;
-
-    let result = chronoscope_db::ingestion::load_bundle(db.pool_ref(), &bundle)
-        .await
-        .context("Failed to load bundle")?;
-
-    eprintln!(
-        "Done! Created {} entities, {} images, {} annotations, {} relations",
-        result.entities_created,
-        result.images_created,
-        result.annotations_created,
-        result.relations_created,
-    );
-
     Ok(())
 }

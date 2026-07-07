@@ -8,13 +8,11 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use chronoscope_core::{
-    AnnotationKind, ExternalLink, ImageSource, LinkTarget, LinkType, OsmElementType, OsmId,
-};
-use chronoscope_integrations::wikidata::{Claim, CommonsFilename, url_for_filename};
+use chronoscope_core::{ExternalLink, LinkTarget, LinkType, OsmElementType, OsmId};
+use chronoscope_integrations::wikidata::Claim;
 use url::Url;
 
-use crate::wikidata::ingest::{HandlerOutput, PropertyContext};
+use crate::wikidata::{HandlerOutput, PropertyContext};
 
 // =============================================================================
 // CONSTANTS
@@ -49,20 +47,6 @@ pub static PROPERTY_HANDLERS: LazyLock<HashMap<&'static str, PropertyHandler>> =
             Box::new(move |claims, ctx| Ok(f(claims, ctx)))
         };
         HashMap::from([
-            // Images
-            ("P18", image(AnnotationKind::ExteriorView { region: None })), // image
-            (
-                "P5775",
-                image(AnnotationKind::InteriorView { region: None }),
-            ), // image of interior
-            (
-                "P3451",
-                image(AnnotationKind::ExteriorView { region: None }),
-            ), // nighttime view
-            (
-                "P3311",
-                image(AnnotationKind::SpatialTrace { geometry: None }),
-            ), // image of design plans
             // Links
             ("P856", url_link(LinkType::Related)), // official website
             ("P973", url_link(LinkType::FurtherReading)), // described at URL
@@ -74,33 +58,6 @@ pub static PROPERTY_HANDLERS: LazyLock<HashMap<&'static str, PropertyHandler>> =
 // =============================================================================
 // PROPERTY HANDLER FACTORIES
 // =============================================================================
-
-fn image(annotation_kind: AnnotationKind) -> PropertyHandler {
-    Box::new(move |claims, _ctx| {
-        let mut out = HandlerOutput::new();
-        for claim in claims {
-            // Skip claims with explicit "no value" or "unknown value"
-            if claim.mainsnak.is_special() {
-                continue;
-            }
-            match claim.mainsnak.string_value() {
-                Some(filename) => {
-                    let url = url_for_filename(&CommonsFilename(filename.to_string()));
-                    out.add_image(
-                        ImageSource {
-                            url,
-                            date: None,
-                            location: None,
-                        },
-                        annotation_kind.clone(),
-                    );
-                }
-                None => out.issue("claim has no string value"),
-            }
-        }
-        Ok(out)
-    })
-}
 
 fn url_link(link_type: LinkType) -> PropertyHandler {
     Box::new(move |claims, _ctx| {
@@ -181,7 +138,7 @@ mod tests {
     use super::*;
     use chronoscope_core::{WikidataEntityId, WikidataPropertyId};
     use chronoscope_integrations::wikidata::{
-        DataValue, QuantityAmount, QuantityUnit, QuantityValue, Snak, WikidataId,
+        DataValue, QuantityAmount, QuantityUnit, QuantityValue, Snak,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -198,128 +155,11 @@ mod tests {
         Claim::simple(Snak::Value(DataValue::String(value.to_string())))
     }
 
-    fn claim_novalue() -> Claim {
-        Claim::simple(Snak::NoValue)
-    }
-
-    fn claim_somevalue() -> Claim {
-        Claim::simple(Snak::SomeValue)
-    }
-
     fn claim_non_string() -> Claim {
         Claim::simple(Snak::Value(DataValue::Quantity(QuantityValue {
             amount: QuantityAmount("1".to_string()),
             unit: QuantityUnit::Dimensionless,
         })))
-    }
-
-    // =========================================================================
-    // image handler (P18, P5775, P3451, P3311)
-    // =========================================================================
-
-    #[test]
-    fn image_handler_creates_image_from_filename() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P18")
-            .ok_or("P18 handler not found")?;
-        let claims = vec![claim_with_string("Example.jpg")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
-
-        assert_eq!(output.images.len(), 1);
-        let (img, kind) = &output.images[0];
-        assert!(img.url.as_str().contains("Example.jpg"));
-        assert!(matches!(kind, AnnotationKind::ExteriorView { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn image_handler_interior_view() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P5775")
-            .ok_or("P5775 handler not found")?;
-        let claims = vec![claim_with_string("Interior.jpg")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
-
-        assert_eq!(output.images.len(), 1);
-        let (_img, kind) = &output.images[0];
-        assert!(matches!(kind, AnnotationKind::InteriorView { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn image_handler_spatial_trace() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P3311")
-            .ok_or("P3311 handler not found")?;
-        let claims = vec![claim_with_string("Plans.jpg")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
-
-        assert_eq!(output.images.len(), 1);
-        let (_img, kind) = &output.images[0];
-        assert!(matches!(kind, AnnotationKind::SpatialTrace { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn image_handler_skips_novalue() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P18")
-            .ok_or("P18 handler not found")?;
-        let claims = vec![claim_novalue()];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
-
-        assert!(output.images.is_empty());
-        assert!(output.issues.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn image_handler_skips_somevalue() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P18")
-            .ok_or("P18 handler not found")?;
-        let claims = vec![claim_somevalue()];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
-
-        assert!(output.images.is_empty());
-        assert!(output.issues.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn image_handler_non_string_value_issues() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P18")
-            .ok_or("P18 handler not found")?;
-        // A value snak but with a non-string DataValue (e.g., Quantity)
-        let claims = vec![claim_non_string()];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
-
-        assert!(output.images.is_empty());
-        assert_eq!(output.issues.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn image_handler_multiple_claims() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P18")
-            .ok_or("P18 handler not found")?;
-        let claims = vec![
-            claim_with_string("Photo1.jpg"),
-            claim_with_string("Photo2.jpg"),
-        ];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
-
-        assert_eq!(output.images.len(), 2);
-        Ok(())
     }
 
     // =========================================================================
@@ -496,90 +336,6 @@ mod tests {
 
         assert!(output.links.is_empty());
         assert_eq!(output.issues.len(), 1);
-        Ok(())
-    }
-
-    // =========================================================================
-    // entity_accumulator
-    // =========================================================================
-
-    #[test]
-    fn entity_accumulator_lifecycle() -> TestResult {
-        use crate::wikidata::ingest::EntityAccumulator;
-
-        let wid = WikidataId::try_from("Q100".to_string())?;
-        use chronoscope_integrations::wikidata::RevisionId;
-        let mut acc = EntityAccumulator::new(0, wid, RevisionId(42));
-        assert_eq!(acc.wikidata_id(), "Q100");
-
-        // Add image
-        acc.add_image(
-            ImageSource {
-                url: url::Url::parse("https://example.com/img.jpg")?,
-                date: None,
-                location: None,
-            },
-            AnnotationKind::ExteriorView { region: None },
-        );
-
-        // Add link
-        acc.add_link(ExternalLink {
-            target: LinkTarget::Pleiades {
-                place_id: "test".to_string(),
-            },
-            link_type: LinkType::SameAs,
-        });
-
-        // Add issue
-        acc.add_issue("P18", "test issue");
-
-        // Create property context
-        let ctx = acc.property_context("P18")?;
-        assert_eq!(ctx.property(), WikidataPropertyId::new(18));
-        assert_eq!(ctx.wikidata_id(), WikidataEntityId::new(100));
-
-        // Merge handler output
-        let mut output = HandlerOutput::new();
-        output.issue("merged issue");
-        acc.merge_output("P856", output);
-
-        // Convert to result
-        let result = acc.into_result(vec![]);
-        assert_eq!(result.wikidata_id, "Q100");
-        assert_eq!(result.revision_id, RevisionId(42));
-        assert_eq!(result.images.len(), 1);
-        assert_eq!(result.links.len(), 1);
-        assert_eq!(result.annotations.len(), 1);
-        assert_eq!(result.issues.len(), 2);
-        Ok(())
-    }
-
-    #[test]
-    fn property_context_creates_cited_evidence() -> TestResult {
-        let ctx = PropertyContext::new("Q100", 42, "P571")?;
-        let cited = ctx.cited("test_raw", 123);
-
-        assert_eq!(cited.value, 123);
-        assert_eq!(cited.evidence.len(), 1);
-        if let chronoscope_core::Evidence::Wikidata {
-            entity_id,
-            revision_id,
-            field,
-            observed_value,
-        } = &cited.evidence[0]
-        {
-            assert_eq!(*entity_id, WikidataEntityId::new(100));
-            assert_eq!(
-                *field,
-                chronoscope_core::WikidataField::Statement {
-                    property_id: WikidataPropertyId::new(571),
-                }
-            );
-            assert_eq!(observed_value, "test_raw");
-            assert_eq!(*revision_id, 42);
-        } else {
-            return Err("expected Wikidata evidence".into());
-        }
         Ok(())
     }
 }
