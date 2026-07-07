@@ -1054,3 +1054,54 @@ async fn test_rome_entities_have_thumbnails() -> TestResult {
     })
     .await
 }
+
+/// Notre-Dame de Paris (lng, lat).
+const NOTRE_DAME: (f64, f64) = (2.349902, 48.852968);
+
+/// Notre-Dame de Paris is constructed over 1163–1345 with a mid-life usage
+/// change dated 1186. In moment order that interior event interleaves *between*
+/// the two construction endpoints. This drives the real detail panel and pins
+/// that order end-to-end — the render-layer complement of `core::moment`'s unit
+/// coverage.
+#[tokio::test]
+async fn test_notre_dame_interior_event_renders_between_construction_endpoints() -> TestResult {
+    web_test(async |t| {
+        t.goto_map_at(NOTRE_DAME.0, NOTRE_DAME.1, 14.0).await?;
+
+        // A single marker sits at these coords, so clicking opens the detail
+        // panel directly — no disambiguation picker.
+        t.click_map_at(NOTRE_DAME.0, NOTRE_DAME.1).await?;
+        t.wait_for_selector("[role='complementary']").await?;
+
+        // The detail fetch is async; wait for a loaded-state token (asserted on
+        // below) before sampling the rendered order.
+        t.wait_for_body_text("Construction completed").await?;
+
+        let panel_text = t.text("[role='complementary']").await?;
+
+        let construction_started = panel_text
+            .find("Construction started")
+            .ok_or("Notre-Dame panel should render a 'Construction started' row")?;
+        let usage_changed = panel_text
+            .find("Usage changed")
+            .ok_or("Notre-Dame panel should render its mid-life 'Usage changed' row")?;
+        let construction_completed = panel_text
+            .find("Construction completed")
+            .ok_or("Notre-Dame panel should render a 'Construction completed' row")?;
+
+        // The mid-life usage change must fall between the construction
+        // endpoints — after the start, before the completion — in rendered order.
+        check(
+            construction_started < usage_changed && usage_changed < construction_completed,
+            format!(
+                "Notre-Dame's mid-life 'Usage changed' row must render between \
+                 'Construction started' and 'Construction completed'; got offsets \
+                 started={construction_started}, usage={usage_changed}, \
+                 completed={construction_completed} in panel: {panel_text}"
+            ),
+        )?;
+
+        Ok(())
+    })
+    .await
+}

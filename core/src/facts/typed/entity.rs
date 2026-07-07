@@ -144,7 +144,7 @@ pub enum InteriorEvent<ImgId> {
     },
 }
 
-/// One sorted timeline entry: the lifecycle detail and the citations behind it.
+/// One timeline entry: the lifecycle detail and the citations behind it.
 ///
 /// `sources` is universal: an interior event carries its kind/existence
 /// citations (so a bare `Modified` with no dates keeps its attribution); a
@@ -160,7 +160,7 @@ pub struct TimelineEntry<EvtId, ImgId> {
 
 /// The typed DTO for one entity: every restrictive field flattened to a
 /// [`Bounded`], every membership attributed, the interior events parsed into a
-/// sorted timeline, and the merge lineage surfaced.
+/// timeline, and the merge lineage surfaced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(
     deserialize = "EntId: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, EvtId: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
@@ -483,8 +483,8 @@ where
 
 /// The date bounds one interior event carries, in representative-first order: a
 /// period's start then completion, a point event's instant, an ambiguous event's
-/// start/completion/occurrence. [`interior_date`] reads the first with a known
-/// lower bound; [`timeline_span`](crate::facts::listing) folds them all.
+/// start/completion/occurrence. [`timeline_span`](crate::facts::listing) folds
+/// them all for the entity's date span.
 pub(crate) fn interior_event_bounds<ImgId>(
     kind: &InteriorEvent<ImgId>,
 ) -> Vec<&Bounded<UncertainDate, ImgId>> {
@@ -513,30 +513,6 @@ pub(crate) fn entry_date_bounds<EvtId, ImgId>(
     }
 }
 
-/// An interior event's best-known date — started, falling back to completed,
-/// falling back to occurred — for ordering. The bookends carry none; they anchor
-/// by lifecycle position instead.
-fn interior_date<ImgId>(kind: &InteriorEvent<ImgId>) -> Option<NaiveDate> {
-    interior_event_bounds(kind)
-        .into_iter()
-        .find_map(|bound| bound.possible.earliest())
-}
-
-/// The total timeline order: construction first, demolition last, interior by
-/// best-known date with undated entries (`None` last) after the dated ones.
-fn entry_sort_key<EvtId, ImgId>(
-    detail: &EventDetail<EvtId, ImgId>,
-) -> (u8, bool, Option<NaiveDate>) {
-    match detail {
-        EventDetail::Constructed { .. } => (0, false, None),
-        EventDetail::Demolished { .. } => (2, false, None),
-        EventDetail::Interior { kind, .. } => {
-            let date = interior_date(kind);
-            (1, date.is_none(), date)
-        }
-    }
-}
-
 /// The union of a bookend's date and location bracket citations — a present
 /// bookend entry's attribution, so it never surfaces empty-sourced.
 fn bookend_sources<EntId, ImgId>(
@@ -556,8 +532,9 @@ where
         .collect()
 }
 
-/// Build the sorted timeline: construction first, demolition last, the interior
-/// events parsed and ordered by earliest known date with undated entries last.
+/// Assemble the timeline in a deterministic structural order: construction
+/// first, the interior events by their id, demolition last. Display ordering —
+/// interleaving endpoints by date — is the [`moment`](crate::moment) layer's job.
 fn timeline<EntId, EvtId, ImgId>(
     projected: &projection::Entity<EntId, EvtId, ImgId, MemberLineage<EntId, ImgId>>,
 ) -> Vec<TimelineEntry<EvtId, ImgId>>
@@ -599,7 +576,6 @@ where
         });
     }
 
-    entries.sort_by_key(|entry| entry_sort_key(&entry.detail));
     entries
 }
 
@@ -1114,19 +1090,20 @@ mod tests {
     }
 
     #[test]
-    fn timeline_orders_construction_first_demolition_last_undated_late() -> TestResult {
+    fn timeline_places_construction_first_demolition_last_interiors_by_id() -> TestResult {
         let mut entity = empty_entity();
         entity.construction.started_at = claim(year(1800)?, lin(1, "https://c")?);
         entity.demolition.completed_at = claim(year(1990)?, lin(1, "https://x")?);
-        // Two interior events: one dated 1900, one undated. Insert undated at a
-        // lower event id so a stable sort would otherwise place it first.
-        entity
-            .events
-            .insert(1, cited(designated_event(None)?, lin(1, "https://u")?));
+        // Two interior events inserted with the later-dated one at the lower id,
+        // so the assembly order tracks the id. Date interleaving is the `moment`
+        // layer's job.
         entity.events.insert(
-            2,
+            1,
             cited(designated_event(Some(1900))?, lin(1, "https://p")?),
         );
+        entity
+            .events
+            .insert(2, cited(designated_event(None)?, lin(1, "https://u")?));
 
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         let kinds: Vec<&str> = out
@@ -1156,7 +1133,7 @@ mod tests {
                 "designated-undated",
                 "demolished"
             ],
-            "construction first, dated interior, undated interior, demolition last"
+            "construction first, interiors in id order, demolition last"
         );
         Ok(())
     }

@@ -363,12 +363,10 @@ fn EntityDetailContent(
 
 /// One row in the rendered entity timeline.
 ///
-/// Each row corresponds to one dated (or dateless) endpoint of a
-/// [`TimelineEntry`]: a period-shaped phase (construction, demolition, an
-/// interior span like modification or repair) contributes one row per
-/// endpoint that actually carries a date, collapsing to a single dateless
-/// row when neither endpoint does; a point-shaped interior event (usage
-/// change, designation) contributes one row for its instant.
+/// Each row is one ordered [`Moment`]: a durational endpoint (construction,
+/// demolition, or an interior span like modification or repair) or a
+/// point-shaped interior event (usage change, designation). A durational whose
+/// endpoints are both dateless collapses to a single bare row.
 #[derive(Debug, Clone)]
 struct TimelineRow {
     label: String,
@@ -411,11 +409,10 @@ use chronoscope_core::date::{DateBound, DatePrecision, UncertainDate};
 use chronoscope_core::facts::citations::ExternalReference;
 use chronoscope_core::facts::lifecycle::{DamageCause, MoveMethod, Usage};
 use chronoscope_core::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
-use chronoscope_core::facts::typed::{
-    Attributed, Bounded, Consensus, EventDetail, InteriorEvent, Period, TimelineEntry, best_name,
-};
+use chronoscope_core::facts::typed::{Attributed, Bounded, EventDetail, InteriorEvent, best_name};
 use chronoscope_core::ids::OsmElementType;
 use chronoscope_core::location::{LocationReference, UnresolvedLocation};
+use chronoscope_core::moment::{Moment, TransitionRole, decompose, topological_order};
 
 /// Fetch entity detail using the typed API client and flatten it into the
 /// view model the panel renders.
@@ -427,7 +424,10 @@ async fn fetch_entity_detail(
         client.get_entity(id).await.map_err(|e| e.to_string())?;
 
     let name = best_name(&entity.names, &browser_language_prefix()).map(|n| n.text.clone());
-    let timeline = entity.timeline.iter().flat_map(timeline_rows).collect();
+    let timeline = topological_order(decompose(&entity.timeline))
+        .iter()
+        .map(moment_row)
+        .collect();
     let links = entity
         .external_refs
         .iter()
@@ -460,174 +460,89 @@ fn browser_language_prefix() -> String {
         .unwrap_or_else(|| "en".to_string())
 }
 
-// ==================== Timeline flattening ====================
+// ==================== Moment → row ====================
 
-/// The endpoint-specific and bare labels for one period-shaped lifecycle
-/// phase (construction, demolition, or a durational interior event).
-struct PhaseLabels {
-    started: &'static str,
-    completed: &'static str,
-    /// Used when neither endpoint carries a date.
-    bare: &'static str,
+/// Map one ordered [`Moment`] to its display row: the role's label (bare when a
+/// durational pair collapsed to a single undated moment), the endpoint's date,
+/// and the secondary text the terminal moment of the event carries.
+fn moment_row(moment: &Moment<MemoryEventId, MemoryImageId>) -> TimelineRow {
+    TimelineRow {
+        label: moment_label(moment.role, moment.collapsed).to_string(),
+        date: moment.date.map(|b| b.possible.clone()),
+        description: carries_description(moment.role, moment.collapsed)
+            .then(|| entry_description(&moment.entry.detail))
+            .flatten(),
+    }
 }
 
-/// Flatten one timeline entry into its display row(s).
-fn timeline_rows(entry: &TimelineEntry<MemoryEventId, MemoryImageId>) -> Vec<TimelineRow> {
-    match &entry.detail {
-        EventDetail::Constructed { period, .. } => period_rows(
-            PhaseLabels {
-                started: "Construction started",
-                completed: "Construction completed",
-                bare: "Constructed",
-            },
-            period,
-            None,
-        ),
-        EventDetail::Demolished { period } => period_rows(
-            PhaseLabels {
-                started: "Demolition started",
-                completed: "Demolition completed",
-                bare: "Demolished",
-            },
-            period,
-            None,
-        ),
+/// The label for a moment's role. The durational start roles read as the bare
+/// verb when collapsed (both endpoints dateless); otherwise start and end roles
+/// read as "… started" / "… completed", and point roles carry their own phrase.
+fn moment_label(role: TransitionRole, collapsed: bool) -> &'static str {
+    use TransitionRole::{
+        Ambiguous, ConstructionEnd, ConstructionStart, DamagedEnd, DamagedStart, DemolitionEnd,
+        DemolitionStart, Designated, ModificationEnd, ModificationStart, MovedEnd, MovedStart,
+        RepairEnd, RepairStart, UsageModified,
+    };
+    match (role, collapsed) {
+        (ConstructionStart, true) => "Constructed",
+        (ModificationStart, true) => "Modified",
+        (RepairStart, true) => "Repaired",
+        (DamagedStart, true) => "Damaged",
+        (MovedStart, true) => "Moved",
+        (DemolitionStart, true) => "Demolished",
+        (ConstructionStart, false) => "Construction started",
+        (ConstructionEnd, _) => "Construction completed",
+        (ModificationStart, false) => "Modification started",
+        (ModificationEnd, _) => "Modification completed",
+        (RepairStart, false) => "Repair started",
+        (RepairEnd, _) => "Repair completed",
+        (DamagedStart, false) => "Damage started",
+        (DamagedEnd, _) => "Damage completed",
+        (MovedStart, false) => "Move started",
+        (MovedEnd, _) => "Move completed",
+        (DemolitionStart, false) => "Demolition started",
+        (DemolitionEnd, _) => "Demolition completed",
+        (UsageModified, _) => "Usage changed",
+        (Designated, _) => "Designated",
+        (Ambiguous, _) => "Event",
+    }
+}
+
+/// Whether this moment carries the event's secondary text. A durational start
+/// (the roles with a `durational_end`) defers to its completion endpoint;
+/// points, collapsed durationals, and completion endpoints carry it.
+fn carries_description(role: TransitionRole, collapsed: bool) -> bool {
+    collapsed || role.durational_end().is_none()
+}
+
+/// The secondary line for a timeline entry: the kind-specific summary (a damage
+/// cause, a move's method and destination, a usage set, a designation) joined
+/// with the entry's free-text descriptions. Bookends carry none.
+fn entry_description(detail: &EventDetail<MemoryEventId, MemoryImageId>) -> Option<String> {
+    let (descriptions, kind) = match detail {
+        EventDetail::Constructed { .. } | EventDetail::Demolished { .. } => return None,
         EventDetail::Interior {
             descriptions, kind, ..
-        } => interior_rows(kind, join_descriptions(descriptions)),
-    }
-}
-
-/// Flatten one interior event's kind into its display row(s), threading
-/// through the entry-level free-text descriptions.
-fn interior_rows(
-    kind: &InteriorEvent<MemoryImageId>,
-    description: Option<String>,
-) -> Vec<TimelineRow> {
+        } => (descriptions, kind),
+    };
+    let free = join_descriptions(descriptions);
     match kind {
-        InteriorEvent::Modified { period } => period_rows(
-            PhaseLabels {
-                started: "Modification started",
-                completed: "Modification completed",
-                bare: "Modified",
-            },
-            period,
-            description,
-        ),
-        InteriorEvent::Repaired { period } => period_rows(
-            PhaseLabels {
-                started: "Repair started",
-                completed: "Repair completed",
-                bare: "Repaired",
-            },
-            period,
-            description,
-        ),
-        InteriorEvent::Damaged { period, cause } => period_rows(
-            PhaseLabels {
-                started: "Damage started",
-                completed: "Damage completed",
-                bare: "Damaged",
-            },
-            period,
-            combine_description(cause.settled().map(damage_cause_label), description),
-        ),
-        InteriorEvent::Moved { period, method, to } => period_rows(
-            PhaseLabels {
-                started: "Move started",
-                completed: "Move completed",
-                bare: "Moved",
-            },
-            period,
-            combine_description(move_summary(method, to), description),
-        ),
-        InteriorEvent::UsageChanged { at, usages } => vec![point_row(
-            "Usage changed",
-            at,
-            combine_description(usages.settled().map(usage_set_label), description),
-        )],
-        InteriorEvent::Designated { at, designation } => vec![point_row(
-            "Designated",
-            at,
-            combine_description(settled_designation(designation), description),
-        )],
-        InteriorEvent::Ambiguous { facts, .. } => vec![TimelineRow {
-            label: "Event".to_string(),
-            date: best_bound(&[&facts.started, &facts.completed, &facts.occurred]),
-            description,
-        }],
+        InteriorEvent::Modified { .. } | InteriorEvent::Repaired { .. } => free,
+        InteriorEvent::Damaged { cause, .. } => {
+            combine_description(cause.settled().map(damage_cause_label), free)
+        }
+        InteriorEvent::Moved { method, to, .. } => {
+            combine_description(move_summary(method, to), free)
+        }
+        InteriorEvent::UsageChanged { usages, .. } => {
+            combine_description(usages.settled().map(usage_set_label), free)
+        }
+        InteriorEvent::Designated { designation, .. } => {
+            combine_description(settled_designation(designation), free)
+        }
+        InteriorEvent::Ambiguous { .. } => free,
     }
-}
-
-/// Flatten a period into one row per dated endpoint, or a single bare row
-/// with "date unknown" when neither endpoint carries a date. `description`
-/// attaches to the terminal-most row present (completed over started).
-fn period_rows(
-    labels: PhaseLabels,
-    period: &Period<MemoryImageId>,
-    description: Option<String>,
-) -> Vec<TimelineRow> {
-    let started = has_date(&period.started).then(|| period.started.possible.clone());
-    let completed = has_date(&period.completed).then(|| period.completed.possible.clone());
-
-    match (started, completed) {
-        (None, None) => vec![TimelineRow {
-            label: labels.bare.to_string(),
-            date: None,
-            description,
-        }],
-        (Some(s), None) => vec![TimelineRow {
-            label: labels.started.to_string(),
-            date: Some(s),
-            description,
-        }],
-        (None, Some(c)) => vec![TimelineRow {
-            label: labels.completed.to_string(),
-            date: Some(c),
-            description,
-        }],
-        (Some(s), Some(c)) => vec![
-            TimelineRow {
-                label: labels.started.to_string(),
-                date: Some(s),
-                description: None,
-            },
-            TimelineRow {
-                label: labels.completed.to_string(),
-                date: Some(c),
-                description,
-            },
-        ],
-    }
-}
-
-/// One point-shaped interior event's row.
-fn point_row(
-    label: &str,
-    at: &Bounded<UncertainDate, MemoryImageId>,
-    description: Option<String>,
-) -> TimelineRow {
-    TimelineRow {
-        label: label.to_string(),
-        date: has_date(at).then(|| at.possible.clone()),
-        description,
-    }
-}
-
-/// Whether a claim actually touched this date slot — `Absent` means no
-/// source ever asserted it, so the row renders "date unknown" rather than
-/// the honest-but-meaningless bottom value.
-fn has_date(bounded: &Bounded<UncertainDate, MemoryImageId>) -> bool {
-    !matches!(bounded.consensus, Consensus::Absent)
-}
-
-/// The first dated bound among several candidates, in priority order. Used
-/// for `Ambiguous` events, whose kind (and thus which date field is
-/// authoritative) never settled.
-fn best_bound(bounds: &[&Bounded<UncertainDate, MemoryImageId>]) -> Option<UncertainDate> {
-    bounds
-        .iter()
-        .find_map(|b| has_date(b).then(|| b.possible.clone()))
 }
 
 /// Join an interior event's free-text descriptions into one secondary line.

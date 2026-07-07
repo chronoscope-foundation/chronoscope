@@ -1,39 +1,14 @@
-//! Per-endpoint projection over [`EntityTransition`].
+//! Per-endpoint projection over the typed lifecycle timeline for display
+//! ordering.
 //!
-//! # Why this exists
-//!
-//! [`EntityTransition`] bundles durational events together: a `Constructed`
-//! variant carries both `started_at` and `completed_at` in one record. Three
-//! consumers need to reason about *individual endpoints* rather than whole
-//! bundles:
-//!
-//! - **Display**: a building whose construction started in 1880 and finished
-//!   in 1889 wants to render as two timeline rows ("Construction started 1880"
-//!   and "Construction completed 1889"), each sortable independently against
-//!   other events. The Mole Antonelliana case is the canonical example —
-//!   `Constructed { completed_at: 1889 }` plus `UsageModified: 1888-03` should
-//!   render the usage change *between* the (unknown) construction start and
-//!   the construction completion, not lumped together by phase.
-//! - **Consistency checking**: the temporal-violation rules
-//!   (`CompletionBeforeStart`, `EventsOutOfOrder`, `EventAfterDemolished`)
-//!   are all expressible as one mechanism: structural edges between roles
-//!   plus date edges between dated moments, with violations as edges that
-//!   contradict.
-//! - **Eventual spatiotemporal solver**: needs the same partial-order view to
-//!   reason about an entity's lifecycle as dated and undated constraints.
-//!
-//! All three want the same primitive: a flat sequence of dated moments with
-//! known structural roles. This module provides it as a borrow over the
-//! underlying transitions, plus a [`topological_order`] sort.
-//!
-//! # Status: interim shape
-//!
-//! The underlying `EntityTransition` data model is still being worked out —
-//! we're choosing between keeping bundled durationals (current shape) and
-//! splitting them into flat `Start`/`End` records linked by an identifier.
-//! The design discussion is tracked outside the repo. Whichever way that
-//! decision lands, the projection consumers (typed, consistency, solver)
-//! should be mostly stable — only [`decompose`] needs to change.
+//! A [`TimelineEntry`] bundles a durational event's two endpoints together: a
+//! construction carries both `started` and `completed` in one
+//! [`Period`](crate::facts::typed::Period). To render — and sort — endpoints
+//! independently, [`decompose`] splits each
+//! durational entry into a start and an end [`Moment`] and leaves each point
+//! entry as one. [`topological_order`] then sorts the moments over structural
+//! lifecycle edges and date edges, so an interior event interleaves between
+//! construction's endpoints when its date falls there.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -41,16 +16,15 @@ use std::collections::BinaryHeap;
 use chrono::NaiveDate;
 
 use crate::date::UncertainDate;
-use crate::entity::EntityTransition;
-use crate::evidence::Cited;
+use crate::facts::typed::{Bounded, Consensus, EventDetail, InteriorEvent, TimelineEntry};
 
 /// The role of a [`Moment`] within an entity's lifecycle.
 ///
-/// Variants are declared in canonical lifecycle order: construction
-/// endpoints, then mid-life events, then demolition endpoints. The
-/// `derive(Ord)` impl provides a deterministic tiebreaker for
-/// [`topological_order`] when two moments have no edge between them.
-/// Reordering variants changes tie-breaking behavior.
+/// Variants are declared in canonical lifecycle order: construction endpoints,
+/// then mid-life events (durational pairs, then point events), then demolition
+/// endpoints. The `derive(Ord)` impl provides a deterministic tiebreaker for
+/// [`topological_order`] when two moments have no edge between them. Reordering
+/// variants changes tie-breaking behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TransitionRole {
     ConstructionStart,
@@ -59,10 +33,13 @@ pub enum TransitionRole {
     ModificationEnd,
     RepairStart,
     RepairEnd,
-    Damaged,
-    Moved,
+    DamagedStart,
+    DamagedEnd,
+    MovedStart,
+    MovedEnd,
     UsageModified,
     Designated,
+    Ambiguous,
     DemolitionStart,
     DemolitionEnd,
 }
@@ -87,179 +64,212 @@ impl TransitionRole {
         !self.is_construction() && !self.is_demolition()
     }
 
-    /// The role's matching end for a durational pair, or `None` for
-    /// point-event roles.
+    /// The role's matching end for a durational pair, or `None` for point-event
+    /// roles.
     #[must_use]
     pub fn durational_end(self) -> Option<Self> {
         match self {
             Self::ConstructionStart => Some(Self::ConstructionEnd),
             Self::ModificationStart => Some(Self::ModificationEnd),
             Self::RepairStart => Some(Self::RepairEnd),
+            Self::DamagedStart => Some(Self::DamagedEnd),
+            Self::MovedStart => Some(Self::MovedEnd),
             Self::DemolitionStart => Some(Self::DemolitionEnd),
             _ => None,
         }
     }
 }
 
-/// One endpoint of a transition projected as an independently-sortable item.
+/// One endpoint of a timeline entry projected as an independently-sortable item.
 ///
-/// A durational transition (`Constructed`, `Modified`, `Repaired`,
-/// `Demolished`) decomposes into two `Moment`s — one for each endpoint —
-/// when at least one date is known. When both dates are unknown, only a
-/// single Start moment is emitted (two "date unknown" rows for one
-/// transition is noise). A point-event transition decomposes into a single
-/// `Moment`.
+/// A durational entry (`Constructed`, `Demolished`, and the `Modified`,
+/// `Repaired`, `Damaged`, `Moved` interior spans) decomposes into two `Moment`s
+/// — one per endpoint — when at least one date is known. When both dates are
+/// unknown, only a single collapsed Start is emitted, since two "date unknown"
+/// rows for one event is noise. A point entry decomposes into a single `Moment`.
 ///
-/// Borrows from the source transition list, so consumers that need access to
-/// shared metadata (description, location, cause) reach through `transition`.
+/// Borrows from the source timeline, so a consumer that needs the entry's
+/// descriptions, cause, or destination reaches through `entry`.
 #[derive(Debug)]
-pub struct Moment<'a, S> {
-    /// Index of the source transition in the entity's transition list.
-    pub transition_index: usize,
-    /// The source transition this moment was projected from.
-    pub transition: &'a EntityTransition<S>,
+pub struct Moment<'a, EvtId, ImgId> {
+    /// Index of the source entry in the entity's timeline.
+    pub entry_index: usize,
+    /// The source timeline entry this moment was projected from.
+    pub entry: &'a TimelineEntry<EvtId, ImgId>,
     pub role: TransitionRole,
     /// The date for this specific endpoint. `None` when unknown.
-    pub date: Option<&'a Cited<UncertainDate, S>>,
-    /// `true` when this is a durational Start whose End was suppressed
-    /// because both dates were unknown.
+    pub date: Option<&'a Bounded<UncertainDate, ImgId>>,
+    /// `true` when this is a durational Start whose End was suppressed because
+    /// both dates were unknown.
     pub collapsed: bool,
 }
 
-impl<S> Moment<'_, S> {
+impl<EvtId, ImgId> Moment<'_, EvtId, ImgId> {
     /// Earliest possible date for this moment.
     #[must_use]
     pub fn earliest(&self) -> Option<NaiveDate> {
-        self.date.and_then(|c| c.value.earliest())
+        self.date.and_then(|b| b.possible.earliest())
     }
 
     /// Latest possible date for this moment.
     #[must_use]
     pub fn latest(&self) -> Option<NaiveDate> {
-        self.date.and_then(|c| c.value.latest())
+        self.date.and_then(|b| b.possible.latest())
     }
 }
 
-fn push_point<'a, S>(
-    out: &mut Vec<Moment<'a, S>>,
-    transition_index: usize,
-    transition: &'a EntityTransition<S>,
+/// Whether a date slot carries a claim. An `Absent` consensus never touched the
+/// slot, so the moment is undated.
+fn has_date<ImgId>(bounded: &Bounded<UncertainDate, ImgId>) -> bool {
+    !matches!(bounded.consensus, Consensus::Absent)
+}
+
+/// The slot as a dated bound, or `None` when it is absent.
+fn dated_bound<ImgId>(
+    bounded: &Bounded<UncertainDate, ImgId>,
+) -> Option<&Bounded<UncertainDate, ImgId>> {
+    has_date(bounded).then_some(bounded)
+}
+
+fn push_point<'a, EvtId, ImgId>(
+    out: &mut Vec<Moment<'a, EvtId, ImgId>>,
+    entry_index: usize,
+    entry: &'a TimelineEntry<EvtId, ImgId>,
     role: TransitionRole,
-    date: Option<&'a Cited<UncertainDate, S>>,
+    date: Option<&'a Bounded<UncertainDate, ImgId>>,
 ) {
     out.push(Moment {
-        transition_index,
-        transition,
+        entry_index,
+        entry,
         role,
         date,
         collapsed: false,
     });
 }
 
-/// Decompose a list of transitions into a flat sequence of [`Moment`]s.
+fn push_durational<'a, EvtId, ImgId>(
+    out: &mut Vec<Moment<'a, EvtId, ImgId>>,
+    entry_index: usize,
+    entry: &'a TimelineEntry<EvtId, ImgId>,
+    start_role: TransitionRole,
+    end_role: TransitionRole,
+    started: &'a Bounded<UncertainDate, ImgId>,
+    completed: &'a Bounded<UncertainDate, ImgId>,
+) {
+    let started = dated_bound(started);
+    let completed = dated_bound(completed);
+    let collapsed = started.is_none() && completed.is_none();
+    out.push(Moment {
+        entry_index,
+        entry,
+        role: start_role,
+        date: started,
+        collapsed,
+    });
+    if !collapsed {
+        out.push(Moment {
+            entry_index,
+            entry,
+            role: end_role,
+            date: completed,
+            collapsed: false,
+        });
+    }
+}
+
+/// Decompose a typed timeline into a flat sequence of [`Moment`]s.
 ///
-/// Each durational variant produces two moments (Start, then End) when at
-/// least one date is known, or a single collapsed Start when both dates are
-/// unknown. Each point variant produces one moment. The output preserves
-/// the input order — sorting is the caller's responsibility via
-/// [`topological_order`].
+/// Each durational entry produces two moments (Start, then End) when at least
+/// one date is known, or a single collapsed Start when both dates are unknown.
+/// Each point entry produces one moment. The output preserves the input order —
+/// sorting is the caller's job via [`topological_order`].
 #[must_use]
-pub fn decompose<S>(transitions: &[EntityTransition<S>]) -> Vec<Moment<'_, S>> {
-    let mut out: Vec<Moment<'_, S>> = Vec::with_capacity(transitions.len() * 2);
-    for (i, t) in transitions.iter().enumerate() {
-        let (start_role, end_role, started, completed) = match t {
-            EntityTransition::Constructed {
-                started_at,
-                completed_at,
-                ..
-            } => (
+pub fn decompose<EvtId, ImgId>(
+    timeline: &[TimelineEntry<EvtId, ImgId>],
+) -> Vec<Moment<'_, EvtId, ImgId>> {
+    let mut out: Vec<Moment<'_, EvtId, ImgId>> = Vec::with_capacity(timeline.len() * 2);
+    for (i, entry) in timeline.iter().enumerate() {
+        match &entry.detail {
+            EventDetail::Constructed { period, .. } => push_durational(
+                &mut out,
+                i,
+                entry,
                 TransitionRole::ConstructionStart,
                 TransitionRole::ConstructionEnd,
-                started_at.as_ref(),
-                completed_at.as_ref(),
+                &period.started,
+                &period.completed,
             ),
-            EntityTransition::Modified {
-                started_at,
-                completed_at,
-                ..
-            } => (
-                TransitionRole::ModificationStart,
-                TransitionRole::ModificationEnd,
-                started_at.as_ref(),
-                completed_at.as_ref(),
-            ),
-            EntityTransition::Repaired {
-                started_at,
-                completed_at,
-                ..
-            } => (
-                TransitionRole::RepairStart,
-                TransitionRole::RepairEnd,
-                started_at.as_ref(),
-                completed_at.as_ref(),
-            ),
-            EntityTransition::Demolished {
-                started_at,
-                completed_at,
-                ..
-            } => (
+            EventDetail::Demolished { period } => push_durational(
+                &mut out,
+                i,
+                entry,
                 TransitionRole::DemolitionStart,
                 TransitionRole::DemolitionEnd,
-                started_at.as_ref(),
-                completed_at.as_ref(),
+                &period.started,
+                &period.completed,
             ),
-            EntityTransition::Damaged { occurred_at, .. } => {
-                push_point(
+            EventDetail::Interior { kind, .. } => match kind {
+                InteriorEvent::Modified { period } => push_durational(
                     &mut out,
                     i,
-                    t,
-                    TransitionRole::Damaged,
-                    occurred_at.as_ref(),
-                );
-                continue;
-            }
-            EntityTransition::Moved { occurred_at, .. } => {
-                push_point(&mut out, i, t, TransitionRole::Moved, occurred_at.as_ref());
-                continue;
-            }
-            EntityTransition::UsageModified { occurred_at, .. } => {
-                push_point(
+                    entry,
+                    TransitionRole::ModificationStart,
+                    TransitionRole::ModificationEnd,
+                    &period.started,
+                    &period.completed,
+                ),
+                InteriorEvent::Repaired { period } => push_durational(
                     &mut out,
                     i,
-                    t,
-                    TransitionRole::UsageModified,
-                    occurred_at.as_ref(),
-                );
-                continue;
-            }
-            EntityTransition::Designated { occurred_at, .. } => {
-                push_point(
+                    entry,
+                    TransitionRole::RepairStart,
+                    TransitionRole::RepairEnd,
+                    &period.started,
+                    &period.completed,
+                ),
+                InteriorEvent::Damaged { period, .. } => push_durational(
                     &mut out,
                     i,
-                    t,
-                    TransitionRole::Designated,
-                    occurred_at.as_ref(),
-                );
-                continue;
-            }
-        };
-
-        let collapsed = started.is_none() && completed.is_none();
-        out.push(Moment {
-            transition_index: i,
-            transition: t,
-            role: start_role,
-            date: started,
-            collapsed,
-        });
-        if !collapsed {
-            out.push(Moment {
-                transition_index: i,
-                transition: t,
-                role: end_role,
-                date: completed,
-                collapsed: false,
-            });
+                    entry,
+                    TransitionRole::DamagedStart,
+                    TransitionRole::DamagedEnd,
+                    &period.started,
+                    &period.completed,
+                ),
+                InteriorEvent::Moved { period, .. } => push_durational(
+                    &mut out,
+                    i,
+                    entry,
+                    TransitionRole::MovedStart,
+                    TransitionRole::MovedEnd,
+                    &period.started,
+                    &period.completed,
+                ),
+                InteriorEvent::UsageChanged { at, .. } => {
+                    push_point(
+                        &mut out,
+                        i,
+                        entry,
+                        TransitionRole::UsageModified,
+                        dated_bound(at),
+                    );
+                }
+                InteriorEvent::Designated { at, .. } => {
+                    push_point(
+                        &mut out,
+                        i,
+                        entry,
+                        TransitionRole::Designated,
+                        dated_bound(at),
+                    );
+                }
+                InteriorEvent::Ambiguous { facts, .. } => {
+                    let date = [&facts.started, &facts.completed, &facts.occurred]
+                        .into_iter()
+                        .find(|&b| has_date(b));
+                    push_point(&mut out, i, entry, TransitionRole::Ambiguous, date);
+                }
+            },
         }
     }
     out
@@ -268,14 +278,14 @@ pub fn decompose<S>(transitions: &[EntityTransition<S>]) -> Vec<Moment<'_, S>> {
 /// Returns `(from, to)` pairs representing structural precedence constraints
 /// between moments. These encode lifecycle rules:
 ///
-/// - Within a durational transition: start before end
+/// - Within a durational entry: start before end
 /// - Construction endpoints before mid-life events
 /// - Construction endpoints before demolition endpoints
 /// - Mid-life events before demolition endpoints
 ///
 /// Mid-life events have no structural ordering relative to each other.
 #[must_use]
-pub fn structural_edges<S>(moments: &[Moment<'_, S>]) -> Vec<(usize, usize)> {
+pub fn structural_edges<EvtId, ImgId>(moments: &[Moment<'_, EvtId, ImgId>]) -> Vec<(usize, usize)> {
     let mut edges = Vec::new();
     for (i, a) in moments.iter().enumerate() {
         for (j, b) in moments.iter().enumerate() {
@@ -283,8 +293,8 @@ pub fn structural_edges<S>(moments: &[Moment<'_, S>]) -> Vec<(usize, usize)> {
                 continue;
             }
             let precedes =
-                // Same-transition durational: start before end
-                (a.transition_index == b.transition_index
+                // Same-entry durational: start before end
+                (a.entry_index == b.entry_index
                     && a.role.durational_end() == Some(b.role))
                 // Construction before mid-life
                 || (a.role.is_construction() && b.role.is_midlife())
@@ -305,16 +315,16 @@ pub fn structural_edges<S>(moments: &[Moment<'_, S>]) -> Vec<(usize, usize)> {
 /// The constraint graph has two kinds of edges:
 ///
 /// - **Structural edges** ([`structural_edges`]): lifecycle rules like
-///   "construction before mid-life." A structural edge is dropped when
-///   date evidence contradicts it — dates win for display, and the
-///   contradiction is surfaced separately by consistency checking.
+///   "construction before mid-life." A structural edge is dropped when date
+///   evidence contradicts it — dates win for display.
 /// - **Date edges**: if `A.latest < B.earliest`, A must precede B.
 ///
-/// When multiple moments have no edges between them (e.g. two undated
-/// mid-life events), ties are broken by `(role, transition_index)` for
-/// determinism.
+/// When multiple moments have no edges between them (e.g. two undated mid-life
+/// events), ties are broken by `(role, entry_index)` for determinism.
 #[must_use]
-pub fn topological_order<'a, S>(mut moments: Vec<Moment<'a, S>>) -> Vec<Moment<'a, S>> {
+pub fn topological_order<'a, EvtId, ImgId>(
+    mut moments: Vec<Moment<'a, EvtId, ImgId>>,
+) -> Vec<Moment<'a, EvtId, ImgId>> {
     let n = moments.len();
     if n == 0 {
         return moments;
@@ -355,12 +365,12 @@ pub fn topological_order<'a, S>(mut moments: Vec<Moment<'a, S>>) -> Vec<Moment<'
         }
     }
 
-    // Kahn's algorithm. Tie-break by (role, transition_index) so the output
-    // is deterministic when two moments have no ordering constraint.
+    // Kahn's algorithm. Tie-break by (role, entry_index) so the output is
+    // deterministic when two moments have no ordering constraint.
     let mut queue: BinaryHeap<Reverse<(TransitionRole, usize, usize)>> = BinaryHeap::new();
     for i in 0..n {
         if in_deg[i] == 0 {
-            queue.push(Reverse((moments[i].role, moments[i].transition_index, i)));
+            queue.push(Reverse((moments[i].role, moments[i].entry_index, i)));
         }
     }
 
@@ -372,7 +382,7 @@ pub fn topological_order<'a, S>(mut moments: Vec<Moment<'a, S>>) -> Vec<Moment<'
             if in_deg[neighbor] == 0 {
                 queue.push(Reverse((
                     moments[neighbor].role,
-                    moments[neighbor].transition_index,
+                    moments[neighbor].entry_index,
                     neighbor,
                 )));
             }
@@ -380,62 +390,123 @@ pub fn topological_order<'a, S>(mut moments: Vec<Moment<'a, S>>) -> Vec<Moment<'
     }
 
     // Permute moments into the computed order.
-    let mut slots: Vec<Option<Moment<'a, S>>> = moments.drain(..).map(Some).collect();
+    let mut slots: Vec<Option<Moment<'a, EvtId, ImgId>>> = moments.drain(..).map(Some).collect();
     order.into_iter().filter_map(|i| slots[i].take()).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algebra::lattice::JoinSemilattice;
     use crate::date::{DatePrecision, UncertainDate};
-    use crate::evidence::Cited;
+    use crate::facts::typed::{Consensus, Period};
     use chrono::NaiveDate;
 
-    type T = EntityTransition<()>;
+    type Entry = TimelineEntry<(), ()>;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn d(year: i32) -> Result<Cited<UncertainDate, ()>, Box<dyn std::error::Error>> {
-        let dt = NaiveDate::from_ymd_opt(year, 1, 1).ok_or("invalid date")?;
-        Ok(Cited::uncited(UncertainDate::with_precision(
-            dt,
-            DatePrecision::Day,
-        )?))
-    }
-
-    fn d_ym(year: i32, month: u32) -> Result<Cited<UncertainDate, ()>, Box<dyn std::error::Error>> {
+    fn dated(
+        year: i32,
+        month: u32,
+    ) -> Result<Bounded<UncertainDate, ()>, Box<dyn std::error::Error>> {
         let dt = NaiveDate::from_ymd_opt(year, month, 1).ok_or("invalid date")?;
-        Ok(Cited::uncited(UncertainDate::with_precision(
-            dt,
-            DatePrecision::Day,
-        )?))
+        let value = UncertainDate::with_precision(dt, DatePrecision::Day)?;
+        Ok(Bounded {
+            possible: value.clone(),
+            sources: Vec::new(),
+            consensus: Consensus::Reached { value },
+        })
     }
 
-    /// Mole Antonelliana: a `Constructed` with only `completed_at = 1889`
-    /// and a `UsageModified` at 1888-03 should render as
-    /// `[ConstructionStart(?), UsageModified(1888), ConstructionEnd(1889)]`
-    /// — the structural edge ConstructionEnd→UsageModified is dropped
-    /// because the dates contradict it, and the date edge
-    /// UsageModified→ConstructionEnd takes over.
+    /// An untouched slot: the honest ⊥ with an `Absent` consensus.
+    fn absent<V: JoinSemilattice>() -> Bounded<V, ()> {
+        Bounded {
+            possible: V::bottom(),
+            sources: Vec::new(),
+            consensus: Consensus::Absent,
+        }
+    }
+
+    fn constructed(
+        started: Bounded<UncertainDate, ()>,
+        completed: Bounded<UncertainDate, ()>,
+    ) -> Entry {
+        Entry {
+            detail: EventDetail::Constructed {
+                period: Period { started, completed },
+                location: absent(),
+            },
+            sources: Vec::new(),
+        }
+    }
+
+    fn demolished(
+        started: Bounded<UncertainDate, ()>,
+        completed: Bounded<UncertainDate, ()>,
+    ) -> Entry {
+        Entry {
+            detail: EventDetail::Demolished {
+                period: Period { started, completed },
+            },
+            sources: Vec::new(),
+        }
+    }
+
+    fn usage_changed(at: Bounded<UncertainDate, ()>) -> Entry {
+        Entry {
+            detail: EventDetail::Interior {
+                id: (),
+                descriptions: Vec::new(),
+                kind: InteriorEvent::UsageChanged {
+                    at,
+                    usages: absent(),
+                },
+            },
+            sources: Vec::new(),
+        }
+    }
+
+    fn roles(timeline: &[Entry]) -> Vec<TransitionRole> {
+        topological_order(decompose(timeline))
+            .iter()
+            .map(|m| m.role)
+            .collect()
+    }
+
+    /// Notre-Dame: constructed 1163→1345 with a usage change in 1200. The usage
+    /// change interleaves *between* the construction endpoints, not after the
+    /// completion — the ConstructionEnd→UsageModified structural edge is dropped
+    /// (dates contradict) and the date edge UsageModified→ConstructionEnd wins.
+    #[test]
+    fn interior_event_interleaves_between_construction_endpoints() -> TestResult {
+        let timeline = vec![
+            constructed(dated(1163, 1)?, dated(1345, 1)?),
+            usage_changed(dated(1200, 1)?),
+        ];
+        assert_eq!(
+            roles(&timeline),
+            vec![
+                TransitionRole::ConstructionStart,
+                TransitionRole::UsageModified,
+                TransitionRole::ConstructionEnd,
+            ]
+        );
+        Ok(())
+    }
+
+    /// Mole Antonelliana: a `Constructed` with only `completed = 1889` and a
+    /// usage change at 1888-03 renders as
+    /// `[ConstructionStart(?), UsageModified(1888), ConstructionEnd(1889)]` —
+    /// the undated start anchors first structurally, the usage change sorts
+    /// before the completion by date.
     #[test]
     fn topological_order_mole_antonelliana() -> TestResult {
-        let transitions: Vec<T> = vec![
-            T::Constructed {
-                started_at: None,
-                completed_at: Some(d(1889)?),
-                location: None,
-                trigger_event: None,
-            },
-            T::UsageModified {
-                occurred_at: Some(d_ym(1888, 3)?),
-                new_usages: Default::default(),
-                description: None,
-                trigger_event: None,
-            },
+        let timeline = vec![
+            constructed(absent(), dated(1889, 1)?),
+            usage_changed(dated(1888, 3)?),
         ];
-        let ordered = topological_order(decompose(&transitions));
-        let roles: Vec<TransitionRole> = ordered.iter().map(|m| m.role).collect();
         assert_eq!(
-            roles,
+            roles(&timeline),
             vec![
                 TransitionRole::ConstructionStart,
                 TransitionRole::UsageModified,
@@ -449,24 +520,12 @@ mod tests {
     /// durationals collapse to a single Start moment.
     #[test]
     fn topological_order_all_undated_falls_back_to_structural() -> TestResult {
-        let transitions: Vec<T> = vec![
-            T::Demolished {
-                started_at: None,
-                completed_at: None,
-                cause: None,
-                trigger_event: None,
-            },
-            T::Constructed {
-                started_at: None,
-                completed_at: None,
-                location: None,
-                trigger_event: None,
-            },
+        let timeline = vec![
+            demolished(absent(), absent()),
+            constructed(absent(), absent()),
         ];
-        let ordered = topological_order(decompose(&transitions));
-        let roles: Vec<TransitionRole> = ordered.iter().map(|m| m.role).collect();
         assert_eq!(
-            roles,
+            roles(&timeline),
             vec![
                 TransitionRole::ConstructionStart,
                 TransitionRole::DemolitionStart,
