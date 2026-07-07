@@ -98,7 +98,6 @@ test-with = "0.14"
 
 # Temp dirs (browser profiles, frontend serve dirs)
 tempfile = "3"
-oxilangtag = { version = "0.1", features = ["serde"] }
 url.workspace = true
 
 # Browser testing (headless Chrome via CDP)
