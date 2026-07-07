@@ -170,18 +170,6 @@ impl<'de> Deserialize<'de> for Language {
     }
 }
 
-impl std::fmt::Display for Language {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.inner, f)
-    }
-}
-
-impl AsRef<str> for Language {
-    fn as_ref(&self) -> &str {
-        &self.inner
-    }
-}
-
 /// Errors from [`Language`] construction and deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LanguageError {
