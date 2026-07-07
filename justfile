@@ -301,39 +301,19 @@ fetch-corpus:
     nix build .#corpus-images --no-link
     echo "Done. Corpus images will be pinned as GC roots on next analysis shell entry."
 
-# Build administrative regions database. Default: italy (~2 GB).
-# Pass `world` for the production-scale planet build (~70 GB, requires
-# regions-world hash to be set in nix/regions.nix first).
-fetch-regions variant="italy":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{ _ensure_nix }}
-    _ensure_nix
-    case "{{ variant }}" in
-        italy|world) ;;
-        *) echo "error: unknown variant {{ variant }}; valid: italy, world" >&2; exit 1 ;;
-    esac
-    echo "==> Building regions database ({{ variant }})..."
-    regions_out=$(nix build ".#regions-{{ variant }}-db" --no-link --print-out-paths)
-    _gc_root_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo .)/.nix-gc-roots"
-    mkdir -p "$_gc_root_dir"
-    nix-store --realise "$regions_out" --add-root "$_gc_root_dir/regions-{{ variant }}-db" > /dev/null 2>&1
-    echo "Done. Regions DB at: $regions_out/regions.sqlite"
-
-# Fetch everything: model weights + corpus images + italy regions.
-# Single nix build so all four FODs fetch in parallel (different hosts —
-# HF, corpus URLs, geofabrik — so concurrency is a clean win).
+# Fetch everything: model weights + corpus images.
+# Single nix build so all FODs fetch in parallel (different hosts —
+# HF, corpus URLs — so concurrency is a clean win).
 fetch-all:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _ensure_nix }}
     _ensure_nix
-    echo "==> Fetching weights, corpus, regions in parallel..."
+    echo "==> Fetching weights, corpus in parallel..."
     nix build \
         .#dinov3-weights \
         .#sam3-weights \
         .#corpus-images \
-        .#regions-italy-db \
         --impure --no-link
     echo "Done."
 

@@ -3,17 +3,6 @@
 version = 4
 
 [[package]]
-name = "accurate"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f209f0bc218ee6cf50db56ec0d9fe10b3cbfb6f3900d019b36c8fdb6d3bc03e"
-dependencies = [
- "cfg-if",
- "ieee754",
- "num-traits",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -122,7 +111,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1384d3fe1eecb464229fcf6eebb72306591c56bf27b373561489458a7c73027d"
 dependencies = [
- "futures 0.3.32",
+ "futures",
  "thiserror 2.0.18",
  "wasm-bindgen-futures",
 ]
@@ -586,12 +575,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "c_vec"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd7a427adc0135366d99db65b36dae9237130997e560ed61118041fb72be6e8"
-
-[[package]]
 name = "camino"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -652,7 +635,7 @@ dependencies = [
  "chromiumoxide_types",
  "dunce",
  "fnv",
- "futures 0.3.32",
+ "futures",
  "futures-timer",
  "pin-project-lite",
  "reqwest 0.13.2",
@@ -868,7 +851,7 @@ dependencies = [
  "chronoscope-integrations",
  "chronoscope-workers",
  "dropshot",
- "futures 0.3.32",
+ "futures",
  "image",
  "oxilangtag",
  "reqwest 0.12.28",
@@ -897,8 +880,8 @@ dependencies = [
  "chronoscope-core",
  "chronoscope-integrations",
  "clap",
- "futures 0.3.32",
- "geo 0.29.3",
+ "futures",
+ "geo",
  "proptest",
  "schemars 0.8.22",
  "serde",
@@ -950,7 +933,7 @@ dependencies = [
  "chronoscope-core",
  "console_error_panic_hook",
  "futures-util",
- "geojson 0.24.2",
+ "geojson",
  "js-sys",
  "leptos",
  "leptos_router",
@@ -1245,51 +1228,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cosmogony"
-version = "0.14.5"
-source = "git+https://github.com/osm-without-borders/cosmogony?tag=v0.14.6#ecaa549995eef8bdac0365b7e7bac790ffcf435c"
-dependencies = [
- "anyhow",
- "flate2",
- "geo-types",
- "geojson 0.22.4",
- "log",
- "osmpbfreader",
- "serde",
- "serde_derive",
- "serde_json",
-]
-
-[[package]]
-name = "cosmogony_builder"
-version = "0.14.5"
-source = "git+https://github.com/osm-without-borders/cosmogony?tag=v0.14.6#ecaa549995eef8bdac0365b7e7bac790ffcf435c"
-dependencies = [
- "anyhow",
- "clap",
- "cosmogony",
- "env_logger",
- "flate2",
- "geo 0.26.0",
- "geo-types",
- "geojson 0.24.2",
- "geos",
- "include_dir",
- "itertools 0.11.0",
- "lazy_static",
- "log",
- "osm_boundaries_utils",
- "osmpbfreader",
- "rayon",
- "regex",
- "rstar 0.11.0",
- "serde",
- "serde_derive",
- "serde_json",
- "serde_yaml",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1562,7 +1500,7 @@ dependencies = [
  "debug-ignore",
  "dropshot_endpoint",
  "form_urlencoded",
- "futures 0.3.32",
+ "futures",
  "hostname 0.4.2",
  "http",
  "http-body-util",
@@ -1696,19 +1634,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "env_logger"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
-dependencies = [
- "humantime",
- "is-terminal",
- "log",
- "regex",
- "termcolor",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1814,16 +1739,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
-name = "flat_map"
-version = "0.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4fa2a56a33c493fc81acbad4676c599cf2b128f21462a020043ea1eee46244f"
-dependencies = [
- "serde",
- "serde_derive",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1910,12 +1825,6 @@ dependencies = [
 
 [[package]]
 name = "futures"
-version = "0.1.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a471a38ef8ed83cd6e40aa59c1ffe17db6855c18e3604d9c4ed8c08ebc28678"
-
-[[package]]
-name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b147ee9d1f6d097cef9ce628cd2ee62288d963e16fb287bd9286455b241382d"
@@ -1944,16 +1853,6 @@ name = "futures-core"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e3450815272ef58cec6d564423f6e755e25379b217b0bc688e295ba24df6b1d"
-
-[[package]]
-name = "futures-cpupool"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab90cde24b3319636588d0c35fe03b1333857621051837ed769faefb4c2162e4"
-dependencies = [
- "futures 0.1.31",
- "num_cpus",
-]
 
 [[package]]
 name = "futures-executor"
@@ -2068,36 +1967,6 @@ dependencies = [
 
 [[package]]
 name = "geo"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bf7fb342abefefb0abbb8d033f37233e6f857a1a970805d15f96560834d699"
-dependencies = [
- "geo-types",
- "geographiclib-rs",
- "log",
- "num-traits",
- "robust 0.2.3",
- "rstar 0.8.4",
-]
-
-[[package]]
-name = "geo"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1645cf1d7fea7dac1a66f7357f3df2677ada708b8d9db8e9b043878930095a96"
-dependencies = [
- "earcutr",
- "float_next_after",
- "geo-types",
- "geographiclib-rs",
- "log",
- "num-traits",
- "robust 1.2.0",
- "rstar 0.11.0",
-]
-
-[[package]]
-name = "geo"
 version = "0.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34f0e6e028c581e82e6822a68869514e94c25e7f8ea669a2d8595bdf7461ccc5"
@@ -2109,7 +1978,7 @@ dependencies = [
  "i_overlay",
  "log",
  "num-traits",
- "robust 1.2.0",
+ "robust",
  "rstar 0.12.2",
  "spade",
 ]
@@ -2137,21 +2006,7 @@ version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5a7f08910fd98737a6eda7568e7c5e645093e073328eeef49758cfe8b0489c7"
 dependencies = [
- "accurate",
  "libm",
-]
-
-[[package]]
-name = "geojson"
-version = "0.22.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05d90d17275f3d3d1c6e64d2703e2667f875e2bb80437e4675537f87fec0f07c"
-dependencies = [
- "geo-types",
- "serde",
- "serde_derive",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2165,31 +2020,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "geos"
-version = "8.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b57a162bbfe8866b1ab898aad47e7fe634a9177c4b1bacc80af04d2b45772a46"
-dependencies = [
- "c_vec",
- "geo-types",
- "geos-sys",
- "libc",
- "num",
- "wkt",
-]
-
-[[package]]
-name = "geos-sys"
-version = "2.0.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48fc11f837935501a7beb10afd8ecec14e5180274acf87e5a36bf0f770485884"
-dependencies = [
- "libc",
- "pkg-config",
- "semver",
 ]
 
 [[package]]
@@ -2654,18 +2484,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
-name = "humantime"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
-
-[[package]]
 name = "hydration_context"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8714ae4adeaa846d838f380fbd72f049197de629948f91bf045329e0cf0a283"
 dependencies = [
- "futures 0.3.32",
+ "futures",
  "once_cell",
  "or_poisoned",
  "pin-project-lite",
@@ -2950,12 +2774,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ieee754"
-version = "0.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9007da9cacbd3e6343da136e98b0d2df013f553d35bdec8b518f07bea768e19c"
-
-[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2994,25 +2812,6 @@ dependencies = [
  "rustdct",
  "serde",
  "transpose",
-]
-
-[[package]]
-name = "include_dir"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
-dependencies = [
- "include_dir_macros",
-]
-
-[[package]]
-name = "include_dir_macros"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
-dependencies = [
- "proc-macro2",
- "quote",
 ]
 
 [[package]]
@@ -3232,7 +3031,7 @@ dependencies = [
  "any_spawner",
  "cfg-if",
  "either_of",
- "futures 0.3.32",
+ "futures",
  "getrandom 0.4.2",
  "hydration_context",
  "leptos_config",
@@ -3341,7 +3140,7 @@ checksum = "c15158449162e099e2273442f7fd9b924f5cefd935d52af5755ec62aa819fa52"
 dependencies = [
  "any_spawner",
  "either_of",
- "futures 0.3.32",
+ "futures",
  "gloo-net",
  "js-sys",
  "leptos",
@@ -3378,7 +3177,7 @@ dependencies = [
  "any_spawner",
  "base64 0.22.1",
  "codee",
- "futures 0.3.32",
+ "futures",
  "hydration_context",
  "or_poisoned",
  "reactive_graph",
@@ -3763,20 +3562,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
-dependencies = [
- "num-bigint",
- "num-complex",
- "num-integer",
- "num-iter",
- "num-rational",
- "num-traits",
-]
-
-[[package]]
 name = "num-bigint"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3844,17 +3629,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
 dependencies = [
  "autocfg",
- "num-integer",
- "num-traits",
-]
-
-[[package]]
-name = "num-rational"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
-dependencies = [
- "num-bigint",
  "num-integer",
  "num-traits",
 ]
@@ -4004,54 +3778,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c04f5d74368e4d0dfe06c45c8627c81bd7c317d52762d118fb9b3076f6420fd"
 
 [[package]]
-name = "osm_boundaries_utils"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14081789b9d45108f642a329f2f47675b73ac66af2383ed154790c99d5ca636c"
-dependencies = [
- "geo 0.18.0",
- "geo-types",
- "log",
- "osmpbfreader",
-]
-
-[[package]]
-name = "osmpbfreader"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31a9a5652ee5d1ac97f64960117f9165d2d185034c5ccf22f6fadd3fcb78ccb2"
-dependencies = [
- "byteorder",
- "flat_map",
- "flate2",
- "par-map",
- "protobuf",
- "protobuf-codegen-pure",
- "pub-iterator-type",
- "self_cell",
- "serde",
- "smartstring",
-]
-
-[[package]]
 name = "oxilangtag"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f3f87617a86af77fa3691e6350483e7154c2ead9f1261b75130e21ca0f8acb"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "par-map"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f05b290991702bb8140cf70915b82b0ae1ec7fe478db97305af990048040095"
-dependencies = [
- "futures 0.1.31",
- "futures-cpupool",
- "num_cpus",
- "pub-iterator-type",
 ]
 
 [[package]]
@@ -4460,31 +4192,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "protobuf"
-version = "2.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "106dd99e98437432fed6519dedecfade6a06a73bb7b2a1e019fdd2bee5778d94"
-
-[[package]]
-name = "protobuf-codegen"
-version = "2.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "033460afb75cf755fcfc16dfaed20b86468082a2ea24e05ac35ab4a099a017d6"
-dependencies = [
- "protobuf",
-]
-
-[[package]]
-name = "protobuf-codegen-pure"
-version = "2.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95a29399fc94bcd3eeaa951c715f7bea69409b2445356b00519740bcd6ddd865"
-dependencies = [
- "protobuf",
- "protobuf-codegen",
-]
-
-[[package]]
 name = "ptr_meta"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4503,12 +4210,6 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
-
-[[package]]
-name = "pub-iterator-type"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "858afdbecdce657c6e32031348cf7326da7700c869c368a136d31565972f7018"
 
 [[package]]
 name = "pulldown-cmark"
@@ -4755,7 +4456,7 @@ checksum = "00c5a025366836190c7030e883cc2bcd9e384ff555336e3c7954741ca411b177"
 dependencies = [
  "any_spawner",
  "async-lock",
- "futures 0.3.32",
+ "futures",
  "guardian",
  "hydration_context",
  "indexmap",
@@ -4878,21 +4579,6 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
-
-[[package]]
-name = "region-builder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chronoscope-api-client",
- "cosmogony",
- "cosmogony_builder",
- "geo-types",
- "geojson 0.24.2",
- "serde_json",
- "sqlx",
- "tokio",
-]
 
 [[package]]
 name = "rend"
@@ -5028,12 +4714,6 @@ dependencies = [
  "quote",
  "syn 1.0.109",
 ]
-
-[[package]]
-name = "robust"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5864e7ef1a6b7bcf1d6ca3f655e65e724ed3b52546a0d0a663c991522f552ea"
 
 [[package]]
 name = "robust"
@@ -5482,12 +5162,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "self_cell"
-version = "1.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b12e76d157a900eb52e81bc6e9f3069344290341720e9178cde2407113ac8d89"
-
-[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5676,19 +5350,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "serial_test"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5724,7 +5385,7 @@ dependencies = [
  "bytes",
  "const-str",
  "const_format",
- "futures 0.3.32",
+ "futures",
  "gloo-net",
  "http",
  "js-sys",
@@ -5949,18 +5610,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "smartstring"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
-dependencies = [
- "autocfg",
- "serde",
- "static_assertions",
- "version_check",
-]
-
-[[package]]
 name = "socket2"
 version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5988,7 +5637,7 @@ checksum = "9699399fd9349b00b184f5635b074f9ec93afffef30c853f8c875b32c0f8c7fa"
 dependencies = [
  "hashbrown 0.16.1",
  "num-traits",
- "robust 1.2.0",
+ "robust",
  "smallvec",
 ]
 
@@ -6391,7 +6040,7 @@ dependencies = [
  "drain_filter_polyfill",
  "either_of",
  "erased",
- "futures 0.3.32",
+ "futures",
  "html-escape",
  "indexmap",
  "itertools 0.14.0",
@@ -6460,15 +6109,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8c27177b12a6399ffc08b98f76f7c9a1f4fe9fc967c784c5a071fa8d93cf7e1"
 dependencies = [
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
 ]
 
 [[package]]
@@ -7083,12 +6723,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
 
 [[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
-
-[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7431,7 +7065,7 @@ dependencies = [
  "base64 0.21.7",
  "base64urlsafedata",
  "bitflags 1.3.2",
- "futures 0.3.32",
+ "futures",
  "hex",
  "nom",
  "num-derive",
@@ -8066,18 +7700,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "wkt"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3c2252781f8927974e8ba6a67c965a759a2b88ea2b1825f6862426bbb1c8f41"
-dependencies = [
- "geo-types",
- "log",
- "num-traits",
- "thiserror 1.0.69",
 ]
 
 [[package]]

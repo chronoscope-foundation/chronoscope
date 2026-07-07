@@ -67,8 +67,7 @@ OpenAPI client regen, corpus FOD layout, HF cache layout, etc.).
 ```bash
 HF_TOKEN=hf_... just fetch-weights        # ~2GB model weights (gated repos; needs HF token)
 just fetch-corpus                          # corpus images from external URLs
-just fetch-regions [italy|world]           # OSM regions DB (italy default ~2GB; world ~70GB)
-just fetch-all                             # weights + corpus + italy regions
+just fetch-all                             # weights + corpus
 ```
 
 Fetched data is pinned as GC roots under `.nix-gc-roots/` (gitignored).

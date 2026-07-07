@@ -87,15 +87,6 @@
           rustCommonArgs = rust.commonArgs;
         };
 
-        regions = import ./nix/regions.nix {
-          inherit
-            pkgs
-            lib
-            craneLib
-            ;
-          rustCommonArgs = rust.commonArgs;
-        };
-
         wikidata = import ./nix/wikidata.nix {
           inherit
             pkgs
@@ -142,7 +133,6 @@
             sqlite
             openssl
             libspatialite
-            geos
           ])
           ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
         # Runtime env for the api/db/ingestion code paths (consumed by the
@@ -286,9 +276,6 @@
             sam3-weights = pythonEnvs.sam3Cache;
 
             wikidata-curated-entities = wikidata.bundles.curated.entities;
-
-            regions-italy-db = regions.regions.italy.db;
-            regions-world-db = regions.regions.world.db;
           };
 
         formatter = pkgs.nixfmt;

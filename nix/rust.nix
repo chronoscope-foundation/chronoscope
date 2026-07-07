@@ -31,7 +31,6 @@ let
         sqlite
         openssl
         libspatialite
-        geos # cosmogony (region-builder dep) links against GEOS
       ]
       ++ lib.optionals stdenv.hostPlatform.isDarwin [
         libiconv
