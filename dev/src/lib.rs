@@ -470,6 +470,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
                 "commits" => stats.commits,
                 "facts" => stats.facts,
                 "skipped" => stats.skipped,
+                "issues" => stats.issues,
             );
             facts
         }

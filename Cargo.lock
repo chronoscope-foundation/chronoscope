@@ -899,13 +899,13 @@ dependencies = [
  "clap",
  "futures 0.3.32",
  "geo 0.29.3",
- "oxilangtag",
  "proptest",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
+ "tracing",
  "url",
 ]
 

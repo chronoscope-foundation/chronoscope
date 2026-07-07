@@ -1,6 +1,17 @@
 //! Wikidata ingestion module.
 //!
-//! Transforms filtered Wikidata architectural entities into Chronoscope schema.
+//! Transforms filtered Wikidata architectural entities into fact-store
+//! commits: `parsing`, `handlers`, and `lifecycle` extract fact-grammar values
+//! (with their [`FactualCitation`]s) from Wikidata JSON, and `commits` shapes
+//! them into one `submit::Commit` per item.
+//!
+//! # Rank policy
+//!
+//! [`Rank::Deprecated`](chronoscope_integrations::wikidata::Rank) claims are
+//! dropped at extraction — Wikidata marks them known-incorrect. Every other
+//! claim is asserted, with no `Preferred` selection: parallel claims about the
+//! same slot flow into the store as competing citations for the conflict
+//! machinery to surface.
 
 pub mod commits;
 pub mod filter;
@@ -10,126 +21,102 @@ pub mod parsing;
 pub mod stream;
 pub mod usage;
 
-use chronoscope_core::{
-    Cited, Evidence, ExternalLink, WikidataEntityId, WikidataField, WikidataIdParseError,
-    WikidataPropertyId,
+use chronoscope_core::facts::citations::{
+    Excerpt, ExcerptError, ExternalSource, FactualCitation, WikidataField,
 };
+use chronoscope_core::ids::{WikidataEntityId, WikidataPropertyId};
+use chronoscope_core::nonempty::NonEmptyVec;
+use chronoscope_integrations::wikidata::{Claim, Rank};
 
-use crate::SourceIdx;
-
-/// Immutable context for a property handler.
+/// Claims eligible for assertion: everything except `Rank::Deprecated`.
 ///
-/// Contains everything a handler needs to create citations. The
-/// Wikidata entity and property ids are parsed once at construction,
-/// so `cited()` can stamp evidence with validated ids without
-/// re-parsing or risking a malformed id.
-#[derive(Clone, Copy)]
-pub struct PropertyContext {
+/// The single implementation of the module's rank policy — every extraction
+/// path reads claims through this filter.
+pub fn asserted_claims(claims: &[Claim]) -> impl Iterator<Item = &Claim> {
+    claims.iter().filter(|c| c.rank != Rank::Deprecated)
+}
+
+/// Per-item citation context: the parsed item id and revision every Wikidata
+/// citation carries, plus the pre-built item-record citation used as the
+/// fallback source for facts with no more precise origin.
+#[derive(Clone)]
+pub struct ItemContext {
     entity_id: WikidataEntityId,
     revision_id: u64,
-    property_id: WikidataPropertyId,
+    item_citation: FactualCitation,
 }
 
-impl PropertyContext {
-    /// Create a new `PropertyContext`, parsing the entity and
-    /// property ids at the boundary.
-    ///
-    /// # Errors
-    /// Returns [`WikidataIdParseError`] if `wikidata_id` is not a
-    /// well-formed entity id (`Q<digits>`) or `property` is not a
-    /// well-formed property id (`P<digits>`).
-    pub fn new(
-        wikidata_id: &str,
-        revision_id: u64,
-        property: &str,
-    ) -> Result<Self, WikidataIdParseError> {
-        Ok(Self::with_property(
-            WikidataEntityId::parse(wikidata_id)?,
-            revision_id,
-            WikidataPropertyId::parse(property)?,
-        ))
-    }
-
-    /// Build a context from already-parsed ids (no re-parsing or
-    /// fallibility). For callers that have validated the ids at an
-    /// earlier boundary.
-    #[must_use]
-    pub fn with_property(
-        entity_id: WikidataEntityId,
-        revision_id: u64,
-        property_id: WikidataPropertyId,
-    ) -> Self {
-        Self {
+impl ItemContext {
+    /// Build a context for one item snapshot, constructing the item-record
+    /// citation up front.
+    pub fn new(entity_id: WikidataEntityId, revision_id: u64) -> Result<Self, ExcerptError> {
+        let item_citation = Self::build_citation(
             entity_id,
             revision_id,
-            property_id,
-        }
+            WikidataField::Item,
+            entity_id.to_string(),
+        )?;
+        Ok(Self {
+            entity_id,
+            revision_id,
+            item_citation,
+        })
     }
 
-    /// Create a cited value with Wikidata evidence for this
-    /// context's property.
-    #[must_use]
-    pub fn cited<T>(&self, raw: impl Into<String>, value: T) -> Cited<T, SourceIdx> {
-        self.cited_under(self.property_id, raw, value)
+    /// The one place a Wikidata `FactualCitation` is shaped: quote `value` as
+    /// the excerpt and record `field`/`revision` beside the item id. Every
+    /// citation this context hands out flows through here so the excerpt and
+    /// source can't drift apart.
+    fn build_citation(
+        entity_id: WikidataEntityId,
+        revision_id: u64,
+        field: WikidataField,
+        value: String,
+    ) -> Result<FactualCitation, ExcerptError> {
+        let excerpt = Excerpt::new(value.clone())?;
+        Ok(FactualCitation {
+            source: ExternalSource::Wikidata {
+                entity_id,
+                field,
+                revision_id,
+                value,
+            },
+            excerpts: NonEmptyVec::singleton(excerpt),
+        })
     }
 
-    /// Create a cited value attributing evidence to `property_id`,
-    /// for a value read from a property other than the context's own.
-    #[must_use]
-    pub fn cited_under<T>(
-        &self,
-        property_id: WikidataPropertyId,
-        raw: impl Into<String>,
-        value: T,
-    ) -> Cited<T, SourceIdx> {
-        Cited::new(
-            value,
-            vec![Evidence::Wikidata {
-                entity_id: self.entity_id,
-                revision_id: self.revision_id,
-                field: WikidataField::Statement { property_id },
-                observed_value: raw.into(),
-            }],
-        )
-    }
-
-    /// Get the current property ID.
-    #[must_use]
-    pub fn property(&self) -> WikidataPropertyId {
-        self.property_id
-    }
-
-    /// Get the Wikidata entity ID.
-    #[must_use]
-    pub fn wikidata_id(&self) -> WikidataEntityId {
+    /// The item's Wikidata entity id.
+    pub fn entity_id(&self) -> WikidataEntityId {
         self.entity_id
     }
-}
 
-/// Output from a property handler.
-///
-/// Handlers are pure functions that return what they want to add.
-#[derive(Default)]
-pub struct HandlerOutput {
-    pub links: Vec<ExternalLink>,
-    pub issues: Vec<String>,
-}
-
-impl HandlerOutput {
-    /// Create an empty output.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    /// The pinned revision id of the item snapshot.
+    pub fn revision_id(&self) -> u64 {
+        self.revision_id
     }
 
-    /// Add an external link.
-    pub fn add_link(&mut self, link: ExternalLink) {
-        self.links.push(link);
+    /// Citation for a claim read from `field`, quoting the observed `value`
+    /// as its excerpt.
+    pub fn citation(
+        &self,
+        field: WikidataField,
+        value: impl Into<String>,
+    ) -> Result<FactualCitation, ExcerptError> {
+        Self::build_citation(self.entity_id, self.revision_id, field, value.into())
     }
 
-    /// Record an issue.
-    pub fn issue(&mut self, msg: impl Into<String>) {
-        self.issues.push(msg.into());
+    /// Citation for a property statement.
+    pub fn statement_citation(
+        &self,
+        property_id: WikidataPropertyId,
+        value: impl Into<String>,
+    ) -> Result<FactualCitation, ExcerptError> {
+        self.citation(WikidataField::Statement { property_id }, value)
+    }
+
+    /// The item-record citation — cites the item's existence as a whole.
+    pub fn item_citation(&self) -> FactualCitation {
+        self.item_citation.clone()
     }
 }
 
@@ -137,34 +124,61 @@ impl HandlerOutput {
 mod tests {
     use super::*;
 
+    use chronoscope_integrations::wikidata::{DataValue, Snak};
+
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn property_context_creates_cited_evidence() -> TestResult {
-        let ctx = PropertyContext::new("Q100", 42, "P571")?;
-        let cited = ctx.cited("test_raw", 123);
+    fn citation_carries_field_revision_and_observed_value() -> TestResult {
+        let ctx = ItemContext::new(WikidataEntityId::new(100), 42)?;
+        let citation = ctx.statement_citation(WikidataPropertyId::new(571), "test_raw")?;
 
-        assert_eq!(cited.value, 123);
-        assert_eq!(cited.evidence.len(), 1);
-        if let chronoscope_core::Evidence::Wikidata {
+        let ExternalSource::Wikidata {
             entity_id,
-            revision_id,
             field,
-            observed_value,
-        } = &cited.evidence[0]
-        {
-            assert_eq!(*entity_id, WikidataEntityId::new(100));
-            assert_eq!(
-                *field,
-                chronoscope_core::WikidataField::Statement {
-                    property_id: WikidataPropertyId::new(571),
-                }
-            );
-            assert_eq!(observed_value, "test_raw");
-            assert_eq!(*revision_id, 42);
-        } else {
-            return Err("expected Wikidata evidence".into());
-        }
+            revision_id,
+            value,
+        } = &citation.source
+        else {
+            return Err("expected Wikidata source".into());
+        };
+        assert_eq!(*entity_id, WikidataEntityId::new(100));
+        assert_eq!(
+            *field,
+            WikidataField::Statement {
+                property_id: WikidataPropertyId::new(571),
+            }
+        );
+        assert_eq!(*revision_id, 42);
+        assert_eq!(value, "test_raw");
+        assert_eq!(citation.excerpts.first().as_str(), "test_raw");
         Ok(())
+    }
+
+    #[test]
+    fn item_citation_quotes_the_item_qid() -> TestResult {
+        let ctx = ItemContext::new(WikidataEntityId::new(1234), 7)?;
+        let citation = ctx.item_citation();
+        let ExternalSource::Wikidata { field, value, .. } = &citation.source else {
+            return Err("expected Wikidata source".into());
+        };
+        assert_eq!(*field, WikidataField::Item);
+        assert_eq!(value, "Q1234");
+        Ok(())
+    }
+
+    #[test]
+    fn asserted_claims_drops_deprecated_only() {
+        let value = |s: &str| Claim::simple(Snak::Value(DataValue::String(s.to_owned())));
+        let mut deprecated = value("dropped");
+        deprecated.rank = Rank::Deprecated;
+        let mut preferred = value("preferred");
+        preferred.rank = Rank::Preferred;
+        let claims = vec![value("normal"), deprecated, preferred];
+
+        let kept: Vec<&str> = asserted_claims(&claims)
+            .filter_map(|c| c.mainsnak.string_value())
+            .collect();
+        assert_eq!(kept, vec!["normal", "preferred"]);
     }
 }

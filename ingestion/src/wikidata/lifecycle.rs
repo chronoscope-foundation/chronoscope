@@ -1,27 +1,137 @@
 //! Lifecycle extraction from Wikidata claims.
 //!
-//! Extracts entity lifecycle transitions (construction, demolition, modifications, etc.)
-//! from Wikidata properties. Handles entity splitting when demolish->rebuild patterns
-//! indicate a new entity.
+//! Extracts construction/demolition bookends and interior lifetime events from
+//! Wikidata properties as fact-shaped [`Contribution`]s, each date and
+//! location paired with its [`FactualCitation`] at the point of extraction.
+//! Handles entity splitting when demolish→rebuild patterns indicate a new
+//! entity.
+//!
+//! Date and location fields are `Vec`s because parallel claims (multiple
+//! non-deprecated statements about one slot) each contribute a competing
+//! cited bound; the conflict machinery reconciles them downstream.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::SourceIdx;
 use chrono::NaiveDate;
-use chronoscope_core::{
-    Cited, DamageCause, EntityTransition, Location, TriggerEventId, UncertainDate,
-    UnresolvedLocation, Usage, WikidataPropertyId,
+use chronoscope_core::date::UncertainDate;
+use chronoscope_core::facts::citations::FactualCitation;
+use chronoscope_core::facts::event;
+use chronoscope_core::facts::lifecycle::{
+    DamageCause, DurationalKind, LifetimeEventKind, PointKind, Usage,
 };
+use chronoscope_core::ids::WikidataPropertyId;
+use chronoscope_core::location::{Location, UnresolvedLocation};
 use chronoscope_integrations::wikidata::{Claim, PropertyId};
 
-use crate::wikidata::PropertyContext;
+use crate::wikidata::{ItemContext, asserted_claims};
+
+// =============================================================================
+// CONTRIBUTION SHAPES
+// =============================================================================
+
+/// A date bound with the citation naming where it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitedDate {
+    pub bound: UncertainDate,
+    pub citation: FactualCitation,
+}
+
+/// A location with the citation naming where it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitedLocation {
+    pub location: UnresolvedLocation,
+    pub citation: FactualCitation,
+}
+
+/// One lifecycle contribution to a split entity: a construction bookend, a
+/// demolition bookend, or an interior lifetime event. Each maps one-for-one
+/// onto the facts the commit builder emits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Contribution {
+    /// Construction bookend claims: start bounds, completion bounds, and
+    /// build locations.
+    Construction {
+        started: Vec<CitedDate>,
+        completed: Vec<CitedDate>,
+        location: Vec<CitedLocation>,
+    },
+    /// Demolition bookend claims: start and completion bounds.
+    Demolition {
+        started: Vec<CitedDate>,
+        completed: Vec<CitedDate>,
+    },
+    /// An interior lifetime event.
+    Event(Box<InteriorEvent>),
+}
+
+/// An interior lifetime event: its kind and date bounds, an optional payload,
+/// and the citation backing its `HasEvent` and payload facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteriorEvent {
+    pub shape: EventShape,
+    pub payload: Option<InteriorPayload>,
+    /// Backs `HasEvent` and the payload: the primary date's citation, or the
+    /// item citation when the event carries no date.
+    pub citation: FactualCitation,
+}
+
+/// The kind and date bounds of an interior event, split along the grammar's
+/// durational/point boundary so a point event can't carry a completion bound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventShape {
+    Durational {
+        kind: DurationalKind,
+        started: Vec<CitedDate>,
+        completed: Vec<CitedDate>,
+    },
+    Point {
+        kind: PointKind,
+        at: Vec<CitedDate>,
+    },
+}
+
+impl EventShape {
+    /// The declared lifetime-event kind.
+    pub fn kind(&self) -> LifetimeEventKind {
+        match self {
+            Self::Durational { kind, .. } => LifetimeEventKind::Durational { kind: *kind },
+            Self::Point { kind, .. } => LifetimeEventKind::Point { kind: *kind },
+        }
+    }
+}
+
+/// A payload fact for an interior event, minus the event id minted at commit
+/// build time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteriorPayload {
+    DamageCause { cause: DamageCause },
+    UsageChange { new_usages: BTreeSet<Usage> },
+}
+
+impl InteriorPayload {
+    /// The event-cluster fact this payload asserts about `event`.
+    pub fn fact<EntId: Ord, EvtId: Ord>(&self, event: EvtId) -> event::Fact<EntId, EvtId> {
+        match self {
+            Self::DamageCause { cause } => event::Fact::DamageCause {
+                event,
+                cause: cause.clone(),
+            },
+            Self::UsageChange { new_usages } => event::Fact::UsageChange {
+                event,
+                new_usages: new_usages.clone(),
+            },
+        }
+    }
+}
 
 // =============================================================================
 // EXTRACTION COMBINATORS
 // =============================================================================
 
 mod extract {
-    use chronoscope_core::{GeoPoint, Location, Meters, UncertainDate, UnresolvedLocation};
+    use chronoscope_core::date::UncertainDate;
+    use chronoscope_core::geo::{GeoPoint, Meters};
+    use chronoscope_core::location::{Location, UnresolvedLocation};
     use chronoscope_integrations::wikidata::{Claim, DataValue, Snak};
 
     use crate::wikidata::parsing::parse_wikidata_time;
@@ -137,224 +247,154 @@ mod extract {
 
         (results, warnings)
     }
-
-    /// Take first claim from array, warn if multiple where one expected.
-    pub fn first_claim<'a>(claims: &'a [Claim], prop: &str) -> (Option<&'a Claim>, Vec<String>) {
-        let mut warnings = Vec::new();
-
-        if claims.len() > 1 {
-            warnings.push(format!(
-                "{}: expected single value, got {} (using first)",
-                prop,
-                claims.len()
-            ));
-        }
-
-        (claims.first(), warnings)
-    }
-}
-
-// =============================================================================
-// CITATION HELPERS
-// =============================================================================
-
-/// Cite the first date from a vec.
-fn cite_first(
-    dates: &[(UncertainDate, String)],
-    prop: &str,
-    ctx: &PropertyContext,
-) -> Option<Cited<UncertainDate, SourceIdx>> {
-    dates
-        .first()
-        .map(|(date, raw)| ctx.cited(format!("{prop}:{raw}"), date.clone()))
-}
-
-/// Cite all dates from a vec.
-fn cite_all(
-    dates: &[(UncertainDate, String)],
-    prop: &str,
-    ctx: &PropertyContext,
-) -> Vec<Cited<UncertainDate, SourceIdx>> {
-    dates
-        .iter()
-        .map(|(date, raw)| ctx.cited(format!("{prop}:{raw}"), date.clone()))
-        .collect()
-}
-
-/// Cite `value` under `prop`, the property it was read from.
-///
-/// A malformed `prop` warns and falls back to the context's property.
-fn cite_under_prop<T>(
-    prop: &str,
-    raw: String,
-    value: T,
-    ctx: &PropertyContext,
-    warnings: &mut Vec<String>,
-) -> Cited<T, SourceIdx> {
-    match WikidataPropertyId::parse(prop) {
-        Ok(property_id) => ctx.cited_under(property_id, raw, value),
-        Err(e) => {
-            warnings.push(format!("{prop}: invalid property id: {e}"));
-            ctx.cited(raw, value)
-        }
-    }
 }
 
 // =============================================================================
 // PROPERTY EXTRACTION HELPERS
 // =============================================================================
 
-/// Extract single time from a property's claims.
-fn extract_property_time(
+/// Extract every asserted time claim of a property, each cited to its
+/// statement.
+fn extract_property_dates(
     claims: &BTreeMap<PropertyId, Vec<Claim>>,
-    prop: &str,
-    ctx: &PropertyContext,
-) -> (Option<Cited<UncertainDate, SourceIdx>>, Vec<String>) {
-    let mut warnings = Vec::new();
-
-    let Some(prop_claims) = claims.get(prop) else {
-        return (None, warnings);
+    property_id: WikidataPropertyId,
+    ctx: &ItemContext,
+    warnings: &mut Vec<String>,
+) -> Vec<CitedDate> {
+    let key = property_id.to_string();
+    let Some(prop_claims) = claims.get(key.as_str()) else {
+        return Vec::new();
     };
 
-    let (claim, w) = extract::first_claim(prop_claims, prop);
-    warnings.extend(w);
-
-    let Some(claim) = claim else {
-        return (None, warnings);
-    };
-
-    let (time, w) = extract::mainsnak_time(claim);
-    warnings.extend(w);
-
-    let cited = time.map(|(date, raw)| cite_under_prop(prop, raw, date, ctx, &mut warnings));
-    (cited, warnings)
+    let mut dates = Vec::new();
+    for claim in asserted_claims(prop_claims) {
+        let (time, w) = extract::mainsnak_time(claim);
+        warnings.extend(w.into_iter().map(|w| format!("{property_id}: {w}")));
+        let Some((bound, raw)) = time else {
+            continue;
+        };
+        match ctx.statement_citation(property_id, raw) {
+            Ok(citation) => dates.push(CitedDate { bound, citation }),
+            Err(e) => warnings.push(format!("{property_id}: citation: {e}")),
+        }
+    }
+    dates
 }
 
-/// Extract location from P625.
-fn extract_property_location(
+/// Extract every asserted P625 coordinate claim, each cited to its statement.
+fn extract_property_locations(
     claims: &BTreeMap<PropertyId, Vec<Claim>>,
-    ctx: &PropertyContext,
-) -> (Option<Cited<UnresolvedLocation, SourceIdx>>, Vec<String>) {
-    let mut warnings = Vec::new();
-
+    ctx: &ItemContext,
+    warnings: &mut Vec<String>,
+) -> Vec<CitedLocation> {
     let Some(prop_claims) = claims.get("P625") else {
-        return (None, warnings);
+        return Vec::new();
     };
 
-    let (claim, w) = extract::first_claim(prop_claims, "P625");
-    warnings.extend(w);
-
-    let Some(claim) = claim else {
-        return (None, warnings);
-    };
-
-    let (location, w) = extract::mainsnak_coordinates(claim);
-    warnings.extend(w);
-
-    let cited = location.map(|loc| {
-        // mainsnak_coordinates always returns Resolved(Circle) variant
-        let raw = if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &loc {
-            format!("{},{}", center.lat(), center.lon())
-        } else {
-            "location".to_string()
+    let mut locations = Vec::new();
+    for claim in asserted_claims(prop_claims) {
+        let (location, w) = extract::mainsnak_coordinates(claim);
+        warnings.extend(w.into_iter().map(|w| format!("P625: {w}")));
+        let Some(location) = location else {
+            continue;
         };
-        ctx.cited_under(WikidataPropertyId::new(625), raw, loc)
-    });
+        let raw = match &location {
+            UnresolvedLocation::Resolved(Location::Circle { center, .. }) => {
+                format!("{},{}", center.lat(), center.lon())
+            }
+            _ => "location".to_string(),
+        };
+        match ctx.statement_citation(WikidataPropertyId::new(625), raw) {
+            Ok(citation) => locations.push(CitedLocation { location, citation }),
+            Err(e) => warnings.push(format!("P625: citation: {e}")),
+        }
+    }
+    locations
+}
 
-    (cited, warnings)
+/// The citation for an interior event: its primary date's, or the item
+/// citation when the event carries no date.
+fn event_citation(primary: Option<&CitedDate>, ctx: &ItemContext) -> FactualCitation {
+    primary.map_or_else(|| ctx.item_citation(), |d| d.citation.clone())
+}
+
+/// Earliest possible day across a set of parallel bounds — the chronological
+/// sort key.
+fn earliest_of(dates: &[CitedDate]) -> Option<NaiveDate> {
+    dates.iter().filter_map(|d| d.bound.earliest()).min()
 }
 
 // =============================================================================
 // P793 CLAIM PROCESSING
 // =============================================================================
 
-/// A transition with its sort key for chronological ordering.
-struct DatedTransition {
-    transition: EntityTransition<SourceIdx>,
+/// A contribution with its sort key for chronological ordering.
+struct DatedContribution {
+    contribution: Contribution,
     sort_key: Option<NaiveDate>,
 }
 
-/// Process one P793 claim. May return multiple transitions for point-in-time events.
-fn process_p793_claim(claim: &Claim, ctx: &PropertyContext) -> (Vec<DatedTransition>, Vec<String>) {
+/// Process one P793 claim into at most one contribution.
+fn process_p793_claim(
+    claim: &Claim,
+    ctx: &ItemContext,
+) -> (Option<DatedContribution>, Vec<String>) {
     let mut warnings = Vec::new();
 
-    // Extract Q-ID
     let (qid, w) = extract::mainsnak_qid(claim);
     warnings.extend(w);
     let Some(qid) = qid else {
-        return (vec![], warnings);
+        return (None, warnings);
     };
 
-    // Extract qualifier dates
-    let (p580, w) = extract::qualifier_times(claim, "P580"); // start time
-    warnings.extend(w);
-    let (p582, w) = extract::qualifier_times(claim, "P582"); // end time
-    warnings.extend(w);
-    let (p585, w) = extract::qualifier_times(claim, "P585"); // point in time
-    warnings.extend(w);
+    let p793 = WikidataPropertyId::new(793);
+    // Qualifier dates are cited to the P793 statement; the excerpt quotes the
+    // trigger-event QID alongside the qualifier the date was read from, so the
+    // trigger survives in the citation text.
+    let qualifier_dates = |prop: &str, warnings: &mut Vec<String>| -> Vec<CitedDate> {
+        let (dates, w) = extract::qualifier_times(claim, prop);
+        warnings.extend(w);
+        dates
+            .into_iter()
+            .filter_map(|(bound, raw)| {
+                match ctx.statement_citation(p793, format!("{qid} {prop}:{raw}")) {
+                    Ok(citation) => Some(CitedDate { bound, citation }),
+                    Err(e) => {
+                        warnings.push(format!("P793 {prop}: citation: {e}"));
+                        None
+                    }
+                }
+            })
+            .collect()
+    };
+    let p580 = qualifier_dates("P580", &mut warnings); // start time
+    let p582 = qualifier_dates("P582", &mut warnings); // end time
+    let p585 = qualifier_dates("P585", &mut warnings); // point in time
 
-    // Warn about multiple values
-    if p580.len() > 1 {
-        warnings.push("P793: multiple P580 (start) dates, using first".to_string());
-    }
-    if p582.len() > 1 {
-        warnings.push("P793: multiple P582 (end) dates, using first".to_string());
-    }
-
-    let trigger = TriggerEventId(qid.clone());
-
-    // Compute sort key from available dates
+    // Sort key from the earliest qualifier date, matching `earliest_of` — the
+    // first in source order can be later, which would sort a construction after
+    // its demolition and fabricate a spurious split.
     let sort_key = p580
-        .first()
-        .or(p582.first())
-        .or(p585.first())
-        .and_then(|(d, _)| d.earliest());
+        .iter()
+        .chain(&p582)
+        .chain(&p585)
+        .filter_map(|d| d.bound.earliest())
+        .min();
 
-    let transitions: Vec<EntityTransition<SourceIdx>> = match qid.as_str() {
+    let contribution: Option<Contribution> = match qid.as_str() {
         // =================================================================
         // CONSTRUCTION EVENTS
         // =================================================================
 
         // Q385378: construction (with start/end qualifiers)
-        "Q385378" => {
-            let started = cite_first(&p580, "P580", ctx);
-            let completed =
-                cite_first(&p582, "P582", ctx).or_else(|| cite_first(&p585, "P585", ctx));
-
-            if started.is_some() || completed.is_some() {
-                vec![EntityTransition::Constructed {
-                    started_at: started,
-                    completed_at: completed,
-                    location: None,
-                    trigger_event: Some(trigger),
-                }]
-            } else {
-                vec![]
-            }
-        }
+        "Q385378" => construction(p580, fallback(p582, p585)),
 
         // Q27136782: start of construction
         // Q1068633: groundbreaking ceremony
-        "Q27136782" | "Q1068633" => cite_all(&p585, "P585", ctx)
-            .into_iter()
-            .map(|d| EntityTransition::Constructed {
-                started_at: Some(d),
-                completed_at: None,
-                location: None,
-                trigger_event: Some(trigger.clone()),
-            })
-            .collect(),
+        "Q27136782" | "Q1068633" => construction(p585, Vec::new()),
 
         // Q59913255: end of construction
-        "Q59913255" => cite_all(&p585, "P585", ctx)
-            .into_iter()
-            .map(|d| EntityTransition::Constructed {
-                started_at: None,
-                completed_at: Some(d),
-                location: None,
-                trigger_event: Some(trigger.clone()),
-            })
-            .collect(),
+        "Q59913255" => construction(Vec::new(), p585),
 
         // =================================================================
         // OPENING EVENTS
@@ -363,26 +403,11 @@ fn process_p793_claim(claim: &Claim, ctx: &PropertyContext) -> (Vec<DatedTransit
         // Q1417098: inauguration
         // Q3010369: opening ceremony
         // Q15051339: opening
-        "Q1417098" | "Q3010369" | "Q15051339" => cite_all(&p585, "P585", ctx)
-            .into_iter()
-            .map(|d| EntityTransition::UsageModified {
-                occurred_at: Some(d),
-                new_usages: [Usage::Unknown].into_iter().collect(),
-                description: Some("Opening".to_string()),
-                trigger_event: Some(trigger.clone()),
-            })
-            .collect(),
+        // A dated usage change; the source states no usage set.
+        "Q1417098" | "Q3010369" | "Q15051339" => usage_changed(p585, None, ctx),
 
         // Q125375: consecration
-        "Q125375" => cite_all(&p585, "P585", ctx)
-            .into_iter()
-            .map(|d| EntityTransition::UsageModified {
-                occurred_at: Some(d),
-                new_usages: [Usage::Religious].into_iter().collect(),
-                description: Some("Consecration".to_string()),
-                trigger_event: Some(trigger.clone()),
-            })
-            .collect(),
+        "Q125375" => usage_changed(p585, Some([Usage::Religious].into_iter().collect()), ctx),
 
         // =================================================================
         // REPAIR/RESTORATION EVENTS
@@ -391,22 +416,13 @@ fn process_p793_claim(claim: &Claim, ctx: &PropertyContext) -> (Vec<DatedTransit
         // Q1370468: architectural reconstruction
         // Q2478058: reconstruction
         // Q217102: restoration
-        "Q1370468" | "Q2478058" | "Q217102" => {
-            let started = cite_first(&p580, "P580", ctx);
-            let completed =
-                cite_first(&p582, "P582", ctx).or_else(|| cite_first(&p585, "P585", ctx));
-
-            if started.is_some() || completed.is_some() {
-                vec![EntityTransition::Repaired {
-                    started_at: started,
-                    completed_at: completed,
-                    description: None,
-                    trigger_event: Some(trigger),
-                }]
-            } else {
-                vec![]
-            }
-        }
+        "Q1370468" | "Q2478058" | "Q217102" => durational(
+            DurationalKind::Repaired,
+            p580,
+            fallback(p582, p585),
+            None,
+            ctx,
+        ),
 
         // =================================================================
         // MODIFICATION EVENTS
@@ -415,59 +431,26 @@ fn process_p793_claim(claim: &Claim, ctx: &PropertyContext) -> (Vec<DatedTransit
         // Q2144402: renovation
         // Q19841649: expansion
         // Q1441983: redevelopment
-        "Q2144402" | "Q19841649" | "Q1441983" => {
-            let started = cite_first(&p580, "P580", ctx);
-            let completed =
-                cite_first(&p582, "P582", ctx).or_else(|| cite_first(&p585, "P585", ctx));
-
-            if started.is_some() || completed.is_some() {
-                vec![EntityTransition::Modified {
-                    started_at: started,
-                    completed_at: completed,
-                    description: None,
-                    trigger_event: Some(trigger),
-                }]
-            } else {
-                vec![]
-            }
-        }
+        "Q2144402" | "Q19841649" | "Q1441983" => durational(
+            DurationalKind::Modified,
+            p580,
+            fallback(p582, p585),
+            None,
+            ctx,
+        ),
 
         // =================================================================
         // DAMAGE EVENTS
         // =================================================================
 
         // Q168983: conflagration (fire)
-        "Q168983" => cite_all(&p585, "P585", ctx)
-            .into_iter()
-            .map(|d| EntityTransition::Damaged {
-                occurred_at: Some(d),
-                cause: Some(DamageCause::Fire),
-                description: None,
-                trigger_event: Some(trigger.clone()),
-            })
-            .collect(),
+        "Q168983" => damage(DamageCause::Fire, p585, ctx),
 
         // Q7944: earthquake
-        "Q7944" => cite_all(&p585, "P585", ctx)
-            .into_iter()
-            .map(|d| EntityTransition::Damaged {
-                occurred_at: Some(d),
-                cause: Some(DamageCause::Earthquake),
-                description: None,
-                trigger_event: Some(trigger.clone()),
-            })
-            .collect(),
+        "Q7944" => damage(DamageCause::Earthquake, p585, ctx),
 
         // Q8068: flood
-        "Q8068" => cite_all(&p585, "P585", ctx)
-            .into_iter()
-            .map(|d| EntityTransition::Damaged {
-                occurred_at: Some(d),
-                cause: Some(DamageCause::Flood),
-                description: None,
-                trigger_event: Some(trigger.clone()),
-            })
-            .collect(),
+        "Q8068" => damage(DamageCause::Flood, p585, ctx),
 
         // =================================================================
         // DEMOLITION EVENTS
@@ -476,50 +459,108 @@ fn process_p793_claim(claim: &Claim, ctx: &PropertyContext) -> (Vec<DatedTransit
         // Q331483: demolition
         // Q17781833: destruction
         "Q331483" | "Q17781833" => {
-            let started = cite_first(&p580, "P580", ctx);
-            let completed =
-                cite_first(&p582, "P582", ctx).or_else(|| cite_first(&p585, "P585", ctx));
-
-            if started.is_some() || completed.is_some() {
-                vec![EntityTransition::Demolished {
-                    started_at: started,
-                    completed_at: completed,
-                    cause: None,
-                    trigger_event: Some(trigger),
-                }]
-            } else {
-                vec![]
-            }
+            let completed = fallback(p582, p585);
+            (!p580.is_empty() || !completed.is_empty()).then_some(Contribution::Demolition {
+                started: p580,
+                completed,
+            })
         }
 
         // =================================================================
         // CLOSURE EVENTS
         // =================================================================
 
-        // Q5135520: closure
-        "Q5135520" => cite_all(&p585, "P585", ctx)
-            .into_iter()
-            .map(|d| EntityTransition::UsageModified {
-                occurred_at: Some(d),
-                new_usages: std::collections::BTreeSet::new(), // Empty = closed
-                description: Some("Closure".to_string()),
-                trigger_event: Some(trigger.clone()),
-            })
-            .collect(),
+        // Q5135520: closure — ceased use, the empty usage set
+        "Q5135520" => usage_changed(p585, Some(BTreeSet::new()), ctx),
 
-        // Unknown event type - skip silently
-        _ => vec![],
+        _ => {
+            warnings.push(format!("P793: unrecognized event QID {qid}"));
+            None
+        }
     };
 
-    let dated = transitions
-        .into_iter()
-        .map(|t| DatedTransition {
-            transition: t,
+    (
+        contribution.map(|contribution| DatedContribution {
+            contribution,
             sort_key,
-        })
-        .collect();
+        }),
+        warnings,
+    )
+}
 
-    (dated, warnings)
+/// The preferred bounds when any were extracted, else the alternate bounds
+/// (end-time qualifiers over point-in-time, and so on).
+fn fallback(preferred: Vec<CitedDate>, alternate: Vec<CitedDate>) -> Vec<CitedDate> {
+    if preferred.is_empty() {
+        alternate
+    } else {
+        preferred
+    }
+}
+
+/// A construction contribution, when at least one date was extracted.
+fn construction(started: Vec<CitedDate>, completed: Vec<CitedDate>) -> Option<Contribution> {
+    (!started.is_empty() || !completed.is_empty()).then_some(Contribution::Construction {
+        started,
+        completed,
+        location: Vec::new(),
+    })
+}
+
+/// A durational interior event, when at least one date was extracted.
+fn durational(
+    kind: DurationalKind,
+    started: Vec<CitedDate>,
+    completed: Vec<CitedDate>,
+    payload: Option<InteriorPayload>,
+    ctx: &ItemContext,
+) -> Option<Contribution> {
+    if started.is_empty() && completed.is_empty() {
+        return None;
+    }
+    let citation = event_citation(started.first().or(completed.first()), ctx);
+    Some(Contribution::Event(Box::new(InteriorEvent {
+        shape: EventShape::Durational {
+            kind,
+            started,
+            completed,
+        },
+        payload,
+        citation,
+    })))
+}
+
+/// A damage event: durational, with the cause as payload; the damage spans
+/// from the claimed point in time.
+fn damage(cause: DamageCause, at: Vec<CitedDate>, ctx: &ItemContext) -> Option<Contribution> {
+    durational(
+        DurationalKind::Damaged,
+        at,
+        Vec::new(),
+        Some(InteriorPayload::DamageCause { cause }),
+        ctx,
+    )
+}
+
+/// A usage-changed point event, when at least one date was extracted.
+/// `new_usages: None` asserts the change with no claimed usage set.
+fn usage_changed(
+    at: Vec<CitedDate>,
+    new_usages: Option<BTreeSet<Usage>>,
+    ctx: &ItemContext,
+) -> Option<Contribution> {
+    if at.is_empty() {
+        return None;
+    }
+    let citation = event_citation(at.first(), ctx);
+    Some(Contribution::Event(Box::new(InteriorEvent {
+        shape: EventShape::Point {
+            kind: PointKind::UsageChanged,
+            at,
+        },
+        payload: new_usages.map(|new_usages| InteriorPayload::UsageChange { new_usages }),
+        citation,
+    })))
 }
 
 // =============================================================================
@@ -528,232 +569,184 @@ fn process_p793_claim(claim: &Claim, ctx: &PropertyContext) -> (Vec<DatedTransit
 
 /// Build lifecycles from claims.
 ///
-/// Extracts P571, P576, P625, P793, P1619 and combines into complete transitions.
-/// Returns (`entity_lifecycles`, warnings). Multiple inner vecs when demolish->construct
-/// indicates entity splitting. Caller creates `EntityRelation::Replaces` between them.
+/// Extracts P571, P576, P625, P793, and the usage-transition properties
+/// (P1619, P3999, P729, P730), fuses them into complete contributions, and
+/// sorts chronologically. Returns (`entity_lifecycles`, warnings). Multiple
+/// inner vecs when demolish→construct indicates entity splitting; the caller
+/// creates `Replaces` relationships between them.
 pub fn build_lifecycles(
     claims: &BTreeMap<PropertyId, Vec<Claim>>,
-    ctx: &PropertyContext,
-) -> (Vec<Vec<EntityTransition<SourceIdx>>>, Vec<String>) {
+    ctx: &ItemContext,
+) -> (Vec<Vec<Contribution>>, Vec<String>) {
     let mut warnings = Vec::new();
-    let mut dated_transitions: Vec<DatedTransition> = Vec::new();
+    let mut dated: Vec<DatedContribution> = Vec::new();
 
     // 1. Extract top-level properties
-    let (inception, w) = extract_property_time(claims, "P571", ctx);
-    warnings.extend(w);
-
-    let (demolished_date, w) = extract_property_time(claims, "P576", ctx);
-    warnings.extend(w);
-
-    let (location, w) = extract_property_location(claims, ctx);
-    warnings.extend(w);
-
-    let (opening, w) = extract_property_time(claims, "P1619", ctx);
-    warnings.extend(w);
-
-    let (closure, w) = extract_property_time(claims, "P3999", ctx);
-    warnings.extend(w);
-
-    let (service_entry, w) = extract_property_time(claims, "P729", ctx);
-    warnings.extend(w);
-
-    let (service_retirement, w) = extract_property_time(claims, "P730", ctx);
-    warnings.extend(w);
+    let inceptions =
+        extract_property_dates(claims, WikidataPropertyId::new(571), ctx, &mut warnings);
+    let demolition_dates =
+        extract_property_dates(claims, WikidataPropertyId::new(576), ctx, &mut warnings);
+    let locations = extract_property_locations(claims, ctx, &mut warnings);
+    let openings =
+        extract_property_dates(claims, WikidataPropertyId::new(1619), ctx, &mut warnings);
+    let closures =
+        extract_property_dates(claims, WikidataPropertyId::new(3999), ctx, &mut warnings);
+    let service_entries =
+        extract_property_dates(claims, WikidataPropertyId::new(729), ctx, &mut warnings);
+    let service_retirements =
+        extract_property_dates(claims, WikidataPropertyId::new(730), ctx, &mut warnings);
 
     // 2. Process P793 events first to collect construction events
-    let mut p793_constructions: Vec<DatedTransition> = Vec::new();
-    let mut p793_other: Vec<DatedTransition> = Vec::new();
+    let mut p793_constructions: Vec<DatedContribution> = Vec::new();
+    let mut p793_other: Vec<DatedContribution> = Vec::new();
 
     if let Some(p793_claims) = claims.get("P793") {
-        for claim in p793_claims {
-            let (transitions, w) = process_p793_claim(claim, ctx);
+        for claim in asserted_claims(p793_claims) {
+            let (contribution, w) = process_p793_claim(claim, ctx);
             warnings.extend(w);
-            for dt in transitions {
-                if matches!(dt.transition, EntityTransition::Constructed { .. }) {
-                    p793_constructions.push(dt);
+            if let Some(dc) = contribution {
+                if matches!(dc.contribution, Contribution::Construction { .. }) {
+                    p793_constructions.push(dc);
                 } else {
-                    p793_other.push(dt);
+                    p793_other.push(dc);
                 }
             }
         }
     }
 
-    // 3. Build Constructed transitions, merging P571/P625 with P793 when appropriate
+    // 3. Build construction contributions, fusing P571/P625 with P793:
+    //    P571 inception is a competing construction *start* bound (existence
+    //    onset ≈ construction start), and P625 is the build location. With no
+    //    P793 construction, the inceptions stand as their own construction;
+    //    otherwise they join the earliest P793 construction's start bounds.
     if p793_constructions.is_empty() {
-        // No P793 construction events - create from P571 + P625
-        if inception.is_some() || location.is_some() {
-            let sort_key = inception.as_ref().and_then(|c| c.value.earliest());
-            dated_transitions.push(DatedTransition {
-                transition: EntityTransition::Constructed {
-                    started_at: None,
-                    completed_at: inception,
-                    location,
-                    trigger_event: None,
+        if !inceptions.is_empty() || !locations.is_empty() {
+            let sort_key = earliest_of(&inceptions);
+            dated.push(DatedContribution {
+                contribution: Contribution::Construction {
+                    started: inceptions,
+                    completed: Vec::new(),
+                    location: locations,
                 },
                 sort_key,
             });
         }
     } else {
-        // Have P793 construction events - merge P625 location into the first one
-        // and P571 inception as completed_at if appropriate
-        let mut used_location = false;
-        let mut used_inception = false;
-
-        // Sort P793 constructions by date to find the earliest
+        // The earliest P793 construction takes the location and absorbs the
+        // P571 inceptions as competing start bounds — every non-deprecated
+        // inception is asserted, never conditionally dropped.
         p793_constructions.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        let mut remaining_locations = locations;
+        let mut remaining_inceptions = inceptions;
 
-        for (i, mut dt) in p793_constructions.into_iter().enumerate() {
-            if let EntityTransition::Constructed {
-                location: ref mut loc_field,
-                completed_at: ref mut comp_field,
-                ..
-            } = dt.transition
+        for (i, mut dc) in p793_constructions.into_iter().enumerate() {
+            if i == 0
+                && let Contribution::Construction {
+                    started,
+                    completed,
+                    location,
+                } = &mut dc.contribution
             {
-                // Attach location to the first construction event
-                if i == 0
-                    && !used_location
-                    && let Some(loc) = location.clone()
-                {
-                    *loc_field = Some(loc);
-                    used_location = true;
-                }
-
-                // If this construction has no completed_at and we have P571, use it
-                // (only for the last construction, which is likely the final completion)
-                if comp_field.is_none()
-                    && !used_inception
-                    && let Some(inc) = inception.clone()
-                {
-                    *comp_field = Some(inc);
-                    used_inception = true;
-                }
+                *location = std::mem::take(&mut remaining_locations);
+                started.append(&mut remaining_inceptions);
+                // An absorbed inception can predate the construction's own
+                // start; keep the sort key equal to the earliest emitted bound.
+                let earliest = started
+                    .iter()
+                    .chain(completed.iter())
+                    .filter_map(|d| d.bound.earliest())
+                    .min();
+                dc.sort_key = earliest;
             }
-            dated_transitions.push(dt);
+            dated.push(dc);
         }
     }
 
     // 4. Add non-construction P793 events
-    dated_transitions.extend(p793_other);
+    dated.extend(p793_other);
 
-    // 5. Add P576 demolished
-    if let Some(demolished) = demolished_date {
-        let sort_key = demolished.value.earliest();
-        dated_transitions.push(DatedTransition {
-            transition: EntityTransition::Demolished {
-                started_at: None,
-                completed_at: Some(demolished),
-                cause: None,
-                trigger_event: None,
+    // 5. Add P576 demolition
+    if !demolition_dates.is_empty() {
+        let sort_key = earliest_of(&demolition_dates);
+        dated.push(DatedContribution {
+            contribution: Contribution::Demolition {
+                started: Vec::new(),
+                completed: demolition_dates,
             },
             sort_key,
         });
     }
 
-    // 6. Add usage-related transitions
-    if let Some(opened) = opening {
-        let sort_key = opened.value.earliest();
-        dated_transitions.push(DatedTransition {
-            transition: EntityTransition::UsageModified {
-                occurred_at: Some(opened),
-                new_usages: [Usage::Unknown].into_iter().collect(),
-                description: Some("Official opening".to_string()),
-                trigger_event: None,
-            },
-            sort_key,
-        });
-    }
-
-    if let Some(closed) = closure {
-        let sort_key = closed.value.earliest();
-        dated_transitions.push(DatedTransition {
-            transition: EntityTransition::UsageModified {
-                occurred_at: Some(closed),
-                new_usages: std::collections::BTreeSet::new(), // Empty = closed
-                description: Some("Official closure".to_string()),
-                trigger_event: None,
-            },
-            sort_key,
-        });
-    }
-
-    if let Some(entry) = service_entry {
-        let sort_key = entry.value.earliest();
-        dated_transitions.push(DatedTransition {
-            transition: EntityTransition::UsageModified {
-                occurred_at: Some(entry),
-                new_usages: [Usage::Transportation].into_iter().collect(),
-                description: Some("Service entry".to_string()),
-                trigger_event: None,
-            },
-            sort_key,
-        });
-    }
-
-    if let Some(retirement) = service_retirement {
-        let sort_key = retirement.value.earliest();
-        dated_transitions.push(DatedTransition {
-            transition: EntityTransition::UsageModified {
-                occurred_at: Some(retirement),
-                new_usages: std::collections::BTreeSet::new(), // Empty = retired
-                description: Some("Service retirement".to_string()),
-                trigger_event: None,
-            },
-            sort_key,
-        });
-    }
+    // 6. Add usage-transition events
+    let mut push_usage = |at: Vec<CitedDate>, new_usages: Option<BTreeSet<Usage>>| {
+        let sort_key = earliest_of(&at);
+        if let Some(contribution) = usage_changed(at, new_usages, ctx) {
+            dated.push(DatedContribution {
+                contribution,
+                sort_key,
+            });
+        }
+    };
+    // P1619 official opening: a dated usage change with no claimed usage set.
+    push_usage(openings, None);
+    // P3999 official closure: ceased use.
+    push_usage(closures, Some(BTreeSet::new()));
+    // P729 service entry.
+    push_usage(
+        service_entries,
+        Some([Usage::Transportation].into_iter().collect()),
+    );
+    // P730 service retirement: ceased use.
+    push_usage(service_retirements, Some(BTreeSet::new()));
 
     // 7. Sort chronologically
-    dated_transitions.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    dated.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
 
     // 8. Split on demolish->construct boundaries
-    let entities = split_on_rebuild(dated_transitions);
+    let entities = split_on_rebuild(dated);
 
     (entities, warnings)
 }
 
-/// Split transitions into separate entities when demolish->construct indicates rebuild.
+/// Split contributions into separate entities when demolish→construct
+/// indicates a rebuild.
 ///
-/// When splitting, if the construction that triggers the split has a location, the
-/// predecessor gets a synthetic `Constructed` with that same location and no dates —
-/// the previous building occupied the same site, we just don't know when it was built.
-fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransition<SourceIdx>>> {
-    if transitions.is_empty() {
+/// When splitting, if the construction that triggers the split has a location,
+/// the predecessor gets a synthetic dateless `Construction` with that same
+/// location — the previous building occupied the same site, we just don't know
+/// when it was built.
+fn split_on_rebuild(contributions: Vec<DatedContribution>) -> Vec<Vec<Contribution>> {
+    if contributions.is_empty() {
         return vec![];
     }
 
-    let mut entities: Vec<Vec<EntityTransition<SourceIdx>>> = vec![vec![]];
+    let mut entities: Vec<Vec<Contribution>> = vec![vec![]];
     let mut saw_demolition = false;
 
-    for dt in transitions {
-        let is_construction = matches!(dt.transition, EntityTransition::Constructed { .. });
-        let is_demolition = matches!(dt.transition, EntityTransition::Demolished { .. });
+    for dc in contributions {
+        let is_construction = matches!(dc.contribution, Contribution::Construction { .. });
+        let is_demolition = matches!(dc.contribution, Contribution::Demolition { .. });
 
         // If we see construction after demolition, start a new entity.
-        // Give the predecessor entity a Constructed at the same location.
+        // Give the predecessor entity a Construction at the same location.
         if saw_demolition && is_construction {
-            if let EntityTransition::Constructed {
-                location: Some(ref loc),
-                ..
-            } = dt.transition
+            if let Contribution::Construction { location, .. } = &dc.contribution
+                && !location.is_empty()
                 && let Some(prev) = entities.last_mut()
             {
-                let has_location = prev.iter().any(|t| {
+                let has_location = prev.iter().any(|c| {
                     matches!(
-                        t,
-                        EntityTransition::Constructed {
-                            location: Some(_),
-                            ..
-                        }
+                        c,
+                        Contribution::Construction { location, .. } if !location.is_empty()
                     )
                 });
                 if !has_location {
                     prev.insert(
                         0,
-                        EntityTransition::Constructed {
-                            started_at: None,
-                            completed_at: None,
-                            location: Some(loc.clone()),
-                            trigger_event: None,
+                        Contribution::Construction {
+                            started: Vec::new(),
+                            completed: Vec::new(),
+                            location: location.clone(),
                         },
                     );
                 }
@@ -762,9 +755,9 @@ fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransiti
             saw_demolition = false;
         }
 
-        // Add transition to current entity (vec is provably non-empty)
+        // Add contribution to current entity (vec is provably non-empty)
         if let Some(last) = entities.last_mut() {
-            last.push(dt.transition);
+            last.push(dc.contribution);
         }
 
         if is_demolition {
@@ -780,9 +773,9 @@ fn split_on_rebuild(transitions: Vec<DatedTransition>) -> Vec<Vec<EntityTransiti
 mod tests {
     use super::*;
     use chrono::Datelike;
-    use chronoscope_core::{
-        Evidence, GeoPoint, WikidataEntityId, WikidataField, WikidataPropertyId,
-    };
+    use chronoscope_core::facts::citations::{ExternalSource, WikidataField};
+    use chronoscope_core::geo::GeoPoint;
+    use chronoscope_core::ids::WikidataEntityId;
     use chronoscope_integrations::wikidata::{
         CoordinateValue, DataValue, EntityRefValue, PropertyId, Rank, Snak, TimeValue, WikidataId,
         WikidataPrecision, WikidataTimestamp,
@@ -802,14 +795,26 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, d)
     }
 
-    /// Property id cited by the first evidence of a lifecycle value.
-    fn evidence_property<T>(cited: &Cited<T, SourceIdx>) -> Result<WikidataPropertyId, String> {
-        match cited.evidence.first() {
-            Some(Evidence::Wikidata {
+    fn ctx() -> Result<ItemContext, Box<dyn std::error::Error>> {
+        Ok(ItemContext::new(WikidataEntityId::new(12345), 100)?)
+    }
+
+    /// The statement property a citation attributes its value to.
+    fn citation_property(citation: &FactualCitation) -> Result<WikidataPropertyId, String> {
+        match &citation.source {
+            ExternalSource::Wikidata {
                 field: WikidataField::Statement { property_id },
                 ..
-            }) => Ok(*property_id),
-            _ => Err("expected Wikidata statement evidence".to_string()),
+            } => Ok(*property_id),
+            other => Err(format!("expected Wikidata statement source, got {other:?}")),
+        }
+    }
+
+    /// The observed value a citation quotes.
+    fn citation_value(citation: &FactualCitation) -> Result<&str, String> {
+        match &citation.source {
+            ExternalSource::Wikidata { value, .. } => Ok(value),
+            other => Err(format!("expected Wikidata source, got {other:?}")),
         }
     }
 
@@ -973,100 +978,89 @@ mod tests {
     }
 
     #[test]
-    fn test_split_on_rebuild() {
+    fn split_on_rebuild_partitions_at_demolish_construct_boundary() {
         // Simulate: Constructed 1920, Demolished 1950, Constructed 1960
-        let transitions = vec![
-            DatedTransition {
-                transition: EntityTransition::Constructed {
-                    started_at: None,
-                    completed_at: None,
-                    location: None,
-                    trigger_event: None,
-                },
+        let bare_construction = || Contribution::Construction {
+            started: Vec::new(),
+            completed: Vec::new(),
+            location: Vec::new(),
+        };
+        let contributions = vec![
+            DatedContribution {
+                contribution: bare_construction(),
                 sort_key: ymd(1920, 1, 1),
             },
-            DatedTransition {
-                transition: EntityTransition::Demolished {
-                    started_at: None,
-                    completed_at: None,
-                    cause: None,
-                    trigger_event: None,
+            DatedContribution {
+                contribution: Contribution::Demolition {
+                    started: Vec::new(),
+                    completed: Vec::new(),
                 },
                 sort_key: ymd(1950, 1, 1),
             },
-            DatedTransition {
-                transition: EntityTransition::Constructed {
-                    started_at: None,
-                    completed_at: None,
-                    location: None,
-                    trigger_event: None,
-                },
+            DatedContribution {
+                contribution: bare_construction(),
                 sort_key: ymd(1960, 1, 1),
             },
         ];
 
-        let entities = split_on_rebuild(transitions);
+        let entities = split_on_rebuild(contributions);
         assert_eq!(entities.len(), 2);
-        assert_eq!(entities[0].len(), 2); // Constructed + Demolished
-        assert_eq!(entities[1].len(), 1); // Constructed
+        assert_eq!(entities[0].len(), 2); // Construction + Demolition
+        assert_eq!(entities[1].len(), 1); // Construction
     }
 
     #[test]
-    fn test_split_on_rebuild_propagates_location() -> TestResult {
-        // Predecessor has no location; successor was constructed at a known location.
-        // The predecessor should get a synthetic Constructed with the inherited location.
-        let loc = UnresolvedLocation::Resolved(Location::point(GeoPoint::new(45.217, 12.277)?));
-        let transitions = vec![
-            DatedTransition {
-                transition: EntityTransition::Demolished {
-                    started_at: None,
-                    completed_at: None,
-                    cause: None,
-                    trigger_event: None,
+    fn split_on_rebuild_gives_predecessor_the_successor_location() -> TestResult {
+        // Predecessor has no location; successor was constructed at a known
+        // location. The predecessor gets a synthetic dateless Construction
+        // with the inherited location, same citation.
+        let location = CitedLocation {
+            location: UnresolvedLocation::Resolved(Location::point(GeoPoint::new(45.217, 12.277)?)),
+            citation: ctx()?.statement_citation(WikidataPropertyId::new(625), "45.217,12.277")?,
+        };
+        let contributions = vec![
+            DatedContribution {
+                contribution: Contribution::Demolition {
+                    started: Vec::new(),
+                    completed: Vec::new(),
                 },
                 sort_key: ymd(1623, 1, 1),
             },
-            DatedTransition {
-                transition: EntityTransition::Constructed {
-                    started_at: None,
-                    completed_at: None,
-                    location: Some(Cited::uncited(loc)),
-                    trigger_event: None,
+            DatedContribution {
+                contribution: Contribution::Construction {
+                    started: Vec::new(),
+                    completed: Vec::new(),
+                    location: vec![location.clone()],
                 },
                 sort_key: ymd(1633, 1, 1),
             },
         ];
 
-        let entities = split_on_rebuild(transitions);
+        let entities = split_on_rebuild(contributions);
         assert_eq!(entities.len(), 2);
 
-        // Predecessor: should have synthetic Constructed (with location) + Demolished
+        // Predecessor: synthetic Construction (with location) + Demolition
         assert_eq!(entities[0].len(), 2);
+        let Contribution::Construction {
+            started,
+            completed,
+            location: inherited,
+        } = &entities[0][0]
+        else {
+            return Err("predecessor should lead with a synthetic Construction".into());
+        };
         assert!(
-            matches!(
-                &entities[0][0],
-                EntityTransition::Constructed {
-                    location: Some(_),
-                    started_at: None,
-                    completed_at: None,
-                    ..
-                }
-            ),
-            "predecessor should have synthetic Constructed with inherited location"
+            started.is_empty() && completed.is_empty(),
+            "no dates invented"
         );
-        assert!(matches!(
-            &entities[0][1],
-            EntityTransition::Demolished { .. }
-        ));
+        assert_eq!(inherited, &vec![location]);
+        assert!(matches!(&entities[0][1], Contribution::Demolition { .. }));
 
-        // Successor: Constructed with location
+        // Successor: Construction with location
         assert_eq!(entities[1].len(), 1);
         assert!(matches!(
             &entities[1][0],
-            EntityTransition::Constructed {
-                location: Some(_),
-                ..
-            }
+            Contribution::Construction { location, .. } if !location.is_empty()
         ));
 
         Ok(())
@@ -1076,18 +1070,7 @@ mod tests {
     // build_lifecycles integration tests
     // =========================================================================
 
-    fn ctx() -> PropertyContext {
-        // Mirrors production: P793 (significant event) is the context
-        // property for the P793-event path; top-level properties cite
-        // their own.
-        PropertyContext::with_property(
-            WikidataEntityId::new(12345),
-            100,
-            WikidataPropertyId::new(793),
-        )
-    }
-
-    /// P571 inception date only -> single Constructed transition
+    /// P571 inception date only -> single Construction start bound
     #[test]
     fn build_p571_inception_only() -> TestResult {
         let claims = claims_from(vec![(
@@ -1098,35 +1081,40 @@ mod tests {
             )?],
         )])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
 
-        let transitions = &lifecycles[0];
-        assert_eq!(transitions.len(), 1);
-        if let EntityTransition::Constructed {
-            completed_at,
-            started_at,
+        let contributions = &lifecycles[0];
+        assert_eq!(contributions.len(), 1);
+        let Contribution::Construction {
+            started,
+            completed,
             location,
-            ..
-        } = &transitions[0]
-        {
-            // P571 becomes completed_at (inception = completion date)
-            let date = completed_at.as_ref().ok_or("expected completed_at")?;
-            assert_eq!(
-                date.value.earliest().ok_or("expected earliest")?.year(),
-                1920
-            );
-            assert_eq!(evidence_property(date)?, WikidataPropertyId::new(571));
-            assert!(started_at.is_none());
-            assert!(location.is_none());
-        } else {
-            return Err("expected Constructed".into());
-        }
+        } = &contributions[0]
+        else {
+            return Err("expected Construction".into());
+        };
+        // P571 is a construction start bound (inception = existence onset)
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            started[0]
+                .bound
+                .earliest()
+                .ok_or("expected earliest")?
+                .year(),
+            1920
+        );
+        assert_eq!(
+            citation_property(&started[0].citation)?,
+            WikidataPropertyId::new(571)
+        );
+        assert!(completed.is_empty());
+        assert!(location.is_empty());
         Ok(())
     }
 
-    /// P571 + P625 -> Constructed with date and location
+    /// P571 + P625 -> Construction with date and location
     #[test]
     fn build_p571_with_p625_location() -> TestResult {
         let claims = claims_from(vec![
@@ -1137,34 +1125,38 @@ mod tests {
             ("P625", vec![coordinate_claim(48.8584, 2.2945)]),
         ])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 1);
 
-        if let EntityTransition::Constructed {
-            completed_at,
-            location,
-            ..
+        let Contribution::Construction {
+            started, location, ..
         } = &lifecycles[0][0]
+        else {
+            return Err("expected Construction".into());
+        };
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            citation_property(&started[0].citation)?,
+            WikidataPropertyId::new(571)
+        );
+        assert_eq!(location.len(), 1);
+        assert_eq!(
+            citation_property(&location[0].citation)?,
+            WikidataPropertyId::new(625)
+        );
+        if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &location[0].location
         {
-            let date = completed_at.as_ref().ok_or("expected completed_at")?;
-            assert_eq!(evidence_property(date)?, WikidataPropertyId::new(571));
-            let loc = location.as_ref().ok_or("expected location")?;
-            assert_eq!(evidence_property(loc)?, WikidataPropertyId::new(625));
-            if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &loc.value {
-                assert!((center.lat() - 48.8584).abs() < 0.001);
-                assert!((center.lon() - 2.2945).abs() < 0.001);
-            } else {
-                return Err("expected Coordinates".into());
-            }
+            assert!((center.lat() - 48.8584).abs() < 0.001);
+            assert!((center.lon() - 2.2945).abs() < 0.001);
         } else {
-            return Err("expected Constructed".into());
+            return Err("expected Coordinates".into());
         }
         Ok(())
     }
 
-    /// P571 + P576 -> Constructed + Demolished
+    /// P571 + P576 -> Construction + Demolition
     #[test]
     fn build_p571_p576_construction_and_demolition() -> TestResult {
         let claims = claims_from(vec![
@@ -1184,23 +1176,27 @@ mod tests {
             ),
         ])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
-        // Sorted chronologically: Constructed (P571) 1900, Demolished (P576) 1960
-        let EntityTransition::Constructed { completed_at, .. } = &lifecycles[0][0] else {
-            return Err("expected Constructed".into());
+        // Sorted chronologically: Construction (P571) 1900, Demolition (P576) 1960
+        let Contribution::Construction { started, .. } = &lifecycles[0][0] else {
+            return Err("expected Construction".into());
         };
-        let inception = completed_at.as_ref().ok_or("expected completed_at")?;
-        assert_eq!(evidence_property(inception)?, WikidataPropertyId::new(571));
+        assert_eq!(
+            citation_property(&started[0].citation)?,
+            WikidataPropertyId::new(571)
+        );
 
-        let EntityTransition::Demolished { completed_at, .. } = &lifecycles[0][1] else {
-            return Err("expected Demolished".into());
+        let Contribution::Demolition { completed, .. } = &lifecycles[0][1] else {
+            return Err("expected Demolition".into());
         };
-        let demolition = completed_at.as_ref().ok_or("expected completed_at")?;
-        assert_eq!(evidence_property(demolition)?, WikidataPropertyId::new(576));
+        assert_eq!(
+            citation_property(&completed[0].citation)?,
+            WikidataPropertyId::new(576)
+        );
         Ok(())
     }
 
@@ -1216,38 +1212,49 @@ mod tests {
             )?],
         )])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 1);
 
-        if let EntityTransition::Constructed {
-            started_at,
-            completed_at,
-            ..
+        let Contribution::Construction {
+            started, completed, ..
         } = &lifecycles[0][0]
-        {
-            let start = started_at.as_ref().ok_or("expected started_at")?;
-            let end = completed_at.as_ref().ok_or("expected completed_at")?;
-            assert_eq!(
-                start.value.earliest().ok_or("expected earliest")?.year(),
-                1887
-            );
-            assert_eq!(
-                end.value.earliest().ok_or("expected earliest")?.year(),
-                1889
-            );
-            // Dates come from P580/P582 qualifiers; the honest source is
-            // the P793 significant-event statement.
-            assert_eq!(evidence_property(start)?, WikidataPropertyId::new(793));
-            assert_eq!(evidence_property(end)?, WikidataPropertyId::new(793));
-        } else {
-            return Err("expected Constructed".into());
-        }
+        else {
+            return Err("expected Construction".into());
+        };
+        assert_eq!(started.len(), 1);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            started[0]
+                .bound
+                .earliest()
+                .ok_or("expected earliest")?
+                .year(),
+            1887
+        );
+        assert_eq!(
+            completed[0]
+                .bound
+                .earliest()
+                .ok_or("expected earliest")?
+                .year(),
+            1889
+        );
+        // Dates come from P580/P582 qualifiers; the honest source is
+        // the P793 significant-event statement.
+        assert_eq!(
+            citation_property(&started[0].citation)?,
+            WikidataPropertyId::new(793)
+        );
+        assert_eq!(
+            citation_property(&completed[0].citation)?,
+            WikidataPropertyId::new(793)
+        );
         Ok(())
     }
 
-    /// P793 damage events map to correct `DamageCause`
+    /// P793 damage events map to correct `DamageCause` payloads
     #[test]
     fn build_p793_damage_events() -> TestResult {
         let claims = claims_from(vec![(
@@ -1259,29 +1266,42 @@ mod tests {
             ],
         )])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
 
-        let transitions = &lifecycles[0];
-        assert_eq!(transitions.len(), 3);
+        let contributions = &lifecycles[0];
+        assert_eq!(contributions.len(), 3);
 
         // Sorted chronologically: fire 1871, earthquake 1906, flood 1927
-        let causes: Vec<_> = transitions
+        let causes: Vec<DamageCause> = contributions
             .iter()
-            .filter_map(|t| {
-                if let EntityTransition::Damaged { cause, .. } = t {
-                    cause.clone()
+            .filter_map(|c| {
+                if let Contribution::Event(event) = c
+                    && matches!(
+                        event.shape,
+                        EventShape::Durational {
+                            kind: DurationalKind::Damaged,
+                            ..
+                        }
+                    )
+                    && let Some(InteriorPayload::DamageCause { cause }) = &event.payload
+                {
+                    Some(cause.clone())
                 } else {
                     None
                 }
             })
             .collect();
 
-        assert_eq!(causes.len(), 3);
-        assert_eq!(causes[0], DamageCause::Fire);
-        assert_eq!(causes[1], DamageCause::Earthquake);
-        assert_eq!(causes[2], DamageCause::Flood);
+        assert_eq!(
+            causes,
+            vec![
+                DamageCause::Fire,
+                DamageCause::Earthquake,
+                DamageCause::Flood
+            ]
+        );
         Ok(())
     }
 
@@ -1297,34 +1317,31 @@ mod tests {
             ],
         )])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
 
         // Should split into 2 entities
         assert_eq!(lifecycles.len(), 2);
 
-        // First entity: constructed + demolished
+        // First entity: construction + demolition
         assert_eq!(lifecycles[0].len(), 2);
         assert!(matches!(
             &lifecycles[0][0],
-            EntityTransition::Constructed { .. }
+            Contribution::Construction { .. }
         ));
-        assert!(matches!(
-            &lifecycles[0][1],
-            EntityTransition::Demolished { .. }
-        ));
+        assert!(matches!(&lifecycles[0][1], Contribution::Demolition { .. }));
 
-        // Second entity: constructed
+        // Second entity: construction
         assert_eq!(lifecycles[1].len(), 1);
         assert!(matches!(
             &lifecycles[1][0],
-            EntityTransition::Constructed { .. }
+            Contribution::Construction { .. }
         ));
         Ok(())
     }
 
     /// Combined scenario: P571 inception + P793 renovation + P576 demolition
-    /// Tests that all property types integrate correctly and sort chronologically
+    /// + P1619 opening. All property types integrate and sort chronologically.
     #[test]
     fn build_combined_lifecycle() -> TestResult {
         let claims = claims_from(vec![
@@ -1359,28 +1376,33 @@ mod tests {
             ), // opening
         ])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
 
-        let transitions = &lifecycles[0];
-        // Constructed (1850), Opening (1855), Renovation (1920), Demolished (1960)
-        assert_eq!(transitions.len(), 4);
+        let contributions = &lifecycles[0];
+        // Construction (1850), Opening (1855), Renovation (1920), Demolition (1960)
+        assert_eq!(contributions.len(), 4);
 
-        // Verify chronological ordering
         assert!(matches!(
-            transitions[0],
-            EntityTransition::Constructed { .. }
+            &contributions[0],
+            Contribution::Construction { .. }
         ));
         assert!(matches!(
-            transitions[1],
-            EntityTransition::UsageModified { .. }
+            &contributions[1],
+            Contribution::Event(e) if matches!(
+                e.shape,
+                EventShape::Point { kind: PointKind::UsageChanged, .. }
+            )
         )); // opening
-        assert!(matches!(transitions[2], EntityTransition::Modified { .. })); // renovation
         assert!(matches!(
-            transitions[3],
-            EntityTransition::Demolished { .. }
-        ));
+            &contributions[2],
+            Contribution::Event(e) if matches!(
+                e.shape,
+                EventShape::Durational { kind: DurationalKind::Modified, .. }
+            )
+        )); // renovation
+        assert!(matches!(&contributions[3], Contribution::Demolition { .. }));
         Ok(())
     }
 
@@ -1399,28 +1421,134 @@ mod tests {
             ),
         ])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 1);
 
-        if let EntityTransition::Constructed { location, .. } = &lifecycles[0][0] {
-            let loc = location
-                .as_ref()
-                .ok_or("P625 should be merged into P793 construction")?;
-            if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &loc.value {
-                assert!((center.lat() - 51.5074).abs() < 0.001);
-                assert!((center.lon() - (-0.1278)).abs() < 0.001);
-            } else {
-                return Err("expected Coordinates".into());
-            }
+        let Contribution::Construction { location, .. } = &lifecycles[0][0] else {
+            return Err("expected Construction".into());
+        };
+        assert_eq!(
+            location.len(),
+            1,
+            "P625 should be merged into P793 construction"
+        );
+        if let UnresolvedLocation::Resolved(Location::Circle { center, .. }) = &location[0].location
+        {
+            assert!((center.lat() - 51.5074).abs() < 0.001);
+            assert!((center.lon() - (-0.1278)).abs() < 0.001);
         } else {
-            return Err("expected Constructed".into());
+            return Err("expected Coordinates".into());
         }
         Ok(())
     }
 
-    /// P729/P730 service entry/retirement -> transportation usage transitions
+    /// P571 joins a P793 construction as a competing start bound, cited to
+    /// P571, alongside the P793 start — it fuses, it does not stand alone.
+    #[test]
+    fn p571_inception_joins_p793_construction_as_competing_start() -> TestResult {
+        let claims = claims_from(vec![
+            (
+                "P571",
+                vec![time_claim(
+                    "+1889-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+            (
+                "P793",
+                vec![p793_event(
+                    "Q27136782", // start of construction: only a started bound
+                    "+1887-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+        ])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(
+            lifecycles[0].len(),
+            1,
+            "P571 fuses, it does not stand alone"
+        );
+
+        let Contribution::Construction {
+            started, completed, ..
+        } = &lifecycles[0][0]
+        else {
+            return Err("expected Construction".into());
+        };
+        assert!(completed.is_empty(), "no completion is invented");
+
+        // Both the P793 start (1887) and the P571 inception (1889) are asserted
+        // as competing start bounds, each cited to its own property.
+        let p793_start = started
+            .iter()
+            .find(|d| citation_property(&d.citation) == Ok(WikidataPropertyId::new(793)))
+            .ok_or("expected a P793-cited start bound")?;
+        assert_eq!(p793_start.bound.earliest().ok_or("earliest")?.year(), 1887);
+        let p571_start = started
+            .iter()
+            .find(|d| citation_property(&d.citation) == Ok(WikidataPropertyId::new(571)))
+            .ok_or("the P571 inception is asserted, not dropped")?;
+        assert_eq!(p571_start.bound.earliest().ok_or("earliest")?.year(), 1889);
+        Ok(())
+    }
+
+    /// Mirrors Notre-Dame (Q2981): a P571 founding date plus a P793 construction
+    /// that already carries a completion. The inception must survive as a
+    /// construction start bound rather than being dropped for lack of an empty
+    /// completion slot.
+    #[test]
+    fn p571_inception_survives_alongside_completed_p793_construction() -> TestResult {
+        let claims = claims_from(vec![
+            (
+                "P571",
+                vec![time_claim(
+                    "+1160-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+            (
+                "P793",
+                vec![p793_event_with_range(
+                    "Q385378",
+                    "+1163-01-01T00:00:00Z",
+                    "+1345-01-01T00:00:00Z",
+                )?],
+            ),
+        ])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].len(), 1, "one fused construction");
+
+        let Contribution::Construction {
+            started, completed, ..
+        } = &lifecycles[0][0]
+        else {
+            return Err("expected Construction".into());
+        };
+        // The P793 completion (1345) is retained.
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].bound.earliest().ok_or("earliest")?.year(),
+            1345
+        );
+        // The P571 founding (1160) survives as a competing start bound.
+        let p571_start = started
+            .iter()
+            .find(|d| citation_property(&d.citation) == Ok(WikidataPropertyId::new(571)))
+            .ok_or("the P571 founding date is not dropped")?;
+        assert_eq!(p571_start.bound.earliest().ok_or("earliest")?.year(), 1160);
+        Ok(())
+    }
+
+    /// P729/P730 service entry/retirement -> transportation / ceased-use payloads
     #[test]
     fn build_service_entry_and_retirement() -> TestResult {
         let claims = claims_from(vec![
@@ -1434,49 +1562,49 @@ mod tests {
             ),
         ])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
         // Service entry (P729) -> Transportation usage
-        if let EntityTransition::UsageModified {
-            occurred_at,
-            new_usages,
-            description,
-            ..
-        } = &lifecycles[0][0]
-        {
-            assert!(new_usages.contains(&Usage::Transportation));
-            assert_eq!(description.as_deref(), Some("Service entry"));
-            let entry = occurred_at.as_ref().ok_or("expected occurred_at")?;
-            assert_eq!(evidence_property(entry)?, WikidataPropertyId::new(729));
-        } else {
-            return Err("expected UsageModified for service entry".into());
-        }
+        let Contribution::Event(entry) = &lifecycles[0][0] else {
+            return Err("expected usage event for service entry".into());
+        };
+        let Some(InteriorPayload::UsageChange { new_usages }) = &entry.payload else {
+            return Err("service entry should carry a usage payload".into());
+        };
+        assert!(new_usages.contains(&Usage::Transportation));
+        let EventShape::Point { at, .. } = &entry.shape else {
+            return Err("usage change is a point event".into());
+        };
+        assert_eq!(
+            citation_property(&at[0].citation)?,
+            WikidataPropertyId::new(729)
+        );
 
-        // Service retirement (P730) -> empty usage (closed)
-        if let EntityTransition::UsageModified {
-            occurred_at,
-            new_usages,
-            description,
-            ..
-        } = &lifecycles[0][1]
-        {
-            assert!(
-                new_usages.is_empty(),
-                "retired service should have empty usage set"
-            );
-            assert_eq!(description.as_deref(), Some("Service retirement"));
-            let retirement = occurred_at.as_ref().ok_or("expected occurred_at")?;
-            assert_eq!(evidence_property(retirement)?, WikidataPropertyId::new(730));
-        } else {
-            return Err("expected UsageModified for service retirement".into());
-        }
+        // Service retirement (P730) -> empty usage set (ceased use)
+        let Contribution::Event(retirement) = &lifecycles[0][1] else {
+            return Err("expected usage event for service retirement".into());
+        };
+        let Some(InteriorPayload::UsageChange { new_usages }) = &retirement.payload else {
+            return Err("service retirement should carry a usage payload".into());
+        };
+        assert!(
+            new_usages.is_empty(),
+            "retired service should have empty usage set"
+        );
+        let EventShape::Point { at, .. } = &retirement.shape else {
+            return Err("usage change is a point event".into());
+        };
+        assert_eq!(
+            citation_property(&at[0].citation)?,
+            WikidataPropertyId::new(730)
+        );
         Ok(())
     }
 
-    /// P793 consecration -> Religious usage
+    /// P793 consecration -> Religious usage payload
     #[test]
     fn build_p793_consecration() -> TestResult {
         let claims = claims_from(vec![(
@@ -1488,29 +1616,143 @@ mod tests {
             )?],
         )])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 1);
 
-        if let EntityTransition::UsageModified {
-            occurred_at,
-            new_usages,
-            description,
-            ..
-        } = &lifecycles[0][0]
-        {
-            assert!(new_usages.contains(&Usage::Religious));
-            assert_eq!(description.as_deref(), Some("Consecration"));
-            // P585 point-in-time qualifier; cited under the P793 statement.
-            let consecrated = occurred_at.as_ref().ok_or("expected occurred_at")?;
-            assert_eq!(
-                evidence_property(consecrated)?,
-                WikidataPropertyId::new(793)
-            );
-        } else {
-            return Err("expected UsageModified for consecration".into());
-        }
+        let Contribution::Event(event) = &lifecycles[0][0] else {
+            return Err("expected usage event for consecration".into());
+        };
+        let Some(InteriorPayload::UsageChange { new_usages }) = &event.payload else {
+            return Err("consecration should carry a usage payload".into());
+        };
+        assert!(new_usages.contains(&Usage::Religious));
+        // P585 point-in-time qualifier; cited under the P793 statement, with
+        // the trigger QID quoted in the observed value.
+        let EventShape::Point { at, .. } = &event.shape else {
+            return Err("usage change is a point event".into());
+        };
+        assert_eq!(
+            citation_property(&at[0].citation)?,
+            WikidataPropertyId::new(793)
+        );
+        assert_eq!(
+            citation_value(&at[0].citation)?,
+            "Q125375 P585:+1626-11-18T00:00:00Z"
+        );
+        Ok(())
+    }
+
+    /// P1619 official opening -> dated usage change with no payload
+    #[test]
+    fn opening_emits_usage_changed_without_payload() -> TestResult {
+        let claims = claims_from(vec![(
+            "P1619",
+            vec![time_claim(
+                "+1855-06-01T00:00:00Z",
+                WikidataPrecision::Month,
+            )?],
+        )])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].len(), 1);
+
+        let Contribution::Event(event) = &lifecycles[0][0] else {
+            return Err("expected usage event for opening".into());
+        };
+        assert!(
+            event.payload.is_none(),
+            "an opening asserts the change, not a usage set"
+        );
+        let EventShape::Point {
+            kind: PointKind::UsageChanged,
+            at,
+        } = &event.shape
+        else {
+            return Err("opening is a UsageChanged point event".into());
+        };
+        assert_eq!(at.len(), 1);
+        assert_eq!(
+            citation_property(&at[0].citation)?,
+            WikidataPropertyId::new(1619)
+        );
+        Ok(())
+    }
+
+    /// Deprecated claims are dropped at extraction
+    #[test]
+    fn deprecated_p571_claim_is_dropped() -> TestResult {
+        let mut deprecated = time_claim("+1800-01-01T00:00:00Z", WikidataPrecision::Year)?;
+        deprecated.rank = Rank::Deprecated;
+        let claims = claims_from(vec![(
+            "P571",
+            vec![
+                deprecated,
+                time_claim("+1920-01-01T00:00:00Z", WikidataPrecision::Year)?,
+            ],
+        )])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(lifecycles.len(), 1);
+        let Contribution::Construction { started, .. } = &lifecycles[0][0] else {
+            return Err("expected Construction".into());
+        };
+        assert_eq!(started.len(), 1, "the deprecated bound contributes nothing");
+        assert_eq!(
+            started[0]
+                .bound
+                .earliest()
+                .ok_or("expected earliest")?
+                .year(),
+            1920
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deprecated_p793_claim_is_dropped() -> TestResult {
+        let mut deprecated =
+            p793_event("Q168983", "+1871-10-08T00:00:00Z", WikidataPrecision::Day)?;
+        deprecated.rank = Rank::Deprecated;
+        let claims = claims_from(vec![("P793", vec![deprecated])])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert!(lifecycles.is_empty(), "a deprecated event asserts nothing");
+        Ok(())
+    }
+
+    /// Multiple non-deprecated claims all assert, as competing citations
+    #[test]
+    fn parallel_p571_claims_yield_competing_start_bounds() -> TestResult {
+        let claims = claims_from(vec![(
+            "P571",
+            vec![
+                time_claim("+1900-01-01T00:00:00Z", WikidataPrecision::Year)?,
+                time_claim("+1905-01-01T00:00:00Z", WikidataPrecision::Year)?,
+            ],
+        )])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(
+            lifecycles[0].len(),
+            1,
+            "one construction, two parallel bounds"
+        );
+        let Contribution::Construction { started, .. } = &lifecycles[0][0] else {
+            return Err("expected Construction".into());
+        };
+        let years: Vec<i32> = started
+            .iter()
+            .filter_map(|d| d.bound.earliest().map(|e| e.year()))
+            .collect();
+        assert_eq!(years, vec![1900, 1905]);
         Ok(())
     }
 
@@ -1519,30 +1761,30 @@ mod tests {
     fn build_invalid_coordinates_warns() -> TestResult {
         let claims = claims_from(vec![("P625", vec![coordinate_claim(999.0, -999.0)])])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         // Should produce a warning about invalid coordinates
         assert!(
             warnings.iter().any(|w| w.contains("invalid coordinates")),
             "expected invalid coordinates warning, got: {warnings:?}"
         );
-        // No transitions since only the coordinate was provided (no P571)
+        // No contributions since only the coordinate was provided (no P571)
         assert!(lifecycles.is_empty() || lifecycles[0].is_empty());
         Ok(())
     }
 
-    /// Empty claims produce no transitions and no warnings
+    /// Empty claims produce no contributions and no warnings
     #[test]
     fn build_empty_claims() -> TestResult {
         let claims = BTreeMap::new();
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty());
         assert!(lifecycles.is_empty());
         Ok(())
     }
 
-    /// Unknown P793 event type is silently skipped
+    /// Unknown P793 event type contributes nothing but records a warning
     #[test]
-    fn build_p793_unknown_event_skipped() -> TestResult {
+    fn build_p793_unknown_event_skipped_with_warning() -> TestResult {
         let claims = claims_from(vec![(
             "P793",
             vec![p793_event(
@@ -1552,10 +1794,46 @@ mod tests {
             )?],
         )])?;
 
-        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx());
-        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        // Unknown event -> no transitions
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(
+            warnings.iter().any(|w| w.contains("Q99999999")),
+            "the unrecognized QID is named in a warning, got: {warnings:?}"
+        );
+        // Unknown event -> no contributions
         assert!(lifecycles.is_empty());
+        Ok(())
+    }
+
+    /// A construction's sort key is the earliest qualifier date, not the first
+    /// in source order — an out-of-order 1960-then-1900 pair sorts by 1900.
+    #[test]
+    fn construction_sort_key_is_earliest_qualifier_date_not_first() -> TestResult {
+        let mut qualifiers = BTreeMap::new();
+        qualifiers.insert(
+            property_id("P580")?,
+            vec![
+                Snak::Value(DataValue::Time(TimeValue {
+                    time: WikidataTimestamp::try_from("+1960-01-01T00:00:00Z".to_string())?,
+                    precision: WikidataPrecision::Year,
+                })),
+                Snak::Value(DataValue::Time(TimeValue {
+                    time: WikidataTimestamp::try_from("+1900-01-01T00:00:00Z".to_string())?,
+                    precision: WikidataPrecision::Year,
+                })),
+            ],
+        );
+        let claim = Claim {
+            mainsnak: Snak::Value(DataValue::WikibaseEntityId(EntityRefValue {
+                id: wikidata_id("Q385378")?, // construction
+            })),
+            qualifiers,
+            rank: Rank::Normal,
+        };
+
+        let (dated, warnings) = process_p793_claim(&claim, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let dated = dated.ok_or("construction should produce a contribution")?;
+        assert_eq!(dated.sort_key, ymd(1900, 1, 1));
         Ok(())
     }
 }

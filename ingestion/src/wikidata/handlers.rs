@@ -1,155 +1,111 @@
-//! Wikidata property handlers.
+//! Link-property extraction.
 //!
-//! Handlers for non-lifecycle Wikidata properties. Lifecycle properties
-//! (P571, P576, P625, P793, P1619, P3999, P729, P730) are handled by the
-//! `lifecycle` module.
+//! Extracts [`ExternalReference`]s from the non-lifecycle link properties
+//! (P856, P973, P402, P1584). Lifecycle properties (P571, P576, P625, P793,
+//! P1619, P3999, P729, P730) are handled by the `lifecycle` module.
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::collections::BTreeMap;
 
-use anyhow::Result;
-use chronoscope_core::{ExternalLink, LinkTarget, LinkType, OsmElementType, OsmId};
-use chronoscope_integrations::wikidata::Claim;
+use chronoscope_core::facts::citations::ExternalReference;
+use chronoscope_core::ids::{OsmElementType, OsmId, PleiadesPlaceId, WikidataPropertyId};
+use chronoscope_integrations::wikidata::{Claim, PropertyId};
 use url::Url;
 
-use crate::wikidata::{HandlerOutput, PropertyContext};
-
-// =============================================================================
-// CONSTANTS
-// =============================================================================
+use crate::wikidata::asserted_claims;
 
 const MAX_URL_LENGTH: usize = 2048;
 
-// =============================================================================
-// HANDLER TYPES
-// =============================================================================
+/// A link-property extraction: the typed reference plus the raw claim value
+/// its citation quotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkRef {
+    /// The property the reference was read from.
+    pub property_id: WikidataPropertyId,
+    pub reference: ExternalReference,
+    /// The claim value as observed, for the citation excerpt.
+    pub raw: String,
+}
 
-/// Handler for top-level Wikidata properties (P-codes).
+/// Extract external references from every link property present.
 ///
-/// Handlers are pure functions: they receive claims and immutable context,
-/// and return what they want to add. Issues are automatically tagged with
-/// the property by the caller.
-pub type PropertyHandler =
-    Box<dyn Fn(&[Claim], &PropertyContext) -> Result<HandlerOutput> + Send + Sync>;
+/// Returns the references alongside issue strings for claims the boundary
+/// rejected (malformed URLs, non-numeric ids).
+pub fn extract_link_references(
+    claims: &BTreeMap<PropertyId, Vec<Claim>>,
+) -> (Vec<LinkRef>, Vec<String>) {
+    let mut refs = Vec::new();
+    let mut issues = Vec::new();
 
-// =============================================================================
-// PROPERTY HANDLER REGISTRY
-// =============================================================================
-
-/// Property handlers for non-lifecycle properties.
-///
-/// Lifecycle properties (P571, P576, P625, P793, P1619, P3999, P729, P730)
-/// are handled separately by the `lifecycle::build_lifecycles` function.
-pub static PROPERTY_HANDLERS: LazyLock<HashMap<&'static str, PropertyHandler>> =
-    LazyLock::new(|| {
-        // Wrapper for infallible handlers
-        let h = |f: fn(&[Claim], &PropertyContext) -> HandlerOutput| -> PropertyHandler {
-            Box::new(move |claims, ctx| Ok(f(claims, ctx)))
+    let mut extract = |prop: &str, f: &dyn Fn(&str) -> Result<ExternalReference, String>| {
+        let Some(prop_claims) = claims.get(prop) else {
+            return;
         };
-        HashMap::from([
-            // Links
-            ("P856", url_link(LinkType::Related)), // official website
-            ("P973", url_link(LinkType::FurtherReading)), // described at URL
-            ("P402", h(handle_osm_relation)),      // OpenStreetMap relation ID
-            ("P1584", h(handle_pleiades)),         // Pleiades ID
-        ])
-    });
-
-// =============================================================================
-// PROPERTY HANDLER FACTORIES
-// =============================================================================
-
-fn url_link(link_type: LinkType) -> PropertyHandler {
-    Box::new(move |claims, _ctx| {
-        let mut out = HandlerOutput::new();
-        for claim in claims {
-            if let Some(url_str) = claim.mainsnak.string_value() {
-                if url_str.len() > MAX_URL_LENGTH {
-                    out.issue(format!("URL too long ({} chars)", url_str.len()));
-                    continue;
-                }
-                if !url_str.starts_with("http://") && !url_str.starts_with("https://") {
-                    out.issue(format!(
-                        "not an HTTP URL: {}",
-                        &url_str[..url_str.len().min(50)]
-                    ));
-                    continue;
-                }
-                match Url::parse(url_str) {
-                    Ok(url) => {
-                        out.add_link(ExternalLink {
-                            target: LinkTarget::Url { url },
-                            link_type,
-                        });
-                    }
-                    Err(e) => out.issue(format!("invalid URL: {e}")),
-                }
+        let Ok(property_id) = WikidataPropertyId::parse(prop) else {
+            return;
+        };
+        for claim in asserted_claims(prop_claims) {
+            let Some(value) = claim.mainsnak.string_value() else {
+                issues.push(format!("{prop}: claim has no string value"));
+                continue;
+            };
+            match f(value) {
+                Ok(reference) => refs.push(LinkRef {
+                    property_id,
+                    reference,
+                    raw: value.to_owned(),
+                }),
+                Err(issue) => issues.push(format!("{prop}: {issue}")),
             }
         }
-        Ok(out)
+    };
+
+    extract("P856", &url_reference); // official website
+    extract("P973", &url_reference); // described at URL
+    extract("P402", &osm_relation_reference); // OpenStreetMap relation ID
+    extract("P1584", &pleiades_reference); // Pleiades ID
+
+    (refs, issues)
+}
+
+fn url_reference(value: &str) -> Result<ExternalReference, String> {
+    if value.len() > MAX_URL_LENGTH {
+        return Err(format!("URL too long ({} chars)", value.len()));
+    }
+    if !value.starts_with("http://") && !value.starts_with("https://") {
+        let head: String = value.chars().take(50).collect();
+        return Err(format!("not an HTTP URL: {head}"));
+    }
+    let url = Url::parse(value).map_err(|e| format!("invalid URL: {e}"))?;
+    Ok(ExternalReference::from_url(&url))
+}
+
+fn osm_relation_reference(value: &str) -> Result<ExternalReference, String> {
+    let element_id: u64 = value
+        .parse()
+        .map_err(|e| format!("invalid OSM relation ID '{value}': {e}"))?;
+    Ok(ExternalReference::OpenStreetMap {
+        element_type: OsmElementType::Relation,
+        id: OsmId::new(element_id),
     })
 }
 
-// =============================================================================
-// CUSTOM HANDLERS
-// =============================================================================
-
-fn handle_osm_relation(claims: &[Claim], _ctx: &PropertyContext) -> HandlerOutput {
-    let mut out = HandlerOutput::new();
-    for claim in claims {
-        let Some(id_str) = claim.mainsnak.string_value() else {
-            out.issue("claim has no string value");
-            continue;
-        };
-        match id_str.parse::<u64>() {
-            Ok(element_id) => out.add_link(ExternalLink {
-                target: LinkTarget::OpenStreetMap {
-                    element_type: OsmElementType::Relation,
-                    element_id: OsmId::new(element_id),
-                },
-                link_type: LinkType::SameAs,
-            }),
-            Err(e) => out.issue(format!("invalid OSM relation ID '{id_str}': {e}")),
-        }
-    }
-    out
-}
-
-fn handle_pleiades(claims: &[Claim], _ctx: &PropertyContext) -> HandlerOutput {
-    let mut out = HandlerOutput::new();
-    for claim in claims {
-        match claim.mainsnak.string_value() {
-            Some(place_id) => {
-                out.add_link(ExternalLink {
-                    target: LinkTarget::Pleiades {
-                        place_id: place_id.to_string(),
-                    },
-                    link_type: LinkType::SameAs,
-                });
-            }
-            None => out.issue("claim has no string value"),
-        }
-    }
-    out
+fn pleiades_reference(value: &str) -> Result<ExternalReference, String> {
+    let place_id: u64 = value
+        .parse()
+        .map_err(|e| format!("invalid Pleiades place ID '{value}': {e}"))?;
+    Ok(ExternalReference::Pleiades {
+        place_id: PleiadesPlaceId::new(place_id),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chronoscope_core::{WikidataEntityId, WikidataPropertyId};
     use chronoscope_integrations::wikidata::{
-        DataValue, QuantityAmount, QuantityUnit, QuantityValue, Snak,
+        DataValue, QuantityAmount, QuantityUnit, QuantityValue, Rank, Snak,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
-
-    fn test_ctx() -> PropertyContext {
-        PropertyContext::with_property(
-            WikidataEntityId::new(12345),
-            100,
-            WikidataPropertyId::new(18),
-        )
-    }
 
     fn claim_with_string(value: &str) -> Claim {
         Claim::simple(Snak::Value(DataValue::String(value.to_string())))
@@ -162,180 +118,176 @@ mod tests {
         })))
     }
 
+    fn claims_for(
+        prop: &str,
+        claims: Vec<Claim>,
+    ) -> Result<BTreeMap<PropertyId, Vec<Claim>>, String> {
+        Ok(BTreeMap::from([(
+            PropertyId::try_from(prop.to_owned())?,
+            claims,
+        )]))
+    }
+
     // =========================================================================
-    // url_link handler (P856, P973)
+    // URL properties (P856, P973)
     // =========================================================================
 
     #[test]
-    fn url_link_handler_valid_url() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P856")
-            .ok_or("P856 handler not found")?;
-        let claims = vec![claim_with_string("https://example.com")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+    fn url_property_yields_reference_with_raw_value() -> TestResult {
+        let claims = claims_for("P856", vec![claim_with_string("https://example.com")])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert_eq!(output.links.len(), 1);
+        assert!(issues.is_empty());
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].property_id, WikidataPropertyId::new(856));
+        assert_eq!(refs[0].raw, "https://example.com");
         assert!(matches!(
-            &output.links[0].target,
-            LinkTarget::Url { url } if url.as_str() == "https://example.com/"
+            &refs[0].reference,
+            ExternalReference::UnmodeledUrl { url } if url.as_str() == "https://example.com/"
         ));
-        assert_eq!(output.links[0].link_type, LinkType::Related);
         Ok(())
     }
 
     #[test]
-    fn url_link_handler_further_reading() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P973")
-            .ok_or("P973 handler not found")?;
-        let claims = vec![claim_with_string("https://example.com/article")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+    fn described_at_url_dispatches_recognized_hosts() -> TestResult {
+        let claims = claims_for(
+            "P973",
+            vec![claim_with_string("https://en.wikipedia.org/wiki/Pantheon")],
+        )?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert_eq!(output.links.len(), 1);
-        assert_eq!(output.links[0].link_type, LinkType::FurtherReading);
+        assert!(issues.is_empty());
+        assert_eq!(refs.len(), 1);
+        assert!(matches!(
+            &refs[0].reference,
+            ExternalReference::Wikipedia { title, .. } if title == "Pantheon"
+        ));
         Ok(())
     }
 
     #[test]
-    fn url_link_handler_rejects_non_http() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P856")
-            .ok_or("P856 handler not found")?;
-        let claims = vec![claim_with_string("ftp://example.com/file")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+    fn url_property_rejects_non_http() -> TestResult {
+        let claims = claims_for("P856", vec![claim_with_string("ftp://example.com/file")])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert!(output.links.is_empty());
-        assert_eq!(output.issues.len(), 1);
-        assert!(output.issues[0].contains("not an HTTP URL"));
+        assert!(refs.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("not an HTTP URL"));
         Ok(())
     }
 
     #[test]
-    fn url_link_handler_rejects_too_long() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P856")
-            .ok_or("P856 handler not found")?;
+    fn url_property_rejects_too_long() -> TestResult {
         let long_url = format!("https://example.com/{}", "x".repeat(MAX_URL_LENGTH));
-        let claims = vec![claim_with_string(&long_url)];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+        let claims = claims_for("P856", vec![claim_with_string(&long_url)])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert!(output.links.is_empty());
-        assert_eq!(output.issues.len(), 1);
-        assert!(output.issues[0].contains("too long"));
+        assert!(refs.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("too long"));
         Ok(())
     }
 
     #[test]
-    fn url_link_handler_exactly_at_max_length() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P856")
-            .ok_or("P856 handler not found")?;
-        // URL exactly at MAX_URL_LENGTH should be accepted
+    fn url_property_accepts_exactly_max_length() -> TestResult {
         let padding = MAX_URL_LENGTH - "https://example.com/".len();
         let url = format!("https://example.com/{}", "x".repeat(padding));
         assert_eq!(url.len(), MAX_URL_LENGTH);
-        let claims = vec![claim_with_string(&url)];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+        let claims = claims_for("P856", vec![claim_with_string(&url)])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert_eq!(output.links.len(), 1);
-        assert!(output.issues.is_empty());
+        assert_eq!(refs.len(), 1);
+        assert!(issues.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn deprecated_link_claim_is_dropped() -> TestResult {
+        let mut deprecated = claim_with_string("https://old.example.com");
+        deprecated.rank = Rank::Deprecated;
+        let claims = claims_for(
+            "P856",
+            vec![deprecated, claim_with_string("https://example.com")],
+        )?;
+        let (refs, issues) = extract_link_references(&claims);
+
+        assert!(issues.is_empty());
+        assert_eq!(refs.len(), 1, "the deprecated claim contributes nothing");
+        assert_eq!(refs[0].raw, "https://example.com");
         Ok(())
     }
 
     // =========================================================================
-    // OSM handler (P402)
+    // OSM relations (P402)
     // =========================================================================
 
     #[test]
-    fn osm_handler_valid_id() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P402")
-            .ok_or("P402 handler not found")?;
-        let claims = vec![claim_with_string("12345")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+    fn osm_relation_id_yields_structured_reference() -> TestResult {
+        let claims = claims_for("P402", vec![claim_with_string("12345")])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert_eq!(output.links.len(), 1);
-        let LinkTarget::OpenStreetMap {
-            element_type,
-            element_id,
-        } = &output.links[0].target
-        else {
-            return Err("expected OpenStreetMap target".into());
-        };
-        assert_eq!(*element_type, OsmElementType::Relation);
-        assert_eq!(element_id.get(), 12345);
-        assert_eq!(output.links[0].link_type, LinkType::SameAs);
+        assert!(issues.is_empty());
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].reference,
+            ExternalReference::OpenStreetMap {
+                element_type: OsmElementType::Relation,
+                id: OsmId::new(12345),
+            }
+        );
+        assert_eq!(refs[0].raw, "12345");
         Ok(())
     }
 
     #[test]
-    fn osm_handler_invalid_id() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P402")
-            .ok_or("P402 handler not found")?;
-        let claims = vec![claim_with_string("not_a_number")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+    fn osm_relation_rejects_non_numeric_id() -> TestResult {
+        let claims = claims_for("P402", vec![claim_with_string("not_a_number")])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert!(output.links.is_empty());
-        assert_eq!(output.issues.len(), 1);
-        assert!(output.issues[0].contains("invalid OSM relation ID"));
+        assert!(refs.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("invalid OSM relation ID"));
         Ok(())
     }
 
     #[test]
-    fn osm_handler_non_string_value() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P402")
-            .ok_or("P402 handler not found")?;
-        let claims = vec![claim_non_string()];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+    fn osm_relation_rejects_non_string_value() -> TestResult {
+        let claims = claims_for("P402", vec![claim_non_string()])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert!(output.links.is_empty());
-        assert_eq!(output.issues.len(), 1);
+        assert!(refs.is_empty());
+        assert_eq!(issues.len(), 1);
         Ok(())
     }
 
     // =========================================================================
-    // Pleiades handler (P1584)
+    // Pleiades (P1584)
     // =========================================================================
 
     #[test]
-    fn pleiades_handler_valid_id() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P1584")
-            .ok_or("P1584 handler not found")?;
-        let claims = vec![claim_with_string("423025")];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+    fn pleiades_id_yields_structured_reference() -> TestResult {
+        let claims = claims_for("P1584", vec![claim_with_string("423025")])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert_eq!(output.links.len(), 1);
-        assert!(matches!(
-            &output.links[0].target,
-            LinkTarget::Pleiades { place_id } if place_id == "423025"
-        ));
-        assert_eq!(output.links[0].link_type, LinkType::SameAs);
+        assert!(issues.is_empty());
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].reference,
+            ExternalReference::Pleiades {
+                place_id: PleiadesPlaceId::new(423025),
+            }
+        );
         Ok(())
     }
 
     #[test]
-    fn pleiades_handler_non_string_value() -> TestResult {
-        let handler = PROPERTY_HANDLERS
-            .get("P1584")
-            .ok_or("P1584 handler not found")?;
-        let claims = vec![claim_non_string()];
-        let ctx = test_ctx();
-        let output = handler(&claims, &ctx)?;
+    fn pleiades_rejects_non_numeric_id() -> TestResult {
+        let claims = claims_for("P1584", vec![claim_with_string("not-numeric")])?;
+        let (refs, issues) = extract_link_references(&claims);
 
-        assert!(output.links.is_empty());
-        assert_eq!(output.issues.len(), 1);
+        assert!(refs.is_empty());
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].contains("invalid Pleiades place ID"));
         Ok(())
     }
 }

@@ -51,7 +51,7 @@ async fn ingest_curated() -> Result<Option<MemoryFactStore>, BoxError> {
         let entity: WikidataEntity =
             serde_json::from_str(line).map_err(|e| format!("line {i}: {e}"))?;
         let qid = entity.id.as_str().to_owned();
-        match build_commit(&entity, &run, recorded_at) {
+        match build_commit(&entity, &run, recorded_at, &mut Vec::new()) {
             Ok(None) => {}
             Ok(Some(commit)) => match commit_facts(&store, commit).await {
                 Ok(_) => committed += 1,
@@ -154,6 +154,30 @@ async fn bbox_listing_projects_landmarks_with_their_dates() -> Result<(), BoxErr
         "the Eiffel Tower projects an 1880s construction window, got {:?}..{:?}",
         eiffel.earliest,
         eiffel.latest
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn notre_dame_founding_survives_as_construction_start() -> Result<(), BoxError> {
+    let Some(store) = ingest_curated().await? else {
+        return Ok(());
+    };
+
+    // Notre-Dame de Paris (Q2981) carries a P571 founding of 1160 alongside a
+    // P793 construction (1163–1345) that already has a completion. The founding
+    // must survive as a competing construction start bound — the earlier
+    // "fill the empty completion" reading dropped it, pushing `earliest` to 1163.
+    let paris = placeable_in(&store, (48.84, 2.28), (48.87, 2.36)).await?;
+    let notre_dame = paris
+        .iter()
+        .find(|s| has_name(s, "Notre-Dame de Paris"))
+        .ok_or("Notre-Dame surfaces in a Paris viewport")?;
+    assert_eq!(
+        notre_dame.earliest.map(|d| d.year()),
+        Some(1160),
+        "the 1160 founding is the earliest date, ahead of the 1163 build start, got {:?}",
+        notre_dame.earliest
     );
     Ok(())
 }

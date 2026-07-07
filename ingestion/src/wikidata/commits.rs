@@ -1,44 +1,35 @@
 //! Fact-store commit construction from Wikidata entities.
 //!
-//! Reshapes the reusable Wikidata parsing layer (`parsing`, `handlers`,
-//! `lifecycle`, `usage`) into `submit::Commit`s: one commit per Wikidata item,
-//! declarations minted local, facts referencing them by bundle-local index.
-
-use std::collections::BTreeSet;
+//! Shapes the Wikidata extraction layer (`parsing`, `handlers`, `lifecycle`)
+//! into `submit::Commit`s: one commit per Wikidata item, declarations minted
+//! local, facts referencing them by bundle-local index.
 
 use chrono::{DateTime, Utc};
 
 use chronoscope_core::facts::assertions::{FactualAssertion, JudgmentAssertion};
-use chronoscope_core::facts::attribute::{self, EntityRelationType, NameText, NameType};
+use chronoscope_core::facts::attribute::{self, EntityRelationType};
 use chronoscope_core::facts::bookend;
 use chronoscope_core::facts::citations::{
-    CitationError, Excerpt, ExcerptError, ExternalReference, ExternalSource, FactualCitation,
-    JudgmentSource, Language, LanguageError, WikidataField,
+    Excerpt, ExcerptError, ExternalReference, ExternalSource, FactualCitation, JudgmentSource,
+    WikidataField,
 };
 use chronoscope_core::facts::depiction::{self, Perspective};
 use chronoscope_core::facts::event;
 use chronoscope_core::facts::ids::IngesterRunId;
 use chronoscope_core::facts::image::{self, ImageMedium};
-use chronoscope_core::facts::lifecycle::{
-    DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind, Usage,
-};
+use chronoscope_core::facts::lifecycle::DurationalRole;
 use chronoscope_core::facts::memory::{MemoryFactStore, MemoryIds};
 use chronoscope_core::facts::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact, commit_facts,
 };
-use chronoscope_core::{
-    Cited, DamageCause as OldDamageCause, EntityName, EntityTransition, Evidence,
-    MoveMethod as OldMoveMethod, NameType as OldNameType, UncertainDate, Usage as OldUsage,
-    WikidataEntityId, WikidataField as OldWikidataField, WikidataPropertyId,
-};
+use chronoscope_core::ids::{WikidataEntityId, WikidataPropertyId};
+use chronoscope_core::nonempty::NonEmptyVec;
 use chronoscope_integrations::wikidata::{CommonsFilename, WikidataEntity, url_for_filename};
 
-use crate::SourceIdx;
-use crate::wikidata::PropertyContext;
-use crate::wikidata::handlers::PROPERTY_HANDLERS;
-use crate::wikidata::lifecycle::build_lifecycles;
+use crate::wikidata::handlers::extract_link_references;
+use crate::wikidata::lifecycle::{CitedDate, Contribution, EventShape, build_lifecycles};
 use crate::wikidata::parsing::{extract_names, parse_sitelink};
-use crate::wikidata::usage;
+use crate::wikidata::{ItemContext, asserted_claims};
 
 /// A failure while turning a Wikidata entity into a commit.
 ///
@@ -46,65 +37,29 @@ use crate::wikidata::usage;
 /// malformed inputs the boundary rejects.
 #[derive(Debug)]
 pub enum BuildError {
-    /// A language tag failed BCP-47 canonicalization.
-    Language(LanguageError),
     /// A citation excerpt was empty or over-length.
     Excerpt(ExcerptError),
-    /// A factual citation had no excerpts.
-    Citation(CitationError),
     /// A `Replaces` relationship's endpoints collapsed to one entity.
     SelfRelationship,
-    /// An evidence variant the Wikidata parsing layer never emits reached the
-    /// citation mapper.
-    UnsupportedEvidence,
-    /// A cited value reached the citation mapper with no evidence — every value
-    /// the parsing layer emits is expected to carry a source.
-    MissingEvidence,
 }
 
 impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Language(e) => write!(f, "language tag: {e}"),
             Self::Excerpt(e) => write!(f, "citation excerpt: {e}"),
-            Self::Citation(e) => write!(f, "citation: {e}"),
             Self::SelfRelationship => {
                 write!(f, "replaces relationship collapsed to a self-loop")
             }
-            Self::UnsupportedEvidence => {
-                write!(f, "evidence source is not a Wikidata claim")
-            }
-            Self::MissingEvidence => write!(f, "cited value carried no evidence"),
         }
     }
 }
 
 impl std::error::Error for BuildError {}
 
-impl From<LanguageError> for BuildError {
-    fn from(e: LanguageError) -> Self {
-        Self::Language(e)
-    }
-}
-
 impl From<ExcerptError> for BuildError {
     fn from(e: ExcerptError) -> Self {
         Self::Excerpt(e)
     }
-}
-
-impl From<CitationError> for BuildError {
-    fn from(e: CitationError) -> Self {
-        Self::Citation(e)
-    }
-}
-
-/// Per-item context threaded through fact construction: the parsed id, its
-/// revision, and the fallback "came from this item" citation.
-struct Ctx {
-    entity_id: WikidataEntityId,
-    revision_id: u64,
-    item_citation: FactualCitation,
 }
 
 /// Turn one Wikidata entity into one fact-store commit.
@@ -116,47 +71,60 @@ struct Ctx {
 /// One item may split into several chronological entities (a demolish→rebuild
 /// pattern); every split, its events, its images, and the `Replaces` edges
 /// between adjacent splits go in the one commit, all declared `Local`.
+///
+/// Extraction skips (unparseable dates, uncitable names, unrecognized event
+/// QIDs) are collected into `warnings` for the ingest driver to surface; they
+/// don't fail the build.
 pub fn build_commit(
     entity: &WikidataEntity,
     run: &IngesterRunId,
     recorded_at: DateTime<Utc>,
+    warnings: &mut Vec<String>,
 ) -> Result<Option<Commit<MemoryIds>>, BuildError> {
     let Ok(entity_id) = WikidataEntityId::parse(entity.id.as_str()) else {
         return Ok(None);
     };
-    let revision_id = entity.lastrevid.0;
-    let item_citation = wikidata_citation(
-        entity_id,
-        revision_id,
-        WikidataField::Item,
-        entity_id.to_string(),
-    )?;
-    let ctx = Ctx {
-        entity_id,
-        revision_id,
-        item_citation,
-    };
+    let ctx = ItemContext::new(entity_id, entity.lastrevid.0)?;
 
-    let names = extract_names(entity, entity.id.as_str(), revision_id);
+    let names = extract_names(entity, &ctx, warnings);
+    let refs = collect_external_references(entity, &ctx, warnings)?;
 
-    // P793 is the significant-event context; the top-level date/location
-    // properties cite their own property per extraction.
-    let lifecycle_ctx =
-        PropertyContext::with_property(entity_id, revision_id, WikidataPropertyId::new(793));
-    let (mut splits, _warnings) = build_lifecycles(&entity.claims, &lifecycle_ctx);
+    let (mut splits, lifecycle_warnings) = build_lifecycles(&entity.claims, &ctx);
+    warnings.extend(lifecycle_warnings);
     if splits.is_empty() {
         splits.push(Vec::new());
     }
     let n_splits = splits.len();
     let latest = n_splits - 1;
 
-    let inferred = usage::infer(entity);
-    let refs = collect_external_references(entity, &ctx)?;
-
     let mut facts: Vec<SubmitFact> = Vec::new();
-    push_name_facts(&mut facts, &names, n_splits)?;
-    push_reference_facts(&mut facts, &refs, n_splits);
-    let event_count = push_lifecycle_facts(&mut facts, &splits, &inferred, &ctx)?;
+    for name in &names {
+        for k in 0..n_splits {
+            facts.push(attribute_fact(
+                attribute::Fact::Name {
+                    entity: EntityIdx(k),
+                    name: name.name.clone(),
+                    language: name.language.clone(),
+                    name_type: name.name_type,
+                    valid_from: None,
+                    valid_to: None,
+                },
+                name.citation.clone(),
+            ));
+        }
+    }
+    for (reference, citation) in &refs {
+        for k in 0..n_splits {
+            facts.push(attribute_fact(
+                attribute::Fact::ExternalReference {
+                    entity: EntityIdx(k),
+                    reference: reference.clone(),
+                },
+                citation.clone(),
+            ));
+        }
+    }
+    let event_count = push_lifecycle_facts(&mut facts, &splits);
     let image_count = push_image_facts(&mut facts, entity, latest, &ctx)?;
     push_replaces_facts(&mut facts, &splits, &ctx)?;
 
@@ -171,119 +139,57 @@ pub fn build_commit(
 }
 
 // ============================================================================
-// Names — on every split
-// ============================================================================
-
-fn push_name_facts(
-    facts: &mut Vec<SubmitFact>,
-    names: &[Cited<EntityName, SourceIdx>],
-    n_splits: usize,
-) -> Result<(), BuildError> {
-    for cited in names {
-        let citation = citation_of(cited)?;
-        let language = Language::new(cited.value.language.as_str())?;
-        let name_type = map_name_type(cited.value.name_type);
-        for k in 0..n_splits {
-            facts.push(attribute_fact(
-                attribute::Fact::Name {
-                    entity: EntityIdx(k),
-                    name: NameText::new(&cited.value.name),
-                    language: language.clone(),
-                    name_type,
-                    valid_from: None,
-                    valid_to: None,
-                },
-                citation.clone(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-// ============================================================================
 // External references — on every split
 // ============================================================================
 
 /// Every external reference the item carries: its own QID, its sitelinks, and
-/// its handler-produced links (OSM, Pleiades, URLs). Each is paired with the
+/// its link-property references (OSM, Pleiades, URLs). Each is paired with the
 /// citation naming where it was read from. Emitted on every split — a lookup by
 /// external ref returns the whole demolish→rebuild set, not one split.
 fn collect_external_references(
     entity: &WikidataEntity,
-    ctx: &Ctx,
+    ctx: &ItemContext,
+    warnings: &mut Vec<String>,
 ) -> Result<Vec<(ExternalReference, FactualCitation)>, BuildError> {
     let mut refs = Vec::new();
 
     refs.push((
-        ExternalReference::Wikidata { qid: ctx.entity_id },
-        ctx.item_citation.clone(),
+        ExternalReference::Wikidata {
+            qid: ctx.entity_id(),
+        },
+        ctx.item_citation(),
     ));
 
     for (site, sitelink) in &entity.sitelinks {
-        if let Some(link) = parse_sitelink(site.as_str(), sitelink.title.as_str()) {
-            let url = link.to_url();
-            refs.push((
-                ExternalReference::from_url(&url),
-                wikidata_citation(
-                    ctx.entity_id,
-                    ctx.revision_id,
+        let title = sitelink.title.as_str();
+        match parse_sitelink(site.as_str(), title) {
+            Some(reference) => {
+                let citation = ctx.citation(
                     WikidataField::Sitelink {
                         site: site.as_str().to_owned(),
                     },
-                    url.to_string(),
-                )?,
-            ));
+                    sitelink.title.clone(),
+                )?;
+                refs.push((reference, citation));
+            }
+            // An empty title is malformed and worth a diagnostic; a non-empty
+            // title on an unsupported project (wikiquote, wikisource) is
+            // filtered by design and stays silent.
+            None if title.is_empty() => {
+                warnings.push(format!("sitelink {site}: empty title"));
+            }
+            None => {}
         }
     }
 
-    for (property, claims) in &entity.claims {
-        let prop = property.as_str();
-        if image_medium_perspective(prop).is_some() {
-            continue;
-        }
-        let Some(handler) = PROPERTY_HANDLERS.get(prop) else {
-            continue;
-        };
-        let Ok(property_id) = WikidataPropertyId::parse(prop) else {
-            continue;
-        };
-        let pctx = PropertyContext::with_property(ctx.entity_id, ctx.revision_id, property_id);
-        let Ok(output) = handler(claims.as_slice(), &pctx) else {
-            continue;
-        };
-        for link in &output.links {
-            let url = link.to_url();
-            refs.push((
-                ExternalReference::from_url(&url),
-                wikidata_citation(
-                    ctx.entity_id,
-                    ctx.revision_id,
-                    WikidataField::Statement { property_id },
-                    url.to_string(),
-                )?,
-            ));
-        }
+    let (links, issues) = extract_link_references(&entity.claims);
+    warnings.extend(issues);
+    for link in links {
+        let citation = ctx.statement_citation(link.property_id, link.raw)?;
+        refs.push((link.reference, citation));
     }
 
     Ok(refs)
-}
-
-fn push_reference_facts(
-    facts: &mut Vec<SubmitFact>,
-    refs: &[(ExternalReference, FactualCitation)],
-    n_splits: usize,
-) {
-    for (reference, citation) in refs {
-        for k in 0..n_splits {
-            facts.push(attribute_fact(
-                attribute::Fact::ExternalReference {
-                    entity: EntityIdx(k),
-                    reference: reference.clone(),
-                },
-                citation.clone(),
-            ));
-        }
-    }
 }
 
 // ============================================================================
@@ -291,278 +197,129 @@ fn push_reference_facts(
 // ============================================================================
 
 /// Emit each split's bookend and interior-event facts, minting one `EventIdx`
-/// per interior transition. Returns the total interior-event count so the caller
+/// per interior event. Returns the total interior-event count so the caller
 /// sizes the event declaration list.
-fn push_lifecycle_facts(
-    facts: &mut Vec<SubmitFact>,
-    splits: &[Vec<EntityTransition<SourceIdx>>],
-    inferred: &BTreeSet<OldUsage>,
-    ctx: &Ctx,
-) -> Result<usize, BuildError> {
+fn push_lifecycle_facts(facts: &mut Vec<SubmitFact>, splits: &[Vec<Contribution>]) -> usize {
     let mut event_count = 0usize;
-    for (k, transitions) in splits.iter().enumerate() {
+    for (k, contributions) in splits.iter().enumerate() {
         let entity = EntityIdx(k);
-        for transition in transitions {
-            match transition {
-                EntityTransition::Constructed {
-                    started_at,
-                    completed_at,
+        for contribution in contributions {
+            match contribution {
+                Contribution::Construction {
+                    started,
+                    completed,
                     location,
-                    ..
                 } => {
-                    push_bookend_dates(facts, entity, started_at, completed_at, false)?;
-                    if let Some(c) = location {
+                    for d in started {
+                        facts.push(construction_fact(
+                            bookend::ConstructionFact::Started {
+                                entity,
+                                bound: d.bound.clone(),
+                            },
+                            d.citation.clone(),
+                        ));
+                    }
+                    for d in completed {
+                        facts.push(construction_fact(
+                            bookend::ConstructionFact::Completed {
+                                entity,
+                                bound: d.bound.clone(),
+                            },
+                            d.citation.clone(),
+                        ));
+                    }
+                    for l in location {
                         facts.push(construction_fact(
                             bookend::ConstructionFact::Location {
                                 entity,
-                                location: c.value.clone(),
+                                location: l.location.clone(),
                             },
-                            citation_of(c)?,
+                            l.citation.clone(),
                         ));
                     }
                 }
-                EntityTransition::Demolished {
-                    started_at,
-                    completed_at,
-                    ..
-                } => {
-                    push_bookend_dates(facts, entity, started_at, completed_at, true)?;
+                Contribution::Demolition { started, completed } => {
+                    for d in started {
+                        facts.push(demolition_fact(
+                            bookend::DemolitionFact::Started {
+                                entity,
+                                bound: d.bound.clone(),
+                            },
+                            d.citation.clone(),
+                        ));
+                    }
+                    for d in completed {
+                        facts.push(demolition_fact(
+                            bookend::DemolitionFact::Completed {
+                                entity,
+                                bound: d.bound.clone(),
+                            },
+                            d.citation.clone(),
+                        ));
+                    }
                 }
-                EntityTransition::Modified {
-                    started_at,
-                    completed_at,
-                    ..
-                } => {
+                Contribution::Event(interior) => {
                     let event = EventIdx(event_count);
                     event_count += 1;
                     facts.push(event_fact(
                         event::Fact::HasEvent {
                             entity,
                             event,
-                            kind: durational(DurationalKind::Modified),
+                            kind: interior.shape.kind(),
                         },
-                        event_citation(transition, ctx)?,
+                        interior.citation.clone(),
                     ));
-                    push_durational_dates(facts, event, started_at, completed_at)?;
-                }
-                EntityTransition::Repaired {
-                    started_at,
-                    completed_at,
-                    ..
-                } => {
-                    let event = EventIdx(event_count);
-                    event_count += 1;
-                    facts.push(event_fact(
-                        event::Fact::HasEvent {
-                            entity,
-                            event,
-                            kind: durational(DurationalKind::Repaired),
-                        },
-                        event_citation(transition, ctx)?,
-                    ));
-                    push_durational_dates(facts, event, started_at, completed_at)?;
-                }
-                EntityTransition::Damaged {
-                    occurred_at, cause, ..
-                } => {
-                    let event = EventIdx(event_count);
-                    event_count += 1;
-                    let cite = event_citation(transition, ctx)?;
-                    facts.push(event_fact(
-                        event::Fact::HasEvent {
-                            entity,
-                            event,
-                            kind: durational(DurationalKind::Damaged),
-                        },
-                        cite.clone(),
-                    ));
-                    push_durational_dates(facts, event, occurred_at, &None)?;
-                    if let Some(cause) = cause {
-                        facts.push(event_fact(
-                            event::Fact::DamageCause {
+                    match &interior.shape {
+                        EventShape::Durational {
+                            started, completed, ..
+                        } => {
+                            push_durational_dates(facts, event, started, DurationalRole::Started);
+                            push_durational_dates(
+                                facts,
                                 event,
-                                cause: map_damage_cause(cause),
-                            },
-                            cite,
-                        ));
+                                completed,
+                                DurationalRole::Completed,
+                            );
+                        }
+                        EventShape::Point { at, .. } => {
+                            for d in at {
+                                facts.push(event_fact(
+                                    event::Fact::PointDate {
+                                        event,
+                                        bound: d.bound.clone(),
+                                    },
+                                    d.citation.clone(),
+                                ));
+                            }
+                        }
                     }
-                }
-                EntityTransition::Moved {
-                    occurred_at,
-                    location,
-                    method,
-                    ..
-                } => {
-                    let event = EventIdx(event_count);
-                    event_count += 1;
-                    let cite = event_citation(transition, ctx)?;
-                    facts.push(event_fact(
-                        event::Fact::HasEvent {
-                            entity,
-                            event,
-                            kind: durational(DurationalKind::Moved),
-                        },
-                        cite.clone(),
-                    ));
-                    push_durational_dates(facts, event, occurred_at, &None)?;
-                    if let Some(loc) = location {
-                        facts.push(event_fact(
-                            event::Fact::MovedToLocation {
-                                event,
-                                location: loc.value.clone(),
-                            },
-                            citation_of(loc)?,
-                        ));
+                    if let Some(payload) = &interior.payload {
+                        facts.push(event_fact(payload.fact(event), interior.citation.clone()));
                     }
-                    if let Some(method) = method {
-                        facts.push(event_fact(
-                            event::Fact::MoveMethod {
-                                event,
-                                method: map_move_method(method),
-                            },
-                            cite,
-                        ));
-                    }
-                }
-                EntityTransition::UsageModified {
-                    occurred_at,
-                    new_usages,
-                    ..
-                } => {
-                    let event = EventIdx(event_count);
-                    event_count += 1;
-                    let cite = event_citation(transition, ctx)?;
-                    facts.push(event_fact(
-                        event::Fact::HasEvent {
-                            entity,
-                            event,
-                            kind: point(PointKind::UsageChanged),
-                        },
-                        cite.clone(),
-                    ));
-                    if let Some(c) = occurred_at {
-                        facts.push(event_fact(
-                            event::Fact::PointDate {
-                                event,
-                                bound: c.value.clone(),
-                            },
-                            citation_of(c)?,
-                        ));
-                    }
-                    facts.push(event_fact(
-                        event::Fact::UsageChange {
-                            event,
-                            new_usages: resolve_usages(new_usages, inferred),
-                        },
-                        cite,
-                    ));
-                }
-                EntityTransition::Designated {
-                    occurred_at,
-                    designation,
-                    ..
-                } => {
-                    let event = EventIdx(event_count);
-                    event_count += 1;
-                    let cite = event_citation(transition, ctx)?;
-                    facts.push(event_fact(
-                        event::Fact::HasEvent {
-                            entity,
-                            event,
-                            kind: point(PointKind::Designated),
-                        },
-                        cite.clone(),
-                    ));
-                    if let Some(c) = occurred_at {
-                        facts.push(event_fact(
-                            event::Fact::PointDate {
-                                event,
-                                bound: c.value.clone(),
-                            },
-                            citation_of(c)?,
-                        ));
-                    }
-                    facts.push(event_fact(
-                        event::Fact::Designation {
-                            event,
-                            designation: designation.clone(),
-                        },
-                        cite,
-                    ));
                 }
             }
         }
     }
-    Ok(event_count)
+    event_count
 }
 
-/// A bookend's start/completion date facts. `demolition` picks the outer variant
-/// (`Demolition` never carries a location, so only its dates route here).
-fn push_bookend_dates(
-    facts: &mut Vec<SubmitFact>,
-    entity: EntityIdx,
-    started_at: &Option<Cited<UncertainDate, SourceIdx>>,
-    completed_at: &Option<Cited<UncertainDate, SourceIdx>>,
-    demolition: bool,
-) -> Result<(), BuildError> {
-    if let Some(c) = started_at {
-        let bound = c.value.clone();
-        let citation = citation_of(c)?;
-        facts.push(if demolition {
-            demolition_fact(bookend::DemolitionFact::Started { entity, bound }, citation)
-        } else {
-            construction_fact(
-                bookend::ConstructionFact::Started { entity, bound },
-                citation,
-            )
-        });
-    }
-    if let Some(c) = completed_at {
-        let bound = c.value.clone();
-        let citation = citation_of(c)?;
-        facts.push(if demolition {
-            demolition_fact(
-                bookend::DemolitionFact::Completed { entity, bound },
-                citation,
-            )
-        } else {
-            construction_fact(
-                bookend::ConstructionFact::Completed { entity, bound },
-                citation,
-            )
-        });
-    }
-    Ok(())
-}
-
-/// A durational event's start/completion `DurationalDate` facts.
+/// A durational event's date facts for one role, one per parallel bound.
 fn push_durational_dates(
     facts: &mut Vec<SubmitFact>,
     event: EventIdx,
-    started_at: &Option<Cited<UncertainDate, SourceIdx>>,
-    completed_at: &Option<Cited<UncertainDate, SourceIdx>>,
-) -> Result<(), BuildError> {
-    if let Some(c) = started_at {
+    bounds: &[CitedDate],
+    role: DurationalRole,
+) {
+    for d in bounds {
         facts.push(event_fact(
             event::Fact::DurationalDate {
                 event,
-                role: DurationalRole::Started,
-                bound: c.value.clone(),
+                role,
+                bound: d.bound.clone(),
             },
-            citation_of(c)?,
+            d.citation.clone(),
         ));
     }
-    if let Some(c) = completed_at {
-        facts.push(event_fact(
-            event::Fact::DurationalDate {
-                event,
-                role: DurationalRole::Completed,
-                bound: c.value.clone(),
-            },
-            citation_of(c)?,
-        ));
-    }
-    Ok(())
 }
 
 // ============================================================================
@@ -576,7 +333,7 @@ fn push_image_facts(
     facts: &mut Vec<SubmitFact>,
     entity: &WikidataEntity,
     latest: usize,
-    ctx: &Ctx,
+    ctx: &ItemContext,
 ) -> Result<usize, BuildError> {
     let mut image_count = 0usize;
     for (property, claims) in &entity.claims {
@@ -586,10 +343,7 @@ fn push_image_facts(
         let Ok(property_id) = WikidataPropertyId::parse(property.as_str()) else {
             continue;
         };
-        for claim in claims {
-            if claim.mainsnak.is_special() {
-                continue;
-            }
+        for claim in asserted_claims(claims) {
             let Some(filename) = claim.mainsnak.string_value() else {
                 continue;
             };
@@ -597,12 +351,7 @@ fn push_image_facts(
             let image = ImageIdx(image_count);
             image_count += 1;
 
-            let citation = wikidata_citation(
-                ctx.entity_id,
-                ctx.revision_id,
-                WikidataField::Statement { property_id },
-                filename.to_owned(),
-            )?;
+            let citation = ctx.statement_citation(property_id, filename)?;
             facts.push(image_fact(
                 image::Fact::Source { image, url },
                 citation.clone(),
@@ -620,9 +369,9 @@ fn push_image_facts(
                 },
                 citation: JudgmentSource::External {
                     source: ExternalSource::Wikidata {
-                        entity_id: ctx.entity_id,
+                        entity_id: ctx.entity_id(),
                         field: WikidataField::Statement { property_id },
-                        revision_id: ctx.revision_id,
+                        revision_id: ctx.revision_id(),
                         value: filename.to_owned(),
                     },
                 },
@@ -653,8 +402,8 @@ fn image_medium_perspective(property: &str) -> Option<(ImageMedium, Option<Persp
 /// values.
 fn push_replaces_facts(
     facts: &mut Vec<SubmitFact>,
-    splits: &[Vec<EntityTransition<SourceIdx>>],
-    ctx: &Ctx,
+    splits: &[Vec<Contribution>],
+    ctx: &ItemContext,
 ) -> Result<(), BuildError> {
     for k in 0..splits.len().saturating_sub(1) {
         let older = EntityIdx(k);
@@ -669,20 +418,18 @@ fn push_replaces_facts(
         if let Some(v) = bookend_raw_value(&splits[k + 1], BookendPhase::Construction) {
             excerpts.push(Excerpt::new(v)?);
         }
-        if excerpts.is_empty() {
-            excerpts.push(Excerpt::new("demolish→rebuild")?);
-        }
+        let excerpts = match NonEmptyVec::try_from_vec(excerpts) {
+            Ok(excerpts) => excerpts,
+            Err(_) => NonEmptyVec::singleton(Excerpt::new("demolish→rebuild")?),
+        };
 
         let source = ExternalSource::Wikidata {
-            entity_id: ctx.entity_id,
+            entity_id: ctx.entity_id(),
             field: WikidataField::Item,
-            revision_id: ctx.revision_id,
+            revision_id: ctx.revision_id(),
             value: "demolish→rebuild".to_owned(),
         };
-        facts.push(attribute_fact(
-            fact,
-            FactualCitation::new(source, excerpts)?,
-        ));
+        facts.push(attribute_fact(fact, FactualCitation { source, excerpts }));
     }
     Ok(())
 }
@@ -695,140 +442,31 @@ enum BookendPhase {
 }
 
 /// The raw observed value behind a split's `phase` bookend — its completion
-/// date, else its start.
-fn bookend_raw_value(split: &[EntityTransition<SourceIdx>], phase: BookendPhase) -> Option<String> {
-    for t in split {
-        match (phase, t) {
+/// date's citation excerpt, else its start's.
+fn bookend_raw_value(split: &[Contribution], phase: BookendPhase) -> Option<String> {
+    for contribution in split {
+        let (started, completed) = match (phase, contribution) {
             (
                 BookendPhase::Construction,
-                EntityTransition::Constructed {
-                    started_at,
-                    completed_at,
-                    ..
+                Contribution::Construction {
+                    started, completed, ..
                 },
             )
-            | (
-                BookendPhase::Demolition,
-                EntityTransition::Demolished {
-                    started_at,
-                    completed_at,
-                    ..
-                },
-            ) => return raw_value(completed_at.as_ref().or(started_at.as_ref())),
-            _ => {}
-        }
+            | (BookendPhase::Demolition, Contribution::Demolition { started, completed }) => {
+                (started, completed)
+            }
+            _ => continue,
+        };
+        return completed
+            .first()
+            .or(started.first())
+            .map(|d| d.citation.excerpts.first().as_str().to_owned());
     }
     None
 }
 
 // ============================================================================
-// Citation mapping (old Evidence -> new FactualCitation)
-// ============================================================================
-
-/// The citation backing a cited value, from its first evidence. Every value the
-/// Wikidata parsing layer emits is cited, so an empty evidence list is a boundary
-/// violation, not a fallback case.
-fn citation_of<T>(cited: &Cited<T, SourceIdx>) -> Result<FactualCitation, BuildError> {
-    let evidence = cited.evidence.first().ok_or(BuildError::MissingEvidence)?;
-    factual_citation(evidence)
-}
-
-/// The citation for an interior event: its primary date's evidence, or the item
-/// citation when the transition carries no date.
-fn event_citation(
-    transition: &EntityTransition<SourceIdx>,
-    ctx: &Ctx,
-) -> Result<FactualCitation, BuildError> {
-    let (start, end) = transition.date_range();
-    match start.or(end) {
-        Some(cited) => citation_of(cited),
-        // The sole item-wide fallback: a dateless interior event carries no
-        // per-fact evidence, so the item citation is its most precise source.
-        None => Ok(ctx.item_citation.clone()),
-    }
-}
-
-/// Map one old-grammar [`Evidence`] to a [`FactualCitation`]. The Wikidata
-/// parsing layer only ever emits `Wikidata` evidence; `Web` maps to a URL
-/// source, and the two in-system variants are rejected rather than faked.
-fn factual_citation(evidence: &Evidence<SourceIdx>) -> Result<FactualCitation, BuildError> {
-    match evidence {
-        Evidence::Wikidata {
-            entity_id,
-            revision_id,
-            field,
-            observed_value,
-        } => wikidata_citation(
-            *entity_id,
-            *revision_id,
-            map_wikidata_field(field)?,
-            observed_value.clone(),
-        ),
-        Evidence::Web {
-            source_url,
-            excerpt,
-        } => {
-            let text = excerpt
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| source_url.to_string());
-            let source = ExternalSource::Url {
-                url: source_url.clone(),
-                published: None,
-            };
-            Ok(FactualCitation::new(source, vec![Excerpt::new(text)?])?)
-        }
-        Evidence::Source { .. } | Evidence::Dbpedia { .. } => Err(BuildError::UnsupportedEvidence),
-    }
-}
-
-/// A Wikidata-sourced factual citation with the observed value as its excerpt.
-fn wikidata_citation(
-    entity_id: WikidataEntityId,
-    revision_id: u64,
-    field: WikidataField,
-    value: String,
-) -> Result<FactualCitation, BuildError> {
-    let excerpt = Excerpt::new(value.clone())?;
-    let source = ExternalSource::Wikidata {
-        entity_id,
-        field,
-        revision_id,
-        value,
-    };
-    Ok(FactualCitation::new(source, vec![excerpt])?)
-}
-
-fn map_wikidata_field(field: &OldWikidataField) -> Result<WikidataField, BuildError> {
-    match field {
-        OldWikidataField::Statement { property_id } => Ok(WikidataField::Statement {
-            property_id: *property_id,
-        }),
-        OldWikidataField::Label { language } => Ok(WikidataField::Label {
-            language: Language::new(language.as_str())?,
-        }),
-    }
-}
-
-/// The raw observed value behind a date's first evidence, for the `Replaces`
-/// excerpt.
-fn raw_value(cited: Option<&Cited<UncertainDate, SourceIdx>>) -> Option<String> {
-    cited?.evidence.first().and_then(evidence_raw_value)
-}
-
-fn evidence_raw_value(ev: &Evidence<SourceIdx>) -> Option<String> {
-    match ev {
-        Evidence::Wikidata { observed_value, .. } => Some(observed_value.clone()),
-        Evidence::Web {
-            excerpt,
-            source_url,
-        } => excerpt.clone().or_else(|| Some(source_url.to_string())),
-        Evidence::Dbpedia { .. } | Evidence::Source { .. } => None,
-    }
-}
-
-// ============================================================================
-// SubmitFact constructors + enum mappings
+// SubmitFact constructors
 // ============================================================================
 
 fn attribute_fact(fact: attribute::Fact<EntityIdx>, citation: FactualCitation) -> SubmitFact {
@@ -872,82 +510,6 @@ fn image_fact(fact: image::Fact<ImageIdx>, citation: FactualCitation) -> SubmitF
     }
 }
 
-fn durational(kind: DurationalKind) -> LifetimeEventKind {
-    LifetimeEventKind::Durational { kind }
-}
-
-fn point(kind: PointKind) -> LifetimeEventKind {
-    LifetimeEventKind::Point { kind }
-}
-
-fn map_name_type(old: OldNameType) -> NameType {
-    match old {
-        OldNameType::Official => NameType::Official,
-        OldNameType::Common => NameType::Common,
-        OldNameType::Historical => NameType::Historical,
-    }
-}
-
-fn map_damage_cause(old: &OldDamageCause) -> DamageCause {
-    match old {
-        OldDamageCause::Earthquake => DamageCause::Earthquake,
-        OldDamageCause::Fire => DamageCause::Fire,
-        OldDamageCause::Flood => DamageCause::Flood,
-        OldDamageCause::Neglect => DamageCause::Neglect,
-        OldDamageCause::Structural => DamageCause::Structural,
-        OldDamageCause::Vandalism => DamageCause::Vandalism,
-        OldDamageCause::War => DamageCause::War,
-        OldDamageCause::Weather => DamageCause::Weather,
-        OldDamageCause::Other { description } => DamageCause::Other {
-            description: description.clone(),
-        },
-    }
-}
-
-fn map_move_method(old: &OldMoveMethod) -> MoveMethod {
-    match old {
-        OldMoveMethod::Disassembled => MoveMethod::Disassembled,
-        OldMoveMethod::Whole => MoveMethod::Whole,
-    }
-}
-
-fn map_usage(old: &OldUsage) -> Usage {
-    match old {
-        OldUsage::Unknown => Usage::Unknown,
-        OldUsage::Agricultural => Usage::Agricultural,
-        OldUsage::Commercial => Usage::Commercial,
-        OldUsage::Cultural => Usage::Cultural,
-        OldUsage::Educational => Usage::Educational,
-        OldUsage::Healthcare => Usage::Healthcare,
-        OldUsage::Industrial => Usage::Industrial,
-        OldUsage::Infrastructure => Usage::Infrastructure,
-        OldUsage::Institutional => Usage::Institutional,
-        OldUsage::Military => Usage::Military,
-        OldUsage::Recreational => Usage::Recreational,
-        OldUsage::Religious => Usage::Religious,
-        OldUsage::Residential => Usage::Residential,
-        OldUsage::Transportation => Usage::Transportation,
-        OldUsage::Other { description } => Usage::Other {
-            description: description.clone(),
-        },
-    }
-}
-
-/// The post-event usage set, applying the ingester's back-fill: a placeholder
-/// `{Unknown}` (opening/service events carry no explicit use) is replaced by the
-/// usage inferred from P366/P31.
-fn resolve_usages(
-    new_usages: &BTreeSet<OldUsage>,
-    inferred: &BTreeSet<OldUsage>,
-) -> BTreeSet<Usage> {
-    let source = if new_usages.len() == 1 && new_usages.contains(&OldUsage::Unknown) {
-        inferred
-    } else {
-        new_usages
-    };
-    source.iter().map(map_usage).collect()
-}
-
 // ============================================================================
 // Submit driver
 // ============================================================================
@@ -963,6 +525,9 @@ pub struct IngestStats {
     pub facts: usize,
     /// Entities skipped because their id wasn't a `Q`-item.
     pub skipped: usize,
+    /// Extraction warnings across those commits — uncitable names, unparseable
+    /// dates, unrecognized event QIDs, and other per-claim skips.
+    pub issues: usize,
 }
 
 /// A failure during an ingest pass.
@@ -1001,8 +566,13 @@ pub async fn ingest_entities(
 ) -> Result<IngestStats, IngestError> {
     let mut stats = IngestStats::default();
     for entity in entities {
-        match build_commit(&entity, run, recorded_at)? {
+        let mut warnings = Vec::new();
+        match build_commit(&entity, run, recorded_at, &mut warnings)? {
             Some(commit) => {
+                for warning in &warnings {
+                    tracing::warn!(qid = entity.id.as_str(), "ingestion: {warning}");
+                }
+                stats.issues += warnings.len();
                 stats.entities += commit.entities.len();
                 stats.facts += commit.facts.len();
                 commit_facts(store, commit)
@@ -1020,11 +590,13 @@ pub async fn ingest_entities(
 mod tests {
     use super::*;
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroUsize;
 
     use chrono::{Datelike, TimeZone};
 
+    use chronoscope_core::facts::attribute::NameType;
+    use chronoscope_core::facts::lifecycle::{DurationalKind, LifetimeEventKind, PointKind};
     use chronoscope_core::facts::listing::summaries_in_bbox;
     use chronoscope_core::facts::memory::MemoryEntityId;
     use chronoscope_core::facts::projection::{member_lineage, project_entity};
@@ -1033,8 +605,8 @@ mod tests {
     use chronoscope_core::geo::{Bbox, GeoPoint};
     use chronoscope_integrations::wikidata::{
         Claim, CoordinateValue, DataValue, EntityRefValue, Label, LanguageCode, PropertyId, Rank,
-        RevisionId, Snak, TimeValue, WikidataEntityType, WikidataId, WikidataPrecision,
-        WikidataTimestamp,
+        RevisionId, SiteId, Sitelink, Snak, TimeValue, WikidataEntityType, WikidataId,
+        WikidataPrecision, WikidataTimestamp,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1101,6 +673,21 @@ mod tests {
         )
     }
 
+    fn item(
+        qid: &str,
+        labels: BTreeMap<LanguageCode, Label>,
+        claims: BTreeMap<PropertyId, Vec<Claim>>,
+    ) -> Result<WikidataEntity, Box<dyn std::error::Error>> {
+        Ok(WikidataEntity {
+            id: WikidataId::try_from(qid.to_owned())?,
+            entity_type: WikidataEntityType::Item,
+            lastrevid: RevisionId(100),
+            labels,
+            claims,
+            sitelinks: BTreeMap::new(),
+        })
+    }
+
     /// A realistic item: two labels, a P571 inception, P625 coordinates, a P18
     /// image, and one P793 fire (an interior `Damaged` event).
     fn pantheon() -> Result<WikidataEntity, Box<dyn std::error::Error>> {
@@ -1130,14 +717,7 @@ mod tests {
                 )?],
             ),
         ]);
-        Ok(WikidataEntity {
-            id: WikidataId::try_from("Q1234".to_owned())?,
-            entity_type: WikidataEntityType::Item,
-            lastrevid: RevisionId(100),
-            labels,
-            claims,
-            sitelinks: BTreeMap::new(),
-        })
+        item("Q1234", labels, claims)
     }
 
     fn run_id() -> IngesterRunId {
@@ -1146,7 +726,7 @@ mod tests {
 
     #[test]
     fn build_commit_emits_names_qid_bookend_event_and_image() -> TestResult {
-        let commit = build_commit(&pantheon()?, &run_id(), fixed_time()?)?
+        let commit = build_commit(&pantheon()?, &run_id(), fixed_time()?, &mut Vec::new())?
             .ok_or("a Q-item builds a commit")?;
 
         assert_eq!(commit.entities.len(), 1, "no demolish→rebuild, one entity");
@@ -1163,13 +743,17 @@ mod tests {
                                     entity,
                                     name,
                                     language,
+                                    name_type,
                                     ..
                                 },
                         },
                     ..
                 } = f
                 {
-                    *entity == EntityIdx(0) && name.as_str() == text && language.as_str() == lang
+                    *entity == EntityIdx(0)
+                        && name.as_str() == text
+                        && language.as_str() == lang
+                        && *name_type == NameType::Common
                 } else {
                     false
                 }
@@ -1207,12 +791,12 @@ mod tests {
                 f,
                 SubmitFact::Factual {
                     assertion: FactualAssertion::Construction {
-                        fact: bookend::ConstructionFact::Completed { entity, .. }
+                        fact: bookend::ConstructionFact::Started { entity, .. }
                     },
                     ..
                 } if *entity == EntityIdx(0)
             )),
-            "the P571 inception is a construction-completion bookend"
+            "the P571 inception is a construction-start bookend"
         );
 
         assert!(
@@ -1258,11 +842,207 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn deprecated_image_claim_is_not_ingested() -> TestResult {
+        let mut deprecated = string_claim("Old retouched.jpg");
+        deprecated.rank = Rank::Deprecated;
+        let claims = BTreeMap::from([(
+            PropertyId::try_from("P18".to_owned())?,
+            vec![deprecated, string_claim("Current.jpg")],
+        )]);
+        let commit = build_commit(
+            &item("Q7", BTreeMap::new(), claims)?,
+            &run_id(),
+            fixed_time()?,
+            &mut Vec::new(),
+        )?
+        .ok_or("expected commit")?;
+
+        assert_eq!(commit.images.len(), 1, "the deprecated photo is dropped");
+        assert!(
+            commit.facts.iter().any(|f| matches!(
+                f,
+                SubmitFact::Factual {
+                    assertion: FactualAssertion::Image {
+                        fact: image::Fact::Source { url, .. }
+                    },
+                    ..
+                } if url.as_str().contains("Current.jpg")
+            )),
+            "the non-deprecated photo survives"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn opening_event_carries_no_usage_change_payload() -> TestResult {
+        let claims = BTreeMap::from([(
+            PropertyId::try_from("P1619".to_owned())?,
+            vec![time_claim(
+                "+1855-06-01T00:00:00Z",
+                WikidataPrecision::Month,
+            )?],
+        )]);
+        let commit = build_commit(
+            &item("Q8", BTreeMap::new(), claims)?,
+            &run_id(),
+            fixed_time()?,
+            &mut Vec::new(),
+        )?
+        .ok_or("expected commit")?;
+
+        assert!(
+            commit.facts.iter().any(|f| matches!(
+                f,
+                SubmitFact::Factual {
+                    assertion: FactualAssertion::Event {
+                        fact: event::Fact::HasEvent {
+                            kind: LifetimeEventKind::Point {
+                                kind: PointKind::UsageChanged
+                            },
+                            ..
+                        }
+                    },
+                    ..
+                }
+            )),
+            "the opening mints a UsageChanged event"
+        );
+        assert!(
+            commit.facts.iter().any(|f| matches!(
+                f,
+                SubmitFact::Factual {
+                    assertion: FactualAssertion::Event {
+                        fact: event::Fact::PointDate { .. }
+                    },
+                    ..
+                }
+            )),
+            "the opening date is a point-date fact"
+        );
+        assert!(
+            !commit.facts.iter().any(|f| matches!(
+                f,
+                SubmitFact::Factual {
+                    assertion: FactualAssertion::Event {
+                        fact: event::Fact::UsageChange { .. }
+                    },
+                    ..
+                }
+            )),
+            "an opening asserts the change, not a usage set"
+        );
+        Ok(())
+    }
+
+    /// A demolish→rebuild item: the commit carries two entities, a `Replaces`
+    /// edge citing the bookend raw values, and a dateless predecessor location.
+    fn rebuilt_church() -> Result<WikidataEntity, Box<dyn std::error::Error>> {
+        let claims = BTreeMap::from([
+            (
+                PropertyId::try_from("P625".to_owned())?,
+                vec![coordinate_claim(45.2177, 12.2790)],
+            ),
+            (
+                PropertyId::try_from("P793".to_owned())?,
+                vec![
+                    p793_event("Q331483", "+1623-01-01T00:00:00Z", WikidataPrecision::Year)?,
+                    p793_event("Q385378", "+1633-01-01T00:00:00Z", WikidataPrecision::Year)?,
+                ],
+            ),
+        ]);
+        item("Q9", BTreeMap::new(), claims)
+    }
+
+    #[test]
+    fn demolish_rebuild_emits_replaces_edge_citing_bookend_dates() -> TestResult {
+        let commit = build_commit(
+            &rebuilt_church()?,
+            &run_id(),
+            fixed_time()?,
+            &mut Vec::new(),
+        )?
+        .ok_or("expected commit")?;
+        assert_eq!(commit.entities.len(), 2, "the rebuild splits the item");
+
+        let replaces = commit
+            .facts
+            .iter()
+            .find_map(|f| {
+                if let SubmitFact::Factual {
+                    assertion:
+                        FactualAssertion::Attribute {
+                            fact: attribute::Fact::Relationship { pair, relation },
+                        },
+                    citation,
+                } = f
+                {
+                    (*relation == EntityRelationType::Replaces).then_some((pair, citation))
+                } else {
+                    None
+                }
+            })
+            .ok_or("expected a Replaces relationship")?;
+        let (pair, citation) = replaces;
+        assert_eq!(*pair.from(), EntityIdx(1), "the newer split replaces");
+        assert_eq!(*pair.to(), EntityIdx(0), "the older split is replaced");
+
+        let excerpts: Vec<&str> = citation.excerpts.iter().map(Excerpt::as_str).collect();
+        assert_eq!(
+            excerpts,
+            vec![
+                "Q331483 P585:+1623-01-01T00:00:00Z",
+                "Q385378 P585:+1633-01-01T00:00:00Z",
+            ],
+            "the edge quotes the demolition and reconstruction raw values"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn predecessor_inherits_location_without_dates() -> TestResult {
+        let commit = build_commit(
+            &rebuilt_church()?,
+            &run_id(),
+            fixed_time()?,
+            &mut Vec::new(),
+        )?
+        .ok_or("expected commit")?;
+
+        assert!(
+            commit.facts.iter().any(|f| matches!(
+                f,
+                SubmitFact::Factual {
+                    assertion: FactualAssertion::Construction {
+                        fact: bookend::ConstructionFact::Location { entity, .. }
+                    },
+                    ..
+                } if *entity == EntityIdx(0)
+            )),
+            "the predecessor stands where its replacement stands"
+        );
+        assert!(
+            !commit.facts.iter().any(|f| matches!(
+                f,
+                SubmitFact::Factual {
+                    assertion: FactualAssertion::Construction {
+                        fact: bookend::ConstructionFact::Started { entity, .. }
+                            | bookend::ConstructionFact::Completed { entity, .. }
+                    },
+                    ..
+                } if *entity == EntityIdx(0)
+            )),
+            "no construction date is invented for the predecessor"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn round_trip_projects_names_refs_and_timeline() -> TestResult {
         let store = MemoryFactStore::new();
         let recorded = fixed_time()?;
-        let commit = build_commit(&pantheon()?, &run_id(), recorded)?.ok_or("expected commit")?;
+        let commit = build_commit(&pantheon()?, &run_id(), recorded, &mut Vec::new())?
+            .ok_or("expected commit")?;
         let result = commit_facts(&store, commit)
             .await
             .map_err(|e| format!("{e:?}"))?;
@@ -1295,7 +1075,7 @@ mod tests {
 
         let construction_year = entity.timeline.iter().find_map(|entry| {
             if let typed::EventDetail::Constructed { period, .. } = &entry.detail {
-                period.completed.possible.earliest()
+                period.started.possible.earliest()
             } else {
                 None
             }
@@ -1303,7 +1083,7 @@ mod tests {
         assert_eq!(
             construction_year.map(|d| d.year()),
             Some(1800),
-            "the P571 inception survives as a construction date on the timeline"
+            "the P571 inception survives as a construction start date on the timeline"
         );
 
         assert!(
@@ -1326,7 +1106,75 @@ mod tests {
         assert_eq!(stats.commits, 1);
         assert_eq!(stats.entities, 1);
         assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.issues, 0, "the clean fixture raises no warnings");
         assert!(stats.facts > 0, "the commit carries facts");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_tallies_extraction_warnings_and_still_commits() -> TestResult {
+        // An unrecognized P793 event QID is dropped with a warning; the item
+        // still commits its other facts.
+        let claims = BTreeMap::from([(
+            PropertyId::try_from("P793".to_owned())?,
+            vec![p793_event(
+                "Q99999999",
+                "+1920-01-01T00:00:00Z",
+                WikidataPrecision::Year,
+            )?],
+        )]);
+        let entity = item("Q123", BTreeMap::from([label("en", "Mystery")]), claims)?;
+
+        let store = MemoryFactStore::new();
+        let stats = ingest_entities(&store, [entity], &run_id(), fixed_time()?).await?;
+        assert_eq!(stats.commits, 1, "the item still commits");
+        assert!(
+            stats.issues > 0,
+            "the unrecognized event QID is tallied as an issue"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_sitelink_title_is_skipped_without_aborting_the_commit() -> TestResult {
+        let mut entity = item(
+            "Q321",
+            BTreeMap::from([label("en", "Placeholder")]),
+            BTreeMap::new(),
+        )?;
+        entity.sitelinks.insert(
+            SiteId("commonswiki".to_owned()),
+            Sitelink {
+                title: String::new(),
+            },
+        );
+
+        let mut warnings = Vec::new();
+        let commit = build_commit(&entity, &run_id(), fixed_time()?, &mut warnings)?
+            .ok_or("the item still builds a commit")?;
+
+        // The item's own QID is the only external reference; the empty-title
+        // sitelink contributes none.
+        let external_refs = commit
+            .facts
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f,
+                    SubmitFact::Factual {
+                        assertion: FactualAssertion::Attribute {
+                            fact: attribute::Fact::ExternalReference { .. }
+                        },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(external_refs, 1, "only the QID reference survives");
+        assert!(
+            warnings.iter().any(|w| w.contains("empty title")),
+            "the empty sitelink title records a warning, got: {warnings:?}"
+        );
         Ok(())
     }
 
@@ -1339,8 +1187,8 @@ mod tests {
     async fn committed_pantheon()
     -> Result<(MemoryFactStore, MemoryEntityId), Box<dyn std::error::Error>> {
         let store = MemoryFactStore::new();
-        let commit =
-            build_commit(&pantheon()?, &run_id(), fixed_time()?)?.ok_or("expected commit")?;
+        let commit = build_commit(&pantheon()?, &run_id(), fixed_time()?, &mut Vec::new())?
+            .ok_or("expected commit")?;
         let result = commit_facts(&store, commit)
             .await
             .map_err(|e| format!("{e:?}"))?;

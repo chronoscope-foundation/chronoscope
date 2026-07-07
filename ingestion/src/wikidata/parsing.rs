@@ -1,17 +1,20 @@
 //! Wikidata JSON parsing utilities.
 //!
-//! Functions for extracting data from Wikidata entity JSON structures.
-//! Some functions operate on raw `serde_json::Value` (for dump filtering),
-//! while others use the typed [`WikidataEntity`] model.
+//! Functions for extracting fact-grammar values from the typed
+//! [`WikidataEntity`] model: names with their citations, sitelinks as external
+//! references, and Wikidata's quirky time format as [`UncertainDate`]s.
 
-use crate::SourceIdx;
 use chrono::NaiveDate;
-use chronoscope_core::{
-    Cited, DatePrecision, EntityName, Evidence, ExternalLink, LinkTarget, LinkType, NameType,
-    UncertainDate, WikidataEntityId, WikidataField, WikidataPropertyId,
+use chronoscope_core::date::{DatePrecision, UncertainDate};
+use chronoscope_core::facts::attribute::{NameText, NameType};
+use chronoscope_core::facts::citations::{
+    ExternalReference, FactualCitation, Language, WikidataField, WikimediaCategoryName,
 };
+use chronoscope_core::ids::WikidataPropertyId;
 use chronoscope_integrations::wikidata::{DataValue, Snak, WikidataEntity, WikidataPrecision};
-use oxilangtag::LanguageTag;
+use url::Url;
+
+use crate::wikidata::{ItemContext, asserted_claims};
 
 /// Build an `UncertainDate` at year granularity or coarser.
 fn coarse_date(year: i32, precision: DatePrecision) -> Option<UncertainDate> {
@@ -57,100 +60,123 @@ pub fn parse_wikidata_time(time_str: &str, precision: WikidataPrecision) -> Opti
     }
 }
 
+/// A name read off an item, with the citation naming where it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedName {
+    pub name: NameText,
+    pub language: Language,
+    pub name_type: NameType,
+    pub citation: FactualCitation,
+}
+
 /// Extract names from labels (common names) and P1448 (official name) claims.
+///
+/// A label or claim whose language tag fails BCP-47 parsing, or whose value
+/// can't be quoted as an excerpt (empty), is skipped — an uncitable name is
+/// dropped rather than fabricated. Each skip records a warning naming the field
+/// and reason.
 pub fn extract_names(
-    wd: &WikidataEntity,
-    wikidata_id: &str,
-    revision_id: u64,
-) -> Vec<Cited<EntityName, SourceIdx>> {
+    entity: &WikidataEntity,
+    ctx: &ItemContext,
+    warnings: &mut Vec<String>,
+) -> Vec<ExtractedName> {
     let mut names = Vec::new();
 
-    // The entity id is parsed once here; a non-entity id can't be cited,
-    // so we return no names rather than fabricate evidence.
-    let Ok(entity_id) = WikidataEntityId::parse(wikidata_id) else {
-        return names;
-    };
-
-    for (lang, label) in &wd.labels {
-        if let Ok(language) = LanguageTag::parse(lang.0.clone()) {
-            names.push(Cited::new(
-                EntityName {
-                    name: label.value.clone(),
-                    name_type: NameType::Common,
-                    language: language.clone(),
-                    valid_from: None,
-                    valid_to: None,
-                },
-                vec![Evidence::Wikidata {
-                    entity_id,
-                    revision_id,
-                    field: WikidataField::Label { language },
-                    observed_value: label.value.clone(),
-                }],
-            ));
-        }
+    for (lang, label) in &entity.labels {
+        let Ok(language) = Language::new(lang.0.as_str()) else {
+            warnings.push(format!("label {}: unparseable language tag", lang.0));
+            continue;
+        };
+        let citation = match ctx.citation(
+            WikidataField::Label {
+                language: language.clone(),
+            },
+            label.value.clone(),
+        ) {
+            Ok(citation) => citation,
+            Err(e) => {
+                warnings.push(format!("label {}: {e}", lang.0));
+                continue;
+            }
+        };
+        names.push(ExtractedName {
+            name: NameText::new(&label.value),
+            language,
+            name_type: NameType::Common,
+            citation,
+        });
     }
 
     let p1448 = WikidataPropertyId::new(1448);
-
-    // P1448 (official name)
-    if let Some(claims) = wd.claims.get("P1448") {
-        for claim in claims {
-            if let Snak::Value(DataValue::MonolingualText(mono)) = &claim.mainsnak
-                && let Ok(language_tag) = LanguageTag::parse(mono.language.0.clone())
-            {
-                names.push(Cited::new(
-                    EntityName {
-                        name: mono.text.clone(),
-                        name_type: NameType::Official,
-                        language: language_tag,
-                        valid_from: None,
-                        valid_to: None,
-                    },
-                    vec![Evidence::Wikidata {
-                        entity_id,
-                        revision_id,
-                        field: WikidataField::Statement { property_id: p1448 },
-                        observed_value: format!("{}:{}", mono.language, mono.text),
-                    }],
-                ));
+    if let Some(claims) = entity.claims.get("P1448") {
+        for claim in asserted_claims(claims) {
+            let Snak::Value(DataValue::MonolingualText(mono)) = &claim.mainsnak else {
+                warnings.push("P1448: expected monolingual text value".to_owned());
+                continue;
+            };
+            if mono.text.is_empty() {
+                warnings.push(format!("P1448: empty official name ({})", mono.language));
+                continue;
             }
+            let Ok(language) = Language::new(mono.language.0.as_str()) else {
+                warnings.push(format!("P1448: unparseable language tag {}", mono.language));
+                continue;
+            };
+            let citation =
+                match ctx.statement_citation(p1448, format!("{}:{}", mono.language, mono.text)) {
+                    Ok(citation) => citation,
+                    Err(e) => {
+                        warnings.push(format!("P1448: {e}"));
+                        continue;
+                    }
+                };
+            names.push(ExtractedName {
+                name: NameText::new(&mono.text),
+                language,
+                name_type: NameType::Official,
+                citation,
+            });
         }
     }
 
     names
 }
 
-/// Parse a sitelink into a structured `ExternalLink`.
-///
-/// Returns Wikipedia or `WikimediaCommons` variants for known sites.
-/// Returns None for unsupported sitelink types.
+/// Parse a sitelink into an [`ExternalReference`].
 ///
 /// Wikidata sitelinks use suffixes like "enwiki", "dewiki", "commonswiki".
-/// We match `*wiki` pattern to catch Wikipedia sites (extracting the language prefix),
-/// but exclude "commonswiki" which uses a different URL structure. Other wikis
-/// like "enwikiquote" don't end in "wiki" so they're naturally filtered out.
+/// The `*wiki` pattern catches Wikipedia sites (extracting the language
+/// prefix); "commonswiki" maps `Category:` pages to the structured category
+/// reference and other Commons pages to their URL. Other Wikimedia projects
+/// ("enwikiquote" doesn't end in "wiki") return `None`.
 #[must_use]
-pub fn parse_sitelink(site: &str, title: &str) -> Option<ExternalLink> {
-    // Wikidata sitelinks are exclusively Wikimedia projects (enwiki, dewiki, etc.),
-    // so non-Wikimedia wikis like RationalWiki never appear here. The language tag
-    // parse acts as a secondary filter — only valid BCP 47 tags pass through.
-    if site.ends_with("wiki") && site != "commonswiki" {
-        let language = site.strip_suffix("wiki")?;
-        let language_tag = LanguageTag::parse(language.to_string()).ok()?;
-        Some(ExternalLink {
-            target: LinkTarget::Wikipedia {
-                language: language_tag,
-                title: title.to_string(),
-            },
-            link_type: LinkType::SameAs,
-        })
-    } else if site == "commonswiki" {
-        Some(ExternalLink {
-            target: LinkTarget::WikimediaCommons {
-                title: title.to_string(),
-            },
-            link_type: LinkType::SameAs,
+pub fn parse_sitelink(site: &str, title: &str) -> Option<ExternalReference> {
+    if title.is_empty() {
+        return None;
+    }
+    if site == "commonswiki" {
+        match title.strip_prefix("Category:") {
+            Some(category) => Some(ExternalReference::WikimediaCommonsCategory {
+                category: WikimediaCategoryName::new(category.replace('_', " ")).ok()?,
+            }),
+            // Non-category Commons pages (galleries, File: pages) keep their
+            // URL form; file pages are ingested as images elsewhere. Commons
+            // page URLs are underscore-form, so normalize spaces to match a
+            // P973 `described at URL` pointing at the same page.
+            None => {
+                let mut url = Url::parse("https://commons.wikimedia.org").ok()?;
+                url.set_path(&format!("/wiki/{}", title.replace(' ', "_")));
+                Some(ExternalReference::UnmodeledUrl { url })
+            }
+        }
+    } else if site.ends_with("wiki") {
+        // Wikidata sitelinks are exclusively Wikimedia projects (enwiki,
+        // dewiki, etc.). The BCP-47 parse acts as a secondary filter on the
+        // language prefix.
+        let language = Language::new(site.strip_suffix("wiki")?).ok()?;
+        Some(ExternalReference::Wikipedia {
+            language,
+            title: title.to_owned(),
         })
     } else {
         None
@@ -161,6 +187,8 @@ pub fn parse_sitelink(site: &str, title: &str) -> Option<ExternalLink> {
 mod tests {
     use super::*;
     use chrono::Datelike;
+    use chronoscope_core::facts::citations::ExternalSource;
+    use chronoscope_core::ids::WikidataEntityId;
     use chronoscope_integrations::wikidata::{
         Claim, Label, LanguageCode, MonolingualTextValue, PropertyId, Rank, RevisionId, Snak,
         WikidataEntityType, WikidataId,
@@ -348,6 +376,19 @@ mod tests {
     // extract_names Unit Tests
     // =============================================================================
 
+    fn ctx() -> Result<ItemContext, Box<dyn std::error::Error>> {
+        Ok(ItemContext::new(WikidataEntityId::new(243), 100)?)
+    }
+
+    fn p1448_claim(language: &str, text: &str) -> Claim {
+        Claim::simple(Snak::Value(DataValue::MonolingualText(
+            MonolingualTextValue {
+                text: text.to_string(),
+                language: LanguageCode(language.to_string()),
+            },
+        )))
+    }
+
     #[test]
     fn extract_names_emits_common_names_from_labels() -> TestResult {
         let entity = WikidataEntity {
@@ -374,41 +415,40 @@ mod tests {
             sitelinks: BTreeMap::new(),
         };
 
-        let names = extract_names(&entity, "Q243", 100);
+        let names = extract_names(&entity, &ctx()?, &mut Vec::new());
         assert_eq!(names.len(), 2);
 
         let english = names
             .iter()
-            .find(|n| n.value.language.as_str() == "en")
+            .find(|n| n.language.as_str() == "en")
             .ok_or("expected an English name")?;
-        assert_eq!(english.value.name, "Eiffel Tower");
-        assert_eq!(english.value.name_type, NameType::Common);
-        assert_eq!(english.evidence.len(), 1);
-        let Evidence::Wikidata {
+        assert_eq!(english.name.as_str(), "Eiffel Tower");
+        assert_eq!(english.name_type, NameType::Common);
+        let ExternalSource::Wikidata {
             entity_id,
             revision_id,
             field,
-            observed_value,
-        } = &english.evidence[0]
+            value,
+        } = &english.citation.source
         else {
-            return Err("expected Wikidata evidence".into());
+            return Err("expected Wikidata source".into());
         };
         assert_eq!(*entity_id, WikidataEntityId::new(243));
         assert_eq!(*revision_id, 100);
         assert_eq!(
             *field,
             WikidataField::Label {
-                language: LanguageTag::parse("en".to_string())?,
+                language: Language::new("en")?,
             }
         );
-        assert_eq!(observed_value, "Eiffel Tower");
+        assert_eq!(value, "Eiffel Tower");
 
         let french = names
             .iter()
-            .find(|n| n.value.language.as_str() == "fr")
+            .find(|n| n.language.as_str() == "fr")
             .ok_or("expected a French name")?;
-        assert_eq!(french.value.name, "Tour Eiffel");
-        assert_eq!(french.value.name_type, NameType::Common);
+        assert_eq!(french.name.as_str(), "Tour Eiffel");
+        assert_eq!(french.name_type, NameType::Common);
         Ok(())
     }
 
@@ -421,31 +461,23 @@ mod tests {
             labels: BTreeMap::new(),
             claims: BTreeMap::from([(
                 PropertyId::try_from("P1448".to_string())?,
-                vec![Claim {
-                    mainsnak: Snak::Value(DataValue::MonolingualText(MonolingualTextValue {
-                        text: "Tour Eiffel".to_string(),
-                        language: LanguageCode("fr".to_string()),
-                    })),
-                    qualifiers: BTreeMap::new(),
-                    rank: Rank::Normal,
-                }],
+                vec![p1448_claim("fr", "Tour Eiffel")],
             )]),
             sitelinks: BTreeMap::new(),
         };
 
-        let names = extract_names(&entity, "Q243", 100);
+        let names = extract_names(&entity, &ctx()?, &mut Vec::new());
         assert_eq!(names.len(), 1);
-        assert_eq!(names[0].value.name, "Tour Eiffel");
-        assert_eq!(names[0].value.name_type, NameType::Official);
-        assert_eq!(names[0].evidence.len(), 1);
-        let Evidence::Wikidata {
+        assert_eq!(names[0].name.as_str(), "Tour Eiffel");
+        assert_eq!(names[0].name_type, NameType::Official);
+        let ExternalSource::Wikidata {
             entity_id,
             revision_id,
             field,
-            observed_value,
-        } = &names[0].evidence[0]
+            value,
+        } = &names[0].citation.source
         else {
-            return Err("expected Wikidata evidence".into());
+            return Err("expected Wikidata source".into());
         };
         assert_eq!(*entity_id, WikidataEntityId::new(243));
         assert_eq!(*revision_id, 100);
@@ -455,7 +487,53 @@ mod tests {
                 property_id: WikidataPropertyId::new(1448),
             }
         );
-        assert_eq!(observed_value, "fr:Tour Eiffel");
+        assert_eq!(value, "fr:Tour Eiffel");
+        Ok(())
+    }
+
+    #[test]
+    fn extract_names_drops_deprecated_p1448_claim() -> TestResult {
+        let mut deprecated = p1448_claim("fr", "Ancien nom");
+        deprecated.rank = Rank::Deprecated;
+        let entity = WikidataEntity {
+            id: wikidata_id("Q243")?,
+            entity_type: WikidataEntityType::Item,
+            lastrevid: RevisionId(100),
+            labels: BTreeMap::new(),
+            claims: BTreeMap::from([(
+                PropertyId::try_from("P1448".to_string())?,
+                vec![deprecated, p1448_claim("fr", "Tour Eiffel")],
+            )]),
+            sitelinks: BTreeMap::new(),
+        };
+
+        let names = extract_names(&entity, &ctx()?, &mut Vec::new());
+        assert_eq!(names.len(), 1, "only the non-deprecated claim survives");
+        assert_eq!(names[0].name.as_str(), "Tour Eiffel");
+        Ok(())
+    }
+
+    #[test]
+    fn extract_names_skips_empty_p1448_and_warns() -> TestResult {
+        let entity = WikidataEntity {
+            id: wikidata_id("Q243")?,
+            entity_type: WikidataEntityType::Item,
+            lastrevid: RevisionId(100),
+            labels: BTreeMap::new(),
+            claims: BTreeMap::from([(
+                PropertyId::try_from("P1448".to_string())?,
+                vec![p1448_claim("fr", "")],
+            )]),
+            sitelinks: BTreeMap::new(),
+        };
+
+        let mut warnings = Vec::new();
+        let names = extract_names(&entity, &ctx()?, &mut warnings);
+        assert!(names.is_empty(), "an empty official name is not emitted");
+        assert!(
+            warnings.iter().any(|w| w.contains("P1448")),
+            "the skip records a P1448 warning, got: {warnings:?}"
+        );
         Ok(())
     }
 
@@ -465,52 +543,86 @@ mod tests {
 
     #[test]
     fn test_sitelink_english_wikipedia() -> TestResult {
-        let link = parse_sitelink("enwiki", "Empire_State_Building").ok_or("should parse")?;
-        assert_eq!(
-            link.to_url().as_str(),
-            "https://en.wikipedia.org/wiki/Empire_State_Building"
-        );
+        let reference = parse_sitelink("enwiki", "Empire State Building").ok_or("should parse")?;
+        match reference {
+            ExternalReference::Wikipedia { language, title } => {
+                assert_eq!(language.as_str(), "en");
+                assert_eq!(title, "Empire State Building");
+            }
+            other => return Err(format!("expected Wikipedia, got {other:?}").into()),
+        }
         Ok(())
     }
 
     #[test]
     fn test_sitelink_german_wikipedia() -> TestResult {
-        let link = parse_sitelink("dewiki", "Berliner_Dom").ok_or("should parse")?;
-        assert_eq!(
-            link.to_url().as_str(),
-            "https://de.wikipedia.org/wiki/Berliner_Dom"
-        );
+        let reference = parse_sitelink("dewiki", "Berliner Dom").ok_or("should parse")?;
+        match reference {
+            ExternalReference::Wikipedia { language, title } => {
+                assert_eq!(language.as_str(), "de");
+                assert_eq!(title, "Berliner Dom");
+            }
+            other => return Err(format!("expected Wikipedia, got {other:?}").into()),
+        }
         Ok(())
     }
 
     #[test]
-    fn test_sitelink_commons() -> TestResult {
-        let link = parse_sitelink("commonswiki", "Category:Buildings").ok_or("should parse")?;
-        assert_eq!(
-            link.to_url().as_str(),
-            "https://commons.wikimedia.org/wiki/Category%3ABuildings"
-        );
+    fn test_sitelink_commons_category() -> TestResult {
+        let reference =
+            parse_sitelink("commonswiki", "Category:Buildings").ok_or("should parse")?;
+        match reference {
+            ExternalReference::WikimediaCommonsCategory { category } => {
+                assert_eq!(category.as_str(), "Buildings");
+            }
+            other => return Err(format!("expected category, got {other:?}").into()),
+        }
         Ok(())
     }
 
     #[test]
-    fn test_sitelink_with_spaces() -> TestResult {
-        let link = parse_sitelink("enwiki", "Empire State Building").ok_or("should parse")?;
-        assert!(link.to_url().as_str().contains("Empire%20State%20Building"));
+    fn commons_gallery_sitelink_matches_p973_url_for_same_page() -> TestResult {
+        // The sitelink carries the space-form title; a P973 `described at URL`
+        // carries the underscore-form page URL. Both must resolve to the same
+        // reference so a lookup joins them.
+        let from_sitelink =
+            parse_sitelink("commonswiki", "Notre-Dame de Paris").ok_or("should parse")?;
+        let from_url = ExternalReference::from_url(&Url::parse(
+            "https://commons.wikimedia.org/wiki/Notre-Dame_de_Paris",
+        )?);
+        assert_eq!(from_sitelink, from_url);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_sitelink_title_is_skipped() {
+        assert!(parse_sitelink("enwiki", "").is_none());
+        assert!(parse_sitelink("commonswiki", "").is_none());
+    }
+
+    #[test]
+    fn test_sitelink_commons_gallery_page_keeps_url_form() -> TestResult {
+        let reference = parse_sitelink("commonswiki", "Rome").ok_or("should parse")?;
+        match reference {
+            ExternalReference::UnmodeledUrl { url } => {
+                assert_eq!(url.as_str(), "https://commons.wikimedia.org/wiki/Rome");
+            }
+            other => return Err(format!("expected UnmodeledUrl, got {other:?}").into()),
+        }
         Ok(())
     }
 
     #[test]
     fn test_sitelink_unknown_site() {
-        let link = parse_sitelink("unknownsite", "Test");
-        assert!(link.is_none());
+        let reference = parse_sitelink("unknownsite", "Test");
+        assert!(reference.is_none());
     }
 
     #[test]
     fn test_sitelink_wikiquote_not_supported() {
         // We only support wikipedia and commons
         // "enwikiquote" ends with "e", not "wiki", so naturally filtered out
-        let link = parse_sitelink("enwikiquote", "Test");
-        assert!(link.is_none());
+        let reference = parse_sitelink("enwikiquote", "Test");
+        assert!(reference.is_none());
     }
 }

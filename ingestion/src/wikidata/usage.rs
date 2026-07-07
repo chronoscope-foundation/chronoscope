@@ -1,8 +1,11 @@
 //! Usage inference from Wikidata properties.
 //!
-//! Maps Wikidata Q-IDs to Chronoscope Usage types.
+//! Maps Wikidata Q-IDs to Chronoscope [`Usage`] categories — the
+//! classification kernel for usage state observations (what a building is
+//! used for, as distinct from the dated usage-change events the lifecycle
+//! path emits, which carry only source-stated uses).
 
-use chronoscope_core::Usage;
+use chronoscope_core::facts::lifecycle::Usage;
 use chronoscope_integrations::wikidata::WikidataEntity;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;
