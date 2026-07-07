@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 
-use chronoscope_api_client::{ClickAction, client::ApiError};
+use chronoscope_api_client::{ClickAction, MarkersResponse, client::ApiError};
 use chronoscope_core::facts::assertions::{FactualAssertion, JudgmentAssertion};
 use chronoscope_core::facts::attribute::{self, NameText, NameType};
 use chronoscope_core::facts::bookend::ConstructionFact;
@@ -101,6 +101,64 @@ async fn commit_named_entity_at(
         ]
         .into_iter()
         .collect(),
+    };
+
+    let result = commit_facts(facts, commit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let id = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity 0 resolved")?
+        .id;
+    Ok(id)
+}
+
+/// Commit a placeable entity carrying one name per `(language, text)` pair, so a
+/// read can exercise `Accept-Language` negotiation between them.
+async fn commit_entity_with_names_at(
+    facts: &MemoryFactStore,
+    names: &[(&str, &str)],
+    lat: f64,
+    lon: f64,
+) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let named = |language: &str,
+                 name: &str|
+     -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(SubmitFact::Factual {
+            assertion: FactualAssertion::Attribute {
+                fact: attribute::Fact::Name {
+                    entity: EntityIdx(0),
+                    name: NameText::new(name),
+                    language: Language::new(language)?,
+                    name_type: NameType::Common,
+                    valid_from: None,
+                    valid_to: None,
+                },
+            },
+            citation: citation("https://example.com/name")?,
+        })
+    };
+    let mut facts_vec = names
+        .iter()
+        .map(|(language, name)| named(language, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    facts_vec.push(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: ConstructionFact::Location {
+                entity: EntityIdx(0),
+                location: resolved_point(lat, lon)?,
+            },
+        },
+        citation: citation("https://example.com/location")?,
+    });
+    let commit = Commit::<MemoryIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: facts_vec.into_iter().collect(),
     };
 
     let result = commit_facts(facts, commit)
@@ -223,9 +281,37 @@ async fn get_entity_returns_the_typed_projection_for_a_known_id() -> TestResult 
         "expected the committed name to round-trip, got {:?}",
         detail.entity.names
     );
+    assert_eq!(
+        detail.display_name.as_deref(),
+        Some("Pantheon"),
+        "with no Accept-Language the negotiated display name falls back to the only name"
+    );
     assert!(
         detail.images.is_empty(),
         "an entity with no depiction carries no detail images"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_defaults_display_name_to_english_without_accept_language() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // The names sort `Firenze` (it) before `Florence` (en), so the first-listed
+    // name is Italian. A header-less client must still get the English default.
+    let id = commit_entity_with_names_at(
+        &ctx.app_state.facts,
+        &[("en", "Florence"), ("it", "Firenze")],
+        43.7731,
+        11.2560,
+    )
+    .await?;
+
+    let detail = ctx.client.get_entity(&id).await?;
+
+    assert_eq!(
+        detail.display_name.as_deref(),
+        Some("Florence"),
+        "a header-less request falls back to the English name, not the first-listed Italian one"
     );
     Ok(())
 }
@@ -267,13 +353,14 @@ async fn get_entity_resolves_a_depicted_image_into_the_detail_grid() -> TestResu
         "display_url serves the resolved original from our own media host"
     );
     assert_eq!(
-        image.label, "Exterior picture",
-        "label combines the exterior perspective and picture medium"
+        image.perspective,
+        Some(Perspective::Exterior),
+        "the settled depiction perspective rides the wire structured, not as prose"
     );
-    assert!(
-        !image.label.contains("view"),
-        "the web appends ' view' to form the aria-label, so label must not \
-         already contain 'view'"
+    assert_eq!(
+        image.medium,
+        Some(ImageMedium::Picture),
+        "the settled image medium rides the wire structured, not as prose"
     );
     Ok(())
 }
@@ -369,7 +456,11 @@ async fn list_markers_selects_a_lone_entity() -> TestResult {
     assert_eq!(response.markers.len(), 1, "expected exactly one marker");
     let marker = &response.markers[0];
     assert_eq!(marker.id, id);
-    assert_eq!(marker.label.as_deref(), Some("Colosseum"));
+    assert_eq!(
+        marker.name.as_deref(),
+        Some("Colosseum"),
+        "with no Accept-Language the negotiated marker name falls back to the only name"
+    );
     assert!(
         marker.thumbnail_url.is_none(),
         "an entity with no depiction has no marker thumbnail"
@@ -466,7 +557,129 @@ async fn list_markers_accepts_an_antimeridian_bbox() -> TestResult {
         .iter()
         .find(|m| m.id == id)
         .ok_or("expected the antimeridian entity inside the wrapping box")?;
-    assert_eq!(marker.label.as_deref(), Some("Dateline Light"));
+    assert_eq!(
+        marker.name.as_deref(),
+        Some("Dateline Light"),
+        "the wrapping-box marker still carries the entity's name"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_markers_negotiates_marker_name_by_accept_language() -> TestResult {
+    let ctx = TestContext::new().await?;
+    commit_entity_with_names_at(
+        &ctx.app_state.facts,
+        &[("en", "Florence"), ("it", "Firenze")],
+        43.7731,
+        11.2560,
+    )
+    .await?;
+
+    let query = "/markers?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
+
+    // `it` preference: the Italian name wins.
+    let italian_resp = ctx
+        .client
+        .reqwest_client()
+        .get(ctx.url(query))
+        .header(reqwest::header::ACCEPT_LANGUAGE, "it")
+        .send()
+        .await?;
+    assert_eq!(
+        italian_resp
+            .headers()
+            .get(reqwest::header::VARY)
+            .and_then(|v| v.to_str().ok()),
+        Some("Accept-Language"),
+        "a language-negotiated response advertises Vary: Accept-Language so caches don't cross-serve locales"
+    );
+    let italian: MarkersResponse = italian_resp.json().await?;
+    assert_eq!(
+        italian.markers.first().and_then(|m| m.name.as_deref()),
+        Some("Firenze"),
+        "an `it` preference selects the Italian name"
+    );
+
+    // `en-US,en;q=0.9`: both entries reduce to the primary subtag `en`, so the
+    // English name wins regardless of the q-weight.
+    let english: MarkersResponse = ctx
+        .client
+        .reqwest_client()
+        .get(ctx.url(query))
+        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        english.markers.first().and_then(|m| m.name.as_deref()),
+        Some("Florence"),
+        "an `en` preference selects the English name"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_markers_matches_accept_language_case_insensitively() -> TestResult {
+    let ctx = TestContext::new().await?;
+    commit_entity_with_names_at(
+        &ctx.app_state.facts,
+        &[("en", "Florence"), ("it", "Firenze")],
+        43.7731,
+        11.2560,
+    )
+    .await?;
+
+    let query = "/markers?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
+
+    // An uppercase `IT` must match the lowercase-canonical stored `it` tag.
+    let response: MarkersResponse = ctx
+        .client
+        .reqwest_client()
+        .get(ctx.url(query))
+        .header(reqwest::header::ACCEPT_LANGUAGE, "IT")
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        response.markers.first().and_then(|m| m.name.as_deref()),
+        Some("Firenze"),
+        "an uppercase `IT` header matches the lowercase-canonical `it` tag"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_markers_orders_accept_language_by_q_weight() -> TestResult {
+    let ctx = TestContext::new().await?;
+    commit_entity_with_names_at(
+        &ctx.app_state.facts,
+        &[("en", "Munich"), ("de", "München")],
+        48.1372,
+        11.5756,
+    )
+    .await?;
+
+    let query = "/markers?min_lat=48.1&max_lat=48.2&min_lon=11.5&max_lon=11.6";
+
+    // `de;q=0.5, en`: `en` carries an implicit q=1.0, outranking `de;q=0.5`
+    // despite coming later in the header, so the English name wins.
+    let response: MarkersResponse = ctx
+        .client
+        .reqwest_client()
+        .get(ctx.url(query))
+        .header(reqwest::header::ACCEPT_LANGUAGE, "de;q=0.5, en")
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        response.markers.first().and_then(|m| m.name.as_deref()),
+        Some("Munich"),
+        "the higher q-weight (`en`, implicit 1.0) wins over `de;q=0.5`"
+    );
     Ok(())
 }
 

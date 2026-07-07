@@ -164,8 +164,11 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
                         back: Some((*back).clone()),
                     }));
                 };
-                let display_name = entry.name.as_deref().unwrap_or("Unknown");
-                let aria = display_name.to_string();
+                let display_name = entry
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let aria = display_name.clone();
                 view! {
                     <li>
                         <button
@@ -174,7 +177,7 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
                             on:click=select
                             aria-label=aria
                         >
-                            <span class="text-sm font-semibold text-ink">{display_name.to_string()}</span>
+                            <span class="text-sm font-semibold text-ink">{display_name}</span>
                         </button>
                     </li>
                 }
@@ -409,8 +412,7 @@ use chronoscope_core::date::{DateBound, DatePrecision, UncertainDate};
 use chronoscope_core::facts::citations::ExternalReference;
 use chronoscope_core::facts::lifecycle::{DamageCause, MoveMethod, Usage};
 use chronoscope_core::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
-use chronoscope_core::facts::typed::{Attributed, Bounded, EventDetail, InteriorEvent, best_name};
-use chronoscope_core::ids::OsmElementType;
+use chronoscope_core::facts::typed::{Attributed, Bounded, EventDetail, InteriorEvent};
 use chronoscope_core::location::{LocationReference, UnresolvedLocation};
 use chronoscope_core::moment::{Moment, TransitionRole, decompose, topological_order};
 
@@ -420,10 +422,12 @@ async fn fetch_entity_detail(
     id: &MemoryEntityId,
     client: &api::Client,
 ) -> Result<EntityDetailView, String> {
-    let api::EntityDetail { entity, images } =
-        client.get_entity(id).await.map_err(|e| e.to_string())?;
+    let api::EntityDetail {
+        entity,
+        display_name,
+        images,
+    } = client.get_entity(id).await.map_err(|e| e.to_string())?;
 
-    let name = best_name(&entity.names, &browser_language_prefix()).map(|n| n.text.clone());
     let timeline = topological_order(decompose(&entity.timeline))
         .iter()
         .map(moment_row)
@@ -438,26 +442,16 @@ async fn fetch_entity_detail(
         .map(|img| MediaInfo {
             display_url: img.display_url,
             source_url: img.source_url,
-            label: img.label,
+            label: api::image_caption(img.perspective, img.medium),
         })
         .collect();
 
     Ok(EntityDetailView {
-        name,
+        name: display_name,
         timeline,
         links,
         media,
     })
-}
-
-/// The browser's preferred language prefix (e.g. "en" from "en-US"), falling
-/// back to "en" when the navigator API is unavailable. Feeds the display-name
-/// choice so the detail heading prefers the viewer's own language.
-fn browser_language_prefix() -> String {
-    web_sys::window()
-        .map(|w| w.navigator().language().unwrap_or_default())
-        .and_then(|lang| lang.split('-').next().map(String::from))
-        .unwrap_or_else(|| "en".to_string())
 }
 
 // ==================== Moment → row ====================
@@ -703,77 +697,37 @@ fn format_uncertain_date(date: &UncertainDate) -> String {
 
 // ==================== External links ====================
 
-/// Build a display link for one external reference. `Wikidata` is the
-/// common case (every Wikidata-sourced entity carries one); the rest cover
-/// the full [`ExternalReference`] vocabulary with the same host/path shapes
-/// [`ExternalReference::from_url`] recognizes, so a reference round-trips
-/// back to the URL it was likely parsed from.
+/// Build a display link for one external reference: the source-name label the
+/// panel shows and the canonical URL. The URL is
+/// [`ExternalReference::to_url`]'s job — this only owns the presentation label
+/// (which stays in the web). An `UnmodeledUrl` with no extractable host renders
+/// no link.
 fn link_info(reference: &ExternalReference) -> Option<LinkInfo> {
-    match reference {
-        ExternalReference::Wikidata { qid } => Some(LinkInfo {
-            label: "Wikidata".to_string(),
-            url: format!("https://www.wikidata.org/wiki/{qid}"),
-        }),
-        ExternalReference::Wikipedia { language, title } => Some(LinkInfo {
-            label: format!("Wikipedia ({})", language.as_str()),
-            url: format!(
-                "https://{}.wikipedia.org/wiki/{}",
-                language.as_str(),
-                title.replace(' ', "_")
-            ),
-        }),
-        ExternalReference::OpenStreetMap { element_type, id } => Some(LinkInfo {
-            label: "OpenStreetMap".to_string(),
-            url: format!(
-                "https://www.openstreetmap.org/{}/{id}",
-                osm_element_path(*element_type)
-            ),
-        }),
-        ExternalReference::OpenHistoricalMap { element_type, id } => Some(LinkInfo {
-            label: "OpenHistoricalMap".to_string(),
-            url: format!(
-                "https://www.openhistoricalmap.org/{}/{id}",
-                osm_element_path(*element_type)
-            ),
-        }),
-        ExternalReference::GeoNames { id } => Some(LinkInfo {
-            label: "GeoNames".to_string(),
-            url: format!("https://www.geonames.org/{id}"),
-        }),
-        ExternalReference::GettyTgn { id } => Some(LinkInfo {
-            label: "Getty TGN".to_string(),
-            url: format!("https://vocab.getty.edu/tgn/{id}"),
-        }),
-        ExternalReference::Pleiades { place_id } => Some(LinkInfo {
-            label: "Pleiades".to_string(),
-            url: format!("https://pleiades.stoa.org/places/{place_id}"),
-        }),
-        ExternalReference::Nrhp { reference_number } => Some(LinkInfo {
-            label: "NRHP".to_string(),
-            url: format!("https://npgallery.nps.gov/NRHP/AssetDetail?assetID={reference_number}"),
-        }),
-        ExternalReference::WikimediaCommonsCategory { category } => Some(LinkInfo {
-            label: "Wikimedia Commons".to_string(),
-            url: format!(
-                "https://commons.wikimedia.org/wiki/Category:{}",
-                category.as_str().replace(' ', "_")
-            ),
-        }),
-        ExternalReference::UnmodeledUrl { url } => {
-            extract_domain(url.as_str()).map(|domain| LinkInfo {
-                label: domain,
-                url: url.to_string(),
-            })
-        }
-    }
+    let label = source_label(reference)?;
+    Some(LinkInfo {
+        label,
+        url: reference.to_url().to_string(),
+    })
 }
 
-fn osm_element_path(element_type: OsmElementType) -> &'static str {
-    match element_type {
-        OsmElementType::Node => "node",
-        OsmElementType::Way => "way",
-        OsmElementType::Relation => "relation",
-    }
+/// The human-readable source name for a link's anchor text — presentation that
+/// stays in the web. `UnmodeledUrl` labels with its host, `None` when the URL
+/// carries no extractable host (so the caller renders no link).
+fn source_label(reference: &ExternalReference) -> Option<String> {
+    Some(match reference {
+        ExternalReference::Wikidata { .. } => "Wikidata".to_string(),
+        ExternalReference::Wikipedia { language, .. } => {
+            format!("Wikipedia ({})", language.as_str())
+        }
+        ExternalReference::OpenStreetMap { .. } => "OpenStreetMap".to_string(),
+        ExternalReference::OpenHistoricalMap { .. } => "OpenHistoricalMap".to_string(),
+        ExternalReference::GeoNames { .. } => "GeoNames".to_string(),
+        ExternalReference::GettyTgn { .. } => "Getty TGN".to_string(),
+        ExternalReference::Pleiades { .. } => "Pleiades".to_string(),
+        ExternalReference::Nrhp { .. } => "NRHP".to_string(),
+        ExternalReference::WikimediaCommonsCategory { .. } => "Wikimedia Commons".to_string(),
+        ExternalReference::UnmodeledUrl { url } => extract_domain(url.as_str())?,
+    })
 }
 
 /// Extract the domain from a URL string (e.g., `"https://example.com/path"` -> `"example.com"`).

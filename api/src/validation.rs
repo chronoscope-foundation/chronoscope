@@ -70,12 +70,36 @@ pub(crate) fn cors_builder() -> http::response::Builder {
 /// Used by endpoints that need cross-origin access (e.g., entity endpoints
 /// called from the web frontend on a different port).
 pub fn json_with_cors<T: serde::Serialize>(value: &T) -> Result<Response<Body>, HttpError> {
+    json_with_cors_headers(value, &[])
+}
+
+/// Like [`json_with_cors`], plus `Vary: Accept-Language` — for responses whose
+/// body is content-negotiated on the request's `Accept-Language`, so a shared
+/// cache keys the negotiated form by language instead of cross-serving one
+/// locale's copy to another.
+pub fn json_with_cors_vary_language<T: serde::Serialize>(
+    value: &T,
+) -> Result<Response<Body>, HttpError> {
+    json_with_cors_headers(value, &[(http::header::VARY, "Accept-Language")])
+}
+
+/// Shared body of the `json_with_cors*` responses: serialize `value` to JSON,
+/// attach CORS + content-type, and append each `(name, value)` in
+/// `extra_headers`.
+fn json_with_cors_headers<T: serde::Serialize>(
+    value: &T,
+    extra_headers: &[(http::HeaderName, &str)],
+) -> Result<Response<Body>, HttpError> {
     let body_bytes = serde_json::to_vec(value)
         .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize response: {e}")))?;
 
-    cors_builder()
+    let mut builder = cors_builder()
         .status(http::StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::CONTENT_TYPE, "application/json");
+    for (name, value) in extra_headers {
+        builder = builder.header(name, *value);
+    }
+    builder
         .body(body_bytes.into())
         .map_err(|e| HttpError::for_internal_error(format!("Failed to build response: {e}")))
 }

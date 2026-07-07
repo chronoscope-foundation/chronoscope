@@ -190,6 +190,29 @@ pub enum OsmElementType {
     Relation,
 }
 
+impl OsmElementType {
+    /// The URL path segment naming this element type — `node`, `way`, or
+    /// `relation` — as used in OSM and OHM element URLs.
+    pub fn segment(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Way => "way",
+            Self::Relation => "relation",
+        }
+    }
+
+    /// The element type a URL path segment names, the inverse of
+    /// [`segment`](Self::segment); `None` for any other segment.
+    pub fn from_segment(segment: &str) -> Option<Self> {
+        match segment {
+            "node" => Some(Self::Node),
+            "way" => Some(Self::Way),
+            "relation" => Some(Self::Relation),
+            _ => None,
+        }
+    }
+}
+
 // ============================================================================
 // Wikidata IDs
 // ============================================================================

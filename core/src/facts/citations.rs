@@ -833,6 +833,91 @@ impl ExternalReference {
     pub fn from_url(url: &Url) -> Self {
         parse_recognized_url(url).unwrap_or_else(|| Self::UnmodeledUrl { url: url.clone() })
     }
+
+    /// The canonical URL for this reference — the inverse of
+    /// [`ExternalReference::from_url`] over every host `from_url` recognizes, so a
+    /// recognized variant round-trips (`from_url(&x.to_url()) == x`). `Nrhp` has a
+    /// canonical URL too, but `from_url` doesn't parse `npgallery.nps.gov`, so it
+    /// is one-way. `UnmodeledUrl` returns its wrapped URL verbatim.
+    pub fn to_url(&self) -> Url {
+        match self {
+            Self::Wikidata { qid } => {
+                let qid = qid.to_string();
+                build("https://www.wikidata.org", &["wiki", qid.as_str()])
+            }
+            Self::OpenStreetMap { element_type, id } => {
+                let id = id.to_string();
+                build(
+                    "https://www.openstreetmap.org",
+                    &[element_type.segment(), id.as_str()],
+                )
+            }
+            Self::OpenHistoricalMap { element_type, id } => {
+                let id = id.to_string();
+                build(
+                    "https://www.openhistoricalmap.org",
+                    &[element_type.segment(), id.as_str()],
+                )
+            }
+            Self::Wikipedia { language, title } => {
+                let title = title.replace(' ', "_");
+                build(
+                    &format!("https://{}.wikipedia.org", language.as_str()),
+                    &["wiki", title.as_str()],
+                )
+            }
+            Self::GeoNames { id } => {
+                let id = id.to_string();
+                build("https://www.geonames.org", &[id.as_str()])
+            }
+            Self::GettyTgn { id } => {
+                let id = id.to_string();
+                build("https://vocab.getty.edu", &["tgn", id.as_str()])
+            }
+            Self::Pleiades { place_id } => {
+                let place_id = place_id.to_string();
+                build("https://pleiades.stoa.org", &["places", place_id.as_str()])
+            }
+            Self::Nrhp { reference_number } => {
+                let mut url = build("https://npgallery.nps.gov", &["NRHP", "AssetDetail"]);
+                url.query_pairs_mut()
+                    .append_pair("assetID", reference_number.as_str());
+                url
+            }
+            Self::WikimediaCommonsCategory { category } => {
+                let category = format!("Category:{}", category.as_str().replace(' ', "_"));
+                build(
+                    "https://commons.wikimedia.org",
+                    &["wiki", category.as_str()],
+                )
+            }
+            Self::UnmodeledUrl { url } => url.clone(),
+        }
+    }
+}
+
+/// Build a URL from a hardcoded scheme+host base and its path segments. Each
+/// segment is split on `/` so a slash inside a title stays a path separator
+/// (Wikipedia `AC/DC` → `/wiki/AC/DC`), while the remaining reserved characters
+/// (`?`, `%`, `#`) percent-encode into their path position rather than being
+/// misread as a query, escape, or fragment. The base is a literal (with at most
+/// a validated language subdomain), which `Url::parse` accepts, and an https URL
+/// always accepts path segments, so neither call can fail for a caller here.
+#[expect(
+    clippy::expect_used,
+    reason = "hardcoded https scheme+host base: Url::parse and path_segments_mut cannot fail for a literal base — surfaced in the work summary"
+)]
+fn build(base: &str, segments: &[&str]) -> Url {
+    let mut url = Url::parse(base).expect("hardcoded base URL parses");
+    {
+        let mut path = url
+            .path_segments_mut()
+            .expect("an https base URL accepts path segments");
+        for &segment in segments {
+            path.extend(segment.split('/'));
+        }
+    }
+    url
 }
 
 fn parse_recognized_url(url: &Url) -> Option<ExternalReference> {
@@ -862,11 +947,11 @@ fn parse_recognized_url(url: &Url) -> Option<ExternalReference> {
             })
         }
         ("openstreetmap.org", [ty, id, ..]) => Some(ExternalReference::OpenStreetMap {
-            element_type: parse_osm_element_type(ty)?,
+            element_type: OsmElementType::from_segment(ty)?,
             id: OsmId::new(id.parse().ok()?),
         }),
         ("openhistoricalmap.org", [ty, id, ..]) => Some(ExternalReference::OpenHistoricalMap {
-            element_type: parse_osm_element_type(ty)?,
+            element_type: OsmElementType::from_segment(ty)?,
             id: OhmId::new(id.parse().ok()?),
         }),
         ("geonames.org", [id, ..]) => Some(ExternalReference::GeoNames {
@@ -883,15 +968,6 @@ fn parse_recognized_url(url: &Url) -> Option<ExternalReference> {
         // subdomain) and falls through rather than minting a bogus `www`
         // language tag.
         _ => parse_wikipedia(canonical_host, &segments),
-    }
-}
-
-fn parse_osm_element_type(segment: &str) -> Option<OsmElementType> {
-    match segment {
-        "node" => Some(OsmElementType::Node),
-        "way" => Some(OsmElementType::Way),
-        "relation" => Some(OsmElementType::Relation),
-        _ => None,
     }
 }
 
@@ -1262,5 +1338,117 @@ mod tests {
             ExternalReference::UnmodeledUrl { .. }
         ));
         Ok(())
+    }
+
+    #[test]
+    fn external_reference_to_url_round_trips_every_recognized_variant() -> TestResult {
+        // `to_url` is the inverse of `from_url` over the hosts `from_url` parses,
+        // so each recognized variant survives a to_url → from_url round trip.
+        // `UnmodeledUrl` round-trips too: its host isn't recognized, so from_url
+        // rebuilds it verbatim. `Nrhp` is excluded — from_url doesn't parse
+        // npgallery.nps.gov, so it is one-way (covered separately below).
+        let recognized = [
+            ExternalReference::Wikidata {
+                qid: WikidataEntityId::new(243),
+            },
+            ExternalReference::OpenStreetMap {
+                element_type: OsmElementType::Way,
+                id: OsmId::new(5013364),
+            },
+            ExternalReference::OpenHistoricalMap {
+                element_type: OsmElementType::Node,
+                id: OhmId::new(12345),
+            },
+            ExternalReference::Wikipedia {
+                language: Language::new("en")?,
+                title: "Empire State Building".to_string(),
+            },
+            ExternalReference::GeoNames {
+                id: GeoNamesId::new(3169070),
+            },
+            ExternalReference::GettyTgn {
+                id: GettyTgnId::new(7000874),
+            },
+            ExternalReference::Pleiades {
+                place_id: PleiadesPlaceId::new(423025),
+            },
+            ExternalReference::WikimediaCommonsCategory {
+                category: WikimediaCategoryName::new("Pantheon (Rome)")?,
+            },
+            ExternalReference::UnmodeledUrl {
+                url: Url::parse("https://example.com/some/path")?,
+            },
+        ];
+        for reference in recognized {
+            let recovered = ExternalReference::from_url(&reference.to_url());
+            assert_eq!(
+                recovered, reference,
+                "{reference:?} must survive to_url → from_url"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_reference_to_url_encodes_wikipedia_spaces_as_underscores() -> TestResult {
+        let reference = ExternalReference::Wikipedia {
+            language: Language::new("en")?,
+            title: "Empire State Building".to_string(),
+        };
+        assert_eq!(
+            reference.to_url().as_str(),
+            "https://en.wikipedia.org/wiki/Empire_State_Building"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_reference_to_url_percent_encodes_reserved_chars_in_titles() -> TestResult {
+        // A `?` in a title must percent-encode into the path, not be misread as a
+        // query delimiter (the bug the segment-wise build fixes) — and still
+        // round-trip back through from_url.
+        let reference = ExternalReference::Wikipedia {
+            language: Language::new("en")?,
+            title: "Who? (album)".to_string(),
+        };
+        let url = reference.to_url();
+        assert_eq!(url.as_str(), "https://en.wikipedia.org/wiki/Who%3F_(album)");
+        assert_eq!(url.query(), None, "the `?` must not open a query string");
+        assert_eq!(
+            ExternalReference::from_url(&url),
+            reference,
+            "a reserved-char title must still round-trip"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_reference_to_url_keeps_slash_literal_in_wikipedia_title() -> TestResult {
+        // A `/` in a title stays a path separator, matching Wikipedia's canonical
+        // `/wiki/AC/DC` rather than percent-encoding to `%2F`. This is one-way:
+        // `from_url` reads only the first title segment (`AC`), so a slashed title
+        // is excluded from the round-trip test above.
+        let reference = ExternalReference::Wikipedia {
+            language: Language::new("en")?,
+            title: "AC/DC".to_string(),
+        };
+        assert_eq!(
+            reference.to_url().as_str(),
+            "https://en.wikipedia.org/wiki/AC/DC"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_reference_to_url_builds_nrhp_asset_detail_link() {
+        // NRHP is one-way (from_url doesn't parse npgallery.nps.gov), so pin its
+        // canonical URL directly rather than through a round trip.
+        let reference = ExternalReference::Nrhp {
+            reference_number: NrhpReferenceNumber::new("66000058"),
+        };
+        assert_eq!(
+            reference.to_url().as_str(),
+            "https://npgallery.nps.gov/NRHP/AssetDetail?assetID=66000058"
+        );
     }
 }

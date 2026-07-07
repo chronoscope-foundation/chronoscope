@@ -504,6 +504,8 @@ async fn load_entities_for_viewport(
 
             // Convert API markers to MapMarkers. Thumbnail loads are spawned
             // below — each marker just stores an AbortHandle for cancellation.
+            // The server negotiated each marker's display name from the
+            // browser's `Accept-Language`, so the label is used as-is.
             let mut new_markers: Vec<MapMarker> = response
                 .markers
                 .into_iter()
@@ -512,7 +514,7 @@ async fn load_entities_for_viewport(
                     MapMarker {
                         id: m.id.0.to_string(),
                         position: (m.latitude, m.longitude),
-                        label: m.label,
+                        label: m.name,
                         click_action: m.click_action,
                         has_thumbnail,
                         _thumbnail_abort: None,

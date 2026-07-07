@@ -27,7 +27,18 @@ use crate::limits;
 use crate::state::AppState;
 use crate::validation::{
     bad_request_with_cors, cors_preflight, error_with_cors, fact_store_err, json_with_cors,
+    json_with_cors_vary_language,
 };
+
+/// The `Accept-Language` header value, when present and valid UTF-8. Read off
+/// the raw request (mirroring `auth::extract_bearer_token`) so the entity read
+/// endpoints can negotiate a single display name per entity.
+fn accept_language(ctx: &RequestContext<Arc<AppState>>) -> Option<&str> {
+    ctx.request
+        .headers()
+        .get(http::header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+}
 
 /// A `GET /entities` resume cursor: the fact-store snapshot it was minted
 /// against plus the walk position, JSON-encoded into the `cursor` query
@@ -221,17 +232,22 @@ pub async fn get_entity(
             continue;
         };
         let display_url = cdn::full_url(&state.config.cdn_base_url, &media.storage_key);
-        let label = entity_types::image_label(&dep.perspective, &image.medium);
         images.push(DetailImage {
             id: dep.other,
             display_url,
             source_url,
-            label,
+            perspective: dep.perspective.settled().copied(),
+            medium: image.medium.settled().copied(),
         });
     }
 
-    let detail = EntityDetail { entity, images };
-    json_with_cors(&detail)
+    let display_name = entity_types::negotiate_name(&entity.names, accept_language(&ctx));
+    let detail = EntityDetail {
+        entity,
+        display_name,
+        images,
+    };
+    json_with_cors_vary_language(&detail)
 }
 
 // ==================== Unified Markers ====================
@@ -293,7 +309,7 @@ pub async fn list_markers(
     // `SameArtifact` representative matches the key the resolver stored under.
     // An unresolved representative leaves the marker with no thumbnail. Marker
     // assembly is pure; the fact-store read lives here.
-    let assembled = entity_types::markers_from_summaries(page.summaries);
+    let assembled = entity_types::markers_from_summaries(page.summaries, accept_language(&ctx));
     let mut markers = Vec::with_capacity(assembled.len());
     for (mut marker, thumbnail) in assembled {
         if let Some(image_id) = thumbnail {
@@ -313,7 +329,7 @@ pub async fn list_markers(
     let truncated = page.next.is_some();
 
     let response = MarkersResponse { markers, truncated };
-    json_with_cors(&response)
+    json_with_cors_vary_language(&response)
 }
 
 // ==================== CORS Preflight ====================

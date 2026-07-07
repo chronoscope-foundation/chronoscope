@@ -20,7 +20,7 @@ pub use auth::{
 pub use client::{ApiError, AuthClient, AuthError, Client, login, paginate, register};
 pub use entities::{
     ClickAction, DetailImage, Entity, EntityDetail, EntityListCursor, EntityListPage,
-    EntityPickerEntry, EntitySummary, Marker, MarkersResponse,
+    EntityPickerEntry, EntitySummary, Marker, MarkersResponse, image_caption,
 };
 pub use ids::{
     AnnotationId, Email, EntityId, EntityLinkId, MediaId, ResearchUrlId, SourceId, UserId,
