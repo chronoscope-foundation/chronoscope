@@ -3,10 +3,8 @@
 //! [`UncertainDate`] models epistemic uncertainty about a single instant in
 //! time. "Built in the 1920s" means "construction started at some unknown
 //! instant within \[1920, 1929\]", not "construction spanned the entire
-//! decade." Duration is modeled by pairing two uncertain instants
-//! (`started_at` and `completed_at` in
-//! [`EntityTransition`](crate::entity::EntityTransition)), not by widening a
-//! single date.
+//! decade." Duration is modeled by pairing two uncertain instants (a start
+//! and an end), not by widening a single date.
 //!
 //! # Representation
 //!

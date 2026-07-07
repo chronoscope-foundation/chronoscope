@@ -35,40 +35,24 @@ const _: () = assert!(
 );
 
 pub mod algebra;
-pub mod annotation;
 pub mod claimed;
 pub mod date;
-pub mod entity;
-pub mod evidence;
 pub mod facts;
 pub mod geo;
 pub mod ids;
-pub mod ingestion;
-pub mod links;
 pub mod location;
 pub mod moment;
 pub mod nonempty;
 
 pub use algebra::lattice::{BoundedLattice, JoinSemilattice, MeetSemilattice};
 pub use algebra::monoid::CommutativeMonoid;
-pub use annotation::{Annotation, AnnotationKind};
 pub use claimed::Claimed;
 pub use date::{DateBound, DateError, DatePrecision, UncertainDate};
-pub use entity::{
-    DamageCause, Entity, EntityName, EntityRelation, EntityRelationType, EntityTransition,
-    MoveMethod, NameType, Usage,
-};
-pub use evidence::{
-    Cited, Evidence, ImageRegion, MaskDimensions, Polyline, PolylineError, RleMask, SourceDetail,
-    SpatialGeometry, WikidataField,
-};
 pub use geo::{Bbox, BboxError, GeoPoint, GeoPointError, Meters};
 pub use ids::{
     ExternalStringIdError, GeoNamesId, GettyTgnId, OhmId, OsmElementType, OsmId, TriggerEventId,
     WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
 };
-pub use ingestion::{ImageSource, IngestionBundle, IngestionNotes, ReferenceError};
-pub use links::{ExternalLink, LinkTarget, LinkType};
 pub use location::{
     ConflictStatus, Distance, Location, LocationError, LocationReference, UnresolvedLocation,
 };
