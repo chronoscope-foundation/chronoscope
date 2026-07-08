@@ -3,7 +3,7 @@
 //!
 //! A [`TimelineEvent`] bundles a durational event's two endpoints together: a
 //! construction carries both `started` and `completed` in one
-//! [`Period`](crate::facts::typed::Period). To render — and sort — endpoints
+//! [`Period`](crate::typed::Period). To render — and sort — endpoints
 //! independently, [`decompose`] splits each
 //! durational event into a start and an end [`Moment`] and leaves each point
 //! event as one. [`topological_order`] then sorts the moments over structural
@@ -18,7 +18,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::date::UncertainDate;
-use crate::facts::typed::{
+use crate::typed::{
     Bounded, EventDetail, InteriorEvent, TimelineEvent, dated_bound, has_date,
     interior_event_bounds,
 };
@@ -387,7 +387,7 @@ mod tests {
     use super::*;
     use crate::algebra::lattice::JoinSemilattice;
     use crate::date::{DatePrecision, UncertainDate};
-    use crate::facts::typed::{Consensus, Period};
+    use crate::typed::{Consensus, Period};
     use chrono::NaiveDate;
 
     type Entry = TimelineEvent<(), ()>;

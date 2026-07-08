@@ -5,7 +5,7 @@
 //! used for, as distinct from the dated usage-change events the lifecycle
 //! path emits, which carry only source-stated uses).
 
-use chronoscope_core::facts::lifecycle::Usage;
+use chronoscope_core::grammar::lifecycle::Usage;
 use chronoscope_integrations::wikidata::WikidataEntity;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::LazyLock;

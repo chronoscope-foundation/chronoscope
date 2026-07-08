@@ -14,12 +14,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use chronoscope_api_client::{Bbox, DetailImage, EntityDetail, EntityListCursor, MarkersResponse};
-use chronoscope_core::facts::listing::{self, ListCursor, summaries_in_bbox};
-use chronoscope_core::facts::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
-use chronoscope_core::facts::projection::{member_lineage, project_entity, project_image};
-use chronoscope_core::facts::store::{FactStore, ImageView};
-use chronoscope_core::facts::typed;
 use chronoscope_core::geo;
+use chronoscope_core::listing::{self, ListCursor, summaries_in_bbox};
+use chronoscope_core::projection::{member_lineage, project_entity, project_image};
+use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
+use chronoscope_core::store::{FactStore, ImageView};
+use chronoscope_core::typed;
 
 use crate::cdn;
 use crate::entity_types;

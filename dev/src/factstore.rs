@@ -10,8 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
-use chronoscope_core::facts::ids::IngesterRunId;
-use chronoscope_core::facts::memory::MemoryFactStore;
+use chronoscope_core::grammar::ids::IngesterRunId;
+use chronoscope_core::store::memory::MemoryFactStore;
 use chronoscope_ingestion::wikidata::commits::{IngestError, IngestStats, ingest_entities};
 use chronoscope_integrations::wikidata::WikidataEntity;
 

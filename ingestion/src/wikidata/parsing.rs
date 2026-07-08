@@ -6,11 +6,11 @@
 
 use chrono::NaiveDate;
 use chronoscope_core::date::{DatePrecision, UncertainDate};
-use chronoscope_core::facts::attribute::{NameText, NameType};
-use chronoscope_core::facts::citations::{
+use chronoscope_core::external_ids::WikidataPropertyId;
+use chronoscope_core::grammar::attribute::{NameText, NameType};
+use chronoscope_core::grammar::citations::{
     ExternalReference, FactualCitation, Language, WikidataField, WikimediaCategoryName,
 };
-use chronoscope_core::ids::WikidataPropertyId;
 use chronoscope_integrations::wikidata::{DataValue, Snak, WikidataEntity, WikidataPrecision};
 use url::Url;
 
@@ -187,8 +187,8 @@ pub fn parse_sitelink(site: &str, title: &str) -> Option<ExternalReference> {
 mod tests {
     use super::*;
     use chrono::Datelike;
-    use chronoscope_core::facts::citations::ExternalSource;
-    use chronoscope_core::ids::WikidataEntityId;
+    use chronoscope_core::external_ids::WikidataEntityId;
+    use chronoscope_core::grammar::citations::ExternalSource;
     use chronoscope_integrations::wikidata::{
         Claim, Label, LanguageCode, MonolingualTextValue, PropertyId, Rank, RevisionId, Snak,
         WikidataEntityType, WikidataId,

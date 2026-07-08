@@ -14,14 +14,14 @@
 //! deliberate act that updates these like a golden.
 
 use chrono::{Datelike, TimeZone, Utc};
-use chronoscope_core::facts::ids::IngesterRunId;
-use chronoscope_core::facts::lifecycle::PointKind;
-use chronoscope_core::facts::listing::{EntitySummary, summaries_in_bbox};
-use chronoscope_core::facts::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
-use chronoscope_core::facts::store::FactStore;
-use chronoscope_core::facts::submit::commit_facts;
+use chronoscope_core::external_ids::WikidataEntityId;
 use chronoscope_core::geo::{Bbox, GeoPoint};
-use chronoscope_core::ids::WikidataEntityId;
+use chronoscope_core::grammar::ids::IngesterRunId;
+use chronoscope_core::grammar::lifecycle::PointKind;
+use chronoscope_core::listing::{EntitySummary, summaries_in_bbox};
+use chronoscope_core::store::FactStore;
+use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
+use chronoscope_core::submit::commit_facts;
 use chronoscope_ingestion::wikidata::ItemContext;
 use chronoscope_ingestion::wikidata::commits::build_commit;
 use chronoscope_ingestion::wikidata::lifecycle::{

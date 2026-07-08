@@ -14,12 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::NaiveDate;
 use chronoscope_core::date::UncertainDate;
-use chronoscope_core::facts::citations::FactualCitation;
-use chronoscope_core::facts::event;
-use chronoscope_core::facts::lifecycle::{
+use chronoscope_core::external_ids::WikidataPropertyId;
+use chronoscope_core::grammar::citations::FactualCitation;
+use chronoscope_core::grammar::event;
+use chronoscope_core::grammar::lifecycle::{
     DamageCause, DurationalKind, LifetimeEventKind, PointKind, Usage,
 };
-use chronoscope_core::ids::WikidataPropertyId;
 use chronoscope_core::location::{Location, UnresolvedLocation};
 use chronoscope_integrations::wikidata::{Claim, PropertyId};
 
@@ -782,9 +782,9 @@ fn split_on_rebuild(contributions: Vec<DatedContribution>) -> Vec<Vec<Contributi
 mod tests {
     use super::*;
     use chrono::Datelike;
-    use chronoscope_core::facts::citations::{ExternalSource, WikidataField};
+    use chronoscope_core::external_ids::WikidataEntityId;
     use chronoscope_core::geo::GeoPoint;
-    use chronoscope_core::ids::WikidataEntityId;
+    use chronoscope_core::grammar::citations::{ExternalSource, WikidataField};
     use chronoscope_integrations::wikidata::{
         CoordinateValue, DataValue, EntityRefValue, PropertyId, Rank, Snak, TimeValue, WikidataId,
         WikidataPrecision, WikidataTimestamp,

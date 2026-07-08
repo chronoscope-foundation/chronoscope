@@ -6,24 +6,24 @@
 
 use chrono::{DateTime, Utc};
 
-use chronoscope_core::facts::assertions::{FactualAssertion, JudgmentAssertion};
-use chronoscope_core::facts::attribute::{self, EntityRelationType};
-use chronoscope_core::facts::bookend;
-use chronoscope_core::facts::citations::{
+use chronoscope_core::external_ids::{WikidataEntityId, WikidataPropertyId};
+use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion};
+use chronoscope_core::grammar::attribute::{self, EntityRelationType};
+use chronoscope_core::grammar::bookend;
+use chronoscope_core::grammar::citations::{
     Excerpt, ExcerptError, ExternalReference, ExternalSource, FactualCitation, JudgmentSource,
     WikidataField,
 };
-use chronoscope_core::facts::depiction::{self, Perspective};
-use chronoscope_core::facts::event;
-use chronoscope_core::facts::ids::IngesterRunId;
-use chronoscope_core::facts::image::{self, ImageMedium};
-use chronoscope_core::facts::lifecycle::DurationalRole;
-use chronoscope_core::facts::memory::{MemoryFactStore, MemoryIds};
-use chronoscope_core::facts::submit::{
+use chronoscope_core::grammar::depiction::{self, Perspective};
+use chronoscope_core::grammar::event;
+use chronoscope_core::grammar::ids::IngesterRunId;
+use chronoscope_core::grammar::image::{self, ImageMedium};
+use chronoscope_core::grammar::lifecycle::DurationalRole;
+use chronoscope_core::nonempty::NonEmptyVec;
+use chronoscope_core::store::memory::{MemoryFactStore, MemoryIds};
+use chronoscope_core::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact, commit_facts,
 };
-use chronoscope_core::ids::{WikidataEntityId, WikidataPropertyId};
-use chronoscope_core::nonempty::NonEmptyVec;
 use chronoscope_integrations::wikidata::{CommonsFilename, WikidataEntity, url_for_filename};
 
 use crate::wikidata::handlers::extract_link_references;
@@ -595,14 +595,14 @@ mod tests {
 
     use chrono::{Datelike, TimeZone};
 
-    use chronoscope_core::facts::attribute::NameType;
-    use chronoscope_core::facts::lifecycle::{DurationalKind, LifetimeEventKind, PointKind};
-    use chronoscope_core::facts::listing::summaries_in_bbox;
-    use chronoscope_core::facts::memory::MemoryEntityId;
-    use chronoscope_core::facts::projection::{member_lineage, project_entity};
-    use chronoscope_core::facts::store::FactStore;
-    use chronoscope_core::facts::typed;
     use chronoscope_core::geo::{Bbox, GeoPoint};
+    use chronoscope_core::grammar::attribute::NameType;
+    use chronoscope_core::grammar::lifecycle::{DurationalKind, LifetimeEventKind, PointKind};
+    use chronoscope_core::listing::summaries_in_bbox;
+    use chronoscope_core::projection::{member_lineage, project_entity};
+    use chronoscope_core::store::FactStore;
+    use chronoscope_core::store::memory::MemoryEntityId;
+    use chronoscope_core::typed;
     use chronoscope_integrations::wikidata::{
         Claim, CoordinateValue, DataValue, EntityRefValue, Label, LanguageCode, PropertyId, Rank,
         RevisionId, SiteId, Sitelink, Snak, TimeValue, WikidataEntityType, WikidataId,

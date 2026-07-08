@@ -17,11 +17,11 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use chronoscope_core::facts::memory::{MemoryFactStore, MemoryImageId};
-use chronoscope_core::facts::projection::{member_lineage, project_entity, project_image};
-use chronoscope_core::facts::schema::{EntityStream, ImageStream};
-use chronoscope_core::facts::store::{EntityView, FactStore, ImageView};
-use chronoscope_core::facts::typed;
+use chronoscope_core::projection::{member_lineage, project_entity, project_image};
+use chronoscope_core::store::memory::{MemoryFactStore, MemoryImageId};
+use chronoscope_core::store::schema::{EntityStream, ImageStream};
+use chronoscope_core::store::{EntityView, FactStore, ImageView};
+use chronoscope_core::typed;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_dev::{ImageResolveMode, load_curated_fact_store, resolve_fact_store_images};
 use chronoscope_workers::{HttpClient, ReqwestClient};

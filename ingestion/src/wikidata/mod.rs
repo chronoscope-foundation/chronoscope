@@ -21,10 +21,10 @@ pub mod parsing;
 pub mod stream;
 pub mod usage;
 
-use chronoscope_core::facts::citations::{
+use chronoscope_core::external_ids::{WikidataEntityId, WikidataPropertyId};
+use chronoscope_core::grammar::citations::{
     Excerpt, ExcerptError, ExternalSource, FactualCitation, WikidataField,
 };
-use chronoscope_core::ids::{WikidataEntityId, WikidataPropertyId};
 use chronoscope_core::nonempty::NonEmptyVec;
 use chronoscope_integrations::wikidata::{Claim, Rank};
 

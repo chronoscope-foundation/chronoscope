@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use chronoscope_core::facts::citations::ExternalReference;
-use chronoscope_core::ids::{OsmElementType, OsmId, PleiadesPlaceId, WikidataPropertyId};
+use chronoscope_core::external_ids::{OsmElementType, OsmId, PleiadesPlaceId, WikidataPropertyId};
+use chronoscope_core::grammar::citations::ExternalReference;
 use chronoscope_integrations::wikidata::{Claim, PropertyId};
 use url::Url;
 

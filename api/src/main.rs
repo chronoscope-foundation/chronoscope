@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config, default_dns_resolver};
-use chronoscope_core::facts::memory::MemoryFactStore;
+use chronoscope_core::store::memory::MemoryFactStore;
 use chronoscope_db::Database;
 use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,

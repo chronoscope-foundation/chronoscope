@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chronoscope_api_client::client::{ApiError, AuthClient};
-use chronoscope_core::facts::memory::{MemoryFactStore, MemoryImageId};
+use chronoscope_core::store::memory::{MemoryFactStore, MemoryImageId};
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{

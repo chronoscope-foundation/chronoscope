@@ -10,7 +10,7 @@ use serde_json::json;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use chronoscope_core::facts::memory::MemoryEntityId;
+use chronoscope_core::store::memory::MemoryEntityId;
 
 use crate::api;
 use crate::maplibre;

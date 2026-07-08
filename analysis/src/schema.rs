@@ -13,7 +13,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub use chronoscope_core::facts::geometry::RleMask;
+pub use chronoscope_core::grammar::geometry::RleMask;
 
 /// DINOv3 CLS embedding dimensionality.
 pub const EMBEDDING_DIM: usize = 1024;

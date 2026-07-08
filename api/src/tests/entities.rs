@@ -11,21 +11,21 @@ use std::collections::HashMap;
 use chrono::{DateTime, TimeZone, Utc};
 
 use chronoscope_api_client::{ClickAction, MarkersResponse, client::ApiError};
-use chronoscope_core::facts::assertions::{FactualAssertion, JudgmentAssertion};
-use chronoscope_core::facts::attribute::{self, NameText, NameType};
-use chronoscope_core::facts::bookend::ConstructionFact;
-use chronoscope_core::facts::citations::{
+use chronoscope_core::geo::{GeoPoint, Meters};
+use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion};
+use chronoscope_core::grammar::attribute::{self, NameText, NameType};
+use chronoscope_core::grammar::bookend::ConstructionFact;
+use chronoscope_core::grammar::citations::{
     Excerpt, ExternalSource, FactualCitation, JudgmentSource, Language,
 };
-use chronoscope_core::facts::depiction::{self, Perspective};
-use chronoscope_core::facts::ids::UserId;
-use chronoscope_core::facts::image::{self, ImageMedium};
-use chronoscope_core::facts::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
-use chronoscope_core::facts::submit::{
+use chronoscope_core::grammar::depiction::{self, Perspective};
+use chronoscope_core::grammar::ids::UserId;
+use chronoscope_core::grammar::image::{self, ImageMedium};
+use chronoscope_core::location::{Location, UnresolvedLocation};
+use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
+use chronoscope_core::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact, commit_facts,
 };
-use chronoscope_core::geo::{GeoPoint, Meters};
-use chronoscope_core::location::{Location, UnresolvedLocation};
 
 use super::TestContext;
 use crate::cdn::tests::TEST_CDN_BASE_URL;

@@ -409,12 +409,12 @@ use std::collections::BTreeSet;
 
 use chronoscope_core::Claimed;
 use chronoscope_core::date::{DateBound, DatePrecision, UncertainDate};
-use chronoscope_core::facts::citations::ExternalReference;
-use chronoscope_core::facts::lifecycle::{DamageCause, MoveMethod, Usage};
-use chronoscope_core::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
-use chronoscope_core::facts::typed::{Attributed, Bounded, EventDetail, InteriorEvent, MomentView};
+use chronoscope_core::grammar::citations::ExternalReference;
+use chronoscope_core::grammar::lifecycle::{DamageCause, MoveMethod, Usage};
 use chronoscope_core::location::{LocationReference, UnresolvedLocation};
 use chronoscope_core::moment::TransitionRole;
+use chronoscope_core::store::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
+use chronoscope_core::typed::{Attributed, Bounded, EventDetail, InteriorEvent, MomentView};
 
 /// Fetch entity detail using the typed API client and flatten it into the
 /// view model the panel renders.

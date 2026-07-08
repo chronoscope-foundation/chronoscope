@@ -13,7 +13,7 @@ use std::pin::Pin;
 use futures_util::FutureExt;
 use futures_util::stream::{self, Stream};
 
-use chronoscope_core::facts::memory::MemoryEntityId;
+use chronoscope_core::store::memory::MemoryEntityId;
 
 use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,

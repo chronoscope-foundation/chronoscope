@@ -23,8 +23,8 @@
 //! Entity-scale things — individual buildings, the Forbidden City as a complex,
 //! a fortress, a citadel — are first-class entities with their own entity id.
 //! Containment between them is expressed by
-//! [`crate::facts::attribute::Fact::Relationship`] with
-//! [`crate::facts::attribute::EntityRelationType::Contains`], not by a location
+//! [`crate::grammar::attribute::Fact::Relationship`] with
+//! [`crate::grammar::attribute::EntityRelationType::Contains`], not by a location
 //! reference.
 //!
 //! Region-scale things — cities, neighborhoods, contested geographical areas
@@ -41,8 +41,8 @@ use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::external_ids::{OhmId, OsmElementType, OsmId};
 use crate::geo::{GeoPoint, GeoPointError, Meters, SphereCap, SpherePoint};
-use crate::ids::{OhmId, OsmElementType, OsmId};
 
 /// Sanity bound on a circle's uncertainty radius: a circle wider than this
 /// almost certainly signals a unit slip or a bad resolution, not a real claim.
@@ -1071,7 +1071,7 @@ impl<'de> Deserialize<'de> for UnresolvedLocation {
 ///
 /// These need external resolution (geocoding, OSM/OHM lookup, etc.) to produce
 /// a [`Location`]. References are region-scale: entity-scale containment lives
-/// on [`crate::facts::attribute::Fact::Relationship`], not here. See the
+/// on [`crate::grammar::attribute::Fact::Relationship`], not here. See the
 /// module-level "Entity vs. region scope" note.
 #[serde_with::skip_serializing_none]
 #[grammar_type]

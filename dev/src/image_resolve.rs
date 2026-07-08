@@ -35,11 +35,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_api::state::ResolvedImageMedia;
-use chronoscope_core::facts::memory::{MemoryError, MemoryFactStore, MemoryImageId};
-use chronoscope_core::facts::projection::{member_lineage, project_image};
-use chronoscope_core::facts::schema::ImageStream;
-use chronoscope_core::facts::store::{FactStore, ImageView};
-use chronoscope_core::facts::typed;
+use chronoscope_core::projection::{member_lineage, project_image};
+use chronoscope_core::store::memory::{MemoryError, MemoryFactStore, MemoryImageId};
+use chronoscope_core::store::schema::ImageStream;
+use chronoscope_core::store::{FactStore, ImageView};
+use chronoscope_core::typed;
 use chronoscope_db::media_store::MediaStore;
 use chronoscope_workers::url_fetcher::{ContentType, detect_content_type, store_image};
 use chronoscope_workers::{HttpClient, HttpRequest, HttpResponse};
@@ -418,12 +418,12 @@ mod tests {
     /// A store of two images, each with a distinct source URL — enough for the
     /// Fetch loop to make two paced network requests.
     async fn two_image_store() -> Result<MemoryFactStore, BoxError> {
-        use chronoscope_core::facts::assertions::FactualAssertion;
-        use chronoscope_core::facts::citations::{Excerpt, ExternalSource, FactualCitation};
-        use chronoscope_core::facts::ids::UserId;
-        use chronoscope_core::facts::image;
-        use chronoscope_core::facts::memory::MemoryIds;
-        use chronoscope_core::facts::submit::{
+        use chronoscope_core::grammar::assertions::FactualAssertion;
+        use chronoscope_core::grammar::citations::{Excerpt, ExternalSource, FactualCitation};
+        use chronoscope_core::grammar::ids::UserId;
+        use chronoscope_core::grammar::image;
+        use chronoscope_core::store::memory::MemoryIds;
+        use chronoscope_core::submit::{
             Commit, CommitAuthor, Decl, ImageIdx, SubmitFact, commit_facts,
         };
 

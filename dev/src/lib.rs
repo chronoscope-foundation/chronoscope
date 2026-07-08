@@ -16,7 +16,7 @@ use std::time::Duration;
 use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config};
-use chronoscope_core::facts::memory::MemoryFactStore;
+use chronoscope_core::store::memory::MemoryFactStore;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId};
 use chronoscope_workers::analysis::AnalysisWorker;

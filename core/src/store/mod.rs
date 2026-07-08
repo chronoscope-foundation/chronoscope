@@ -1,0 +1,547 @@
+//! Persistence layer — holding facts and serving them back.
+//!
+//! The store owns the [`FactStore`] / [`FactView`] trait surface plus the
+//! machinery around it:
+//!
+//! - [`schema`] — the read query vocabulary ([`schema::Bbox`],
+//!   [`schema::TimeRange`], [`schema::FactPage`], [`schema::EquivClass`]) and
+//!   the per-subject stream enums ([`schema::EntityStream`] /
+//!   [`schema::EventStream`] / [`schema::ImageStream`]). Each subject kind has a
+//!   single canonical equivalence (and entities a single canonical edge
+//!   relation), all implicit — there are no per-subject relation enums.
+//! - [`pagination`] — the generic cursor→stream adapter every walk pages on.
+//! - [`memory`] — the in-memory [`memory::MemoryFactStore`] backend.
+//!
+//! The store trait's associated types are written in [`submit`](crate::submit)'s
+//! data types ([`Commit`](crate::submit::Commit),
+//! [`StoredFact`](crate::submit::StoredFact),
+//! [`SubmitResult`](crate::submit::SubmitResult),
+//! [`FactLookup`](crate::submit::FactLookup),
+//! [`SubmitError`](crate::submit::SubmitError)), while `submit`'s pipeline and
+//! matcher consume this trait. So `store` and `submit` are co-recursive peers,
+//! read together, rather than a clean one-directional stack.
+//!
+//! - [`FactStore`] is the writeable handle: it owns the clock
+//!   ([`Self::next_fact_id`], [`Self::now`]), accepts commits
+//!   ([`Self::submit_commit`]), and builds snapshot-scoped read views
+//!   ([`Self::no_later_than`]).
+//! - [`FactView`] is a snapshot-scoped read handle with subject-agnostic
+//!   methods (fact lookup, snapshot inquiry).
+//!
+//! Subject-parametric reads live on one companion trait per subject kind:
+//! [`EntityView`], [`EventView`], [`ImageView`]. Each does equivalence
+//! resolution, indexed walks, and backlink walks.
+//!
+//! The view traits are generic over the [`FactStore`] `S` and carry no
+//! associated types — they read the id kinds and error type off `S`, so a
+//! store and its views share one id vocabulary and one error type.
+//!
+//! Trait methods spell `async fn` as `fn ... -> impl Future + Send` to make
+//! the `Send` bound explicit; clippy's `async_fn_in_trait` rejects the
+//! implicit form under `-D warnings`.
+//!
+//! ## Snapshot semantics
+//!
+//! [`FactId`] is a `u64` newtype; every value including zero is valid.
+//! Snapshots and pagination cursors are plain [`FactId`] under "next id"
+//! semantics:
+//!
+//! - [`Self::next_fact_id`] returns the next id the store would mint — one
+//!   past the highest stored fact, or `FactId::new(0)` on an empty store.
+//! - `no_later_than(snapshot) -> View` is an exclusive upper bound: the
+//!   view exposes facts with `id < snapshot`. `FactId::new(0)` is the
+//!   empty-store view; every lookup returns [`FactLookup::Future`] or
+//!   [`FactLookup::Unknown`].
+//! - [`FactView::snapshot`] returns the bound the view was pinned at.
+//! - Every paginated walk pages on an opaque resume token: `None` opens the
+//!   walk, `Some(token)` resumes at the previous page's token. The backlink
+//!   walks (`all_facts_about_*`) and `walk_events` page on
+//!   [`Cursor`](Self::Cursor); the class walks (`walk_entity_classes` /
+//!   `walk_image_classes`) page on [`ClassCursor`](Self::ClassCursor). A caller
+//!   threads the token back verbatim, never constructing or inspecting it, so a
+//!   walk's inclusive-vs-exclusive resume polarity stays the backend's own
+//!   business. A page's token is `None` when the walk is exhausted, `Some` when
+//!   there may be more, regardless of this page's size, since a conforming
+//!   backend may return a short or empty page that still carries a token. Page
+//!   size is never a completion signal; only the token is.
+//!
+//! [`Self::next_fact_id`] gives the scalar watermark; [`Self::now`] returns
+//! a snapshot view directly (its method doc says why it isn't a default
+//! composing the two).
+//!
+//! ## Transaction-scoped writes
+//!
+//! Callers enter a transaction via [`Self::with_tx`], submit commits through
+//! the supplied [`Self::Tx`] handle, and return `Ok` to commit or
+//! `Err`/panic to roll back. The submit sequence is match → resolve/mint →
+//! validate → insert. It reads existing state to match declarations and
+//! check cross-fact rules before inserting, so the whole sequence runs under
+//! one transaction — a held mutex for the in-memory backend, a SQL
+//! transaction for a SQL backend — to keep a concurrent writer from slipping
+//! between the reads and the insert.
+//!
+//! The closure-scoped `with_tx` shape (rather than `begin_tx` / `commit_tx`)
+//! lets the trait carry the brand-pattern `for<'brand>` HRTB.
+//!
+//! ## Cross-store safety
+//!
+//! The `for<'brand>` HRTB plus the invariant `'brand` on `Tx<'brand>` stops
+//! a tx from one store reaching another store of the same type. Each
+//! `with_tx(...)` mints a fresh existential `'brand`, so passing a tx from
+//! `store_a.with_tx(...)` into `store_b.with_tx(...)`'s closure fails to
+//! typecheck — the brands are distinct existentials and the lifetime is
+//! invariant. The closure is the only way to name a `Tx<'brand>`, and the
+//! returned future is bounded by `'brand`, so handles can't leak past it.
+//!
+//! `'brand` is a type-level marker, not a borrow; backends carry their state
+//! on `&self`. [`MemoryTx`](crate::store::memory::MemoryTx) is a zero-size
+//! sentinel. A SQL backend puts a `sqlx::Transaction` inside `Tx<'brand>`;
+//! the brand still gates which `with_tx` body it threads through.
+
+pub mod memory;
+pub(crate) mod pagination;
+pub mod schema;
+
+use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
+
+use crate::grammar::ids::{FactId, IdScheme};
+use crate::nonempty::NonEmptyVec;
+use crate::store::schema::{
+    ClassPage, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
+};
+use crate::submit;
+use crate::submit::{FactLookup, StoredFact, SubmitError, SubmitResult};
+
+// ============================================================================
+// Store id-projection aliases
+// ============================================================================
+
+/// The entity id kind of store `S`'s scheme.
+pub type EntityIdOf<S> = <<S as FactStore>::Ids as IdScheme>::Entity;
+/// The lifetime-event id kind of store `S`'s scheme.
+pub type EventIdOf<S> = <<S as FactStore>::Ids as IdScheme>::Event;
+/// The image id kind of store `S`'s scheme.
+pub type ImageIdOf<S> = <<S as FactStore>::Ids as IdScheme>::Image;
+
+/// Producer-form commit consumed by [`FactStore::submit_commit`], pinned to
+/// a store's id scheme. An alias to keep signatures readable and clippy's
+/// `type_complexity` quiet.
+pub type SubmitCommitInput<S> = submit::Commit<<S as FactStore>::Ids>;
+
+/// Output of [`FactStore::submit_commit`]. The [`SubmitCommitError`] carries
+/// the store's id scheme so a rejection surfaces the offending id typed, not
+/// stringified.
+pub type SubmitCommitOutput<S> = Result<
+    SubmitResult<<S as FactStore>::Ids>,
+    SubmitCommitError<<S as FactStore>::Error, <S as FactStore>::Ids>,
+>;
+
+/// Result of [`FactView::fact`] for a view over store `S`.
+pub type FactLookupOutput<S> = Result<FactLookup<<S as FactStore>::Ids>, <S as FactStore>::Error>;
+
+// ============================================================================
+// FactStore — writeable handle
+// ============================================================================
+
+/// Writeable fact-store handle. Owns the clock and the commit endpoint;
+/// builds snapshot-scoped read views via [`Self::no_later_than`] /
+/// [`Self::now`].
+///
+/// `Error` is backend failures (SQL connection, I/O). Submit-pipeline
+/// failures (rule violations, index out-of-range) are domain errors and flow
+/// through [`SubmitError`] on a separate channel.
+///
+/// `Sized` is a supertrait because the view traits take the store as a
+/// type-parameter argument (`FactView<Self>`). Stores are always concrete
+/// handles, never `dyn FactStore`, so the bound is free and lets the
+/// `View<'a>` GAT name `FactView<Self>`.
+pub trait FactStore: Send + Sync + Sized {
+    /// Backend-specific error type for non-domain failures.
+    type Error: Debug + Send + Sync;
+
+    /// The persistent id scheme this backend mints and references — its
+    /// entity / event / image id kinds bundled behind one
+    /// [`IdScheme`]. Shape varies by backend (`u64`-newtypes in-memory,
+    /// something else for SQL); the trait pins only [`IdScheme`], whose
+    /// associated [`SchemeId`](crate::grammar::ids::SchemeId) kinds carry the
+    /// clone / order / hash / serde / schema / display bounds the store, view,
+    /// and submit surface use.
+    type Ids: IdScheme;
+
+    /// Opaque pagination cursor. Each page of a paginated walk
+    /// (`all_facts_about_*`, `walk_*`) reports a `next_cursor` of this type;
+    /// a generic caller threads it straight back as the next `after` without
+    /// constructing or inspecting it. Its shape is the backend's — a [`FactId`]
+    /// in-memory, a compound key for a SQL backend keying off several columns.
+    ///
+    /// `Send` because the walk futures are `Send` and the cursor rides inside
+    /// one, both in each page and in [`paginate`](crate::store::pagination::paginate)'s
+    /// resume state.
+    type Cursor: Send;
+
+    /// Opaque cursor for a class walk over subject `Rep`. Kept apart from
+    /// [`Self::Cursor`] because a class walk pages a `(representative, fact_id)`
+    /// key, not a bare fact id — in-memory it is `(Rep, FactId)`, a SQL backend
+    /// a compound key over the same two columns. A generic caller threads it
+    /// straight back as the next `after` without inspecting it.
+    ///
+    /// `Send` for the same reason as [`Self::Cursor`]; `Rep: Send` since the
+    /// cursor embeds the representative.
+    type ClassCursor<Rep>: Send
+    where
+        Rep: Send;
+
+    /// Branded transaction handle threaded through [`Self::submit_commit`].
+    /// `'brand` is a fresh existential minted per [`Self::with_tx`] call; it
+    /// tags handles to their call site so the type system can refuse
+    /// cross-instance misuse, and has no runtime role.
+    ///
+    /// In-memory backends hold a `MutexGuard` in the handle; SQL backends
+    /// hold a `sqlx::Transaction`. Dropping the handle before
+    /// [`Self::with_tx`]'s closure completes rolls back.
+    type Tx<'brand>: Send + 'brand
+    where
+        Self: 'brand;
+
+    /// The borrowed snapshot-scoped read view this store produces. The bound
+    /// aggregates [`FactView`] and the three per-subject view traits so
+    /// consumers can call any read method on a `Self::View<'_>` without
+    /// re-binding. The view reads its id kinds and error type off `Self`.
+    type View<'a>: FactView<Self> + EntityView<Self> + EventView<Self> + ImageView<Self> + 'a
+    where
+        Self: 'a;
+
+    /// Run `f` inside a fresh transaction. The closure receives `&Self` and
+    /// `&mut Self::Tx<'brand>`, where `'brand` is a fresh existential per
+    /// call, so a tx from one `with_tx` call can't reach another store's
+    /// closure. This is the brand pattern (cf. `GhostCell`, `qcell::TCell`).
+    ///
+    /// `f` takes `&Self` rather than capturing one: the `for<'brand>` HRTB
+    /// would force an externally-captured `&self` to be `'static`, so the
+    /// store reference is threaded in instead.
+    ///
+    /// The store opens the transaction, runs `f`, commits on `Ok` and rolls
+    /// back on `Err`. Backend-level failures (`begin`, `commit`) flow through
+    /// `Result<R, Self::Error>`; submit-pipeline errors live inside `R` —
+    /// typically `R = Result<T, SubmitCommitError<Self::Error>>`.
+    fn with_tx<F, R>(&self, f: F) -> impl Future<Output = Result<R, Self::Error>> + Send
+    where
+        F: for<'brand> FnOnce(
+                &'brand Self,
+                &'brand mut Self::Tx<'brand>,
+            ) -> Pin<Box<dyn Future<Output = R> + Send + 'brand>>
+            + Send,
+        R: Send;
+
+    /// Submit a commit bundle inside the supplied transaction. Derives the
+    /// [`CommitId`](crate::grammar::ids::CommitId) via `Commit::id()` (JCS +
+    /// SHA-256) and dedups against the commit cache, resolves every
+    /// declaration to a persistent id (`Existing` passes through, `Local`
+    /// mints fresh), rewrites each fact's bundle-local indices to the
+    /// resolved ids, and inserts. A matcher match on a `Local` decl is
+    /// persisted as a machine-authored identity judgment in a companion
+    /// commit, reported via `SubmitResult::companion_commit_id`.
+    ///
+    /// The `tx` borrow is `&mut` so the caller can't overlap two
+    /// `submit_commit` calls on one handle; sequential commits inside one
+    /// transaction are fine.
+    fn submit_commit<'brand, 'tx>(
+        &'tx self,
+        tx: &'tx mut Self::Tx<'brand>,
+        commit: SubmitCommitInput<Self>,
+    ) -> impl Future<Output = SubmitCommitOutput<Self>> + Send + 'tx
+    where
+        Self: 'brand,
+        'brand: 'tx;
+
+    /// The next [`FactId`] this store would mint — one past the highest
+    /// stored fact, or `FactId::new(0)` on an empty store (the value
+    /// [`Self::no_later_than`] accepts to pin an empty-store view).
+    fn next_fact_id(&self) -> impl Future<Output = Result<FactId, Self::Error>> + Send;
+
+    /// A read view pinned at `snapshot` (exclusive upper bound): the view
+    /// exposes facts with `id < snapshot`. `FactId::new(0)` is the
+    /// empty-store view — every lookup returns `Future` / `Unknown`.
+    fn no_later_than(&self, snapshot: FactId) -> Self::View<'_>;
+
+    /// Snapshot the current latest state. Implemented directly so a SQL
+    /// backend can pin the snapshot in one round-trip (`SELECT max(fact_id)`
+    /// inside the view-constructing query) rather than the two a default
+    /// composing [`Self::next_fact_id`] + [`Self::no_later_than`] would take.
+    /// Either form is a snapshot at some recent point; a writer landing
+    /// mid-read isn't included.
+    fn now(&self) -> impl Future<Output = Result<Self::View<'_>, Self::Error>> + Send;
+}
+
+/// Aggregate error for `submit_commit`: a submit-pipeline domain error or a
+/// backend failure, in one enum so the return type stays `Result<_, _>`.
+/// `Submit` carries every rule violation the pipeline found in one batch;
+/// backend failures carry backend diagnostics.
+///
+/// `E` is the backend error; `R` is the backend's id scheme, threaded into
+/// [`SubmitError`] so a rejection carries the offending id typed. The scheme
+/// appears only in the `Submit` arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitCommitError<E, R: IdScheme> {
+    /// A submit-pipeline run rejected the bundle, carrying the non-empty
+    /// batch of every rule it violated.
+    Submit(NonEmptyVec<SubmitError<R::Entity, R::Event, R::Image>>),
+    /// A backend failure (I/O, transaction abort, etc.).
+    Backend(E),
+}
+
+impl<E, R: IdScheme> std::fmt::Display for SubmitCommitError<E, R>
+where
+    E: std::fmt::Display,
+    R::Entity: std::fmt::Display,
+    R::Event: std::fmt::Display,
+    R::Image: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Submit(errs) => {
+                write!(
+                    f,
+                    "submit pipeline rejected commit ({} error(s)):",
+                    errs.len()
+                )?;
+                for e in errs {
+                    write!(f, "\n  - {e}")?;
+                }
+                Ok(())
+            }
+            Self::Backend(e) => write!(f, "backend failure: {e}"),
+        }
+    }
+}
+
+impl<E, R: IdScheme> std::error::Error for SubmitCommitError<E, R>
+where
+    E: std::fmt::Debug + std::fmt::Display,
+    R::Entity: std::fmt::Display,
+    R::Event: std::fmt::Display,
+    R::Image: std::fmt::Display,
+{
+}
+
+impl<E, R: IdScheme> From<SubmitError<R::Entity, R::Event, R::Image>> for SubmitCommitError<E, R> {
+    fn from(e: SubmitError<R::Entity, R::Event, R::Image>) -> Self {
+        Self::Submit(NonEmptyVec::singleton(e))
+    }
+}
+
+// ============================================================================
+// FactView — schema-agnostic read handle
+// ============================================================================
+
+/// Snapshot-scoped read handle, subject-agnostic methods only — see
+/// [`EntityView`] / [`EventView`] / [`ImageView`] for the rest.
+///
+/// Every method here and on the companion traits is filtered to facts with
+/// `id < snapshot()` not retracted by any fact below that bound.
+///
+/// Generic over the [`FactStore`] `S`: id kinds and error type come from `S`,
+/// so the trait has no associated types of its own.
+pub trait FactView<S: FactStore>: Send + Sync {
+    /// The exclusive-upper-bound [`FactId`] this view is pinned at; it exposes
+    /// facts with `id < snapshot()`. `FactId::new(0)` is the empty-store view.
+    fn snapshot(&self) -> FactId;
+
+    /// Look up a fact by id, preserving the four outcomes (active, retracted,
+    /// future, unknown).
+    fn fact(&self, fact_id: FactId) -> impl Future<Output = FactLookupOutput<S>> + Send;
+
+    /// Whether a commit with `id` was recorded at-or-before this snapshot. A
+    /// retracted commit still counts as existing — it was once recorded, so
+    /// re-retracting it targets something real.
+    ///
+    /// Commit visibility isn't gated by a `FactId` bound: the submit pipeline
+    /// records a commit's metadata alongside its facts, so "recorded
+    /// at-or-before this snapshot" is the same cut the per-fact bound
+    /// expresses. The submit-time
+    /// [`RetractCommit`](crate::grammar::assertions::MetaAssertion::RetractCommit)
+    /// validator uses this to reject a retraction whose target was never
+    /// recorded ([`SubmitError::CommitNotFound`]).
+    fn commit_known(
+        &self,
+        id: &crate::grammar::ids::CommitId,
+    ) -> impl Future<Output = Result<bool, S::Error>> + Send;
+
+    /// Where `id` sits relative to this view's snapshot — see [`FactPlacement`].
+    ///
+    /// A read snapshot has no in-flight commit, so it never reports `InFlight`
+    /// — only `Committed` or `Absent`. A commit-in-preparation view (the submit
+    /// union view) additionally reports `InFlight` for facts this commit mints.
+    fn placement(&self, id: FactId)
+    -> impl Future<Output = Result<FactPlacement, S::Error>> + Send;
+}
+
+/// Where a [`FactId`] sits relative to the commit a view is preparing.
+///
+/// The meta-rules read this to classify a retract/supersede target: a target
+/// must predate the in-flight commit ([`Self::Committed`]), not be minted
+/// inside it ([`Self::InFlight`]) and not be missing ([`Self::Absent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactPlacement {
+    /// No such fact at this view's snapshot — a future id or one never minted.
+    Absent,
+    /// Minted in the in-flight commit this view is preparing.
+    InFlight,
+    /// A fact at-or-before the snapshot, predating any in-flight commit.
+    Committed,
+}
+
+/// Store-pinned [`StoredFact`] alias, to keep signatures returning
+/// `FactPage` over a store's id shape readable.
+pub type StoredFactOf<S> = StoredFact<<S as FactStore>::Ids>;
+
+/// One page of a store `S`'s paginated walk over subject `Subj`: rows of the
+/// store's stored facts resumed by its opaque [`FactStore::Cursor`]. An alias to
+/// keep the walk return types readable and clippy's `type_complexity` quiet.
+pub type WalkPage<S, Subj> = FactPage<StoredFactOf<S>, Subj, <S as FactStore>::Cursor>;
+
+/// One page of a store `S`'s class walk over subject `Subj`:
+/// `(representative, fact_id)` rows resumed by its opaque
+/// [`FactStore::ClassCursor`]. The class-walk analogue of [`WalkPage`].
+pub type ClassWalkPage<S, Subj> = ClassPage<Subj, <S as FactStore>::ClassCursor<Subj>>;
+
+// ============================================================================
+// EntityView — entity-parametric reads
+// ============================================================================
+
+/// Entity-parametric reads over a snapshot view. Entities have one
+/// canonical equivalence (`SameEntity`) and one canonical directed-edge
+/// relation (`Topological`), both implicit — no relation parameter to pass.
+pub trait EntityView<S: FactStore>: FactView<S> {
+    /// The class representative of `member` under `SameEntity` at this
+    /// snapshot. A member with no incident edges (or unknown to the store)
+    /// is its own representative.
+    fn entity_representative(
+        &self,
+        member: &EntityIdOf<S>,
+    ) -> impl Future<Output = Result<EntityIdOf<S>, S::Error>> + Send;
+
+    /// The full `SameEntity` equivalence class of `member` at this
+    /// snapshot — representative plus every member.
+    fn entity_class(
+        &self,
+        member: &EntityIdOf<S>,
+    ) -> impl Future<Output = Result<EquivClass<EntityIdOf<S>>, S::Error>> + Send;
+
+    /// Walk entity-touching facts via an index as `(representative, fact_id)`
+    /// rows, class-scoped by `SameEntity`.
+    ///
+    /// `after` is a resume token: `None` opens the walk from the first row,
+    /// `Some(cursor)` resumes at the previous page's returned `next`. Rows come
+    /// ordered by `(representative, fact_id)`, so a class's rows stay contiguous
+    /// across page boundaries.
+    ///
+    /// A page's `next_class` must resume the walk strictly past the last row's
+    /// representative, and must be `Some` whenever a representative greater than
+    /// it remains. A rep-enumerating consumer (the viewport listing) drives the
+    /// walk by `next_class` to visit each class once, so a backend that reports
+    /// `None` while a greater representative remains truncates that consumer.
+    fn walk_entity_classes<'a>(
+        &'a self,
+        stream: &'a EntityStream<'a>,
+        after: Option<S::ClassCursor<EntityIdOf<S>>>,
+        limit: std::num::NonZeroUsize,
+    ) -> impl Future<Output = Result<ClassWalkPage<S, EntityIdOf<S>>, S::Error>> + Send + 'a;
+
+    /// Paginated backlink walk — "which facts mention this entity?". `after` is
+    /// a resume token: `None` opens the walk, `Some(cursor)` resumes at the
+    /// previous page's returned `next_cursor`. Each page's `next_cursor` is an
+    /// opaque token: `Some` means thread it back as the next `after` — there may
+    /// be more, regardless of page size — and `None` means the walk is exhausted.
+    fn all_facts_about_entity(
+        &self,
+        entity: &EntityIdOf<S>,
+        after: Option<S::Cursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> impl Future<Output = Result<WalkPage<S, EntityIdOf<S>>, S::Error>> + Send;
+}
+
+// ============================================================================
+// EventView — event-parametric reads
+// ============================================================================
+
+/// Event-parametric reads over a snapshot view. Events have one canonical
+/// equivalence (`SameEvent`), implicit; no edge relations today.
+pub trait EventView<S: FactStore>: FactView<S> {
+    /// The class representative of `member` under `SameEvent` at this
+    /// snapshot.
+    fn event_representative(
+        &self,
+        member: &EventIdOf<S>,
+    ) -> impl Future<Output = Result<EventIdOf<S>, S::Error>> + Send;
+
+    /// The full `SameEvent` equivalence class of `member` at this snapshot.
+    fn event_class(
+        &self,
+        member: &EventIdOf<S>,
+    ) -> impl Future<Output = Result<EquivClass<EventIdOf<S>>, S::Error>> + Send;
+
+    /// Walk event-touching facts via an index, class-scoped by `SameEvent`.
+    /// `after` is a resume token — `None` opens the walk, `Some(cursor)` resumes
+    /// at the previous page's returned `next_cursor`.
+    fn walk_events<'a>(
+        &'a self,
+        stream: &'a EventStream<'a>,
+        after: Option<S::Cursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> impl Future<Output = Result<WalkPage<S, EventIdOf<S>>, S::Error>> + Send + 'a;
+
+    /// Paginated backlink walk — "which facts mention this event?". `after` is a
+    /// resume token: `None` opens the walk, `Some(cursor)` resumes at the
+    /// previous page's returned `next_cursor`.
+    fn all_facts_about_event(
+        &self,
+        event: &EventIdOf<S>,
+        after: Option<S::Cursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> impl Future<Output = Result<WalkPage<S, EventIdOf<S>>, S::Error>> + Send;
+}
+
+// ============================================================================
+// ImageView — image-parametric reads
+// ============================================================================
+
+/// Image-parametric reads over a snapshot view. Images have one canonical
+/// equivalence (`SameArtifact`), implicit; no edge relations today.
+pub trait ImageView<S: FactStore>: FactView<S> {
+    /// The class representative of `member` under `SameArtifact` at this
+    /// snapshot.
+    fn image_representative(
+        &self,
+        member: &ImageIdOf<S>,
+    ) -> impl Future<Output = Result<ImageIdOf<S>, S::Error>> + Send;
+
+    /// The full `SameArtifact` equivalence class of `member` at this
+    /// snapshot.
+    fn image_class(
+        &self,
+        member: &ImageIdOf<S>,
+    ) -> impl Future<Output = Result<EquivClass<ImageIdOf<S>>, S::Error>> + Send;
+
+    /// Walk image-touching facts via an index as `(representative, fact_id)`
+    /// rows, class-scoped by `SameArtifact`. See
+    /// [`EntityView::walk_entity_classes`] for the row shape and pagination.
+    fn walk_image_classes<'a>(
+        &'a self,
+        stream: &'a ImageStream<'a>,
+        after: Option<S::ClassCursor<ImageIdOf<S>>>,
+        limit: std::num::NonZeroUsize,
+    ) -> impl Future<Output = Result<ClassWalkPage<S, ImageIdOf<S>>, S::Error>> + Send + 'a;
+
+    /// Paginated backlink walk — "which facts mention this image?". `after` is a
+    /// resume token: `None` opens the walk, `Some(cursor)` resumes at the
+    /// previous page's returned `next_cursor`.
+    fn all_facts_about_image(
+        &self,
+        image: &ImageIdOf<S>,
+        after: Option<S::Cursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> impl Future<Output = Result<WalkPage<S, ImageIdOf<S>>, S::Error>> + Send;
+}

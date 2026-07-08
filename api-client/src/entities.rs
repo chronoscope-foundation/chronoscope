@@ -1,18 +1,18 @@
 //! Entity API response types — read side of the fact store.
 //!
 //! These are thin aliases over the fact store's own `typed`/`listing` DTOs
-//! (`chronoscope_core::facts::*`), concretized to the in-memory backend's id
+//! (`chronoscope_core::{typed, listing}`), concretized to the in-memory backend's id
 //! scheme. The server projects a `MemoryFactStore` snapshot straight into
 //! these shapes; there's no separate wire-format translation layer.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use chronoscope_core::facts::depiction::Perspective;
-use chronoscope_core::facts::ids::FactId;
-use chronoscope_core::facts::image::ImageMedium;
-use chronoscope_core::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
-use chronoscope_core::facts::{listing, typed};
+use chronoscope_core::grammar::depiction::Perspective;
+use chronoscope_core::grammar::ids::FactId;
+use chronoscope_core::grammar::image::ImageMedium;
+use chronoscope_core::store::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
+use chronoscope_core::{listing, typed};
 
 /// Full entity detail — the fact store's typed projection, concretized to the
 /// in-memory backend's id scheme. Wrapped in [`EntityDetail`] by

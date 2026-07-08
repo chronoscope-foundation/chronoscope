@@ -10,10 +10,10 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use chronoscope_api_client::{ClickAction, EntityPickerEntry, Marker};
-use chronoscope_core::facts::listing::EntitySummary;
-use chronoscope_core::facts::memory::{MemoryEntityId, MemoryImageId};
-use chronoscope_core::facts::typed::{self, find_by_language};
 use chronoscope_core::geo::{self, GeoPoint};
+use chronoscope_core::listing::EntitySummary;
+use chronoscope_core::store::memory::{MemoryEntityId, MemoryImageId};
+use chronoscope_core::typed::{self, find_by_language};
 use dropshot::HttpError;
 
 use crate::limits;
