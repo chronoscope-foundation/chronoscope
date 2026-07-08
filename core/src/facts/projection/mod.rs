@@ -32,27 +32,34 @@ use std::future::{Future, ready};
 use futures_util::{TryFutureExt, TryStreamExt};
 
 use crate::algebra::semiring::{Lineage, Semiring};
-use crate::facts::ids::FactId;
+use crate::facts::ids::{FactId, IdScheme};
 use crate::facts::pagination::{PAGE_SIZE, paginate};
 use crate::facts::schema::{EquivClass, FactPage};
 use crate::facts::store::{
     EntityIdOf, EntityView, EventIdOf, EventView, FactStore, ImageIdOf, ImageView, StoredFactOf,
     WalkPage,
 };
+use crate::facts::submit::StoredFact;
 
-/// The member-aware lineage closure: a `(source id, citation)` pair becomes the
-/// singleton atom `{(id, citation)}`. The provenance public callers pass to
-/// [`project_entity`] for [`MemberLineage`]-typed projections; keeping the id in
-/// the atom is what makes [`connecting_glue`] computable.
-pub fn member_lineage<EntId, ImgId>(
-    id: &EntId,
-    citation: &Citation<ImgId>,
-) -> MemberLineage<EntId, ImgId>
+/// The member-aware lineage closure: the fact's citation becomes the singleton
+/// atom `{(id, citation)}`, keyed by the source id the fact spoke to. The
+/// provenance public callers pass to [`project_entity`] / [`project_image`] for
+/// [`MemberLineage`]-typed projections; keeping the id in the atom is what makes
+/// [`connecting_glue`] computable. A meta fact cites nothing, lifting to the
+/// multiplicative identity.
+pub fn member_lineage<R, Id>(
+    _fact_id: &FactId,
+    id: &Id,
+    fact: &StoredFact<R>,
+) -> MemberLineage<Id, R::Image>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    R: IdScheme,
+    Id: Ord + Clone,
 {
-    Lineage::Of([(id.clone(), citation.clone())].into_iter().collect())
+    match merge::citation_of(fact) {
+        Some(citation) => Lineage::Of([(id.clone(), citation)].into_iter().collect()),
+        None => Lineage::one(),
+    }
 }
 
 /// Drain each subject's backlink walk into one `FactId`-keyed map. A fact
@@ -88,10 +95,11 @@ where
 /// Resolves the class, drains every member's backlinks (aggregation is
 /// class-level — each source's facts stay on its own id), takes the entity→event
 /// hop to reach interior events, and folds them per field with the no-winners
-/// join. Each fact is tagged through `provenance` against the source id it spoke
-/// to — its own subject for an entity-level claim, the reaching member for an
-/// interior event. All reads are snapshot-scoped and active-only, so the
-/// projection carries no retraction logic of its own.
+/// join. Each fact is tagged through `provenance`, which sees the fact's id and
+/// the whole stored fact alongside the source id it spoke to — its own subject
+/// for an entity-level claim, the reaching member for an interior event. All
+/// reads are snapshot-scoped and active-only, so the projection carries no
+/// retraction logic of its own.
 ///
 /// An id no committed fact names drains to an empty backlink set: the class is a
 /// lone singleton with nothing to fold, so the entity does not exist at this
@@ -105,7 +113,7 @@ where
 pub async fn project_entity<S, V, T>(
     view: &V,
     entity_id: EntityIdOf<S>,
-    provenance: impl Fn(&EntityIdOf<S>, &Citation<ImageIdOf<S>>) -> T,
+    provenance: impl Fn(&FactId, &EntityIdOf<S>, &StoredFactOf<S>) -> T,
 ) -> Result<
     Option<(
         EquivClass<EntityIdOf<S>>,
@@ -169,7 +177,7 @@ where
 pub async fn project_image<S, V, T>(
     view: &V,
     image_id: ImageIdOf<S>,
-    provenance: impl Fn(&ImageIdOf<S>, &Citation<ImageIdOf<S>>) -> T,
+    provenance: impl Fn(&FactId, &ImageIdOf<S>, &StoredFactOf<S>) -> T,
 ) -> Result<
     Option<(
         EquivClass<ImageIdOf<S>>,
