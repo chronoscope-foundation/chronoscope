@@ -1073,7 +1073,7 @@ mod tests {
             "the QID reference reads back off the projection"
         );
 
-        let construction_year = entity.timeline.iter().find_map(|entry| {
+        let construction_year = entity.timeline.events().iter().find_map(|entry| {
             if let typed::EventDetail::Constructed { period, .. } = &entry.detail {
                 period.started.possible.earliest()
             } else {
@@ -1087,14 +1087,14 @@ mod tests {
         );
 
         assert!(
-            entity.timeline.iter().any(|entry| matches!(
+            entity.timeline.events().iter().any(|entry| matches!(
                 &entry.detail,
                 typed::EventDetail::Interior {
                     kind: typed::InteriorEvent::Damaged { .. },
                     ..
                 }
             )),
-            "the fire reads back as a Damaged timeline entry"
+            "the fire reads back as a Damaged timeline event"
         );
         Ok(())
     }

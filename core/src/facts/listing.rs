@@ -182,7 +182,7 @@ where
             if let Some(point) = extract_point(&entity)
                 && bbox.contains(&point)
             {
-                let (earliest, latest) = timeline_span(&entity.timeline);
+                let (earliest, latest) = timeline_span(entity.timeline.events());
                 let thumbnail = representative_image(&entity);
                 summaries.push(EntitySummary {
                     id: entity.id,
@@ -212,14 +212,14 @@ where
 }
 
 /// The date span of a parsed timeline: the earliest lower bound and latest upper
-/// bound across every dated entry, each `None` when nothing dates that side.
+/// bound across every dated event, each `None` when nothing dates that side.
 fn timeline_span<EvtId, ImgId>(
-    timeline: &[typed::TimelineEntry<EvtId, ImgId>],
+    events: &[typed::TimelineEvent<EvtId, ImgId>],
 ) -> (Option<NaiveDate>, Option<NaiveDate>) {
     let mut earliest: Option<NaiveDate> = None;
     let mut latest: Option<NaiveDate> = None;
-    for entry in timeline {
-        for date in typed::entry_date_bounds(&entry.detail) {
+    for event in events {
+        for date in typed::entry_date_bounds(&event.detail) {
             if let Some(lo) = date.possible.earliest() {
                 earliest = Some(earliest.map_or(lo, |cur| cur.min(lo)));
             }

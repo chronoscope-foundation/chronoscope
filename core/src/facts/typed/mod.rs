@@ -27,9 +27,11 @@ use crate::facts::projection::{
 
 mod entity;
 mod image;
+mod timeline;
 
 pub use entity::*;
 pub use image::*;
+pub use timeline::*;
 
 /// A value with the citations that attribute it — the additive-field mirror,
 /// where membership carries no consensus/extent split.
@@ -249,6 +251,18 @@ where
         perspective: bracket(&entry.value.perspective),
         sources: sources(&entry.support),
     }
+}
+
+/// Whether a flattened slot carries a claim: an `Absent` consensus never touched
+/// it, so a date slot is undated. Shared by the moment layer and the timeline's
+/// date resolution.
+pub(crate) fn has_date<V, ImgId>(bounded: &Bounded<V, ImgId>) -> bool {
+    !matches!(bounded.consensus, Consensus::Absent)
+}
+
+/// The slot as a present bound, or `None` when it is absent.
+pub(crate) fn dated_bound<V, ImgId>(bounded: &Bounded<V, ImgId>) -> Option<&Bounded<V, ImgId>> {
+    has_date(bounded).then_some(bounded)
 }
 
 /// Whether a bracket carries a claim — its extent support is past the semiring

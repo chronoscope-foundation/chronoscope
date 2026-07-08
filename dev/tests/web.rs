@@ -286,9 +286,9 @@ async fn test_entity_click_opens_detail() -> TestResult {
 
         // The panel renders "Loading..." while fetching the entity detail.
         // Wait for a loaded-state token instead of polling for absence of
-        // "Loading..." — "Construction completed" is asserted on below, so
+        // "Loading..." — "Construction started" is asserted on below, so
         // its presence proves the fetch settled and rendered.
-        t.wait_for_body_text("Construction completed").await?;
+        t.wait_for_body_text("Construction started").await?;
 
         let panel_text = t.text("[role='complementary']").await?;
 
@@ -304,20 +304,20 @@ async fn test_entity_click_opens_detail() -> TestResult {
             format!("Panel should show timeline section, got: {panel_text}"),
         )?;
 
-        // Hagia Sophia's Constructed has only `completed_at` (year 0537).
-        // The year must reach the panel and be labeled as the completion
-        // endpoint, not the bare verb.
+        // Hagia Sophia's construction carries only a start bound (its P571
+        // inception, year 0537). The year must reach the panel labeled as the
+        // start endpoint, not the bare verb.
         check(
             panel_text.contains("537"),
             format!(
-                "Panel should show Hagia Sophia's construction completion year 537, got: {panel_text}"
+                "Panel should show Hagia Sophia's construction start year 537, got: {panel_text}"
             ),
         )?;
         check(
-            panel_text.contains("Construction completed"),
+            panel_text.contains("Construction started"),
             format!(
                 "Panel should label Hagia Sophia's dated construction row as \
-                 'Construction completed' (not the bare 'Constructed'), got: {panel_text}"
+                 'Construction started' (not the bare 'Constructed'), got: {panel_text}"
             ),
         )?;
 

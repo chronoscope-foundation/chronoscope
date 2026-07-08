@@ -56,4 +56,4 @@ pub use ids::{
 pub use location::{
     ConflictStatus, Distance, Location, LocationError, LocationReference, UnresolvedLocation,
 };
-pub use moment::{Moment, TransitionRole, decompose, structural_edges, topological_order};
+pub use moment::TransitionRole;

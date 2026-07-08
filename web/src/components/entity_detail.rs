@@ -412,9 +412,9 @@ use chronoscope_core::date::{DateBound, DatePrecision, UncertainDate};
 use chronoscope_core::facts::citations::ExternalReference;
 use chronoscope_core::facts::lifecycle::{DamageCause, MoveMethod, Usage};
 use chronoscope_core::facts::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
-use chronoscope_core::facts::typed::{Attributed, Bounded, EventDetail, InteriorEvent};
+use chronoscope_core::facts::typed::{Attributed, Bounded, EventDetail, InteriorEvent, MomentView};
 use chronoscope_core::location::{LocationReference, UnresolvedLocation};
-use chronoscope_core::moment::{Moment, TransitionRole, decompose, topological_order};
+use chronoscope_core::moment::TransitionRole;
 
 /// Fetch entity detail using the typed API client and flatten it into the
 /// view model the panel renders.
@@ -428,10 +428,7 @@ async fn fetch_entity_detail(
         images,
     } = client.get_entity(id).await.map_err(|e| e.to_string())?;
 
-    let timeline = topological_order(decompose(&entity.timeline))
-        .iter()
-        .map(moment_row)
-        .collect();
+    let timeline = entity.timeline.moments().map(moment_row).collect();
     let links = entity
         .external_refs
         .iter()
@@ -456,15 +453,16 @@ async fn fetch_entity_detail(
 
 // ==================== Moment → row ====================
 
-/// Map one ordered [`Moment`] to its display row: the role's label (bare when a
-/// durational pair collapsed to a single undated moment), the endpoint's date,
-/// and the secondary text the terminal moment of the event carries.
-fn moment_row(moment: &Moment<MemoryEventId, MemoryImageId>) -> TimelineRow {
+/// Map one ordered [`MomentView`] to its display row: the role's label (bare when
+/// a durational pair collapsed to a single undated moment), the endpoint's date,
+/// and — when this moment carries it — the event's secondary text.
+fn moment_row(moment: MomentView<'_, MemoryEventId, MemoryImageId>) -> TimelineRow {
     TimelineRow {
         label: moment_label(moment.role, moment.collapsed).to_string(),
         date: moment.date.map(|b| b.possible.clone()),
-        description: carries_description(moment.role, moment.collapsed)
-            .then(|| entry_description(&moment.entry.detail))
+        description: moment
+            .carries_description
+            .then(|| entry_description(&moment.event.detail))
             .flatten(),
     }
 }
@@ -501,13 +499,6 @@ fn moment_label(role: TransitionRole, collapsed: bool) -> &'static str {
         (Designated, _) => "Designated",
         (Ambiguous, _) => "Event",
     }
-}
-
-/// Whether this moment carries the event's secondary text. A durational start
-/// (the roles with a `durational_end`) defers to its completion endpoint;
-/// points, collapsed durationals, and completion endpoints carry it.
-fn carries_description(role: TransitionRole, collapsed: bool) -> bool {
-    collapsed || role.durational_end().is_none()
 }
 
 /// The secondary line for a timeline entry: the kind-specific summary (a damage

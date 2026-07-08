@@ -32,15 +32,18 @@ pub struct Name<ImgId> {
     pub sources: Vec<Citation<ImgId>>,
 }
 
-/// The first item whose language tag (read via `get_lang`) starts with
-/// `prefix`, or `None` when none match. The caller owns the fallback for an
-/// unmatched preference — the API's `Accept-Language` negotiation builds its
+/// The first item whose language tag's primary subtag (read via `get_lang`)
+/// equals `prefix`, or `None` when none match. Primary-subtag equality keeps
+/// `en` distinct from `enm` (Middle English). The caller owns the fallback for
+/// an unmatched preference — the API's `Accept-Language` negotiation builds its
 /// per-prefix match on this.
 pub fn find_by_language<'a, T, F>(items: &'a [T], prefix: &str, get_lang: F) -> Option<&'a T>
 where
     F: Fn(&T) -> &str,
 {
-    items.iter().find(|item| get_lang(item).starts_with(prefix))
+    items
+        .iter()
+        .find(|item| get_lang(item).split('-').next() == Some(prefix))
 }
 
 /// A directed relationship to a neighbor: the bare target id plus the relation
@@ -142,7 +145,9 @@ pub enum InteriorEvent<ImgId> {
     },
 }
 
-/// One timeline entry: the lifecycle detail and the citations behind it.
+/// One timeline event: the lifecycle detail and the citations behind it. The
+/// data-carrier a [`Timeline`] stores once; the moment sequence references it by
+/// index.
 ///
 /// `sources` is universal: an interior event carries its kind/existence
 /// citations (so a bare `Modified` with no dates keeps its attribution); a
@@ -151,7 +156,7 @@ pub enum InteriorEvent<ImgId> {
 #[serde(bound(
     deserialize = "EvtId: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
 ))]
-pub struct TimelineEntry<EvtId, ImgId> {
+pub struct TimelineEvent<EvtId, ImgId> {
     pub detail: EventDetail<EvtId, ImgId>,
     pub sources: Vec<Citation<ImgId>>,
 }
@@ -169,7 +174,7 @@ pub struct Entity<EntId: Ord, EvtId, ImgId> {
     pub relations: Vec<Relation<EntId, ImgId>>,
     pub external_refs: Vec<Attributed<ExternalReference, ImgId>>,
     pub location: Bounded<UnresolvedLocation, ImgId>,
-    pub timeline: Vec<TimelineEntry<EvtId, ImgId>>,
+    pub timeline: Timeline<EvtId, ImgId>,
     /// Images depicting this entity, with their per-depiction linkage.
     pub depictions: Vec<Depiction<ImgId, ImgId>>,
     pub merged_from: MergeProvenance<EntId, ImgId>,
@@ -198,8 +203,8 @@ where
             .iter()
             .map(|(reference, entry)| factset(entry, reference.clone()))
             .collect();
-        let timeline = timeline(projected);
-        let location = entity_location(&projected.construction.location, &timeline);
+        let timeline = Timeline::build(timeline_events(projected));
+        let location = entity_location(&projected.construction.location, timeline.events());
         let depictions = projected
             .depictions
             .iter()
@@ -530,21 +535,22 @@ where
         .collect()
 }
 
-/// Assemble the timeline in a deterministic structural order: construction
-/// first, the interior events by their id, demolition last. Display ordering —
-/// interleaving endpoints by date — is the [`moment`](crate::moment) layer's job.
-fn timeline<EntId, EvtId, ImgId>(
+/// Assemble the timeline events in a deterministic structural order:
+/// construction first, the interior events by their id, demolition last. Display
+/// ordering — interleaving endpoints by date — is the [`moment`](crate::moment)
+/// layer's job, folded into [`Timeline::build`].
+fn timeline_events<EntId, EvtId, ImgId>(
     projected: &projection::Entity<EntId, EvtId, ImgId, MemberLineage<EntId, ImgId>>,
-) -> Vec<TimelineEntry<EvtId, ImgId>>
+) -> Vec<TimelineEvent<EvtId, ImgId>>
 where
     EntId: Ord + Clone,
     EvtId: Ord + Clone + std::fmt::Debug,
     ImgId: Ord + Clone,
 {
-    let mut entries: Vec<TimelineEntry<EvtId, ImgId>> = Vec::new();
+    let mut events: Vec<TimelineEvent<EvtId, ImgId>> = Vec::new();
 
     if bookend_present(&projected.construction) {
-        entries.push(TimelineEntry {
+        events.push(TimelineEvent {
             detail: EventDetail::Constructed {
                 period: bookend_period(&projected.construction),
                 location: bracket(&projected.construction.location),
@@ -555,7 +561,7 @@ where
 
     for (event_id, entry) in &projected.events {
         let (kind, sources) = interior_event(&entry.value, event_id);
-        entries.push(TimelineEntry {
+        events.push(TimelineEvent {
             detail: EventDetail::Interior {
                 id: event_id.clone(),
                 descriptions: descriptions(&entry.value.descriptions),
@@ -566,7 +572,7 @@ where
     }
 
     if bookend_present(&projected.demolition) {
-        entries.push(TimelineEntry {
+        events.push(TimelineEvent {
             detail: EventDetail::Demolished {
                 period: bookend_period(&projected.demolition),
             },
@@ -574,7 +580,7 @@ where
         });
     }
 
-    entries
+    events
 }
 
 /// The best-known landing date of a `Moved` entry: its completion if dated,
@@ -587,21 +593,21 @@ fn landing_date<ImgId>(period: &Period<ImgId>) -> Option<NaiveDate> {
         .or_else(|| period.started.possible.earliest())
 }
 
-/// The entity-level location: the destination of the latest `Moved` entry in the
-/// built timeline by best-known landing date, else the construction location. The
+/// The entity-level location: the destination of the latest `Moved` event in the
+/// timeline by best-known landing date, else the construction location. The
 /// `Option<NaiveDate>` ordering puts a dated move above an undated one and the
 /// later landing on top.
 fn entity_location<EntId, EvtId, ImgId>(
     construction_location: &Bracket<UnresolvedLocation, MemberLineage<EntId, ImgId>>,
-    timeline: &[TimelineEntry<EvtId, ImgId>],
+    events: &[TimelineEvent<EvtId, ImgId>],
 ) -> Bounded<UnresolvedLocation, ImgId>
 where
     EntId: Ord + Clone,
     ImgId: Ord + Clone,
 {
-    timeline
+    events
         .iter()
-        .filter_map(|entry| match &entry.detail {
+        .filter_map(|event| match &event.detail {
             EventDetail::Interior {
                 kind: InteriorEvent::Moved { period, to, .. },
                 ..
@@ -845,6 +851,7 @@ mod tests {
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         let entry = out
             .timeline
+            .events()
             .iter()
             .find(|e| {
                 matches!(
@@ -1057,6 +1064,7 @@ mod tests {
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         let kinds: Vec<&str> = out
             .timeline
+            .events()
             .iter()
             .map(|e| match &e.detail {
                 EventDetail::Constructed { .. } => "constructed",
@@ -1169,5 +1177,22 @@ mod tests {
             "the entity-side depiction flattens its perspective"
         );
         Ok(())
+    }
+
+    #[test]
+    fn find_by_language_matches_primary_subtag_exactly() {
+        // A two-letter request resolves to its exact primary subtag: "en" picks
+        // the English name, leaving "enm" (Middle English) for an "enm" request.
+        let names = [("enm", "Olde Englisc"), ("en", "English")];
+        assert_eq!(
+            find_by_language(&names, "en", |n| n.0).map(|n| n.1),
+            Some("English"),
+            "en resolves to the exact en tag, even with enm listed first"
+        );
+        assert_eq!(
+            find_by_language(&names, "enm", |n| n.0).map(|n| n.1),
+            Some("Olde Englisc"),
+            "enm resolves to its own tag"
+        );
     }
 }
