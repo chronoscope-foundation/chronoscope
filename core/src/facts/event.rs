@@ -186,6 +186,11 @@ pub enum Fact<EntId: Ord, EvtId: Ord> {
     MoveMethod { event: EvtId, method: MoveMethod },
     /// New set of active uses after a
     /// [`crate::facts::lifecycle::PointKind::UsageChanged`] event.
+    ///
+    /// Operational status — opened, closed, repurposed — is modeled as a
+    /// point-in-time transition. A fuller model would carry explicit in-use and
+    /// out-of-use intervals; the transition points approximate those spans at
+    /// the resolution sources supply.
     UsageChange {
         event: EvtId,
         /// The post-event usage set; empty represents closure or vacancy.

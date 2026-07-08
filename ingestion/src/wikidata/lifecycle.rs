@@ -677,14 +677,23 @@ pub fn build_lifecycles(
         });
     }
 
-    // 6. Add usage-transition events
+    // 6. Add usage-transition events, one per distinct claimed date. One
+    //    property can carry several genuine transitions — a station reopened
+    //    over decades — so each distinct date becomes its own event, and claims
+    //    sharing a date merge into one, pooling their citations.
     let mut push_usage = |at: Vec<CitedDate>, new_usages: Option<BTreeSet<Usage>>| {
-        let sort_key = earliest_of(&at);
-        if let Some(contribution) = usage_changed(at, new_usages, ctx) {
-            dated.push(DatedContribution {
-                contribution,
-                sort_key,
-            });
+        let mut by_date: BTreeMap<UncertainDate, Vec<CitedDate>> = BTreeMap::new();
+        for cited in at {
+            by_date.entry(cited.bound.clone()).or_default().push(cited);
+        }
+        for group in by_date.into_values() {
+            let sort_key = earliest_of(&group);
+            if let Some(contribution) = usage_changed(group, new_usages.clone(), ctx) {
+                dated.push(DatedContribution {
+                    contribution,
+                    sort_key,
+                });
+            }
         }
     };
     // P1619 official opening: a dated usage change with no claimed usage set.

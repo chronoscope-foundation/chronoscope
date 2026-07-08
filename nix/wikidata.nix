@@ -30,7 +30,7 @@ let
     #   - 8 distinct Italian regions total (state-level clustering)
     curated = {
       timestamp = "2022-01-03T00:00:00Z";
-      hash = "sha256-6jcOrNExkUgjUl44ncEEL1ukMYtUwu+wo8wGIDZEkvo=";
+      hash = "sha256-Q+YS0e4ZRnL+ivIBaGh5R8gZUX6nWeQPbZ0zGcV/+7E=";
       entities = {
         # Original test set (non-Italian + Chioggia)
         "Q243" = "Eiffel Tower";
@@ -42,6 +42,13 @@ let
         "Q5171466" = "Cornelius Vanderbilt II House";
         "Q5652831" = "William K. Vanderbilt House";
         "Q108584685" = "Vanderbilt Triple Palace";
+
+        # Usage-transition regression set: an entity's repeated openings must
+        # project as distinct events, not collapse into one conflicting event.
+        # BER opened once behind a long trail of deprecated planned dates;
+        # Bostancı station opened across several distinct years.
+        "Q160556" = "Berlin Brandenburg Airport";
+        "Q4947652" = "Bostancı railway station";
 
         # Rome (Lazio) — 4 entities for city-level multi-entity tests
         "Q192784" = "Trajan's Column";

@@ -15,12 +15,18 @@
 
 use chrono::{Datelike, TimeZone, Utc};
 use chronoscope_core::facts::ids::IngesterRunId;
+use chronoscope_core::facts::lifecycle::PointKind;
 use chronoscope_core::facts::listing::{EntitySummary, summaries_in_bbox};
 use chronoscope_core::facts::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
 use chronoscope_core::facts::store::FactStore;
 use chronoscope_core::facts::submit::commit_facts;
 use chronoscope_core::geo::{Bbox, GeoPoint};
+use chronoscope_core::ids::WikidataEntityId;
+use chronoscope_ingestion::wikidata::ItemContext;
 use chronoscope_ingestion::wikidata::commits::build_commit;
+use chronoscope_ingestion::wikidata::lifecycle::{
+    Contribution, EventShape, InteriorPayload, build_lifecycles,
+};
 use chronoscope_integrations::wikidata::WikidataEntity;
 use std::num::NonZeroUsize;
 
@@ -100,6 +106,77 @@ async fn placeable_in(
 
 fn has_name(s: &EntitySummary<MemoryEntityId, MemoryImageId>, name: &str) -> bool {
     s.names.iter().any(|n| n.text == name)
+}
+
+/// The `UsageChanged` interior events one entity extracts, split into openings
+/// (no usage payload) and ceased-use events (an empty usage set), each keyed by
+/// its earliest year. Populated across every lifecycle split.
+struct UsageTransitions {
+    openings: Vec<i32>,
+    ceased: Vec<i32>,
+}
+
+fn collect_usage_transitions(splits: &[Vec<Contribution>]) -> UsageTransitions {
+    let mut openings = Vec::new();
+    let mut ceased = Vec::new();
+    for split in splits {
+        for contribution in split {
+            let Contribution::Event(event) = contribution else {
+                continue;
+            };
+            let EventShape::Point {
+                kind: PointKind::UsageChanged,
+                at,
+            } = &event.shape
+            else {
+                continue;
+            };
+            let Some(year) = at
+                .iter()
+                .filter_map(|d| d.bound.earliest())
+                .map(|d| d.year())
+                .min()
+            else {
+                continue;
+            };
+            match &event.payload {
+                None => openings.push(year),
+                Some(InteriorPayload::UsageChange { new_usages }) if new_usages.is_empty() => {
+                    ceased.push(year);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    openings.sort_unstable();
+    ceased.sort_unstable();
+    UsageTransitions { openings, ceased }
+}
+
+/// Run the lifecycle extraction over one curated entity's claims, sorting its
+/// usage transitions. `None` when `WIKIDATA_ENTITIES_JSONL` is unset (the caller
+/// then skips); an `Err` when the QID is absent from the fetched set.
+fn usage_transitions(qid: &str) -> Result<Option<UsageTransitions>, BoxError> {
+    let Ok(path) = std::env::var("WIKIDATA_ENTITIES_JSONL") else {
+        eprintln!("WIKIDATA_ENTITIES_JSONL unset — skipping {qid} usage-transition check");
+        return Ok(None);
+    };
+    let content = std::fs::read_to_string(&path)?;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entity: WikidataEntity = serde_json::from_str(line)?;
+        if entity.id.as_str() != qid {
+            continue;
+        }
+        let entity_id =
+            WikidataEntityId::parse(entity.id.as_str()).map_err(|e| format!("{e:?}"))?;
+        let ctx = ItemContext::new(entity_id, entity.lastrevid.0)?;
+        let (splits, _warnings) = build_lifecycles(&entity.claims, &ctx);
+        return Ok(Some(collect_usage_transitions(&splits)));
+    }
+    Err(format!("curated entity {qid} not present in the fetched set").into())
 }
 
 #[tokio::test]
@@ -207,6 +284,60 @@ async fn demolish_rebuild_splits_into_two_dated_entities() -> Result<(), BoxErro
     assert!(
         years.len() >= 2,
         "the split entities carry distinct construction dates, got {years:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn ber_rank_filtered_openings_merge_to_a_single_2020_event() -> Result<(), BoxError> {
+    // Berlin Brandenburg Airport (Q160556) carries a preferred and a
+    // normal-rank P1619 opening at the same 2020-10-31 date behind a trail of
+    // deprecated planned openings. Rank-filtering drops the planned dates and
+    // the two same-date claims share one event, so exactly one opening survives.
+    let Some(transitions) = usage_transitions("Q160556")? else {
+        return Ok(());
+    };
+    assert_eq!(
+        transitions.openings,
+        vec![2020],
+        "one real opening survives the deprecated planned dates and the same-date merge"
+    );
+    assert!(
+        transitions.ceased.is_empty(),
+        "BER records no closure, got {:?}",
+        transitions.ceased
+    );
+    Ok(())
+}
+
+#[test]
+fn bostanci_projects_one_opening_per_distinct_date() -> Result<(), BoxError> {
+    // Bostancı railway station (Q4947652) records four distinct non-deprecated
+    // P1619 openings; each distinct date is its own transition event rather than
+    // parallel bounds on one event straddling a century and a half.
+    let Some(transitions) = usage_transitions("Q4947652")? else {
+        return Ok(());
+    };
+    assert_eq!(
+        transitions.openings,
+        vec![1874, 1910, 1969, 2019],
+        "one opening event per distinct non-deprecated date"
+    );
+    Ok(())
+}
+
+#[test]
+fn bostanci_closure_is_a_single_ceased_use_event() -> Result<(), BoxError> {
+    // The station's one P3999 closure (2013) is a normal-rank claim in the
+    // pinned snapshot, so it stands as its own ceased-use event, distinct from
+    // the openings rather than fused with them.
+    let Some(transitions) = usage_transitions("Q4947652")? else {
+        return Ok(());
+    };
+    assert_eq!(
+        transitions.ceased,
+        vec![2013],
+        "the closure is one ceased-use event at its own date"
     );
     Ok(())
 }
