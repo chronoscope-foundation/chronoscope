@@ -1,9 +1,9 @@
 //! Equivalence classes over the active identity edges of a [`ReadCore`]
-//! snapshot.
-
-use std::collections::{BTreeMap, BTreeSet};
+//! snapshot: the fact-bag scan feeding the backend-shared
+//! [`EquivAdjacency`].
 
 use super::{MemStoredFact, ReadCore};
+use crate::store::equiv::EquivAdjacency;
 use crate::store::schema::EquivClass;
 
 impl ReadCore<'_> {
@@ -16,22 +16,17 @@ impl ReadCore<'_> {
         edge_of: impl Fn(&MemStoredFact) -> Option<(S, S)>,
     ) -> EquivAdjacency<S>
     where
-        S: Copy + Ord + std::hash::Hash,
+        S: Copy + Ord,
     {
-        let mut adjacency: BTreeMap<S, Vec<S>> = BTreeMap::new();
-        for (fid, fact) in self.visible_facts() {
-            let Some((a, b)) = edge_of(fact) else {
-                continue;
-            };
+        EquivAdjacency::from_edges(self.visible_facts().filter_map(|(fid, fact)| {
+            let edge = edge_of(fact)?;
             // A retracted equivalence is no edge — retraction dissolves the
             // link at later snapshots.
             if self.retracted_by(fid).is_some() {
-                continue;
+                return None;
             }
-            adjacency.entry(a).or_default().push(b);
-            adjacency.entry(b).or_default().push(a);
-        }
-        EquivAdjacency { adjacency }
+            Some(edge)
+        }))
     }
 
     /// The equivalence class of `member` at this snapshot: the connected
@@ -44,37 +39,8 @@ impl ReadCore<'_> {
         edge_of: impl Fn(&MemStoredFact) -> Option<(S, S)>,
     ) -> EquivClass<S>
     where
-        S: Copy + Ord + std::hash::Hash,
+        S: Copy + Ord,
     {
         self.equiv_adjacency(edge_of).class_of(member)
-    }
-}
-
-/// Adjacency over the active identity edges at one snapshot — the reusable
-/// product of a single [`ReadCore::equiv_adjacency`] pass over the fact bag.
-pub(super) struct EquivAdjacency<S> {
-    adjacency: BTreeMap<S, Vec<S>>,
-}
-
-impl<S: Copy + Ord + std::hash::Hash> EquivAdjacency<S> {
-    /// The equivalence class of `member`: the connected component containing
-    /// it, with the minimum id as the canonical representative (deterministic
-    /// across re-queries of one snapshot). A member with no incident edge —
-    /// or one unknown to the store — is its own singleton class.
-    pub(super) fn class_of(&self, member: S) -> EquivClass<S> {
-        let mut members: BTreeSet<S> = BTreeSet::new();
-        let mut frontier = vec![member];
-        while let Some(m) = frontier.pop() {
-            if !members.insert(m) {
-                continue;
-            }
-            frontier.extend(self.adjacency.get(&m).into_iter().flatten().copied());
-        }
-        // `members` holds at least `member`, so the minimum always exists.
-        let representative = members.first().copied().unwrap_or(member);
-        EquivClass {
-            representative,
-            members,
-        }
     }
 }

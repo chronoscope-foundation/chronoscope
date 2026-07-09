@@ -197,17 +197,16 @@ pub async fn list_entities(
 
     let mut view = state.facts.now().await.map_err(fact_store_err)?;
     let page =
-        match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, cursor, limit).await
-    {
-        Ok(p) => p,
-        Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
-        Err(listing::ListError::SnapshotMismatch) => {
-            return error_with_cors(
-                http::StatusCode::BAD_REQUEST,
-                "cursor is from a stale snapshot; restart the listing without a cursor",
-            );
-        }
-    };
+        match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, cursor, limit).await {
+            Ok(p) => p,
+            Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
+            Err(listing::ListError::SnapshotMismatch) => {
+                return error_with_cors(
+                    http::StatusCode::BAD_REQUEST,
+                    "cursor is from a stale snapshot; restart the listing without a cursor",
+                );
+            }
+        };
 
     let next = page.next.map(|c| encode_cursor(&c)).transpose()?;
     let response = EntityListPage {
@@ -338,17 +337,17 @@ pub async fn list_markers(
     let mut view = state.facts.now().await.map_err(fact_store_err)?;
     let page =
         match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, None, limit).await {
-        Ok(p) => p,
-        Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
-        // No cursor is ever passed here, and `summaries_in_bbox` only checks
-        // snapshot staleness against a supplied cursor — unreachable in
-        // practice, handled rather than assumed away.
-        Err(listing::ListError::SnapshotMismatch) => {
-            return Err(internal_error_with_cors(
-                "unexpected snapshot mismatch with no cursor".to_string(),
-            ));
-        }
-    };
+            Ok(p) => p,
+            Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
+            // No cursor is ever passed here, and `summaries_in_bbox` only checks
+            // snapshot staleness against a supplied cursor — unreachable in
+            // practice, handled rather than assumed away.
+            Err(listing::ListError::SnapshotMismatch) => {
+                return Err(internal_error_with_cors(
+                    "unexpected snapshot mismatch with no cursor".to_string(),
+                ));
+            }
+        };
 
     // Serve each marker's representative thumbnail from our own `/media/{key}`.
     // The summary's thumbnail id is a class member; resolving it to the

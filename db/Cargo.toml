@@ -51,3 +51,5 @@ bytes.workspace = true
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# The backend-agnostic FactStore conformance suite.
+chronoscope-core = { path = "../core", features = ["sqlx", "test-support"] }

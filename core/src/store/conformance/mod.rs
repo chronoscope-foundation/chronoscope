@@ -2,9 +2,9 @@
 //!
 //! Store/view/submit semantics — submit round-trips, declaration resolution,
 //! content-address dedup, retraction visibility, walks and pagination,
-//! equivalence classes, transaction atomicity and poisoning — are contracts
-//! every backend owes, so their tests are written once, generic over the
-//! store, and stamped per backend:
+//! equivalence classes, transaction atomicity and rejected-submit
+//! containment — are contracts every backend owes, so their tests are
+//! written once, generic over the store, and stamped per backend:
 //!
 //! - [`cases`] holds the generic test bodies — each an `async fn` taking a
 //!   fresh store and returning [`TestResult`]. Assertions thread the ids a
@@ -18,9 +18,10 @@
 //!   case, individually named and reportable.
 //!
 //! Instantiating a backend takes three things: a store-builder expression (a
-//! future resolving to `Result<S, E>`, evaluated fresh per test), an
-//! [`UnmintedIds`] impl for the store, and `tokio` (`macros` + `rt`)
-//! available where the macro expands.
+//! future resolving to `Result<(S, Cx), E>`, evaluated fresh per test — `Cx`
+//! is backend context held alive for the test's duration, `()` when the
+//! store needs none), an [`UnmintedIds`] impl for the store, and `tokio`
+//! (`macros` + `rt`) available where the macro expands.
 //!
 //! ```ignore
 //! use chronoscope_core::store::conformance::UnmintedIds;
@@ -28,7 +29,7 @@
 //! impl UnmintedIds for MyFactStore { /* ids outside the mintable space */ }
 //!
 //! chronoscope_core::fact_store_conformance!(async {
-//!     Ok::<_, MyError>(MyFactStore::fresh().await?)
+//!     Ok::<_, MyError>((MyFactStore::fresh().await?, ()))
 //! });
 //! ```
 //!
@@ -63,20 +64,75 @@ pub trait UnmintedIds: FactStore {
 
 /// Stamp the fact-store conformance suite against one backend.
 ///
-/// `$build_store` is an expression evaluating to a future of `Result<S, E>`
-/// (`E: std::error::Error + 'static`) — a fresh empty store per test,
-/// re-evaluated for each. The store must implement
+/// `$build_store` is an expression evaluating to a future of
+/// `Result<(S, Cx), E>` (`E: std::error::Error + 'static`) — a fresh empty
+/// store per test, re-evaluated for each. `Cx` is backend context the test
+/// holds alive alongside the store (a file-backed store's tempdir); pass
+/// `()` when the store needs none. The store must implement
 /// [`UnmintedIds`](crate::store::conformance::UnmintedIds), and `tokio`
 /// (`macros` + `rt`) must be available where the macro expands.
 ///
 /// Each case becomes its own `#[tokio::test]`, so a backend's failures
-/// report under the case's name. The ignored cases pin contracts for reads
-/// the backends still stub (`walk_events`, event classes); they flip green
-/// once the read is implemented.
+/// report under the case's name. The suite-wide ignored cases pin contracts
+/// for reads every backend still stubs (`walk_events`, event classes); they
+/// flip green once the read is implemented.
+///
+/// The optional `ignore(...)` form marks additional cases `#[ignore]` for
+/// this backend only, each with a reason naming the capability the backend
+/// doesn't offer yet:
+///
+/// ```ignore
+/// chronoscope_core::fact_store_conformance!(
+///     async { MyFactStore::fresh().await },
+///     ignore(
+///         walk_entity_classes_group_submitted_facts_into_one_class:
+///             "class-stream walks are not implemented",
+///     )
+/// );
+/// ```
+///
+/// Ignored cases still compile and stay countable in the runner's ignored
+/// tally, so a backend's gaps are visible rather than silently absent. A
+/// name that isn't a real case fails to compile.
 #[macro_export]
 macro_rules! fact_store_conformance {
-    ($build_store:expr) => {
-        $crate::fact_store_conformance! { @cases $build_store =>
+    ($build_store:expr $(,)?) => {
+        $crate::fact_store_conformance!($build_store, ignore());
+    };
+    ($build_store:expr, ignore($($icase:ident: $ireason:literal),* $(,)?) $(,)?) => {
+        $crate::fact_store_conformance! { @expand ($) $build_store, [$(($icase, $ireason))*] }
+    };
+    (@expand ($d:tt) $build_store:expr, [$(($icase:ident, $ireason:literal))*]) => {
+        // Existence check: a renamed or removed case can't linger silently in
+        // an ignore list.
+        $( use $crate::store::conformance::cases::$icase as _; )*
+
+        // One arm per backend-ignored case name, matched ahead of the
+        // catch-all: listing a case ident routes its stamp through the
+        // `#[ignore]` arm, so name matching happens at macro-expansion time.
+        macro_rules! __fact_store_conformance_case {
+            $(
+                ($d(#[$d gattr:meta])* $icase) => {
+                    $d(#[$d gattr])*
+                    #[ignore = $ireason]
+                    #[tokio::test]
+                    async fn $icase() -> $crate::store::conformance::TestResult {
+                        let (store, _cx) = $build_store.await?;
+                        $crate::store::conformance::cases::$icase(store).await
+                    }
+                };
+            )*
+            ($d(#[$d attr:meta])* $d case:ident) => {
+                $d(#[$d attr])*
+                #[tokio::test]
+                async fn $d case() -> $crate::store::conformance::TestResult {
+                    let (store, _cx) = $build_store.await?;
+                    $crate::store::conformance::cases::$d case(store).await
+                }
+            };
+        }
+
+        $crate::fact_store_conformance! { @cases =>
             roundtrip_small_commit_through_fact_lookup,
             existing_decl_passes_through_to_supplied_id,
             local_decls_mint_distinct_newly_minted_ids,
@@ -112,9 +168,9 @@ macro_rules! fact_store_conformance {
             two_commits_share_one_with_tx_brand,
             err_from_with_tx_closure_rolls_back_submitted_commit,
             retract_commit_of_earlier_commit_in_same_tx_lands,
-            swallowed_submit_rejection_poisons_the_transaction,
+            swallowed_submit_rejection_leaves_nothing_durable,
             record_commit_marks_only_its_own_facts_committed,
-            overlapping_recorded_commits_fail_the_transaction_at_apply,
+            overlapping_recorded_commits_never_commit,
             retract_fact_targeting_same_commit_fact_rejected,
             retract_fact_targeting_prior_fact_accepted,
             supersede_fact_targeting_same_commit_fact_rejected,
@@ -172,14 +228,7 @@ macro_rules! fact_store_conformance {
             class_walk_next_class_cursor_skips_to_the_next_representative,
         }
     };
-    (@cases $build_store:expr => $($(#[$attr:meta])* $case:ident,)+) => {
-        $(
-            $(#[$attr])*
-            #[tokio::test]
-            async fn $case() -> $crate::store::conformance::TestResult {
-                let store = $build_store.await?;
-                $crate::store::conformance::cases::$case(store).await
-            }
-        )+
+    (@cases => $($(#[$attr:meta])* $case:ident,)+) => {
+        $( __fact_store_conformance_case! { $(#[$attr])* $case } )+
     };
 }

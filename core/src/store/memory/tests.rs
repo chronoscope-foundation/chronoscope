@@ -11,6 +11,7 @@ use crate::grammar::attribute::NameText;
 use crate::grammar::citations::Language;
 use crate::listing::{self, ListCursor, ListError};
 use crate::projection::{member_lineage, project_entity};
+use crate::store::SubmitCommitError;
 use crate::store::conformance::fixtures::{
     PAGE_100, commit_name, commit_result, commit_retract, construction_at,
     construction_location_in, fixed_time, has_event_fact, local_bundle, moved_kind, moved_to,
@@ -34,7 +35,9 @@ impl UnmintedIds for MemoryFactStore {
     }
 }
 
-crate::fact_store_conformance!(async { Ok::<_, std::convert::Infallible>(MemoryFactStore::new()) });
+crate::fact_store_conformance!(async {
+    Ok::<_, std::convert::Infallible>((MemoryFactStore::new(), ()))
+});
 
 // --- canonical-form wire boundary ---
 //
@@ -270,6 +273,46 @@ async fn swallowed_zero_staged_rejection_cannot_burn_counters() -> TestResult {
             .any(|e| matches!(e, SubmitError::UnknownExistingEntity { .. })),
         "got {errs:?}"
     );
+    Ok(())
+}
+
+/// This backend's failed submit scope poisons the transaction: a later submit on
+/// the same handle refuses as a backend error naming the poison instead of
+/// validating against the rejected staging, and a closure that swallows the
+/// rejection and returns `Ok` fails at apply rather than committing the
+/// leftovers.
+#[tokio::test]
+async fn swallowed_rejection_poisons_later_submits_and_the_apply() -> TestResult {
+    let store = MemoryFactStore::new();
+    // Decl 1 is never referenced: the bundle stages its one fact, then
+    // rejects with UnusedDeclaration.
+    let doomed: TestBundle = local_bundle(2, 0, 0, 0, vec![name_fact(0, "staged-then-rejected")?])?;
+    let healthy: TestBundle =
+        local_bundle(1, 0, 0, 10, vec![name_fact(0, "after-the-rejection")?])?;
+    let outcome = store
+        .with_tx(|s, tx| {
+            Box::pin(async move {
+                if s.submit_commit(tx, doomed).await.is_ok() {
+                    return Err("expected the submit to be rejected".to_owned());
+                }
+                let Err(SubmitCommitError::Backend(e)) = s.submit_commit(tx, healthy).await else {
+                    return Err("expected a backend error from the poisoned tx".to_owned());
+                };
+                let rendered = e.to_string();
+                if !rendered.contains("transaction poisoned")
+                    || !rendered.contains("an earlier submit failed")
+                {
+                    return Err(format!("expected the poison cause named, got {rendered}"));
+                }
+                Ok::<_, String>(())
+            })
+        })
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a poisoned transaction must fail at apply, got {outcome:?}"
+    );
+    assert_eq!(store.next_fact_id().await?, FactId::new(0));
     Ok(())
 }
 
@@ -765,7 +808,10 @@ async fn summaries_in_bbox_pins_snapshot() -> TestResult {
     )
     .await?;
     let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
-    let mut view = store.no_later_than(snapshot);
+    let mut view = store
+        .no_later_than(snapshot)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
 
     // A second in-box entity lands after the snapshot; the pinned view can't see it.
     commit_result(

@@ -11,6 +11,7 @@ use futures_util::TryStreamExt;
 use url::Url;
 
 use crate::date::{DatePrecision, UncertainDate};
+use crate::geo::{Bbox, GeoPoint, Meters};
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::grammar::attribute::{self, NameText, NameType};
 use crate::grammar::bookend;
@@ -21,6 +22,8 @@ use crate::grammar::ids::{CommitId, FactId, IdScheme, UserId};
 use crate::grammar::lifecycle::{
     DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind,
 };
+use crate::location::{Location, LocationReference, UnresolvedLocation};
+use crate::nonempty::NonEmptyVec;
 use crate::store::pagination::paginate;
 use crate::store::schema::{ClassRow, EntityStream, ImageStream};
 use crate::store::{
@@ -30,9 +33,6 @@ use crate::submit::{
     Commit as SubmitBundle, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitError,
     SubmitFact, SubmitResult, commit_facts,
 };
-use crate::geo::{Bbox, GeoPoint, Meters};
-use crate::location::{Location, LocationReference, UnresolvedLocation};
-use crate::nonempty::NonEmptyVec;
 
 use super::{TestError, TestResult};
 

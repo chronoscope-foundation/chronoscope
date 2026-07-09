@@ -47,10 +47,10 @@
 //! panics drops the [`MemoryTx`] — overlay and all — leaving `Inner`
 //! untouched, with no rollback path because nothing was mutated. The
 //! transaction is the unit of atomicity: a multi-commit closure that fails
-//! partway applies none of its commits. A failed submit poisons the
-//! transaction ([`FactWrite::poison`]): the write primitives and the apply
-//! refuse, so a closure that swallows the rejection can't commit its
-//! leftovers.
+//! partway applies none of its commits. The overlay can't unwind one
+//! submit's slice, so a failed [`FactWrite::with_submit_scope`] poisons the
+//! transaction: the write primitives and the apply refuse, and a closure
+//! that swallows the rejection can't commit its leftovers.
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::grammar::assertions::MetaAssertion;
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
+use crate::store::retraction::RetractionEdges;
 use crate::store::schema::{
     ClassPage, EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem,
     normalize_name,
@@ -318,7 +319,10 @@ impl<'a> ReadCore<'a> {
             return FactLookup::Future;
         }
         match self.fact_slot(fact_id) {
-            Some(fact) => self.resolve_active_or_retracted(fact_id, fact),
+            Some(fact) => match self.retracted_by(fact_id) {
+                Some(by) => FactLookup::Retracted { by },
+                None => FactLookup::Active(Box::new(fact.clone())),
+            },
             None => FactLookup::Unknown,
         }
     }
@@ -356,62 +360,11 @@ impl<'a> ReadCore<'a> {
         }
     }
 
-    /// A resolved slot: `Retracted` if an effective retractor exists at this
-    /// snapshot, else `Active`.
-    fn resolve_active_or_retracted(&self, fact_id: FactId, fact: &MemStoredFact) -> MemFactLookup {
-        match self.retracted_by(fact_id) {
-            Some(by) => FactLookup::Retracted { by },
-            None => FactLookup::Active(Box::new(fact.clone())),
-        }
-    }
-
-    /// The lowest [`FactId`] effectively retracting `fact_id` at this snapshot,
-    /// or `None`.
-    ///
-    /// Walks only the subgraph bearing on `fact_id` — the meta-facts retracting
-    /// it, the ones retracting those, and so on — not the whole index. Submit
-    /// validation forces every retractor's id above its target's, so the walk
-    /// climbs strictly (no cycle) and resolves high-to-low, each retractor's
-    /// status known before the fact it retracts. A fact is retracted by the
-    /// lowest of its retractors that is visible at this snapshot and not itself
-    /// effectively retracted.
-    fn retracted_by(&self, fact_id: FactId) -> Option<FactId> {
-        // No retractor edge in either source → active. The `?` returns None now,
-        // before the walk below allocates its frontier and subgraph.
-        self.retractor_ids(fact_id).next()?;
-        // Collect the facts reachable upward from `fact_id` through visible
-        // retractor edges. Edges climb in id, so the frontier drains and a
-        // shared retractor is collected once.
-        let mut subgraph: BTreeSet<FactId> = BTreeSet::new();
-        let mut frontier = vec![fact_id];
-        while let Some(id) = frontier.pop() {
-            if !subgraph.insert(id) {
-                continue;
-            }
-            frontier.extend(
-                self.retractor_ids(id)
-                    .filter(|candidate| candidate.get() < self.snapshot.get()),
-            );
-        }
-        // Resolve the subgraph high-to-low: each retractor resolves before the
-        // fact it retracts.
-        let mut retracted: HashMap<FactId, Option<FactId>> = HashMap::new();
-        for &id in subgraph.iter().rev() {
-            let by = self
-                .retractor_ids(id)
-                .filter(|candidate| candidate.get() < self.snapshot.get())
-                .filter(|candidate| retracted.get(candidate).copied().flatten().is_none())
-                .min();
-            retracted.insert(id, by);
-        }
-        retracted.get(&fact_id).copied().flatten()
-    }
-
     /// Every fact id retracting `id`, unioning the committed index with the
     /// in-flight pending overlay. A fact can be retracted by a pre-commit
     /// meta-fact (committed) and an in-commit one (pending) at once, so both
-    /// sources are walked.
-    fn retractor_ids(&self, id: FactId) -> impl Iterator<Item = FactId> + '_ {
+    /// indexes contribute.
+    fn retractors_of(&self, id: FactId) -> impl Iterator<Item = FactId> + '_ {
         let committed = self.retractors.get(&id).into_iter().flatten();
         let pending = self
             .pending_retractors
@@ -419,6 +372,36 @@ impl<'a> ReadCore<'a> {
             .into_iter()
             .flatten();
         committed.chain(pending).copied()
+    }
+
+    /// The retractor edges bearing on `fact_id`: a frontier walk over the
+    /// index maps materializing only the reachable subgraph — the same
+    /// closure the SQLite backend's recursive CTE fetches.
+    fn retraction_edges_for(&self, fact_id: FactId) -> RetractionEdges {
+        let mut edges: Vec<(FactId, FactId)> = Vec::new();
+        let mut visited: BTreeSet<FactId> = BTreeSet::new();
+        let mut frontier = vec![fact_id];
+        while let Some(id) = frontier.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            for retractor in self.retractors_of(id) {
+                edges.push((id, retractor));
+                frontier.push(retractor);
+            }
+        }
+        RetractionEdges::from_edges(edges)
+    }
+
+    /// The lowest [`FactId`] effectively retracting `fact_id` at this snapshot,
+    /// or `None` — the shared fixpoint
+    /// ([`retraction::effective_retractor`](crate::store::retraction::effective_retractor))
+    /// over the subgraph from [`Self::retraction_edges_for`].
+    fn retracted_by(&self, fact_id: FactId) -> Option<FactId> {
+        // Most facts have no retractor at all; answer without materializing.
+        self.retractors_of(fact_id).next()?;
+        let edges = self.retraction_edges_for(fact_id);
+        crate::store::retraction::effective_retractor(fact_id, self.snapshot, &edges)
     }
 
     /// Whether `id` names a recorded commit — committed, or recorded earlier
@@ -620,10 +603,12 @@ struct Pending {
     /// [`ReadCore::placement_at`] reports them [`FactPlacement::InFlight`];
     /// [`MemoryTx::record_commit`] moves exactly its commit's `fact_ids` in.
     recorded: BTreeSet<FactId>,
-    /// The cause a failed submit poisoned this transaction with. Once set,
-    /// the write primitives and [`apply_pending`] refuse — the failure may
-    /// have left staging and mints here, and committing them would store
-    /// facts no recorded commit stands behind.
+    /// Set by a failed [`FactWrite::with_submit_scope`]: this backend
+    /// cannot unwind a rejected submit's staging and mints, so its
+    /// conforming unwind poisons the transaction instead — the write
+    /// primitives and [`apply_pending`] refuse, naming the failure that
+    /// poisoned it, keeping facts no recorded commit stands behind out of
+    /// durability.
     poisoned: Option<String>,
     /// Metadata of commits recorded in this transaction, unioned with the
     /// committed map for `commit_known` and `RetractCommit` expansion, so a
@@ -783,7 +768,7 @@ impl CoreSource for MemoryTx<'_> {
     }
 }
 
-impl FactWrite<MemoryFactStore> for MemoryTx<'_> {
+impl<'brand> FactWrite<MemoryFactStore> for MemoryTx<'brand> {
     /// Mint a fresh entity id from the pending counter, bumping it. `Inner`
     /// is untouched — a transaction that never applies drops the mint with
     /// the rest of the pending state.
@@ -866,13 +851,38 @@ impl FactWrite<MemoryFactStore> for MemoryTx<'_> {
         Ok(())
     }
 
-    /// Poison the transaction, keeping the first cause — later failures
-    /// descend from it. The read surface stays answerable; the overlay it
-    /// sees is void along with the transaction.
-    fn poison(&mut self, cause: String) {
-        if self.pending.poisoned.is_none() {
-            self.pending.poisoned = Some(cause);
+    type Nested<'n>
+        = MemoryTx<'brand>
+    where
+        Self: 'n;
+
+    /// The overlay can't unwind one submit's slice, so a failed scope
+    /// poisons the transaction instead — writes and the apply step refuse
+    /// from here on. The read surface stays answerable; the overlay it sees
+    /// is void along with the transaction.
+    async fn with_submit_scope<'s, R, E, F>(&'s mut self, f: F) -> Result<Result<R, E>, MemoryError>
+    where
+        Self: 's,
+        R: Send,
+        E: std::fmt::Debug + Send,
+        F: for<'n> FnOnce(
+                &'n mut Self::Nested<'s>,
+            )
+                -> std::pin::Pin<Box<dyn Future<Output = Result<R, E>> + Send + 'n>>
+            + Send,
+    {
+        let result = f(self).await;
+        if let Err(e) = &result {
+            // One capped line of the inner error keeps later refusals
+            // diagnostic without replaying the full rejection; the first
+            // cause wins across nested scopes.
+            let cause: String = format!("an earlier submit failed: {e:?}")
+                .chars()
+                .take(200)
+                .collect();
+            self.pending.poisoned.get_or_insert(cause);
         }
+        Ok(result)
     }
 }
 
@@ -889,8 +899,8 @@ impl FactWrite<MemoryFactStore> for MemoryTx<'_> {
 // `MemoryFactStore`, so the bodies name `Memory*Id` / `MemoryError` directly.
 
 impl<Src: CoreSource + Send + Sync> FactView<MemoryFactStore> for Src {
-    fn snapshot(&self) -> FactId {
-        CoreSource::snapshot(self)
+    async fn snapshot(&mut self) -> Result<FactId, MemoryError> {
+        Ok(CoreSource::snapshot(self))
     }
 
     async fn fact(&mut self, fact_id: FactId) -> Result<MemFactLookup, MemoryError> {
@@ -1149,12 +1159,11 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
 /// recorded [`StoredCommit`]s, whose `fact_ids` map staged offsets to their
 /// commit.
 ///
-/// A poisoned transaction refuses to apply — the poison names the failed
-/// submit whose leftovers it would otherwise commit. The coverage check
-/// below backs that up: every staged fact must be covered by exactly one
-/// recorded commit (the recorded `fact_ids` map staged offsets to commit
-/// ids), so commit-less or doubly-claimed staging fails loudly even if it
-/// arrives unpoisoned.
+/// A poisoned transaction refuses to apply — an aborted submit's leftovers
+/// would otherwise commit. The coverage check below backs that up: every
+/// staged fact must be covered by exactly one recorded commit (the recorded
+/// `fact_ids` map staged offsets to commit ids), so commit-less or
+/// doubly-claimed staging fails loudly even if it arrives unpoisoned.
 fn apply_pending(inner: &mut Inner, pending: Pending) -> Result<(), MemoryError> {
     pending.poison_check()?;
     let committed_len = inner.facts.len() as u64;
@@ -1338,11 +1347,11 @@ impl FactStore for MemoryFactStore {
         Ok(self.lock_inner().await.next_fact_id())
     }
 
-    fn no_later_than(&self, snapshot: FactId) -> Self::View<'_> {
-        MemorySource {
+    async fn no_later_than(&self, snapshot: FactId) -> Result<Self::View<'_>, Self::Error> {
+        Ok(MemorySource {
             store: self,
             snapshot,
-        }
+        })
     }
 
     async fn now(&self) -> Result<Self::View<'_>, Self::Error> {

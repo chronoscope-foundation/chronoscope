@@ -4,6 +4,7 @@
 //! It is used by both the API server and background workers.
 
 pub mod error;
+pub mod facts;
 pub mod media_store;
 pub mod models;
 pub mod queries;
@@ -25,6 +26,9 @@ use tokio::sync::watch;
 use chronoscope_integrations::IntegrationRegistry;
 
 pub use error::{DbError, DbResult, is_unique_violation};
+pub use facts::{
+    SqliteEntityId, SqliteEventId, SqliteFactStore, SqliteFactStoreError, SqliteIds, SqliteImageId,
+};
 pub use models::{
     FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
     ResolvedContent, ResolvedTarget, User,
@@ -181,7 +185,7 @@ impl Database {
     /// This is used by tests that want to verify query plans themselves (to avoid circular dependency).
     pub async fn new_without_plan_verification(database_url: &str) -> DbResult<Self> {
         let registry = chronoscope_integrations::create_registry(None)?;
-        let pool = Self::create_pool(database_url).await?;
+        let pool = create_pool(database_url).await?;
 
         sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -215,43 +219,13 @@ impl Database {
         })
     }
 
-    /// Create the SQLite connection pool with SpatiaLite loaded.
-    async fn create_pool(database_url: &str) -> DbResult<SqlitePool> {
-        let spatialite_dir = std::env::var("SPATIALITE_LIBRARY_PATH")
-            .map_err(|_| DbError::Config("SPATIALITE_LIBRARY_PATH must be set".to_string()))?;
-
-        // Pooled in-memory SQLite needs a shared-cache URI: each pooled
-        // connection opens the filename independently, and without
-        // cache=shared every connection would see its own empty database.
-        // The per-pool sequence number keeps separate pools isolated.
-        let options = if database_url == "sqlite::memory:" {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static SEQ: AtomicUsize = AtomicUsize::new(0);
-            let seqno = SEQ.fetch_add(1, Ordering::Relaxed);
-            SqliteConnectOptions::new().filename(format!(
-                "file:chronoscope-mem-{seqno}?mode=memory&cache=shared"
-            ))
-        } else {
-            SqliteConnectOptions::from_str(database_url)?
-        }
-        .create_if_missing(true)
-        .foreign_keys(true)
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-        .busy_timeout(Duration::from_secs(5))
-        .extension(format!("{spatialite_dir}/mod_spatialite"));
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
-            .await?;
-
-        Ok(pool)
-    }
-
     /// Verify all query plans (static queries + queue-generated queries).
     async fn verify_all_query_plans(&self) -> DbResult<()> {
         // Verify static queries
         queries::verify_all_query_plans(&self.pool).await?;
+
+        // Verify fact-store queries
+        facts::verify_query_plans(&self.pool).await?;
 
         // Verify queue-generated queries
         for queue in &self.all_queues {
@@ -262,7 +236,52 @@ impl Database {
 
         Ok(())
     }
+}
 
+/// Create the SQLite connection pool with SpatiaLite loaded. A free function
+/// rather than a `Database` method so the fact-store tests can build the same
+/// pool shape without the queue/registry plumbing.
+pub(crate) async fn create_pool(database_url: &str) -> DbResult<SqlitePool> {
+    let spatialite_dir = std::env::var("SPATIALITE_LIBRARY_PATH")
+        .map_err(|_| DbError::Config("SPATIALITE_LIBRARY_PATH must be set".to_string()))?;
+
+    // Pooled in-memory SQLite needs a shared-cache URI: each pooled
+    // connection opens the filename independently, and without
+    // cache=shared every connection would see its own empty database.
+    // The per-pool sequence number keeps separate pools isolated.
+    let options = if database_url == "sqlite::memory:" {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seqno = SEQ.fetch_add(1, Ordering::Relaxed);
+        SqliteConnectOptions::new().filename(format!(
+            "file:chronoscope-mem-{seqno}?mode=memory&cache=shared"
+        ))
+    } else {
+        SqliteConnectOptions::from_str(database_url)?
+    }
+    .create_if_missing(true)
+    .foreign_keys(true)
+    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+    // NORMAL is WAL's idiomatic pairing: one fsync per checkpoint instead of
+    // per commit, and a power cut costs at most the tail commits, never
+    // corruption.
+    .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+    .busy_timeout(Duration::from_secs(5))
+    .extension(format!("{spatialite_dir}/mod_spatialite"));
+
+    // Fact-store read views hold a connection for their lifetime (one WAL
+    // read transaction each), so the cap covers concurrent held views plus
+    // the writer and short CRUD/queue acquires — not just transient
+    // statements.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(16)
+        .connect_with(options)
+        .await?;
+
+    Ok(pool)
+}
+
+impl Database {
     // ==================== Users ====================
 
     /// Create a new user with username and email.

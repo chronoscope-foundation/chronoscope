@@ -99,10 +99,13 @@ async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
                 continue;
             }
             last = Some(row.representative);
-            let Some((class, projected)) =
-                project_entity::<MemoryFactStore, _, _>(&mut view, row.representative, member_lineage)
-                    .await
-                    .map_err(|e| format!("{e:?}"))?
+            let Some((class, projected)) = project_entity::<MemoryFactStore, _, _>(
+                &mut view,
+                row.representative,
+                member_lineage,
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))?
             else {
                 continue;
             };

@@ -807,7 +807,11 @@ async fn retracting_companion_commit_dissolves_the_class() -> TestResult {
     };
     commit_result(&store, retraction).await?;
 
-    let before = store.no_later_than(linked_at).entity_class(&fresh).await?;
+    let before = store
+        .no_later_than(linked_at)
+        .await?
+        .entity_class(&fresh)
+        .await?;
     assert!(
         before.members.contains(&existing),
         "before the retraction the pair shares a class"

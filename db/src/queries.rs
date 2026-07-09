@@ -25,6 +25,13 @@ pub enum QueryPlanError {
         #[source]
         source: sqlx::Error,
     },
+
+    #[error("Failed to list schema relations while verifying query '{name}': {source}")]
+    SchemaLookupFailed {
+        name: String,
+        #[source]
+        source: sqlx::Error,
+    },
 }
 
 /// A query definition that can be both executed and explained.
@@ -49,7 +56,16 @@ impl QueryDef {
 /// # Errors
 /// Returns `QueryPlanError` if any query would cause a full table scan.
 pub async fn verify_all_query_plans(pool: &SqlitePool) -> Result<(), QueryPlanError> {
-    for query_def in ALL {
+    verify_query_defs(pool, ALL).await
+}
+
+/// Verify a list of query definitions — the shared loop under every
+/// `QueryDef` collection's verifier.
+pub(crate) async fn verify_query_defs(
+    pool: &SqlitePool,
+    defs: &[&QueryDef],
+) -> Result<(), QueryPlanError> {
+    for query_def in defs {
         verify_query_plan_sql(pool, query_def.name, query_def.sql).await?;
     }
     Ok(())
@@ -76,17 +92,62 @@ pub async fn verify_query_plan_sql(
             source: e,
         })?;
 
-    for (_, _, _, detail) in plan {
+    // CTE relations the plan itself declares (`MATERIALIZE name` /
+    // `CO-ROUTINE name`). A later `SCAN name` of one of these is a bounded
+    // subquery scan — the CTE's own steps were verified as plan lines of
+    // their own — not a table scan.
+    let mut cte_names: std::collections::HashSet<&str> = plan
+        .iter()
+        .filter_map(|(_, _, _, detail)| {
+            detail
+                .strip_prefix("MATERIALIZE ")
+                .or_else(|| detail.strip_prefix("CO-ROUTINE "))
+        })
+        .collect();
+
+    // A CTE named after a real relation gets no waiver: the plan renders a
+    // full scan of the table and the bounded CTE scan as the same
+    // `SCAN <name>` line (a subquery-scoped CTE leaves the outer name bound
+    // to the table), so the waiver could accept a real table scan. Names
+    // compare lowercased — SQLite resolves them case-insensitively.
+    if !cte_names.is_empty() {
+        let relations =
+            schema_relation_names(pool)
+                .await
+                .map_err(|e| QueryPlanError::SchemaLookupFailed {
+                    name: name.to_string(),
+                    source: e,
+                })?;
+        cte_names.retain(|cte| !relations.contains(&cte.to_lowercase()));
+    }
+
+    // A `SCAN ... USING COVERING INDEX` line is judged by whether the index
+    // is partial, so fetch the live partial-index names when one appears.
+    let partial_indexes = if plan
+        .iter()
+        .any(|(_, _, _, detail)| detail.contains(" USING COVERING INDEX "))
+    {
+        partial_index_names(pool)
+            .await
+            .map_err(|e| QueryPlanError::SchemaLookupFailed {
+                name: name.to_string(),
+                source: e,
+            })?
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    for (_, _, _, detail) in &plan {
         // SCAN without an index means full table scan
         // SCAN ... USING INDEX is fine (it's an index scan)
         // SEARCH is always fine (it's an index lookup)
         // SCAN (subquery-N) is fine (scanning materialized subquery result)
         // SCAN ... VIRTUAL TABLE is fine (table-valued function like json_each)
-        if is_full_table_scan(&detail) {
+        if is_full_table_scan(detail, &cte_names, &partial_indexes) {
             return Err(QueryPlanError::FullTableScan {
                 name: name.to_string(),
                 sql: sql.to_string(),
-                detail,
+                detail: detail.clone(),
             });
         }
     }
@@ -95,9 +156,36 @@ pub async fn verify_query_plan_sql(
 }
 
 /// Check if an EXPLAIN QUERY PLAN detail line indicates a full table scan.
-fn is_full_table_scan(detail: &str) -> bool {
-    detail.starts_with("SCAN ")
-        && !detail.contains("USING")
+///
+/// "USING" waives most `SCAN` lines even though an index scan still reads
+/// every index row — the top-N-by-`ORDER BY` idiom depends on that (the scan
+/// stops at the LIMIT). A covering-index scan gets no such benefit of the
+/// doubt: nothing bounds it, so it counts as a full scan unless the index is
+/// partial and therefore holds only the rows its predicate admits (the
+/// unclaimed-staging audit probes one that is empty in committed state).
+fn is_full_table_scan(
+    detail: &str,
+    cte_names: &std::collections::HashSet<&str>,
+    partial_indexes: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(scanned) = detail.strip_prefix("SCAN ") else {
+        return false;
+    };
+    // A recursive CTE's initial `SELECT <constants>` step plans as a
+    // constant-row scan — one synthesized row, no table behind it.
+    if scanned == "CONSTANT ROW" {
+        return false;
+    }
+    // Scanning a relation this same plan declared as a CTE is a bounded
+    // subquery scan (fact-store recursive CTEs reference their tables
+    // unaliased so the names line up).
+    if cte_names.contains(scanned) {
+        return false;
+    }
+    if let Some(index) = scanned.split(" USING COVERING INDEX ").nth(1) {
+        return !partial_indexes.contains(&index.to_lowercase());
+    }
+    !detail.contains("USING")
         && !detail.contains("(subquery")
         && !detail.contains("VIRTUAL TABLE")
         // LEFT-JOIN scans are expected when joining a materialized CTE
@@ -110,6 +198,51 @@ fn is_full_table_scan(detail: &str) -> bool {
         // bounded. Currently the only LEFT-JOIN scans in practice are on
         // `ranked_reps` (small CTE) and `region_centroids` (small CTE).
         && !detail.contains("LEFT-JOIN")
+}
+
+/// Every table and view name in the live schema, across all attached
+/// databases, lowercased.
+async fn schema_relation_names(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let schemas: Vec<(i64, String, Option<String>)> = sqlx::query_as("PRAGMA database_list")
+        .fetch_all(pool)
+        .await?;
+    let mut names = std::collections::HashSet::new();
+    for (_, schema, _) in schemas {
+        let quoted = schema.replace('"', "\"\"");
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT name FROM \"{quoted}\".sqlite_master WHERE type IN ('table', 'view')"
+        ))
+        .fetch_all(pool)
+        .await?;
+        names.extend(rows.into_iter().map(|(relation,)| relation.to_lowercase()));
+    }
+    Ok(names)
+}
+
+/// Every partial index name in the live schema, across all attached
+/// databases, lowercased.
+async fn partial_index_names(
+    pool: &SqlitePool,
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    let schemas: Vec<(i64, String, Option<String>)> = sqlx::query_as("PRAGMA database_list")
+        .fetch_all(pool)
+        .await?;
+    let mut names = std::collections::HashSet::new();
+    for (_, schema, _) in schemas {
+        let dquoted = schema.replace('"', "\"\"");
+        let squoted = schema.replace('\'', "''");
+        let rows: Vec<(String,)> = sqlx::query_as(&format!(
+            "SELECT il.name FROM \"{dquoted}\".sqlite_master m \
+             JOIN pragma_index_list(m.name, '{squoted}') il \
+             WHERE m.type = 'table' AND il.\"partial\" = 1"
+        ))
+        .fetch_all(pool)
+        .await?;
+        names.extend(rows.into_iter().map(|(index,)| index.to_lowercase()));
+    }
+    Ok(names)
 }
 
 macro_rules! define_queries {
@@ -212,5 +345,62 @@ mod tests {
         let db = Database::new_without_plan_verification("sqlite::memory:").await?;
         verify_all_query_plans(db.pool()).await?;
         Ok(())
+    }
+
+    /// A CTE named after a real table earns that name no scan waiver. The
+    /// subquery-scoped CTE here leaves the outer `users` bound to the real
+    /// table, whose full scan renders as `SCAN users` — identical to the
+    /// CTE's own bounded scan line — so the verifier must refuse the query.
+    #[tokio::test]
+    async fn cte_named_after_real_table_does_not_waive_its_scan()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let db = Database::new_without_plan_verification("sqlite::memory:").await?;
+        let sql = "
+            SELECT *
+            FROM (WITH users(id) AS MATERIALIZED (SELECT 1) SELECT * FROM users) sub, users
+        ";
+        let outcome = verify_query_plan_sql(db.pool(), "cte_shadows_real_table", sql).await;
+        let Err(QueryPlanError::FullTableScan { detail, .. }) = outcome else {
+            return Err(format!("expected a full-table-scan refusal, got {outcome:?}").into());
+        };
+        assert_eq!(detail, "SCAN users");
+        Ok(())
+    }
+
+    /// A covering-index scan reads every index row — a table scan in index
+    /// clothing — so the verifier refuses it end-to-end.
+    #[tokio::test]
+    async fn covering_index_scan_of_a_full_index_is_refused()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let db = Database::new_without_plan_verification("sqlite::memory:").await?;
+        let sql = "SELECT kind, current_rep, fact_id FROM fact_subjects ORDER BY kind, current_rep";
+        let outcome = verify_query_plan_sql(db.pool(), "covering_scan", sql).await;
+        let Err(QueryPlanError::FullTableScan { detail, .. }) = outcome else {
+            return Err(format!("expected a full-scan refusal, got {outcome:?}").into());
+        };
+        assert!(
+            detail.starts_with("SCAN fact_subjects USING COVERING INDEX"),
+            "refusal must name the covering scan, got {detail}"
+        );
+        Ok(())
+    }
+
+    /// The partial-index exemption: a covering scan of a partial index is
+    /// bounded by the index predicate, so only the non-partial one refuses.
+    #[test]
+    fn covering_index_scan_is_waived_only_for_partial_indexes() {
+        let no_ctes = std::collections::HashSet::new();
+        let partials: std::collections::HashSet<String> =
+            std::iter::once("idx_facts_unclaimed".to_owned()).collect();
+        assert!(is_full_table_scan(
+            "SCAN fact_subjects USING COVERING INDEX idx_subjects_rep",
+            &no_ctes,
+            &partials,
+        ));
+        assert!(!is_full_table_scan(
+            "SCAN facts USING COVERING INDEX idx_facts_unclaimed",
+            &no_ctes,
+            &partials,
+        ));
     }
 }

@@ -143,8 +143,9 @@ where
     S: FactStore,
     V: EntityView<S> + EventView<S> + Sync,
 {
+    let snapshot = view.snapshot().await.map_err(ListError::Backend)?;
     if let Some(c) = &cursor
-        && c.snapshot != view.snapshot()
+        && c.snapshot != snapshot
     {
         return Err(ListError::SnapshotMismatch);
     }
@@ -204,10 +205,7 @@ where
 
     Ok(EntityListPage {
         summaries,
-        next: resume.map(|walk| ListCursor {
-            snapshot: view.snapshot(),
-            walk,
-        }),
+        next: resume.map(|walk| ListCursor { snapshot, walk }),
     })
 }
 

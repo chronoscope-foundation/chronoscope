@@ -11,11 +11,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::date::{DatePrecision, UncertainDate};
+use crate::geo::{GeoPoint, Meters};
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::grammar::attribute;
 use crate::grammar::citations::{ExternalSource, JudgmentSource, Justification};
 use crate::grammar::identity;
 use crate::grammar::ids::{CommitId, FactId, UserId};
+use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::store::schema::{ClassRow, EntityStream, EventStream, ImageStream};
 use crate::store::{
     EntityIdOf, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageIdOf,
@@ -26,8 +28,6 @@ use crate::submit::{
     ImageIdx, ResolutionOrigin, StoredCommit, StoredFact, SubjectKind, SubmitError, SubmitResult,
     commit_facts,
 };
-use crate::geo::{GeoPoint, Meters};
-use crate::location::{Location, LocationReference, UnresolvedLocation};
 
 use super::fixtures::{
     PAGE_100, captured_date_fact, commit_err, commit_name, commit_ok, commit_result,
@@ -1466,7 +1466,10 @@ pub async fn err_from_with_tx_closure_rolls_back_submitted_commit<S: FactStore>(
     // The submitted fact never landed and the clock never advanced.
     let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
     assert_eq!(after, watermark);
-    let mut view = store.no_later_than(FactId::new(watermark.get() + 1));
+    let mut view = store
+        .no_later_than(FactId::new(watermark.get() + 1))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     let lookup = view.fact(watermark).await.map_err(|e| format!("{e:?}"))?;
     assert!(matches!(lookup, FactLookup::Unknown), "got {lookup:?}");
 
@@ -1535,11 +1538,14 @@ pub async fn retract_commit_of_earlier_commit_in_same_tx_lands<S: FactStore>(
     Ok(())
 }
 
-/// A rejected submit poisons the transaction: a later submit on the same
-/// handle fails fast with the poison cause instead of validating against the
-/// rejected staging, and a closure that swallows the rejection and returns
-/// `Ok` fails at apply rather than committing the leftovers.
-pub async fn swallowed_submit_rejection_poisons_the_transaction<S: FactStore>(
+/// Nothing from a rejected submit is ever durable, even when the `with_tx`
+/// closure swallows the rejection and returns `Ok`. How a backend refuses is
+/// its own business — unwinding the submit boundary and committing an empty
+/// transaction, or refusing the whole transaction at apply — so the case
+/// accepts either `with_tx` outcome and pins what both must guarantee: the
+/// store stays empty, the rejected commit stays unknown, and a fresh
+/// transaction is fully usable.
+pub async fn swallowed_submit_rejection_leaves_nothing_durable<S: FactStore>(
     store: S,
 ) -> TestResult {
     // Decl 1 is never referenced: the bundle stages its one fact, then
@@ -1554,40 +1560,38 @@ pub async fn swallowed_submit_rejection_poisons_the_transaction<S: FactStore>(
             .into_iter()
             .collect(),
     };
-    let healthy: SubmitCommitInput<S> = SubmitBundle {
-        author: user_author()?,
-        recorded_at: fixed_time() + chrono::Duration::seconds(10),
-        entities: vec![Decl::Local],
-        events: Vec::new(),
-        images: Vec::new(),
-        facts: [name_fact(0, "after-the-rejection")?].into_iter().collect(),
-    };
-    let outcome = store
+    let doomed_id = doomed.id()?;
+    // The with_tx outcome is deliberately unasserted: rejection recovery is
+    // backend-defined — memory refuses the whole transaction, sqlite unwinds
+    // the submit scope and commits clean.
+    let _outcome = store
         .with_tx(|s, tx| {
             Box::pin(async move {
-                if s.submit_commit(tx, doomed).await.is_ok() {
+                let Err(SubmitCommitError::Submit(_)) = s.submit_commit(tx, doomed).await else {
                     return Err("expected the submit to be rejected".to_owned());
-                }
-                // The poison surfaces on the next use of the handle, as a
-                // backend error naming the driver's cause.
-                let Err(SubmitCommitError::Backend(e)) = s.submit_commit(tx, healthy).await else {
-                    return Err("expected a backend error from the poisoned tx".to_owned());
                 };
-                let rendered = format!("{e:?}");
-                if !rendered.contains("earlier submit_commit was rejected") {
-                    return Err(format!("expected the poison cause named, got {rendered}"));
-                }
                 Ok::<_, String>(())
             })
         })
         .await;
-    assert!(
-        outcome.is_err(),
-        "a poisoned transaction must fail at apply, got {outcome:?}"
-    );
-    // Nothing landed.
+
+    // Nothing landed: the clock never advanced and the rejected commit was
+    // never recorded.
     let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
     assert_eq!(after, FactId::new(0));
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    assert!(
+        !view
+            .commit_known(&doomed_id)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+    );
+
+    // A fresh transaction sees no leftovers: its commit is a first commit
+    // and its fact takes the first id.
+    let result = commit_name(&store, "after-the-rejection").await?;
+    assert!(!result.previously_committed);
+    assert_eq!(result.fact_ids.first(), Some(&FactId::new(0)));
     Ok(())
 }
 
@@ -1679,12 +1683,12 @@ pub async fn record_commit_marks_only_its_own_facts_committed<S: FactStore>(
     Ok(())
 }
 
-/// Two recorded commits claiming one staged fact fail the transaction at
-/// apply: a fact belongs to exactly one commit, and a double claim would
-/// otherwise resolve arbitrarily.
-pub async fn overlapping_recorded_commits_fail_the_transaction_at_apply<S: FactStore>(
-    store: S,
-) -> TestResult {
+/// Two recorded commits claiming one staged fact never commit: a fact
+/// belongs to exactly one commit, and a double claim would otherwise resolve
+/// arbitrarily. Where the refusal lands is backend-defined — the claiming
+/// `record_commit` or the transaction's commit step — so the case accepts
+/// either failure and pins that nothing becomes durable.
+pub async fn overlapping_recorded_commits_never_commit<S: FactStore>(store: S) -> TestResult {
     let seed = commit_name(&store, "seed").await?;
     let seed_fid = *seed.fact_ids.first().ok_or("no seed fact id")?;
     let watermark = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
@@ -1705,8 +1709,8 @@ pub async fn overlapping_recorded_commits_fail_the_transaction_at_apply<S: FactS
         })
         .await;
     assert!(
-        outcome.is_err(),
-        "a doubly-claimed staged fact must fail the transaction, got {outcome:?}"
+        !matches!(outcome, Ok(Ok(()))),
+        "a doubly-claimed staged fact must refuse the record or the transaction, got {outcome:?}"
     );
     // Nothing landed.
     let after = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
@@ -1854,7 +1858,10 @@ pub async fn retract_fact_hides_target_only_after_its_commit<S: FactStore>(store
         .map_err(|e| format!("{e:?}"))?;
     let retractor = *retraction.fact_ids.first().ok_or("no retractor fact id")?;
 
-    let mut before = store.no_later_than(retractor);
+    let mut before = store
+        .no_later_than(retractor)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     let lookup = before.fact(target).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Active(_) = lookup else {
         return Err(format!("expected Active before retraction, got {lookup:?}").into());
@@ -1907,7 +1914,10 @@ pub async fn read_snapshot_placement_never_inflight_past_watermark<S: FactStore>
     assert_eq!(committed_count, FactId::new(2));
 
     // An "everything" view whose watermark is well past the committed count.
-    let mut view = store.no_later_than(FactId::new(1_000));
+    let mut view = store
+        .no_later_than(FactId::new(1_000))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
 
     // An id between the committed count and the watermark names no fact — the
     // old lower-bound-only `InFlight` branch wrongly reported `InFlight` here.
@@ -2044,13 +2054,19 @@ pub async fn retraction_of_retraction_restores_visibility<S: FactStore>(store: S
         .map_err(|e| format!("{e:?}"))?;
     let r2 = *c3.fact_ids.first().ok_or("no r2 id")?;
 
-    let mut era1 = store.no_later_than(r1);
+    let mut era1 = store
+        .no_later_than(r1)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     let lookup = era1.fact(f1).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Active(_) = lookup else {
         return Err(format!("C1-era: expected Active, got {lookup:?}").into());
     };
 
-    let mut era2 = store.no_later_than(r2);
+    let mut era2 = store
+        .no_later_than(r2)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     let lookup = era2.fact(f1).await.map_err(|e| format!("{e:?}"))?;
     let FactLookup::Retracted { by } = lookup else {
         return Err(format!("C2-era: expected Retracted, got {lookup:?}").into());
@@ -2291,7 +2307,10 @@ pub async fn all_facts_about_image_respects_snapshot<S: FactStore>(store: S) -> 
         .map_err(|e| format!("{e:?}"))?;
     let late = *c2.fact_ids.first().ok_or("no fact id")?;
 
-    let mut view = store.no_later_than(snapshot);
+    let mut view = store
+        .no_later_than(snapshot)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     let page = view
         .all_facts_about_image(&image, None, PAGE_100)
         .await

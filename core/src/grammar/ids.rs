@@ -46,6 +46,7 @@ pub trait SchemeId:
     + JsonSchema
     + Send
     + Sync
+    + 'static
 {
 }
 
@@ -59,6 +60,7 @@ impl<T> SchemeId for T where
         + JsonSchema
         + Send
         + Sync
+        + 'static
 {
 }
 
@@ -74,7 +76,10 @@ impl<T> SchemeId for T where
 /// `#[derive(Debug, Clone, PartialEq, Eq, Ord, Hash)]` on a type generic over
 /// `R` emits an `R: Debug` (etc.) bound on each impl, so `R: IdScheme` alone
 /// has to satisfy them for the derives to be usable behind the uniform bound.
-pub trait IdScheme: Clone + std::fmt::Debug + Eq + Ord + std::hash::Hash {
+/// `'static` because ids are plain owned data: values built over a scheme
+/// (commits, facts) ride inside boxed `Send` futures whose lifetime is the
+/// caller's to choose.
+pub trait IdScheme: Clone + std::fmt::Debug + Eq + Ord + std::hash::Hash + 'static {
     /// The entity id kind.
     type Entity: SchemeId;
     /// The lifetime-event id kind.

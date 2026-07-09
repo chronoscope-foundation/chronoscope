@@ -172,3 +172,97 @@ CREATE TABLE follows (
 -- Composite index supports filtering by user and ordering by created_at for pagination
 CREATE INDEX idx_follows_user_created ON follows(user_id, created_at DESC);
 CREATE INDEX idx_follows_url ON follows(url_id);
+
+-- ==================== Fact store ====================
+
+-- The counters row is the sequence SQLite lacks: subject ids have no tables
+-- of their own, so there is nothing to auto-increment. Seeded here so a mint
+-- is always one UPDATE ... RETURNING against an existing row; a Postgres
+-- backend swaps in real sequences.
+CREATE TABLE fact_counters (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    next_entity_id INTEGER NOT NULL,
+    next_event_id INTEGER NOT NULL,
+    next_image_id INTEGER NOT NULL
+);
+INSERT INTO fact_counters (id, next_entity_id, next_event_id, next_image_id)
+VALUES (0, 0, 0, 0);
+
+-- commit_seq is the surrogate every fact row references — an integer that
+-- varint-encodes in a byte or two where the 64-char hash costs 64 per row.
+-- commit_id stays the unique content address. Rows are never deleted, so
+-- rowid reuse can't occur and AUTOINCREMENT would only add the
+-- sqlite_sequence write. commit_json holds only what the other tables can't
+-- reconstruct (author, recorded time, declaration lists, fact ids); with
+-- result_json's resolutions and the facts rows, the CommitId stays
+-- re-checkable.
+CREATE TABLE fact_commits (
+    commit_seq INTEGER PRIMARY KEY,   -- rowid alias
+    commit_id TEXT NOT NULL UNIQUE,   -- lowercase-hex JCS/SHA-256
+    commit_json TEXT NOT NULL,        -- minimal commit form
+    result_json TEXT NOT NULL         -- cached SubmitResult (idempotent re-submit)
+);
+
+-- fact_json is the source of truth; the remaining nullable columns are
+-- single-valued facets projected out for indexed reads.
+--
+-- commit_seq is NULL while the fact's commit is still in flight inside its
+-- transaction: staging inserts the row, recording the commit claims it, and
+-- the transaction refuses to commit while any row is left unclaimed. That
+-- nullability is also the committed/in-flight placement boundary.
+CREATE TABLE facts (
+    fact_id INTEGER PRIMARY KEY,      -- dense, monotonic; rowid alias
+    commit_seq INTEGER REFERENCES fact_commits(commit_seq),
+    fact_json TEXT NOT NULL,
+
+    name_norm TEXT, name_language TEXT,
+    external_ref TEXT,
+    source_url TEXT,
+    date_earliest TEXT, date_latest TEXT,
+    lat REAL, lon REAL, radius_m REAL,
+
+    -- identity edges (SameEntity / SameEvent / SameArtifact)
+    edge_kind TEXT CHECK (edge_kind IN ('entity', 'event', 'image')),
+    edge_a INTEGER, edge_b INTEGER,
+
+    -- retraction targets (RetractFact / SupersedeFact / RetractCommit)
+    retracts_fact_id INTEGER, retracts_commit_seq INTEGER
+);
+CREATE INDEX idx_facts_name ON facts(name_norm, name_language, fact_id)
+    WHERE name_norm IS NOT NULL;
+CREATE INDEX idx_facts_extref ON facts(external_ref, fact_id)
+    WHERE external_ref IS NOT NULL;
+CREATE INDEX idx_facts_srcurl ON facts(source_url, fact_id)
+    WHERE source_url IS NOT NULL;
+CREATE INDEX idx_facts_edge_a ON facts(edge_kind, edge_a) WHERE edge_a IS NOT NULL;
+CREATE INDEX idx_facts_edge_b ON facts(edge_kind, edge_b) WHERE edge_b IS NOT NULL;
+CREATE INDEX idx_facts_retracts_fact ON facts(retracts_fact_id)
+    WHERE retracts_fact_id IS NOT NULL;
+CREATE INDEX idx_facts_retracts_commit ON facts(retracts_commit_seq)
+    WHERE retracts_commit_seq IS NOT NULL;
+-- The pre-commit audit probes for any row left unclaimed. Committed state
+-- never holds one, so this partial index covers only the current
+-- transaction's in-flight staging — effectively empty — and keeps the probe
+-- off the full table.
+CREATE INDEX idx_facts_unclaimed ON facts(fact_id) WHERE commit_seq IS NULL;
+
+-- m:n fact ↔ subject mentions. current_rep is seeded with the subject's own
+-- id as its representative.
+CREATE TABLE fact_subjects (
+    fact_id INTEGER NOT NULL REFERENCES facts(fact_id),
+    kind TEXT NOT NULL CHECK (kind IN ('entity', 'event', 'image')),
+    subject_id INTEGER NOT NULL,
+    current_rep INTEGER NOT NULL,
+    PRIMARY KEY (kind, subject_id, fact_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_subjects_rep ON fact_subjects(kind, current_rep, fact_id);
+
+-- SpatiaLite indexes only geometry MBRs, and polygonizing an uncertainty
+-- circle would invent precision. Honest lat/lon/radius columns plus a plain
+-- rtree over the geodesic MBR, refined by the shared containment predicate;
+-- keyed by fact_id.
+CREATE VIRTUAL TABLE facts_spatial USING rtree(
+    id,
+    min_lat, max_lat,
+    min_lon, max_lon
+);

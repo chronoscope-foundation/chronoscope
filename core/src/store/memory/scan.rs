@@ -6,13 +6,13 @@ use std::ops::Bound;
 
 use url::Url;
 
-use super::equiv::EquivAdjacency;
 use super::{MemStoredFact, MemoryEntityId, MemoryEventId, MemoryIds, MemoryImageId, ReadCore};
 use crate::geo::Bbox;
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::grammar::citations::{ExternalReference, Language};
 use crate::grammar::ids::FactId;
 use crate::grammar::{attribute, bookend, event, identity, image};
+use crate::store::equiv::EquivAdjacency;
 use crate::store::schema::{ClassPage, ClassRow, normalize_name};
 use crate::submit::StoredFact;
 use crate::submit::result::{StoredFactualFact, StoredJudgmentFact};

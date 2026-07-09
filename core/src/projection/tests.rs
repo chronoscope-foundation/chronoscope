@@ -507,7 +507,10 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
     assert_eq!(key.name.as_str(), "New");
 
     // At the pre-retraction snapshot: both names.
-    let mut view_before = store.no_later_than(snapshot_before);
+    let mut view_before = store
+        .no_later_than(snapshot_before)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
     let (_, before) = project_entity::<MemoryFactStore, _, _>(&mut view_before, id, member_lineage)
         .await?
         .ok_or("known id should project")?;

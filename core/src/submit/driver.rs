@@ -16,6 +16,7 @@ use crate::grammar::assertions::JudgmentAssertion;
 use crate::grammar::citations::JudgmentSource;
 use crate::grammar::identity;
 use crate::grammar::ids::{FactId, IdScheme};
+use crate::nonempty::NonEmptyVec;
 use crate::store::{
     EntityIdOf, EventIdOf, FactStore, FactWrite, ImageIdOf, SubmitCommitError, SubmitCommitOutput,
 };
@@ -25,7 +26,6 @@ use crate::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, Resolution, ResolutionOrigin,
     StoredCommit, SubjectKind, SubmitError, SubmitFact, SubmitResult,
 };
-use crate::nonempty::NonEmptyVec;
 
 /// [`SubmitError`] over store `S`'s three id kinds.
 type StoreSubmitError<S> = SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>;
@@ -135,49 +135,25 @@ impl<S: FactStore> DeclKind<S> for ImageDecls {
 /// The producer is recorded after the companion id is attached, so an
 /// idempotent re-submission replays the same companion.
 ///
-/// Any error poisons the transaction: a failed submit may have left staging
-/// and mints the backend cannot unwind, so the transaction is void — later
-/// writes and the commit step refuse, and retrying means a fresh `with_tx`.
-/// The contract is uniform across backends and failure points; even a
-/// pre-staging rejection poisons. A dedup replay is a success and leaves the
-/// transaction usable.
+/// The whole run sits inside a submit scope
+/// ([`FactWrite::with_submit_scope`]): the scope keeps the staging and
+/// mints on `Ok` and unwinds them on `Err` — how much of the transaction
+/// survives an unwind is the backend's scope behavior. The rejected
+/// submit's own error flows out untouched. A dedup replay is a success.
 pub(crate) async fn drive_submit<S, W>(tx: &mut W, commit: Commit<S::Ids>) -> SubmitCommitOutput<S>
 where
     S: FactStore,
     W: FactWrite<S>,
 {
-    match submit_with_companion(tx, commit).await {
-        Ok(result) => Ok(result),
-        Err(e) => {
-            tx.poison(poison_cause::<S>(&e));
-            Err(e)
-        }
-    }
+    tx.with_submit_scope(move |scope| {
+        Box::pin(async move { submit_with_companion(scope, commit).await })
+    })
+    .await
+    .map_err(SubmitCommitError::Backend)?
 }
 
-/// The cause a failed submit records when poisoning its transaction — a
-/// one-line summary rather than the full batch, since it prefixes every
-/// later error on the handle.
-fn poison_cause<S: FactStore>(e: &StoreCommitError<S>) -> String {
-    match e {
-        SubmitCommitError::Submit(errs) => format!(
-            "an earlier submit_commit was rejected ({} rule violation(s))",
-            errs.len()
-        ),
-        SubmitCommitError::Backend(err) => {
-            format!("an earlier submit_commit hit a backend failure: {err:?}")
-        }
-        SubmitCommitError::Hashing { message } => {
-            format!("an earlier submit_commit failed to hash its commit: {message}")
-        }
-        SubmitCommitError::Internal { message } => {
-            format!("an earlier submit_commit broke a driver invariant: {message}")
-        }
-    }
-}
-
-/// The producer + companion sequence behind [`drive_submit`], which owns the
-/// poison-on-error contract.
+/// The producer + companion sequence behind [`drive_submit`], run inside the
+/// producer's submit scope; the companion gets its own nested scope here.
 async fn submit_with_companion<S, W>(tx: &mut W, commit: Commit<S::Ids>) -> SubmitCommitOutput<S>
 where
     S: FactStore,
@@ -192,30 +168,50 @@ where
     };
 
     if let Some(companion) = build_companion_commit::<S>(recorded_at, &matched)? {
-        // The companion's decls are all `Existing` over ids this submit just
-        // resolved, so a rule rejection here is a store bug — reclassified
-        // off the client-facing `Submit` channel, keeping its violations as
-        // the diagnosis.
-        let companion_submitted = match submit_one(tx, companion).await {
-            Err(SubmitCommitError::Submit(batch)) => {
-                return Err(SubmitCommitError::Internal {
-                    message: format!("companion commit rejected: {batch:?}"),
-                });
-            }
-            other => other?,
-        };
-        if let Some((companion_stored, _)) = companion_submitted.fresh {
-            tx.record_commit(companion_stored, &companion_submitted.result)
-                .await
-                .map_err(SubmitCommitError::Backend)?;
-        }
-        result.companion_commit_id = Some(companion_submitted.result.commit_id);
+        let companion_commit_id = tx
+            .with_submit_scope(move |scope| {
+                Box::pin(async move { submit_companion(scope, companion).await })
+            })
+            .await
+            .map_err(SubmitCommitError::Backend)??;
+        result.companion_commit_id = Some(companion_commit_id);
     }
 
     tx.record_commit(stored, &result)
         .await
         .map_err(SubmitCommitError::Backend)?;
     Ok(result)
+}
+
+/// Pipeline-and-record for the companion commit, run inside its own nested
+/// submit scope; returns the companion's commit id for the producer's
+/// result.
+async fn submit_companion<S, W>(
+    tx: &mut W,
+    companion: Commit<S::Ids>,
+) -> Result<crate::grammar::ids::CommitId, StoreCommitError<S>>
+where
+    S: FactStore,
+    W: FactWrite<S>,
+{
+    // The companion's decls are all `Existing` over ids this submit just
+    // resolved, so a rule rejection here is a store bug — reclassified
+    // off the client-facing `Submit` channel, keeping its violations as
+    // the diagnosis.
+    let companion_submitted = match submit_one(tx, companion).await {
+        Err(SubmitCommitError::Submit(batch)) => {
+            return Err(SubmitCommitError::Internal {
+                message: format!("companion commit rejected: {batch:?}"),
+            });
+        }
+        other => other?,
+    };
+    if let Some((companion_stored, _)) = companion_submitted.fresh {
+        tx.record_commit(companion_stored, &companion_submitted.result)
+            .await
+            .map_err(SubmitCommitError::Backend)?;
+    }
+    Ok(companion_submitted.result.commit_id)
 }
 
 // ============================================================================
@@ -287,7 +283,7 @@ where
 
     // The matcher runs before any fact stages, so the snapshot captured here
     // is the view every matcher judgment cites.
-    let matcher_snapshot = tx.snapshot();
+    let matcher_snapshot = tx.snapshot().await.map_err(SubmitCommitError::Backend)?;
 
     // Reject unresolvable references before minting, so a malformed bundle
     // burns no ids. A fact pointing at a missing declaration can't resolve, so
@@ -400,7 +396,7 @@ where
     }
 
     // Unused declarations are checked post-mint; a non-empty reject batch
-    // poisons the transaction, so neither the staging nor the burned
+    // aborts the submit boundary, so neither the staging nor the burned
     // counters can reach durability.
     validation_errors.extend(check_all_decls_referenced(
         &entity_refs,

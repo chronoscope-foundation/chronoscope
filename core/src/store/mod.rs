@@ -10,6 +10,10 @@
 //!   single canonical equivalence (and entities a single canonical edge
 //!   relation), all implicit — there are no per-subject relation enums.
 //! - [`pagination`] — the generic cursor→stream adapter every walk pages on.
+//! - [`equiv`] / [`retraction`] — backend-shared resolution: equivalence
+//!   components over identity edges and the effective-retraction fixpoint.
+//!   Each backend fetches edges its own way; the resolution runs here so
+//!   backends can't drift.
 //! - [`memory`] — the in-memory [`memory::MemoryFactStore`] backend.
 //! - `conformance` — backend-agnostic [`FactStore`] test suite, available to
 //!   other crates behind the `test-support` feature.
@@ -34,10 +38,11 @@
 //! [`EntityView`], [`EventView`], [`ImageView`]. Each does equivalence
 //! resolution, indexed walks, and backlink walks.
 //!
-//! A view is an exclusive read handle: every reading method takes `&mut self`
-//! so a backend can drive a connection that serialises its reads (a `sqlx`
-//! executor is `&mut`). Concurrent reads are spelled as additional views
-//! pinned at the same snapshot — `no_later_than(view.snapshot())`.
+//! A view is an exclusive read handle over one backing connection, held for
+//! the view's lifetime: every reading method takes `&mut self` so a backend
+//! can drive that connection (a `sqlx` executor is `&mut`). Concurrent reads
+//! are more views on more connections, pinned at the same snapshot —
+//! `no_later_than(view.snapshot().await?).await?`.
 //!
 //! The view traits are generic over the [`FactStore`] `S` and carry no
 //! associated types — they read the id kinds and error type off `S`, so a
@@ -94,9 +99,9 @@
 //! existing state to match declarations and check cross-fact rules before
 //! staging, so the whole sequence runs under one transaction — a held mutex
 //! for the in-memory backend, a SQL transaction for a SQL backend — to keep
-//! a concurrent writer from slipping between the reads and the insert. A
-//! failed submit poisons the transaction ([`FactWrite::poison`]): later
-//! writes and the commit step refuse, so a rejection can't smuggle its
+//! a concurrent writer from slipping between the reads and the insert. The
+//! driver runs each pipeline inside a submit scope
+//! ([`FactWrite::with_submit_scope`]), so a rejection can't smuggle its
 //! staging into history.
 //!
 //! The closure-scoped `with_tx` shape (rather than `begin_tx` / `commit_tx`)
@@ -121,8 +126,10 @@
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
+pub mod equiv;
 pub mod memory;
 pub(crate) mod pagination;
+pub mod retraction;
 pub mod schema;
 
 use std::fmt::Debug;
@@ -290,10 +297,11 @@ pub trait FactStore: Send + Sync + Sized {
     /// [`FactWrite`] primitives on [`Self::Tx`], so backends implement the
     /// primitives and inherit the orchestration.
     ///
-    /// Any error poisons the transaction (see [`FactWrite::poison`]): a
-    /// failed submit may leave staging and mints the backend cannot unwind,
-    /// so the transaction is void — return `Err` from the `with_tx` closure
-    /// and retry in a fresh one.
+    /// The driver runs the pipeline inside a submit scope (see
+    /// [`FactWrite::with_submit_scope`]): after a failed submit nothing it
+    /// staged or minted is observable, though a backend that cannot unwind
+    /// voids the whole transaction — on error, return `Err` from the
+    /// `with_tx` closure and retry in a fresh one.
     ///
     /// The `tx` borrow is `&mut` so the caller can't overlap two
     /// `submit_commit` calls on one handle; sequential commits inside one
@@ -318,14 +326,20 @@ pub trait FactStore: Send + Sync + Sized {
     /// A read view pinned at `snapshot` (exclusive upper bound): the view
     /// exposes facts with `id < snapshot`. `FactId::new(0)` is the
     /// empty-store view — every lookup returns `Future` / `Unknown`.
-    fn no_later_than(&self, snapshot: FactId) -> Self::View<'_>;
+    ///
+    /// Constructing a view acquires its backing connection, which can wait
+    /// or fail; the view holds that one connection for its lifetime, and
+    /// concurrent reads are more views on more connections.
+    fn no_later_than(
+        &self,
+        snapshot: FactId,
+    ) -> impl Future<Output = Result<Self::View<'_>, Self::Error>> + Send;
 
     /// Snapshot the current latest state. Implemented directly so a SQL
-    /// backend can pin the snapshot in one round-trip (`SELECT max(fact_id)`
-    /// inside the view-constructing query) rather than the two a default
-    /// composing [`Self::next_fact_id`] + [`Self::no_later_than`] would take.
-    /// Either form is a snapshot at some recent point; a writer landing
-    /// mid-read isn't included.
+    /// backend can read the watermark on the view's own connection rather
+    /// than the extra checkout a default composing [`Self::next_fact_id`] +
+    /// [`Self::no_later_than`] would take. Either form is a snapshot at some
+    /// recent point; a writer landing mid-read isn't included.
     fn now(&self) -> impl Future<Output = Result<Self::View<'_>, Self::Error>> + Send;
 }
 
@@ -415,15 +429,17 @@ impl<E, R: IdScheme> From<SubmitError<R::Entity, R::Event, R::Image>> for Submit
 ///
 /// The handle is exclusive: reads take `&mut self` so a backend can serve
 /// them off a `&mut` connection or transaction. For concurrent reads, pin
-/// more views at the same snapshot via `no_later_than(view.snapshot())`.
+/// more views at the same snapshot via
+/// `no_later_than(view.snapshot().await?).await?`.
 ///
 /// Generic over the [`FactStore`] `S`: id kinds and error type come from `S`,
 /// so the trait has no associated types of its own.
 pub trait FactView<S: FactStore>: Send + Sync {
-    /// The exclusive-upper-bound [`FactId`] this view is pinned at; it exposes
-    /// facts with `id < snapshot()`. `FactId::new(0)` is the empty-store view.
-    /// `&self`: the bound is pinned metadata, no I/O behind it.
-    fn snapshot(&self) -> FactId;
+    /// The exclusive-upper-bound [`FactId`] this view answers under; it
+    /// exposes facts with `id < snapshot()`. `FactId::new(0)` is the
+    /// empty-store view. A pinned view answers its stored bound without I/O;
+    /// a live transaction computes it, and it moves as facts stage.
+    fn snapshot(&mut self) -> impl Future<Output = Result<FactId, S::Error>> + Send;
 
     /// Look up a fact by id, preserving the four outcomes (active, retracted,
     /// future, unknown).
@@ -699,13 +715,32 @@ pub trait FactWrite<S: FactStore>:
         result: &SubmitResult<S::Ids>,
     ) -> impl Future<Output = Result<(), S::Error>> + Send;
 
-    /// Mark the transaction permanently unusable, recording `cause`. The
-    /// submit driver calls this on any failed submit: staging and mints from
-    /// the failure may remain in the transaction, so it must not commit.
-    /// After it, every write primitive on this handle and the `with_tx`
-    /// commit step fail with a backend error naming the cause; the read
-    /// surface keeps answering, void along with the transaction. Retrying
-    /// means a fresh [`FactStore::with_tx`]. The first cause wins — later
-    /// failures descend from it.
-    fn poison(&mut self, cause: String);
+    /// The write handle a submit scope lends its closure — the same write
+    /// surface, one scope deeper.
+    type Nested<'n>: FactWrite<S> + Send
+    where
+        Self: 'n;
+
+    /// Run `f` inside a submit scope: keep its staging and mints on inner
+    /// `Ok`, unwind them on inner `Err` — [`FactStore::with_tx`] in
+    /// miniature, and scopes nest (a producer commit's encloses its
+    /// companion's). How a backend unwinds is its own business: a SQL
+    /// savepoint rolls back; the in-memory overlay poisons the transaction,
+    /// refusing all further work. The driver wraps every commit's pipeline
+    /// run in one, so a rejected submit's leftovers never share the
+    /// transaction with later submits, and the inner `Err` flows out
+    /// untouched. `E: Debug` lets a backend that voids the transaction
+    /// record the failure as its refusal cause.
+    fn with_submit_scope<'s, R, E, F>(
+        &'s mut self,
+        f: F,
+    ) -> impl Future<Output = Result<Result<R, E>, S::Error>> + Send
+    where
+        Self: 's,
+        R: Send,
+        E: Debug + Send,
+        F: for<'n> FnOnce(
+                &'n mut Self::Nested<'s>,
+            ) -> Pin<Box<dyn Future<Output = Result<R, E>> + Send + 'n>>
+            + Send;
 }
