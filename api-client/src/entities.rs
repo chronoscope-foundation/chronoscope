@@ -1,9 +1,12 @@
 //! Entity API response types — read side of the fact store.
 //!
-//! These are thin aliases over the fact store's own `typed`/`listing` DTOs
-//! (`chronoscope_core::{typed, listing}`), concretized to the in-memory backend's id
-//! scheme. The server projects a `MemoryFactStore` snapshot straight into
-//! these shapes; there's no separate wire-format translation layer.
+//! The [`typed`]/[`listing`] DTOs and the wrappers here are generic over the id
+//! scheme: the server instantiates them at a backend's concrete ids (which
+//! serialize as opaque strings) and a client at [`EntityId`]/[`EventId`]/
+//! [`ImageId`], both sides sharing one wire shape. The `Entity`/`EntitySummary`
+//! aliases below are the client-facing instantiations. There's no separate
+//! wire-format translation layer — the server projects a snapshot straight into
+//! these shapes.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -13,15 +16,15 @@ use chronoscope_core::GeoPoint;
 use chronoscope_core::conflicts::AnyConflictReport;
 use chronoscope_core::grammar::depiction::Perspective;
 use chronoscope_core::grammar::image::ImageMedium;
-use chronoscope_core::store::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
 use chronoscope_core::{listing, typed};
 
-/// Full entity detail — the fact store's typed projection, concretized to the
-/// in-memory backend's id scheme. Wrapped in [`EntityDetail`] by
-/// `GET /entities/{id}`; no infrastructure envelope (no `created_at`/`updated_at`
-/// — the fact store has no row-level timestamps, only per-fact provenance
-/// already carried inside the typed fields).
-pub type Entity = typed::Entity<MemoryEntityId, MemoryEventId, MemoryImageId>;
+use crate::ids::{EntityId, EventId, ImageId};
+
+/// The client-facing entity projection: [`typed::Entity`] at the opaque wire ids.
+/// Wrapped in [`EntityDetail`] by `GET /entities/{id}`; no infrastructure
+/// envelope (no `created_at`/`updated_at` — the fact store has no row-level
+/// timestamps, only per-fact provenance already carried inside the typed fields).
+pub type Entity = typed::Entity<EntityId, EventId, ImageId>;
 
 /// The `GET /entities/{id}` response: the typed entity, the display name the
 /// server negotiated from the request's `Accept-Language`, the resolved image
@@ -38,11 +41,14 @@ pub type Entity = typed::Entity<MemoryEntityId, MemoryEventId, MemoryImageId>;
 /// entity's projection — each a structured report the panel renders a disputed
 /// indicator from. Empty when every date slot is consistent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct EntityDetail {
-    pub entity: Entity,
+#[serde(bound(
+    deserialize = "E: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, V: ::serde::de::DeserializeOwned, I: ::serde::de::DeserializeOwned"
+))]
+pub struct EntityDetail<E: Ord, V, I> {
+    pub entity: typed::Entity<E, V, I>,
     pub display_name: Option<String>,
-    pub images: Vec<DetailImage>,
-    pub conflicts: Vec<AnyConflictReport<MemoryEntityId, MemoryEventId>>,
+    pub images: Vec<DetailImage<I>>,
+    pub conflicts: Vec<AnyConflictReport<E, V>>,
 }
 
 /// One image in an entity's detail grid: the id it is keyed by, the URL the
@@ -61,8 +67,8 @@ pub struct EntityDetail {
 /// unsettled. The client composes its own localized caption from them; the wire
 /// carries the structured values, not a pre-rendered English string.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct DetailImage {
-    pub id: MemoryImageId,
+pub struct DetailImage<I> {
+    pub id: I,
     #[schemars(with = "String")]
     pub display_url: Url,
     #[schemars(with = "String")]
@@ -94,9 +100,10 @@ pub fn image_caption(perspective: Option<Perspective>, medium: Option<ImageMediu
     }
 }
 
-/// One placeable entity in a viewport listing: id, names, current marker, and
-/// timeline date span. Returned by `GET /entities`.
-pub type EntitySummary = listing::EntitySummary<MemoryEntityId, MemoryImageId>;
+/// The client-facing viewport summary: [`listing::EntitySummary`] at the opaque
+/// wire ids — id, names, current marker, and timeline date span. Returned by
+/// `GET /entities`.
+pub type EntitySummary = listing::EntitySummary<EntityId, ImageId>;
 
 /// An opaque resume token for `GET /entities` pagination. The server mints one
 /// per page; the client threads it back verbatim. Its contents — the pinned
@@ -126,8 +133,9 @@ impl std::fmt::Display for Cursor {
 /// page and the opaque [`Cursor`] for the next, `None` once the viewport is
 /// exhausted.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct EntityListPage {
-    pub summaries: Vec<EntitySummary>,
+#[serde(bound(deserialize = "E: ::serde::Deserialize<'de>, I: ::serde::de::DeserializeOwned"))]
+pub struct EntityListPage<E, I> {
+    pub summaries: Vec<listing::EntitySummary<E, I>>,
     pub next: Option<Cursor>,
 }
 
@@ -135,10 +143,10 @@ pub struct EntityListPage {
 
 /// A map marker for one entity (or a co-located group of entities).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Marker {
+pub struct Marker<E> {
     /// The entity id — for a co-located group, the group's first member
     /// (sorted by earliest date). `click_action` carries every member.
-    pub id: MemoryEntityId,
+    pub id: E,
     pub point: GeoPoint,
     /// The representative entity's display name, negotiated server-side from the
     /// request's `Accept-Language`. `None` when the entity has no name.
@@ -151,25 +159,25 @@ pub struct Marker {
     #[schemars(with = "Option<String>")]
     pub thumbnail_url: Option<Url>,
     /// What happens when the user clicks this marker.
-    pub click_action: ClickAction,
+    pub click_action: ClickAction<E>,
 }
 
 /// What happens when a marker is clicked.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type")]
-pub enum ClickAction {
+pub enum ClickAction<E> {
     /// Open the entity detail panel.
     #[serde(rename = "select")]
-    Select { entity_id: MemoryEntityId },
+    Select { entity_id: E },
     /// Show a disambiguation picker (co-located entities at the same point).
     #[serde(rename = "disambiguate")]
-    Disambiguate { entries: Vec<EntityPickerEntry> },
+    Disambiguate { entries: Vec<EntityPickerEntry<E>> },
 }
 
 /// One entry in a co-located entity disambiguation picker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct EntityPickerEntry {
-    pub id: MemoryEntityId,
+pub struct EntityPickerEntry<E> {
+    pub id: E,
     /// The entity's display name, negotiated server-side from the request's
     /// `Accept-Language`. `None` when the entity has no name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,8 +186,8 @@ pub struct EntityPickerEntry {
 
 /// Response for the unified markers endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MarkersResponse {
-    pub markers: Vec<Marker>,
+pub struct MarkersResponse<E> {
+    pub markers: Vec<Marker<E>>,
     /// True if results were truncated at the server limit.
     pub truncated: bool,
 }

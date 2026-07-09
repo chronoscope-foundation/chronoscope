@@ -744,7 +744,7 @@ async fn find_entity_with_media(
     for marker in &response.markers {
         if marker.thumbnail_url.is_some() {
             let entity_id = match &marker.click_action {
-                chronoscope_api_client::ClickAction::Select { entity_id } => *entity_id,
+                chronoscope_api_client::ClickAction::Select { entity_id } => entity_id.clone(),
                 _ => continue,
             };
             let detail = client.get_entity(&entity_id).await?;

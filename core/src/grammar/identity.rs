@@ -563,7 +563,7 @@ mod tests {
     #[test]
     fn deserialize_routes_through_smart_constructor_same_entity() -> TestResult {
         // Inputs reversed (a > b), to check the parse canonicalises them.
-        let json = r#"{"type":"same_entity","pair":{"a":2,"b":1}}"#;
+        let json = r#"{"type":"same_entity","pair":{"a":"2","b":"1"}}"#;
         let parsed: MemFact = serde_json::from_str(json)?;
         let Fact::SameEntity { pair } = parsed else {
             return Err("expected SameEntity".into());
@@ -581,21 +581,21 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_self_equivalence_same_entity() {
-        let json = r#"{"type":"same_entity","pair":{"a":1,"b":1}}"#;
+        let json = r#"{"type":"same_entity","pair":{"a":"1","b":"1"}}"#;
         let result: Result<MemFact, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 
     #[test]
     fn deserialize_rejects_self_equivalence_same_artifact() {
-        let json = r#"{"type":"same_artifact","pair":{"a":1,"b":1}}"#;
+        let json = r#"{"type":"same_artifact","pair":{"a":"1","b":"1"}}"#;
         let result: Result<MemFact, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
 
     #[test]
     fn deserialize_rejects_self_equivalence_same_event() {
-        let json = r#"{"type":"same_event","pair":{"a":1,"b":1}}"#;
+        let json = r#"{"type":"same_event","pair":{"a":"1","b":"1"}}"#;
         let result: Result<MemFact, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }

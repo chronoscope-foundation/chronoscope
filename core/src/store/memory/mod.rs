@@ -86,47 +86,75 @@ use self::scan::{
 // Concrete id types
 // ============================================================================
 
-/// In-memory entity id — a `u64` newtype minted from the store's entity
-/// counter.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(transparent)]
-pub struct MemoryEntityId(pub u64);
+/// Define a `u64`-newtype backend id.
+///
+/// `Copy`/`Ord`/`Hash` for use as an index and map key, a `<prefix>-N` `Display`
+/// for logs, and a wire form that renders the `u64` as a decimal *string* (via
+/// [`Serializer::collect_str`](serde::Serializer::collect_str)). Serializing the
+/// key as a string keeps the read wire's id a `string` for every backend, so no
+/// consumer bakes in an integer-shaped id. `Deserialize` parses that string back
+/// to the `u64`; the `JsonSchema` is a non-referenceable bare `string`, so the
+/// backend's id type name never reaches the OpenAPI spec.
+macro_rules! memory_id {
+    ($name:ident, $prefix:literal, $doc:expr) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub u64);
 
-impl std::fmt::Display for MemoryEntityId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "entity-{}", self.0)
-    }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, concat!($prefix, "-{}"), self.0)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(deserializer)?;
+                s.parse::<u64>().map(Self).map_err(|e| {
+                    serde::de::Error::custom(format!("invalid {} {s:?}: {e}", stringify!($name)))
+                })
+            }
+        }
+
+        impl JsonSchema for $name {
+            fn schema_name() -> String {
+                <String as JsonSchema>::schema_name()
+            }
+
+            fn json_schema(
+                generator: &mut schemars::r#gen::SchemaGenerator,
+            ) -> schemars::schema::Schema {
+                <String as JsonSchema>::json_schema(generator)
+            }
+
+            fn is_referenceable() -> bool {
+                false
+            }
+        }
+    };
 }
 
-/// In-memory lifetime-event id — a `u64` newtype minted from the store's
-/// event counter.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(transparent)]
-pub struct MemoryEventId(pub u64);
-
-impl std::fmt::Display for MemoryEventId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "event-{}", self.0)
-    }
-}
-
-/// In-memory image id — a `u64` newtype minted from the store's image
-/// counter.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(transparent)]
-pub struct MemoryImageId(pub u64);
-
-impl std::fmt::Display for MemoryImageId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "image-{}", self.0)
-    }
-}
+memory_id!(
+    MemoryEntityId,
+    "entity",
+    "In-memory entity id — a `u64` newtype minted from the store's entity counter."
+);
+memory_id!(
+    MemoryEventId,
+    "event",
+    "In-memory lifetime-event id — a `u64` newtype minted from the store's event counter."
+);
+memory_id!(
+    MemoryImageId,
+    "image",
+    "In-memory image id — a `u64` newtype minted from the store's image counter."
+);
 
 /// The in-memory backend's id scheme: the three `u64`-newtype id kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema)]

@@ -120,12 +120,10 @@ where
 // ==================== Path params ====================
 
 // EntityIdPath is required by Dropshot — Path<T> needs a struct with named
-// fields matching the URL template parameter. Dropshot's path/query
-// deserializer parses each segment via `FromStr` per target type, so a plain
-// numeric path segment like `/entities/5` deserializes straight into
-// `MemoryEntityId`'s `#[serde(transparent)]` `u64` — no string-path adapter
-// needed. (Its `Display` renders the unrelated debug form `entity-5`; that
-// never enters the path-parsing path.)
+// fields matching the URL template parameter. `MemoryEntityId` now deserializes
+// from an opaque string, so the `/entities/5` segment arrives as the string
+// "5" and parses back to the `u64` — and the generated path-param schema is a
+// bare `string`, carrying no backend id type name.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EntityIdPath {
     pub id: MemoryEntityId,

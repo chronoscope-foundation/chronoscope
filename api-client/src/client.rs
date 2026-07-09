@@ -14,14 +14,13 @@ use futures_util::FutureExt;
 use futures_util::stream::{self, Stream};
 
 use chronoscope_core::geo::Bbox;
-use chronoscope_core::store::memory::MemoryEntityId;
 
 use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-use crate::entities::EntityDetail;
-use crate::ids::{Email, ResearchUrlId};
+use crate::entities::{EntityDetail, MarkersResponse};
+use crate::ids::{Email, EntityId, EventId, ImageId, ResearchUrlId};
 use crate::pagination::{PageToken, ResultsPage};
 use crate::users::{UpdateUserRequest, UserResponse};
 use crate::webauthn_types::{
@@ -103,17 +102,17 @@ impl Client {
     // ==================== Entity endpoints (public) ====================
 
     /// Fetch a single entity by ID, with its resolved detail image grid.
-    pub async fn get_entity(&self, id: &MemoryEntityId) -> Result<EntityDetail, ApiError> {
-        // `MemoryEntityId`'s `Display` renders the debug form `entity-{n}`;
-        // the URL path segment must be the bare wire integer the server's
-        // path deserializer expects.
-        let url = format!("{}/entities/{}", self.base_url, id.0);
+    pub async fn get_entity(
+        &self,
+        id: &EntityId,
+    ) -> Result<EntityDetail<EntityId, EventId, ImageId>, ApiError> {
+        let url = format!("{}/entities/{}", self.base_url, id.as_str());
         self.get_json(&url).await
     }
 
     /// Fetch map markers for a bounding box. Co-located entities (same point)
     /// collapse into one disambiguation marker.
-    pub async fn list_markers(&self, bbox: &Bbox) -> Result<crate::MarkersResponse, ApiError> {
+    pub async fn list_markers(&self, bbox: &Bbox) -> Result<MarkersResponse<EntityId>, ApiError> {
         let url = format!(
             "{}/markers?min_lat={}&max_lat={}&min_lon={}&max_lon={}",
             self.base_url,

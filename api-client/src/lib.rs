@@ -22,9 +22,7 @@ pub use entities::{
     ClickAction, Cursor, DetailImage, Entity, EntityDetail, EntityListPage, EntityPickerEntry,
     EntitySummary, Marker, MarkersResponse, image_caption,
 };
-pub use ids::{
-    AnnotationId, Email, EntityId, EntityLinkId, MediaId, ResearchUrlId, SourceId, UserId,
-};
+pub use ids::{Email, EntityId, EventId, ImageId, MediaId, ResearchUrlId, UserId};
 pub use pagination::{PageToken, ResultsPage};
 pub use types::{MediaType, ResearchUrlStatus, ZoneType};
 pub use users::{UpdateUserRequest, UserResponse};

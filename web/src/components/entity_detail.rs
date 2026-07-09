@@ -157,9 +157,12 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
                     // The marker's feature id is its representative — the first
                     // (earliest) entry the server sorted the group by, which is
                     // also `marker.id`. Highlight that, whichever member is picked.
-                    let feature = back.first().map(|e| e.id).unwrap_or(id);
+                    let feature = back
+                        .first()
+                        .map(|e| e.id.clone())
+                        .unwrap_or_else(|| id.clone());
                     set_selected.set(Some(EntitySelection::Single {
-                        detail: id,
+                        detail: id.clone(),
                         feature,
                         back: Some((*back).clone()),
                     }));
@@ -189,7 +192,7 @@ fn EntityPicker(entries: Vec<EntityPickerEntry>) -> impl IntoView {
 /// Fetches and displays entity detail content.
 #[component]
 fn EntityDetailContent(
-    id: MemoryEntityId,
+    id: EntityId,
     api_client: Rc<RefCell<Option<api::Client>>>,
 ) -> impl IntoView {
     let (retry_count, set_retry_count) = signal(0u32);
@@ -197,6 +200,9 @@ fn EntityDetailContent(
         // Include retry_count in the dependency so incrementing it re-fetches.
         let _retry = retry_count.get();
         let api = api_client.clone();
+        // The resource re-runs on each dependency change, so hand the future its
+        // own id clone rather than moving the captured one out of the closure.
+        let id = id.clone();
         async move {
             let client = crate::api::get_or_init_client(&api)
                 .await
@@ -413,13 +419,14 @@ use chronoscope_core::grammar::citations::ExternalReference;
 use chronoscope_core::grammar::lifecycle::{DamageCause, MoveMethod, Usage};
 use chronoscope_core::location::{LocationReference, UnresolvedLocation};
 use chronoscope_core::moment::TransitionRole;
-use chronoscope_core::store::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
 use chronoscope_core::typed::{Attributed, Bounded, EventDetail, InteriorEvent, MomentView};
+
+use chronoscope_api_client::{EntityId, EventId, ImageId};
 
 /// Fetch entity detail using the typed API client and flatten it into the
 /// view model the panel renders.
 async fn fetch_entity_detail(
-    id: &MemoryEntityId,
+    id: &EntityId,
     client: &api::Client,
 ) -> Result<EntityDetailView, String> {
     let api::EntityDetail {
@@ -457,7 +464,7 @@ async fn fetch_entity_detail(
 /// Map one ordered [`MomentView`] to its display row: the role's label (bare when
 /// a durational pair collapsed to a single undated moment), the endpoint's date,
 /// and — when this moment carries it — the event's secondary text.
-fn moment_row(moment: MomentView<'_, MemoryEventId, MemoryImageId>) -> TimelineRow {
+fn moment_row(moment: MomentView<'_, EventId, ImageId>) -> TimelineRow {
     TimelineRow {
         label: moment_label(moment.role, moment.collapsed).to_string(),
         date: moment.date.map(|b| b.possible.clone()),
@@ -505,7 +512,7 @@ fn moment_label(role: TransitionRole, collapsed: bool) -> &'static str {
 /// The secondary line for a timeline entry: the kind-specific summary (a damage
 /// cause, a move's method and destination, a usage set, a designation) joined
 /// with the entry's free-text descriptions. Bookends carry none.
-fn entry_description(detail: &EventDetail<MemoryEventId, MemoryImageId>) -> Option<String> {
+fn entry_description(detail: &EventDetail<EventId, ImageId>) -> Option<String> {
     let (descriptions, kind) = match detail {
         EventDetail::Constructed { .. } | EventDetail::Demolished { .. } => return None,
         EventDetail::Interior {
@@ -532,7 +539,7 @@ fn entry_description(detail: &EventDetail<MemoryEventId, MemoryImageId>) -> Opti
 }
 
 /// Join an interior event's free-text descriptions into one secondary line.
-fn join_descriptions(descriptions: &[Attributed<String, MemoryImageId>]) -> Option<String> {
+fn join_descriptions(descriptions: &[Attributed<String, ImageId>]) -> Option<String> {
     if descriptions.is_empty() {
         return None;
     }
@@ -548,7 +555,7 @@ fn join_descriptions(descriptions: &[Attributed<String, MemoryImageId>]) -> Opti
 /// The designation text when the claim settled to exactly one value —
 /// conflicting or unsettled designations render dateless label + date only,
 /// rather than guessing among rivals.
-fn settled_designation(designation: &Bounded<Claimed<String>, MemoryImageId>) -> Option<String> {
+fn settled_designation(designation: &Bounded<Claimed<String>, ImageId>) -> Option<String> {
     designation.settled().cloned()
 }
 
@@ -637,8 +644,8 @@ fn location_display(location: &UnresolvedLocation) -> Option<String> {
 /// The secondary line for a `Moved` event: its settled method and, when the
 /// destination names a place, where it went.
 fn move_summary(
-    method: &Bounded<Claimed<MoveMethod>, MemoryImageId>,
-    to: &Bounded<UnresolvedLocation, MemoryImageId>,
+    method: &Bounded<Claimed<MoveMethod>, ImageId>,
+    to: &Bounded<UnresolvedLocation, ImageId>,
 ) -> Option<String> {
     let method = method.settled().map(move_method_label);
     let destination = location_display(&to.possible);

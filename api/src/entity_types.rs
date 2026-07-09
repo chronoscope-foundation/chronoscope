@@ -140,7 +140,7 @@ fn negotiate_name_for_prefixes(
 pub fn markers_from_summaries(
     summaries: Vec<EntitySummary<MemoryEntityId, MemoryImageId>>,
     accept_language: Option<&str>,
-) -> Vec<(Marker, Option<MemoryImageId>)> {
+) -> Vec<(Marker<MemoryEntityId>, Option<MemoryImageId>)> {
     let prefixes = parse_accept_language(accept_language);
     let mut coord_groups: EntityGroups = HashMap::new();
     for summary in summaries {
@@ -164,7 +164,7 @@ type EntityGroups = HashMap<(u64, u64), Vec<EntitySummary<MemoryEntityId, Memory
 fn marker_from_group(
     mut group: Vec<EntitySummary<MemoryEntityId, MemoryImageId>>,
     prefixes: &[String],
-) -> (Marker, Option<MemoryImageId>) {
+) -> (Marker<MemoryEntityId>, Option<MemoryImageId>) {
     group.sort_by_key(|e| (e.earliest.is_none(), e.earliest));
 
     let click_action = if let [only] = group.as_slice() {

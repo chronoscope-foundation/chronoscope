@@ -3,7 +3,7 @@
 //! Facts are committed directly against `ctx.app_state.facts` (there's no
 //! write endpoint yet) and then read back over HTTP, exercising the real
 //! Dropshot path/query extraction and JSON wire shapes — including the
-//! `MemoryEntityId` path-param round trip (numeric wire form vs. the
+//! `MemoryEntityId` path-param round trip (decimal-string wire form vs. the
 //! `entity-{n}` `Display` form).
 
 use std::collections::{BTreeSet, HashMap};
@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use chrono::{DateTime, TimeZone, Utc};
 
 use chronoscope_api_client::{
-    ClickAction, Cursor, EntityListPage, MarkersResponse, client::ApiError,
+    ClickAction, Cursor, EntityId, EntityListPage, MarkersResponse, client::ApiError,
 };
 use chronoscope_core::conflicts::{AnyConflictReport, BookendEndpoint, ConflictPath};
 use chronoscope_core::date::{DatePrecision, UncertainDate};
@@ -36,6 +36,14 @@ use crate::cdn::tests::TEST_CDN_BASE_URL;
 use crate::state::ResolvedImageMedia;
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// The client-side wire id the server serializes a `MemoryEntityId` as: the
+/// backend id crosses the wire as its decimal string, which the typed client
+/// reads back as an opaque [`EntityId`]. Bridges a committed backend id to the
+/// id the typed client surfaces for the same entity.
+fn wire_entity_id(id: MemoryEntityId) -> EntityId {
+    EntityId::new(id.0.to_string())
+}
 
 fn fixed_time() -> Result<DateTime<Utc>, &'static str> {
     Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
@@ -277,9 +285,9 @@ async fn get_entity_returns_the_typed_projection_for_a_known_id() -> TestResult 
     let ctx = TestContext::new().await?;
     let id = commit_named_entity_at(&ctx.app_state.facts, "Pantheon", 41.8986, 12.4769).await?;
 
-    let detail = ctx.client.get_entity(&id).await?;
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
 
-    assert_eq!(detail.entity.id, id);
+    assert_eq!(detail.entity.id, wire_entity_id(id));
     assert!(
         detail.entity.names.iter().any(|n| n.text == "Pantheon"),
         "expected the committed name to round-trip, got {:?}",
@@ -310,7 +318,7 @@ async fn get_entity_defaults_display_name_to_english_without_accept_language() -
     )
     .await?;
 
-    let detail = ctx.client.get_entity(&id).await?;
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
 
     assert_eq!(
         detail.display_name.as_deref(),
@@ -344,9 +352,9 @@ async fn get_entity_resolves_a_depicted_image_into_the_detail_grid() -> TestResu
     let ctx =
         TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
 
-    let detail = ctx.client.get_entity(&id).await?;
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
 
-    assert_eq!(detail.entity.id, id);
+    assert_eq!(detail.entity.id, wire_entity_id(id));
     let image = detail.images.first().ok_or("expected one detail image")?;
     assert_eq!(
         image.source_url.as_str(),
@@ -382,7 +390,7 @@ async fn get_entity_skips_a_depiction_whose_image_is_unresolved() -> TestResult 
 
     let ctx = TestContext::with_facts_and_image_media(facts, HashMap::new()).await?;
 
-    let detail = ctx.client.get_entity(&id).await?;
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
     assert!(
         detail.images.is_empty(),
         "an unresolved depiction contributes no grid tile, got {:?}",
@@ -398,7 +406,7 @@ async fn get_entity_404s_for_an_id_no_fact_ever_named() -> TestResult {
     // any commit, so no fact anywhere mentions it.
     let unknown = MemoryEntityId(999_999);
 
-    match ctx.client.get_entity(&unknown).await {
+    match ctx.client.get_entity(&wire_entity_id(unknown)).await {
         Ok(entity) => {
             return Err(format!(
                 "an unnamed id must 404, not project as an empty entity: {entity:?}"
@@ -433,10 +441,10 @@ async fn get_entity_404_carries_cors_headers() -> TestResult {
 
 #[tokio::test]
 async fn get_entity_path_param_round_trips_the_numeric_wire_form() -> TestResult {
-    // `MemoryEntityId`'s `Display` renders the debug form `entity-{n}`, not
-    // the wire form the path deserializer parses. Hitting the raw HTTP path
-    // with the bare integer (what `Client::get_entity` sends) pins that the
-    // server-side path extraction actually accepts it.
+    // `MemoryEntityId`'s `Display` renders the debug form `entity-{n}`, not the
+    // wire form the path deserializer parses. Hitting the raw HTTP path with the
+    // backend id's decimal-string form (what `Client::get_entity` sends) pins
+    // that the server-side path extraction accepts it.
     let ctx = TestContext::new().await?;
     let id = commit_named_entity_at(&ctx.app_state.facts, "Bare Numeric Path", 10.0, 10.0).await?;
 
@@ -503,7 +511,7 @@ async fn get_entity_surfaces_a_competing_construction_date_conflict() -> TestRes
     let ctx = TestContext::new().await?;
     let (id, expected) = commit_competing_construction_dates(&ctx.app_state.facts).await?;
 
-    let detail = ctx.client.get_entity(&id).await?;
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
 
     assert_eq!(
         detail.conflicts.len(),
@@ -513,7 +521,8 @@ async fn get_entity_surfaces_a_competing_construction_date_conflict() -> TestRes
     );
     let AnyConflictReport::Date(report) = detail.conflicts.first().ok_or("no conflict report")?;
     assert_eq!(
-        report.location.entity, id,
+        report.location.entity,
+        wire_entity_id(id),
         "the conflict is anchored to the entity that was read"
     );
     assert_eq!(
@@ -543,7 +552,7 @@ async fn list_markers_selects_a_lone_entity() -> TestResult {
 
     assert_eq!(response.markers.len(), 1, "expected exactly one marker");
     let marker = &response.markers[0];
-    assert_eq!(marker.id, id);
+    assert_eq!(marker.id, wire_entity_id(id));
     assert_eq!(
         marker.name.as_deref(),
         Some("Colosseum"),
@@ -554,7 +563,7 @@ async fn list_markers_selects_a_lone_entity() -> TestResult {
         "an entity with no depiction has no marker thumbnail"
     );
     match &marker.click_action {
-        ClickAction::Select { entity_id } => assert_eq!(*entity_id, id),
+        ClickAction::Select { entity_id } => assert_eq!(*entity_id, wire_entity_id(id)),
         other => return Err(format!("expected Select, got {other:?}").into()),
     }
     assert!(!response.truncated);
@@ -579,7 +588,7 @@ async fn list_markers_carries_a_thumbnail_for_a_depicted_entity() -> TestResult 
     let marker = response
         .markers
         .iter()
-        .find(|m| m.id == id)
+        .find(|m| m.id == wire_entity_id(id))
         .ok_or("expected a marker for the depicted entity")?;
     assert_eq!(
         marker.thumbnail_url.as_ref().map(url::Url::as_str),
@@ -606,8 +615,8 @@ async fn list_markers_disambiguates_colocated_entities() -> TestResult {
     );
     match &response.markers[0].click_action {
         ClickAction::Disambiguate { entries } => {
-            let ids: std::collections::BTreeSet<_> = entries.iter().map(|e| e.id).collect();
-            assert_eq!(ids, [a, b].into_iter().collect());
+            let ids: std::collections::BTreeSet<_> = entries.iter().map(|e| e.id.clone()).collect();
+            assert_eq!(ids, [a, b].into_iter().map(wire_entity_id).collect());
         }
         other => return Err(format!("expected Disambiguate, got {other:?}").into()),
     }
@@ -643,7 +652,7 @@ async fn list_markers_accepts_an_antimeridian_bbox() -> TestResult {
     let marker = response
         .markers
         .iter()
-        .find(|m| m.id == id)
+        .find(|m| m.id == wire_entity_id(id))
         .ok_or("expected the antimeridian entity inside the wrapping box")?;
     assert_eq!(
         marker.name.as_deref(),
@@ -682,7 +691,7 @@ async fn list_markers_negotiates_marker_name_by_accept_language() -> TestResult 
         Some("Accept-Language"),
         "a language-negotiated response advertises Vary: Accept-Language so caches don't cross-serve locales"
     );
-    let italian: MarkersResponse = italian_resp.json().await?;
+    let italian: MarkersResponse<MemoryEntityId> = italian_resp.json().await?;
     assert_eq!(
         italian.markers.first().and_then(|m| m.name.as_deref()),
         Some("Firenze"),
@@ -691,7 +700,7 @@ async fn list_markers_negotiates_marker_name_by_accept_language() -> TestResult 
 
     // `en-US,en;q=0.9`: both entries reduce to the primary subtag `en`, so the
     // English name wins regardless of the q-weight.
-    let english: MarkersResponse = ctx
+    let english: MarkersResponse<MemoryEntityId> = ctx
         .client
         .reqwest_client()
         .get(ctx.url(query))
@@ -722,7 +731,7 @@ async fn list_markers_matches_accept_language_case_insensitively() -> TestResult
     let query = "/markers?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
 
     // An uppercase `IT` must match the lowercase-canonical stored `it` tag.
-    let response: MarkersResponse = ctx
+    let response: MarkersResponse<MemoryEntityId> = ctx
         .client
         .reqwest_client()
         .get(ctx.url(query))
@@ -754,7 +763,7 @@ async fn list_markers_orders_accept_language_by_q_weight() -> TestResult {
 
     // `de;q=0.5, en`: `en` carries an implicit q=1.0, outranking `de;q=0.5`
     // despite coming later in the header, so the English name wins.
-    let response: MarkersResponse = ctx
+    let response: MarkersResponse<MemoryEntityId> = ctx
         .client
         .reqwest_client()
         .get(ctx.url(query))
@@ -782,7 +791,8 @@ async fn list_entities_lists_placeable_entities_in_the_bbox() -> TestResult {
         .get("/entities?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3")
         .await?;
     assert_eq!(resp.status(), 200);
-    let page: chronoscope_api_client::EntityListPage = resp.json().await?;
+    let page: chronoscope_api_client::EntityListPage<MemoryEntityId, MemoryImageId> =
+        resp.json().await?;
 
     assert!(
         page.summaries.iter().any(|s| s.id == id),
@@ -821,7 +831,7 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
     // Page 1 caps at the limit and, with entities still to come, hands back a cursor.
     let resp = ctx.get(&format!("/entities?{bbox}&limit=1")).await?;
     assert_eq!(resp.status(), 200);
-    let page1: EntityListPage = resp.json().await?;
+    let page1: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
     assert_eq!(
         page1.summaries.len(),
         1,
@@ -843,7 +853,7 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
             .get(&format!("/entities?{bbox}&limit=1&cursor={}", c.as_str()))
             .await?;
         assert_eq!(resp.status(), 200, "a minted cursor round-trips as a 200");
-        let page: EntityListPage = resp.json().await?;
+        let page: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
         for summary in &page.summaries {
             assert!(
                 seen.insert(summary.id),

@@ -172,7 +172,7 @@ fn golden_attribute_fact_name() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":1,"language":"en","name":"Pantheon","name_type":"common","type":"name","valid_from":null,"valid_to":null}"#,
+        r#"{"entity":"1","language":"en","name":"Pantheon","name_type":"common","type":"name","valid_from":null,"valid_to":null}"#,
     )
 }
 
@@ -181,7 +181,7 @@ fn golden_attribute_fact_relationship() -> Result<()> {
     let f = attribute::Fact::relationship(ent(1)?, ent(2)?, EntityRelationType::Contains)?;
     assert_golden_roundtrip(
         &f,
-        r#"{"pair":{"from":1,"to":2},"relation":"contains","type":"relationship"}"#,
+        r#"{"pair":{"from":"1","to":"2"},"relation":"contains","type":"relationship"}"#,
     )
 }
 
@@ -193,7 +193,7 @@ fn golden_construction_fact_started() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":1,"type":"started"}"#,
+        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":"1","type":"started"}"#,
     )
 }
 
@@ -205,7 +205,7 @@ fn golden_demolition_fact_started() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":1,"type":"started"}"#,
+        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":"1","type":"started"}"#,
     )
 }
 
@@ -218,7 +218,7 @@ fn golden_event_fact_durational_date() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"event":1,"role":"started","type":"durational_date"}"#,
+        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"event":"1","role":"started","type":"durational_date"}"#,
     )
 }
 
@@ -233,7 +233,7 @@ fn golden_event_fact_has_event() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":1,"event":1,"kind":{"kind":"damaged","type":"durational"},"type":"has_event"}"#,
+        r#"{"entity":"1","event":"1","kind":{"kind":"damaged","type":"durational"},"type":"has_event"}"#,
     )
 }
 
@@ -243,7 +243,7 @@ fn golden_event_fact_move_method() -> Result<()> {
         event: evt(1)?,
         method: MoveMethod::Whole,
     };
-    assert_golden_roundtrip(&f, r#"{"event":1,"method":"whole","type":"move_method"}"#)
+    assert_golden_roundtrip(&f, r#"{"event":"1","method":"whole","type":"move_method"}"#)
 }
 
 #[test]
@@ -254,7 +254,7 @@ fn golden_image_fact_source() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"image":1,"type":"source","url":"https://example.com/img"}"#,
+        r#"{"image":"1","type":"source","url":"https://example.com/img"}"#,
     )
 }
 
@@ -266,7 +266,7 @@ fn golden_image_fact_medium() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"image":1,"medium":"pictorial_map","type":"medium"}"#,
+        r#"{"image":"1","medium":"pictorial_map","type":"medium"}"#,
     )
 }
 
@@ -276,7 +276,7 @@ fn golden_identity_fact_same_entity() -> Result<()> {
         ent(1)?,
         ent(2)?,
     )?;
-    assert_golden_roundtrip(&f, r#"{"pair":{"a":1,"b":2},"type":"same_entity"}"#)
+    assert_golden_roundtrip(&f, r#"{"pair":{"a":"1","b":"2"},"type":"same_entity"}"#)
 }
 
 #[test]
@@ -292,7 +292,7 @@ fn golden_depiction_fact_bare() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":1,"image":1,"localization":null,"perspective":null}"#,
+        r#"{"entity":"1","image":"1","localization":null,"perspective":null}"#,
     )
 }
 
@@ -308,7 +308,7 @@ fn golden_depiction_fact_localized() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":1,"image":1,"localization":{"rect":{"max":{"x":0.30000001192092896,"y":0.4000000059604645},"min":{"x":0.10000000149011612,"y":0.20000000298023224}},"type":"bbox"},"perspective":"interior"}"#,
+        r#"{"entity":"1","image":"1","localization":{"rect":{"max":{"x":0.30000001192092896,"y":0.4000000059604645},"min":{"x":0.10000000149011612,"y":0.20000000298023224}},"type":"bbox"},"perspective":"interior"}"#,
     )
 }
 
@@ -326,7 +326,7 @@ fn golden_observation_fact_feature() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":1,"feature":{"shape":"gabled","type":"roof_shape"},"type":"feature"}"#,
+        r#"{"entity":"1","feature":{"shape":"gabled","type":"roof_shape"},"type":"feature"}"#,
     )
 }
 
@@ -335,7 +335,7 @@ fn golden_observation_fact_spatial() -> Result<()> {
     let f = observation::Fact::spatial(ent(1)?, ent(2)?, TopologicalRel::Adjacent)?;
     assert_golden_roundtrip(
         &f,
-        r#"{"pair":{"from":1,"to":2},"relation":{"type":"adjacent"},"type":"spatial"}"#,
+        r#"{"pair":{"from":"1","to":"2"},"relation":{"type":"adjacent"},"type":"spatial"}"#,
     )
 }
 
@@ -349,7 +349,7 @@ fn golden_composites_fact_is_subimage_of() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"parent":2,"region":{"rect":{"max":{"x":0.5,"y":0.5},"min":{"x":0,"y":0}},"type":"rect"},"subimage":1,"type":"is_subimage_of"}"#,
+        r#"{"parent":"2","region":{"rect":{"max":{"x":0.5,"y":0.5},"min":{"x":0,"y":0}},"type":"rect"},"subimage":"1","type":"is_subimage_of"}"#,
     )
 }
 
@@ -375,7 +375,7 @@ fn golden_decl_existing_locks_tagged_id_payload() -> Result<()> {
     // `Decl::Existing` carries an id, part of the commit address. Locks that
     // the `{"type":"existing","id":..}` tagging round-trips.
     let decl: Decl<MemoryEntityId> = Decl::Existing { id: ent(5)? };
-    assert_golden_roundtrip(&decl, r#"{"id":5,"type":"existing"}"#)
+    assert_golden_roundtrip(&decl, r#"{"id":"5","type":"existing"}"#)
 }
 
 #[test]
@@ -684,7 +684,7 @@ fn golden_commit_canonical_jcs_analyzer_companion_bundle() -> Result<()> {
 
     assert_golden(
         &bundle.canonical_jcs()?,
-        r#"{"author":"analyzer:matcher@test-version","entities":[{"id":1,"type":"existing"},{"id":2,"type":"existing"}],"events":[],"facts":[{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"basis":[3,5],"process":"matcher","snapshot":7,"type":"derivation","version":"test-version"},"type":"judgment"}],"images":[],"recorded_at":"2024-01-01T12:00:00+00:00"}"#,
+        r#"{"author":"analyzer:matcher@test-version","entities":[{"id":"1","type":"existing"},{"id":"2","type":"existing"}],"events":[],"facts":[{"assertion":{"fact":{"pair":{"a":0,"b":1},"type":"same_entity"},"type":"identity"},"citation":{"basis":[3,5],"process":"matcher","snapshot":7,"type":"derivation","version":"test-version"},"type":"judgment"}],"images":[],"recorded_at":"2024-01-01T12:00:00+00:00"}"#,
     );
     Ok(())
 }

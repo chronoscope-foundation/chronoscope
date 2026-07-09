@@ -10,7 +10,7 @@ use serde_json::json;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
-use chronoscope_core::store::memory::MemoryEntityId;
+use chronoscope_api_client::EntityId;
 
 use crate::api;
 use crate::maplibre;
@@ -143,12 +143,12 @@ pub enum EntitySelection {
     /// A single entity's detail.
     Single {
         /// The entity whose detail panel to show.
-        detail: MemoryEntityId,
+        detail: EntityId,
         /// The marker to highlight — its co-located group's representative.
         /// Equals `detail` for a plain marker click; differs when a
         /// non-representative member of a disambiguation group is picked,
         /// since map features are keyed on the representative's id.
-        feature: MemoryEntityId,
+        feature: EntityId,
         /// The co-located group to return to, when this came from a
         /// disambiguation pick.
         back: Option<Vec<EntityPickerEntry>>,
@@ -157,16 +157,16 @@ pub enum EntitySelection {
     Multiple(Vec<EntityPickerEntry>),
 }
 
-/// Re-export the picker entry type from the API client.
-pub use chronoscope_api_client::EntityPickerEntry;
+/// Client-facing picker entry, at the opaque wire entity id.
+pub type EntityPickerEntry = chronoscope_api_client::EntityPickerEntry<EntityId>;
 
 /// A map marker — the map component's uniform view of every entity rendered
 /// on the map. No region clustering — every marker is either a single entity
 /// or a co-located disambiguation group, optionally carrying a thumbnail.
 #[derive(Clone, Debug)]
 struct MapMarker {
-    /// String form of the representative entity's numeric id — the stable
-    /// key MapLibre uses for the GeoJSON feature (`promoteId`) and for
+    /// The representative entity's opaque wire id as a string — the stable key
+    /// MapLibre uses for the GeoJSON feature (`promoteId`) and for
     /// selection-state tracking.
     id: String,
     /// Geographic position as `(latitude, longitude)`.
@@ -228,7 +228,7 @@ fn build_markers_geojson(markers: &[MapMarker]) -> Option<JsValue> {
             props.insert("kind".into(), "entity".into());
             match &marker.click_action {
                 api::ClickAction::Select { entity_id } => {
-                    props.insert("id".into(), entity_id.0.into());
+                    props.insert("id".into(), entity_id.as_str().into());
                 }
                 api::ClickAction::Disambiguate { entries } => {
                     if let Ok(json) = serde_json::to_string(entries) {
@@ -498,7 +498,7 @@ async fn load_entities_for_viewport(
                 .filter_map(|m| {
                     m.thumbnail_url
                         .as_ref()
-                        .map(|url| (m.id.0.to_string(), url.as_str().to_string()))
+                        .map(|url| (m.id.as_str().to_string(), url.as_str().to_string()))
                 })
                 .collect();
 
@@ -512,7 +512,7 @@ async fn load_entities_for_viewport(
                 .map(|m| {
                     let has_thumbnail = m.thumbnail_url.is_some();
                     MapMarker {
-                        id: m.id.0.to_string(),
+                        id: m.id.as_str().to_string(),
                         position: (m.point.lat(), m.point.lon()),
                         label: m.name,
                         click_action: m.click_action,
@@ -812,18 +812,18 @@ async fn load_image(url: &str) -> Result<web_sys::HtmlImageElement, String> {
 /// variant — text-only slice, no region clustering.
 enum ClickTarget {
     /// Select a single entity.
-    Select(MemoryEntityId),
+    Select(EntityId),
     /// Disambiguate co-located entities.
     Disambiguate(Vec<EntityPickerEntry>),
 }
 
 /// Raw deserialization target for GeoJSON feature properties.
 /// Immediately converted to [`ClickTarget`] — never used directly.
-/// `id` deserializes straight from the numeric `id` property
-/// (`MemoryEntityId` is `#[serde(transparent)]` over `u64`).
+/// `id` deserializes from the string `id` property written in
+/// `build_markers_geojson` (`EntityId` is a transparent string newtype).
 #[derive(serde::Deserialize)]
 struct RawMarkerProps {
-    id: Option<MemoryEntityId>,
+    id: Option<EntityId>,
     group: Option<String>,
 }
 
@@ -873,7 +873,7 @@ fn handle_marker_click(event: JsValue, set_selected: WriteSignal<Option<EntitySe
     match target {
         ClickTarget::Select(id) => {
             set_selected.set(Some(EntitySelection::Single {
-                detail: id,
+                detail: id.clone(),
                 feature: id,
                 back: None,
             }));
@@ -1244,13 +1244,12 @@ fn effect_selection(
     let prev_id: Rc<Cell<Option<String>>> = Rc::new(Cell::new(None));
 
     Effect::new(move || {
-        // Feature ids are the marker's numeric-string form (see
-        // `MapMarker::id` / `build_markers_geojson`), not `MemoryEntityId`'s
-        // debug-shaped `Display`. Highlight the marker the selection belongs
-        // to — its representative `feature` id — which for a disambiguation
-        // pick differs from the picked member's detail id.
+        // Feature ids are the marker's opaque wire id as a string (see
+        // `MapMarker::id` / `build_markers_geojson`). Highlight the marker the
+        // selection belongs to — its representative `feature` id — which for a
+        // disambiguation pick differs from the picked member's detail id.
         let new_id = match signals.selected.get() {
-            Some(EntitySelection::Single { feature, .. }) => Some(feature.0.to_string()),
+            Some(EntitySelection::Single { feature, .. }) => Some(feature.as_str().to_string()),
             _ => None,
         };
 

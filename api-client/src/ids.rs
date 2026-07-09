@@ -1,23 +1,25 @@
-//! Strongly-typed ID newtypes for API entities.
+//! Strongly-typed ID newtypes for the API contract.
 //!
-//! These are infrastructure identifiers that appear in API responses. They wrap
-//! UUIDv7 strings and provide type safety to prevent mixing up different ID types.
+//! Two families:
 //!
-//! When the `sqlx` feature is enabled, these types derive `sqlx::Type` so the
-//! database layer can use them directly in row structs without manual conversion.
+//! - Infrastructure ids ([`UserId`], [`ResearchUrlId`], [`MediaId`], [`Email`])
+//!   wrap UUIDv7 strings the database mints. Under the `sqlx` feature they derive
+//!   `sqlx::Type` so row structs use them directly.
+//! - Opaque wire ids ([`EntityId`], [`ImageId`], [`EventId`]) are backend-agnostic
+//!   identifiers the client reads out of fact-store read responses. They carry no
+//!   format assumption — whatever string the backend serialized round-trips
+//!   verbatim — so the client never names a backend's concrete id type.
 
 use std::fmt;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Macro to define a strongly-typed ID newtype.
-///
-/// Each ID type wraps a String (UUIDv7) and provides:
-/// - `new()` to create from any string-like value
-/// - `generate()` to create a new UUIDv7
-/// - `as_str()` to get the inner string reference
-/// - Display, `AsRef<str>`, and derives for serialization
+/// Define a UUIDv7-backed infrastructure id newtype wrapping a `String`:
+/// - `new()` from any string-like value
+/// - `generate()` for a fresh UUIDv7
+/// - `as_str()`, `Display`, `AsRef<str>`, and the serialization derives
+/// - `sqlx::Type` under the `sqlx` feature
 macro_rules! define_id {
     ($name:ident, $doc:expr) => {
         #[doc = $doc]
@@ -60,16 +62,54 @@ macro_rules! define_id {
     };
 }
 
-define_id!(EntityId, "Persistent entity identifier (UUIDv7).");
-define_id!(
-    SourceId,
-    "Persistent source identifier (UUIDv7). References images, maps, and documents."
-);
-define_id!(EntityLinkId, "Entity external link identifier (UUIDv7).");
-define_id!(AnnotationId, "Annotation identifier (UUIDv7).");
 define_id!(UserId, "User account identifier (UUIDv7).");
 define_id!(ResearchUrlId, "Research URL identifier (UUIDv7).");
 define_id!(MediaId, "Fetched media blob identifier (UUIDv7).");
+
+/// Define an opaque, backend-agnostic wire id newtype wrapping a `String`.
+///
+/// Unlike [`define_id!`] these carry no format assumption and no `generate()` —
+/// the value is whatever string the backend serialized, threaded back verbatim.
+/// The `#[serde(transparent)]` wire form is the bare string, so the client reads
+/// a backend's id without naming the backend's concrete id type.
+macro_rules! wire_id {
+    ($name:ident, $doc:expr) => {
+        #[doc = $doc]
+        #[derive(
+            Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+        )]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            #[must_use]
+            pub fn new(id: impl Into<String>) -> Self {
+                Self(id.into())
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+wire_id!(EntityId, "Opaque wire identifier for an entity.");
+wire_id!(ImageId, "Opaque wire identifier for an image.");
+wire_id!(EventId, "Opaque wire identifier for a lifetime event.");
 
 /// An email address.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

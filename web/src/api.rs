@@ -5,7 +5,13 @@
 
 use wasm_bindgen::JsCast;
 
-pub use chronoscope_api_client::{ClickAction, Client, EntityDetail, image_caption};
+pub use chronoscope_api_client::{Client, EntityId, EventId, ImageId, image_caption};
+
+/// Client-facing instantiations of the generic read DTOs at the opaque wire ids.
+/// The web frontend is a leaf consumer, so it pins the id params once here rather
+/// than spelling them at every use site.
+pub type ClickAction = chronoscope_api_client::ClickAction<EntityId>;
+pub type EntityDetail = chronoscope_api_client::EntityDetail<EntityId, EventId, ImageId>;
 
 // ==================== Runtime Configuration ====================
 
