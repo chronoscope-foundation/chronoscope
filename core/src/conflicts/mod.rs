@@ -14,9 +14,11 @@
 //! over-determined slot's fact set to one minimal fighting set. The detector
 //! itself lands here alongside them.
 
+mod detect;
 pub mod minimize;
 mod report;
 
+pub use detect::{CitedFact, cited_lineage, detect_conflicts};
 pub use report::{
     AnyConflictReport, BookendEndpoint, ConflictId, ConflictKind, ConflictLocation, ConflictPath,
     ConflictReport, DateConflict, EventEndpoint, Resolution, Uninhabited,
