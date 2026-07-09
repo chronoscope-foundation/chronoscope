@@ -13,7 +13,7 @@ Nix build infrastructure. One derivation module per project area;
 | `web.nix`       | WASM build pipeline + `web-build`/`web-test-build`/`web-clippy` checks |
 | `python.nix`    | `analysisEnv`, model weight FODs, triton checks     |
 | `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |
-| `wikidata.nix`  | Curated Wikidata entity fetch → `entities.jsonl` FOD |
+| `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL) |
 
 Dev shell composition lives in `flake.nix`, not in any single component
 module — it has the visibility to compose across modules.
@@ -53,6 +53,12 @@ Each shell composes only the pins it actually uses (e.g. `triton`
 pins weights, not corpus). If a derivation that takes time to build is
 not pinned and not in the store, it'll be silently re-fetched/rebuilt
 the next time the shell loads.
+
+The bulk dump pipeline (`wikidata-arch-entities`) is the exception: building it
+downloads the ~109GB dump and runs the filter, so it must never fire from a
+shell hook. `just fetch-wikidata` builds and pins it via `--out-link` (itself
+a GC root). The dump pipeline lives in `packages`, not `checks`, so the commit
+gate never touches it.
 
 ## Lazy parameter passing
 

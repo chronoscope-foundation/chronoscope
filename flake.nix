@@ -303,6 +303,13 @@
             sam3-weights = pythonEnvs.sam3Cache;
 
             wikidata-curated-entities = wikidata.bundles.curated.entities;
+
+            # Bulk dump pipeline. Packages, not checks — the commit gate
+            # never downloads the dump. Build + pin the architectural-entities
+            # set with `just fetch-wikidata`.
+            wikidata-dump = wikidata.dump.full;
+            wikidata-arch-types = wikidata.dump.archTypes;
+            wikidata-arch-entities = wikidata.dump.archEntities;
           }
           // lib.optionalAttrs isDarwin {
             ios-api-package = openapi.apiPackage;

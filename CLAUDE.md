@@ -69,6 +69,7 @@ OpenAPI client regen, corpus FOD layout, HF cache layout, etc.).
 HF_TOKEN=hf_... just fetch-weights        # ~2GB model weights (gated repos; needs HF token)
 just fetch-corpus                          # corpus images from external URLs
 just fetch-all                             # weights + corpus
+just fetch-wikidata                        # build+pin the architectural-entities set (bulk ingestion source)
 ```
 
 Fetched data is pinned as GC roots under `.nix-gc-roots/` (gitignored).

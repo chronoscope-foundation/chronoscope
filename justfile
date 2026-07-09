@@ -330,6 +330,20 @@ fetch-all:
         --impure --no-link
     echo "Done."
 
+# Build + pin the Wikidata architectural-entities set. Runs the bulk pipeline:
+# fetch the ~109GB dump (FOD, on first run), resolve the P279 type set, and
+# filter down to architectural entities. Expensive — run rarely. The
+# --out-link is itself the GC root, so ordinary shell entry never triggers it.
+fetch-wikidata:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    _ensure_nix
+    mkdir -p .nix-gc-roots
+    echo "==> Building + pinning architectural-entities set (downloads the dump on first run)..."
+    nix build .#wikidata-arch-entities --out-link .nix-gc-roots/wikidata-arch-entities
+    echo "Done. Pinned at .nix-gc-roots/wikidata-arch-entities/entities.jsonl"
+
 # ---------------------------------------------------------------------------
 # Corpus tooling. Live in their own world because the corpus pipeline has
 # specific feature flags and a separate analysis-results derivation.
