@@ -470,7 +470,7 @@ async fn load_entities_for_viewport(
     signals.set_fetch_error.set(None);
     signals.set_map_error.set(None);
 
-    let bbox = match chronoscope_api_client::Bbox::new(min_lat, max_lat, min_lon, max_lon) {
+    let bbox = match chronoscope_core::geo::Bbox::from_coords(min_lat, max_lat, min_lon, max_lon) {
         Ok(b) => b,
         Err(e) => {
             signals.set_loading.set(false);
@@ -498,7 +498,7 @@ async fn load_entities_for_viewport(
                 .filter_map(|m| {
                     m.thumbnail_url
                         .as_ref()
-                        .map(|url| (m.id.0.to_string(), url.clone()))
+                        .map(|url| (m.id.0.to_string(), url.as_str().to_string()))
                 })
                 .collect();
 
@@ -513,7 +513,7 @@ async fn load_entities_for_viewport(
                     let has_thumbnail = m.thumbnail_url.is_some();
                     MapMarker {
                         id: m.id.0.to_string(),
-                        position: (m.latitude, m.longitude),
+                        position: (m.point.lat(), m.point.lon()),
                         label: m.name,
                         click_action: m.click_action,
                         has_thumbnail,

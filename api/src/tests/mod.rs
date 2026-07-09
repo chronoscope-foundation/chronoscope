@@ -225,7 +225,7 @@ impl TestContext {
             rp_origin: format!("http://localhost:{}", addr.port()),
             bind_addr: addr,
             ios_app_id,
-            cdn_base_url: crate::cdn::tests::TEST_CDN_BASE_URL.to_string(),
+            cdn_base_url: Url::parse(crate::cdn::tests::TEST_CDN_BASE_URL)?,
         };
 
         let db = Database::new(&config.database_url).await?;

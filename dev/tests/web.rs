@@ -730,11 +730,12 @@ async fn test_detail_panel_focus() -> TestResult {
 async fn find_entity_with_media(
     t: &WebTest,
 ) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
-    use chronoscope_api_client::{Bbox, Client};
+    use chronoscope_api_client::Client;
+    use chronoscope_core::geo::Bbox;
 
     let client = Client::new(t.api_base_url());
     // Rome's bbox — the 4 Roman entities sit here, several with seeded media.
-    let bbox = Bbox::new(41.5, 42.5, 12.0, 13.0)?;
+    let bbox = Bbox::from_coords(41.5, 42.5, 12.0, 13.0)?;
     let response = client.list_markers(&bbox).await?;
 
     // Pick the entity with the most resolved media among those whose marker
@@ -750,8 +751,8 @@ async fn find_entity_with_media(
             let count = detail.images.len();
             if best.as_ref().is_none_or(|b| count > b.2) {
                 best = Some((
-                    marker.longitude,
-                    marker.latitude,
+                    marker.point.lon(),
+                    marker.point.lat(),
                     count,
                     entity_id.to_string(),
                 ));

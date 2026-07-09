@@ -10,29 +10,12 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use chronoscope_api_client::{ClickAction, EntityPickerEntry, Marker};
-use chronoscope_core::geo::{self, GeoPoint};
 use chronoscope_core::listing::EntitySummary;
 use chronoscope_core::store::memory::{MemoryEntityId, MemoryImageId};
 use chronoscope_core::typed::{self, find_by_language};
 use dropshot::HttpError;
 
 use crate::limits;
-
-/// Convert a request-supplied bbox to the fact store's own `Bbox`.
-///
-/// `chronoscope_api_client::Bbox` already validated coordinate ranges and
-/// finiteness (and admits an antimeridian-crossing `min_lon > max_lon` box),
-/// and `chronoscope_core::geo::Bbox` is itself antimeridian-aware — it rejects
-/// only inverted latitude, which the client bbox already precludes. Both steps
-/// keep their fallible signatures, threaded through via `?` rather than assumed
-/// away; any failure surfaces to the caller as a 400.
-pub fn to_core_bbox(bbox: &chronoscope_api_client::Bbox) -> Result<geo::Bbox, String> {
-    let sw =
-        GeoPoint::new(bbox.min_lat(), bbox.min_lon()).map_err(|e| format!("sw corner: {e}"))?;
-    let ne =
-        GeoPoint::new(bbox.max_lat(), bbox.max_lon()).map_err(|e| format!("ne corner: {e}"))?;
-    geo::Bbox::new(sw, ne).map_err(|e| e.to_string())
-}
 
 /// The page-size cap shared by `/entities` and `/markers`, as a `NonZeroUsize`.
 ///
@@ -202,8 +185,7 @@ fn marker_from_group(
     let representative = &group[0];
     let marker = Marker {
         id: representative.id,
-        latitude: representative.point.lat(),
-        longitude: representative.point.lon(),
+        point: representative.point,
         name: negotiate_name_for_prefixes(&representative.names, prefixes),
         thumbnail_url: None,
         click_action,

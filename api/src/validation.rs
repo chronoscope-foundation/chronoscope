@@ -37,6 +37,14 @@ pub fn bad_request_with_cors(message: String) -> HttpError {
     err
 }
 
+/// A `500 Internal Server Error` carrying CORS headers, so a browser on the
+/// public no-auth endpoints can read the diagnostic body cross-origin.
+pub fn internal_error_with_cors(message: String) -> HttpError {
+    let mut err = HttpError::for_internal_error(message);
+    add_cors_headers(&mut err);
+    err
+}
+
 /// CORS headers applied to all cross-origin responses — defined once,
 /// used by both success responses (via `cors_builder`) and error
 /// responses (via `add_cors_headers`).

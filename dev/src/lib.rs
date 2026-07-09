@@ -427,7 +427,8 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
             .parse()
             .map_err(|e| format!("Invalid bind address: {e}"))?,
         ios_app_id: config.ios_app_id,
-        cdn_base_url: config.cdn_base_url,
+        cdn_base_url: url::Url::parse(&config.cdn_base_url)
+            .map_err(|e| format!("Invalid CDN base URL: {e}"))?,
     };
 
     // Generate a random JWT secret for this session
@@ -448,7 +449,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         "rp_id" => &api_config.rp_id,
         "rp_origin" => &api_config.rp_origin,
         "bind_addr" => %api_config.bind_addr,
-        "cdn_base_url" => &api_config.cdn_base_url,
+        "cdn_base_url" => %api_config.cdn_base_url,
     );
 
     // Configure Dropshot (before api_config is moved)

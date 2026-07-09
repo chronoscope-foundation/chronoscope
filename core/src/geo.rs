@@ -219,6 +219,37 @@ impl std::fmt::Display for BboxError {
 
 impl std::error::Error for BboxError {}
 
+/// Errors from [`Bbox::from_coords`]: a corner coordinate out of range or
+/// non-finite (from [`GeoPoint::new`]), or a latitude-inverted corner pair
+/// (from [`Bbox::new`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum BboxCoordsError {
+    /// The southwest corner's latitude or longitude failed [`GeoPoint::new`].
+    Southwest(GeoPointError),
+    /// The northeast corner's latitude or longitude failed [`GeoPoint::new`].
+    Northeast(GeoPointError),
+    /// The corner pair was latitude-inverted (see [`BboxError`]).
+    Bbox(BboxError),
+}
+
+impl std::fmt::Display for BboxCoordsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Southwest(e) => write!(f, "southwest bbox corner: {e}"),
+            Self::Northeast(e) => write!(f, "northeast bbox corner: {e}"),
+            Self::Bbox(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for BboxCoordsError {}
+
+impl From<BboxError> for BboxCoordsError {
+    fn from(e: BboxError) -> Self {
+        Self::Bbox(e)
+    }
+}
+
 impl Bbox {
     /// Construct a bbox from southwest and northeast corners. Rejects an
     /// inverted latitude span (`sw.lat() > ne.lat()`); a westward longitude
@@ -232,6 +263,23 @@ impl Bbox {
         Ok(Self { sw, ne })
     }
 
+    /// Construct a bbox from flat `(min_lat, max_lat, min_lon, max_lon)`
+    /// coordinates — the shape a map-viewport query arrives in. The `min_*`
+    /// pair becomes the southwest corner, `max_*` the northeast; a westward
+    /// longitude span (`min_lon > max_lon`) is the antimeridian-wrap
+    /// convention (see [`Bbox`]). Per-corner range/finiteness comes from
+    /// [`GeoPoint::new`], latitude ordering from [`Bbox::new`].
+    pub fn from_coords(
+        min_lat: f64,
+        max_lat: f64,
+        min_lon: f64,
+        max_lon: f64,
+    ) -> Result<Self, BboxCoordsError> {
+        let sw = GeoPoint::new(min_lat, min_lon).map_err(BboxCoordsError::Southwest)?;
+        let ne = GeoPoint::new(max_lat, max_lon).map_err(BboxCoordsError::Northeast)?;
+        Ok(Self::new(sw, ne)?)
+    }
+
     /// Southwest corner — the minimum-latitude, minimum-longitude point.
     pub fn sw(&self) -> &GeoPoint {
         &self.sw
@@ -240,6 +288,27 @@ impl Bbox {
     /// Northeast corner — the maximum-latitude, maximum-longitude point.
     pub fn ne(&self) -> &GeoPoint {
         &self.ne
+    }
+
+    /// The box's minimum latitude (southwest corner).
+    pub fn min_lat(&self) -> f64 {
+        self.sw.lat()
+    }
+
+    /// The box's maximum latitude (northeast corner).
+    pub fn max_lat(&self) -> f64 {
+        self.ne.lat()
+    }
+
+    /// The western longitude edge. On an antimeridian-wrapping box this is
+    /// numerically greater than [`max_lon`](Self::max_lon).
+    pub fn min_lon(&self) -> f64 {
+        self.sw.lon()
+    }
+
+    /// The eastern longitude edge.
+    pub fn max_lon(&self) -> f64 {
+        self.ne.lon()
     }
 
     /// Whether `p` lies within the box, inclusive on every edge.
@@ -551,6 +620,33 @@ mod tests {
         let b = Bbox::new(sw, ne)?;
         assert_eq!(b.sw(), &sw);
         assert_eq!(b.ne(), &ne);
+        Ok(())
+    }
+
+    #[test]
+    fn bbox_from_coords_maps_corners_and_validates() -> TestResult {
+        // (min_lat, max_lat, min_lon, max_lon) → sw=(min_lat,min_lon),
+        // ne=(max_lat,max_lon). Pins the positional mapping so a swapped
+        // lat/lon argument is caught.
+        let b = Bbox::from_coords(40.0, 41.0, -74.0, -73.0)?;
+        assert_eq!(b.sw(), &GeoPoint::new(40.0, -74.0)?);
+        assert_eq!(b.ne(), &GeoPoint::new(41.0, -73.0)?);
+        assert_eq!(
+            (b.min_lat(), b.max_lat(), b.min_lon(), b.max_lon()),
+            (40.0, 41.0, -74.0, -73.0)
+        );
+        // An out-of-range coordinate is rejected by the corner constructor.
+        assert!(matches!(
+            Bbox::from_coords(0.0, 1.0, 0.0, 200.0),
+            Err(BboxCoordsError::Northeast(
+                GeoPointError::LongitudeOutOfRange { .. }
+            ))
+        ));
+        // Inverted latitude is rejected by `Bbox::new`.
+        assert!(matches!(
+            Bbox::from_coords(50.0, 40.0, 0.0, 1.0),
+            Err(BboxCoordsError::Bbox(BboxError::LatitudeInverted { .. }))
+        ));
         Ok(())
     }
 

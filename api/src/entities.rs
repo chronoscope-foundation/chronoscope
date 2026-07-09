@@ -8,13 +8,15 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use base64::prelude::*;
 use dropshot::{Body, HttpError, Query, RequestContext, endpoint};
 use http::Response;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use chronoscope_api_client::{Bbox, DetailImage, EntityDetail, EntityListCursor, MarkersResponse};
+use chronoscope_api_client::{Cursor, DetailImage, EntityDetail, EntityListPage, MarkersResponse};
 use chronoscope_core::geo;
+use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::listing::{self, ListCursor, summaries_in_bbox};
 use chronoscope_core::projection::{member_lineage, project_entity, project_image};
 use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
@@ -26,8 +28,8 @@ use crate::entity_types;
 use crate::limits;
 use crate::state::AppState;
 use crate::validation::{
-    bad_request_with_cors, cors_preflight, error_with_cors, fact_store_err, json_with_cors,
-    json_with_cors_vary_language,
+    bad_request_with_cors, cors_preflight, error_with_cors, fact_store_err,
+    internal_error_with_cors, json_with_cors, json_with_cors_vary_language,
 };
 
 /// The `Accept-Language` header value, when present and valid UTF-8. Read off
@@ -40,27 +42,57 @@ fn accept_language(ctx: &RequestContext<Arc<AppState>>) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
-/// A `GET /entities` resume cursor: the fact-store snapshot it was minted
-/// against plus the walk position, JSON-encoded into the `cursor` query
-/// parameter (opaque to the client, round-tripped verbatim).
-type Cursor = ListCursor<EntityListCursor>;
+/// The server-internal resume cursor: the fact-store snapshot the listing was
+/// pinned to plus the walk position. Encoded into the opaque wire [`Cursor`]
+/// token via [`encode_cursor`], never exposed structurally.
+type ListState = ListCursor<(MemoryEntityId, FactId)>;
+
+/// Version byte prefixing an encoded cursor blob. A token minted under a
+/// different version is rejected rather than misparsed.
+const CURSOR_VERSION: u8 = 1;
+
+/// Encode the internal [`ListState`] into the opaque wire token: a version byte
+/// then its JSON form, base64url-encoded.
+fn encode_cursor(state: &ListState) -> Result<Cursor, HttpError> {
+    let mut bytes = vec![CURSOR_VERSION];
+    serde_json::to_writer(&mut bytes, state)
+        .map_err(|e| internal_error_with_cors(format!("cursor encode failed: {e}")))?;
+    Ok(Cursor::new(BASE64_URL_SAFE_NO_PAD.encode(&bytes)))
+}
+
+/// Decode an opaque wire token back into the internal [`ListState`]. A malformed
+/// blob or a token from a different [`CURSOR_VERSION`] surfaces as a CORS-tagged
+/// 400 the browser can read.
+fn decode_cursor(cursor: &Cursor) -> Result<ListState, HttpError> {
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(cursor.as_str())
+        .map_err(|e| bad_request_with_cors(format!("Invalid cursor: {e}")))?;
+    let (&version, payload) = bytes
+        .split_first()
+        .ok_or_else(|| bad_request_with_cors("Invalid cursor: empty token".to_string()))?;
+    if version != CURSOR_VERSION {
+        return Err(bad_request_with_cors(format!(
+            "Invalid cursor: unsupported version {version}"
+        )));
+    }
+    serde_json::from_slice(payload)
+        .map_err(|e| bad_request_with_cors(format!("Invalid cursor: {e}")))
+}
 
 /// Parse the four viewport query fields into the fact store's `Bbox`.
 ///
 /// Shared by `/entities` and `/markers`, whose query params carry the same
-/// bbox corners. `chronoscope_api_client::Bbox` range-validates the
-/// coordinates (admitting an antimeridian-crossing `min_lon > max_lon` box);
-/// the core conversion then only rejects inverted latitude. Either rejection
-/// surfaces as a CORS-tagged 400 the browser can read.
+/// bbox corners. `geo::Bbox::from_coords` range-validates each corner (admitting
+/// an antimeridian-crossing `min_lon > max_lon` box) and rejects an inverted
+/// latitude span; either rejection surfaces as a CORS-tagged 400 the browser can
+/// read.
 fn request_bbox(
     min_lat: f64,
     max_lat: f64,
     min_lon: f64,
     max_lon: f64,
 ) -> Result<geo::Bbox, HttpError> {
-    let bbox = Bbox::new(min_lat, max_lat, min_lon, max_lon)
-        .map_err(|e| bad_request_with_cors(format!("Invalid bbox: {e}")))?;
-    entity_types::to_core_bbox(&bbox)
+    geo::Bbox::from_coords(min_lat, max_lat, min_lon, max_lon)
         .map_err(|e| bad_request_with_cors(format!("Invalid bbox: {e}")))
 }
 
@@ -113,10 +145,10 @@ pub struct EntitiesQueryParams {
     /// Page size; server clamps to `limits::ENTITY_LIST_MAX_PAGE_SIZE`.
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Resume cursor from a previous page's `next`, JSON-encoded. Absent for
-    /// the first page.
+    /// Opaque resume cursor from a previous page's `next`. Absent for the first
+    /// page.
     #[serde(default)]
-    pub cursor: Option<String>,
+    pub cursor: Option<Cursor>,
 }
 
 /// List entities within a geographic bounding box (public, no authentication required).
@@ -157,17 +189,9 @@ pub async fn list_entities(
     let limit = NonZeroUsize::new(requested_limit as usize)
         .ok_or_else(|| bad_request_with_cors("limit must be at least 1".to_string()))?;
 
-    let cursor: Option<Cursor> = match params.cursor {
+    let cursor: Option<ListState> = match params.cursor {
         None => None,
-        Some(s) => match serde_json::from_str(&s) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                return error_with_cors(
-                    http::StatusCode::BAD_REQUEST,
-                    &format!("Invalid cursor: {e}"),
-                );
-            }
-        },
+        Some(c) => Some(decode_cursor(&c)?),
     };
 
     let view = state.facts.now().await.map_err(fact_store_err)?;
@@ -183,7 +207,12 @@ pub async fn list_entities(
         }
     };
 
-    json_with_cors(&page)
+    let next = page.next.map(|c| encode_cursor(&c)).transpose()?;
+    let response = EntityListPage {
+        summaries: page.summaries,
+        next,
+    };
+    json_with_cors(&response)
 }
 
 /// Get a single entity with full detail (public, no authentication required).
@@ -225,7 +254,7 @@ pub async fn get_entity(
         let Some(image) = typed_image(&view, dep.other).await? else {
             continue;
         };
-        let Some(source_url) = image.urls.first().map(|a| a.value.to_string()) else {
+        let Some(source_url) = image.urls.first().map(|a| a.value.clone()) else {
             continue;
         };
         let Some(media) = state.image_media.get(&image.id) else {
@@ -298,7 +327,7 @@ pub async fn list_markers(
         // snapshot staleness against a supplied cursor — unreachable in
         // practice, handled rather than assumed away.
         Err(listing::ListError::SnapshotMismatch) => {
-            return Err(HttpError::for_internal_error(
+            return Err(internal_error_with_cors(
                 "unexpected snapshot mismatch with no cursor".to_string(),
             ));
         }
@@ -366,4 +395,42 @@ pub async fn markers_options(
     _ctx: RequestContext<Arc<AppState>>,
 ) -> Result<Response<Body>, HttpError> {
     cors_preflight()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rejected cursor is client-supplied input, so it must surface as a
+    /// browser-readable 400 rather than a panic or a 500.
+    fn assert_rejected_400(result: Result<ListState, HttpError>) -> Result<(), String> {
+        match result {
+            Ok(_) => Err("expected a rejected cursor, got a decoded ListState".to_string()),
+            Err(err) if err.status_code.as_status() == http::StatusCode::BAD_REQUEST => Ok(()),
+            Err(err) => Err(format!(
+                "expected a 400, got {}",
+                err.status_code.as_status()
+            )),
+        }
+    }
+
+    #[test]
+    fn decode_cursor_rejects_an_empty_token() -> Result<(), String> {
+        // Empty base64 decodes to zero bytes, so there is no version byte to
+        // split off — the rejection must not panic on the empty slice.
+        assert_rejected_400(decode_cursor(&Cursor::new("")))
+    }
+
+    #[test]
+    fn decode_cursor_rejects_non_base64() -> Result<(), String> {
+        assert_rejected_400(decode_cursor(&Cursor::new("!!! not base64 !!!")))
+    }
+
+    #[test]
+    fn decode_cursor_rejects_an_unsupported_version_byte() -> Result<(), String> {
+        // A well-formed base64 blob whose leading version byte isn't
+        // `CURSOR_VERSION` is refused before any payload parse.
+        let token = BASE64_URL_SAFE_NO_PAD.encode([CURSOR_VERSION.wrapping_add(1)]);
+        assert_rejected_400(decode_cursor(&Cursor::new(token)))
+    }
 }

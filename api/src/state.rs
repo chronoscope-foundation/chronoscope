@@ -64,14 +64,15 @@ pub struct Config {
     pub ios_app_id: Option<String>,
 
     /// CDN base URL for media assets (e.g., `https://cdn.chronoscope.io`)
-    pub cdn_base_url: String,
+    pub cdn_base_url: Url,
 }
 
 impl Config {
     /// Load configuration from environment variables
     ///
     /// # Errors
-    /// Returns `ConfigError::InvalidBindAddr` if the bind address is invalid.
+    /// Returns `ConfigError::InvalidBindAddr` if the bind address is invalid, or
+    /// `ConfigError::InvalidCdnUrl` if `CDN_BASE_URL` is not a valid base URL.
     pub fn from_env() -> Result<Self, ConfigError> {
         let database_url =
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:chronoscope.db".to_string());
@@ -88,8 +89,15 @@ impl Config {
 
         let ios_app_id = std::env::var("IOS_APP_ID").ok();
 
-        let cdn_base_url = std::env::var("CDN_BASE_URL")
+        let cdn_base_url_raw = std::env::var("CDN_BASE_URL")
             .unwrap_or_else(|_| "https://cdn.chronoscope.io".to_string());
+        let cdn_base_url = Url::parse(&cdn_base_url_raw)
+            .map_err(|e| ConfigError::InvalidCdnUrl(format!("{e}")))?;
+        if cdn_base_url.cannot_be_a_base() {
+            return Err(ConfigError::InvalidCdnUrl(format!(
+                "CDN base URL must be a base URL: {cdn_base_url_raw}"
+            )));
+        }
 
         Ok(Self {
             database_url,
@@ -118,6 +126,9 @@ pub struct ResolvedImageMedia {
 pub enum ConfigError {
     #[error("Invalid bind address: {0}")]
     InvalidBindAddr(String),
+
+    #[error("Invalid CDN base URL: {0}")]
+    InvalidCdnUrl(String),
 }
 
 #[derive(Error, Debug)]

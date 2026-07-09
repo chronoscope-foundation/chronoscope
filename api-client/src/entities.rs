@@ -7,9 +7,10 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
+use chronoscope_core::GeoPoint;
 use chronoscope_core::grammar::depiction::Perspective;
-use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::grammar::image::ImageMedium;
 use chronoscope_core::store::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
 use chronoscope_core::{listing, typed};
@@ -56,8 +57,10 @@ pub struct EntityDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DetailImage {
     pub id: MemoryImageId,
-    pub display_url: String,
-    pub source_url: String,
+    #[schemars(with = "String")]
+    pub display_url: Url,
+    #[schemars(with = "String")]
+    pub source_url: Url,
     pub perspective: Option<Perspective>,
     pub medium: Option<ImageMedium>,
 }
@@ -89,13 +92,38 @@ pub fn image_caption(perspective: Option<Perspective>, medium: Option<ImageMediu
 /// timeline date span. Returned by `GET /entities`.
 pub type EntitySummary = listing::EntitySummary<MemoryEntityId, MemoryImageId>;
 
-/// The resume cursor threaded through `GET /entities` pagination: the walk
-/// position `summaries_in_bbox` hands back, JSON-encoded into the `cursor`
-/// query parameter for the next request.
-pub type EntityListCursor = (MemoryEntityId, FactId);
+/// An opaque resume token for `GET /entities` pagination. The server mints one
+/// per page; the client threads it back verbatim. Its contents — the pinned
+/// snapshot and walk position — are server-internal and never inspected
+/// client-side.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct Cursor(String);
 
-/// One page of a `GET /entities` viewport listing.
-pub type EntityListPage = listing::EntityListPage<MemoryEntityId, MemoryImageId, EntityListCursor>;
+impl Cursor {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Cursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One page of a `GET /entities` viewport listing: the summaries gathered this
+/// page and the opaque [`Cursor`] for the next, `None` once the viewport is
+/// exhausted.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct EntityListPage {
+    pub summaries: Vec<EntitySummary>,
+    pub next: Option<Cursor>,
+}
 
 // ==================== Unified Markers ====================
 
@@ -105,8 +133,7 @@ pub struct Marker {
     /// The entity id — for a co-located group, the group's first member
     /// (sorted by earliest date). `click_action` carries every member.
     pub id: MemoryEntityId,
-    pub latitude: f64,
-    pub longitude: f64,
+    pub point: GeoPoint,
     /// The representative entity's display name, negotiated server-side from the
     /// request's `Accept-Language`. `None` when the entity has no name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,7 +142,8 @@ pub struct Marker {
     /// Same `display_url` semantics as [`DetailImage`]: served from our own
     /// `/media/{key}` host, or the shared placeholder in dev/test.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thumbnail_url: Option<String>,
+    #[schemars(with = "Option<String>")]
+    pub thumbnail_url: Option<Url>,
     /// What happens when the user clicks this marker.
     pub click_action: ClickAction,
 }

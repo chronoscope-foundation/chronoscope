@@ -161,7 +161,7 @@ pub async fn get_research(
 /// Build a research URL dossier from DB data.
 fn build_dossier(
     data: ResearchUrlWithResolved,
-    cdn_base_url: &str,
+    cdn_base_url: &url::Url,
 ) -> Result<ResearchUrlDossier, HttpError> {
     let resolved = build_resolved_content(&data, cdn_base_url)?;
 
@@ -179,7 +179,7 @@ fn build_dossier(
 /// Build resolved content from DB data.
 fn build_resolved_content(
     data: &ResearchUrlWithResolved,
-    cdn_base_url: &str,
+    cdn_base_url: &url::Url,
 ) -> Result<Option<ResolvedContent>, HttpError> {
     match &data.resolved {
         Some(chronoscope_db::ResolvedContent::Page(page)) => Ok(Some(ResolvedContent::Page(
@@ -193,7 +193,7 @@ fn build_resolved_content(
 }
 
 /// Convert a DB Page to API `PageDossier`.
-fn convert_page(page: &Page, cdn_base_url: &str) -> Result<PageDossier, HttpError> {
+fn convert_page(page: &Page, cdn_base_url: &url::Url) -> Result<PageDossier, HttpError> {
     let media: Result<Vec<_>, _> = page
         .data
         .media
@@ -215,7 +215,7 @@ fn convert_page(page: &Page, cdn_base_url: &str) -> Result<PageDossier, HttpErro
 /// Convert a `MediaSlot` to API `MediaReference`.
 fn convert_media_reference(
     slot: &MediaSlot,
-    cdn_base_url: &str,
+    cdn_base_url: &url::Url,
 ) -> Result<MediaReference, HttpError> {
     match &slot.resolved {
         Some(media) => Ok(MediaReference::Fetched(Box::new(convert_media(
@@ -229,7 +229,7 @@ fn convert_media_reference(
 }
 
 /// Convert a DB Media to API `MediaDossier`.
-fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, HttpError> {
+fn convert_media(media: &Media, cdn_base_url: &url::Url) -> Result<MediaDossier, HttpError> {
     // Parse source_metadata JSON, propagating errors for corrupt data
     let source_metadata = media
         .data
@@ -260,8 +260,8 @@ fn convert_media(media: &Media, cdn_base_url: &str) -> Result<MediaDossier, Http
         width,
         height,
         duration_seconds: media.data.duration_seconds,
-        thumbnail_url: cdn::thumbnail_url(cdn_base_url, &media.data.storage_key),
-        full_url: cdn::full_url(cdn_base_url, &media.data.storage_key),
+        thumbnail_url: cdn::thumbnail_url(cdn_base_url, &media.data.storage_key).into(),
+        full_url: cdn::full_url(cdn_base_url, &media.data.storage_key).into(),
         captured: media.data.captured.clone(),
         location: media.data.location.clone(),
         source_metadata,
@@ -341,12 +341,18 @@ mod tests {
 
     type TestResult = Result<(), HttpError>;
 
+    /// Parse the shared test CDN base into a `Url` for the URL-building helpers.
+    fn test_cdn_base() -> Result<url::Url, HttpError> {
+        url::Url::parse(TEST_CDN_BASE_URL)
+            .map_err(|e| HttpError::for_internal_error(format!("test cdn base url: {e}")))
+    }
+
     // ==================== GPS Location ====================
 
     #[test]
     fn test_convert_media_no_gps_produces_none_location() -> TestResult {
         let media = minimal_media();
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
         assert!(dossier.location.is_none());
         Ok(())
     }
@@ -361,7 +367,7 @@ mod tests {
             ),
         ));
 
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         let location = dossier
             .location
@@ -393,7 +399,7 @@ mod tests {
             ),
         ));
 
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         assert!(dossier.location.is_some());
         Ok(())
@@ -406,7 +412,7 @@ mod tests {
         let mut media = minimal_media();
         media.data.source_metadata = Some(r#"{"camera": "iPhone 12", "iso": 100}"#.to_string());
 
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         let metadata = dossier
             .source_metadata
@@ -417,18 +423,19 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_media_invalid_json_returns_error() {
+    fn test_convert_media_invalid_json_returns_error() -> TestResult {
         let mut media = minimal_media();
         media.data.source_metadata = Some("not valid json {{{".to_string());
 
-        let result = convert_media(&media, TEST_CDN_BASE_URL);
+        let result = convert_media(&media, &test_cdn_base()?);
         assert!(result.is_err(), "Invalid JSON should return error");
+        Ok(())
     }
 
     #[test]
     fn test_convert_media_null_metadata_produces_none() -> TestResult {
         let media = minimal_media();
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
         assert!(dossier.source_metadata.is_none());
         Ok(())
     }
@@ -442,7 +449,7 @@ mod tests {
             resolved: Some(minimal_media()),
         };
 
-        let reference = convert_media_reference(&slot, TEST_CDN_BASE_URL)?;
+        let reference = convert_media_reference(&slot, &test_cdn_base()?)?;
 
         assert!(matches!(reference, MediaReference::Fetched(_)));
         Ok(())
@@ -452,7 +459,7 @@ mod tests {
     fn test_convert_media_reference_pending() -> TestResult {
         let slot = MediaSlot::pending("https://example.com/pending.jpg");
 
-        let reference = convert_media_reference(&slot, TEST_CDN_BASE_URL)?;
+        let reference = convert_media_reference(&slot, &test_cdn_base()?)?;
 
         match reference {
             MediaReference::Pending { source_url } => {
@@ -475,7 +482,7 @@ mod tests {
         let mut media = minimal_media();
         media.data.width = -100; // Negative width (DB corruption)
 
-        let err = convert_media(&media, TEST_CDN_BASE_URL)
+        let err = convert_media(&media, &test_cdn_base()?)
             .err()
             .ok_or_else(|| {
                 HttpError::for_bad_request(None, "Negative width should return error".to_string())
@@ -494,7 +501,7 @@ mod tests {
         let mut media = minimal_media();
         media.data.height = -50; // Negative height (DB corruption)
 
-        let err = convert_media(&media, TEST_CDN_BASE_URL)
+        let err = convert_media(&media, &test_cdn_base()?)
             .err()
             .ok_or_else(|| {
                 HttpError::for_bad_request(None, "Negative height should return error".to_string())
@@ -513,7 +520,7 @@ mod tests {
     #[test]
     fn test_convert_analysis_pending_status() -> TestResult {
         let media = minimal_media(); // analysis_status = "pending"
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         assert!(
             matches!(dossier.analysis.analysis, AnalysisOutcome::Pending),
@@ -527,7 +534,7 @@ mod tests {
         let mut media = minimal_media();
         media.analysis = chronoscope_db::MediaAnalysisState::Processing;
 
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         assert!(
             matches!(dossier.analysis.analysis, AnalysisOutcome::InProgress),
@@ -543,7 +550,7 @@ mod tests {
             error: "Triton server unavailable".to_string(),
         };
 
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         let AnalysisOutcome::Failed { error } = &dossier.analysis.analysis else {
             return Err(test_err("Expected Failed outcome"));
@@ -606,7 +613,7 @@ mod tests {
             analysis_result: serialize(&analysis_result)?,
         };
 
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
             return Err(test_err("Expected analysis Success"));
@@ -663,7 +670,7 @@ mod tests {
             analysis_result: serialize(&analysis_result)?,
         };
 
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
             return Err(test_err("Expected analysis Success"));
@@ -679,17 +686,18 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_analysis_corrupt_json_returns_error() {
+    fn test_convert_analysis_corrupt_json_returns_error() -> TestResult {
         let mut media = minimal_media();
         media.analysis = chronoscope_db::MediaAnalysisState::Complete {
             analysis_result: "not valid json {{{".to_string(),
         };
 
-        let result = convert_media(&media, TEST_CDN_BASE_URL);
+        let result = convert_media(&media, &test_cdn_base()?);
         assert!(
             result.is_err(),
             "Corrupt analysis JSON should return internal error"
         );
+        Ok(())
     }
 
     #[test]
@@ -705,7 +713,7 @@ mod tests {
             analysis_result: serialize(&analysis_result)?,
         };
 
-        let dossier = convert_media(&media, TEST_CDN_BASE_URL)?;
+        let dossier = convert_media(&media, &test_cdn_base()?)?;
 
         let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
             return Err(test_err("Expected analysis Success"));

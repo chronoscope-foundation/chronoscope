@@ -13,6 +13,7 @@ use std::pin::Pin;
 use futures_util::FutureExt;
 use futures_util::stream::{self, Stream};
 
+use chronoscope_core::geo::Bbox;
 use chronoscope_core::store::memory::MemoryEntityId;
 
 use crate::auth::{
@@ -22,7 +23,6 @@ use crate::auth::{
 use crate::entities::EntityDetail;
 use crate::ids::{Email, ResearchUrlId};
 use crate::pagination::{PageToken, ResultsPage};
-use crate::types::Bbox;
 use crate::users::{UpdateUserRequest, UserResponse};
 use crate::webauthn_types::{
     CredentialCreationOptions, CredentialRequestOptions, PublicKeyCredentialAssertion,

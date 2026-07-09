@@ -437,8 +437,8 @@ async fn fetch_entity_detail(
     let media = images
         .into_iter()
         .map(|img| MediaInfo {
-            display_url: img.display_url,
-            source_url: img.source_url,
+            display_url: img.display_url.into(),
+            source_url: img.source_url.into(),
             label: api::image_caption(img.perspective, img.medium),
         })
         .collect();

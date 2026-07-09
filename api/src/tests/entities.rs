@@ -10,7 +10,9 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 
-use chronoscope_api_client::{ClickAction, MarkersResponse, client::ApiError};
+use chronoscope_api_client::{
+    ClickAction, Cursor, EntityListPage, MarkersResponse, client::ApiError,
+};
 use chronoscope_core::geo::{GeoPoint, Meters};
 use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use chronoscope_core::grammar::attribute::{self, NameText, NameType};
@@ -345,11 +347,13 @@ async fn get_entity_resolves_a_depicted_image_into_the_detail_grid() -> TestResu
     assert_eq!(detail.entity.id, id);
     let image = detail.images.first().ok_or("expected one detail image")?;
     assert_eq!(
-        image.source_url, src,
+        image.source_url.as_str(),
+        src,
         "source_url preserves the real Commons URL for the lightbox link"
     );
     assert_eq!(
-        image.display_url, expected_display,
+        image.display_url.as_str(),
+        expected_display.as_str(),
         "display_url serves the resolved original from our own media host"
     );
     assert_eq!(
@@ -450,7 +454,7 @@ async fn list_markers_selects_a_lone_entity() -> TestResult {
     let ctx = TestContext::new().await?;
     let id = commit_named_entity_at(&ctx.app_state.facts, "Colosseum", 41.8902, 12.4922).await?;
 
-    let bbox = chronoscope_api_client::Bbox::new(41.8, 42.0, 12.4, 12.6)?;
+    let bbox = chronoscope_core::geo::Bbox::from_coords(41.8, 42.0, 12.4, 12.6)?;
     let response = ctx.client.list_markers(&bbox).await?;
 
     assert_eq!(response.markers.len(), 1, "expected exactly one marker");
@@ -485,7 +489,7 @@ async fn list_markers_carries_a_thumbnail_for_a_depicted_entity() -> TestResult 
     let ctx =
         TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
 
-    let bbox = chronoscope_api_client::Bbox::new(41.8, 42.0, 12.4, 12.6)?;
+    let bbox = chronoscope_core::geo::Bbox::from_coords(41.8, 42.0, 12.4, 12.6)?;
     let response = ctx.client.list_markers(&bbox).await?;
 
     let marker = response
@@ -494,7 +498,7 @@ async fn list_markers_carries_a_thumbnail_for_a_depicted_entity() -> TestResult 
         .find(|m| m.id == id)
         .ok_or("expected a marker for the depicted entity")?;
     assert_eq!(
-        marker.thumbnail_url.as_deref(),
+        marker.thumbnail_url.as_ref().map(url::Url::as_str),
         Some(expected_thumb.as_str()),
         "the marker thumbnail serves the resolved image's thumbnail from our media host"
     );
@@ -508,7 +512,7 @@ async fn list_markers_disambiguates_colocated_entities() -> TestResult {
     let a = commit_named_entity_at(&ctx.app_state.facts, "Old Chapel", 45.2, 12.27).await?;
     let b = commit_named_entity_at(&ctx.app_state.facts, "New Chapel", 45.2, 12.27).await?;
 
-    let bbox = chronoscope_api_client::Bbox::new(45.0, 45.4, 12.0, 12.5)?;
+    let bbox = chronoscope_core::geo::Bbox::from_coords(45.0, 45.4, 12.0, 12.5)?;
     let response = ctx.client.list_markers(&bbox).await?;
 
     assert_eq!(
@@ -532,7 +536,7 @@ async fn list_markers_omits_entities_outside_the_bbox() -> TestResult {
     commit_named_entity_at(&ctx.app_state.facts, "Eiffel Tower", 48.8584, 2.2945).await?;
 
     // A box nowhere near Paris.
-    let bbox = chronoscope_api_client::Bbox::new(41.8, 42.0, 12.4, 12.6)?;
+    let bbox = chronoscope_core::geo::Bbox::from_coords(41.8, 42.0, 12.4, 12.6)?;
     let response = ctx.client.list_markers(&bbox).await?;
 
     assert!(response.markers.is_empty());
@@ -546,10 +550,10 @@ async fn list_markers_accepts_an_antimeridian_bbox() -> TestResult {
     let id = commit_named_entity_at(&ctx.app_state.facts, "Dateline Light", 0.0, 179.5).await?;
 
     // A box that wraps across the antimeridian: min_lon (170) > max_lon (-170).
-    // The whole path — client Bbox, the server's `request_bbox`, and the core
-    // spatial walk — must accept the wrap rather than 400, and surface the
+    // The whole path — `Bbox::from_coords`, the server's `request_bbox`, and the
+    // core spatial walk — must accept the wrap rather than 400, and surface the
     // entity inside it.
-    let bbox = chronoscope_api_client::Bbox::new(-1.0, 1.0, 170.0, -170.0)?;
+    let bbox = chronoscope_core::geo::Bbox::from_coords(-1.0, 1.0, 170.0, -170.0)?;
     let response = ctx.client.list_markers(&bbox).await?;
 
     let marker = response
@@ -712,5 +716,65 @@ async fn list_entities_rejects_a_page_size_over_the_max() -> TestResult {
         .get("/entities?min_lat=0&max_lat=1&min_lon=0&max_lon=1&limit=100000")
         .await?;
     assert_eq!(resp.status(), 400);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // Three placeable entities inside one small bbox; limit=1 forces the walk
+    // across cursor-linked pages, exercising the encode/decode round trip.
+    let expected: std::collections::BTreeSet<MemoryEntityId> = [
+        commit_named_entity_at(&ctx.app_state.facts, "Alpha", 43.771, 11.251).await?,
+        commit_named_entity_at(&ctx.app_state.facts, "Beta", 43.772, 11.252).await?,
+        commit_named_entity_at(&ctx.app_state.facts, "Gamma", 43.773, 11.253).await?,
+    ]
+    .into_iter()
+    .collect();
+
+    let bbox = "min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
+
+    // Page 1 caps at the limit and, with entities still to come, hands back a cursor.
+    let resp = ctx.get(&format!("/entities?{bbox}&limit=1")).await?;
+    assert_eq!(resp.status(), 200);
+    let page1: EntityListPage = resp.json().await?;
+    assert_eq!(
+        page1.summaries.len(),
+        1,
+        "limit=1 caps the first page at a single summary"
+    );
+    let mut seen: std::collections::BTreeSet<MemoryEntityId> =
+        page1.summaries.iter().map(|s| s.id).collect();
+    let mut cursor: Option<Cursor> = Some(
+        page1
+            .next
+            .ok_or("page 1 must carry a next cursor while entities remain")?,
+    );
+
+    // Threading each page's cursor back visits the rest with no repeats and
+    // terminates with next=None.
+    let mut pages = 1;
+    while let Some(c) = cursor.take() {
+        let resp = ctx
+            .get(&format!("/entities?{bbox}&limit=1&cursor={}", c.as_str()))
+            .await?;
+        assert_eq!(resp.status(), 200, "a minted cursor round-trips as a 200");
+        let page: EntityListPage = resp.json().await?;
+        for summary in &page.summaries {
+            assert!(
+                seen.insert(summary.id),
+                "entity {:?} surfaced on two different pages",
+                summary.id
+            );
+        }
+        cursor = page.next;
+        pages += 1;
+        assert!(pages <= 8, "cursor pagination failed to terminate");
+    }
+
+    assert_eq!(
+        seen, expected,
+        "the cursor walk covers every committed entity exactly once"
+    );
     Ok(())
 }

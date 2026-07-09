@@ -251,7 +251,7 @@ pub fn set_cursor(map: &Map, cursor: &str) {
 /// special-case glue. Don't "fix" the inversion here without also
 /// teaching the entity/cluster query code to ignore the flag.
 ///
-/// [`Bbox`]: chronoscope_api_client::Bbox
+/// [`Bbox`]: chronoscope_core::geo::Bbox
 fn wrap_lon(lon: f64) -> f64 {
     ((lon + 180.0).rem_euclid(360.0)) - 180.0
 }
