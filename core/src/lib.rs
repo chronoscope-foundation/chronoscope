@@ -85,6 +85,7 @@ const _: () = assert!(
 );
 
 pub mod algebra;
+pub mod conflicts;
 pub mod date;
 pub mod external_ids;
 pub mod geo;
