@@ -170,15 +170,14 @@ Real client and mock client both conform, enabling:
 
 ## OpenAPI Integration
 
-The API contract flows from Rust to Swift automatically:
+The API contract flows from Rust to Swift:
 
 1. Dropshot macros + schemars derives define the API in Rust
-2. `cargo run --bin openapi -- api/target/openapi.json` generates the spec
-3. iOS project symlinks to this file at `ios/ChronoscopeAPI/Sources/ChronoscopeAPI/openapi.json`
-4. Swift OpenAPI Generator plugin generates client code at Xcode build time
-5. Xcode pre-build phase regenerates spec if Rust sources changed
+2. The `openapi` binary serializes the spec (`packages.openapi`), which is assembled into the ChronoscopeAPI SwiftPM package (`packages.ios-api-package`)
+3. `just xcodegen` splices that package's store path and the Swift tool paths into the xcodegen spec (`packages.ios-project-spec`, via `replaceVars`), pins it so the closure survives GC, and generates `ios/Chronoscope.xcodeproj` in place with those paths baked in
+4. The Swift OpenAPI Generator plugin produces client code from the package at Xcode build time
 
-This means API changes are immediately reflected in the Swift client - no manual sync needed.
+The spec is content-addressed in the store; `just openapi` builds the raw contract when you want to inspect it. After changing the Rust API (or the hand-written sources under `ios/ChronoscopeAPI/`), re-run `just xcodegen`.
 
 ## Development Server
 

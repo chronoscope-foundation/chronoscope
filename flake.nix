@@ -33,6 +33,7 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
         inherit (pkgs) lib;
+        inherit (pkgs.stdenv.hostPlatform) isDarwin;
 
         toolchain =
           with fenix.packages.${system};
@@ -110,6 +111,26 @@
 
         api = import ./nix/api.nix {
           inherit pkgs craneLib;
+          rustCommonArgs = rust.commonArgs;
+          inherit (rust) cargoArtifacts;
+        };
+
+        # Swift sources for the ChronoscopeAPI package, filtered so a source
+        # edit is the only thing that rebuilds the store package.
+        iosApiSrc = lib.cleanSourceWith {
+          src = ./ios/ChronoscopeAPI;
+          filter =
+            path: type:
+            (type == "directory")
+            || lib.hasSuffix ".swift" path
+            || lib.hasSuffix ".yaml" path
+            || lib.hasSuffix ".yml" path;
+          name = "chronoscope-ios-api-src";
+        };
+
+        openapi = import ./nix/openapi.nix {
+          inherit pkgs craneLib iosApiSrc;
+          iosProjectTemplate = ./ios/project.yml;
           rustCommonArgs = rust.commonArgs;
           inherit (rust) cargoArtifacts;
         };
@@ -256,8 +277,13 @@
                   find . -name '*.nix' -print0 | xargs -0 deadnix --fail -L
                   touch $out
                 '';
+
+            openapi = openapi.spec;
             # corpus-tests intentionally excluded — requires GPU (run on
             # dedicated CI runners via `nix build .#corpus-tests`).
+          }
+          // lib.optionalAttrs isDarwin {
+            ios-project-spec = openapi.projectSpec;
           };
 
         packages =
@@ -265,6 +291,7 @@
           // web.packages
           // {
             inherit (api) api;
+            openapi = openapi.spec;
 
             corpus-images = corpus.corpusImages;
             corpus-fetch = corpus.corpusFetchBin;
@@ -276,6 +303,10 @@
             sam3-weights = pythonEnvs.sam3Cache;
 
             wikidata-curated-entities = wikidata.bundles.curated.entities;
+          }
+          // lib.optionalAttrs isDarwin {
+            ios-api-package = openapi.apiPackage;
+            ios-project-spec = openapi.projectSpec;
           };
 
         formatter = pkgs.nixfmt;
@@ -377,6 +408,26 @@
               ${mkBanner "triton" ''
                 echo "  python: $(python3 --version 2>/dev/null)"
                 echo "  schematool: $(command -v schematool 2>/dev/null || echo 'not found')"
+              ''}
+            '';
+          };
+
+        }
+        // lib.optionalAttrs isDarwin {
+          # iOS project generation & Swift lint/format. The OpenAPI spec is
+          # prebuilt via `nix build .#openapi`.
+          ios = pkgs.mkShell {
+            nativeBuildInputs = with pkgs; [
+              just
+              xcodegen
+              swiftformat
+              swiftlint
+              xcbeautify
+            ];
+            shellHook = ''
+              ${gcRootsPrelude}
+              ${mkBanner "ios" ''
+                echo "  xcodegen: $(xcodegen --version 2>/dev/null)"
               ''}
             '';
           };

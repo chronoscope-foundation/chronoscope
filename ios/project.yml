@@ -1,3 +1,5 @@
+# Nix splices store paths into the at-sign placeholders below
+# (see nix/openapi.nix). Generate the project with `just xcodegen`.
 name: Chronoscope
 options:
   bundleIdPrefix: chronoscope.app
@@ -8,7 +10,7 @@ options:
 
 packages:
   ChronoscopeAPI:
-    path: ChronoscopeAPI
+    path: "@ios_api_package@"
 
 configFiles:
   Debug: Local.xcconfig
@@ -49,22 +51,22 @@ targets:
     preBuildScripts:
       - name: SwiftFormat
         script: |
-          export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
-          if command -v swiftformat >/dev/null; then
-            swiftformat "$SRCROOT"
-          else
-            echo "warning: SwiftFormat not installed, run 'brew install swiftformat'"
+          FMT="@swiftformat@/bin/swiftformat"
+          if [ ! -x "$FMT" ]; then
+            echo "error: swiftformat not found at $FMT; run 'just xcodegen' to regenerate the project" >&2
+            exit 1
           fi
+          "$FMT" "$SRCROOT"
         basedOnDependencyAnalysis: false
     postCompileScripts:
       - name: SwiftLint
         script: |
-          export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
-          if command -v swiftlint >/dev/null; then
-            cd "$SRCROOT" && swiftlint lint --quiet
-          else
-            echo "warning: SwiftLint not installed, run 'brew install swiftlint'"
+          LINT="@swiftlint@/bin/swiftlint"
+          if [ ! -x "$LINT" ]; then
+            echo "error: swiftlint not found at $LINT; run 'just xcodegen' to regenerate the project" >&2
+            exit 1
           fi
+          cd "$SRCROOT" && "$LINT" lint --quiet
         basedOnDependencyAnalysis: false
 
   ChronoscopeShareExtension:
@@ -115,20 +117,6 @@ schemes:
         ChronoscopeShareExtension: all
         ChronoscopeTests: [test]
         ChronoscopeUITests: [test]
-      preActions:
-        - script: |
-            export PATH="$HOME/.cargo/bin:$PATH"
-            OPENAPI_JSON="${SRCROOT}/../api/target/openapi.json"
-            API_SRC="${SRCROOT}/../api/src"
-            DB_SRC="${SRCROOT}/../db/src"
-            if [ ! -f "$OPENAPI_JSON" ] || \
-               [ -n "$(find "$API_SRC" -newer "$OPENAPI_JSON" 2>/dev/null)" ] || \
-               [ -n "$(find "$DB_SRC" -newer "$OPENAPI_JSON" 2>/dev/null)" ]; then
-              echo "Regenerating OpenAPI spec..."
-              cd "${SRCROOT}/../api" && cargo run --bin openapi -- target/openapi.json
-            fi
-          name: Generate OpenAPI Spec
-          settingsTarget: Chronoscope
     run:
       config: Debug
     test:

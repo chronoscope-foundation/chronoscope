@@ -48,6 +48,7 @@ each other beyond what they explicitly compose.
 | `web`      | api + wasm toolchain + trunk + tailwind + chromium + WEB_DIST    | Frontend; running `web-dev`; browser tests   |
 | `analysis` | api + Python analysis env + weights + corpus                     | Iterating on `chronoscope-analysis` correctness |
 | `triton`   | Python analysis env + weights + rust toolchain (for schematool)  | Triton harness / serving config              |
+| `ios`      | xcodegen + swiftformat/swiftlint/xcbeautify                      | iOS project generation & Swift lint/format   |
 
 `just` recipes pick the smallest shell that covers their target
 (e.g. `just clippy web` enters `web`, `just check triton` runs hermetically
@@ -124,7 +125,8 @@ just clippy [target]        # cargo clippy
 
 # Concrete actions
 just web-dev                # integrated dev server (API + Trunk live reload; auto-picks free ports)
-just openapi                # regenerate api/target/openapi.json
+just openapi                # build the raw OpenAPI spec (inspect the contract)
+just xcodegen               # splice store paths into the xcodegen spec, regenerate the Xcode project
 just corpus-hash            # add hashes for new corpus URLs
 just corpus-test            # run Rust corpus test suite
 just corpus-test-vlm        # corpus tests + VLM (needs remote Triton)

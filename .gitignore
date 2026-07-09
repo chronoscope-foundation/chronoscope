@@ -30,9 +30,6 @@ target/
 *.db-wal
 /data/
 
-# OpenAPI generated specs (regenerated on build)
-openapi.json
-
 # iOS / Xcode
 ios/Chronoscope.xcodeproj/
 ios/ChronoscopeAPI/.build/

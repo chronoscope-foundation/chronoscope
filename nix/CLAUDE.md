@@ -9,6 +9,7 @@ Nix build infrastructure. One derivation module per project area;
 |-----------------|-----------------------------------------------------|
 | `rust.nix`      | Workspace `commonArgs`, native checks, `default` package |
 | `api.nix`       | Wrapped `chronoscope-api` binary (SpatiaLite path baked in) |
+| `openapi.nix`   | OpenAPI `spec`, ChronoscopeAPI SwiftPM package, store-path-spliced xcodegen `projectSpec` |
 | `web.nix`       | WASM build pipeline + `web-build`/`web-test-build`/`web-clippy` checks |
 | `python.nix`    | `analysisEnv`, model weight FODs, triton checks     |
 | `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |

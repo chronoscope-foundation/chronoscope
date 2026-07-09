@@ -12,13 +12,14 @@ hand-written.
 Endpoint workflow:
 
 1. Edit the macro / handler in this crate
-2. `just openapi` — regenerates `api/target/openapi.json`
-3. Regenerate downstream clients (`chronoscope-api-client`, web frontend,
-   future iOS Swift client)
+2. `just openapi` — build the raw spec (`packages.openapi`) to inspect the contract
+3. Refresh downstream clients — iOS via `just xcodegen` (splices the spec into
+   the ChronoscopeAPI package and regenerates the Xcode project); the web/CLI
+   clients are hand-wired
 4. Now the rest of the workspace compiles against the new contract
 
-The spec lives in `api/src/bin/openapi.rs`'s output — the `openapi`
-binary writes the JSON. iOS, web, and CLI clients all read from this.
+The `openapi` binary (`api/src/bin/openapi.rs`) writes the JSON; the iOS client
+reads it via the generated ChronoscopeAPI package.
 
 ## Runtime env vars
 

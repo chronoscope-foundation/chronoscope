@@ -74,16 +74,18 @@ The API contract is the source of truth:
 
 1. Rust endpoints are defined with Dropshot macros
 2. Request/response types derive `JsonSchema` via schemars
-3. `cargo run --bin openapi -- api/target/openapi.json` generates the spec
-4. iOS project symlinks to this file at `ios/ChronoscopeAPI/Sources/ChronoscopeAPI/openapi.json`
-5. Swift OpenAPI Generator creates type-safe client code at Xcode build time
+3. The `openapi` binary serializes the spec (`packages.openapi`), assembled into the ChronoscopeAPI SwiftPM package (`packages.ios-api-package`)
+4. `just xcodegen` splices that package's store path and the Swift tool paths into the xcodegen spec (`packages.ios-project-spec`, via `replaceVars`), pins it so the closure survives GC, and generates `ios/Chronoscope.xcodeproj` in place
+5. Swift OpenAPI Generator produces type-safe client code from the package at Xcode build time
+
+The store paths are baked into the generated project, and the spec is content-addressed in the store. `just openapi` builds the raw contract (`packages.openapi`) for inspection. To change the client, edit the hand-written source under `ios/ChronoscopeAPI/` (`Package.swift`, `ChronoscopeAPI.swift`, `openapi-generator-config.yaml`) or the Rust API, then `just xcodegen` to rebuild the spec and regenerate the project.
 
 To add a new endpoint:
 
 1. Define the Rust handler with Dropshot macros
 2. Add request/response types with schemars derives
 3. Register the endpoint in the API
-4. Run `cargo run --bin openapi` (or let Xcode pre-build do it)
+4. Run `just xcodegen` to rebuild the spec and regenerate the project
 5. Use the generated Swift types immediately
 
 ## Testing Philosophy

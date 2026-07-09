@@ -33,7 +33,6 @@ The thin slice establishes the patterns for the full platform. Next steps includ
 
 - [Nix](https://nixos.org/download/) ([Determinate Nix](https://determinate.systems/nix/) recommended)
 - Xcode 16+
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen)
 - ngrok (authenticated - `ngrok config add-authtoken YOUR_TOKEN`)
 
 ### Development Environment
@@ -79,7 +78,7 @@ Once fetched, data is pinned as GC roots in `.nix-gc-roots/` so Nix garbage coll
    cd ios
    cp Local.xcconfig.example Local.xcconfig
    # Edit Local.xcconfig with your Apple Developer Team ID
-   xcodegen generate
+   just xcodegen
    ```
 
 2. **Start the dev server**:

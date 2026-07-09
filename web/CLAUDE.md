@@ -21,15 +21,16 @@ The fast inner loop:
 
 ## OpenAPI-first
 
-The `chronoscope-api-client` crate is generated from the OpenAPI spec.
-Touching anything in `api/src/` that changes the contract requires:
+The `chronoscope-api-client` crate is hand-written Rust (the typed
+`Client`/`AuthClient`), updated by hand to track the contract. When an
+`api/src/` change alters the contract:
 
-1. `just openapi` — regenerates `api/target/openapi.json`
-2. Regenerate the client (typed `Client`/`AuthClient`)
+1. `just openapi` — build the raw spec (`packages.openapi`) to see the new contract
+2. Update `chronoscope-api-client` by hand to match
 3. Then this crate compiles against the new types
 
-If the web crate fails to compile after an API change, suspect step 1 or 2
-hasn't been run.
+If the web crate fails to compile after an API change, suspect the client
+wasn't updated to match.
 
 ## Production build pipeline
 

@@ -262,16 +262,29 @@ web-dev:
     fi
     cargo run -p chronoscope-dev --bin web-dev
 
-# Generate the OpenAPI spec at api/target/openapi.json.
+# Build the OpenAPI spec (Nix) and report its store path — inspect the contract.
 openapi:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _ensure_nix }}
     _ensure_nix
+    out=$(nix build .#openapi --no-link --print-out-paths)
+    echo "openapi spec: $out/openapi.json"
+
+# Regenerate the Xcode project. Nix splices the API-package + Swift-tool store
+# paths into the xcodegen spec; pinning the spec keeps that closure alive.
+xcodegen:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    _ensure_nix
     if [ -z "${IN_NIX_SHELL:-}" ]; then
-        exec nix develop .#api --command just openapi
+        exec nix develop .#ios --command just xcodegen
     fi
-    cargo run --bin openapi -- api/target/openapi.json
+    mkdir -p .nix-gc-roots
+    spec=$(nix build .#ios-project-spec --out-link .nix-gc-roots/ios-project-spec --print-out-paths)
+    cd ios
+    xcodegen generate --spec "$spec" --project-root . --project .
 
 # ---------------------------------------------------------------------------
 # Data fetches. Each is a thin wrapper around `nix build` + GC root pinning.
