@@ -6,13 +6,15 @@
 //! `MemoryEntityId` path-param round trip (numeric wire form vs. the
 //! `entity-{n}` `Display` form).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chrono::{DateTime, TimeZone, Utc};
 
 use chronoscope_api_client::{
     ClickAction, Cursor, EntityListPage, MarkersResponse, client::ApiError,
 };
+use chronoscope_core::conflicts::{AnyConflictReport, BookendEndpoint, ConflictPath};
+use chronoscope_core::date::{DatePrecision, UncertainDate};
 use chronoscope_core::geo::{GeoPoint, Meters};
 use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use chronoscope_core::grammar::attribute::{self, NameText, NameType};
@@ -21,7 +23,7 @@ use chronoscope_core::grammar::citations::{
     Excerpt, ExternalSource, FactualCitation, JudgmentSource, Language,
 };
 use chronoscope_core::grammar::depiction::{self, Perspective};
-use chronoscope_core::grammar::ids::UserId;
+use chronoscope_core::grammar::ids::{FactId, UserId};
 use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::location::{Location, UnresolvedLocation};
 use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
@@ -443,6 +445,88 @@ async fn get_entity_path_param_round_trips_the_numeric_wire_form() -> TestResult
         resp.status(),
         200,
         "a bare numeric path segment must resolve"
+    );
+    Ok(())
+}
+
+/// Commit one entity with two competing `Construction::Started` dates in
+/// disjoint years, over-determining its construction-started slot. Returns the
+/// entity id and the two minted fact ids — the fighting set the detector must
+/// attribute.
+async fn commit_competing_construction_dates(
+    facts: &MemoryFactStore,
+) -> Result<(MemoryEntityId, BTreeSet<FactId>), Box<dyn std::error::Error + Send + Sync>> {
+    let started =
+        |year: i32, url: &str| -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
+            let bound = UncertainDate::with_precision(
+                chrono::NaiveDate::from_ymd_opt(year, 1, 1).ok_or("valid date")?,
+                DatePrecision::Year,
+            )?;
+            Ok(SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Started {
+                        entity: EntityIdx(0),
+                        bound,
+                    },
+                },
+                citation: citation(url)?,
+            })
+        };
+    let commit = Commit::<MemoryIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [
+            started(1887, "https://a.example/src")?,
+            started(1889, "https://b.example/src")?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(facts, commit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let id = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity 0 resolved")?
+        .id;
+    let fact_ids = result.fact_ids.iter().copied().collect();
+    Ok((id, fact_ids))
+}
+
+#[tokio::test]
+async fn get_entity_surfaces_a_competing_construction_date_conflict() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let (id, expected) = commit_competing_construction_dates(&ctx.app_state.facts).await?;
+
+    let detail = ctx.client.get_entity(&id).await?;
+
+    assert_eq!(
+        detail.conflicts.len(),
+        1,
+        "one over-determined slot yields one conflict report, got {:?}",
+        detail.conflicts
+    );
+    let AnyConflictReport::Date(report) = detail.conflicts.first().ok_or("no conflict report")?;
+    assert_eq!(
+        report.location.entity, id,
+        "the conflict is anchored to the entity that was read"
+    );
+    assert_eq!(
+        report.location.path,
+        ConflictPath::Construction {
+            endpoint: BookendEndpoint::Started,
+        },
+        "the conflict anchors at the construction-started slot"
+    );
+    let contributing: BTreeSet<FactId> = report.data.contributing.iter().copied().collect();
+    assert_eq!(
+        contributing, expected,
+        "both competing start claims are the fighting set"
     );
     Ok(())
 }

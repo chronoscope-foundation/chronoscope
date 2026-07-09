@@ -15,11 +15,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use chronoscope_api_client::{Cursor, DetailImage, EntityDetail, EntityListPage, MarkersResponse};
+use chronoscope_core::conflicts::{cited_lineage, detect_conflicts};
 use chronoscope_core::geo;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::listing::{self, ListCursor, summaries_in_bbox};
 use chronoscope_core::projection::{member_lineage, project_entity, project_image};
-use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
+use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
 use chronoscope_core::store::{FactStore, ImageView};
 use chronoscope_core::typed;
 
@@ -270,11 +271,25 @@ pub async fn get_entity(
         });
     }
 
+    // This entity's own over-determined date slots. The typed projection above
+    // carries citations for the read DTO; the detector reads the whole fighting
+    // facts, so the same class is projected again under `cited_lineage`. The id
+    // already projected `Some` above, so the cited projection matches; a `None`
+    // means the class emptied between the two reads, which carries no conflicts.
+    let conflicts = match project_entity::<MemoryFactStore, _, _>(&view, id, cited_lineage)
+        .await
+        .map_err(fact_store_err)?
+    {
+        Some((_, cited_entity)) => detect_conflicts::<MemoryIds>(&id, &cited_entity),
+        None => Vec::new(),
+    };
+
     let display_name = entity_types::negotiate_name(&entity.names, accept_language(&ctx));
     let detail = EntityDetail {
         entity,
         display_name,
         images,
+        conflicts,
     };
     json_with_cors_vary_language(&detail)
 }

@@ -426,6 +426,7 @@ async fn fetch_entity_detail(
         entity,
         display_name,
         images,
+        conflicts: _,
     } = client.get_entity(id).await.map_err(|e| e.to_string())?;
 
     let timeline = entity.timeline.moments().map(moment_row).collect();

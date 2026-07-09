@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use chronoscope_core::GeoPoint;
+use chronoscope_core::conflicts::AnyConflictReport;
 use chronoscope_core::grammar::depiction::Perspective;
 use chronoscope_core::grammar::image::ImageMedium;
 use chronoscope_core::store::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
@@ -23,20 +24,25 @@ use chronoscope_core::{listing, typed};
 pub type Entity = typed::Entity<MemoryEntityId, MemoryEventId, MemoryImageId>;
 
 /// The `GET /entities/{id}` response: the typed entity, the display name the
-/// server negotiated from the request's `Accept-Language`, and the resolved
-/// image grid the detail panel renders. The entity's `depictions` name the
-/// images by id; `images` carries each depicted image's resolved URLs plus its
-/// structured perspective/medium so the client renders the grid without a
-/// second round-trip per image.
+/// server negotiated from the request's `Accept-Language`, the resolved image
+/// grid the detail panel renders, and the entity's own conflict reports. The
+/// entity's `depictions` name the images by id; `images` carries each depicted
+/// image's resolved URLs plus its structured perspective/medium so the client
+/// renders the grid without a second round-trip per image.
 ///
 /// `entity.names` still carries every localized name with its provenance;
 /// `display_name` is just the one the panel heading shows, chosen server-side so
 /// every client agrees on it. `None` only when the entity has no name at all.
+///
+/// `conflicts` are the over-determined date slots the detector found in this one
+/// entity's projection — each a structured report the panel renders a disputed
+/// indicator from. Empty when every date slot is consistent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct EntityDetail {
     pub entity: Entity,
     pub display_name: Option<String>,
     pub images: Vec<DetailImage>,
+    pub conflicts: Vec<AnyConflictReport<MemoryEntityId, MemoryEventId>>,
 }
 
 /// One image in an entity's detail grid: the id it is keyed by, the URL the
