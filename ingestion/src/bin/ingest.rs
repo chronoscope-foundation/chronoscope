@@ -2,6 +2,7 @@
 //!
 //! Subcommands for the Wikidata ingestion pipeline:
 //! - `fetch`: Fetch entities at a timestamp (resolves revisions, produces JSONL)
+//! - `resolve-types`: Resolve the architectural type set (from a dump, or SPARQL)
 //! - `filter`: Filter a Wikidata dump for architectural entities
 
 use std::io::Write;
@@ -77,14 +78,41 @@ enum Command {
         output: OutputTarget,
     },
 
+    /// Resolve the architectural structure type set.
+    ///
+    /// By default derives the set offline from the dump's own P279
+    /// (subclass-of) graph. With `--sparql`, queries Wikidata's live SPARQL
+    /// endpoint instead. Writes a sorted JSON array of Q-IDs.
+    ResolveTypes {
+        /// Input Wikidata dump (JSON, .gz, or .bz2); required unless --sparql
+        #[arg(short, long)]
+        input: Option<PathBuf>,
+
+        /// Resolve via live Wikidata SPARQL instead of the dump
+        #[arg(long, conflicts_with = "input")]
+        sparql: bool,
+
+        /// Output types JSON file
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Print progress information
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
     /// Filter a Wikidata dump for architectural entities.
     ///
-    /// Queries Wikidata SPARQL for architectural structure types, then
-    /// streams the dump and writes matching entities as JSONL.
+    /// Loads a resolved type set (see `resolve-types`), then streams the dump
+    /// and writes matching entities as JSONL.
     Filter {
         /// Input Wikidata dump file (JSON, .gz, or .bz2)
         #[arg(short, long)]
         input: PathBuf,
+
+        /// Resolved types JSON produced by `resolve-types`
+        #[arg(short, long)]
+        types: PathBuf,
 
         /// Output JSONL file path
         #[arg(short, long)]
@@ -117,12 +145,19 @@ async fn run(cli: Cli) -> Result<()> {
             entities,
             output,
         } => cmd_fetch(&timestamp, &entities, &output).await,
+        Command::ResolveTypes {
+            input,
+            sparql,
+            output,
+            verbose,
+        } => cmd_resolve_types(input.as_deref(), sparql, &output, verbose).await,
         Command::Filter {
             input,
+            types,
             output,
             limit,
             verbose,
-        } => cmd_filter(&input, &output, limit, verbose).await,
+        } => cmd_filter(&input, &types, &output, limit, verbose).await,
     }
 }
 
@@ -210,13 +245,52 @@ async fn cmd_fetch(
 }
 
 // =============================================================================
+// RESOLVE TYPES
+// =============================================================================
+
+async fn cmd_resolve_types(
+    input: Option<&Path>,
+    sparql: bool,
+    output: &Path,
+    verbose: bool,
+) -> Result<()> {
+    use chronoscope_ingestion::wikidata::filter;
+
+    let types = if sparql {
+        let client = wikidata_client(300)?;
+        if verbose {
+            eprintln!("Fetching architectural structure types from Wikidata SPARQL...");
+        }
+        filter::fetch_architectural_types(&client).await?
+    } else {
+        let input =
+            input.ok_or_else(|| anyhow::anyhow!("--input is required unless --sparql is set"))?;
+        filter::resolve_types_from_dump(input, verbose).await?
+    };
+
+    filter::write_types(output, &types)?;
+    eprintln!(
+        "Wrote {} architectural types to {}",
+        types.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+// =============================================================================
 // FILTER
 // =============================================================================
 
-async fn cmd_filter(input: &Path, output: &Path, limit: Option<u64>, verbose: bool) -> Result<()> {
-    let client = wikidata_client(300)?;
+async fn cmd_filter(
+    input: &Path,
+    types: &Path,
+    output: &Path,
+    limit: Option<u64>,
+    verbose: bool,
+) -> Result<()> {
+    use chronoscope_ingestion::wikidata::filter;
 
-    chronoscope_ingestion::wikidata::filter::filter_dump(&client, input, output, limit, verbose)
-        .await?;
+    let target_types = filter::read_types(types)?;
+    filter::filter_dump(input, output, &target_types, limit, verbose).await?;
     Ok(())
 }

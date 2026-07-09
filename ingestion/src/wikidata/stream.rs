@@ -58,13 +58,19 @@ pub async fn open_compressed(path: &Path) -> Result<Box<dyn AsyncBufRead + Send 
 ///
 /// Wikidata dumps are JSON arrays: `[ {entity}, {entity}, ... ]`
 /// This handles the array brackets and trailing commas, yielding parsed entities.
+///
+/// A JSON parse error yields the error and resumes on the next line — one bad
+/// record shouldn't abort a multi-gigabyte dump. A read/decode error is fatal:
+/// a latched decompressor error would repeat forever, so the error surfaces
+/// once and the stream ends (state carries `None` in place of the reader).
 pub fn wikidata_entities<R>(reader: R) -> impl Stream<Item = Result<Value>>
 where
     R: AsyncBufRead + Unpin,
 {
     stream::unfold(
-        (reader, String::new()),
-        |(mut reader, mut line_buf)| async move {
+        (Some(reader), String::new()),
+        |(reader, mut line_buf)| async move {
+            let mut reader = reader?; // None => a read error already ended the stream
             loop {
                 line_buf.clear();
                 match reader.read_line(&mut line_buf).await {
@@ -81,20 +87,17 @@ where
                         let json_str = trimmed.trim_end_matches(',');
 
                         match serde_json::from_str(json_str) {
-                            Ok(value) => return Some((Ok(value), (reader, line_buf))),
+                            Ok(value) => return Some((Ok(value), (Some(reader), line_buf))),
                             Err(e) => {
                                 return Some((
                                     Err(anyhow::anyhow!("JSON parse error: {}", e)),
-                                    (reader, line_buf),
+                                    (Some(reader), line_buf),
                                 ));
                             }
                         }
                     }
                     Err(e) => {
-                        return Some((
-                            Err(anyhow::anyhow!("Read error: {}", e)),
-                            (reader, line_buf),
-                        ));
+                        return Some((Err(anyhow::anyhow!("Read error: {}", e)), (None, line_buf)));
                     }
                 }
             }
@@ -121,6 +124,17 @@ pub fn is_instance_of(entity: &Value, target_types: &HashSet<WikidataId>) -> boo
         .iter()
         .filter_map(|c| get_claim_qid(c))
         .any(|qid| target_types.contains(qid))
+}
+
+/// P279 (subclass-of) parent Q-IDs of an item entity.
+///
+/// A P279 value `B` on entity `A` means "A is a subclass of B"; each yielded
+/// Q-ID is such a `B`. Non-items and items without P279 yield nothing.
+pub fn subclass_parents(entity: &Value) -> impl Iterator<Item = &str> {
+    let claims = is_item(entity)
+        .then(|| get_claims(entity, "P279"))
+        .flatten();
+    claims.into_iter().flatten().filter_map(get_claim_qid)
 }
 
 #[cfg(test)]
@@ -174,5 +188,58 @@ mod tests {
         assert!(!is_instance_of(&property, &targets));
 
         Ok(())
+    }
+
+    #[test]
+    fn subclass_parents_reads_p279_qids_of_items_only() {
+        let subclass = json!({
+            "type": "item",
+            "claims": {
+                "P279": [
+                    { "mainsnak": { "datavalue": { "value": { "id": "Q811979" } } } },
+                    { "mainsnak": { "datavalue": { "value": { "id": "Q41176" } } } }
+                ]
+            }
+        });
+        let parents: Vec<&str> = subclass_parents(&subclass).collect();
+        assert_eq!(parents, vec!["Q811979", "Q41176"]);
+
+        // No P279 claims, and a non-item both yield nothing.
+        assert_eq!(subclass_parents(&json!({"type": "item"})).count(), 0);
+        let property = json!({
+            "type": "property",
+            "claims": { "P279": [{ "mainsnak": { "datavalue": { "value": { "id": "Q1" } } } }] }
+        });
+        assert_eq!(subclass_parents(&property).count(), 0);
+    }
+
+    /// A reader whose first read fails, modeling a latched decompressor error.
+    struct FailingReader;
+
+    impl tokio::io::AsyncRead for FailingReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("simulated decode failure")))
+        }
+    }
+
+    #[tokio::test]
+    async fn read_error_ends_stream_instead_of_re_reading() {
+        use futures::StreamExt;
+
+        let reader = BufReader::new(FailingReader);
+        let mut stream = std::pin::pin!(wikidata_entities(reader));
+
+        assert!(
+            matches!(stream.next().await, Some(Err(_))),
+            "the read error surfaces once"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the stream ends after a read error rather than re-reading the failed reader"
+        );
     }
 }
