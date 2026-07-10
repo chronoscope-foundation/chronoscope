@@ -36,12 +36,12 @@ use super::fixtures::{
     designated_kind, disjunctive_date, drain_entity_classes, drain_image_classes,
     event_damage_cause_fact, event_description_fact, event_durational_date_fact,
     event_move_method_fact, event_moved_to_location_fact, event_point_date_fact,
-    external_judgment_citation, fixed_time, gap_from_event_fact, has_event_fact,
-    image_observation_citation, judgment_citation, local_bundle, map_medium_fact,
-    medium_picture_fact, moved_kind, moved_to, n_circle_location, name_fact, name_window_fact,
+    external_judgment_citation, external_reference_fact, fixed_time, gap_from_event_fact,
+    has_event_fact, image_observation_citation, local_bundle, map_medium_fact, medium_picture_fact,
+    moved_kind, moved_to, n_circle_location, name_fact, name_window_fact,
     observation_external_published, observation_feature_fact, retract_commit_fact, retract_fact,
-    sample_bbox, sample_citation, started_with_date, subimage_fact, submit_batch, supersede_fact,
-    user_author, year_date,
+    same_event_fact, sample_bbox, sample_citation, started_with_date, subimage_fact, submit_batch,
+    supersede_fact, user_author, year_date,
 };
 use super::{TestResult, UnmintedIds};
 
@@ -174,6 +174,115 @@ pub async fn local_decls_mint_distinct_newly_minted_ids<S: FactStore>(store: S) 
         );
     }
 
+    Ok(())
+}
+
+// --- matcher anchor precedence ---
+
+/// Name twins carrying distinct external references stay distinct: a decl
+/// with any reference draws its candidates from reference walks alone, so a
+/// declared-but-unknown reference mints fresh instead of merging with the
+/// name twin. No identity is asserted, so there is no companion commit and
+/// the two entities read as distinct classes.
+pub async fn name_twin_with_distinct_references_mints_fresh<S: FactStore>(store: S) -> TestResult {
+    let first = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![name_fact(0, "Pantheon")?, external_reference_fact(0, 1)?],
+        )?,
+    )
+    .await?;
+    let existing = first
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing decl")?
+        .id
+        .clone();
+
+    let second = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![name_fact(0, "Pantheon")?, external_reference_fact(0, 2)?],
+        )?,
+    )
+    .await?;
+    let resolution = second.entities.get(&EntityIdx(0)).ok_or("missing decl")?;
+    assert_eq!(
+        resolution.origin,
+        ResolutionOrigin::NewlyMinted,
+        "a distinct reference is positive evidence of a new subject"
+    );
+    assert_eq!(
+        second.companion_commit_id, None,
+        "no match, so no companion commit"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let class = view
+        .entity_class(&resolution.id)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        !class.members.contains(&existing),
+        "the name twins must read as distinct classes; got {:?}",
+        class.members
+    );
+    Ok(())
+}
+
+/// A decl carrying no external references still matches by name: the fresh
+/// mint classes with the existing same-named entity through the companion
+/// commit's identity judgment.
+pub async fn name_match_without_references_joins_existing_class<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let first = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![name_fact(0, "Pantheon")?])?,
+    )
+    .await?;
+    let existing = first
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing decl")?
+        .id
+        .clone();
+
+    let second = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![name_fact(0, "Pantheon")?])?,
+    )
+    .await?;
+    let resolution = second.entities.get(&EntityIdx(0)).ok_or("missing decl")?;
+    assert_eq!(
+        resolution.origin,
+        ResolutionOrigin::MatchedExisting {
+            matched: existing.clone()
+        }
+    );
+    assert!(
+        second.companion_commit_id.is_some(),
+        "a match records its identity judgment in a companion commit"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let class = view
+        .entity_class(&resolution.id)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        class.members.contains(&existing),
+        "the fresh mint must class with the matched entity; got {:?}",
+        class.members
+    );
     Ok(())
 }
 
@@ -596,7 +705,8 @@ pub async fn entity_representative_is_canonical_across_same_entity_members<S: Fa
 }
 
 /// Event analogue of [`entity_class_contains_both_same_entity_members`].
-/// Stamped `#[ignore]`d while the class read is stubbed.
+/// Stamped `#[ignore]`d while submit rejects `SameEvent` and the class read
+/// is stubbed; both must lift before this runs green.
 pub async fn event_class_contains_both_same_event_members<S: FactStore>(store: S) -> TestResult {
     let identity_pair = identity::Fact::same_event(EventIdx(0), EventIdx(1))?;
     let bundle: SubmitCommitInput<S> = SubmitBundle {
@@ -647,7 +757,8 @@ pub async fn event_class_contains_both_same_event_members<S: FactStore>(store: S
 
 /// Event analogue of
 /// [`entity_representative_is_canonical_across_same_entity_members`].
-/// Stamped `#[ignore]`d while representative selection is stubbed.
+/// Stamped `#[ignore]`d while submit rejects `SameEvent` and representative
+/// selection is stubbed; both must lift before this runs green.
 pub async fn event_representative_is_canonical_across_same_event_members<S: FactStore>(
     store: S,
 ) -> TestResult {
@@ -2448,7 +2559,7 @@ pub async fn event_referenced_only_as_gap_endpoint_without_has_event_rejected<S:
 
 /// Two `HasEvent` facts of different kinds on one minted event id is a
 /// self-contradiction — an event has one kind — and is rejected, not stored.
-/// Disagreement belongs on separate `SameEvent`-linked event ids.
+/// Disagreement belongs on separate event ids.
 pub async fn event_two_has_event_kinds_rejected<S: FactStore>(store: S) -> TestResult {
     let errs = commit_err(
         &store,
@@ -2552,12 +2663,12 @@ pub async fn event_date_contradicts_declared_category_rejected<S: FactStore>(
     Ok(())
 }
 
-/// Two sources disagreeing on an event's kind store fine as *separate* events
-/// linked by `SameEvent`: C1 mints event E `Damaged`, C2 mints event F `Moved`
-/// and judges `SameEvent(E, F)`. Each commit carries one `HasEvent` per minted
-/// id, so neither is rejected; the disagreement sits in the store as a
-/// class-level conflict, read back per id.
-pub async fn cross_source_kind_conflict_via_same_event_stored<S: FactStore>(
+/// Two sources disagreeing on an event's kind store fine as *separate* events:
+/// C1 mints event E `Damaged`, C2 mints event F `Moved` on the same entity.
+/// Each commit carries one `HasEvent` per minted id, so neither is rejected —
+/// the kind rules bind per event id, not per entity — and the disagreement
+/// sits in the store, read back per id.
+pub async fn cross_source_kind_conflict_stores_as_separate_events<S: FactStore>(
     store: S,
 ) -> TestResult {
     let c1 = commit_facts(
@@ -2572,7 +2683,42 @@ pub async fn cross_source_kind_conflict_via_same_event_stored<S: FactStore>(
         .ok_or("missing entity")?
         .id
         .clone();
-    let event_e = c1
+
+    let c2: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(10),
+        entities: vec![Decl::Existing { id: entity }],
+        events: vec![Decl::Local],
+        images: Vec::new(),
+        facts: [has_event_fact(0, 0, moved_kind())?].into_iter().collect(),
+    };
+    commit_ok(&store, c2).await
+}
+
+/// A commit adding facts to an already-existing event need not restate its
+/// `HasEvent`: the exactly-one rule reads the cumulative neighbourhood, so
+/// the prior commit's typing claim covers the new fact. C2 declares the event
+/// `Existing`, adds only a description, lands clean, and the fact reads back
+/// active.
+pub async fn existing_event_accepts_new_facts_without_restating_has_event<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, designated_kind())?,
+                event_point_date_fact(0)?,
+            ],
+        )?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let event = c1
         .events
         .get(&EventIdx(0))
         .ok_or("missing event")?
@@ -2582,22 +2728,49 @@ pub async fn cross_source_kind_conflict_via_same_event_stored<S: FactStore>(
     let c2: SubmitCommitInput<S> = SubmitBundle {
         author: user_author()?,
         recorded_at: fixed_time() + chrono::Duration::seconds(10),
-        entities: vec![Decl::Existing { id: entity }],
-        events: vec![Decl::Local, Decl::Existing { id: event_e }],
+        entities: Vec::new(),
+        events: vec![Decl::Existing { id: event }],
         images: Vec::new(),
-        facts: [
-            has_event_fact(0, 0, moved_kind())?,
-            crate::submit::SubmitFact::Judgment {
-                assertion: JudgmentAssertion::Identity {
-                    fact: identity::Fact::same_event(EventIdx(0), EventIdx(1))?,
-                },
-                citation: judgment_citation()?,
-            },
-        ]
-        .into_iter()
-        .collect(),
+        facts: [event_description_fact(0)?].into_iter().collect(),
     };
-    commit_ok(&store, c2).await
+    let second = commit_result(&store, c2).await?;
+    let fact_id = *second.fact_ids.first().ok_or("no fact id")?;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let lookup = view.fact(fact_id).await.map_err(|e| format!("{e:?}"))?;
+    assert!(
+        matches!(lookup, FactLookup::Active(_)),
+        "expected the new event fact active, got {lookup:?}"
+    );
+    Ok(())
+}
+
+/// A `SameEvent` identity fact is rejected at submit: reads answer singleton
+/// event classes — event equivalence is not resolved — so a stored edge would
+/// be silently ignored. The bundle is otherwise clean, so the rejection is
+/// exactly the `SameEvent` arm.
+pub async fn same_event_identity_fact_rejected<S: FactStore>(store: S) -> TestResult {
+    let errs = commit_err(
+        &store,
+        local_bundle(
+            1,
+            2,
+            0,
+            0,
+            vec![
+                has_event_fact(0, 0, designated_kind())?,
+                has_event_fact(1, 0, designated_kind())?,
+                same_event_fact(0, 1)?,
+            ],
+        )?,
+    )
+    .await?;
+    assert_eq!(errs.len().get(), 1, "got {errs:?}");
+    assert!(
+        matches!(errs.first(), SubmitError::SameEventUnresolvable { .. }),
+        "got {errs:?}"
+    );
+    Ok(())
 }
 
 /// A same-commit retraction is visible to the exactly-one rule's read: C1 puts a

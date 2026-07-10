@@ -60,8 +60,8 @@ pub enum MatchOutcome<Id> {
     Matched {
         /// The existing subject — the class representative the anchors hit.
         id: Id,
-        /// The anchor facts that produced the hit, from the winning key
-        /// family (an external-ref hit never cites name rows).
+        /// The anchor facts that produced the hit, all from one key family
+        /// (a decl carrying references never cites name rows).
         basis: BTreeSet<FactId>,
     },
     /// No single existing subject identified, so no sameness judgment.
@@ -85,9 +85,11 @@ pub enum MatchOutcome<Id> {
 /// Exact-match only: a decl's anchors are the [`attribute::Fact::ExternalReference`]
 /// values and normalized `(name, language)` pairs its bundle facts carry, and
 /// its candidates are the existing entities sharing an anchor, each
-/// canonicalised to its `SameEntity` class representative. An external-ref hit
-/// is a hard precedence over a name hit — a reference is an authoritative
-/// cross-system identity, a shared name is weaker evidence. Exactly one
+/// canonicalised to its `SameEntity` class representative. A decl carrying any
+/// external reference draws candidates from reference walks alone — a
+/// reference is an authoritative cross-system identity, so a declared but
+/// unknown one is positive evidence of a new subject, not a name twin. Names
+/// participate only for a decl with no references at all. Exactly one
 /// distinct candidate is [`MatchOutcome::Matched`]; zero or several are
 /// [`MatchOutcome::Unmatched`], the candidate list feeding
 /// [`ResolutionOrigin::Ambiguous`](super::result::ResolutionOrigin::Ambiguous).
@@ -156,8 +158,9 @@ pub async fn match_entities<S: FactStore, V: EntityView<S>>(
             })
             .await?;
         }
-        // Hard precedence: names are consulted only with no external-ref hit.
-        if candidates.is_empty() {
+        // A declared reference owns the decl's identity evidence even when its
+        // walk finds nothing; names weigh in only for a reference-free decl.
+        if !references.contains_key(&idx) {
             for (name, language) in names.get(&idx).into_iter().flatten() {
                 let stream = EntityStream::ByName { name, language };
                 collect_candidates::<S, _, _, _, _>(&mut candidates, &mut *view, |v, cursor| {

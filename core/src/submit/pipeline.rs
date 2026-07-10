@@ -39,7 +39,7 @@ use super::{EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::date::UncertainDate;
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use crate::grammar::citations::{ExternalSource, FactualCitation, JudgmentSource, MetaSource};
-use crate::grammar::identity::{IdMapError, SelfLoop};
+use crate::grammar::identity::{self, IdMapError, SelfLoop};
 use crate::grammar::ids::{FactId, IdScheme, SubjectKind};
 use crate::grammar::lifecycle::LifetimeEventKind;
 use crate::grammar::{attribute, bookend, composites, event, image};
@@ -526,6 +526,7 @@ fn run_cluster_rules<S>(
 {
     rule_event_has_one_kind::<S>(candidates, event_facts, errors);
     rule_event_fact_kind_consistency::<S>(candidates, event_facts, errors);
+    rule_same_event_unresolvable::<S>(candidates, errors);
     rule_name_window::<S>(candidates, errors);
     rule_single_interval_date::<S>(candidates, errors);
     rule_location_validity::<S>(candidates, errors);
@@ -573,7 +574,7 @@ where
 /// which is why the set spans every referenced id, not just typing/payload
 /// subjects.
 /// Cross-source disagreement on the subject or kind belongs on separate
-/// `SameEvent`-linked event ids, not on one id.
+/// event ids, not on one id.
 fn rule_event_has_one_kind<S>(
     candidates: &[StoredFactOf<S>],
     event_facts: &HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
@@ -603,8 +604,7 @@ fn rule_event_has_one_kind<S>(
 /// rejected. An event already failing [`rule_event_has_one_kind`] with ≥2
 /// distinct `HasEvent` is skipped — its kind is genuinely disputed, an
 /// order-dependent mismatch here would just double-report. Stored cross-source
-/// kind disagreement lives on separate `SameEvent`-linked ids, each internally
-/// consistent.
+/// kind disagreement lives on separate event ids, each internally consistent.
 fn rule_event_fact_kind_consistency<S>(
     candidates: &[StoredFactOf<S>],
     event_facts: &HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
@@ -681,6 +681,32 @@ where
         );
     }
     events
+}
+
+/// `SameEvent` identity facts are rejected: reads answer singleton event
+/// classes — event equivalence is not resolved — so a stored edge would be
+/// silently ignored. Pushes dedup by the event pair, so differently-cited
+/// facts over one pair yield one error.
+fn rule_same_event_unresolvable<S: FactStore>(
+    candidates: &[StoredFactOf<S>],
+    errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
+) {
+    let mut offending: BTreeSet<(EventIdOf<S>, EventIdOf<S>)> = BTreeSet::new();
+    for fact in candidates {
+        if let StoredFact::Judgment(StoredJudgmentFact {
+            assertion:
+                JudgmentAssertion::Identity {
+                    fact: identity::Fact::SameEvent { pair },
+                },
+            ..
+        }) = fact
+        {
+            offending.insert((pair.a().clone(), pair.b().clone()));
+        }
+    }
+    for (a, b) in offending {
+        errors.push(SubmitError::SameEventUnresolvable { a, b });
+    }
 }
 
 /// A name's validity window may not close before it opens. With both bounds

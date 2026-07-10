@@ -613,6 +613,16 @@ pub fn same_entity_fact(a: usize, b: usize) -> Result<SubmitFact, TestError> {
     })
 }
 
+/// A `SameEvent` judgment between two event indices.
+pub fn same_event_fact(a: usize, b: usize) -> Result<SubmitFact, TestError> {
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Identity {
+            fact: identity::Fact::same_event(EventIdx(a), EventIdx(b))?,
+        },
+        citation: judgment_citation()?,
+    })
+}
+
 /// A composite `IsSubimageOf` fact linking the two image indices.
 pub fn subimage_fact(subimage_idx: usize, parent_idx: usize) -> Result<SubmitFact, TestError> {
     let region = crate::grammar::composites::SubimageRegion::rect(0.0, 0.0, 0.5, 0.5)?;

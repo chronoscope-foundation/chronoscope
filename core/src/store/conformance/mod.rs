@@ -136,6 +136,8 @@ macro_rules! fact_store_conformance {
             roundtrip_small_commit_through_fact_lookup,
             existing_decl_passes_through_to_supplied_id,
             local_decls_mint_distinct_newly_minted_ids,
+            name_twin_with_distinct_references_mints_fresh,
+            name_match_without_references_joins_existing_class,
             walk_entity_classes_group_submitted_facts_into_one_class,
             class_walk_pages_distinct_entities_as_contiguous_runs,
             all_facts_about_entity_returns_facts_mentioning_it,
@@ -144,9 +146,9 @@ macro_rules! fact_store_conformance {
             all_facts_about_image_returns_facts_mentioning_it,
             entity_class_contains_both_same_entity_members,
             entity_representative_is_canonical_across_same_entity_members,
-            #[ignore = "event_class is stubbed to the singleton {member}; this pins that a SameEvent-linked pair shares a two-member class and flips green once the union-find read is implemented"]
+            #[ignore = "submit rejects SameEvent while event_class is stubbed to the singleton {member}; this pins that a SameEvent-linked pair shares a two-member class and flips green once reads resolve event equivalence and the submit rejection is lifted"]
             event_class_contains_both_same_event_members,
-            #[ignore = "event_representative is stubbed to return member itself; this pins that both SameEvent members share one canonical representative and flips green once representative selection is implemented"]
+            #[ignore = "submit rejects SameEvent while event_representative is stubbed to return member itself; this pins that both SameEvent members share one canonical representative and flips green once reads resolve event equivalence and the submit rejection is lifted"]
             event_representative_is_canonical_across_same_event_members,
             image_class_contains_both_same_artifact_members,
             image_representative_is_canonical_across_same_artifact_members,
@@ -197,7 +199,9 @@ macro_rules! fact_store_conformance {
             event_two_has_event_entities_rejected,
             event_payload_contradicts_declared_kind_rejected,
             event_date_contradicts_declared_category_rejected,
-            cross_source_kind_conflict_via_same_event_stored,
+            cross_source_kind_conflict_stores_as_separate_events,
+            existing_event_accepts_new_facts_without_restating_has_event,
+            same_event_identity_fact_rejected,
             event_kind_rule_sees_same_commit_retraction,
             event_retype_without_retracting_stale_payload_rejected,
             observation_depiction_retracted_in_same_commit_rejected,

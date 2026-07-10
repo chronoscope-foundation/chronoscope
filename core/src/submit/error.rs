@@ -165,6 +165,17 @@ pub enum SubmitError<EntId, EvtId, ImgId> {
         /// The shared image id both sides of the pair resolved to.
         id: ImgId,
     },
+    /// An `identity::Fact::SameEvent` judgment. Reads answer singleton event
+    /// classes — event equivalence is not resolved — so a stored `SameEvent`
+    /// edge would be silently ignored. Rejecting it keeps the singleton
+    /// answers honest.
+    #[error("SameEvent on events {a} and {b} is rejected: reads do not resolve event equivalence")]
+    SameEventUnresolvable {
+        /// The canonically-smaller member of the rejected pair.
+        a: EvtId,
+        /// The canonically-larger member of the rejected pair.
+        b: EvtId,
+    },
     /// A retraction or supersession target fact was not found at submit
     /// time.
     #[error("fact {id} not found")]
@@ -253,11 +264,11 @@ pub enum SubmitError<EntId, EvtId, ImgId> {
     /// An event id carries more than one distinct `HasEvent` — a different
     /// subject entity or a different declared kind on one id. An event has one
     /// subject and one kind; genuine cross-source disagreement is expressed as
-    /// separate events (different ids) linked by `SameEvent`, never two
-    /// `HasEvent` on one id. (Re-asserting the identical `HasEvent`
-    /// content-addresses to one fact, so it isn't a duplicate.)
+    /// separate events (different ids), never two `HasEvent` on one id.
+    /// (Re-asserting the identical `HasEvent` content-addresses to one fact,
+    /// so it isn't a duplicate.)
     #[error(
-        "event {event} carries conflicting HasEvent claims; disagreement belongs on separate SameEvent-linked events"
+        "event {event} carries conflicting HasEvent claims; disagreement belongs on separate events"
     )]
     EventMultipleHasEvent {
         /// The event with conflicting `HasEvent` claims.
