@@ -16,11 +16,11 @@ use chronoscope_core::grammar::citations::{
 };
 use chronoscope_core::grammar::depiction::{self, Perspective};
 use chronoscope_core::grammar::event;
-use chronoscope_core::grammar::ids::IngesterRunId;
+use chronoscope_core::grammar::ids::{IdScheme, IngesterRunId};
 use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::grammar::lifecycle::DurationalRole;
 use chronoscope_core::nonempty::NonEmptyVec;
-use chronoscope_core::store::memory::{MemoryFactStore, MemoryIds};
+use chronoscope_core::store::FactStore;
 use chronoscope_core::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact, commit_facts,
 };
@@ -75,12 +75,12 @@ impl From<ExcerptError> for BuildError {
 /// Extraction skips (unparseable dates, uncitable names, unrecognized event
 /// QIDs) are collected into `warnings` for the ingest driver to surface; they
 /// don't fail the build.
-pub fn build_commit(
+pub fn build_commit<R: IdScheme>(
     entity: &WikidataEntity,
     run: &IngesterRunId,
     recorded_at: DateTime<Utc>,
     warnings: &mut Vec<String>,
-) -> Result<Option<Commit<MemoryIds>>, BuildError> {
+) -> Result<Option<Commit<R>>, BuildError> {
     let Ok(entity_id) = WikidataEntityId::parse(entity.id.as_str()) else {
         return Ok(None);
     };
@@ -530,6 +530,25 @@ pub struct IngestStats {
     pub issues: usize,
 }
 
+impl std::ops::AddAssign for IngestStats {
+    fn add_assign(&mut self, rhs: Self) {
+        // Destructured so a new counter forces an update here at compile time
+        // rather than silently going unfolded.
+        let IngestStats {
+            commits,
+            entities,
+            facts,
+            skipped,
+            issues,
+        } = rhs;
+        self.commits += commits;
+        self.entities += entities;
+        self.facts += facts;
+        self.skipped += skipped;
+        self.issues += issues;
+    }
+}
+
 /// A failure during an ingest pass.
 #[derive(Debug)]
 pub enum IngestError {
@@ -558,8 +577,8 @@ impl From<BuildError> for IngestError {
 }
 
 /// Build and submit one commit per entity, tallying as it goes.
-pub async fn ingest_entities(
-    store: &MemoryFactStore,
+pub async fn ingest_entities<S: FactStore>(
+    store: &S,
     entities: impl IntoIterator<Item = WikidataEntity>,
     run: &IngesterRunId,
     recorded_at: DateTime<Utc>,
@@ -601,7 +620,7 @@ mod tests {
     use chronoscope_core::listing::summaries_in_bbox;
     use chronoscope_core::projection::{member_lineage, project_entity};
     use chronoscope_core::store::FactStore;
-    use chronoscope_core::store::memory::MemoryEntityId;
+    use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds};
     use chronoscope_core::typed;
     use chronoscope_integrations::wikidata::{
         Claim, CoordinateValue, DataValue, EntityRefValue, Label, LanguageCode, PropertyId, Rank,
@@ -726,8 +745,9 @@ mod tests {
 
     #[test]
     fn build_commit_emits_names_qid_bookend_event_and_image() -> TestResult {
-        let commit = build_commit(&pantheon()?, &run_id(), fixed_time()?, &mut Vec::new())?
-            .ok_or("a Q-item builds a commit")?;
+        let commit =
+            build_commit::<MemoryIds>(&pantheon()?, &run_id(), fixed_time()?, &mut Vec::new())?
+                .ok_or("a Q-item builds a commit")?;
 
         assert_eq!(commit.entities.len(), 1, "no demolish→rebuild, one entity");
         assert_eq!(commit.events.len(), 1, "the fire is one interior event");
@@ -850,7 +870,7 @@ mod tests {
             PropertyId::try_from("P18".to_owned())?,
             vec![deprecated, string_claim("Current.jpg")],
         )]);
-        let commit = build_commit(
+        let commit = build_commit::<MemoryIds>(
             &item("Q7", BTreeMap::new(), claims)?,
             &run_id(),
             fixed_time()?,
@@ -883,7 +903,7 @@ mod tests {
                 WikidataPrecision::Month,
             )?],
         )]);
-        let commit = build_commit(
+        let commit = build_commit::<MemoryIds>(
             &item("Q8", BTreeMap::new(), claims)?,
             &run_id(),
             fixed_time()?,
@@ -956,7 +976,7 @@ mod tests {
 
     #[test]
     fn demolish_rebuild_emits_replaces_edge_citing_bookend_dates() -> TestResult {
-        let commit = build_commit(
+        let commit = build_commit::<MemoryIds>(
             &rebuilt_church()?,
             &run_id(),
             fixed_time()?,
@@ -1001,7 +1021,7 @@ mod tests {
 
     #[test]
     fn predecessor_inherits_location_without_dates() -> TestResult {
-        let commit = build_commit(
+        let commit = build_commit::<MemoryIds>(
             &rebuilt_church()?,
             &run_id(),
             fixed_time()?,
@@ -1151,7 +1171,7 @@ mod tests {
         );
 
         let mut warnings = Vec::new();
-        let commit = build_commit(&entity, &run_id(), fixed_time()?, &mut warnings)?
+        let commit = build_commit::<MemoryIds>(&entity, &run_id(), fixed_time()?, &mut warnings)?
             .ok_or("the item still builds a commit")?;
 
         // The item's own QID is the only external reference; the empty-title

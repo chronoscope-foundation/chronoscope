@@ -19,7 +19,9 @@
 
 pub mod commons;
 pub mod entity;
+pub mod filter;
 mod sparql;
+pub mod stream;
 
 pub use commons::url_for_filename;
 pub use entity::{

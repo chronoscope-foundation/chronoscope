@@ -75,8 +75,44 @@ let
 
   # ======================== Build infrastructure ========================
 
-  # Build the ingest binary via crane.
-  ingestBin = craneLib.buildPackage (
+  # Cargo needs every workspace member's manifest + the lock to resolve, but
+  # not their source. This tree carries only the manifests + lock — no `.rs` —
+  # so it's immune to source churn in core/db/ingestion.
+  dumpManifests = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../Cargo.lock
+      (lib.fileset.fileFilter (f: f.name == "Cargo.toml") ../.)
+    ];
+  };
+
+  # Stub every crate from its manifest (so cargo can resolve the workspace),
+  # then overlay only the real integrations *source* — the one crate the dump
+  # binary compiles. mkDummySrc rewrites manifests to be self-consistent, so we
+  # keep its manifests (which carry integrations' real deps) and swap in just
+  # the code. A core edit leaves this source unchanged; an integrations-source
+  # edit rebuilds it — decoupling the expensive derivations from core/db churn.
+  dumpToolSrc = pkgs.runCommand "wikidata-dump-src" { } ''
+    cp -r ${craneLib.mkDummySrc { src = dumpManifests; }} $out
+    chmod -R u+w $out
+    rm -rf $out/integrations/src
+    cp -r ${../integrations/src} $out/integrations/src
+  '';
+
+  # Core-free dump-filter tooling: fetch / resolve-types / filter.
+  dumpToolBin = craneLib.buildPackage (
+    rustCommonArgs
+    // {
+      inherit cargoArtifacts;
+      src = dumpToolSrc;
+      pname = "wikidata-dump";
+      cargoExtraArgs = "-p chronoscope-integrations --bin wikidata-dump";
+      doCheck = false;
+    }
+  );
+
+  # The build-db loader, which pulls in core/db to write the fact store.
+  buildDbBin = craneLib.buildPackage (
     rustCommonArgs
     // {
       inherit cargoArtifacts;
@@ -102,13 +138,13 @@ let
         outputHashAlgo = "sha256";
         outputHash = bundle.hash;
         nativeBuildInputs = [
-          ingestBin
+          dumpToolBin
           pkgs.cacert
         ];
         SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
         buildCommand = ''
           mkdir -p $out
-          ingest fetch \
+          wikidata-dump fetch \
             --timestamp ${lib.escapeShellArg bundle.timestamp} \
             ${entityArgs} \
             --output $out/entities.jsonl
@@ -175,10 +211,10 @@ let
   # graph. The class hierarchy tracks the dump's snapshot, not live Wikidata.
   wikidataArchTypes = pkgs.stdenvNoCC.mkDerivation {
     name = "wikidata-arch-types-${dumpPin.date}";
-    nativeBuildInputs = [ ingestBin ];
+    nativeBuildInputs = [ dumpToolBin ];
     buildCommand = ''
       mkdir -p $out
-      ingest resolve-types --input ${dumpFile} --output $out/arch-types.json --verbose
+      wikidata-dump resolve-types --input ${dumpFile} --output $out/arch-types.json --verbose
     '';
   };
 
@@ -186,10 +222,10 @@ let
   # pinning, orders of magnitude smaller than the dump it came from.
   wikidataArchEntities = pkgs.stdenvNoCC.mkDerivation {
     name = "wikidata-arch-entities-${dumpPin.date}";
-    nativeBuildInputs = [ ingestBin ];
+    nativeBuildInputs = [ dumpToolBin ];
     buildCommand = ''
       mkdir -p $out
-      ingest filter \
+      wikidata-dump filter \
         --input ${dumpFile} \
         --types ${wikidataArchTypes}/arch-types.json \
         --output $out/entities.jsonl \
@@ -197,9 +233,53 @@ let
     '';
   };
 
+  # ======================== Facts DB (SQLite) ========================
+  #
+  # Load an entities JSONL into a SQLite fact store via `ingest build-db`.
+  # Pure — no network. `--limit` slices the first N entities (nested
+  # prefixes) so the DB can grow toward the full set without re-running the
+  # dump scan, which already happened upstream.
+
+  mkFactsDb =
+    name: source: recordedAt: limit:
+    pkgs.stdenvNoCC.mkDerivation {
+      name = "wikidata-facts-db-${name}";
+      nativeBuildInputs = [
+        buildDbBin
+        pkgs.sqlite
+      ];
+      SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
+      buildCommand = ''
+        mkdir -p $out
+        ingest build-db \
+          --input ${source}/entities.jsonl \
+          --database-url sqlite:$out/facts.db \
+          --recorded-at ${lib.escapeShellArg recordedAt} \
+          ${lib.optionalString (limit != null) "--limit ${toString limit}"}
+        # A store DB is read-only, so it must carry no WAL side files: fold the
+        # WAL back in and switch to a rollback journal.
+        sqlite3 $out/facts.db "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"
+        rm -f $out/facts.db-wal $out/facts.db-shm
+        facts=$(sqlite3 $out/facts.db "SELECT count(*) FROM facts")
+        echo "facts DB '${name}' holds $facts facts"
+        test "$facts" -gt 0
+      '';
+    };
+
+  bulkRecordedAt = "${dumpPin.date}T00:00:00Z";
+
+  factsDbs = {
+    # Dump-free DB from the curated bundle — always buildable, and the
+    # validation instance for the build-db path.
+    curated = mkFactsDb "curated" bundles.curated.entities bundleDefs.curated.timestamp null;
+    "1k" = mkFactsDb "1k" wikidataArchEntities bulkRecordedAt 1000;
+    "100k" = mkFactsDb "100k" wikidataArchEntities bulkRecordedAt 100000;
+    full = mkFactsDb "full" wikidataArchEntities bulkRecordedAt null;
+  };
+
 in
 {
-  inherit bundles ingestBin;
+  inherit bundles factsDbs dumpToolBin;
   dump = {
     full = dumpFull;
     archTypes = wikidataArchTypes;

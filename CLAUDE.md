@@ -70,6 +70,7 @@ HF_TOKEN=hf_... just fetch-weights        # ~2GB model weights (gated repos; nee
 just fetch-corpus                          # corpus images from external URLs
 just fetch-all                             # weights + corpus
 just fetch-wikidata                        # build+pin the architectural-entities set (bulk ingestion source)
+just fetch-wikidata-db [size]              # build+pin a SQLite facts DB (curated|1k|100k|full)
 ```
 
 Fetched data is pinned as GC roots under `.nix-gc-roots/` (gitignored).

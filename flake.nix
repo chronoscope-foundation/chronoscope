@@ -279,6 +279,10 @@
                 '';
 
             openapi = openapi.spec;
+
+            # Hermetic coverage of the build-db path: a dump-free facts DB from
+            # the curated bundle, self-validating that it holds facts.
+            wikidata-facts-db-curated = wikidata.factsDbs.curated;
             # corpus-tests intentionally excluded — requires GPU (run on
             # dedicated CI runners via `nix build .#corpus-tests`).
           }
@@ -307,9 +311,20 @@
             # Bulk dump pipeline. Packages, not checks — the commit gate
             # never downloads the dump. Build + pin the architectural-entities
             # set with `just fetch-wikidata`.
+            # Core-free dump-filter tool (fetch/resolve-types/filter), built
+            # from a narrowed source so core/db churn doesn't rebuild it.
+            wikidata-dump-tool = wikidata.dumpToolBin;
+
             wikidata-dump = wikidata.dump.full;
             wikidata-arch-types = wikidata.dump.archTypes;
             wikidata-arch-entities = wikidata.dump.archEntities;
+
+            # SQLite fact-store DBs built from the entities via `ingest
+            # build-db`. `curated` is dump-free; the sizes slice first-N.
+            wikidata-facts-db-curated = wikidata.factsDbs.curated;
+            wikidata-facts-db-1k = wikidata.factsDbs."1k";
+            wikidata-facts-db-100k = wikidata.factsDbs."100k";
+            wikidata-facts-db-full = wikidata.factsDbs.full;
           }
           // lib.optionalAttrs isDarwin {
             ios-api-package = openapi.apiPackage;

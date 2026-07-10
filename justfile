@@ -344,6 +344,17 @@ fetch-wikidata:
     nix build .#wikidata-arch-entities --out-link .nix-gc-roots/wikidata-arch-entities
     echo "Done. Pinned at .nix-gc-roots/wikidata-arch-entities/entities.jsonl"
 
+# Build + pin a SQLite facts DB (size: curated | 1k | 100k | full). Every size
+# above `curated` needs the architectural-entities set (and thus the dump).
+fetch-wikidata-db size="full":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    _ensure_nix
+    mkdir -p .nix-gc-roots
+    nix build ".#wikidata-facts-db-{{ size }}" --out-link ".nix-gc-roots/wikidata-facts-db-{{ size }}"
+    echo "Done. Pinned at .nix-gc-roots/wikidata-facts-db-{{ size }}/facts.db"
+
 # ---------------------------------------------------------------------------
 # Corpus tooling. Live in their own world because the corpus pipeline has
 # specific feature flags and a separate analysis-results derivation.

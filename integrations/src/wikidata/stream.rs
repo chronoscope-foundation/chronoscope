@@ -5,10 +5,10 @@
 //! - JSON entity parsing (handles Wikidata's array-wrapped format)
 //! - Filtering predicates
 
+use crate::wikidata::WikidataId;
 use anyhow::{Context, Result};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder};
-use chronoscope_integrations::wikidata::WikidataId;
-use futures::stream::{self, Stream};
+use futures_util::stream::{self, Stream};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::Path;
@@ -228,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_error_ends_stream_instead_of_re_reading() {
-        use futures::StreamExt;
+        use futures_util::StreamExt;
 
         let reader = BufReader::new(FailingReader);
         let mut stream = std::pin::pin!(wikidata_entities(reader));

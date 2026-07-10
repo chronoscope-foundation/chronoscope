@@ -13,7 +13,7 @@ Nix build infrastructure. One derivation module per project area;
 | `web.nix`       | WASM build pipeline + `web-build`/`web-test-build`/`web-clippy` checks |
 | `python.nix`    | `analysisEnv`, model weight FODs, triton checks     |
 | `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |
-| `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL) |
+| `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL → SQLite facts DBs) |
 
 Dev shell composition lives in `flake.nix`, not in any single component
 module — it has the visibility to compose across modules.

@@ -42,6 +42,11 @@ reqwest = { version = "0.12", default-features = false, features = ["native-tls"
 bytes.workspace = true
 futures-util = "0.3"
 
+# Wikidata dump streaming, filtering, and the wikidata-dump CLI
+async-compression = { version = "0.4", features = ["tokio", "gzip", "bzip2"] }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+
 # Hashing (for HTTP cache keys and Commons URLs)
 sha2 = "0.10"
 hex = "0.4"

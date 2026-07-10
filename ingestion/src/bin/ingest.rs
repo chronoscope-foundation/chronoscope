@@ -1,16 +1,14 @@
 //! Chronoscope ingestion CLI.
 //!
-//! Subcommands for the Wikidata ingestion pipeline:
-//! - `fetch`: Fetch entities at a timestamp (resolves revisions, produces JSONL)
-//! - `resolve-types`: Resolve the architectural type set (from a dump, or SPARQL)
-//! - `filter`: Filter a Wikidata dump for architectural entities
+//! `build-db`: load a filtered Wikidata entities JSONL dump into a SQLite fact
+//! store. The dump-filter tooling (`fetch`, `resolve-types`, `filter`) lives in
+//! `chronoscope-integrations`' `wikidata-dump` binary, which stays free of
+//! core/db.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use chronoscope_integrations::wikidata::{ApiTimestamp, RevisionId, WikidataClient, WikidataId};
-use chronoscope_integrations::{ReqwestClient, ReqwestConfig};
+use chronoscope_ingestion::wikidata::commits::IngestStats;
 
 /// Chronoscope ingestion pipeline
 #[derive(clap::Parser)]
@@ -20,111 +18,34 @@ struct Cli {
     command: Command,
 }
 
-/// Output target: file path or stdout.
-#[derive(Clone)]
-enum OutputTarget {
-    Stdout,
-    File(PathBuf),
-}
-
-impl OutputTarget {
-    fn open(&self) -> Result<std::io::BufWriter<Box<dyn std::io::Write>>> {
-        let writer: Box<dyn std::io::Write> = match self {
-            Self::Stdout => Box::new(std::io::stdout().lock()),
-            Self::File(path) => {
-                let file = std::fs::File::create(path)
-                    .with_context(|| format!("Failed to create {}", path.display()))?;
-                Box::new(file)
-            }
-        };
-        Ok(std::io::BufWriter::new(writer))
-    }
-}
-
-fn parse_output_target(s: &str) -> std::result::Result<OutputTarget, String> {
-    if s == "-" {
-        Ok(OutputTarget::Stdout)
-    } else {
-        Ok(OutputTarget::File(PathBuf::from(s)))
-    }
-}
-
-fn parse_entity_arg(s: &str) -> std::result::Result<(WikidataId, String), String> {
-    let (qid, name) = s
-        .split_once('=')
-        .ok_or_else(|| format!("entity must be QID=Name, got: {s}"))?;
-    let id = WikidataId::try_from(qid.to_string())?;
-    Ok((id, name.to_string()))
+fn parse_recorded_at(s: &str) -> std::result::Result<chrono::DateTime<chrono::Utc>, String> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|e| format!("invalid RFC 3339 timestamp: {e}"))
 }
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Fetch entities from Wikidata at a specific timestamp.
+    /// Load a Wikidata entities JSONL dump into a SQLite fact store.
     ///
-    /// Resolves revision IDs at the given timestamp, fetches entity data,
-    /// and validates that each entity has a label matching the provided name.
-    /// Produces deterministic sorted JSONL.
-    Fetch {
-        /// Timestamp to pin revisions to (e.g., "2022-01-03T00:00:00Z")
-        #[arg(short, long)]
-        timestamp: ApiTimestamp,
-
-        /// Entities to fetch as QID=Name pairs (e.g., Q243="Eiffel Tower")
-        #[arg(short, long = "entity", required = true, value_parser = parse_entity_arg)]
-        entities: Vec<(WikidataId, String)>,
-
-        /// Output JSONL file path (or - for stdout)
-        #[arg(short, long, default_value = "-", value_parser = parse_output_target)]
-        output: OutputTarget,
-    },
-
-    /// Resolve the architectural structure type set.
-    ///
-    /// By default derives the set offline from the dump's own P279
-    /// (subclass-of) graph. With `--sparql`, queries Wikidata's live SPARQL
-    /// endpoint instead. Writes a sorted JSON array of Q-IDs.
-    ResolveTypes {
-        /// Input Wikidata dump (JSON, .gz, or .bz2); required unless --sparql
-        #[arg(short, long)]
-        input: Option<PathBuf>,
-
-        /// Resolve via live Wikidata SPARQL instead of the dump
-        #[arg(long, conflicts_with = "input")]
-        sparql: bool,
-
-        /// Output types JSON file
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Print progress information
-        #[arg(short, long)]
-        verbose: bool,
-    },
-
-    /// Filter a Wikidata dump for architectural entities.
-    ///
-    /// Loads a resolved type set (see `resolve-types`), then streams the dump
-    /// and writes matching entities as JSONL.
-    Filter {
-        /// Input Wikidata dump file (JSON, .gz, or .bz2)
+    /// Streams the input in batches, submitting one commit per entity to the
+    /// on-disk (or in-memory) store under a single ingester run.
+    BuildDb {
+        /// Input entities JSONL, one entity per line
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Resolved types JSON produced by `resolve-types`
-        #[arg(short, long)]
-        types: PathBuf,
+        /// Fact-store database URL (e.g. `sqlite:facts.db` or `sqlite::memory:`)
+        #[arg(long)]
+        database_url: String,
 
-        /// Output JSONL file path
-        #[arg(short, long)]
-        output: PathBuf,
+        /// Snapshot timestamp (RFC 3339) recorded on every commit
+        #[arg(long, value_parser = parse_recorded_at)]
+        recorded_at: chrono::DateTime<chrono::Utc>,
 
-        /// Maximum number of entities to process
+        /// Ingest only the first N entities
         #[arg(short, long)]
         limit: Option<u64>,
-
-        /// Print progress information
-        #[arg(short, long)]
-        verbose: bool,
     },
 }
 
@@ -140,157 +61,113 @@ fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Fetch {
-            timestamp,
-            entities,
-            output,
-        } => cmd_fetch(&timestamp, &entities, &output).await,
-        Command::ResolveTypes {
+        Command::BuildDb {
             input,
-            sparql,
-            output,
-            verbose,
-        } => cmd_resolve_types(input.as_deref(), sparql, &output, verbose).await,
-        Command::Filter {
-            input,
-            types,
-            output,
+            database_url,
+            recorded_at,
             limit,
-            verbose,
-        } => cmd_filter(&input, &types, &output, limit, verbose).await,
+        } => cmd_build_db(&input, &database_url, recorded_at, limit).await,
     }
 }
 
-/// Create a `WikidataClient` with standard configuration.
-fn wikidata_client(timeout_secs: u64) -> Result<WikidataClient<ReqwestClient>> {
-    let http = ReqwestClient::with_config(&ReqwestConfig {
-        timeout: std::time::Duration::from_secs(timeout_secs),
-        ..ReqwestConfig::default()
-    })?;
-    Ok(WikidataClient::new(http))
-}
-
 // =============================================================================
-// FETCH
+// BUILD DB
 // =============================================================================
 
-async fn cmd_fetch(
-    timestamp: &ApiTimestamp,
-    entities: &[(WikidataId, String)],
-    output: &OutputTarget,
-) -> Result<()> {
-    let client = wikidata_client(60)?;
-
-    eprintln!(
-        "Fetching {} entities at timestamp {timestamp}",
-        entities.len()
-    );
-
-    // Step 1: Resolve revision IDs at the timestamp
-    let ids: Vec<&str> = entities.iter().map(|(id, _)| id.as_str()).collect();
-    let revisions = client
-        .resolve_revisions(&ids, timestamp)
-        .await
-        .context("Failed to resolve entity revisions")?;
-
-    for (entity_id, rev_id) in &revisions {
-        eprintln!("  {entity_id} -> rev {rev_id}");
-    }
-
-    // Step 2: Fetch entities at those revisions
-    let revision_pairs: Vec<(&str, RevisionId)> = revisions
-        .iter()
-        .map(|(id, rev)| (id.as_str(), *rev))
-        .collect();
-    let fetched = client
-        .get_entities_at_revisions(&revision_pairs)
-        .await
-        .context("Failed to fetch entities")?;
-
-    eprintln!("  Fetched {} entities", fetched.len());
-
-    // Step 3: Validate names against provided names
-    for (qid, expected_name) in entities {
-        let entity = fetched
-            .get(qid)
-            .ok_or_else(|| anyhow::anyhow!("entity {qid} not found in fetched results"))?;
-        let has_matching_label = entity
-            .labels
-            .values()
-            .any(|label| label.value == *expected_name);
-        if !has_matching_label {
-            let actual_labels: Vec<&str> = entity
-                .labels
-                .values()
-                .map(|l| l.value.as_str())
-                .take(5)
-                .collect();
-            anyhow::bail!(
-                "name mismatch for {qid}: expected '{expected_name}' but labels are {actual_labels:?}",
-            );
-        }
-    }
-
-    // Step 4: Write sorted JSONL
-    let mut writer = output.open()?;
-    let mut sorted_keys: Vec<&WikidataId> = fetched.keys().collect();
-    sorted_keys.sort_by_key(|k| k.as_str());
-    for key in sorted_keys {
-        serde_json::to_writer(&mut writer, &fetched[key])?;
-        writeln!(writer)?;
-    }
-
-    eprintln!("Done! Wrote {} entities", fetched.len());
-    Ok(())
-}
-
-// =============================================================================
-// RESOLVE TYPES
-// =============================================================================
-
-async fn cmd_resolve_types(
-    input: Option<&Path>,
-    sparql: bool,
-    output: &Path,
-    verbose: bool,
-) -> Result<()> {
-    use chronoscope_ingestion::wikidata::filter;
-
-    let types = if sparql {
-        let client = wikidata_client(300)?;
-        if verbose {
-            eprintln!("Fetching architectural structure types from Wikidata SPARQL...");
-        }
-        filter::fetch_architectural_types(&client).await?
-    } else {
-        let input =
-            input.ok_or_else(|| anyhow::anyhow!("--input is required unless --sparql is set"))?;
-        filter::resolve_types_from_dump(input, verbose).await?
-    };
-
-    filter::write_types(output, &types)?;
-    eprintln!(
-        "Wrote {} architectural types to {}",
-        types.len(),
-        output.display()
-    );
-    Ok(())
-}
-
-// =============================================================================
-// FILTER
-// =============================================================================
-
-async fn cmd_filter(
+/// Stream a Wikidata entities JSONL dump into a SQLite fact store.
+///
+/// The dump is millions of entities, so it's read line by line and submitted
+/// in batches rather than materialized into one `Vec`. Every commit carries the
+/// same `recorded_at`, so re-loading the same snapshot content-addresses to the
+/// same `CommitId`s.
+async fn cmd_build_db(
     input: &Path,
-    types: &Path,
-    output: &Path,
+    database_url: &str,
+    recorded_at: chrono::DateTime<chrono::Utc>,
     limit: Option<u64>,
-    verbose: bool,
 ) -> Result<()> {
-    use chronoscope_ingestion::wikidata::filter;
+    use chronoscope_core::grammar::ids::IngesterRunId;
 
-    let target_types = filter::read_types(types)?;
-    filter::filter_dump(input, output, &target_types, limit, verbose).await?;
+    let store = chronoscope_db::SqliteFactStore::open(database_url)
+        .await
+        .with_context(|| format!("opening fact store at {database_url}"))?;
+    let run = IngesterRunId::new("wikidata-dump");
+
+    // Tear the pool down inside the runtime whatever the outcome, so
+    // SpatiaLite's dlclose stays off the process-exit path even on error.
+    let result = ingest_jsonl(&store, input, &run, recorded_at, limit).await;
+    store.close().await;
+    let stats = result?;
+
+    eprintln!(
+        "Ingested {} entities across {} commits ({} facts, {} skipped, {} issues)",
+        stats.entities, stats.commits, stats.facts, stats.skipped, stats.issues
+    );
+    Ok(())
+}
+
+/// Stream the JSONL dump into `store` in batches, stopping at `limit` entities.
+/// Split out from `cmd_build_db` so the caller can close the store on any
+/// error path, not just success.
+async fn ingest_jsonl(
+    store: &chronoscope_db::SqliteFactStore,
+    input: &Path,
+    run: &chronoscope_core::grammar::ids::IngesterRunId,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+    limit: Option<u64>,
+) -> Result<IngestStats> {
+    use std::io::BufRead;
+
+    use chronoscope_integrations::wikidata::WikidataEntity;
+
+    const BATCH_SIZE: usize = 10_000;
+
+    let file =
+        std::fs::File::open(input).with_context(|| format!("opening {}", input.display()))?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut stats = IngestStats::default();
+    let mut batch: Vec<WikidataEntity> = Vec::new();
+    let mut parsed: u64 = 0;
+
+    for (i, line) in reader.lines().enumerate() {
+        if limit.is_some_and(|n| parsed >= n) {
+            break;
+        }
+        let line = line.with_context(|| format!("reading {} line {}", input.display(), i + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entity: WikidataEntity = serde_json::from_str(&line)
+            .with_context(|| format!("parsing {} line {}", input.display(), i + 1))?;
+        batch.push(entity);
+        parsed += 1;
+
+        if batch.len() >= BATCH_SIZE {
+            ingest_batch(store, run, recorded_at, &mut batch, &mut stats).await?;
+        }
+    }
+    ingest_batch(store, run, recorded_at, &mut batch, &mut stats).await?;
+    Ok(stats)
+}
+
+/// Submit one batch of parsed entities, draining `batch` and folding the
+/// per-batch tally into the running total.
+async fn ingest_batch(
+    store: &chronoscope_db::SqliteFactStore,
+    run: &chronoscope_core::grammar::ids::IngesterRunId,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+    batch: &mut Vec<chronoscope_integrations::wikidata::WikidataEntity>,
+    stats: &mut chronoscope_ingestion::wikidata::commits::IngestStats,
+) -> Result<()> {
+    use chronoscope_ingestion::wikidata::commits::ingest_entities;
+
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let batch_stats = ingest_entities(store, std::mem::take(batch), run, recorded_at)
+        .await
+        .context("submitting entity batch")?;
+    *stats += batch_stats;
     Ok(())
 }

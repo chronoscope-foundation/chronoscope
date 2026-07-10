@@ -77,6 +77,20 @@ chronoscope_core::fact_store_conformance!(
     )
 );
 
+/// `open` yields a migrated, usable store, and `close` tears it down inside the
+/// runtime — the teardown that keeps SpatiaLite's dlclose off the exit path.
+#[tokio::test]
+async fn open_migrates_the_store_and_close_tears_it_down() -> TestResult {
+    let store = SqliteFactStore::open("sqlite::memory:").await?;
+    assert_eq!(
+        store.next_fact_id().await?,
+        FactId::new(0),
+        "a freshly opened store starts before any fact"
+    );
+    store.close().await;
+    Ok(())
+}
+
 // --- file-backed persistence ---
 
 /// A committed fact survives dropping the store and pool: a reopened

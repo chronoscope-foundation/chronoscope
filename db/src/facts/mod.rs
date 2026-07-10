@@ -94,6 +94,24 @@ impl SqliteFactStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    /// Open a fact store at `database_url`: build the pool, run migrations,
+    /// and wrap it. The lighter construction for batch loaders — no server
+    /// queues or worker channel, so `close` alone tears down cleanly.
+    ///
+    /// # Errors
+    /// Returns [`DbError`](crate::DbError) if the pool or migrations fail.
+    pub async fn open(database_url: &str) -> crate::DbResult<Self> {
+        let pool = crate::create_pool(database_url).await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Self::new(pool))
+    }
+
+    /// Close the pool, awaiting connection teardown inside the runtime so
+    /// SpatiaLite's `dlclose` finishes before process exit.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
 }
 
 // ============================================================================

@@ -874,19 +874,17 @@ name = "chronoscope-ingestion"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-compression",
  "chrono",
  "chronoscope-core",
+ "chronoscope-db",
  "chronoscope-integrations",
  "clap",
- "futures",
  "geo",
  "proptest",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "tokio",
- "tokio-util",
  "tracing",
  "url",
 ]
@@ -895,10 +893,13 @@ dependencies = [
 name = "chronoscope-integrations"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-compression",
  "async-trait",
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "clap",
  "futures-util",
  "hex",
  "md-5",

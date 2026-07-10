@@ -14,11 +14,9 @@
 //! machinery to surface.
 
 pub mod commits;
-pub mod filter;
 pub mod handlers;
 pub mod lifecycle;
 pub mod parsing;
-pub mod stream;
 pub mod usage;
 
 use chronoscope_core::external_ids::{WikidataEntityId, WikidataPropertyId};

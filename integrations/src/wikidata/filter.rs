@@ -8,11 +8,11 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::http::HttpClient;
+use crate::wikidata::{WikidataClient, WikidataId};
 use anyhow::{Context, Result};
-use chronoscope_integrations::http::HttpClient;
-use chronoscope_integrations::wikidata::{WikidataClient, WikidataId};
-use futures::StreamExt;
-use futures::stream::Stream;
+use futures_util::StreamExt;
+use futures_util::stream::Stream;
 use serde_json::Value;
 
 use crate::wikidata::stream::{
@@ -83,7 +83,7 @@ pub async fn fetch_architectural_types<H: HttpClient>(
         .iter()
         .map(|t| client.fetch_subclasses(t))
         .collect();
-    let exclude_results = futures::future::try_join_all(exclude_futures)
+    let exclude_results = futures_util::future::try_join_all(exclude_futures)
         .await
         .context("Failed to fetch exclusion types")?;
 
