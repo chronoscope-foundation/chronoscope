@@ -9,7 +9,9 @@
 //!   [`schema::ImageStream`]). Each subject kind has a
 //!   single canonical equivalence (and entities a single canonical edge
 //!   relation), all implicit — there are no per-subject relation enums.
-//! - [`pagination`] — the generic cursor→stream adapter every walk pages on.
+//! - [`pagination`] — the generic cursor→stream adapter every walk pages on,
+//!   plus the backend-shared class/depiction pagers over materialized row
+//!   sets.
 //! - [`equiv`] / [`retraction`] — backend-shared resolution: equivalence
 //!   components over identity edges and the effective-retraction fixpoint.
 //!   Each backend fetches edges its own way; the resolution runs here so
@@ -128,7 +130,7 @@
 pub mod conformance;
 pub mod equiv;
 pub mod memory;
-pub(crate) mod pagination;
+pub mod pagination;
 pub mod retraction;
 pub mod schema;
 

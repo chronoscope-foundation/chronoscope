@@ -37,11 +37,12 @@ use super::fixtures::{
     drain_image_classes, event_damage_cause_fact, event_description_fact,
     event_durational_date_fact, event_move_method_fact, event_moved_to_location_fact,
     event_point_date_fact, external_judgment_citation, external_reference_fact, fixed_time,
-    gap_from_event_fact, has_event_fact, image_observation_citation, local_bundle, map_medium_fact,
-    medium_picture_fact, moved_kind, moved_to, n_circle_location, name_fact, name_window_fact,
-    observation_external_published, observation_feature_fact, retract_commit_fact, retract_fact,
-    same_event_fact, sample_bbox, sample_citation, started_with_date, subimage_fact, submit_batch,
-    supersede_fact, user_author, year_date,
+    gap_from_event_fact, has_event_fact, image_observation_citation, image_source_fact,
+    local_bundle, map_medium_fact, medium_picture_fact, moved_kind, moved_to, n_circle_location,
+    name_fact, name_window_fact, observation_external_published, observation_feature_fact,
+    retract_commit_fact, retract_fact, same_entity_fact, same_event_fact, sample_bbox,
+    sample_citation, started_with_date, subimage_fact, submit_batch, supersede_fact, user_author,
+    year_date,
 };
 use super::{TestResult, UnmintedIds};
 
@@ -282,6 +283,351 @@ pub async fn name_match_without_references_joins_existing_class<S: FactStore>(
         class.members.contains(&existing),
         "the fresh mint must class with the matched entity; got {:?}",
         class.members
+    );
+    Ok(())
+}
+
+/// The fact id of an active `SameEntity` judgment linking exactly `x` and
+/// `y`, found through the backlink walk on `x`.
+async fn same_entity_fact_between<S: FactStore, V: EntityView<S>>(
+    view: &mut V,
+    x: &EntityIdOf<S>,
+    y: &EntityIdOf<S>,
+) -> Result<Option<FactId>, super::TestError> {
+    let page = view
+        .all_facts_about_entity(x, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    for item in page.items {
+        if let StoredFact::Judgment(judgment) = &item.fact
+            && let JudgmentAssertion::Identity {
+                fact: identity::Fact::SameEntity { pair },
+            } = &judgment.assertion
+        {
+            let linked: BTreeSet<&EntityIdOf<S>> = [pair.a(), pair.b()].into_iter().collect();
+            let want: BTreeSet<&EntityIdOf<S>> = [x, y].into_iter().collect();
+            if linked == want {
+                return Ok(Some(item.fact_id));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The image analogue of [`same_entity_fact_between`].
+async fn same_artifact_fact_between<S: FactStore, V: ImageView<S>>(
+    view: &mut V,
+    x: &ImageIdOf<S>,
+    y: &ImageIdOf<S>,
+) -> Result<Option<FactId>, super::TestError> {
+    let page = view
+        .all_facts_about_image(x, None, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    for item in page.items {
+        if let StoredFact::Judgment(judgment) = &item.fact
+            && let JudgmentAssertion::Identity {
+                fact: identity::Fact::SameArtifact { pair },
+            } = &judgment.assertion
+        {
+            let linked: BTreeSet<&ImageIdOf<S>> = [pair.a(), pair.b()].into_iter().collect();
+            let want: BTreeSet<&ImageIdOf<S>> = [x, y].into_iter().collect();
+            if linked == want {
+                return Ok(Some(item.fact_id));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A later commit's `Local` decl carrying the same external reference
+/// resolves `MatchedExisting`: the matcher reaches the first commit's entity
+/// through the reference walk, records a `SameEntity` judgment in a
+/// machine-authored companion commit, and both ids read as one class.
+pub async fn external_reference_match_joins_existing_entity_class<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let first = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![external_reference_fact(0, 42)?])?,
+    )
+    .await?;
+    let existing = first
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing decl")?
+        .id
+        .clone();
+
+    let second = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![external_reference_fact(0, 42)?])?,
+    )
+    .await?;
+    let resolution = second.entities.get(&EntityIdx(0)).ok_or("missing decl")?;
+    assert_eq!(
+        resolution.origin,
+        ResolutionOrigin::MatchedExisting {
+            matched: existing.clone()
+        }
+    );
+    let fresh = resolution.id.clone();
+    assert!(
+        second.companion_commit_id.is_some(),
+        "a match records its identity judgment in a companion commit"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let edge = same_entity_fact_between::<S, _>(&mut view, &fresh, &existing).await?;
+    assert!(
+        edge.is_some(),
+        "the companion's SameEntity judgment must link the fresh mint to the match"
+    );
+    let class = view
+        .entity_class(&fresh)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        class.members.contains(&existing) && class.members.contains(&fresh),
+        "the fresh mint must class with the matched entity; got {:?}",
+        class.members
+    );
+    Ok(())
+}
+
+/// The image analogue of
+/// [`external_reference_match_joins_existing_entity_class`]: a later
+/// commit's `Local` image decl carrying the same source URL resolves
+/// `MatchedExisting`, records a `SameArtifact` judgment in the companion
+/// commit, and both ids read as one class.
+pub async fn source_url_match_joins_existing_image_class<S: FactStore>(store: S) -> TestResult {
+    let url = "https://example.com/artifact-source.jpg";
+    let first = commit_result(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![image_source_fact(0, url)?])?,
+    )
+    .await?;
+    let existing = first
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing decl")?
+        .id
+        .clone();
+
+    let second = commit_result(
+        &store,
+        local_bundle(0, 0, 1, 10, vec![image_source_fact(0, url)?])?,
+    )
+    .await?;
+    let resolution = second.images.get(&ImageIdx(0)).ok_or("missing decl")?;
+    assert_eq!(
+        resolution.origin,
+        ResolutionOrigin::MatchedExisting {
+            matched: existing.clone()
+        }
+    );
+    let fresh = resolution.id.clone();
+    assert!(
+        second.companion_commit_id.is_some(),
+        "a match records its identity judgment in a companion commit"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let edge = same_artifact_fact_between::<S, _>(&mut view, &fresh, &existing).await?;
+    assert!(
+        edge.is_some(),
+        "the companion's SameArtifact judgment must link the fresh mint to the match"
+    );
+    let class = view
+        .image_class(&fresh)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        class.members.contains(&existing) && class.members.contains(&fresh),
+        "the fresh mint must class with the matched image; got {:?}",
+        class.members
+    );
+    Ok(())
+}
+
+/// Retracting the matcher's `SameEntity` judgment splits the merged classes
+/// again — while a view pinned before the retraction still resolves the
+/// merged representative, because representative history is snapshot-scoped
+/// rather than destructively rewritten.
+pub async fn retracted_identity_edge_splits_classes_and_earlier_snapshots_stay_merged<
+    S: FactStore,
+>(
+    store: S,
+) -> TestResult {
+    let first = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![external_reference_fact(0, 7)?])?,
+    )
+    .await?;
+    let a = first
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing decl")?
+        .id
+        .clone();
+    let second = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![external_reference_fact(0, 7)?])?,
+    )
+    .await?;
+    let b = second
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing decl")?
+        .id
+        .clone();
+
+    let merged_at = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+    let edge_fid = {
+        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        same_entity_fact_between::<S, _>(&mut view, &b, &a)
+            .await?
+            .ok_or("expected the companion's SameEntity judgment")?
+    };
+
+    commit_retract(&store, edge_fid, 20).await?;
+
+    // The classes stand apart again, each id its own representative.
+    let mut now_view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rep_a = now_view
+        .entity_representative(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let rep_b = now_view
+        .entity_representative(&b)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(rep_a, a, "a returns to its own representative");
+    assert_eq!(rep_b, b, "b returns to its own representative");
+    let class_b = now_view
+        .entity_class(&b)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        !class_b.members.contains(&a),
+        "the classes must split; got {:?}",
+        class_b.members
+    );
+
+    // A view pinned before the retraction still sees the merge.
+    let mut merged_view = store
+        .no_later_than(merged_at)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let then_a = merged_view
+        .entity_representative(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let then_b = merged_view
+        .entity_representative(&b)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        then_a, then_b,
+        "the pre-retraction snapshot still resolves the merged representative"
+    );
+    let merged = merged_view
+        .entity_class(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        merged.members.contains(&a) && merged.members.contains(&b),
+        "the pre-retraction snapshot still reads one class; got {:?}",
+        merged.members
+    );
+    assert_eq!(merged.representative, then_a);
+    Ok(())
+}
+
+/// A split pair can merge again: a `SameEntity` edge merges two entities,
+/// its retraction splits them, and a later commit re-asserts the same pair.
+/// The re-merge submits cleanly, reads as one class at now, and a snapshot
+/// between the retraction and the re-merge still sees the split.
+pub async fn re_merging_a_split_pair_submits_cleanly_and_restores_the_class<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let first = commit_result(
+        &store,
+        local_bundle(2, 0, 0, 0, vec![same_entity_fact(0, 1)?])?,
+    )
+    .await?;
+    let a = first
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing decl 0")?
+        .id
+        .clone();
+    let b = first
+        .entities
+        .get(&EntityIdx(1))
+        .ok_or("missing decl 1")?
+        .id
+        .clone();
+    let edge_fid = *first.fact_ids.first().ok_or("missing the identity fact")?;
+
+    commit_retract(&store, edge_fid, 10).await?;
+    let split_at = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    let re_merge: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: vec![
+            Decl::Existing { id: a.clone() },
+            Decl::Existing { id: b.clone() },
+        ],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [same_entity_fact(0, 1)?].into_iter().collect(),
+    };
+    commit_result(&store, re_merge).await?;
+
+    // Now: one class again, one representative for both members.
+    let mut now_view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let class = now_view
+        .entity_class(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        class.members.contains(&a) && class.members.contains(&b),
+        "the re-merge must read as one class; got {:?}",
+        class.members
+    );
+    let rep_a = now_view
+        .entity_representative(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let rep_b = now_view
+        .entity_representative(&b)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(rep_a, rep_b, "both members resolve one representative");
+
+    // Between the retraction and the re-merge: still split.
+    let mut split_view = store
+        .no_later_than(split_at)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        split_view
+            .entity_representative(&b)
+            .await
+            .map_err(|e| format!("{e:?}"))?,
+        b,
+        "the between-snapshot still sees b as its own representative"
+    );
+    let split_class = split_view
+        .entity_class(&a)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(
+        !split_class.members.contains(&b),
+        "the between-snapshot still reads split classes; got {:?}",
+        split_class.members
     );
     Ok(())
 }
@@ -3775,11 +4121,12 @@ pub async fn walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities<
     Ok(())
 }
 
-/// Two entities, each with two in-box construction `Location`s, paged one row at
-/// a time. `next` walks every row (each representative twice); `next_class`
-/// skips the emitted representative's remaining rows, so paging on it visits
-/// each representative once. Row order follows the representative's `Ord`, so
-/// the two minted ids are sorted into walk order first.
+/// Two entities, each with two construction bookends, walked over the `All`
+/// stream one row at a time. `next` walks every row (each representative
+/// twice); `next_class` skips the emitted representative's remaining rows, so
+/// paging on it visits each representative once. Row order follows the
+/// representative's `Ord`, so the two minted ids are sorted into walk order
+/// first.
 pub async fn class_walk_next_class_cursor_skips_to_the_next_representative<S: FactStore>(
     store: S,
 ) -> TestResult {
@@ -3791,8 +4138,8 @@ pub async fn class_walk_next_class_cursor_skips_to_the_next_representative<S: Fa
             0,
             0,
             vec![
-                construction_at(0, 40.2, -73.8)?,
-                construction_at(0, 40.3, -73.7)?,
+                construction_started_in(0, 1700)?,
+                construction_started_in(0, 1710)?,
             ],
         )?,
     )
@@ -3806,8 +4153,8 @@ pub async fn class_walk_next_class_cursor_skips_to_the_next_representative<S: Fa
             0,
             10,
             vec![
-                construction_at(0, 40.6, -73.4)?,
-                construction_at(0, 40.7, -73.3)?,
+                construction_started_in(0, 1800)?,
+                construction_started_in(0, 1810)?,
             ],
         )?,
     )
@@ -3820,8 +4167,7 @@ pub async fn class_walk_next_class_cursor_skips_to_the_next_representative<S: Fa
         (b_id, a_id)
     };
 
-    let bbox = sample_bbox()?;
-    let stream = EntityStream::InBbox(&bbox);
+    let stream = EntityStream::All;
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let one = std::num::NonZeroUsize::MIN;
 

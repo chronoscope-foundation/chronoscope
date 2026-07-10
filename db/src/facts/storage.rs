@@ -20,7 +20,7 @@ use chronoscope_core::grammar::citations::{
     ExternalReference, FactualCitation, JudgmentSource, MetaSource,
 };
 use chronoscope_core::grammar::ids::{CommitId, FactId, SubjectKind};
-use chronoscope_core::grammar::{attribute, bookend, event, identity, image};
+use chronoscope_core::grammar::{attribute, bookend, depiction, event, identity, image};
 use chronoscope_core::location::{Location, UnresolvedLocation};
 use chronoscope_core::nonempty::NonEmptyVec;
 use chronoscope_core::store::schema::normalize_name;
@@ -566,6 +566,69 @@ pub(super) fn facet_columns(fact: &StoredFact<SqliteIds>) -> Result<Facets, Sqli
                 ..Facets::default()
             }),
         },
+    }
+}
+
+// The keyed class walks fetch candidates by facet column, then file each
+// under the subject the facet belongs to. These extractors are the read-side
+// halves of `facet_columns`'s Name / ExternalReference / Source arms — kept
+// beside it so a facet's column and its subject stay one pairing.
+
+/// The entity a stored `Name` fact names.
+pub(super) fn named_entity(fact: &StoredFact<SqliteIds>) -> Option<SqliteEntityId> {
+    match fact {
+        StoredFact::Factual(StoredFactualFact {
+            assertion:
+                FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name { entity, .. },
+                },
+            ..
+        }) => Some(*entity),
+        _ => None,
+    }
+}
+
+/// The entity a stored `ExternalReference` fact names.
+pub(super) fn referenced_entity(fact: &StoredFact<SqliteIds>) -> Option<SqliteEntityId> {
+    match fact {
+        StoredFact::Factual(StoredFactualFact {
+            assertion:
+                FactualAssertion::Attribute {
+                    fact: attribute::Fact::ExternalReference { entity, .. },
+                },
+            ..
+        }) => Some(*entity),
+        _ => None,
+    }
+}
+
+/// The image a stored `Source` fact names.
+pub(super) fn sourced_image(fact: &StoredFact<SqliteIds>) -> Option<SqliteImageId> {
+    match fact {
+        StoredFact::Factual(StoredFactualFact {
+            assertion:
+                FactualAssertion::Image {
+                    fact: image::Fact::Source { image, .. },
+                },
+            ..
+        }) => Some(*image),
+        _ => None,
+    }
+}
+
+/// The `(entity, image)` pair a stored `Depiction` judgment links.
+pub(super) fn depiction_subjects(
+    fact: &StoredFact<SqliteIds>,
+) -> Option<(SqliteEntityId, SqliteImageId)> {
+    match fact {
+        StoredFact::Judgment(StoredJudgmentFact {
+            assertion:
+                JudgmentAssertion::Depiction {
+                    fact: depiction::Fact { entity, image, .. },
+                },
+            ..
+        }) => Some((*entity, *image)),
+        _ => None,
     }
 }
 

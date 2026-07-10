@@ -25,17 +25,25 @@
 //! a deferred read transaction; dropping the view rolls it back and returns
 //! the connection. WAL latches the read snapshot at the first read
 //! statement, not at BEGIN — the fact-id bound is the semantic snapshot.
-//! Retraction and equivalence resolve through the backend-shared algorithms
-//! in [`chronoscope_core::store::retraction`] and
-//! [`chronoscope_core::store::equiv`] over edges fetched by recursive CTE —
-//! see [`read`] for the shapes. The class-stream walks
-//! (`walk_entity_classes`, `walk_image_classes`) answer empty pages; the
-//! conformance suite marks their cases ignored for this backend. The submit
-//! matcher finds candidates only through these walks, so cross-commit
-//! identity matching is inert on this backend until they land.
+//! Retraction resolves through the backend-shared fixpoint in
+//! [`chronoscope_core::store::retraction`] over edges fetched by recursive
+//! CTE — see [`read`] for the shapes.
+//!
+//! Representatives and classes read the append-only `subject_reps` log: one
+//! descending seek resolves any member at any snapshot (no row = self), and
+//! the reverse gather answers a whole class. The log is maintained at write
+//! time ([`maintain`]) — staging an identity edge logs the merge it
+//! performs, staging a retraction that touches identity edges recomputes
+//! the affected components — so historical views cost the same one seek as
+//! now. The class-stream walks (`walk_entity_classes`,
+//! `walk_image_classes`) combine the facet indexes with that resolution,
+//! and `walk_entity_depictions` combines it with the subject backlinks;
+//! the spatial and temporal streams still answer empty pages until their
+//! indexes exist, with their conformance cases ignored.
 
 mod convert;
 mod error;
+mod maintain;
 mod queries;
 mod read;
 mod storage;
@@ -54,7 +62,7 @@ use sqlx::{Acquire, Sqlite, SqliteConnection, Transaction};
 
 use chronoscope_core::grammar::ids::{CommitId, FactId, SubjectKind};
 use chronoscope_core::store::schema::{
-    ClassPage, DepictionPage, EntityStream, EquivClass, ImageStream,
+    ClassPage, EntityStream, EquivClass, ImageStream, normalize_name,
 };
 use chronoscope_core::store::{
     ClassWalkPage, DepictionWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView,
@@ -66,8 +74,11 @@ pub use self::error::SqliteFactStoreError;
 pub use self::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
 
 use self::error::sql;
-use self::read::ReadBound;
-use self::storage::{commit_to_json, facet_columns, fact_to_json, result_to_json, subject_rows};
+use self::read::{FacetKey, ReadBound};
+use self::storage::{
+    commit_to_json, external_ref_key, facet_columns, fact_to_json, named_entity, referenced_entity,
+    result_to_json, sourced_image, subject_rows,
+};
 
 use self::convert::{i64_to_u64, u64_to_i64};
 
@@ -356,7 +367,7 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         &mut self,
         member: &SqliteEntityId,
     ) -> Result<SqliteEntityId, Error> {
-        Ok(self.entity_class(member).await?.representative)
+        read::representative(self.conn.conn(), self.bound, *member).await
     }
 
     async fn entity_class(
@@ -366,19 +377,36 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         read::equiv_class(self.conn.conn(), self.bound, *member).await
     }
 
-    /// The class-stream walks need the maintained-representative machinery
-    /// this backend doesn't have; an empty page is the contract's
-    /// nothing-found answer. It must stay quiet rather than error: the
-    /// submit matcher drains these walks on every submit with `Local`
-    /// decls, so an error here would break every write. The ignored
-    /// conformance cases pin the gap.
+    /// The spatial and temporal streams wait on their indexes
+    /// (`facts_spatial` is still unpopulated); their empty page is the
+    /// contract's nothing-found answer, and it must stay quiet rather than
+    /// error because the submit matcher drains walks on every submit with
+    /// `Local` decls. The ignored `InBbox` conformance case pins that gap.
     async fn walk_entity_classes<'b>(
         &'b mut self,
-        _stream: &'b EntityStream<'b>,
-        _after: Option<(SqliteEntityId, FactId)>,
-        _limit: std::num::NonZeroUsize,
+        stream: &'b EntityStream<'b>,
+        after: Option<(SqliteEntityId, FactId)>,
+        limit: std::num::NonZeroUsize,
     ) -> Result<ClassWalkPage<SqliteFactStore, SqliteEntityId>, Error> {
-        Ok(empty_class_page())
+        let bound = self.bound;
+        let conn = self.conn.conn();
+        match stream {
+            EntityStream::ByName { name, language } => {
+                let key = FacetKey::Name {
+                    norm: normalize_name(name),
+                    language: language.as_str(),
+                };
+                read::keyed_class_page(conn, bound, key, named_entity, after, limit).await
+            }
+            EntityStream::ByExternalReference { reference } => {
+                let key = FacetKey::ExternalRef(external_ref_key(reference)?);
+                read::keyed_class_page(conn, bound, key, referenced_entity, after, limit).await
+            }
+            EntityStream::All => read::all_class_page(conn, bound, after, limit).await,
+            EntityStream::InBbox(_)
+            | EntityStream::InTimeRange(_)
+            | EntityStream::InBboxAndTimeRange { .. } => Ok(empty_class_page()),
+        }
     }
 
     async fn all_facts_about_entity(
@@ -390,20 +418,13 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         read::backlink_page(self.conn.conn(), self.bound, *entity, after, limit).await
     }
 
-    /// Empty for the same reason as `walk_entity_classes`: the depiction walk
-    /// needs the maintained-representative machinery this backend doesn't have,
-    /// so an empty page is the contract's nothing-found answer. The ignored
-    /// conformance cases pin the gap.
     async fn walk_entity_depictions<'b>(
         &'b mut self,
-        _entity: &'b SqliteEntityId,
-        _after: Option<(SqliteImageId, FactId)>,
-        _limit: std::num::NonZeroUsize,
+        entity: &'b SqliteEntityId,
+        after: Option<(SqliteImageId, FactId)>,
+        limit: std::num::NonZeroUsize,
     ) -> Result<DepictionWalkPage<SqliteFactStore>, Error> {
-        Ok(DepictionPage {
-            rows: Vec::new(),
-            next_class: None,
-        })
+        read::depiction_page(self.conn.conn(), self.bound, *entity, after, limit).await
     }
 }
 
@@ -437,7 +458,7 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
         &mut self,
         member: &SqliteImageId,
     ) -> Result<SqliteImageId, Error> {
-        Ok(self.image_class(member).await?.representative)
+        read::representative(self.conn.conn(), self.bound, *member).await
     }
 
     async fn image_class(
@@ -447,16 +468,26 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
         read::equiv_class(self.conn.conn(), self.bound, *member).await
     }
 
-    /// Empty for the same reason as `walk_entity_classes`: no
-    /// maintained-representative machinery, and the matcher drains this
-    /// walk on every submit, so nothing-found must stay quiet.
+    /// The spatial and temporal streams answer empty pages for the same
+    /// reason as `walk_entity_classes`'s.
     async fn walk_image_classes<'b>(
         &'b mut self,
-        _stream: &'b ImageStream<'b>,
-        _after: Option<(SqliteImageId, FactId)>,
-        _limit: std::num::NonZeroUsize,
+        stream: &'b ImageStream<'b>,
+        after: Option<(SqliteImageId, FactId)>,
+        limit: std::num::NonZeroUsize,
     ) -> Result<ClassWalkPage<SqliteFactStore, SqliteImageId>, Error> {
-        Ok(empty_class_page())
+        let bound = self.bound;
+        let conn = self.conn.conn();
+        match stream {
+            ImageStream::BySourceUrl { url } => {
+                let key = FacetKey::SourceUrl(url.as_str());
+                read::keyed_class_page(conn, bound, key, sourced_image, after, limit).await
+            }
+            ImageStream::All => read::all_class_page(conn, bound, after, limit).await,
+            ImageStream::InBbox(_)
+            | ImageStream::InTimeRange(_)
+            | ImageStream::InBboxAndTimeRange { .. } => Ok(empty_class_page()),
+        }
     }
 
     async fn all_facts_about_image(
@@ -586,16 +617,22 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         // fact_id is the rowid alias, so the insert's rowid is the new id.
         let fid_raw = staged.last_insert_rowid();
         for (kind, subject) in subjects {
-            // current_rep seeds as the subject's own id — the representative
-            // of a singleton class.
             sqlx::query(queries::INSERT_SUBJECT.sql)
                 .bind(fid_raw)
                 .bind(kind)
                 .bind(subject)
-                .bind(subject)
                 .execute(&mut *conn)
                 .await
                 .map_err(sql("inserting fact subject row"))?;
+        }
+        // Representative-log maintenance runs on the same connection as the
+        // staging, so a rejected submit's savepoint unwinds its rep rows
+        // with its fact rows.
+        if let (Some(kind), Some(a), Some(b)) = (facets.edge_kind, facets.edge_a, facets.edge_b) {
+            maintain::record_identity_edge(&mut *conn, kind, a, b, fid_raw).await?;
+        }
+        if facets.retracts_fact_id.is_some() || retracts_commit_seq.is_some() {
+            maintain::record_retraction(&mut *conn, fid_raw).await?;
         }
         Ok(FactId::new(i64_to_u64(fid_raw, "staged fact id")?))
     }

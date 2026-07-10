@@ -29,6 +29,24 @@ macro_rules! next_fact_id_expr {
     };
 }
 
+/// The representative-resolution rule — the member's last `subject_reps` row
+/// strictly below the exclusive snapshot bound wins — spliced into the point
+/// resolve and the All-walk's correlated subquery so the rule cannot drift.
+/// `$member` / `$bound` are the SQL expressions for the member and the
+/// bound; the kind is always `?1`.
+macro_rules! resolve_rep_expr {
+    ($member:expr, $bound:expr) => {
+        concat!(
+            "SELECT r.rep FROM subject_reps r
+             WHERE r.kind = ?1 AND r.member = ",
+            $member,
+            " AND r.as_of < ",
+            $bound,
+            " ORDER BY r.as_of DESC LIMIT 1"
+        )
+    };
+}
+
 macro_rules! define_fact_queries {
     ($($name:ident: $sql:expr),* $(,)?) => {
         $(pub(super) const $name: QueryDef = QueryDef { name: stringify!($name), sql: $sql };)*
@@ -75,7 +93,7 @@ define_fact_queries! {
                   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
     "
     ),
-    INSERT_SUBJECT: "INSERT INTO fact_subjects (fact_id, kind, subject_id, current_rep) VALUES (?1, ?2, ?3, ?4)",
+    INSERT_SUBJECT: "INSERT INTO fact_subjects (fact_id, kind, subject_id) VALUES (?1, ?2, ?3)",
 
     // Commit recording: the metadata/result row, then a claim per fact
     // under the new surrogate seq. The seq comes back as the insert's rowid
@@ -137,12 +155,61 @@ define_fact_queries! {
         SELECT target_id, retractor_id FROM edge
     ",
 
+    // Representative log. RESOLVE_REP is the one resolution path — the
+    // shared resolve_rep_expr! rule (member ?2, bound ?3), a single
+    // descending covering seek on the primary key; no row means the member
+    // is its own representative (the caller COALESCEs). CLASS_MEMBERS is the
+    // reverse gather: every member whose latest log row below ?3 names ?2 as
+    // its representative — candidates off idx_subject_reps_rep, each
+    // anti-joined against its own later rows by a correlated primary-key
+    // probe (the representative itself, rowless when it never moved, is the
+    // caller's to add).
+    RESOLVE_REP: resolve_rep_expr!("?2", "?3"),
+    CLASS_MEMBERS: "
+        SELECT s.member FROM subject_reps s
+        WHERE s.kind = ?1 AND s.rep = ?2 AND s.as_of < ?3
+        AND NOT EXISTS (
+            SELECT 1 FROM subject_reps later
+            WHERE later.kind = ?1 AND later.member = s.member
+              AND later.as_of > s.as_of AND later.as_of < ?3
+        )
+    ",
+    INSERT_REP: "INSERT INTO subject_reps (kind, member, as_of, rep) VALUES (?1, ?2, ?3, ?4)",
+
+    // The identity edges a staged meta-fact ?1 can change the liveness of:
+    // its transitive targets, descending through retracts_fact_id (a
+    // primary-key probe) and retracts_commit_seq (the target commit's
+    // recorded fact ids, via json_each over its commit_json). The downward
+    // mirror of RETRACTOR_CLOSURE; targets' ids sit strictly below their
+    // retractors', so the descent terminates. Identity facts retract
+    // nothing, so they are the leaves the final select keeps.
+    IDENTITY_TARGETS: "
+        WITH RECURSIVE target(fact_id) AS (
+            SELECT ?1
+            UNION
+            SELECT t.retracts_fact_id
+            FROM target CROSS JOIN facts t ON t.fact_id = target.fact_id
+            WHERE t.retracts_fact_id IS NOT NULL
+            UNION
+            SELECT json_each.value
+            FROM target CROSS JOIN facts t ON t.fact_id = target.fact_id
+            CROSS JOIN fact_commits c ON c.commit_seq = t.retracts_commit_seq
+            CROSS JOIN json_each(c.commit_json, '$.fact_ids')
+        )
+        SELECT f.edge_kind, f.edge_a, f.edge_b
+        FROM target CROSS JOIN facts f ON f.fact_id = target.fact_id
+        WHERE f.edge_kind IS NOT NULL
+    ",
+
     // The identity-edge facts of ?1's connected component under edge kind
     // ?2, below snapshot ?3, retracted edges included: traversal
     // over-approximates, and the Rust side re-walks from the member over
     // active edges only, so an edge reachable only through a retracted link
     // costs a fetched row, never a wrong class. Filtering the final select
     // on edge_a alone is complete because membership propagates both ways.
+    // Write-path machinery only: the read-side class queries resolve through
+    // the subject_reps log, and this CTE recomputes components when a staged
+    // retraction changes identity-edge liveness.
     EQUIV_COMPONENT: "
         WITH RECURSIVE member(id) AS (
             SELECT ?1
@@ -169,6 +236,65 @@ define_fact_queries! {
         ORDER BY s.fact_id
         LIMIT ?5
     ",
+
+    // Every fact mentioning subject (?1 kind, ?2 id) below snapshot ?3 —
+    // BACKLINK_PAGE without the page cut. The depiction walk fetches each
+    // entity-class member's whole backlink set and filters to depictions in
+    // Rust, so its candidate population is one entity class's mentions.
+    SUBJECT_FACTS: "
+        SELECT s.fact_id, f.fact_json
+        FROM fact_subjects s JOIN facts f ON f.fact_id = s.fact_id
+        WHERE s.kind = ?1 AND s.subject_id = ?2 AND s.fact_id < ?3
+    ",
+
+    // Keyed class-walk candidates: every fact under one facet key, below
+    // snapshot bound (the trailing parameter). Each rides its partial facet
+    // index; the whole candidate set is key-sized, so the walk fetches it
+    // and pages in Rust with memory-identical cursor semantics. The subject
+    // comes out of fact_json (the facet columns don't carry it).
+    CLASS_CANDIDATES_BY_NAME: "
+        SELECT fact_id, fact_json FROM facts
+        WHERE name_norm = ?1 AND name_language = ?2 AND fact_id < ?3
+    ",
+    CLASS_CANDIDATES_BY_EXTREF: "
+        SELECT fact_id, fact_json FROM facts
+        WHERE external_ref = ?1 AND fact_id < ?2
+    ",
+    CLASS_CANDIDATES_BY_SRCURL: "
+        SELECT fact_id, fact_json FROM facts
+        WHERE source_url = ?1 AND fact_id < ?2
+    ",
+
+    // The All-stream class walk: every fact_subjects row of kind ?1 below
+    // snapshot ?2, its subject resolved to a representative by the
+    // correlated one-seek log resolution, deduped (two same-class subjects
+    // of one fact fold to one row), ordered by the computed
+    // (rep, fact_id), resuming strictly past cursor (?3, ?4), at most ?5
+    // rows. Retraction filtering happens in Rust over the batched closure.
+    //
+    // DELIBERATE FULL WALK: enumerating every class IS this stream's
+    // semantics, so the kind-prefixed primary-key search visits the whole
+    // subject population and every page re-sorts the walk. It passes the
+    // plan verifier because the kind equality plans as a SEARCH, but no
+    // index bounds the rows behind it — conformance-scale only; a
+    // production consumer triggers reconsidering the stream itself.
+    CLASS_WALK_ALL: concat!(
+        "
+        SELECT rep, fact_id FROM (
+            SELECT DISTINCT
+                COALESCE((",
+        resolve_rep_expr!("s.subject_id", "?2"),
+        "),
+                         s.subject_id) AS rep,
+                s.fact_id AS fact_id
+            FROM fact_subjects s
+            WHERE s.kind = ?1 AND s.fact_id < ?2
+        )
+        WHERE (rep, fact_id) > (?3, ?4)
+        ORDER BY rep, fact_id
+        LIMIT ?5
+    "
+    ),
 }
 
 /// Verify every fact-store query's plan — no full table scans.

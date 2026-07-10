@@ -58,22 +58,8 @@ async fn fresh_store() -> Result<(SqliteFactStore, tempfile::TempDir), TestError
 chronoscope_core::fact_store_conformance!(
     fresh_store(),
     ignore(
-        walk_entity_classes_group_submitted_facts_into_one_class:
-            "walk_entity_classes answers an empty page on this backend; flips green once the class-stream walk reads the facts table",
-        class_walk_pages_distinct_entities_as_contiguous_runs:
-            "walk_entity_classes answers an empty page on this backend; flips green once the class-stream walk reads the facts table",
-        walk_image_classes_group_submitted_facts_into_one_class:
-            "walk_image_classes answers an empty page on this backend; flips green once the class-stream walk reads the facts table",
-        name_match_without_references_joins_existing_class:
-            "the matcher's ByName walk answers an empty page on this backend; flips green once the class-stream walks read the facts table",
-        walk_entity_depictions_pages_the_images_depicting_an_entity:
-            "walk_entity_depictions stub returns an empty page on this backend; flips green once the depiction walk reads the facts table",
-        walk_entity_depictions_pages_across_the_next_class_cursor:
-            "walk_entity_depictions stub returns an empty page on this backend; flips green once the depiction walk reads the facts table",
         walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities:
             "the InBbox stream needs the populated facts_spatial rtree; flips green once the spatial walk lands",
-        class_walk_next_class_cursor_skips_to_the_next_representative:
-            "walk_entity_classes answers an empty page on this backend; flips green once the class-stream walk reads the facts table",
     )
 );
 

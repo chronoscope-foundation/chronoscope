@@ -10,21 +10,30 @@
 //! [`RETRACTOR_CLOSURE`](super::queries::RETRACTOR_CLOSURE) fetch for the
 //! rows in hand, then the shared fixpoint
 //! ([`chronoscope_core::store::retraction`]) in Rust.
+//!
+//! Representatives and classes resolve through the `subject_reps` log
+//! ([`resolve_rep_raw`] / [`class_members_raw`]): the write path
+//! ([`super::maintain`]) keeps the log equal to the live-edge components at
+//! every snapshot, so no read walks identity edges.
 
 use sqlx::SqliteConnection;
 
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::store::FactPlacement;
-use chronoscope_core::store::equiv::EquivAdjacency;
+use chronoscope_core::store::pagination;
 use chronoscope_core::store::retraction::{RetractionEdges, effective_retractor};
-use chronoscope_core::store::schema::{EquivClass, FactPage, PageItem};
+use chronoscope_core::store::schema::{
+    ClassPage, ClassRow, DepictionPage, EquivClass, FactPage, PageItem,
+};
 use chronoscope_core::submit::{FactLookup, StoredFact, SubmitResult};
 
-use super::convert::{i64_to_u64, u64_to_i64};
+use super::convert::{i64_to_u64, seed_ids, u64_to_i64};
 use super::error::{SqliteFactStoreError, json, sql};
-use super::ids::SqliteIds;
+use super::ids::{SqliteEntityId, SqliteIds, SqliteImageId};
 use super::queries;
-use super::storage::{SubjectColumn, fact_from_json, kind_tag, result_from_json};
+use super::storage::{
+    SubjectColumn, depiction_subjects, fact_from_json, kind_tag, result_from_json,
+};
 
 /// A read's visibility: a pool view's pinned exclusive upper bound, or the
 /// whole of what the connection sees (a transaction's union view).
@@ -37,7 +46,7 @@ pub(super) enum ReadBound {
 impl ReadBound {
     /// SQL bind form. Stored fact ids all fit `i64`, so the union view (and
     /// any larger pin) admits the same rows as the maximum.
-    fn bind(self) -> i64 {
+    pub(super) fn bind(self) -> i64 {
         match self {
             ReadBound::Pinned(snapshot) => i64::try_from(snapshot.get()).unwrap_or(i64::MAX),
             ReadBound::Union => i64::MAX,
@@ -45,7 +54,7 @@ impl ReadBound {
     }
 
     /// The bound as a [`FactId`] for the shared retraction fixpoint.
-    fn fact_id(self) -> FactId {
+    pub(super) fn fact_id(self) -> FactId {
         match self {
             ReadBound::Pinned(snapshot) => snapshot,
             ReadBound::Union => FactId::new(u64::MAX),
@@ -206,35 +215,74 @@ pub(super) async fn placement(
     })
 }
 
-/// The equivalence class of `member` under its kind's canonical identity
-/// edges at the snapshot: component fetch (retracted edges included), one
-/// batched retractor closure over the edge facts, then the shared adjacency
-/// walk from `member` over active edges only.
+/// The representative of a raw subject id at the bound: the log's last row
+/// strictly below it, one descending covering seek; no row means the member
+/// has always been its own representative.
+pub(super) async fn resolve_rep_raw(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    kind: &str,
+    member: i64,
+) -> Result<i64, SqliteFactStoreError> {
+    let row: Option<(i64,)> = sqlx::query_as(queries::RESOLVE_REP.sql)
+        .bind(kind)
+        .bind(member)
+        .bind(bound.bind())
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(sql("resolving subject representative"))?;
+    Ok(row.map_or(member, |(rep,)| rep))
+}
+
+/// The raw members whose latest log row at the bound names `rep` as their
+/// representative. The representative itself appears only when it carries a
+/// self row (after a split); callers add it.
+pub(super) async fn class_members_raw(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    kind: &str,
+    rep: i64,
+) -> Result<Vec<i64>, SqliteFactStoreError> {
+    let rows: Vec<(i64,)> = sqlx::query_as(queries::CLASS_MEMBERS.sql)
+        .bind(kind)
+        .bind(rep)
+        .bind(bound.bind())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("gathering class members"))?;
+    Ok(rows.into_iter().map(|(member,)| member).collect())
+}
+
+/// The class representative of `member` at the snapshot — one log seek.
+pub(super) async fn representative<S: SubjectColumn>(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    member: S,
+) -> Result<S, SqliteFactStoreError> {
+    let rep = resolve_rep_raw(conn, bound, kind_tag(S::KIND), member.raw()).await?;
+    Ok(S::from_raw(rep))
+}
+
+/// The equivalence class of `member` at the snapshot, read off the
+/// representative log: one seek to the representative, then the reverse
+/// gather, plus the representative itself.
 pub(super) async fn equiv_class<S: SubjectColumn>(
     conn: &mut SqliteConnection,
     bound: ReadBound,
     member: S,
 ) -> Result<EquivClass<S>, SqliteFactStoreError> {
-    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(queries::EQUIV_COMPONENT.sql)
-        .bind(member.raw())
-        .bind(kind_tag(S::KIND))
-        .bind(bound.bind())
-        .fetch_all(&mut *conn)
-        .await
-        .map_err(sql("fetching identity-edge component"))?;
-    let seeds: Vec<FactId> = rows
-        .iter()
-        .map(|(fid, _, _)| Ok(FactId::new(i64_to_u64(*fid, "component edge fact id")?)))
-        .collect::<Result<_, SqliteFactStoreError>>()?;
-    let retraction = retraction_edges(conn, bound, &seeds).await?;
-    let mut edges = Vec::with_capacity(rows.len());
-    for ((_, a, b), fid) in rows.iter().zip(&seeds) {
-        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
-            continue;
-        }
-        edges.push((S::from_raw(*a), S::from_raw(*b)));
-    }
-    Ok(EquivAdjacency::from_edges(edges).class_of(member))
+    let rep = resolve_rep_raw(conn, bound, kind_tag(S::KIND), member.raw()).await?;
+    let mut members: std::collections::BTreeSet<S> =
+        class_members_raw(conn, bound, kind_tag(S::KIND), rep)
+            .await?
+            .into_iter()
+            .map(S::from_raw)
+            .collect();
+    members.insert(S::from_raw(rep));
+    Ok(EquivClass {
+        representative: S::from_raw(rep),
+        members,
+    })
 }
 
 /// One page of the facts mentioning `subject`, active at the snapshot,
@@ -271,10 +319,7 @@ pub(super) async fn backlink_page<S: SubjectColumn>(
     let more = rows.len() > limit.get();
     rows.truncate(limit.get());
 
-    let seeds: Vec<FactId> = rows
-        .iter()
-        .map(|(fid, _)| Ok(FactId::new(i64_to_u64(*fid, "backlink fact id")?)))
-        .collect::<Result<_, SqliteFactStoreError>>()?;
+    let seeds = seed_ids(rows.iter().map(|(fid, _)| fid), "backlink fact id")?;
     let retraction = retraction_edges(conn, bound, &seeds).await?;
 
     let mut items = Vec::with_capacity(rows.len());
@@ -290,4 +335,280 @@ pub(super) async fn backlink_page<S: SubjectColumn>(
     }
     let next_cursor = if more { seeds.last().copied() } else { None };
     Ok(FactPage { items, next_cursor })
+}
+
+/// The facet key a keyed class walk fetches candidates under. Each variant
+/// carries exactly the columns of its partial index; the key values arrive
+/// pre-encoded by the same functions the write path uses ([`normalize_name`]
+/// for names, [`external_ref_key`](super::storage::external_ref_key) for
+/// references), so the walk and the stored facets cannot drift.
+///
+/// [`normalize_name`]: chronoscope_core::store::schema::normalize_name
+pub(super) enum FacetKey<'a> {
+    Name { norm: String, language: &'a str },
+    ExternalRef(String),
+    SourceUrl(&'a str),
+}
+
+impl FacetKey<'_> {
+    /// Fetch this key's `(fact_id, fact_json)` candidates below the bound.
+    async fn candidates(
+        &self,
+        conn: &mut SqliteConnection,
+        bound: ReadBound,
+    ) -> Result<Vec<(i64, String)>, SqliteFactStoreError> {
+        match self {
+            FacetKey::Name { norm, language } => {
+                sqlx::query_as(queries::CLASS_CANDIDATES_BY_NAME.sql)
+                    .bind(norm)
+                    .bind(language)
+                    .bind(bound.bind())
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(sql("fetching name-keyed class candidates"))
+            }
+            FacetKey::ExternalRef(key) => sqlx::query_as(queries::CLASS_CANDIDATES_BY_EXTREF.sql)
+                .bind(key)
+                .bind(bound.bind())
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(sql("fetching reference-keyed class candidates")),
+            FacetKey::SourceUrl(url) => sqlx::query_as(queries::CLASS_CANDIDATES_BY_SRCURL.sql)
+                .bind(url)
+                .bind(bound.bind())
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(sql("fetching url-keyed class candidates")),
+        }
+    }
+}
+
+/// One page of a keyed class walk (`ByName` / `ByExternalReference` /
+/// `BySourceUrl`). The candidate set is key-sized, so the walk fetches it
+/// whole: candidates off the facet index, one batched retractor closure,
+/// `subject_of` on each survivor's decoded fact, one log seek per distinct
+/// subject, and the `(representative, fact_id)` rows page in Rust with the
+/// memory backend's exact cursor semantics ([`page_rows`]).
+pub(super) async fn keyed_class_page<S: SubjectColumn>(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    key: FacetKey<'_>,
+    subject_of: impl Fn(&StoredFact<SqliteIds>) -> Option<S>,
+    after: Option<(S, FactId)>,
+    limit: std::num::NonZeroUsize,
+) -> Result<ClassPage<S, (S, FactId)>, SqliteFactStoreError> {
+    let candidates = key.candidates(conn, bound).await?;
+    let seeds = seed_ids(
+        candidates.iter().map(|(fid, _)| fid),
+        "class candidate fact id",
+    )?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+
+    let mut reps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut rows: std::collections::BTreeSet<(S, FactId)> = std::collections::BTreeSet::new();
+    for ((_, fact_json), fid) in candidates.iter().zip(&seeds) {
+        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
+            continue;
+        }
+        let Some(subject) = subject_of(&fact_from_json(fact_json)?) else {
+            continue;
+        };
+        let rep = match reps.get(&subject.raw()) {
+            Some(rep) => *rep,
+            None => {
+                let rep = resolve_rep_raw(conn, bound, kind_tag(S::KIND), subject.raw()).await?;
+                reps.insert(subject.raw(), rep);
+                rep
+            }
+        };
+        rows.insert((S::from_raw(rep), *fid));
+    }
+    Ok(pagination::class_page(&rows, after, limit))
+}
+
+/// One page of the depiction walk: the depiction facts of `entity`'s
+/// `SameEntity` class, each row keeping its whole fact under the depicted
+/// image's `SameArtifact` representative, ordered `(image_rep, fact_id)`.
+/// Candidates are the class members' backlink sets filtered to depictions of
+/// the class; one batched retractor closure gates them and one log seek per
+/// distinct depicted image resolves the grouping representative. The
+/// backend-shared [`pagination::grouped_class_page`] cuts the page by whole
+/// images — `limit` counts distinct image representatives and every fact of
+/// an included image enters the page.
+pub(super) async fn depiction_page(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    entity: SqliteEntityId,
+    after: Option<(SqliteImageId, FactId)>,
+    limit: std::num::NonZeroUsize,
+) -> Result<
+    DepictionPage<StoredFact<SqliteIds>, SqliteImageId, (SqliteImageId, FactId)>,
+    SqliteFactStoreError,
+> {
+    let members = equiv_class(conn, bound, entity).await?.members;
+    // A depiction names one entity, so each candidate appears under exactly
+    // one member; the map keys by fact id regardless.
+    let mut candidates: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
+    for member in &members {
+        let rows: Vec<(i64, String)> = sqlx::query_as(queries::SUBJECT_FACTS.sql)
+            .bind(kind_tag(SqliteEntityId::KIND))
+            .bind(member.raw())
+            .bind(bound.bind())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql("fetching depiction candidates"))?;
+        candidates.extend(rows);
+    }
+    let seeds = seed_ids(candidates.keys(), "depiction candidate fact id")?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+
+    let mut reps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut rows: std::collections::BTreeSet<(SqliteImageId, FactId)> =
+        std::collections::BTreeSet::new();
+    let mut facts: std::collections::BTreeMap<FactId, StoredFact<SqliteIds>> =
+        std::collections::BTreeMap::new();
+    for ((_, fact_json), fid) in candidates.iter().zip(&seeds) {
+        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
+            continue;
+        }
+        let fact = fact_from_json(fact_json)?;
+        let Some((depicted, image)) = depiction_subjects(&fact) else {
+            continue;
+        };
+        if !members.contains(&depicted) {
+            continue;
+        }
+        let rep = match reps.get(&image.raw()) {
+            Some(rep) => *rep,
+            None => {
+                let rep = resolve_rep_raw(conn, bound, kind_tag(SqliteImageId::KIND), image.raw())
+                    .await?;
+                reps.insert(image.raw(), rep);
+                rep
+            }
+        };
+        rows.insert((SqliteImageId::from_raw(rep), *fid));
+        facts.insert(*fid, fact);
+    }
+
+    let (pairs, next_class) = pagination::grouped_class_page(&rows, after, limit);
+    let mut page: Vec<PageItem<StoredFact<SqliteIds>, SqliteImageId>> = Vec::new();
+    for (representative, fact_id) in pairs {
+        // Every row's fact was kept when the row was built.
+        if let Some(fact) = facts.remove(&fact_id) {
+            page.push(PageItem {
+                fact_id,
+                fact,
+                representative,
+            });
+        }
+    }
+    Ok(DepictionPage {
+        rows: page,
+        next_class,
+    })
+}
+
+/// The `(rep, fact_id)` SQL binds for an All-walk cursor. `None` opens the
+/// walk (below every real row). The row cursor's fact id always fits `i64`
+/// (it names a stored row); the class cursor's `u64::MAX` sentinel clamps to
+/// `i64::MAX`, which still sorts past every real row of its representative.
+fn all_cursor_binds<S: SubjectColumn>(after: Option<(S, FactId)>) -> (i64, i64) {
+    match after {
+        None => (i64::MIN, i64::MAX),
+        Some((rep, fid)) => (rep.raw(), i64::try_from(fid.get()).unwrap_or(i64::MAX)),
+    }
+}
+
+/// One page of the All-stream class walk: the single-statement walk
+/// ([`CLASS_WALK_ALL`](super::queries::CLASS_WALK_ALL)) fetches one row past
+/// the page to learn whether candidates remain, then the batched retractor
+/// closure drops retracted candidates in Rust. `next` resumes past the last
+/// candidate consumed (active or not), so a page can come back short with a
+/// live cursor. `next_class` follows the last emitted row's representative:
+/// when the lookahead shares it, a one-row probe past `(rep, MAX)` answers
+/// whether a later representative remains; a fully-retracted page carries
+/// the row cursor instead, since it emitted no representative to skip.
+pub(super) async fn all_class_page<S: SubjectColumn>(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    after: Option<(S, FactId)>,
+    limit: std::num::NonZeroUsize,
+) -> Result<ClassPage<S, (S, FactId)>, SqliteFactStoreError> {
+    let (after_rep, after_fid) = all_cursor_binds(after);
+    let fetch = i64::try_from(limit.get())
+        .unwrap_or(i64::MAX)
+        .saturating_add(1);
+    let mut candidates: Vec<(i64, i64)> = sqlx::query_as(queries::CLASS_WALK_ALL.sql)
+        .bind(kind_tag(S::KIND))
+        .bind(bound.bind())
+        .bind(after_rep)
+        .bind(after_fid)
+        .bind(fetch)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("fetching all-stream class page"))?;
+    let lookahead = if candidates.len() > limit.get() {
+        candidates.pop()
+    } else {
+        None
+    };
+
+    let seeds = seed_ids(
+        candidates.iter().map(|(_, fid)| fid),
+        "class candidate fact id",
+    )?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    let mut rows: Vec<ClassRow<S>> = Vec::new();
+    for ((rep, _), fid) in candidates.iter().zip(&seeds) {
+        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
+            continue;
+        }
+        rows.push(ClassRow {
+            representative: S::from_raw(*rep),
+            fact_id: *fid,
+        });
+    }
+
+    let next = match (&lookahead, candidates.last(), seeds.last()) {
+        (Some(_), Some((rep, _)), Some(fid)) => Some((S::from_raw(*rep), *fid)),
+        _ => None,
+    };
+    let next_class = match (rows.last(), &lookahead) {
+        (_, None) => None,
+        // Every candidate on the page was retracted: there is no emitted
+        // representative to skip past, so the class cursor continues at the
+        // row cursor — strictly forward, never truncating a live class
+        // beyond the retracted stretch.
+        (None, Some(_)) => next,
+        (Some(last), Some((ahead_rep, _))) => {
+            let last_raw = last.representative.raw();
+            let beyond = if *ahead_rep > last_raw {
+                true
+            } else {
+                // The probe counts candidates without retraction filtering,
+                // so a trailing fully-retracted class still answers Some —
+                // the consumer's next fetch comes back empty with an
+                // exhausted cursor, one extra round trip and correct
+                // termination. Deliberate: filtering the probe would cost a
+                // retraction closure at every page end.
+                let probe: Option<(i64, i64)> = sqlx::query_as(queries::CLASS_WALK_ALL.sql)
+                    .bind(kind_tag(S::KIND))
+                    .bind(bound.bind())
+                    .bind(last_raw)
+                    .bind(i64::MAX)
+                    .bind(1_i64)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(sql("probing for a later class"))?;
+                probe.is_some()
+            };
+            beyond.then_some(pagination::class_cursor_past(last.representative))
+        }
+    };
+    Ok(ClassPage {
+        rows,
+        next,
+        next_class,
+    })
 }

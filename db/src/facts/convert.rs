@@ -6,6 +6,8 @@
 //! silent wrap. The backend's own subject ids are `i64` end-to-end
 //! ([`ids`](super::ids)) and never come through here.
 
+use chronoscope_core::grammar::ids::FactId;
+
 /// A value that doesn't fit the other side of the `u64` ⇄ `i64` boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{context}: value {value} does not fit an {target}")]
@@ -34,6 +36,18 @@ pub fn i64_to_u64(value: i64, context: &'static str) -> Result<u64, IdConvertErr
         value: value.to_string(),
         target: "u64",
     })
+}
+
+/// A candidate batch's stored fact ids as the [`FactId`] seed list the
+/// retraction closure takes. `context` names the batch for the conversion
+/// error.
+pub fn seed_ids<'a>(
+    ids: impl IntoIterator<Item = &'a i64>,
+    context: &'static str,
+) -> Result<Vec<FactId>, IdConvertError> {
+    ids.into_iter()
+        .map(|id| Ok(FactId::new(i64_to_u64(*id, context)?)))
+        .collect()
 }
 
 #[cfg(test)]

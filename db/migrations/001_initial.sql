@@ -246,16 +246,31 @@ CREATE INDEX idx_facts_retracts_commit ON facts(retracts_commit_seq)
 -- off the full table.
 CREATE INDEX idx_facts_unclaimed ON facts(fact_id) WHERE commit_seq IS NULL;
 
--- m:n fact ↔ subject mentions. current_rep is seeded with the subject's own
--- id as its representative.
+-- m:n fact ↔ subject mentions.
 CREATE TABLE fact_subjects (
     fact_id INTEGER NOT NULL REFERENCES facts(fact_id),
     kind TEXT NOT NULL CHECK (kind IN ('entity', 'event', 'image')),
     subject_id INTEGER NOT NULL,
-    current_rep INTEGER NOT NULL,
     PRIMARY KEY (kind, subject_id, fact_id)
 ) WITHOUT ROWID;
-CREATE INDEX idx_subjects_rep ON fact_subjects(kind, current_rep, fact_id);
+
+-- Representative log: one append-only history of class-representative
+-- assignments. No row = the member has always been its own representative;
+-- the last row below a snapshot's exclusive fact-id bound wins, so one
+-- descending seek resolves any member at any snapshot. Rows are inserted by
+-- submit-time maintenance
+-- (merges, and retractions whose liveness effect touches identity edges);
+-- rep = member rows do occur after splits — history is never deleted. The
+-- primary key serves the member seeks; idx_subject_reps_rep serves the
+-- reverse class gather.
+CREATE TABLE subject_reps (
+    kind   TEXT    NOT NULL CHECK (kind IN ('entity', 'event', 'image')),
+    member INTEGER NOT NULL,
+    as_of  INTEGER NOT NULL,   -- fact id of the identity event
+    rep    INTEGER NOT NULL,
+    PRIMARY KEY (kind, member, as_of)
+) WITHOUT ROWID;
+CREATE INDEX idx_subject_reps_rep ON subject_reps(kind, rep, as_of);
 
 -- SpatiaLite indexes only geometry MBRs, and polygonizing an uncertainty
 -- circle would invent precision. Honest lat/lon/radius columns plus a plain

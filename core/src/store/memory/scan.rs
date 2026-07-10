@@ -2,7 +2,6 @@
 //! `walk_*` stream arms.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::Bound;
 
 use url::Url;
 
@@ -13,7 +12,8 @@ use crate::grammar::citations::{ExternalReference, Language};
 use crate::grammar::ids::FactId;
 use crate::grammar::{attribute, bookend, depiction, event, identity, image};
 use crate::store::equiv::EquivAdjacency;
-use crate::store::schema::{ClassPage, ClassRow, DepictionPage, PageItem, normalize_name};
+use crate::store::pagination;
+use crate::store::schema::{ClassPage, DepictionPage, PageItem, normalize_name};
 use crate::submit::StoredFact;
 use crate::submit::result::{StoredFactualFact, StoredJudgmentFact};
 
@@ -262,15 +262,9 @@ impl ReadCore<'_> {
 
     /// A page of `(representative, fact_id)` rows ordered by
     /// `(representative, fact_id)`, resuming strictly past `after` (`None` opens
-    /// the walk). The scan behind the class `walk_*` stream arms, over the index
-    /// [`Self::class_rows`] builds.
-    ///
-    /// `next` is the last emitted `(representative, fact_id)` when more rows
-    /// remain past the page, else `None`. `next_class` resumes past the last
-    /// row's representative — an opaque `(last_rep, u64::MAX)` that sorts after
-    /// every real `(last_rep, fid)`, so a resume strictly past it lands on the
-    /// first row of the next class — and is live only while a greater
-    /// representative remains in the set.
+    /// the walk). The scan behind the class `walk_*` stream arms: the index
+    /// [`Self::class_rows`] builds, cut by the backend-shared
+    /// [`pagination::class_page`].
     pub(super) fn walk_classes<S, I>(
         &self,
         after: Option<(S, FactId)>,
@@ -283,49 +277,17 @@ impl ReadCore<'_> {
         I: IntoIterator<Item = S>,
     {
         let rows = self.class_rows(subjects_of, edge_of);
-        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
-        let mut remaining = rows.range((lower, Bound::Unbounded)).copied();
-        let page: Vec<ClassRow<S>> = remaining
-            .by_ref()
-            .take(limit.get())
-            .map(|(representative, fact_id)| ClassRow {
-                representative,
-                fact_id,
-            })
-            .collect();
-        let next = if remaining.next().is_some() {
-            page.last().map(|row| (row.representative, row.fact_id))
-        } else {
-            None
-        };
-        // The set's maximum row carries the maximum representative; when the
-        // page's last rep falls short of it, a later class remains to skip to.
-        let next_class = page.last().and_then(|last| {
-            rows.iter()
-                .next_back()
-                .filter(|(max_rep, _)| *max_rep > last.representative)
-                .map(|_| (last.representative, FactId::new(u64::MAX)))
-        });
-        ClassPage {
-            rows: page,
-            next,
-            next_class,
-        }
+        pagination::class_page(&rows, after, limit)
     }
 
     /// A page of the depiction facts depicting `entity_members`, under their
     /// depicted-image `SameArtifact` rep, ordered `(image_rep, fact_id)` and
     /// resuming strictly past `after` (`None` opens the walk). The scan behind
-    /// [`walk_entity_depictions`](crate::store::EntityView::walk_entity_depictions),
-    /// over the index [`Self::class_rows`] builds from the
-    /// [`depiction_of_entity`] predicate.
-    ///
-    /// Each row keeps its whole depiction fact. A page carries whole images:
-    /// `limit` counts distinct image reps, and every fact of each included image
-    /// enters the page, so an image never straddles the boundary. `next_class`
-    /// resumes past the last image — the same opaque `(last_rep, u64::MAX)`
-    /// sentinel [`Self::walk_classes`] uses — and is live only while a greater
-    /// image rep remains in the set.
+    /// [`walk_entity_depictions`](crate::store::EntityView::walk_entity_depictions):
+    /// the index [`Self::class_rows`] builds from the [`depiction_of_entity`]
+    /// predicate, cut by the backend-shared [`pagination::grouped_class_page`]
+    /// (whole images — `limit` counts distinct image reps), each row carrying
+    /// its whole depiction fact.
     pub(super) fn walk_depictions(
         &self,
         entity_members: &BTreeSet<MemoryEntityId>,
@@ -336,19 +298,9 @@ impl ReadCore<'_> {
             |fact| depiction_of_entity(fact, entity_members),
             same_artifact_edge,
         );
-        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let (pairs, next_class) = pagination::grouped_class_page(&rows, after, limit);
         let mut page: Vec<PageItem<MemStoredFact, MemoryImageId>> = Vec::new();
-        let mut last_rep: Option<MemoryImageId> = None;
-        let mut distinct = 0usize;
-        for (representative, fact_id) in rows.range((lower, Bound::Unbounded)).copied() {
-            if last_rep != Some(representative) {
-                // Starting a further image would overrun the page's image budget.
-                if distinct == limit.get() {
-                    break;
-                }
-                distinct += 1;
-                last_rep = Some(representative);
-            }
+        for (representative, fact_id) in pairs {
             // The row came from a visible, active fact, so its slot is present.
             if let Some(fact) = self.fact_slot(fact_id) {
                 page.push(PageItem {
@@ -358,12 +310,6 @@ impl ReadCore<'_> {
                 });
             }
         }
-        let next_class = last_rep.and_then(|last| {
-            rows.iter()
-                .next_back()
-                .filter(|(max_rep, _)| *max_rep > last)
-                .map(|_| (last, FactId::new(u64::MAX)))
-        });
         DepictionPage {
             rows: page,
             next_class,

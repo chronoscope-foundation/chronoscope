@@ -373,13 +373,13 @@ mod tests {
     async fn covering_index_scan_of_a_full_index_is_refused()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = Database::new_without_plan_verification("sqlite::memory:").await?;
-        let sql = "SELECT kind, current_rep, fact_id FROM fact_subjects ORDER BY kind, current_rep";
+        let sql = "SELECT kind, rep, as_of FROM subject_reps ORDER BY kind, rep";
         let outcome = verify_query_plan_sql(db.pool(), "covering_scan", sql).await;
         let Err(QueryPlanError::FullTableScan { detail, .. }) = outcome else {
             return Err(format!("expected a full-scan refusal, got {outcome:?}").into());
         };
         assert!(
-            detail.starts_with("SCAN fact_subjects USING COVERING INDEX"),
+            detail.starts_with("SCAN subject_reps USING COVERING INDEX"),
             "refusal must name the covering scan, got {detail}"
         );
         Ok(())
@@ -393,7 +393,7 @@ mod tests {
         let partials: std::collections::HashSet<String> =
             std::iter::once("idx_facts_unclaimed".to_owned()).collect();
         assert!(is_full_table_scan(
-            "SCAN fact_subjects USING COVERING INDEX idx_subjects_rep",
+            "SCAN subject_reps USING COVERING INDEX idx_subject_reps_rep",
             &no_ctes,
             &partials,
         ));
