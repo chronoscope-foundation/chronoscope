@@ -33,12 +33,12 @@ use super::fixtures::{
     PAGE_100, captured_date_fact, commit_err, commit_name, commit_ok, commit_result,
     commit_retract, construction_at, construction_location_fact, construction_started_fact,
     construction_started_in, construction_with_location, damaged_kind, depiction_fact,
-    designated_kind, disjunctive_date, drain_entity_classes, drain_image_classes,
-    event_damage_cause_fact, event_description_fact, event_durational_date_fact,
-    event_move_method_fact, event_moved_to_location_fact, event_point_date_fact,
-    external_judgment_citation, external_reference_fact, fixed_time, gap_from_event_fact,
-    has_event_fact, image_observation_citation, local_bundle, map_medium_fact, medium_picture_fact,
-    moved_kind, moved_to, n_circle_location, name_fact, name_window_fact,
+    designated_kind, disjunctive_date, drain_entity_classes, drain_entity_depictions,
+    drain_image_classes, event_damage_cause_fact, event_description_fact,
+    event_durational_date_fact, event_move_method_fact, event_moved_to_location_fact,
+    event_point_date_fact, external_judgment_citation, external_reference_fact, fixed_time,
+    gap_from_event_fact, has_event_fact, image_observation_citation, local_bundle, map_medium_fact,
+    medium_picture_fact, moved_kind, moved_to, n_circle_location, name_fact, name_window_fact,
     observation_external_published, observation_feature_fact, retract_commit_fact, retract_fact,
     same_event_fact, sample_bbox, sample_citation, started_with_date, subimage_fact, submit_batch,
     supersede_fact, user_author, year_date,
@@ -533,6 +533,315 @@ pub async fn walk_image_classes_group_submitted_facts_into_one_class<S: FactStor
     assert_eq!(
         walked, submitted,
         "the walk's fact ids are exactly the submitted image-touching facts"
+    );
+    Ok(())
+}
+
+/// The images depicting an entity page through `walk_entity_depictions` as raw
+/// depiction facts under their image rep: exactly the depicted images surface,
+/// each carrying its own depiction fact, and an image depicted only by a
+/// different entity stays out.
+pub async fn walk_entity_depictions_pages_the_images_depicting_an_entity<S: FactStore>(
+    store: S,
+) -> TestResult {
+    // Entity 0 depicts images 0 and 1. Entity 1 depicts image 2 — a real,
+    // depicted image, just not by our entity, so surfacing it would mean the
+    // walk ignored entity membership.
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local, Decl::Local],
+        facts: [
+            depiction_fact(0, 0)?,
+            depiction_fact(0, 1)?,
+            depiction_fact(1, 2)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity0 = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity 0")?
+        .id
+        .clone();
+    let image0 = result
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing image 0")?
+        .id
+        .clone();
+    let image1 = result
+        .images
+        .get(&ImageIdx(1))
+        .ok_or("missing image 1")?
+        .id
+        .clone();
+    let image2 = result
+        .images
+        .get(&ImageIdx(2))
+        .ok_or("missing image 2")?
+        .id
+        .clone();
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows = drain_entity_depictions::<S, _>(&mut view, &entity0, PAGE_100)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    let reps: BTreeSet<ImageIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+    assert_eq!(
+        reps,
+        [image0, image1].into_iter().collect::<BTreeSet<_>>(),
+        "exactly the two images entity 0 depicts must surface; got {rows:?}"
+    );
+    assert!(
+        !reps.contains(&image2),
+        "an image depicted only by another entity must be excluded; got {rows:?}"
+    );
+
+    // Each row keeps its own depiction fact — readable as a Depiction naming
+    // entity 0 and the row's own image rep.
+    for row in &rows {
+        let StoredFact::Judgment(judgment) = &row.fact else {
+            return Err(format!(
+                "depiction row must carry a judgment fact; got {:?}",
+                row.fact
+            )
+            .into());
+        };
+        let JudgmentAssertion::Depiction { fact } = &judgment.assertion else {
+            return Err(format!(
+                "depiction row must carry a Depiction; got {:?}",
+                judgment.assertion
+            )
+            .into());
+        };
+        assert_eq!(
+            fact.entity, entity0,
+            "the depiction names the queried entity"
+        );
+        assert_eq!(
+            fact.image, row.representative,
+            "the depiction's image is the row's representative"
+        );
+    }
+    Ok(())
+}
+
+/// Paging the depiction walk one image at a time resumes across the
+/// `next_class` cursor. Entity 0 depicts four images; two of them are the same
+/// artifact, so they share one image representative carrying both their
+/// depiction facts, and images 2 and 3 are singletons — three distinct image
+/// reps, one of them multi-fact. At a one-image limit each page covers exactly
+/// one rep, the shared rep's page keeps both its facts whole, and every
+/// depicted image surfaces once across the walk.
+pub async fn walk_entity_depictions_pages_across_the_next_class_cursor<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let same_artifact = identity::Fact::same_artifact(ImageIdx(0), ImageIdx(1))?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local, Decl::Local, Decl::Local],
+        facts: [
+            crate::submit::SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Identity {
+                    fact: same_artifact,
+                },
+                citation: JudgmentSource::PersonalKnowledge {
+                    user: UserId::new("alice"),
+                    justification: Justification::new("These two scans are the same artifact.")?,
+                },
+            },
+            depiction_fact(0, 0)?,
+            depiction_fact(0, 1)?,
+            depiction_fact(0, 2)?,
+            depiction_fact(0, 3)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity0 = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity 0")?
+        .id
+        .clone();
+    let image0 = result
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("missing image 0")?
+        .id
+        .clone();
+    let image1 = result
+        .images
+        .get(&ImageIdx(1))
+        .ok_or("missing image 1")?
+        .id
+        .clone();
+    let image2 = result
+        .images
+        .get(&ImageIdx(2))
+        .ok_or("missing image 2")?
+        .id
+        .clone();
+    let image3 = result
+        .images
+        .get(&ImageIdx(3))
+        .ok_or("missing image 3")?
+        .id
+        .clone();
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rep_pair = view
+        .image_representative(&image0)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let rep_pair_via_1 = view
+        .image_representative(&image1)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        rep_pair, rep_pair_via_1,
+        "the SameArtifact pair collapses to one image representative"
+    );
+    let rep2 = view
+        .image_representative(&image2)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let rep3 = view
+        .image_representative(&image3)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    // Page one image at a time, threading `next_class` as the next `after`.
+    let one = std::num::NonZeroUsize::MIN;
+    let mut pages: Vec<Vec<_>> = Vec::new();
+    let mut cursor_live: Vec<bool> = Vec::new();
+    let mut after = None;
+    loop {
+        assert!(pages.len() < 8, "the depiction walk must terminate");
+        let page = view
+            .walk_entity_depictions(&entity0, after, one)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        cursor_live.push(page.next_class.is_some());
+        pages.push(page.rows);
+        match page.next_class {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+
+    // Each page covers exactly one image rep; collect the reps in walk order and
+    // read every row's depiction fact to recover its underlying image.
+    let mut page_reps: Vec<ImageIdOf<S>> = Vec::new();
+    let mut seen_images: Vec<ImageIdOf<S>> = Vec::new();
+    let mut pair_page_images: Option<BTreeSet<ImageIdOf<S>>> = None;
+    for rows in &pages {
+        let reps: BTreeSet<ImageIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+        assert_eq!(
+            reps.len(),
+            1,
+            "each page covers exactly one image rep at a one-image limit; got {rows:?}"
+        );
+        let rep = reps
+            .into_iter()
+            .next()
+            .ok_or("a page under test has a rep")?;
+        let mut page_images: BTreeSet<ImageIdOf<S>> = BTreeSet::new();
+        for row in rows {
+            let StoredFact::Judgment(judgment) = &row.fact else {
+                return Err(format!(
+                    "depiction row must carry a judgment fact; got {:?}",
+                    row.fact
+                )
+                .into());
+            };
+            let JudgmentAssertion::Depiction { fact } = &judgment.assertion else {
+                return Err(format!(
+                    "depiction row must carry a Depiction; got {:?}",
+                    judgment.assertion
+                )
+                .into());
+            };
+            assert_eq!(
+                fact.entity, entity0,
+                "the depiction names the queried entity"
+            );
+            page_images.insert(fact.image.clone());
+            seen_images.push(fact.image.clone());
+        }
+        if rep == rep_pair {
+            pair_page_images = Some(page_images);
+        }
+        page_reps.push(rep);
+    }
+
+    assert_eq!(
+        page_reps.len(),
+        3,
+        "one page per distinct image rep at a one-image limit; got {page_reps:?}"
+    );
+    let distinct_reps: BTreeSet<ImageIdOf<S>> = page_reps.iter().cloned().collect();
+    assert_eq!(
+        page_reps.len(),
+        distinct_reps.len(),
+        "each image rep pages contiguously, never twice; got {page_reps:?}"
+    );
+    let expected_reps: BTreeSet<ImageIdOf<S>> =
+        [rep_pair.clone(), rep2, rep3].into_iter().collect();
+    assert_eq!(
+        distinct_reps, expected_reps,
+        "exactly the three depicted image reps surface"
+    );
+
+    // The shared rep's page keeps both its depiction facts, unsplit.
+    let pair_images = pair_page_images.ok_or("the same-artifact rep must surface as a page")?;
+    assert_eq!(
+        pair_images,
+        [image0.clone(), image1.clone()]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "the same-artifact rep's page carries both of its depiction facts"
+    );
+
+    // Every depicted image surfaces exactly once across the walk.
+    let seen_set: BTreeSet<ImageIdOf<S>> = seen_images.iter().cloned().collect();
+    assert_eq!(
+        seen_images.len(),
+        seen_set.len(),
+        "no depiction fact surfaces twice; got {seen_images:?}"
+    );
+    assert_eq!(
+        seen_set,
+        [image0, image1, image2, image3]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "every depicted image surfaces exactly once"
+    );
+
+    // `next_class` is live on every page but the last.
+    let (last_live, earlier_live) = cursor_live
+        .split_last()
+        .ok_or("the walk emits at least one page")?;
+    assert!(!*last_live, "the final page's next_class is exhausted");
+    assert!(
+        earlier_live.iter().all(|&live| live),
+        "every non-final page carries a live next_class"
     );
     Ok(())
 }

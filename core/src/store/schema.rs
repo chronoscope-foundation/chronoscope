@@ -225,6 +225,25 @@ impl<Rep, Cur> ClassPage<Rep, Cur> {
 }
 
 // ============================================================================
+// Depiction walk
+// ============================================================================
+
+/// One page of an entity's depiction walk: raw depiction facts ([`PageItem`])
+/// under their depicted-image `SameArtifact` rep, ordered `(image_rep, fact_id)`
+/// so an image's facts are contiguous. A page carries whole images — every
+/// depiction fact of each image it touches — and [`next_class`](Self::next_class)
+/// resumes at the next distinct image, so an image never straddles a page
+/// boundary. `Rep` is the image id, `F` the stored-fact payload, `Cur` the
+/// backend's class cursor over `Rep`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DepictionPage<F, Rep, Cur> {
+    pub rows: Vec<PageItem<F, Rep>>,
+    /// Resume at the next distinct image, past every fact of this page's last
+    /// image. `None` once the walk is exhausted.
+    pub next_class: Option<Cur>,
+}
+
+// ============================================================================
 // Equivalence class
 // ============================================================================
 

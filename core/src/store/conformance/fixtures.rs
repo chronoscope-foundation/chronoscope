@@ -25,9 +25,10 @@ use crate::grammar::lifecycle::{
 use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
 use crate::store::pagination::paginate;
-use crate::store::schema::{ClassRow, EntityStream, ImageStream};
+use crate::store::schema::{ClassRow, EntityStream, ImageStream, PageItem};
 use crate::store::{
-    EntityIdOf, EntityView, FactStore, ImageIdOf, ImageView, SubmitCommitError, SubmitCommitInput,
+    EntityIdOf, EntityView, FactStore, ImageIdOf, ImageView, StoredFactOf, SubmitCommitError,
+    SubmitCommitInput,
 };
 use crate::submit::{
     Commit as SubmitBundle, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitError,
@@ -84,6 +85,26 @@ where
         let page = v.walk_image_classes(stream, cursor, limit).await?;
         let (rows, next) = page.into_parts();
         Ok::<_, S::Error>((rows, next, v))
+    })
+    .try_collect()
+    .await
+}
+
+/// Drain an entity's depiction walk to its rows at the given page limit,
+/// threading the exclusive view through [`paginate`]'s walk state. Each row is
+/// a raw depiction fact under its depicted-image `SameArtifact` rep.
+pub async fn drain_entity_depictions<S, V>(
+    view: &mut V,
+    entity: &EntityIdOf<S>,
+    limit: std::num::NonZeroUsize,
+) -> Result<Vec<PageItem<StoredFactOf<S>, ImageIdOf<S>>>, S::Error>
+where
+    S: FactStore,
+    V: EntityView<S>,
+{
+    paginate(view, |v, cursor| async move {
+        let page = v.walk_entity_depictions(entity, cursor, limit).await?;
+        Ok::<_, S::Error>((page.rows, page.next_class, v))
     })
     .try_collect()
     .await

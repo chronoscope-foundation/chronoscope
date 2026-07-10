@@ -11,9 +11,9 @@ use crate::geo::Bbox;
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::grammar::citations::{ExternalReference, Language};
 use crate::grammar::ids::FactId;
-use crate::grammar::{attribute, bookend, event, identity, image};
+use crate::grammar::{attribute, bookend, depiction, event, identity, image};
 use crate::store::equiv::EquivAdjacency;
-use crate::store::schema::{ClassPage, ClassRow, normalize_name};
+use crate::store::schema::{ClassPage, ClassRow, DepictionPage, PageItem, normalize_name};
 use crate::submit::StoredFact;
 use crate::submit::result::{StoredFactualFact, StoredJudgmentFact};
 
@@ -143,6 +143,25 @@ pub(super) fn image_sourced_from(fact: &MemStoredFact, url: &Url) -> Option<Memo
     }
 }
 
+/// The image a stored `Depiction` fact depicts one of `entity_members` in — the
+/// depiction-walk extractor, keyed on the depicted entity's `SameEntity` class.
+/// A judgment that isn't a depiction, or a depiction whose entity falls outside
+/// the class, contributes nothing.
+pub(super) fn depiction_of_entity(
+    fact: &MemStoredFact,
+    entity_members: &BTreeSet<MemoryEntityId>,
+) -> Option<MemoryImageId> {
+    if let JudgmentAssertion::Depiction {
+        fact: depiction::Fact { entity, image, .. },
+    } = judgment_assertion(fact)?
+        && entity_members.contains(entity)
+    {
+        Some(*image)
+    } else {
+        None
+    }
+}
+
 /// The entity a stored fact places inside `bbox`, if any — the `InBbox` stream
 /// extractor. A construction bookend yields its own entity; a `MovedToLocation`
 /// yields the entity its event's `HasEvent` owns, read from `owners` (see
@@ -185,29 +204,24 @@ impl ReadCore<'_> {
         owners
     }
 
-    /// A page of `(representative, fact_id)` rows ordered by
-    /// `(representative, fact_id)`, resuming strictly past `after` (`None` opens
-    /// the walk). `subjects_of` yields the subjects a visible, active fact
-    /// contributes under the stream; each resolves to its equivalence-class
-    /// representative (the component `edge_of`'s edges induce — see
-    /// [`Self::equiv_class`]) and the pair is emitted once, so a fact naming two
-    /// members of one class lands under a single row. The scan behind the class
-    /// `walk_*` stream arms.
+    /// The ordered `(representative, fact_id)` index a class walk pages over:
+    /// every visible, active fact's subjects resolved to their
+    /// equivalence-class representative, keyed `(representative, fact_id)`.
+    /// `subjects_of` yields the subjects a fact contributes under the stream;
+    /// each resolves to the representative of the component `edge_of`'s edges
+    /// induce (see [`Self::equiv_class`]), and the pair enters the set once, so a
+    /// fact naming two members of one class lands under a single row and the set
+    /// order keeps a class's rows contiguous. The adjacency is built once at the
+    /// first membership lookup and every representative resolves from it.
     ///
-    /// `next` is the last emitted `(representative, fact_id)` when more rows
-    /// remain past the page, else `None`. `next_class` resumes past the last
-    /// row's representative — an opaque `(last_rep, u64::MAX)` that sorts after
-    /// every real `(last_rep, fid)`, so a resume strictly past it lands on the
-    /// first row of the next class — and is live only while a greater
-    /// representative remains in the set. The adjacency is built once per call
-    /// and every representative lookup answers from it.
-    pub(super) fn walk_classes<S, I>(
+    /// Shared by [`Self::walk_classes`] and [`Self::walk_depictions`]: they
+    /// differ in the predicate they scan with and whether their rows keep the
+    /// fact, never in how membership is resolved or ordered.
+    fn class_rows<S, I>(
         &self,
-        after: Option<(S, FactId)>,
-        limit: std::num::NonZeroUsize,
         subjects_of: impl Fn(&MemStoredFact) -> I,
         edge_of: impl Fn(&MemStoredFact) -> Option<(S, S)>,
-    ) -> ClassPage<S, (S, FactId)>
+    ) -> BTreeSet<(S, FactId)>
     where
         S: Copy + Ord + std::hash::Hash,
         I: IntoIterator<Item = S>,
@@ -243,7 +257,32 @@ impl ReadCore<'_> {
                 rows.insert((representative, fid));
             }
         }
+        rows
+    }
 
+    /// A page of `(representative, fact_id)` rows ordered by
+    /// `(representative, fact_id)`, resuming strictly past `after` (`None` opens
+    /// the walk). The scan behind the class `walk_*` stream arms, over the index
+    /// [`Self::class_rows`] builds.
+    ///
+    /// `next` is the last emitted `(representative, fact_id)` when more rows
+    /// remain past the page, else `None`. `next_class` resumes past the last
+    /// row's representative — an opaque `(last_rep, u64::MAX)` that sorts after
+    /// every real `(last_rep, fid)`, so a resume strictly past it lands on the
+    /// first row of the next class — and is live only while a greater
+    /// representative remains in the set.
+    pub(super) fn walk_classes<S, I>(
+        &self,
+        after: Option<(S, FactId)>,
+        limit: std::num::NonZeroUsize,
+        subjects_of: impl Fn(&MemStoredFact) -> I,
+        edge_of: impl Fn(&MemStoredFact) -> Option<(S, S)>,
+    ) -> ClassPage<S, (S, FactId)>
+    where
+        S: Copy + Ord + std::hash::Hash,
+        I: IntoIterator<Item = S>,
+    {
+        let rows = self.class_rows(subjects_of, edge_of);
         let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
         let mut remaining = rows.range((lower, Bound::Unbounded)).copied();
         let page: Vec<ClassRow<S>> = remaining
@@ -270,6 +309,63 @@ impl ReadCore<'_> {
         ClassPage {
             rows: page,
             next,
+            next_class,
+        }
+    }
+
+    /// A page of the depiction facts depicting `entity_members`, under their
+    /// depicted-image `SameArtifact` rep, ordered `(image_rep, fact_id)` and
+    /// resuming strictly past `after` (`None` opens the walk). The scan behind
+    /// [`walk_entity_depictions`](crate::store::EntityView::walk_entity_depictions),
+    /// over the index [`Self::class_rows`] builds from the
+    /// [`depiction_of_entity`] predicate.
+    ///
+    /// Each row keeps its whole depiction fact. A page carries whole images:
+    /// `limit` counts distinct image reps, and every fact of each included image
+    /// enters the page, so an image never straddles the boundary. `next_class`
+    /// resumes past the last image — the same opaque `(last_rep, u64::MAX)`
+    /// sentinel [`Self::walk_classes`] uses — and is live only while a greater
+    /// image rep remains in the set.
+    pub(super) fn walk_depictions(
+        &self,
+        entity_members: &BTreeSet<MemoryEntityId>,
+        after: Option<(MemoryImageId, FactId)>,
+        limit: std::num::NonZeroUsize,
+    ) -> DepictionPage<MemStoredFact, MemoryImageId, (MemoryImageId, FactId)> {
+        let rows = self.class_rows(
+            |fact| depiction_of_entity(fact, entity_members),
+            same_artifact_edge,
+        );
+        let lower = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut page: Vec<PageItem<MemStoredFact, MemoryImageId>> = Vec::new();
+        let mut last_rep: Option<MemoryImageId> = None;
+        let mut distinct = 0usize;
+        for (representative, fact_id) in rows.range((lower, Bound::Unbounded)).copied() {
+            if last_rep != Some(representative) {
+                // Starting a further image would overrun the page's image budget.
+                if distinct == limit.get() {
+                    break;
+                }
+                distinct += 1;
+                last_rep = Some(representative);
+            }
+            // The row came from a visible, active fact, so its slot is present.
+            if let Some(fact) = self.fact_slot(fact_id) {
+                page.push(PageItem {
+                    fact_id,
+                    fact: fact.clone(),
+                    representative,
+                });
+            }
+        }
+        let next_class = last_rep.and_then(|last| {
+            rows.iter()
+                .next_back()
+                .filter(|(max_rep, _)| *max_rep > last)
+                .map(|_| (last, FactId::new(u64::MAX)))
+        });
+        DepictionPage {
+            rows: page,
             next_class,
         }
     }

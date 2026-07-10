@@ -138,7 +138,9 @@ use std::pin::Pin;
 
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
-use crate::store::schema::{ClassPage, EntityStream, EquivClass, FactPage, ImageStream};
+use crate::store::schema::{
+    ClassPage, DepictionPage, EntityStream, EquivClass, FactPage, ImageStream,
+};
 use crate::submit;
 use crate::submit::{FactLookup, StoredCommit, StoredFact, SubmitError, SubmitResult};
 
@@ -499,6 +501,13 @@ pub type WalkPage<S, Subj> = FactPage<StoredFactOf<S>, Subj, <S as FactStore>::C
 /// [`FactStore::ClassCursor`]. The class-walk analogue of [`WalkPage`].
 pub type ClassWalkPage<S, Subj> = ClassPage<Subj, <S as FactStore>::ClassCursor<Subj>>;
 
+/// One page of a store `S`'s entity-depiction walk: raw depiction
+/// [`StoredFact`]s under their depicted-image `SameArtifact` rep, resumed by the
+/// store's opaque image [`FactStore::ClassCursor`]. The fact-carrying analogue
+/// of [`ClassWalkPage`], keyed on the image id.
+pub type DepictionWalkPage<S> =
+    DepictionPage<StoredFactOf<S>, ImageIdOf<S>, <S as FactStore>::ClassCursor<ImageIdOf<S>>>;
+
 // ============================================================================
 // EntityView — entity-parametric reads
 // ============================================================================
@@ -553,6 +562,25 @@ pub trait EntityView<S: FactStore>: FactView<S> {
         after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<WalkPage<S, EntityIdOf<S>>, S::Error>> + Send;
+
+    /// Page the images depicting `entity` — the far end of every
+    /// [`JudgmentAssertion::Depiction`](crate::grammar::assertions::JudgmentAssertion::Depiction)
+    /// whose entity is in `entity`'s `SameEntity` class — as raw depiction facts
+    /// under their image `SameArtifact` rep.
+    ///
+    /// Rows come ordered by `(image_rep, fact_id)`, so an image's depiction
+    /// facts stay contiguous. A page carries whole images: `limit` counts
+    /// distinct images, and every depiction fact of each included image is
+    /// present, so an image never straddles a page boundary. `after` is a resume
+    /// token — `None` opens the walk, `Some(cursor)` resumes at the previous
+    /// page's `next_class`; `None` on a page's `next_class` means the walk is
+    /// exhausted.
+    fn walk_entity_depictions<'a>(
+        &'a mut self,
+        entity: &'a EntityIdOf<S>,
+        after: Option<S::ClassCursor<ImageIdOf<S>>>,
+        limit: std::num::NonZeroUsize,
+    ) -> impl Future<Output = Result<DepictionWalkPage<S>, S::Error>> + Send + 'a;
 }
 
 // ============================================================================

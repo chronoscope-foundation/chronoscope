@@ -53,10 +53,12 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::{Acquire, Sqlite, SqliteConnection, Transaction};
 
 use chronoscope_core::grammar::ids::{CommitId, FactId, SubjectKind};
-use chronoscope_core::store::schema::{ClassPage, EntityStream, EquivClass, ImageStream};
+use chronoscope_core::store::schema::{
+    ClassPage, DepictionPage, EntityStream, EquivClass, ImageStream,
+};
 use chronoscope_core::store::{
-    ClassWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageView,
-    WalkPage,
+    ClassWalkPage, DepictionWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView,
+    FactWrite, ImageView, WalkPage,
 };
 use chronoscope_core::submit::{FactLookup, StoredCommit, StoredFact, SubmitResult};
 
@@ -368,6 +370,22 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         limit: std::num::NonZeroUsize,
     ) -> Result<WalkPage<SqliteFactStore, SqliteEntityId>, Error> {
         read::backlink_page(self.conn.conn(), self.bound, *entity, after, limit).await
+    }
+
+    /// Empty for the same reason as `walk_entity_classes`: the depiction walk
+    /// needs the maintained-representative machinery this backend doesn't have,
+    /// so an empty page is the contract's nothing-found answer. The ignored
+    /// conformance cases pin the gap.
+    async fn walk_entity_depictions<'b>(
+        &'b mut self,
+        _entity: &'b SqliteEntityId,
+        _after: Option<(SqliteImageId, FactId)>,
+        _limit: std::num::NonZeroUsize,
+    ) -> Result<DepictionWalkPage<SqliteFactStore>, Error> {
+        Ok(DepictionPage {
+            rows: Vec::new(),
+            next_class: None,
+        })
     }
 }
 

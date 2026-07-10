@@ -143,6 +143,8 @@ macro_rules! fact_store_conformance {
             all_facts_about_entity_returns_facts_mentioning_it,
             all_facts_about_event_returns_facts_mentioning_it,
             walk_image_classes_group_submitted_facts_into_one_class,
+            walk_entity_depictions_pages_the_images_depicting_an_entity,
+            walk_entity_depictions_pages_across_the_next_class_cursor,
             all_facts_about_image_returns_facts_mentioning_it,
             entity_class_contains_both_same_entity_members,
             entity_representative_is_canonical_across_same_entity_members,

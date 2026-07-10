@@ -69,8 +69,8 @@ use crate::store::schema::{
     ClassPage, EntityStream, EquivClass, FactPage, ImageStream, PageItem, normalize_name,
 };
 use crate::store::{
-    ClassWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageView,
-    StoredFactOf,
+    ClassWalkPage, DepictionWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView,
+    FactWrite, ImageView, StoredFactOf,
 };
 use crate::submit::{FactLookup, StoredCommit, StoredFact, SubmitResult};
 
@@ -1046,6 +1046,23 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
                     after,
                     limit,
                 )
+            })
+            .await)
+    }
+
+    async fn walk_entity_depictions<'b>(
+        &'b mut self,
+        entity: &'b MemoryEntityId,
+        after: Option<(MemoryImageId, FactId)>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<DepictionWalkPage<MemoryFactStore>, MemoryError> {
+        let entity = *entity;
+        Ok(self
+            .with_core(move |core| {
+                // The entity's SameEntity class is resolved once; the walk keys
+                // depictions on whether their entity falls in it.
+                let members = core.equiv_class(entity, same_entity_edge).members;
+                core.walk_depictions(&members, after, limit)
             })
             .await)
     }
