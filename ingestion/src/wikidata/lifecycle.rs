@@ -171,13 +171,13 @@ mod extract {
             }
         };
 
-        // Convert coordinate precision from degrees to meters using Haversine distance.
-        // This accounts for longitude convergence at higher latitudes, unlike the
-        // equator-only approximation (deg * 111_000).
+        // Wikidata coordinate precision is an angular grid size in degrees. The
+        // largest physical extent of that uncertainty is along the meridian
+        // (~111 km per degree, at every latitude), so measure the radius there.
         let radius_m = coord.precision.map(|deg| {
             use geo::{Distance, Haversine};
             let center = geo::Point::new(coord.longitude, coord.latitude);
-            let offset = geo::Point::new(coord.longitude + deg.abs(), coord.latitude);
+            let offset = geo::Point::new(coord.longitude, coord.latitude + deg.abs());
             Haversine::distance(center, offset)
         });
 
@@ -334,17 +334,53 @@ struct DatedContribution {
     sort_key: Option<NaiveDate>,
 }
 
-/// Process one P793 claim into at most one contribution.
-fn process_p793_claim(
-    claim: &Claim,
-    ctx: &ItemContext,
-) -> (Option<DatedContribution>, Vec<String>) {
+/// One contribution per distinct claimed date: a point event repeated on
+/// several dates is several events. Shared by the P793 point events and the
+/// usage-transition properties.
+fn fan_out_points(
+    dates: Vec<CitedDate>,
+    make: impl Fn(Vec<CitedDate>) -> Option<Contribution>,
+) -> Vec<DatedContribution> {
+    let mut by_date: BTreeMap<UncertainDate, Vec<CitedDate>> = BTreeMap::new();
+    for cited in dates {
+        by_date.entry(cited.bound.clone()).or_default().push(cited);
+    }
+    by_date
+        .into_values()
+        .filter_map(|group| {
+            let sort_key = earliest_of(&group);
+            make(group).map(|contribution| DatedContribution {
+                contribution,
+                sort_key,
+            })
+        })
+        .collect()
+}
+
+/// A range event's single optional contribution, carrying the claim-wide sort
+/// key. Its several date qualifiers are competing bounds for one event.
+fn range_single(
+    contribution: Option<Contribution>,
+    sort_key: Option<NaiveDate>,
+) -> Vec<DatedContribution> {
+    contribution
+        .map(|contribution| DatedContribution {
+            contribution,
+            sort_key,
+        })
+        .into_iter()
+        .collect()
+}
+
+/// Process one P793 claim into contributions: point events fan out to one per
+/// distinct claimed date, range events yield at most one.
+fn process_p793_claim(claim: &Claim, ctx: &ItemContext) -> (Vec<DatedContribution>, Vec<String>) {
     let mut warnings = Vec::new();
 
     let (qid, w) = extract::mainsnak_qid(claim);
     warnings.extend(w);
     let Some(qid) = qid else {
-        return (None, warnings);
+        return (Vec::new(), warnings);
     };
 
     let p793 = WikidataPropertyId::new(793);
@@ -381,20 +417,20 @@ fn process_p793_claim(
         .filter_map(|d| d.bound.earliest())
         .min();
 
-    let contribution: Option<Contribution> = match qid.as_str() {
+    let contributions: Vec<DatedContribution> = match qid.as_str() {
         // =================================================================
         // CONSTRUCTION EVENTS
         // =================================================================
 
         // Q385378: construction (with start/end qualifiers)
-        "Q385378" => construction(p580, fallback(p582, p585)),
+        "Q385378" => range_single(construction(p580, fallback(p582, p585)), sort_key),
 
         // Q27136782: start of construction
         // Q1068633: groundbreaking ceremony
-        "Q27136782" | "Q1068633" => construction(p585, Vec::new()),
+        "Q27136782" | "Q1068633" => range_single(construction(p585, Vec::new()), sort_key),
 
         // Q59913255: end of construction
-        "Q59913255" => construction(Vec::new(), p585),
+        "Q59913255" => range_single(construction(Vec::new(), p585), sort_key),
 
         // =================================================================
         // OPENING EVENTS
@@ -404,10 +440,14 @@ fn process_p793_claim(
         // Q3010369: opening ceremony
         // Q15051339: opening
         // A dated usage change; the source states no usage set.
-        "Q1417098" | "Q3010369" | "Q15051339" => usage_changed(p585, None, ctx),
+        "Q1417098" | "Q3010369" | "Q15051339" => {
+            fan_out_points(p585, |group| usage_changed(group, None, ctx))
+        }
 
         // Q125375: consecration
-        "Q125375" => usage_changed(p585, Some([Usage::Religious].into_iter().collect()), ctx),
+        "Q125375" => fan_out_points(p585, |group| {
+            usage_changed(group, Some([Usage::Religious].into_iter().collect()), ctx)
+        }),
 
         // =================================================================
         // REPAIR/RESTORATION EVENTS
@@ -416,12 +456,15 @@ fn process_p793_claim(
         // Q1370468: architectural reconstruction
         // Q2478058: reconstruction
         // Q217102: restoration
-        "Q1370468" | "Q2478058" | "Q217102" => durational(
-            DurationalKind::Repaired,
-            p580,
-            fallback(p582, p585),
-            None,
-            ctx,
+        "Q1370468" | "Q2478058" | "Q217102" => range_single(
+            durational(
+                DurationalKind::Repaired,
+                p580,
+                fallback(p582, p585),
+                None,
+                ctx,
+            ),
+            sort_key,
         ),
 
         // =================================================================
@@ -431,12 +474,15 @@ fn process_p793_claim(
         // Q2144402: renovation
         // Q19841649: expansion
         // Q1441983: redevelopment
-        "Q2144402" | "Q19841649" | "Q1441983" => durational(
-            DurationalKind::Modified,
-            p580,
-            fallback(p582, p585),
-            None,
-            ctx,
+        "Q2144402" | "Q19841649" | "Q1441983" => range_single(
+            durational(
+                DurationalKind::Modified,
+                p580,
+                fallback(p582, p585),
+                None,
+                ctx,
+            ),
+            sort_key,
         ),
 
         // =================================================================
@@ -444,13 +490,13 @@ fn process_p793_claim(
         // =================================================================
 
         // Q168983: conflagration (fire)
-        "Q168983" => damage(DamageCause::Fire, p585, ctx),
+        "Q168983" => fan_out_points(p585, |group| damage(DamageCause::Fire, group, ctx)),
 
         // Q7944: earthquake
-        "Q7944" => damage(DamageCause::Earthquake, p585, ctx),
+        "Q7944" => fan_out_points(p585, |group| damage(DamageCause::Earthquake, group, ctx)),
 
         // Q8068: flood
-        "Q8068" => damage(DamageCause::Flood, p585, ctx),
+        "Q8068" => fan_out_points(p585, |group| damage(DamageCause::Flood, group, ctx)),
 
         // =================================================================
         // DEMOLITION EVENTS
@@ -460,10 +506,12 @@ fn process_p793_claim(
         // Q17781833: destruction
         "Q331483" | "Q17781833" => {
             let completed = fallback(p582, p585);
-            (!p580.is_empty() || !completed.is_empty()).then_some(Contribution::Demolition {
-                started: p580,
-                completed,
-            })
+            let demolition =
+                (!p580.is_empty() || !completed.is_empty()).then_some(Contribution::Demolition {
+                    started: p580,
+                    completed,
+                });
+            range_single(demolition, sort_key)
         }
 
         // =================================================================
@@ -471,21 +519,17 @@ fn process_p793_claim(
         // =================================================================
 
         // Q5135520: closure — ceased use, the empty usage set
-        "Q5135520" => usage_changed(p585, Some(BTreeSet::new()), ctx),
+        "Q5135520" => fan_out_points(p585, |group| {
+            usage_changed(group, Some(BTreeSet::new()), ctx)
+        }),
 
         _ => {
             warnings.push(format!("P793: unrecognized event QID {qid}"));
-            None
+            Vec::new()
         }
     };
 
-    (
-        contribution.map(|contribution| DatedContribution {
-            contribution,
-            sort_key,
-        }),
-        warnings,
-    )
+    (contributions, warnings)
 }
 
 /// The preferred bounds when any were extracted, else the alternate bounds
@@ -602,9 +646,9 @@ pub fn build_lifecycles(
 
     if let Some(p793_claims) = claims.get("P793") {
         for claim in asserted_claims(p793_claims) {
-            let (contribution, w) = process_p793_claim(claim, ctx);
+            let (contributions, w) = process_p793_claim(claim, ctx);
             warnings.extend(w);
-            if let Some(dc) = contribution {
+            for dc in contributions {
                 if matches!(dc.contribution, Contribution::Construction { .. }) {
                     p793_constructions.push(dc);
                 } else {
@@ -682,19 +726,9 @@ pub fn build_lifecycles(
     //    over decades — so each distinct date becomes its own event, and claims
     //    sharing a date merge into one, pooling their citations.
     let mut push_usage = |at: Vec<CitedDate>, new_usages: Option<BTreeSet<Usage>>| {
-        let mut by_date: BTreeMap<UncertainDate, Vec<CitedDate>> = BTreeMap::new();
-        for cited in at {
-            by_date.entry(cited.bound.clone()).or_default().push(cited);
-        }
-        for group in by_date.into_values() {
-            let sort_key = earliest_of(&group);
-            if let Some(contribution) = usage_changed(group, new_usages.clone(), ctx) {
-                dated.push(DatedContribution {
-                    contribution,
-                    sort_key,
-                });
-            }
-        }
+        dated.extend(fan_out_points(at, |group| {
+            usage_changed(group, new_usages.clone(), ctx)
+        }));
     };
     // P1619 official opening: a dated usage change with no claimed usage set.
     push_usage(openings, None);
@@ -930,9 +964,11 @@ mod tests {
     }
 
     #[test]
-    fn test_coordinate_precision_accounts_for_latitude() -> TestResult {
-        // At 60°N, 1 degree of longitude is ~55.8km (cos(60°) * 111km).
-        // The old equator approximation would give ~111km for any latitude.
+    fn coordinate_precision_uses_meridian_extent() -> TestResult {
+        // Precision is an angular grid size applied to both axes; its largest
+        // physical extent is the meridian arc, ~111 km per degree at every
+        // latitude. A 1° grid at 60°N therefore yields the same radius it would
+        // at the equator.
         let claim_high_lat = Claim {
             mainsnak: Snak::Value(DataValue::GlobeCoordinate(CoordinateValue {
                 latitude: 60.0,
@@ -947,15 +983,15 @@ mod tests {
         let loc = loc.ok_or("expected Some")?;
 
         if let UnresolvedLocation::Resolved(Location::Circle { radius, .. }) = loc {
-            // At 60°N, 1 degree longitude ≈ 55,800m (not 111,000m)
+            // Meridian arc of 1° latitude ≈ 111,195 m, latitude-independent.
             let radius_m = radius.0;
             assert!(
-                radius_m < 70_000.0,
-                "precision at 60°N should be well under 70km, got {radius_m}m"
+                radius_m > 100_000.0,
+                "meridian extent of 1° is ~111 km regardless of latitude, got {radius_m}m"
             );
             assert!(
-                radius_m > 40_000.0,
-                "precision at 60°N should be over 40km, got {radius_m}m"
+                radius_m < 120_000.0,
+                "meridian extent of 1° is ~111 km regardless of latitude, got {radius_m}m"
             );
         } else {
             return Err("expected Resolved(Circle)".into());
@@ -1311,6 +1347,75 @@ mod tests {
                 DamageCause::Flood
             ]
         );
+        Ok(())
+    }
+
+    /// One fire claim carrying two distinct point-in-time dates is two separate
+    /// damage events — each dated fire is its own event, not one event with two
+    /// competing bounds.
+    #[test]
+    fn p793_fire_on_two_dates_yields_two_damage_events() -> TestResult {
+        let mut qualifiers = BTreeMap::new();
+        qualifiers.insert(
+            property_id("P585")?,
+            vec![
+                Snak::Value(DataValue::Time(TimeValue {
+                    time: WikidataTimestamp::try_from("+1871-10-08T00:00:00Z".to_string())?,
+                    precision: WikidataPrecision::Day,
+                })),
+                Snak::Value(DataValue::Time(TimeValue {
+                    time: WikidataTimestamp::try_from("+1906-04-18T00:00:00Z".to_string())?,
+                    precision: WikidataPrecision::Day,
+                })),
+            ],
+        );
+        let claim = Claim {
+            mainsnak: Snak::Value(DataValue::WikibaseEntityId(EntityRefValue {
+                id: wikidata_id("Q168983")?, // fire
+            })),
+            qualifiers,
+            rank: Rank::Normal,
+        };
+        let claims = claims_from(vec![("P793", vec![claim])])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(lifecycles.len(), 1);
+
+        let damage_starts: Vec<&Vec<CitedDate>> = lifecycles[0]
+            .iter()
+            .filter_map(|c| match c {
+                Contribution::Event(event) => match &event.shape {
+                    EventShape::Durational {
+                        kind: DurationalKind::Damaged,
+                        started,
+                        ..
+                    } => Some(started),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            damage_starts.len(),
+            2,
+            "each distinct fire date is its own damage event"
+        );
+        // Each fanned-out event carries exactly the one date it split on, and the
+        // events are ordered chronologically by that date.
+        let years: Vec<i32> = damage_starts
+            .iter()
+            .map(|started| {
+                assert_eq!(started.len(), 1, "one bound per damage event");
+                started
+                    .first()
+                    .and_then(|d| d.bound.earliest())
+                    .map(|d| d.year())
+                    .ok_or("expected a dated bound")
+            })
+            .collect::<Result<_, _>>()?;
+        assert_eq!(years, vec![1871, 1906]);
         Ok(())
     }
 
@@ -1841,8 +1946,9 @@ mod tests {
 
         let (dated, warnings) = process_p793_claim(&claim, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        let dated = dated.ok_or("construction should produce a contribution")?;
-        assert_eq!(dated.sort_key, ymd(1900, 1, 1));
+        assert_eq!(dated.len(), 1, "construction yields one contribution");
+        let sort_key = dated.first().ok_or("expected a contribution")?.sort_key;
+        assert_eq!(sort_key, ymd(1900, 1, 1));
         Ok(())
     }
 }
