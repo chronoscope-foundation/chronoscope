@@ -18,7 +18,7 @@ use crate::grammar::citations::{ExternalSource, JudgmentSource, Justification};
 use crate::grammar::identity;
 use crate::grammar::ids::{CommitId, FactId, UserId};
 use crate::location::{Location, LocationReference, UnresolvedLocation};
-use crate::store::schema::{ClassRow, EntityStream, EventStream, ImageStream};
+use crate::store::schema::{ClassRow, EntityStream, ImageStream};
 use crate::store::{
     EntityIdOf, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageIdOf,
     ImageView, SubmitCommitError, SubmitCommitInput,
@@ -334,46 +334,6 @@ pub async fn all_facts_about_entity_returns_facts_mentioning_it<S: FactStore>(
     assert!(
         submitted.is_subset(&returned),
         "all_facts_about_entity must return every fact mentioning the entity; \
-         submitted={submitted:?}, returned={returned:?}"
-    );
-    Ok(())
-}
-
-/// Event analogue of [`walk_entity_classes_group_submitted_facts_into_one_class`].
-/// Stamped `#[ignore]`d while `walk_events` is stubbed; flips green once the
-/// walk reads the fact bag.
-pub async fn walk_events_returns_submitted_event_facts<S: FactStore>(store: S) -> TestResult {
-    let bundle: SubmitCommitInput<S> = SubmitBundle {
-        author: user_author()?,
-        recorded_at: fixed_time(),
-        entities: vec![Decl::Local],
-        events: vec![Decl::Local],
-        images: Vec::new(),
-        facts: [
-            has_event_fact(0, 0, designated_kind())?,
-            event_point_date_fact(0)?,
-            event_description_fact(0)?,
-        ]
-        .into_iter()
-        .collect(),
-    };
-
-    let result = commit_facts(&store, bundle)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let submitted: BTreeSet<FactId> = result.fact_ids.iter().copied().collect();
-    assert_eq!(submitted.len(), 3, "expected three submitted facts");
-
-    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = view
-        .walk_events(&EventStream::All, None, PAGE_100)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-
-    let returned: BTreeSet<FactId> = page.items.iter().map(|item| item.fact_id).collect();
-    assert!(
-        submitted.is_subset(&returned),
-        "walk_events(All) must return every submitted event-touching fact; \
          submitted={submitted:?}, returned={returned:?}"
     );
     Ok(())

@@ -6,19 +6,17 @@
 //! entities additionally have one canonical directed-edge relation
 //! (`Topological`). These relations are implicit: there's no per-subject
 //! relation enum to pass, because there's nothing to choose between. The query
-//! types here describe what to walk (the [`EntityStream`] / [`EventStream`] /
+//! types here describe what to walk (the [`EntityStream`] /
 //! [`ImageStream`] indices) and what comes back — [`FactPage`] / [`PageItem`]
 //! for the backlink walks, [`ClassPage`] / [`ClassRow`] for the class walks,
 //! and [`EquivClass`] for a single subject's class.
 //!
 //! ## Subject kinds
 //!
-//! Three subject kinds, one stream enum per kind:
+//! Two stream enums, one per indexed subject kind:
 //!
 //! - **Entities** — [`EntityStream`]. Walked over the canonical `SameEntity`
 //!   equivalence.
-//! - **Lifetime events** — [`EventStream`]. Walked over the canonical
-//!   `SameEvent` equivalence. No edge relations today.
 //! - **Images** — [`ImageStream`]. Walked over the canonical `SameArtifact`
 //!   equivalence. No edge relations today.
 //!
@@ -109,21 +107,6 @@ pub enum EntityStream<'a> {
     /// equals the supplied one. A SQL backend implements this as an indexed
     /// scan against the externalrefs index.
     ByExternalReference { reference: &'a ExternalReference },
-}
-
-/// Which index to walk for event-scoped queries. Consumed by the event view
-/// trait's `walk_events`, which class-scopes the result by the canonical
-/// `SameEvent` equivalence.
-///
-/// Events carry only a temporal index today; spatial extent and naming are
-/// entity-level concepts. A future event-attribute grammar adding spatial or
-/// naming would land new variants here.
-#[derive(Debug)]
-pub enum EventStream<'a> {
-    /// Walk every event-touching fact in `fact_id` order.
-    All,
-    /// Walk facts whose date index entry intersects `range`.
-    InTimeRange(&'a TimeRange),
 }
 
 /// Which index to walk for image-scoped queries. Consumed by the image view

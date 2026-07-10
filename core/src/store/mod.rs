@@ -6,7 +6,7 @@
 //! - [`schema`] — the read query vocabulary ([`schema::Bbox`],
 //!   [`schema::TimeRange`], [`schema::FactPage`], [`schema::EquivClass`]) and
 //!   the per-subject stream enums ([`schema::EntityStream`] /
-//!   [`schema::EventStream`] / [`schema::ImageStream`]). Each subject kind has a
+//!   [`schema::ImageStream`]). Each subject kind has a
 //!   single canonical equivalence (and entities a single canonical edge
 //!   relation), all implicit — there are no per-subject relation enums.
 //! - [`pagination`] — the generic cursor→stream adapter every walk pages on.
@@ -67,7 +67,7 @@
 //! - [`FactView::snapshot`] returns the bound the view was pinned at.
 //! - Every paginated walk pages on an opaque resume token: `None` opens the
 //!   walk, `Some(token)` resumes at the previous page's token. The backlink
-//!   walks (`all_facts_about_*`) and `walk_events` page on
+//!   walks (`all_facts_about_*`) page on
 //!   [`Cursor`](Self::Cursor); the class walks (`walk_entity_classes` /
 //!   `walk_image_classes`) page on [`ClassCursor`](Self::ClassCursor). A caller
 //!   threads the token back verbatim, never constructing or inspecting it, so a
@@ -138,9 +138,7 @@ use std::pin::Pin;
 
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
-use crate::store::schema::{
-    ClassPage, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
-};
+use crate::store::schema::{ClassPage, EntityStream, EquivClass, FactPage, ImageStream};
 use crate::submit;
 use crate::submit::{FactLookup, StoredCommit, StoredFact, SubmitError, SubmitResult};
 
@@ -576,16 +574,6 @@ pub trait EventView<S: FactStore>: FactView<S> {
         &mut self,
         member: &EventIdOf<S>,
     ) -> impl Future<Output = Result<EquivClass<EventIdOf<S>>, S::Error>> + Send;
-
-    /// Walk event-touching facts via an index, class-scoped by `SameEvent`.
-    /// `after` is a resume token — `None` opens the walk, `Some(cursor)` resumes
-    /// at the previous page's returned `next_cursor`.
-    fn walk_events<'a>(
-        &'a mut self,
-        stream: &'a EventStream<'a>,
-        after: Option<S::Cursor>,
-        limit: std::num::NonZeroUsize,
-    ) -> impl Future<Output = Result<WalkPage<S, EventIdOf<S>>, S::Error>> + Send + 'a;
 
     /// Paginated backlink walk — "which facts mention this event?". `after` is a
     /// resume token: `None` opens the walk, `Some(cursor)` resumes at the

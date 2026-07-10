@@ -74,8 +74,8 @@ pub trait UnmintedIds: FactStore {
 ///
 /// Each case becomes its own `#[tokio::test]`, so a backend's failures
 /// report under the case's name. The suite-wide ignored cases pin contracts
-/// for reads every backend still stubs (`walk_events`, event classes); they
-/// flip green once the read is implemented.
+/// for reads every backend still stubs (event classes); they flip green once
+/// the read is implemented.
 ///
 /// The optional `ignore(...)` form marks additional cases `#[ignore]` for
 /// this backend only, each with a reason naming the capability the backend
@@ -139,8 +139,6 @@ macro_rules! fact_store_conformance {
             walk_entity_classes_group_submitted_facts_into_one_class,
             class_walk_pages_distinct_entities_as_contiguous_runs,
             all_facts_about_entity_returns_facts_mentioning_it,
-            #[ignore = "walk_events is stubbed to an empty page; this pins the walk-returns-submitted-facts contract and flips green once walk_events reads the fact bag"]
-            walk_events_returns_submitted_event_facts,
             all_facts_about_event_returns_facts_mentioning_it,
             walk_image_classes_group_submitted_facts_into_one_class,
             all_facts_about_image_returns_facts_mentioning_it,

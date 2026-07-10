@@ -29,8 +29,7 @@
 //! in [`chronoscope_core::store::retraction`] and
 //! [`chronoscope_core::store::equiv`] over edges fetched by recursive CTE —
 //! see [`read`] for the shapes. The class-stream walks
-//! (`walk_entity_classes`, `walk_events`, `walk_image_classes`) answer empty
-//! pages, the same stub shape as the in-memory backend's `walk_events`; the
+//! (`walk_entity_classes`, `walk_image_classes`) answer empty pages; the
 //! conformance suite marks their cases ignored for this backend. The submit
 //! matcher finds candidates only through these walks, so cross-commit
 //! identity matching is inert on this backend until they land.
@@ -54,12 +53,10 @@ use sqlx::sqlite::SqlitePool;
 use sqlx::{Acquire, Sqlite, SqliteConnection, Transaction};
 
 use chronoscope_core::grammar::ids::{CommitId, FactId, SubjectKind};
-use chronoscope_core::store::schema::{
-    ClassPage, EntityStream, EquivClass, EventStream, FactPage, ImageStream,
-};
+use chronoscope_core::store::schema::{ClassPage, EntityStream, EquivClass, ImageStream};
 use chronoscope_core::store::{
     ClassWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageView,
-    StoredFactOf, WalkPage,
+    WalkPage,
 };
 use chronoscope_core::submit::{FactLookup, StoredCommit, StoredFact, SubmitResult};
 
@@ -389,19 +386,6 @@ impl<C: AsConn> EventView<SqliteFactStore> for SqliteHandle<C> {
         Ok(singleton_class(*member))
     }
 
-    /// Mirrors the in-memory backend's identical stub: events have no
-    /// stream index and no consumer — the projection reaches events through
-    /// the entity's `HasEvent` hop. The suite-wide ignored event cases pin
-    /// this.
-    async fn walk_events<'b>(
-        &'b mut self,
-        _stream: &'b EventStream<'b>,
-        _after: Option<FactId>,
-        _limit: std::num::NonZeroUsize,
-    ) -> Result<WalkPage<SqliteFactStore, SqliteEventId>, Error> {
-        Ok(empty_fact_page())
-    }
-
     async fn all_facts_about_event(
         &mut self,
         event: &SqliteEventId,
@@ -631,13 +615,6 @@ fn empty_class_page<Rep>() -> ClassPage<Rep, (Rep, FactId)> {
         rows: Vec::new(),
         next: None,
         next_class: None,
-    }
-}
-
-fn empty_fact_page<S>() -> FactPage<StoredFactOf<SqliteFactStore>, S, FactId> {
-    FactPage {
-        items: Vec::new(),
-        next_cursor: None,
     }
 }
 

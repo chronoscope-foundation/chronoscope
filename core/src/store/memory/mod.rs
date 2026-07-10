@@ -66,8 +66,7 @@ use crate::grammar::assertions::MetaAssertion;
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
 use crate::store::retraction::RetractionEdges;
 use crate::store::schema::{
-    ClassPage, EntityStream, EquivClass, EventStream, FactPage, ImageStream, PageItem,
-    normalize_name,
+    ClassPage, EntityStream, EquivClass, FactPage, ImageStream, PageItem, normalize_name,
 };
 use crate::store::{
     ClassWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageView,
@@ -1039,18 +1038,6 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
         Ok(EquivClass {
             representative: *member,
             members: std::iter::once(*member).collect(),
-        })
-    }
-
-    async fn walk_events<'b>(
-        &'b mut self,
-        _stream: &'b EventStream<'b>,
-        _after: Option<FactId>,
-        _limit: std::num::NonZeroUsize,
-    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId, FactId>, MemoryError> {
-        Ok(FactPage {
-            items: Vec::new(),
-            next_cursor: None,
         })
     }
 
