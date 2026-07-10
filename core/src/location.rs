@@ -619,7 +619,11 @@ impl crate::algebra::monoid::CommutativeMonoid for Location {
     }
 }
 
-impl crate::algebra::lattice::JoinSemilattice for Location {}
+impl crate::algebra::lattice::JoinSemilattice for Location {
+    fn is_bottom(&self) -> bool {
+        self.denotes_empty()
+    }
+}
 
 /// The meet half of the resolved location lattice, the dual of the join above.
 /// ⊤ is [`Unbounded`](Location::Unbounded); the meet intersects and
@@ -836,15 +840,8 @@ impl UnresolvedLocation {
     /// [`Pending`]: ConflictStatus::Pending
     /// [`Consistent`]: ConflictStatus::Consistent
     pub fn conflict_status(&self) -> ConflictStatus {
-        // A `Resolved` leaf already holds the geometry the skeleton would be, so
-        // test it on the borrow rather than cloning it into a fresh skeleton.
-        // The skeleton differs from the value only where a `Reference` becomes
-        // ⊤, so it's only worth building when one is present.
-        let empty = match self {
-            Self::Resolved(loc) => loc.denotes_empty(),
-            _ => self.permissive_skeleton().denotes_empty(),
-        };
-        if empty {
+        use crate::algebra::lattice::JoinSemilattice;
+        if self.is_bottom() {
             ConflictStatus::Conflict
         } else if self.has_reference() {
             ConflictStatus::Pending
@@ -941,7 +938,17 @@ impl crate::algebra::monoid::CommutativeMonoid for UnresolvedLocation {
     }
 }
 
-impl crate::algebra::lattice::JoinSemilattice for UnresolvedLocation {}
+impl crate::algebra::lattice::JoinSemilattice for UnresolvedLocation {
+    /// The permissive-skeleton emptiness: every `Reference` becomes ⊤, then the
+    /// skeleton is tested for geometric emptiness. A `Resolved` leaf already holds
+    /// that geometry, so it is tested on the borrow.
+    fn is_bottom(&self) -> bool {
+        match self {
+            Self::Resolved(loc) => loc.denotes_empty(),
+            _ => self.permissive_skeleton().denotes_empty(),
+        }
+    }
+}
 
 /// The meet half of the unresolved location lattice, the dual of the join above.
 /// ⊤ is `Resolved(Unbounded)`; the meet conjoins and canonicalizes, so the

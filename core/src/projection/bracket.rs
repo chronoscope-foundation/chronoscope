@@ -9,7 +9,7 @@
 //! collapsing to ⊥ — is the bilattice's ⊤, a paraconsistent conflict rather than
 //! an error (Belnap 1977; Ginsberg 1988; Fitting 1991).
 
-use crate::algebra::lattice::BoundedLattice;
+use crate::algebra::lattice::{BoundedLattice, JoinSemilattice};
 use crate::algebra::monoid::CommutativeMonoid;
 use crate::algebra::semiring::Semiring;
 use crate::date::UncertainDate;
@@ -97,7 +97,7 @@ pub trait ConsensusConflict {
 
 impl ConsensusConflict for UncertainDate {
     fn conflict(&self) -> ConflictStatus {
-        if self.intervals().is_empty() {
+        if self.is_bottom() {
             ConflictStatus::Conflict
         } else {
             ConflictStatus::Consistent
@@ -107,9 +107,10 @@ impl ConsensusConflict for UncertainDate {
 
 impl<A: Ord> ConsensusConflict for Claimed<A> {
     fn conflict(&self) -> ConflictStatus {
-        match self {
-            Claimed::Of { values } if values.is_empty() => ConflictStatus::Conflict,
-            Claimed::Of { .. } | Claimed::Any => ConflictStatus::Consistent,
+        if self.is_bottom() {
+            ConflictStatus::Conflict
+        } else {
+            ConflictStatus::Consistent
         }
     }
 }

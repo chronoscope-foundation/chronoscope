@@ -624,7 +624,11 @@ impl crate::algebra::monoid::CommutativeMonoid for UncertainDate {
     }
 }
 
-impl crate::algebra::lattice::JoinSemilattice for UncertainDate {}
+impl crate::algebra::lattice::JoinSemilattice for UncertainDate {
+    fn is_bottom(&self) -> bool {
+        self.is_empty()
+    }
+}
 
 /// The meet half of the date lattice. ⊤ is `unknown()`, the meet identity;
 /// `meet` delegates to the inherent intersection.

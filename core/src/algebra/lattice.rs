@@ -4,8 +4,11 @@
 //! whose `combine` is also idempotent. [`JoinSemilattice`] names that floor — its
 //! ⊥ ([`bottom`](JoinSemilattice::bottom)) and ⊔
 //! ([`join`](JoinSemilattice::join)) are the monoid's `identity` and `combine`
-//! under lattice names. Each value lattice supplies its own canonicalizing
-//! `combine`. [`join_all`](JoinSemilattice::join_all) is a convenience for folding
+//! under lattice names. Recognizing ⊥ is
+//! [`is_bottom`](JoinSemilattice::is_bottom), a predicate each lattice supplies
+//! for its own ⊥ — a canonical value, a family of empties, or a geometric
+//! emptiness routine. Each value lattice supplies its own
+//! canonicalizing `combine`. [`join_all`](JoinSemilattice::join_all) is a convenience for folding
 //! a whole stream through `combine` from ⊥ (empty → ⊥, singleton → itself); a
 //! consumer that merges incrementally just calls `combine`.
 //!
@@ -24,13 +27,19 @@ use super::monoid::CommutativeMonoid;
 ///
 /// The supertrait carries the operation; this trait adds one law — idempotence,
 /// `a ⊔ a == a` — that distinguishes a join-semilattice from a bare commutative
-/// monoid. It has no required methods: the join monoid's `identity` is ⊥ and its
-/// `combine` is ⊔.
+/// monoid. The join monoid's `identity` is ⊥ and its `combine` is ⊔; the one
+/// required method is [`is_bottom`](Self::is_bottom), the ⊥-recognition predicate.
 pub trait JoinSemilattice: CommutativeMonoid {
     /// The least element ⊥ — the join identity, `a ⊔ ⊥ == a`.
     fn bottom() -> Self {
         Self::identity()
     }
+
+    /// Whether this value is ⊥ — the least element, denoting nothing / a
+    /// contradiction. A predicate, so each lattice recognizes its own ⊥ its own
+    /// way: a canonical value, a family of empties, or a geometric emptiness
+    /// routine.
+    fn is_bottom(&self) -> bool;
 
     /// The join ⊔ of two values, consuming both.
     fn join(self, other: Self) -> Self {

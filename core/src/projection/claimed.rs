@@ -54,7 +54,11 @@ impl<A: Ord> CommutativeMonoid for Claimed<A> {
     }
 }
 
-impl<A: Ord> JoinSemilattice for Claimed<A> {}
+impl<A: Ord> JoinSemilattice for Claimed<A> {
+    fn is_bottom(&self) -> bool {
+        matches!(self, Claimed::Of { values } if values.is_empty())
+    }
+}
 
 impl<A: Ord> MeetSemilattice for Claimed<A> {
     fn top() -> Self {

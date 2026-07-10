@@ -9,8 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::algebra::lattice::{BoundedLattice, MeetSemilattice};
-use crate::algebra::monoid::CommutativeMonoid;
+use crate::algebra::lattice::{BoundedLattice, JoinSemilattice, MeetSemilattice};
 use crate::grammar::ids::FactId;
 use crate::nonempty::NonEmptyVec;
 
@@ -46,7 +45,7 @@ use crate::nonempty::NonEmptyVec;
 /// so results are ≥ 2 in practice.
 pub fn minimize<T>(premises: &[(FactId, T)]) -> Option<NonEmptyVec<FactId>>
 where
-    T: BoundedLattice + Eq + Clone,
+    T: BoundedLattice + Clone,
 {
     let mut keep: BTreeSet<FactId> = premises.iter().map(|(fact, _)| *fact).collect();
 
@@ -74,9 +73,9 @@ where
     NonEmptyVec::try_from_vec(keep.into_iter().collect()).ok()
 }
 
-/// A value has collapsed to ⊥ when it equals the join-semilattice identity.
-fn is_bottom<T: BoundedLattice + Eq>(v: &T) -> bool {
-    *v == <T as CommutativeMonoid>::identity()
+/// A value has collapsed to ⊥, by the lattice's own `is_bottom` predicate.
+fn is_bottom<T: JoinSemilattice>(v: &T) -> bool {
+    v.is_bottom()
 }
 
 /// Meet the premise values that survive `keep` and aren't `skip`, folding
@@ -101,7 +100,9 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::algebra::lattice::JoinSemilattice;
+    use crate::algebra::monoid::CommutativeMonoid;
     use crate::date::{DatePrecision, UncertainDate};
+    use crate::projection::Claimed;
 
     use super::*;
 
@@ -134,6 +135,39 @@ mod tests {
         Ok(())
     }
 
+    // -- The Claimed set lattice ------------------------------------------
+
+    /// `minimize` over the `Claimed` set lattice: two premises with disjoint
+    /// sets meet (set intersection) to the empty `Of`, which `is_bottom`
+    /// recognizes as ⊥. Each premise is essential — dropping either lifts the
+    /// meet off ⊥ — so both facts survive, driving the deletion pass through
+    /// `is_bottom` on a set carrier.
+    #[test]
+    fn disjoint_claimed_sets_minimize_to_both_facts() -> TestResult {
+        let left: Claimed<u8> = Claimed::Of {
+            values: [1, 2].into_iter().collect(),
+        };
+        let right: Claimed<u8> = Claimed::Of {
+            values: [3].into_iter().collect(),
+        };
+        let premises = vec![(FactId::new(1), left), (FactId::new(2), right)];
+        assert!(
+            is_bottom(&meet_of(&premises, &all_facts_claimed(&premises), None)),
+            "disjoint claimed sets meet to the empty Of, which is bottom"
+        );
+        let keep = minimize(&premises).ok_or("expected Some")?;
+        assert_eq!(
+            keep.into_vec(),
+            vec![FactId::new(1), FactId::new(2)],
+            "each disjoint claim is essential, so both facts survive"
+        );
+        Ok(())
+    }
+
+    fn all_facts_claimed(premises: &[(FactId, Claimed<u8>)]) -> BTreeSet<FactId> {
+        premises.iter().map(|(fact, _)| *fact).collect()
+    }
+
     // -- Bitset lattice for the property suite ----------------------------
 
     /// A `u8`-backed bounded lattice: ⊤ is all bits, meet is bitwise AND; ⊥ is
@@ -151,7 +185,11 @@ mod tests {
         }
     }
 
-    impl JoinSemilattice for Bitset {}
+    impl JoinSemilattice for Bitset {
+        fn is_bottom(&self) -> bool {
+            self.0 == 0
+        }
+    }
 
     impl MeetSemilattice for Bitset {
         fn top() -> Self {
