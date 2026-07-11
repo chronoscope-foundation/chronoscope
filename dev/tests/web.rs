@@ -737,6 +737,7 @@ async fn find_entity_with_media(
     // Rome's bbox — the 4 Roman entities sit here, several with seeded media.
     let bbox = Bbox::from_coords(41.5, 42.5, 12.0, 13.0)?;
     let response = client.list_markers(&bbox).await?;
+    let images_limit = std::num::NonZeroU32::new(50).ok_or("nonzero image page size")?;
 
     // Pick the entity with the most resolved media among those whose marker
     // carries a thumbnail.
@@ -747,8 +748,10 @@ async fn find_entity_with_media(
                 chronoscope_api_client::ClickAction::Select { entity_id } => entity_id.clone(),
                 _ => continue,
             };
-            let detail = client.get_entity(&entity_id).await?;
-            let count = detail.images.len();
+            let page = client
+                .get_entity_images(&entity_id, images_limit, None)
+                .await?;
+            let count = page.images.len();
             if best.as_ref().is_none_or(|b| count > b.2) {
                 best = Some((
                     marker.point.lon(),

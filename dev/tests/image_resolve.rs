@@ -99,7 +99,7 @@ async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
                 continue;
             }
             last = Some(row.representative);
-            let Some((class, projected)) = project_entity::<MemoryFactStore, _, _>(
+            let Some((_class, projected)) = project_entity::<MemoryFactStore, _, _>(
                 &mut view,
                 row.representative,
                 member_lineage,
@@ -109,9 +109,9 @@ async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
             else {
                 continue;
             };
-            for dep in &typed::Entity::parse(&projected, &class).depictions {
+            for (image, _entry) in projected.depictions.iter() {
                 let rep = view
-                    .image_representative(&dep.other)
+                    .image_representative(image)
                     .await
                     .map_err(|e| format!("{e:?}"))?;
                 reps.insert(rep);

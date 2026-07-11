@@ -7,6 +7,7 @@
 //! `AuthClient` derefs to `Client`, so it can call any public method.
 //! Uses `reqwest` which works on both native (tokio) and WASM (web-sys fetch) targets.
 
+use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::pin::Pin;
 
@@ -19,7 +20,7 @@ use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-use crate::entities::{EntityDetail, MarkersResponse};
+use crate::entities::{Cursor, EntityDetail, EntityImagesPage, MarkersResponse};
 use crate::ids::{Email, EntityId, EventId, ImageId, ResearchUrlId};
 use crate::pagination::{PageToken, ResultsPage};
 use crate::users::{UpdateUserRequest, UserResponse};
@@ -101,12 +102,34 @@ impl Client {
 
     // ==================== Entity endpoints (public) ====================
 
-    /// Fetch a single entity by ID, with its resolved detail image grid.
+    /// Fetch a single entity by ID. The depicting images are the paginated
+    /// [`Self::get_entity_images`] sub-resource, not part of this response.
     pub async fn get_entity(
         &self,
         id: &EntityId,
     ) -> Result<EntityDetail<EntityId, EventId, ImageId>, ApiError> {
         let url = format!("{}/entities/{}", self.base_url, id.as_str());
+        self.get_json(&url).await
+    }
+
+    /// Fetch one page of the images depicting an entity, resolved into detail
+    /// tiles. `cursor` is `None` for the first page, then the previous page's
+    /// `next`. The server clamps `limit` to its own maximum.
+    pub async fn get_entity_images(
+        &self,
+        id: &EntityId,
+        limit: NonZeroU32,
+        cursor: Option<&Cursor>,
+    ) -> Result<EntityImagesPage<ImageId>, ApiError> {
+        let mut url = format!(
+            "{}/entities/{}/images?limit={limit}",
+            self.base_url,
+            id.as_str(),
+        );
+        if let Some(cursor) = cursor {
+            url.push_str("&cursor=");
+            url.push_str(cursor.as_str());
+        }
         self.get_json(&url).await
     }
 

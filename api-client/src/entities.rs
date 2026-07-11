@@ -27,11 +27,10 @@ use crate::ids::{EntityId, EventId, ImageId};
 pub type Entity = typed::Entity<EntityId, EventId, ImageId>;
 
 /// The `GET /entities/{id}` response: the typed entity, the display name the
-/// server negotiated from the request's `Accept-Language`, the resolved image
-/// grid the detail panel renders, and the entity's own conflict reports. The
-/// entity's `depictions` name the images by id; `images` carries each depicted
-/// image's resolved URLs plus its structured perspective/medium so the client
-/// renders the grid without a second round-trip per image.
+/// server negotiated from the request's `Accept-Language`, and the entity's own
+/// conflict reports. The depicting images are the paginated
+/// `GET /entities/{id}/images` sub-resource ([`EntityImagesPage`]), fetched
+/// separately.
 ///
 /// `entity.names` still carries every localized name with its provenance;
 /// `display_name` is just the one the panel heading shows, chosen server-side so
@@ -47,7 +46,6 @@ pub type Entity = typed::Entity<EntityId, EventId, ImageId>;
 pub struct EntityDetail<E: Ord, V, I> {
     pub entity: typed::Entity<E, V, I>,
     pub display_name: Option<String>,
-    pub images: Vec<DetailImage<I>>,
     pub conflicts: Vec<AnyConflictReport<E, V>>,
 }
 
@@ -136,6 +134,17 @@ impl std::fmt::Display for Cursor {
 #[serde(bound(deserialize = "E: ::serde::Deserialize<'de>, I: ::serde::de::DeserializeOwned"))]
 pub struct EntityListPage<E, I> {
     pub summaries: Vec<listing::EntitySummary<E, I>>,
+    pub next: Option<Cursor>,
+}
+
+/// One page of an entity's depicting images: the resolved [`DetailImage`] tiles
+/// gathered this page and the opaque [`Cursor`] for the next, `None` once the
+/// entity's depictions are exhausted. Returned by `GET /entities/{id}/images`;
+/// the client threads `next` back verbatim to page the grid.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(bound(deserialize = "I: ::serde::de::DeserializeOwned"))]
+pub struct EntityImagesPage<I> {
+    pub images: Vec<DetailImage<I>>,
     pub next: Option<Cursor>,
 }
 

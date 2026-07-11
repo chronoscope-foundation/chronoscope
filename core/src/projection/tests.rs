@@ -2102,3 +2102,147 @@ async fn observed_image_does_not_leak_a_foreign_depiction() -> TestResult {
     );
     Ok(())
 }
+
+// ------------------------------------------------------------------
+// project_entity_images — the paged depiction assembler
+//
+// Folds one walk page's raw depiction facts into typed `Depiction`s, keyed by
+// image rep, without projecting the whole entity. Mirrors the depictions the
+// full `project_entity` fold would surface, one page at a time.
+// ------------------------------------------------------------------
+
+/// A `Depiction` judgment naming a bundle entity/image, with an optional
+/// perspective — the submit-side counterpart to `depiction_stored`.
+fn depiction_submit(
+    entity: EntityIdx,
+    image: ImageIdx,
+    perspective: Option<Perspective>,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Depiction {
+            fact: crate::grammar::depiction::Fact {
+                entity,
+                image,
+                localization: None,
+                perspective,
+            },
+        },
+        citation: judgment_source()?,
+    })
+}
+
+#[tokio::test]
+async fn project_entity_images_assembles_a_tile_per_depicted_image() -> TestResult {
+    let store = MemoryFactStore::new();
+    // Entity 0 is depicted by two images (distinct perspectives); entity 1 is
+    // depicted by a third. The walk is entity-scoped, so entity 0's page carries
+    // its two images only.
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local, Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local, Decl::Local],
+        facts: [
+            depiction_submit(EntityIdx(0), ImageIdx(0), Some(Perspective::Exterior))?,
+            depiction_submit(EntityIdx(0), ImageIdx(1), Some(Perspective::Interior))?,
+            depiction_submit(EntityIdx(1), ImageIdx(2), Some(Perspective::Exterior))?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity0 = result.entities.get(&EntityIdx(0)).ok_or("missing e0")?.id;
+    let img0 = result.images.get(&ImageIdx(0)).ok_or("missing i0")?.id;
+    let img1 = result.images.get(&ImageIdx(1)).ok_or("missing i1")?.id;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (depictions, next) = project_entity_images::<MemoryFactStore, _>(
+        &mut view,
+        entity0,
+        None,
+        NonZeroUsize::new(10).ok_or("nonzero")?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+
+    assert!(
+        next.is_none(),
+        "a page larger than the image count exhausts the walk"
+    );
+    let settled: BTreeMap<MemImgId, Perspective> = depictions
+        .iter()
+        .filter_map(|d| d.perspective.settled().map(|p| (d.other, *p)))
+        .collect();
+    assert_eq!(
+        settled,
+        BTreeMap::from([(img0, Perspective::Exterior), (img1, Perspective::Interior),]),
+        "exactly the two images depicting entity 0 surface, each keyed by its \
+         image rep with its settled perspective"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn project_entity_images_walks_every_image_once_across_pages() -> TestResult {
+    let store = MemoryFactStore::new();
+    // Two images depict one entity; limit=1 forces one image per page, so the
+    // resume cursor must thread each image in exactly once and then terminate.
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local],
+        facts: [
+            depiction_submit(EntityIdx(0), ImageIdx(0), Some(Perspective::Exterior))?,
+            depiction_submit(EntityIdx(0), ImageIdx(1), Some(Perspective::Interior))?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity0 = result.entities.get(&EntityIdx(0)).ok_or("missing e0")?.id;
+    let img0 = result.images.get(&ImageIdx(0)).ok_or("missing i0")?.id;
+    let img1 = result.images.get(&ImageIdx(1)).ok_or("missing i1")?.id;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let one = NonZeroUsize::new(1).ok_or("nonzero")?;
+    let mut seen: BTreeSet<MemImgId> = BTreeSet::new();
+    let mut after: Option<(MemImgId, FactId)> = None;
+    let mut pages = 0;
+    loop {
+        let (depictions, next) =
+            project_entity_images::<MemoryFactStore, _>(&mut view, entity0, after, one)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+        assert!(
+            depictions.len() <= 1,
+            "limit=1 caps each page at a single image, got {}",
+            depictions.len()
+        );
+        for d in &depictions {
+            assert!(
+                seen.insert(d.other),
+                "image {:?} surfaced on two pages",
+                d.other
+            );
+        }
+        pages += 1;
+        assert!(pages <= 5, "cursor pagination failed to terminate");
+        match next {
+            Some(c) => after = Some(c),
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        BTreeSet::from([img0, img1]),
+        "the cursor walk covers every depicting image exactly once"
+    );
+    Ok(())
+}

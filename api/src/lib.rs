@@ -49,9 +49,11 @@ pub fn register_api(
     // Entity endpoints
     api.register(entities::list_entities)?;
     api.register(entities::get_entity)?;
+    api.register(entities::get_entity_images)?;
     api.register(entities::list_markers)?;
     api.register(entities::entities_options)?;
     api.register(entities::entity_options)?;
+    api.register(entities::entity_images_options)?;
     api.register(entities::markers_options)?;
 
     // Well-known endpoints

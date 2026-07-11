@@ -175,8 +175,6 @@ pub struct Entity<EntId: Ord, EvtId, ImgId> {
     pub external_refs: Vec<Attributed<ExternalReference, ImgId>>,
     pub location: Bounded<UnresolvedLocation, ImgId>,
     pub timeline: Timeline<EvtId, ImgId>,
-    /// Images depicting this entity, with their per-depiction linkage.
-    pub depictions: Vec<Depiction<ImgId, ImgId>>,
     pub merged_from: MergeProvenance<EntId, ImgId>,
 }
 
@@ -205,11 +203,6 @@ where
             .collect();
         let timeline = Timeline::build(timeline_events(projected));
         let location = entity_location(&projected.construction.location, timeline.events());
-        let depictions = projected
-            .depictions
-            .iter()
-            .map(|(image, entry)| depiction(image.clone(), entry))
-            .collect();
         let merged_from = merge_provenance(&projected.sameness, class);
 
         Self {
@@ -219,7 +212,6 @@ where
             external_refs,
             location,
             timeline,
-            depictions,
             merged_from,
         }
     }
@@ -1126,55 +1118,6 @@ mod tests {
             name.sources.len(),
             1,
             "the name presence still cites its fact"
-        );
-        Ok(())
-    }
-
-    // ---- entity-side depictions ----
-
-    #[test]
-    fn entity_parse_populates_depictions_from_projection() -> TestResult {
-        let geom = geometry()?;
-        let mut entity = empty_entity();
-        // Key the depiction by an image id (9) distinct from the entity id (1),
-        // so the assertion genuinely pins keying by the image map key.
-        entity.depictions.insert(
-            9,
-            cited(
-                depiction_record(
-                    Some(geom.clone()),
-                    Some(Perspective::Interior),
-                    lin(1, "https://d")?,
-                ),
-                lin(1, "https://d")?,
-            ),
-        );
-
-        let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
-        assert_eq!(
-            out.depictions.len(),
-            1,
-            "the projected depiction surfaces on the entity"
-        );
-        let dep = out.depictions.first().ok_or("no depiction")?;
-        assert_eq!(dep.other, 9, "the depiction is keyed by its image map key");
-        assert_eq!(
-            dep.localization.consensus,
-            Consensus::Reached {
-                value: Claimed::Of {
-                    values: [geom].into_iter().collect()
-                }
-            },
-            "the entity-side depiction flattens its localization"
-        );
-        assert_eq!(
-            dep.perspective.consensus,
-            Consensus::Reached {
-                value: Claimed::Of {
-                    values: [Perspective::Interior].into_iter().collect()
-                }
-            },
-            "the entity-side depiction flattens its perspective"
         );
         Ok(())
     }

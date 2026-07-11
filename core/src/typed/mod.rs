@@ -129,18 +129,19 @@ pub struct MergeProvenance<EntId: Ord, ImgId> {
 /// the view classification when a source supplies one, and the citations behind
 /// the link.
 ///
-/// Reached from both directions — [`Image::depicts`] reads it by entity,
-/// [`Entity::depictions`] by image — so the one type carries both views. A bare
-/// depiction (no localization, no perspective) flattens both bracket fields to
-/// `Absent`; `sources` keeps the link's attribution.
+/// The one type serves both reading directions: [`Image::depicts`] keys it by
+/// entity, and the entity's image sub-resource
+/// ([`project_entity_images`](crate::projection::project_entity_images)) keys it
+/// by image. A bare depiction (no localization, no perspective) flattens both
+/// bracket fields to `Absent`; `sources` keeps the link's attribution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(
     deserialize = "OtherId: ::serde::Deserialize<'de>, ImgId: ::serde::de::DeserializeOwned"
 ))]
 pub struct Depiction<OtherId, ImgId> {
     /// The depiction's far end — the depicted entity in [`Image::depicts`], the
-    /// depicting image in [`Entity::depictions`]; the one generic type serves
-    /// both directions.
+    /// depicting image in the entity's image sub-resource; the one generic type
+    /// serves both directions.
     pub other: OtherId,
     pub localization: Bounded<Claimed<ImageGeometry>, ImgId>,
     pub perspective: Bounded<Claimed<Perspective>, ImgId>,

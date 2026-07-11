@@ -9,7 +9,7 @@ use super::*;
 use crate::geo::GeoPoint;
 use crate::grammar::attribute::NameText;
 use crate::grammar::citations::Language;
-use crate::listing::{self, ListCursor, ListError};
+use crate::listing;
 use crate::projection::{member_lineage, project_entity};
 use crate::store::SubmitCommitError;
 use crate::store::conformance::fixtures::{
@@ -797,8 +797,8 @@ async fn summaries_in_bbox_paginates_each_entity_once() -> TestResult {
     Ok(())
 }
 
-/// A view pinned before a later commit never sees it, and a cursor from a
-/// different snapshot is refused rather than replayed against the wrong state.
+/// A view pinned before a later commit never sees it: the walk reads the exact
+/// snapshot the view was opened on, so a write that lands after is invisible.
 #[tokio::test]
 async fn summaries_in_bbox_pins_snapshot() -> TestResult {
     let store = MemoryFactStore::new();
@@ -828,18 +828,6 @@ async fn summaries_in_bbox_pins_snapshot() -> TestResult {
         page.summaries.len(),
         1,
         "the fact committed after the snapshot is invisible"
-    );
-
-    let stale = ListCursor {
-        snapshot: FactId::new(u64::MAX),
-        walk: (MemoryEntityId(0), FactId::new(0)),
-    };
-    let replayed =
-        listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, Some(stale), PAGE_100)
-            .await;
-    assert!(
-        matches!(replayed, Err(ListError::SnapshotMismatch)),
-        "a cursor from a foreign snapshot is refused"
     );
     Ok(())
 }

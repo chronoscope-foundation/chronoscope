@@ -7,6 +7,7 @@
 //! `entity-{n}` `Display` form).
 
 use std::collections::{BTreeSet, HashMap};
+use std::num::NonZeroU32;
 
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -298,10 +299,6 @@ async fn get_entity_returns_the_typed_projection_for_a_known_id() -> TestResult 
         Some("Pantheon"),
         "with no Accept-Language the negotiated display name falls back to the only name"
     );
-    assert!(
-        detail.images.is_empty(),
-        "an entity with no depiction carries no detail images"
-    );
     Ok(())
 }
 
@@ -338,8 +335,34 @@ fn resolved_media(image_id: MemoryImageId) -> ResolvedImageMedia {
     }
 }
 
+// ==================== get_entity_images ====================
+
+/// A default page size for image-grid reads: well above the per-test image
+/// counts, so one page exhausts the walk unless a test pages deliberately.
+fn image_page_size() -> Result<NonZeroU32, &'static str> {
+    NonZeroU32::new(50).ok_or("nonzero image page size")
+}
+
 #[tokio::test]
-async fn get_entity_resolves_a_depicted_image_into_the_detail_grid() -> TestResult {
+async fn get_entity_images_is_empty_for_an_entity_with_no_depiction() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Pantheon", 41.8986, 12.4769).await?;
+
+    let page = ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), image_page_size()?, None)
+        .await?;
+    assert!(
+        page.images.is_empty(),
+        "an entity with no depiction carries no image tiles, got {:?}",
+        page.images
+    );
+    assert!(page.next.is_none(), "an empty grid has no next page");
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult {
     let facts = MemoryFactStore::new();
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Pantheon.jpg";
     let (id, image_id) =
@@ -352,10 +375,12 @@ async fn get_entity_resolves_a_depicted_image_into_the_detail_grid() -> TestResu
     let ctx =
         TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
 
-    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
+    let page = ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), image_page_size()?, None)
+        .await?;
 
-    assert_eq!(detail.entity.id, wire_entity_id(id));
-    let image = detail.images.first().ok_or("expected one detail image")?;
+    let image = page.images.first().ok_or("expected one detail image")?;
     assert_eq!(
         image.source_url.as_str(),
         src,
@@ -376,11 +401,12 @@ async fn get_entity_resolves_a_depicted_image_into_the_detail_grid() -> TestResu
         Some(ImageMedium::Picture),
         "the settled image medium rides the wire structured, not as prose"
     );
+    assert!(page.next.is_none(), "one image exhausts the walk");
     Ok(())
 }
 
 #[tokio::test]
-async fn get_entity_skips_a_depiction_whose_image_is_unresolved() -> TestResult {
+async fn get_entity_images_skips_a_depiction_whose_image_is_unresolved() -> TestResult {
     // The image has a Source fact but no entry in the media map — a tile that
     // can't load is worse than an absent one, so the grid drops it.
     let facts = MemoryFactStore::new();
@@ -390,11 +416,347 @@ async fn get_entity_skips_a_depiction_whose_image_is_unresolved() -> TestResult 
 
     let ctx = TestContext::with_facts_and_image_media(facts, HashMap::new()).await?;
 
-    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
+    let page = ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), image_page_size()?, None)
+        .await?;
     assert!(
-        detail.images.is_empty(),
+        page.images.is_empty(),
         "an unresolved depiction contributes no grid tile, got {:?}",
-        detail.images
+        page.images
+    );
+    Ok(())
+}
+
+/// Commit a named, placeable entity depicted by `count` distinct images, each
+/// carrying a Commons `Source` URL and a `Picture` medium. Returns the entity id
+/// and its image ids in declaration order. Drives the paginated image grid.
+async fn commit_entity_with_depicted_images(
+    facts: &MemoryFactStore,
+    name: &str,
+    lat: f64,
+    lon: f64,
+    count: usize,
+) -> Result<(MemoryEntityId, Vec<MemoryImageId>), Box<dyn std::error::Error + Send + Sync>> {
+    let mut submit_facts = vec![
+        SubmitFact::Factual {
+            assertion: FactualAssertion::Attribute {
+                fact: attribute::Fact::Name {
+                    entity: EntityIdx(0),
+                    name: NameText::new(name),
+                    language: Language::new("en")?,
+                    name_type: NameType::Common,
+                    valid_from: None,
+                    valid_to: None,
+                },
+            },
+            citation: citation("https://example.com/name")?,
+        },
+        SubmitFact::Factual {
+            assertion: FactualAssertion::Construction {
+                fact: ConstructionFact::Location {
+                    entity: EntityIdx(0),
+                    location: resolved_point(lat, lon)?,
+                },
+            },
+            citation: citation("https://example.com/location")?,
+        },
+    ];
+    for image in 0..count {
+        submit_facts.push(SubmitFact::Factual {
+            assertion: FactualAssertion::Image {
+                fact: image::Fact::Source {
+                    image: ImageIdx(image),
+                    url: url::Url::parse(&format!(
+                        "https://commons.wikimedia.org/img-{image}.jpg"
+                    ))?,
+                },
+            },
+            citation: citation("https://commons.wikimedia.org/source")?,
+        });
+        submit_facts.push(SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Depiction {
+                fact: depiction::Fact {
+                    entity: EntityIdx(0),
+                    image: ImageIdx(image),
+                    localization: None,
+                    perspective: Some(Perspective::Exterior),
+                },
+            },
+            citation: JudgmentSource::External {
+                source: ExternalSource::Url {
+                    url: url::Url::parse(&format!("https://commons.wikimedia.org/dep-{image}"))?,
+                    published: None,
+                },
+            },
+        });
+    }
+    let commit = Commit::<MemoryIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: (0..count).map(|_| Decl::Local).collect(),
+        facts: submit_facts.into_iter().collect(),
+    };
+
+    let result = commit_facts(facts, commit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let entity_id = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity 0 resolved")?
+        .id;
+    let image_ids = (0..count)
+        .map(|image| {
+            result
+                .images
+                .get(&ImageIdx(image))
+                .map(|r| r.id)
+                .ok_or("image resolved")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((entity_id, image_ids))
+}
+
+/// Commit one more exterior depiction onto an existing entity, minting a fresh
+/// image that carries a Commons `Source` URL. Lands an intervening write after a
+/// page-1 read so a resume can prove it reads the pinned snapshot, not `now()`.
+async fn commit_extra_depiction_on(
+    facts: &MemoryFactStore,
+    entity_id: MemoryEntityId,
+    image_source_url: &str,
+) -> Result<MemoryImageId, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<MemoryIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Existing { id: entity_id }],
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: image::Fact::Source {
+                        image: ImageIdx(0),
+                        url: url::Url::parse(image_source_url)?,
+                    },
+                },
+                citation: citation("https://commons.wikimedia.org/source")?,
+            },
+            SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Depiction {
+                    fact: depiction::Fact {
+                        entity: EntityIdx(0),
+                        image: ImageIdx(0),
+                        localization: None,
+                        perspective: Some(Perspective::Exterior),
+                    },
+                },
+                citation: JudgmentSource::External {
+                    source: ExternalSource::Url {
+                        url: url::Url::parse("https://commons.wikimedia.org/depiction-extra")?,
+                        published: None,
+                    },
+                },
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(facts, commit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let image_id = result
+        .images
+        .get(&ImageIdx(0))
+        .ok_or("extra image resolved")?
+        .id;
+    Ok(image_id)
+}
+
+#[tokio::test]
+async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult {
+    let facts = MemoryFactStore::new();
+    // Three depicted images inside one entity; limit=1 forces the walk across
+    // cursor-linked pages, exercising the images cursor encode/decode round trip.
+    let (id, image_ids) =
+        commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 3).await?;
+    let media: HashMap<MemoryImageId, ResolvedImageMedia> = image_ids
+        .iter()
+        .map(|&image_id| (image_id, resolved_media(image_id)))
+        .collect();
+    // The wire form of a backend image id is its decimal string, the same shape
+    // the tiles carry back; compare on that rather than re-parsing.
+    let expected: BTreeSet<String> = image_ids.iter().map(|id| id.0.to_string()).collect();
+    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+
+    let one = NonZeroU32::new(1).ok_or("nonzero")?;
+
+    // Page 1 caps at one image and hands back a cursor while images remain.
+    let page1 = ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), one, None)
+        .await?;
+    assert_eq!(
+        page1.images.len(),
+        1,
+        "limit=1 caps the first page at a single image tile"
+    );
+    let mut seen: BTreeSet<String> = page1
+        .images
+        .iter()
+        .map(|tile| tile.id.as_str().to_string())
+        .collect();
+    let mut cursor: Option<Cursor> = Some(
+        page1
+            .next
+            .ok_or("page 1 must carry a next cursor while images remain")?,
+    );
+
+    let mut pages = 1;
+    while let Some(c) = cursor.take() {
+        let page = ctx
+            .client
+            .get_entity_images(&wire_entity_id(id), one, Some(&c))
+            .await?;
+        for tile in &page.images {
+            assert!(
+                seen.insert(tile.id.as_str().to_string()),
+                "image {} surfaced on two different pages",
+                tile.id.as_str()
+            );
+        }
+        cursor = page.next;
+        pages += 1;
+        assert!(pages <= 8, "cursor pagination failed to terminate");
+    }
+
+    assert_eq!(
+        seen, expected,
+        "the cursor walk covers every depicting image exactly once"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> TestResult {
+    let facts = MemoryFactStore::new();
+    // Three depicted images make ≥2 pages at limit=1. Media is registered for a
+    // range past those three, so a later image would resolve into a tile *if* the
+    // resume erroneously read `now()` rather than the cursor's pinned snapshot.
+    let (id, image_ids) =
+        commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 3).await?;
+    let media: HashMap<MemoryImageId, ResolvedImageMedia> = (0..8u64)
+        .map(|i| {
+            let image_id = MemoryImageId(i);
+            (image_id, resolved_media(image_id))
+        })
+        .collect();
+    let expected: BTreeSet<String> = image_ids.iter().map(|id| id.0.to_string()).collect();
+    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+
+    let one = NonZeroU32::new(1).ok_or("nonzero")?;
+
+    // Page 1 pins its snapshot into the cursor it hands back.
+    let page1 = ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), one, None)
+        .await?;
+    let mut seen: BTreeSet<String> = page1
+        .images
+        .iter()
+        .map(|tile| tile.id.as_str().to_string())
+        .collect();
+    let mut cursor: Option<Cursor> = Some(
+        page1
+            .next
+            .ok_or("page 1 must carry a next cursor while images remain")?,
+    );
+
+    // A fourth depiction lands on the same entity after page 1. Its facts postdate
+    // the cursor's snapshot, so the resumed walk must never surface it — a `now()`
+    // read would, since its media is registered and it carries a source URL.
+    let intruder = commit_extra_depiction_on(
+        &ctx.app_state.facts,
+        id,
+        "https://commons.wikimedia.org/intruder.jpg",
+    )
+    .await?;
+
+    let mut pages = 1;
+    while let Some(c) = cursor.take() {
+        // A snapshot-pinned cursor resumes cleanly; the typed client turns any
+        // 400 into an `Err` the `?` would surface.
+        let page = ctx
+            .client
+            .get_entity_images(&wire_entity_id(id), one, Some(&c))
+            .await?;
+        for tile in &page.images {
+            assert!(
+                seen.insert(tile.id.as_str().to_string()),
+                "image {} surfaced on two different pages",
+                tile.id.as_str()
+            );
+        }
+        cursor = page.next;
+        pages += 1;
+        assert!(pages <= 8, "cursor pagination failed to terminate");
+    }
+
+    assert_eq!(
+        seen, expected,
+        "the resumed walk covers exactly the three images the pinned snapshot held"
+    );
+    assert!(
+        !seen.contains(&intruder.0.to_string()),
+        "the image committed after the cursor's snapshot must not surface mid-walk"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_images_404s_for_an_id_no_fact_ever_named() -> TestResult {
+    // The images sub-resource mirrors `get_entity`'s "not found": an id no
+    // committed fact named 404s rather than returning an empty grid, and the
+    // 404 carries CORS so the cross-origin web panel reads it as a clean "not
+    // found" instead of an opaque transport error.
+    let ctx = TestContext::new().await?;
+    // A fresh store mints entity ids from 0; this id was never declared.
+    let resp = ctx.get("/entities/999999/images?limit=50").await?;
+    assert_eq!(
+        resp.status(),
+        404,
+        "an id no fact named must 404, not return an empty grid"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "the 404 must carry CORS so a cross-origin client can read it"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_images_requires_a_limit_with_cors() -> TestResult {
+    // `limit` is required, but declared `Option` at the deserialize layer so a
+    // missing value reaches the handler and 400s *with* CORS. A required
+    // `NonZeroU32` would make Dropshot reject a missing limit before the handler,
+    // with no CORS headers — unreadable to the cross-origin web client.
+    let ctx = TestContext::new().await?;
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Pantheon", 41.8986, 12.4769).await?;
+
+    let resp = ctx.get(&format!("/entities/{}/images", id.0)).await?;
+    assert_eq!(resp.status(), 400, "a missing limit is a bad request");
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*"),
+        "the 400 must carry CORS so the browser can read the message"
     );
     Ok(())
 }
@@ -869,6 +1231,77 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
     assert_eq!(
         seen, expected,
         "the cursor walk covers every committed entity exactly once"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // Three placeable entities in one small bbox make ≥2 pages at limit=1.
+    let expected: std::collections::BTreeSet<MemoryEntityId> = [
+        commit_named_entity_at(&ctx.app_state.facts, "Alpha", 43.771, 11.251).await?,
+        commit_named_entity_at(&ctx.app_state.facts, "Beta", 43.772, 11.252).await?,
+        commit_named_entity_at(&ctx.app_state.facts, "Gamma", 43.773, 11.253).await?,
+    ]
+    .into_iter()
+    .collect();
+
+    let bbox = "min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
+
+    // Page 1 pins its snapshot into the cursor it hands back.
+    let resp = ctx.get(&format!("/entities?{bbox}&limit=1")).await?;
+    assert_eq!(resp.status(), 200);
+    let page1: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
+    let mut seen: std::collections::BTreeSet<MemoryEntityId> =
+        page1.summaries.iter().map(|s| s.id).collect();
+    let mut cursor: Option<Cursor> = Some(
+        page1
+            .next
+            .ok_or("page 1 must carry a next cursor while entities remain")?,
+    );
+
+    // Three more in-box entities land after page 1. Their facts postdate the
+    // cursor's snapshot, so the resumed walk must never surface them — a `now()`
+    // read would, since all six sit in the same bbox.
+    let intruders: std::collections::BTreeSet<MemoryEntityId> = [
+        commit_named_entity_at(&ctx.app_state.facts, "Delta", 43.774, 11.254).await?,
+        commit_named_entity_at(&ctx.app_state.facts, "Epsilon", 43.775, 11.255).await?,
+        commit_named_entity_at(&ctx.app_state.facts, "Zeta", 43.776, 11.256).await?,
+    ]
+    .into_iter()
+    .collect();
+
+    let mut pages = 1;
+    while let Some(c) = cursor.take() {
+        let resp = ctx
+            .get(&format!("/entities?{bbox}&limit=1&cursor={}", c.as_str()))
+            .await?;
+        assert_eq!(
+            resp.status(),
+            200,
+            "a snapshot-pinned cursor resumes as a 200, never a stale-snapshot 400"
+        );
+        let page: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
+        for summary in &page.summaries {
+            assert!(
+                seen.insert(summary.id),
+                "entity {:?} surfaced on two different pages",
+                summary.id
+            );
+        }
+        cursor = page.next;
+        pages += 1;
+        assert!(pages <= 8, "cursor pagination failed to terminate");
+    }
+
+    assert_eq!(
+        seen, expected,
+        "the resumed walk covers exactly the entities the pinned snapshot held"
+    );
+    assert!(
+        seen.is_disjoint(&intruders),
+        "entities committed after the cursor's snapshot must not surface mid-walk"
     );
     Ok(())
 }

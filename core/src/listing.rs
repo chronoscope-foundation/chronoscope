@@ -22,8 +22,9 @@ use serde::{Deserialize, Serialize};
 use crate::geo::{Bbox, GeoPoint};
 use crate::grammar::depiction::Perspective;
 use crate::grammar::ids::FactId;
-use crate::projection::Claimed;
-use crate::projection::{member_lineage, project_entity};
+use crate::projection::{
+    Bracket, Claimed, DepictionRecord, FactMap, MemberLineage, member_lineage, project_entity,
+};
 use crate::store::schema::EntityStream;
 use crate::store::{EntityIdOf, EntityView, EventView, FactStore, ImageIdOf};
 use crate::typed;
@@ -40,27 +41,40 @@ pub fn extract_point<EntId: Ord, EvtId, ImgId>(
 
 /// The image whose thumbnail represents this entity on the map: the first
 /// depiction classified `Exterior`, else the first depiction, `None` when the
-/// entity has none. Exterior is read off the depiction's own perspective —
-/// cheap — so the marker listing settles on a representative without
-/// re-projecting the image.
-fn representative_image<EntId, EvtId, ImgId>(
-    entity: &typed::Entity<EntId, EvtId, ImgId>,
+/// entity has none. Perspective is read straight off each depiction record's
+/// bracket, so the pick settles a representative without materializing typed
+/// depictions or cloning their localization geometry and citations.
+fn representative_image<EntId, ImgId>(
+    depictions: &FactMap<
+        ImgId,
+        DepictionRecord<MemberLineage<EntId, ImgId>>,
+        MemberLineage<EntId, ImgId>,
+    >,
 ) -> Option<ImgId>
 where
-    EntId: Ord,
-    ImgId: Clone,
+    EntId: Ord + Clone,
+    ImgId: Ord + Clone,
 {
-    entity
-        .depictions
-        .iter()
-        .find(|d| is_exterior(&d.perspective))
-        .or_else(|| entity.depictions.first())
-        .map(|d| d.other.clone())
+    let mut first: Option<&ImgId> = None;
+    for (image, entry) in depictions {
+        first.get_or_insert(image);
+        if is_exterior(&entry.value.perspective) {
+            return Some(image.clone());
+        }
+    }
+    first.cloned()
 }
 
-/// Whether a depiction's perspective settled to `Exterior`.
-fn is_exterior<ImgId>(perspective: &typed::Bounded<Claimed<Perspective>, ImgId>) -> bool {
-    perspective
+/// Whether a depiction's perspective settled to `Exterior`, flattened and
+/// settled off the record's bracket the same way the typed projection reads it.
+fn is_exterior<EntId, ImgId>(
+    perspective: &Bracket<Claimed<Perspective>, MemberLineage<EntId, ImgId>>,
+) -> bool
+where
+    EntId: Ord + Clone,
+    ImgId: Ord + Clone,
+{
+    typed::bracket(perspective)
         .settled()
         .map(|p| *p == Perspective::Exterior)
         .unwrap_or(false)
@@ -89,8 +103,9 @@ pub struct EntitySummary<EntId, ImgId> {
 }
 
 /// A resume token for [`summaries_in_bbox`]: the snapshot it was minted against
-/// and the walk cursor to continue past. Pinning the snapshot lets a resume
-/// reject a token from a different view rather than silently mixing states.
+/// and the walk cursor to continue past. The snapshot lets a resume re-open the
+/// exact past view the first page read, so the walk continues over one stable
+/// snapshot and never sees writes that landed after it started.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ListCursor<Cur> {
     pub snapshot: FactId,
@@ -108,12 +123,10 @@ pub struct EntityListPage<EntId, ImgId, Cur> {
     pub next: Option<ListCursor<Cur>>,
 }
 
-/// A listing failure: a backend error from the walk or projection, or a cursor
-/// minted against a different snapshot than the view it was replayed on.
+/// A listing failure: a backend error from the walk or projection.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ListError<E> {
     Backend(E),
-    SnapshotMismatch,
 }
 
 /// List the entities whose current marker falls in `bbox`, at the view's
@@ -128,8 +141,10 @@ pub enum ListError<E> {
 /// size: the result holds at least `limit` summaries (or every one the viewport
 /// has) and overshoots by at most one page.
 ///
-/// A `cursor` from a different snapshot yields [`ListError::SnapshotMismatch`];
-/// a fresh listing passes `None`.
+/// `view` is read at whatever snapshot the caller opened it on; a resume opens
+/// the view at the `cursor`'s snapshot, so the walk continues over the same
+/// pinned state the first page read. The `next` cursor carries that snapshot
+/// forward. A fresh listing passes `None`.
 pub async fn summaries_in_bbox<S, V>(
     view: &mut V,
     bbox: &Bbox,
@@ -144,12 +159,6 @@ where
     V: EntityView<S> + EventView<S> + Sync,
 {
     let snapshot = view.snapshot().await.map_err(ListError::Backend)?;
-    if let Some(c) = &cursor
-        && c.snapshot != snapshot
-    {
-        return Err(ListError::SnapshotMismatch);
-    }
-
     let mut after = cursor.map(|c| c.walk);
     let mut summaries: Vec<EntitySummary<EntityIdOf<S>, ImageIdOf<S>>> = Vec::new();
 
@@ -184,7 +193,12 @@ where
                 && bbox.contains(&point)
             {
                 let (earliest, latest) = timeline_span(entity.timeline.events());
-                let thumbnail = representative_image(&entity);
+                // One representative depicted-image id — the raw depiction map
+                // key. It needn't equal a tile's representative id from the images
+                // sub-resource, which keys each tile by its image's `SameArtifact`
+                // class; both ids resolve to the same image through that class, so
+                // the marker thumbnail still loads.
+                let thumbnail = representative_image(&projected.depictions);
                 summaries.push(EntitySummary {
                     id: entity.id,
                     names: entity.names,

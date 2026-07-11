@@ -30,15 +30,19 @@ pub use types::{
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 
+use crate::algebra::monoid::CommutativeMonoid;
 use crate::algebra::semiring::{Lineage, Semiring};
+use crate::grammar::assertions::JudgmentAssertion;
 use crate::grammar::ids::{FactId, IdScheme};
 use crate::store::pagination::PAGE_SIZE;
-use crate::store::schema::{EquivClass, PageItem};
+use crate::store::schema::{DepictionPage, EquivClass, PageItem};
 use crate::store::{
     EntityIdOf, EntityView, EventIdOf, EventView, FactStore, ImageIdOf, ImageView, StoredFactOf,
 };
 use crate::submit::StoredFact;
+use crate::typed;
 
 /// The member-aware lineage closure: the fact's citation becomes the singleton
 /// atom `{(id, citation)}`, keyed by the source id the fact spoke to. The
@@ -240,6 +244,87 @@ where
 
     let image = merge::project_image_facts(&facts, &class.members, provenance);
     Ok(Some((class, image)))
+}
+
+/// The `Cited<DepictionRecord>` a page's depiction rows fold into, keyed by
+/// image rep — the same entry shape an [`Entity`]'s `depictions` `FactMap`
+/// holds, over the image-scoped member lineage.
+type ImageDepiction<S> = Cited<
+    DepictionRecord<MemberLineage<ImageIdOf<S>, ImageIdOf<S>>>,
+    MemberLineage<ImageIdOf<S>, ImageIdOf<S>>,
+>;
+
+/// Assemble one page of an entity's depicting images, without projecting the
+/// whole entity.
+///
+/// [`EntityView::walk_entity_depictions`] pages the depicting images — distinct
+/// images, each image's raw depiction facts contiguous under its `SameArtifact`
+/// rep. Each image's facts fold through [`merge::inject_depiction`] +
+/// [`typed::depiction`] into one tile keyed by that rep, so competing depictions
+/// of the same artifact merge; two sources disagreeing on a merged artifact's
+/// perspective leave that axis unsettled. Region-aware disambiguation of the
+/// distinct depictions is deferred. The rows carry their facts, so there is no
+/// second store read.
+///
+/// Returns the typed [`Depiction`](typed::Depiction)s keyed by image rep and the
+/// walk's `next_class` resume cursor (`None` once the depictions are exhausted).
+pub async fn project_entity_images<S, V>(
+    view: &mut V,
+    entity: EntityIdOf<S>,
+    after: Option<S::ClassCursor<ImageIdOf<S>>>,
+    limit: NonZeroUsize,
+) -> Result<
+    (
+        Vec<typed::Depiction<ImageIdOf<S>, ImageIdOf<S>>>,
+        Option<S::ClassCursor<ImageIdOf<S>>>,
+    ),
+    S::Error,
+>
+where
+    S: FactStore,
+    V: EntityView<S>,
+{
+    let DepictionPage { rows, next_class } =
+        view.walk_entity_depictions(&entity, after, limit).await?;
+
+    // Group the page's rows by image rep, folding each image's depiction facts
+    // into one `Cited<DepictionRecord>` — the per-key merge `Entity::parse`'s
+    // `depictions` FactMap runs: values meet, supports sum. The source id the
+    // depiction's support cites is the image rep, so the atoms mirror the
+    // image-side projection.
+    let mut folded: BTreeMap<ImageIdOf<S>, ImageDepiction<S>> = BTreeMap::new();
+    for PageItem {
+        fact_id,
+        fact,
+        representative,
+    } in rows
+    {
+        let StoredFact::Judgment(judgment) = &fact else {
+            continue;
+        };
+        let JudgmentAssertion::Depiction { fact: depiction } = &judgment.assertion else {
+            continue;
+        };
+        let support = member_lineage(&fact_id, &representative, &fact);
+        let entry = Cited {
+            value: merge::inject_depiction(depiction, &support),
+            support,
+        };
+        let merged = match folded.remove(&representative) {
+            Some(existing) => Cited {
+                value: existing.value.combine(entry.value),
+                support: existing.support.plus(entry.support),
+            },
+            None => entry,
+        };
+        folded.insert(representative, merged);
+    }
+
+    let depictions = folded
+        .iter()
+        .map(|(image, entry)| typed::depiction(image.clone(), entry))
+        .collect();
+    Ok((depictions, next_class))
 }
 
 #[cfg(test)]

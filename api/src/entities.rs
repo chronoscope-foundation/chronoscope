@@ -14,14 +14,18 @@ use http::Response;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use chronoscope_api_client::{Cursor, DetailImage, EntityDetail, EntityListPage, MarkersResponse};
+use chronoscope_api_client::{
+    Cursor, DetailImage, EntityDetail, EntityImagesPage, EntityListPage, MarkersResponse,
+};
 use chronoscope_core::conflicts::{cited_lineage, detect_conflicts};
 use chronoscope_core::geo;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::listing::{self, ListCursor, summaries_in_bbox};
-use chronoscope_core::projection::{member_lineage, project_entity, project_image};
+use chronoscope_core::projection::{
+    member_lineage, project_entity, project_entity_images, project_image,
+};
 use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
-use chronoscope_core::store::{FactStore, ImageView};
+use chronoscope_core::store::{EntityView, FactStore, FactView, ImageView};
 use chronoscope_core::typed;
 
 use crate::cdn;
@@ -48,36 +52,72 @@ fn accept_language(ctx: &RequestContext<Arc<AppState>>) -> Option<&str> {
 /// token via [`encode_cursor`], never exposed structurally.
 type ListState = ListCursor<(MemoryEntityId, FactId)>;
 
-/// Version byte prefixing an encoded cursor blob. A token minted under a
-/// different version is rejected rather than misparsed.
+/// The `/entities/{id}/images` resume cursor: the pinned snapshot plus the
+/// depiction walk's image-class position. Its own version namespace, so a token
+/// minted for the entity listing can't be replayed here.
+type ImagesListState = ListCursor<(MemoryImageId, FactId)>;
+
+/// Version byte prefixing an encoded entity-listing cursor. A token minted under
+/// a different version is rejected rather than misparsed.
 const CURSOR_VERSION: u8 = 1;
 
-/// Encode the internal [`ListState`] into the opaque wire token: a version byte
-/// then its JSON form, base64url-encoded.
-fn encode_cursor(state: &ListState) -> Result<Cursor, HttpError> {
-    let mut bytes = vec![CURSOR_VERSION];
+/// Version byte prefixing an encoded entity-images cursor. Distinct from
+/// [`CURSOR_VERSION`] so the two cursor families can't be confused — their walk
+/// payloads are shape-identical on the wire (entity and image ids both
+/// serialize as decimal strings), so the version byte is the only thing that
+/// tells them apart.
+const IMAGES_CURSOR_VERSION: u8 = 2;
+
+/// Encode an internal cursor state into the opaque wire token: a `version` byte
+/// then its JSON form, base64url-encoded. Each cursor family owns its own
+/// version byte, so this is the one place the wire envelope lives.
+fn encode_cursor_blob<T: serde::Serialize>(version: u8, state: &T) -> Result<Cursor, HttpError> {
+    let mut bytes = vec![version];
     serde_json::to_writer(&mut bytes, state)
         .map_err(|e| internal_error_with_cors(format!("cursor encode failed: {e}")))?;
     Ok(Cursor::new(BASE64_URL_SAFE_NO_PAD.encode(&bytes)))
 }
 
-/// Decode an opaque wire token back into the internal [`ListState`]. A malformed
-/// blob or a token from a different [`CURSOR_VERSION`] surfaces as a CORS-tagged
-/// 400 the browser can read.
-fn decode_cursor(cursor: &Cursor) -> Result<ListState, HttpError> {
+/// Decode an opaque wire token back into a cursor state. A malformed blob or a
+/// token from a different `version` surfaces as a CORS-tagged 400 the browser
+/// can read. The inverse of [`encode_cursor_blob`].
+fn decode_cursor_blob<T: serde::de::DeserializeOwned>(
+    version: u8,
+    cursor: &Cursor,
+) -> Result<T, HttpError> {
     let bytes = BASE64_URL_SAFE_NO_PAD
         .decode(cursor.as_str())
         .map_err(|e| bad_request_with_cors(format!("Invalid cursor: {e}")))?;
-    let (&version, payload) = bytes
+    let (&found, payload) = bytes
         .split_first()
         .ok_or_else(|| bad_request_with_cors("Invalid cursor: empty token".to_string()))?;
-    if version != CURSOR_VERSION {
+    if found != version {
         return Err(bad_request_with_cors(format!(
-            "Invalid cursor: unsupported version {version}"
+            "Invalid cursor: unsupported version {found}"
         )));
     }
     serde_json::from_slice(payload)
         .map_err(|e| bad_request_with_cors(format!("Invalid cursor: {e}")))
+}
+
+/// Encode the entity-listing resume cursor.
+fn encode_cursor(state: &ListState) -> Result<Cursor, HttpError> {
+    encode_cursor_blob(CURSOR_VERSION, state)
+}
+
+/// Decode the entity-listing resume cursor.
+fn decode_cursor(cursor: &Cursor) -> Result<ListState, HttpError> {
+    decode_cursor_blob(CURSOR_VERSION, cursor)
+}
+
+/// Encode the entity-images resume cursor.
+fn encode_images_cursor(state: &ImagesListState) -> Result<Cursor, HttpError> {
+    encode_cursor_blob(IMAGES_CURSOR_VERSION, state)
+}
+
+/// Decode the entity-images resume cursor.
+fn decode_images_cursor(cursor: &Cursor) -> Result<ImagesListState, HttpError> {
+    decode_cursor_blob(IMAGES_CURSOR_VERSION, cursor)
 }
 
 /// Parse the four viewport query fields into the fact store's `Bbox`.
@@ -193,17 +233,21 @@ pub async fn list_entities(
         Some(c) => Some(decode_cursor(&c)?),
     };
 
-    let mut view = state.facts.now().await.map_err(fact_store_err)?;
+    // Resume reads at the cursor's pinned snapshot; the first page reads `now()`.
+    // The log is append-only, so a pinned snapshot stays readable forever — a
+    // cursor is never stale.
+    let mut view = match &cursor {
+        Some(c) => state
+            .facts
+            .no_later_than(c.snapshot)
+            .await
+            .map_err(fact_store_err)?,
+        None => state.facts.now().await.map_err(fact_store_err)?,
+    };
     let page =
         match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, cursor, limit).await {
             Ok(p) => p,
             Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
-            Err(listing::ListError::SnapshotMismatch) => {
-                return error_with_cors(
-                    http::StatusCode::BAD_REQUEST,
-                    "cursor is from a stale snapshot; restart the listing without a cursor",
-                );
-            }
         };
 
     let next = page.next.map(|c| encode_cursor(&c)).transpose()?;
@@ -216,10 +260,10 @@ pub async fn list_entities(
 
 /// Get a single entity with full detail (public, no authentication required).
 ///
-/// The response is the fact store's typed entity projection wrapped alongside
-/// its resolved detail image grid: each depicted image is projected for its
-/// source URL and rendered into a [`DetailImage`]. External links live in
-/// `entity.external_refs`.
+/// The response is the fact store's typed entity projection plus its negotiated
+/// display name and conflict reports. External links live in
+/// `entity.external_refs`; the depicting images are the paginated
+/// `GET /entities/{id}/images` sub-resource.
 #[endpoint {
     method = GET,
     path = "/entities/{id}",
@@ -243,13 +287,123 @@ pub async fn get_entity(
     };
     let entity = typed::Entity::parse(&projected, &class);
 
-    // Each depicted image serves its full-resolution original from our own
-    // `/media/{key}` as `display_url`, keeping the upstream Commons URL as
-    // `source_url` for the "open original" link. A depiction whose image lacks
-    // a `Source` fact, or whose image the resolver never stored, contributes no
-    // grid tile — a tile that can't load is worse than an absent one.
+    // This entity's own over-determined date slots. The typed projection above
+    // carries citations for the read DTO; the detector reads the whole fighting
+    // facts, so the same class is projected again under `cited_lineage`. The id
+    // already projected `Some` above, so the cited projection matches; a `None`
+    // means the class emptied between the two reads, which carries no conflicts.
+    let conflicts = match project_entity::<MemoryFactStore, _, _>(&mut view, id, cited_lineage)
+        .await
+        .map_err(fact_store_err)?
+    {
+        Some((_, cited_entity)) => detect_conflicts::<MemoryIds>(&id, &cited_entity),
+        None => Vec::new(),
+    };
+
+    let display_name = entity_types::negotiate_name(&entity.names, accept_language(&ctx));
+    let detail = EntityDetail {
+        entity,
+        display_name,
+        conflicts,
+    };
+    json_with_cors_vary_language(&detail)
+}
+
+/// Query parameters for the entity images sub-resource.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct EntityImagesQueryParams {
+    /// Page size, counting distinct depicted images; required, and the server
+    /// clamps it down to `limits::ENTITY_IMAGES_MAX_PAGE_SIZE`. Optional at the
+    /// deserialize layer so a missing or zero value surfaces as a CORS-readable
+    /// 400 from the handler, not a header-less Dropshot rejection a browser
+    /// can't read.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Opaque resume cursor from a previous page's `next`. Absent for the first
+    /// page.
+    #[serde(default)]
+    pub cursor: Option<Cursor>,
+}
+
+/// Page the images depicting an entity (public, no authentication required).
+///
+/// Each depicted image serves its full-resolution original from our own
+/// `/media/{key}` as `display_url`, keeping the upstream source URL as
+/// `source_url` for the "open original" link. A depiction whose image lacks a
+/// `Source` fact, or whose image the resolver never stored, contributes no grid
+/// tile — a tile that can't load is worse than an absent one.
+///
+/// The cursor is snapshot-pinned, mirroring `/entities`: a resume re-opens the
+/// view at the cursor's snapshot, so the whole walk reads one stable state. The
+/// log is append-only, so that snapshot stays readable forever — a cursor never
+/// goes stale.
+#[endpoint {
+    method = GET,
+    path = "/entities/{id}/images",
+}]
+pub async fn get_entity_images(
+    ctx: RequestContext<Arc<AppState>>,
+    path: dropshot::Path<EntityIdPath>,
+    query: Query<EntityImagesQueryParams>,
+) -> Result<Response<Body>, HttpError> {
+    let state = ctx.context();
+    let id = path.into_inner().id;
+    let params = query.into_inner();
+
+    // `limit` is required, but declared `Option` so a missing/zero value reaches
+    // the handler and rejects with a CORS-readable 400 (mirroring `/entities`),
+    // rather than a header-less Dropshot rejection a browser can't read. Over-max
+    // requests clamp down instead of 400 (the intentional divergence from
+    // `/entities`), so a client can ask for "as many as allowed".
+    let requested_limit = params
+        .limit
+        .ok_or_else(|| bad_request_with_cors("limit is required".to_string()))?;
+    let effective = requested_limit.min(limits::ENTITY_IMAGES_MAX_PAGE_SIZE);
+    let limit = NonZeroUsize::new(effective as usize)
+        .ok_or_else(|| bad_request_with_cors("limit must be at least 1".to_string()))?;
+
+    let cursor: Option<ImagesListState> = match params.cursor {
+        None => None,
+        Some(c) => Some(decode_images_cursor(&c)?),
+    };
+
+    // Resume reads at the cursor's pinned snapshot; the first page reads `now()`.
+    // The log is append-only, so a pinned snapshot stays readable forever — a
+    // cursor is never stale.
+    let mut view = match &cursor {
+        Some(c) => state
+            .facts
+            .no_later_than(c.snapshot)
+            .await
+            .map_err(fact_store_err)?,
+        None => state.facts.now().await.map_err(fact_store_err)?,
+    };
+    let snapshot = view.snapshot().await.map_err(fact_store_err)?;
+    let after = cursor.map(|c| c.walk);
+
+    let (depictions, next_walk) =
+        project_entity_images::<MemoryFactStore, _>(&mut view, id, after, limit)
+            .await
+            .map_err(fact_store_err)?;
+
+    // An empty page hides two cases: an entity that depicts nothing here, or an
+    // id no fact ever named. A single-fact backlink probe tells them apart —
+    // present facts mean an existing entity with an empty grid (200), an empty
+    // probe means no such entity (a CORS-tagged 404, mirroring `get_entity`). A
+    // non-empty page already proves existence, so the probe runs only when the
+    // page comes back empty.
+    if depictions.is_empty() {
+        let id_facts = view
+            .all_facts_about_entity(&id, None, NonZeroUsize::MIN)
+            .await
+            .map_err(fact_store_err)?;
+        if id_facts.items.is_empty() {
+            return error_with_cors(http::StatusCode::NOT_FOUND, "Entity not found");
+        }
+    }
+
     let mut images = Vec::new();
-    for dep in &entity.depictions {
+    for dep in &depictions {
         let Some(image) = typed_image(&mut view, dep.other).await? else {
             continue;
         };
@@ -269,27 +423,11 @@ pub async fn get_entity(
         });
     }
 
-    // This entity's own over-determined date slots. The typed projection above
-    // carries citations for the read DTO; the detector reads the whole fighting
-    // facts, so the same class is projected again under `cited_lineage`. The id
-    // already projected `Some` above, so the cited projection matches; a `None`
-    // means the class emptied between the two reads, which carries no conflicts.
-    let conflicts = match project_entity::<MemoryFactStore, _, _>(&mut view, id, cited_lineage)
-        .await
-        .map_err(fact_store_err)?
-    {
-        Some((_, cited_entity)) => detect_conflicts::<MemoryIds>(&id, &cited_entity),
-        None => Vec::new(),
-    };
-
-    let display_name = entity_types::negotiate_name(&entity.names, accept_language(&ctx));
-    let detail = EntityDetail {
-        entity,
-        display_name,
-        images,
-        conflicts,
-    };
-    json_with_cors_vary_language(&detail)
+    let next = next_walk
+        .map(|walk| encode_images_cursor(&ListCursor { snapshot, walk }))
+        .transpose()?;
+    let response = EntityImagesPage { images, next };
+    json_with_cors(&response)
 }
 
 // ==================== Unified Markers ====================
@@ -337,14 +475,6 @@ pub async fn list_markers(
         match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, None, limit).await {
             Ok(p) => p,
             Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
-            // No cursor is ever passed here, and `summaries_in_bbox` only checks
-            // snapshot staleness against a supplied cursor — unreachable in
-            // practice, handled rather than assumed away.
-            Err(listing::ListError::SnapshotMismatch) => {
-                return Err(internal_error_with_cors(
-                    "unexpected snapshot mismatch with no cursor".to_string(),
-                ));
-            }
         };
 
     // Serve each marker's representative thumbnail from our own `/media/{key}`.
@@ -400,6 +530,18 @@ pub async fn entity_options(
     cors_preflight()
 }
 
+/// CORS preflight for the entity images sub-resource.
+#[endpoint {
+    method = OPTIONS,
+    path = "/entities/{id}/images",
+}]
+pub async fn entity_images_options(
+    _ctx: RequestContext<Arc<AppState>>,
+    _path: dropshot::Path<EntityIdPath>,
+) -> Result<Response<Body>, HttpError> {
+    cors_preflight()
+}
+
 /// CORS preflight for unified markers endpoint.
 #[endpoint {
     method = OPTIONS,
@@ -417,9 +559,9 @@ mod tests {
 
     /// A rejected cursor is client-supplied input, so it must surface as a
     /// browser-readable 400 rather than a panic or a 500.
-    fn assert_rejected_400(result: Result<ListState, HttpError>) -> Result<(), String> {
+    fn assert_rejected_400<T>(result: Result<T, HttpError>) -> Result<(), String> {
         match result {
-            Ok(_) => Err("expected a rejected cursor, got a decoded ListState".to_string()),
+            Ok(_) => Err("expected a rejected cursor, got a decoded state".to_string()),
             Err(err) if err.status_code.as_status() == http::StatusCode::BAD_REQUEST => Ok(()),
             Err(err) => Err(format!(
                 "expected a 400, got {}",
@@ -446,5 +588,36 @@ mod tests {
         // `CURSOR_VERSION` is refused before any payload parse.
         let token = BASE64_URL_SAFE_NO_PAD.encode([CURSOR_VERSION.wrapping_add(1)]);
         assert_rejected_400(decode_cursor(&Cursor::new(token)))
+    }
+
+    #[test]
+    fn decode_images_cursor_rejects_an_empty_token() -> Result<(), String> {
+        assert_rejected_400(decode_images_cursor(&Cursor::new("")))
+    }
+
+    #[test]
+    fn decode_images_cursor_rejects_non_base64() -> Result<(), String> {
+        assert_rejected_400(decode_images_cursor(&Cursor::new("!!! not base64 !!!")))
+    }
+
+    #[test]
+    fn decode_images_cursor_rejects_an_unsupported_version_byte() -> Result<(), String> {
+        let token = BASE64_URL_SAFE_NO_PAD.encode([IMAGES_CURSOR_VERSION.wrapping_add(1)]);
+        assert_rejected_400(decode_images_cursor(&Cursor::new(token)))
+    }
+
+    #[test]
+    fn decode_images_cursor_rejects_an_entity_listing_cursor() -> Result<(), String> {
+        // The entity-listing and images cursors have shape-identical walk
+        // payloads on the wire (entity and image ids both serialize as decimal
+        // strings), so only the version byte separates them. An `/entities`
+        // cursor must be refused by the images decoder, never silently misparsed
+        // into an image walk position.
+        let entity_cursor = encode_cursor(&ListCursor {
+            snapshot: FactId::new(0),
+            walk: (MemoryEntityId(1), FactId::new(2)),
+        })
+        .map_err(|e| format!("{e:?}"))?;
+        assert_rejected_400(decode_images_cursor(&entity_cursor))
     }
 }

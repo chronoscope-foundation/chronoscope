@@ -196,18 +196,89 @@ fn EntityDetailContent(
     api_client: Rc<RefCell<Option<api::Client>>>,
 ) -> impl IntoView {
     let (retry_count, set_retry_count) = signal(0u32);
-    let detail = LocalResource::new(move || {
-        // Include retry_count in the dependency so incrementing it re-fetches.
-        let _retry = retry_count.get();
-        let api = api_client.clone();
-        // The resource re-runs on each dependency change, so hand the future its
-        // own id clone rather than moving the captured one out of the closure.
+    let detail = LocalResource::new({
+        let api_client = api_client.clone();
         let id = id.clone();
-        async move {
-            let client = crate::api::get_or_init_client(&api)
-                .await
-                .ok_or_else(|| "Failed to load API configuration".to_string())?;
-            fetch_entity_detail(&id, &client).await
+        move || {
+            // Include retry_count in the dependency so incrementing it re-fetches.
+            let _retry = retry_count.get();
+            let api = api_client.clone();
+            // The resource re-runs on each dependency change, so hand the future
+            // its own id clone rather than moving the captured one out.
+            let id = id.clone();
+            async move {
+                let client = crate::api::get_or_init_client(&api)
+                    .await
+                    .ok_or_else(|| "Failed to load API configuration".to_string())?;
+                fetch_entity_detail(&id, &client).await
+            }
+        }
+    });
+
+    // The depicting images load page-by-page into `media`: the first page
+    // eagerly, further pages when the reader clicks "Load more". `next_cursor` is
+    // the resume token for the following page (`None` once the grid is
+    // exhausted); `loading` guards against overlapping fetches. `page_req` is the
+    // "Load more" trigger — a plain counter the (Send-bound) grid button bumps,
+    // so the button never has to capture the `!Send` API client.
+    let (media, set_media) = signal(Vec::<MediaInfo>::new());
+    let (next_cursor, set_next_cursor) = signal(Option::<api::Cursor>::None);
+    let (loading, set_loading) = signal(false);
+    let (page_req, set_page_req) = signal(0u32);
+    // The error for the images section, `None` while healthy. A failed fetch
+    // surfaces here; a retryable error offers a retry, a terminal one (the
+    // entity no longer exists) reports without one so the reader isn't stranded
+    // re-triggering a fetch that can only fail again.
+    let (images_error, set_images_error) = signal(Option::<ImagesFetchError>::None);
+
+    // Fetch one page past `cursor` and fold it into the accumulator. Holds the
+    // `!Send` API client, so it lives here in the component body rather than in
+    // the view.
+    let load_page = move |cursor: Option<api::Cursor>| {
+        if loading.get_untracked() {
+            return;
+        }
+        set_loading.set(true);
+        set_images_error.set(None);
+        let api = api_client.clone();
+        let id = id.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = match crate::api::get_or_init_client(&api).await {
+                Some(client) => fetch_entity_images_page(&id, cursor.as_ref(), &client).await,
+                None => Err(ImagesFetchError::Other(
+                    "Failed to load API configuration".to_string(),
+                )),
+            };
+            match result {
+                Ok((tiles, next)) => {
+                    set_media.update(|acc| acc.extend(tiles));
+                    set_next_cursor.set(next);
+                    set_loading.set(false);
+                }
+                // A snapshot-pinned cursor never goes stale, so a load-more reads
+                // the past snapshot where the entity existed and can't 404. A
+                // page-1 fetch (at the live snapshot) still can, if the entity was
+                // deleted after the detail load — that's terminal. The stored
+                // error carries whether a retry could help.
+                Err(e) => {
+                    set_images_error.set(Some(e));
+                    set_loading.set(false);
+                }
+            }
+        });
+    };
+
+    // Page 1 waits for the entity detail to resolve successfully: a failed or
+    // missing entity renders its own error and depicts nothing, so gating the
+    // first fetch on a loaded detail keeps a 404 from drawing a wasted image
+    // request. Each "Load more" bump (`req > 0`) pages past the stored resume
+    // cursor regardless of the detail.
+    Effect::new(move |_| {
+        let req = page_req.get();
+        if req > 0 {
+            load_page(next_cursor.get_untracked());
+        } else if matches!(detail.get(), Some(Ok(_))) {
+            load_page(None);
         }
     });
 
@@ -262,60 +333,107 @@ fn EntityDetailContent(
                                     }
                                 })}
 
-                                // Images
-                                {(!entity.media.is_empty()).then(|| {
-                                    let count = entity.media.len();
-                                    let lightbox = expect_context::<LightboxState>();
+                                // Images — a separate paginated fetch. The section
+                                // shows whenever there are tiles, another page to
+                                // fetch, or a recoverable error to retry, so a
+                                // first page that fully filters out still surfaces
+                                // "Load more" instead of stranding an empty grid.
+                                {move || {
+                                    let tiles = media.get();
+                                    let has_more = next_cursor.get().is_some();
+                                    let error = images_error.get();
+                                    let show = !tiles.is_empty() || has_more || error.is_some();
+                                    show.then(move || {
+                                        let count = tiles.len();
+                                        // Only a retryable error offers a retry; a
+                                        // terminal error (the entity no longer
+                                        // exists) doesn't, and neither does a
+                                        // healthy "more to load".
+                                        let retryable = matches!(error, Some(ImagesFetchError::Other(_)));
+                                        let button_label = if retryable { "Retry" } else { "Load more" };
+                                        let show_button = has_more || retryable;
 
-                                    view! {
+                                        view! {
                                         <div class="mb-3">
-                                            <p class="text-xs font-sans text-copper font-semibold mb-1">
-                                                {format!("Images ({count})")}
-                                            </p>
-                                            <ul class="grid grid-cols-2 gap-2" role="list">
-                                                {entity.media.iter().map(|m| {
-                                                    let alt = format!("{} view", m.label);
-                                                    let aria = format!("{alt} \u{2014} opens preview");
-                                                    let content = LightboxContent {
-                                                        url: m.display_url.clone(),
-                                                        alt: alt.clone(),
-                                                        source_url: m.source_url.clone(),
-                                                    };
-                                                    let lb = lightbox.clone();
-                                                    let on_click = move |_: leptos::ev::MouseEvent| {
-                                                        lb.open(content.clone());
-                                                    };
-                                                    view! {
-                                                        <li>
-                                                            <button
-                                                                class="relative w-full rounded-md overflow-hidden shadow-sm \
-                                                                       ring-1 ring-sepia/10 cursor-pointer \
-                                                                       hover:scale-[1.02] transition-transform"
-                                                                on:click=on_click
-                                                                aria-label=aria
-                                                            >
-                                                                // Loading placeholder (visible until image loads)
-                                                                <div class="w-full aspect-square bg-sepia/10 animate-pulse absolute inset-0"/>
-                                                                <img
-                                                                    src={m.display_url.clone()}
-                                                                    alt=alt
-                                                                    loading="lazy"
-                                                                    class="w-full aspect-square object-cover relative"
-                                                                />
-                                                                // Caption badge (bottom-right pill)
-                                                                <span class="absolute bottom-1 right-1 px-1.5 py-0.5 \
-                                                                             bg-ink/70 text-white text-xs font-sans \
-                                                                             rounded-full">
-                                                                    {m.label.clone()}
-                                                                </span>
-                                                            </button>
-                                                        </li>
+                                            {(!tiles.is_empty()).then(move || {
+                                                let lightbox = expect_context::<LightboxState>();
+                                                view! {
+                                                    <p class="text-xs font-sans text-copper font-semibold mb-1">
+                                                        {format!("Images ({count} loaded)")}
+                                                    </p>
+                                                    <ul class="grid grid-cols-2 gap-2" role="list">
+                                                        {tiles.iter().map(|m| {
+                                                            let alt = format!("{} view", m.label);
+                                                            let aria = format!("{alt} \u{2014} opens preview");
+                                                            let content = LightboxContent {
+                                                                url: m.display_url.clone(),
+                                                                alt: alt.clone(),
+                                                                source_url: m.source_url.clone(),
+                                                            };
+                                                            let lb = lightbox.clone();
+                                                            let on_click = move |_: leptos::ev::MouseEvent| {
+                                                                lb.open(content.clone());
+                                                            };
+                                                            view! {
+                                                                <li>
+                                                                    <button
+                                                                        class="relative w-full rounded-md overflow-hidden shadow-sm \
+                                                                               ring-1 ring-sepia/10 cursor-pointer \
+                                                                               hover:scale-[1.02] transition-transform"
+                                                                        on:click=on_click
+                                                                        aria-label=aria
+                                                                    >
+                                                                        // Loading placeholder (visible until image loads)
+                                                                        <div class="w-full aspect-square bg-sepia/10 animate-pulse absolute inset-0"/>
+                                                                        <img
+                                                                            src={m.display_url.clone()}
+                                                                            alt=alt
+                                                                            loading="lazy"
+                                                                            class="w-full aspect-square object-cover relative"
+                                                                        />
+                                                                        // Caption badge (bottom-right pill)
+                                                                        <span class="absolute bottom-1 right-1 px-1.5 py-0.5 \
+                                                                                     bg-ink/70 text-white text-xs font-sans \
+                                                                                     rounded-full">
+                                                                            {m.label.clone()}
+                                                                        </span>
+                                                                    </button>
+                                                                </li>
+                                                            }
+                                                        }).collect::<Vec<_>>()}
+                                                    </ul>
+                                                }
+                                            })}
+                                            {error.map(|e| {
+                                                let text = match e {
+                                                    ImagesFetchError::Gone => {
+                                                        "Images are no longer available; this entity no longer exists.".to_string()
                                                     }
-                                                }).collect::<Vec<_>>()}
-                                            </ul>
+                                                    ImagesFetchError::Other(m) => {
+                                                        format!("Couldn\u{2019}t load images: {m}")
+                                                    }
+                                                };
+                                                view! {
+                                                    <p class="text-sm text-red-600 mt-2">{text}</p>
+                                                }
+                                            })}
+                                            {show_button.then(move || view! {
+                                                <button
+                                                    class="mt-2 w-full text-sm text-ink hover:underline \
+                                                           cursor-pointer disabled:opacity-50 disabled:cursor-default"
+                                                    on:click=move |_: leptos::ev::MouseEvent| {
+                                                        set_page_req.update(|n| *n += 1);
+                                                    }
+                                                    disabled=move || loading.get()
+                                                    aria-label="Load more images"
+                                                >
+                                                    {button_label}
+                                                </button>
+                                            })}
                                         </div>
-                                    }
-                                })}
+                                        }
+                                    })
+                                }}
 
                                 // Links
                                 {(!entity.links.is_empty()).then(|| {
@@ -408,10 +526,10 @@ struct EntityDetailView {
     name: Option<String>,
     timeline: Vec<TimelineRow>,
     links: Vec<LinkInfo>,
-    media: Vec<MediaInfo>,
 }
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 use chronoscope_core::Claimed;
 use chronoscope_core::date::{DateBound, DatePrecision, UncertainDate};
@@ -423,8 +541,16 @@ use chronoscope_core::typed::{Attributed, Bounded, EventDetail, InteriorEvent, M
 
 use chronoscope_api_client::{EntityId, EventId, ImageId};
 
+/// Image tiles fetched per grid page. The panel loads the first page eagerly and
+/// appends further pages on demand via "Load more".
+const IMAGES_PAGE_SIZE: NonZeroU32 = match NonZeroU32::new(24) {
+    Some(n) => n,
+    None => NonZeroU32::MIN,
+};
+
 /// Fetch entity detail using the typed API client and flatten it into the
-/// view model the panel renders.
+/// view model the panel renders. The depicting images are a separate paginated
+/// fetch ([`fetch_entity_images_page`]).
 async fn fetch_entity_detail(
     id: &EntityId,
     client: &api::Client,
@@ -432,7 +558,6 @@ async fn fetch_entity_detail(
     let api::EntityDetail {
         entity,
         display_name,
-        images,
         conflicts: _,
     } = client.get_entity(id).await.map_err(|e| e.to_string())?;
 
@@ -442,7 +567,46 @@ async fn fetch_entity_detail(
         .iter()
         .filter_map(|r| link_info(&r.value))
         .collect();
-    let media = images
+
+    Ok(EntityDetailView {
+        name: display_name,
+        timeline,
+        links,
+    })
+}
+
+/// Why an image-page fetch failed, split by whether a retry can help.
+#[derive(Clone)]
+enum ImagesFetchError {
+    /// The entity no longer exists — a 404. Terminal: a snapshot-pinned cursor
+    /// never goes stale, so only a page-1 read (at the live snapshot) can hit
+    /// this, when the entity was deleted after the detail load. A retry would
+    /// just 404 again.
+    Gone,
+    /// Any other failure; surfaced with a retry affordance.
+    Other(String),
+}
+
+/// Fetch one page of an entity's depicting images, flattening each tile into a
+/// [`MediaInfo`] and returning the resume cursor for the next page (`None` once
+/// the grid is exhausted).
+async fn fetch_entity_images_page(
+    id: &EntityId,
+    cursor: Option<&api::Cursor>,
+    client: &api::Client,
+) -> Result<(Vec<MediaInfo>, Option<api::Cursor>), ImagesFetchError> {
+    let page = client
+        .get_entity_images(id, IMAGES_PAGE_SIZE, cursor)
+        .await
+        .map_err(|e| match e {
+            // A snapshot-pinned cursor never goes stale and the client always
+            // sends a valid limit, so a 404 here means the entity was deleted
+            // between the detail load and this fetch.
+            api::ApiError::Api { status: 404, .. } => ImagesFetchError::Gone,
+            other => ImagesFetchError::Other(other.to_string()),
+        })?;
+    let tiles = page
+        .images
         .into_iter()
         .map(|img| MediaInfo {
             display_url: img.display_url.into(),
@@ -450,13 +614,7 @@ async fn fetch_entity_detail(
             label: api::image_caption(img.perspective, img.medium),
         })
         .collect();
-
-    Ok(EntityDetailView {
-        name: display_name,
-        timeline,
-        links,
-        media,
-    })
+    Ok((tiles, page.next))
 }
 
 // ==================== Moment → row ====================
