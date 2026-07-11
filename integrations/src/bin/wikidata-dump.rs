@@ -62,6 +62,38 @@ fn parse_entity_arg(s: &str) -> std::result::Result<(WikidataId, String), String
     Ok((id, name.to_string()))
 }
 
+/// The mutually exclusive `resolve-types` sources. Clap enforces exactly one of
+/// `--input` / `--sparql` via the arg group, so [`into_source`] can collapse
+/// them to a clean [`TypeSource`] without a runtime "you must pass one" check.
+///
+/// [`into_source`]: TypeSourceArgs::into_source
+#[derive(clap::Args)]
+#[group(required = true, multiple = false)]
+struct TypeSourceArgs {
+    /// Input Wikidata dump (JSON, .gz, or .bz2)
+    #[arg(short, long)]
+    input: Option<PathBuf>,
+
+    /// Resolve via live Wikidata SPARQL instead of the dump
+    #[arg(long)]
+    sparql: bool,
+}
+
+/// Where resolve-types reads the class hierarchy from.
+enum TypeSource {
+    Dump(PathBuf),
+    Sparql,
+}
+
+impl TypeSourceArgs {
+    fn into_source(self) -> TypeSource {
+        match self.input {
+            Some(path) => TypeSource::Dump(path),
+            None => TypeSource::Sparql,
+        }
+    }
+}
+
 #[derive(clap::Subcommand)]
 enum Command {
     /// Fetch entities from Wikidata at a specific timestamp.
@@ -89,13 +121,8 @@ enum Command {
     /// (subclass-of) graph. With `--sparql`, queries Wikidata's live SPARQL
     /// endpoint instead. Writes a sorted JSON array of Q-IDs.
     ResolveTypes {
-        /// Input Wikidata dump (JSON, .gz, or .bz2); required unless --sparql
-        #[arg(short, long)]
-        input: Option<PathBuf>,
-
-        /// Resolve via live Wikidata SPARQL instead of the dump
-        #[arg(long, conflicts_with = "input")]
-        sparql: bool,
+        #[command(flatten)]
+        source: TypeSourceArgs,
 
         /// Output types JSON file
         #[arg(short, long)]
@@ -151,11 +178,10 @@ async fn run(cli: Cli) -> Result<()> {
             output,
         } => cmd_fetch(&timestamp, &entities, &output).await,
         Command::ResolveTypes {
-            input,
-            sparql,
+            source,
             output,
             verbose,
-        } => cmd_resolve_types(input.as_deref(), sparql, &output, verbose).await,
+        } => cmd_resolve_types(source.into_source(), &output, verbose).await,
         Command::Filter {
             input,
             types,
@@ -253,22 +279,16 @@ async fn cmd_fetch(
 // RESOLVE TYPES
 // =============================================================================
 
-async fn cmd_resolve_types(
-    input: Option<&Path>,
-    sparql: bool,
-    output: &Path,
-    verbose: bool,
-) -> Result<()> {
-    let types = if sparql {
-        let client = wikidata_client(300)?;
-        if verbose {
-            eprintln!("Fetching architectural structure types from Wikidata SPARQL...");
+async fn cmd_resolve_types(source: TypeSource, output: &Path, verbose: bool) -> Result<()> {
+    let types = match source {
+        TypeSource::Dump(path) => filter::resolve_types_from_dump(&path, verbose).await?,
+        TypeSource::Sparql => {
+            let client = wikidata_client(300)?;
+            if verbose {
+                eprintln!("Fetching architectural structure types from Wikidata SPARQL...");
+            }
+            filter::fetch_architectural_types(&client).await?
         }
-        filter::fetch_architectural_types(&client).await?
-    } else {
-        let input =
-            input.ok_or_else(|| anyhow::anyhow!("--input is required unless --sparql is set"))?;
-        filter::resolve_types_from_dump(input, verbose).await?
     };
 
     filter::write_types(output, &types)?;
@@ -294,4 +314,77 @@ async fn cmd_filter(
     let target_types = filter::read_types(types)?;
     filter::filter_dump(input, output, &target_types, limit, verbose).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// The resolved `resolve-types` source for `args`, or an error if the argv
+    /// named a different subcommand.
+    fn resolve_source(args: &[&str]) -> Result<TypeSource> {
+        let Command::ResolveTypes { source, .. } = Cli::try_parse_from(args)?.command else {
+            anyhow::bail!("expected the resolve-types subcommand");
+        };
+        Ok(source.into_source())
+    }
+
+    #[test]
+    fn resolve_types_accepts_input() -> Result<()> {
+        let source = resolve_source(&[
+            "wikidata-dump",
+            "resolve-types",
+            "--input",
+            "d.gz",
+            "--output",
+            "o.json",
+        ])?;
+        assert!(
+            matches!(source, TypeSource::Dump(_)),
+            "--input resolves to a dump source"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_types_accepts_sparql() -> Result<()> {
+        let source = resolve_source(&[
+            "wikidata-dump",
+            "resolve-types",
+            "--sparql",
+            "--output",
+            "o.json",
+        ])?;
+        assert!(
+            matches!(source, TypeSource::Sparql),
+            "--sparql resolves to the SPARQL source"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_types_rejects_neither() {
+        assert!(
+            Cli::try_parse_from(["wikidata-dump", "resolve-types", "--output", "o.json"]).is_err(),
+            "neither --input nor --sparql must be a clap error"
+        );
+    }
+
+    #[test]
+    fn resolve_types_rejects_both() {
+        assert!(
+            Cli::try_parse_from([
+                "wikidata-dump",
+                "resolve-types",
+                "--input",
+                "d.gz",
+                "--sparql",
+                "--output",
+                "o.json",
+            ])
+            .is_err(),
+            "giving both --input and --sparql must be a clap error"
+        );
+    }
 }

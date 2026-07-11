@@ -114,13 +114,28 @@ pub async fn resolve_types_from_dump(
     }
 
     let reader = open_compressed(input_path).await?;
-    let mut lines = std::pin::pin!(wikidata_lines(reader));
+    let reverse = subclass_graph(wikidata_lines(reader), verbose).await?;
+    let types = architectural_closure(&reverse)?;
 
-    // parent Q-ID -> child Q-IDs. Only subclass edges land here, so this stays
-    // far smaller than the full dump.
+    if verbose {
+        eprintln!("Resolved {} architectural types", types.len());
+    }
+
+    Ok(types)
+}
+
+/// Build the reverse P279 subclass map (parent Q-ID -> child Q-IDs) from a
+/// stream of raw entity lines. Only entities carrying P279 contribute edges, so
+/// the map stays far smaller than the full dump. A malformed JSON line is
+/// counted and skipped; a read/decompress fault fails the whole pass.
+async fn subclass_graph<S>(lines: S, verbose: bool) -> Result<HashMap<String, Vec<String>>>
+where
+    S: Stream<Item = Result<String>>,
+{
+    let mut lines = std::pin::pin!(lines);
     let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
     let mut total: u64 = 0;
-    let mut errors: u64 = 0;
+    let mut parse_errors: u64 = 0;
 
     while let Some(result) = lines.next().await {
         match result {
@@ -132,32 +147,23 @@ pub async fn resolve_types_from_dump(
                 match serde_json::from_str::<SubclassView>(&line) {
                     Ok(entity) => record_subclass_edges(&mut reverse, &entity),
                     Err(e) => {
-                        errors += 1;
+                        parse_errors += 1;
                         if verbose {
-                            eprintln!("Error at entity {total}: {e}");
+                            eprintln!("Parse error at entity {total}: {e}");
                         }
                     }
                 }
             }
-            Err(e) => {
-                errors += 1;
-                if verbose {
-                    eprintln!("Error at entity {total}: {e}");
-                }
-            }
+            // A read/decompress fault means a truncated or corrupt dump; fail loudly.
+            Err(e) => return Err(e).context(format!("reading dump near entity {total}")),
         }
     }
 
-    let types = architectural_closure(&reverse)?;
-
     if verbose {
-        eprintln!(
-            "Scanned {total} entities ({errors} errors); resolved {} architectural types",
-            types.len()
-        );
+        eprintln!("Scanned {total} entities ({parse_errors} parse errors)");
     }
 
-    Ok(types)
+    Ok(reverse)
 }
 
 /// Record entity `A`'s P279 edges into the reverse map: for each parent `B`
@@ -346,11 +352,11 @@ where
                     }
                 }
             }
+            // A read/decompress fault means a truncated or corrupt dump; fail
+            // loudly so we never pin a partial result.
             Err(e) => {
-                stats.errors += 1;
-                if verbose {
-                    eprintln!("Error at entity {}: {}", stats.total_entities, e);
-                }
+                return Err(e)
+                    .context(format!("reading dump near entity {}", stats.total_entities));
             }
         }
     }
@@ -366,15 +372,34 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// A dump item `qid` subclassing each of `parents` (a P279 claim per
-    /// parent), parsed through [`SubclassView`] so the P279 claim shape stays
-    /// realistic.
-    fn subclass_item(qid: &str, parents: &[&str]) -> Result<SubclassView> {
+    /// parent), as raw JSON.
+    fn subclass_json(qid: &str, parents: &[&str]) -> Value {
         let claims: Vec<Value> = parents
             .iter()
             .map(|p| json!({ "mainsnak": { "datavalue": { "value": { "id": p } } } }))
             .collect();
-        let entity = json!({ "id": qid, "type": "item", "claims": { "P279": claims } });
-        Ok(serde_json::from_value(entity)?)
+        json!({ "id": qid, "type": "item", "claims": { "P279": claims } })
+    }
+
+    /// The same entity parsed through [`SubclassView`] so the P279 claim shape
+    /// stays realistic.
+    fn subclass_item(qid: &str, parents: &[&str]) -> Result<SubclassView> {
+        Ok(serde_json::from_value(subclass_json(qid, parents))?)
+    }
+
+    /// The same entity as a raw JSON line, for stream-level tests.
+    fn subclass_line(qid: &str, parents: &[&str]) -> String {
+        subclass_json(qid, parents).to_string()
+    }
+
+    /// A dump line for item `qid` that is an instance (P31) of `type_qid`.
+    fn instance_line(qid: &str, type_qid: &str) -> String {
+        json!({
+            "id": qid,
+            "type": "item",
+            "claims": { "P31": [{ "mainsnak": { "datavalue": { "value": { "id": type_qid } } } }] },
+        })
+        .to_string()
     }
 
     fn closure_of(entities: &[SubclassView]) -> Result<HashSet<WikidataId>> {
@@ -441,5 +466,76 @@ mod tests {
             parse_types("[]").is_err(),
             "an empty types file is a match-nothing footgun and must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn process_entities_fails_on_a_read_error() -> TestResult {
+        let targets: HashSet<WikidataId> = [qid("Q41176")?].into_iter().collect();
+        let lines = futures_util::stream::iter(vec![
+            Ok(instance_line("Q1", "Q41176")),
+            Err(anyhow::anyhow!("boom")),
+        ]);
+        let mut writer = BufWriter::new(tempfile::tempfile()?);
+        assert!(
+            process_entities(lines, &targets, &mut writer, false)
+                .await
+                .is_err(),
+            "a mid-stream read error fails the pass instead of pinning truncated output"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_entities_tolerates_a_bad_json_line() -> TestResult {
+        let targets: HashSet<WikidataId> = [qid("Q41176")?].into_iter().collect();
+        let good = instance_line("Q1", "Q41176");
+        let lines = futures_util::stream::iter(vec![
+            Ok(good.clone()),
+            Ok("not json".to_string()),
+            Ok(good),
+        ]);
+        let mut writer = BufWriter::new(tempfile::tempfile()?);
+        let stats = process_entities(lines, &targets, &mut writer, false).await?;
+        assert!(
+            stats.errors >= 1,
+            "the malformed line is counted, not fatal"
+        );
+        assert_eq!(
+            stats.matches, 2,
+            "both architectural entities still matched"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subclass_graph_fails_on_a_read_error() -> TestResult {
+        let lines = futures_util::stream::iter(vec![
+            Ok(subclass_line("Q1", &[ARCHITECTURAL_STRUCTURE_ROOT])),
+            Err(anyhow::anyhow!("boom")),
+        ]);
+        assert!(
+            subclass_graph(lines, false).await.is_err(),
+            "a mid-stream read error fails the subclass pass"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn subclass_graph_tolerates_a_bad_json_line() -> TestResult {
+        let lines = futures_util::stream::iter(vec![
+            Ok(subclass_line("Q1", &[ARCHITECTURAL_STRUCTURE_ROOT])),
+            Ok("not json".to_string()),
+            Ok(subclass_line("Q2", &["Q1"])),
+        ]);
+        let reverse = subclass_graph(lines, false).await?;
+        assert!(
+            reverse.contains_key(ARCHITECTURAL_STRUCTURE_ROOT),
+            "the subclass edge before the bad line is recorded"
+        );
+        assert!(
+            reverse.contains_key("Q1"),
+            "the subclass edge after the bad line is recorded"
+        );
+        Ok(())
     }
 }
