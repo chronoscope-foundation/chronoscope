@@ -16,17 +16,15 @@ use tokio::fs::File;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 
 /// Get a Q-ID reference from a raw claim JSON's mainsnak (for wikibase-entityid type).
-fn get_claim_qid(claim: &Value) -> Option<&str> {
+fn claim_qid(claim: &Value) -> Option<&str> {
     claim
         .pointer("/mainsnak/datavalue/value/id")
         .and_then(|i| i.as_str())
 }
 
-/// Get claims array for a property from a raw entity JSON.
-fn get_claims<'a>(wd: &'a Value, property: &str) -> Option<&'a Vec<Value>> {
-    wd.get("claims")
-        .and_then(|c| c.get(property))
-        .and_then(|p| p.as_array())
+/// A Wikidata dump record is an item (not a property, lexeme, etc.).
+fn is_item(entity_type: Option<&str>) -> bool {
+    entity_type == Some("item")
 }
 
 /// Buffer size for async I/O (8 MB).
@@ -54,16 +52,13 @@ pub async fn open_compressed(path: &Path) -> Result<Box<dyn AsyncBufRead + Send 
     }
 }
 
-/// Parse Wikidata JSON dump lines into a stream of entities.
+/// Yield the raw JSON text of each entity in a Wikidata dump line stream.
 ///
-/// Wikidata dumps are JSON arrays: `[ {entity}, {entity}, ... ]`
-/// This handles the array brackets and trailing commas, yielding parsed entities.
-///
-/// A JSON parse error yields the error and resumes on the next line — one bad
-/// record shouldn't abort a multi-gigabyte dump. A read/decode error is fatal:
-/// a latched decompressor error would repeat forever, so the error surfaces
-/// once and the stream ends (state carries `None` in place of the reader).
-pub fn wikidata_entities<R>(reader: R) -> impl Stream<Item = Result<Value>>
+/// Array brackets, blank lines, and trailing commas are stripped; each yielded
+/// String is one entity object ready to deserialize. A read/decode error is
+/// fatal — surfaced once, then the stream ends (state carries `None` in place
+/// of the reader); a per-line JSON parse error is the consumer's to handle.
+pub(crate) fn wikidata_lines<R>(reader: R) -> impl Stream<Item = Result<String>>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -86,15 +81,7 @@ where
                         // Strip trailing comma
                         let json_str = trimmed.trim_end_matches(',');
 
-                        match serde_json::from_str(json_str) {
-                            Ok(value) => return Some((Ok(value), (Some(reader), line_buf))),
-                            Err(e) => {
-                                return Some((
-                                    Err(anyhow::anyhow!("JSON parse error: {}", e)),
-                                    (Some(reader), line_buf),
-                                ));
-                            }
-                        }
+                        return Some((Ok(json_str.to_owned()), (Some(reader), line_buf)));
                     }
                     Err(e) => {
                         return Some((Err(anyhow::anyhow!("Read error: {}", e)), (None, line_buf)));
@@ -105,112 +92,137 @@ where
     )
 }
 
-/// Check if an entity is a Wikidata item (not a property, lexeme, etc.).
-pub fn is_item(entity: &Value) -> bool {
-    entity.get("type").and_then(|t| t.as_str()) == Some("item")
+/// Slim view of a dump entity for the P279 (subclass-of) pass: only the fields
+/// the subclass-graph build reads. Every other field — labels, descriptions,
+/// sitelinks, other claims — is structurally skipped during deserialization.
+#[derive(serde::Deserialize)]
+pub(crate) struct SubclassView {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default, rename = "type")]
+    entity_type: Option<String>,
+    #[serde(default)]
+    claims: SubclassClaims,
 }
 
-/// Check if an entity is an instance of any target type (via P31).
-pub fn is_instance_of(entity: &Value, target_types: &HashSet<WikidataId>) -> bool {
-    if !is_item(entity) {
-        return false;
+#[derive(serde::Deserialize, Default)]
+struct SubclassClaims {
+    #[serde(default, rename = "P279")]
+    p279: Vec<Value>,
+}
+
+/// Slim view of a dump entity for the P31 (instance-of) pass: only the fields
+/// the match predicate reads. Every other field is structurally skipped.
+#[derive(serde::Deserialize)]
+pub(crate) struct InstanceView {
+    #[serde(default, rename = "type")]
+    entity_type: Option<String>,
+    #[serde(default)]
+    claims: InstanceClaims,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct InstanceClaims {
+    #[serde(default, rename = "P31")]
+    p31: Vec<Value>,
+}
+
+impl SubclassView {
+    /// P279 (subclass-of) parent Q-IDs. A P279 value `B` on this entity means
+    /// "this is a subclass of B"; each yielded Q-ID is such a `B`. A non-item
+    /// yields nothing.
+    pub(crate) fn subclass_parents(&self) -> impl Iterator<Item = &str> {
+        is_item(self.entity_type.as_deref())
+            .then_some(&self.claims.p279)
+            .into_iter()
+            .flatten()
+            .filter_map(claim_qid)
     }
 
-    let Some(claims) = get_claims(entity, "P31") else {
-        return false;
-    };
-
-    claims
-        .iter()
-        .filter_map(|c| get_claim_qid(c))
-        .any(|qid| target_types.contains(qid))
+    pub(crate) fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
 }
 
-/// P279 (subclass-of) parent Q-IDs of an item entity.
-///
-/// A P279 value `B` on entity `A` means "A is a subclass of B"; each yielded
-/// Q-ID is such a `B`. Non-items and items without P279 yield nothing.
-pub fn subclass_parents(entity: &Value) -> impl Iterator<Item = &str> {
-    let claims = is_item(entity)
-        .then(|| get_claims(entity, "P279"))
-        .flatten();
-    claims.into_iter().flatten().filter_map(get_claim_qid)
+impl InstanceView {
+    /// True when this item is an instance (P31) of any target type.
+    pub(crate) fn is_instance_of(&self, target_types: &HashSet<WikidataId>) -> bool {
+        is_item(self.entity_type.as_deref())
+            && self
+                .claims
+                .p31
+                .iter()
+                .filter_map(claim_qid)
+                .any(|q| target_types.contains(q))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn test_is_item() {
-        assert!(is_item(&json!({"type": "item"})));
-        assert!(!is_item(&json!({"type": "property"})));
-        assert!(!is_item(&json!({})));
-    }
-
-    #[test]
-    fn test_is_instance_of() -> Result<(), Box<dyn std::error::Error>> {
+    fn is_instance_of_matches_item_p31_against_targets() -> Result<(), Box<dyn std::error::Error>> {
         let targets: HashSet<WikidataId> = [WikidataId::try_from("Q41176".to_string())?]
             .into_iter()
             .collect();
 
-        let building = json!({
-            "type": "item",
-            "claims": {
-                "P31": [{
-                    "mainsnak": {
-                        "datavalue": {
-                            "value": {"id": "Q41176"}
-                        }
-                    }
-                }]
-            }
-        });
-        assert!(is_instance_of(&building, &targets));
+        let building: InstanceView = serde_json::from_str(
+            r#"{"type":"item","claims":{"P31":[{"mainsnak":{"datavalue":{"value":{"id":"Q41176"}}}}]}}"#,
+        )?;
+        assert!(building.is_instance_of(&targets), "P31 names a target type");
 
-        let other = json!({
-            "type": "item",
-            "claims": {
-                "P31": [{
-                    "mainsnak": {
-                        "datavalue": {
-                            "value": {"id": "Q12345"}
-                        }
-                    }
-                }]
-            }
-        });
-        assert!(!is_instance_of(&other, &targets));
-
-        // Not an item
-        let property = json!({"type": "property"});
-        assert!(!is_instance_of(&property, &targets));
+        let other: InstanceView = serde_json::from_str(
+            r#"{"type":"item","claims":{"P31":[{"mainsnak":{"datavalue":{"value":{"id":"Q12345"}}}}]}}"#,
+        )?;
+        assert!(!other.is_instance_of(&targets), "P31 misses every target");
 
         Ok(())
     }
 
     #[test]
-    fn subclass_parents_reads_p279_qids_of_items_only() {
-        let subclass = json!({
-            "type": "item",
-            "claims": {
-                "P279": [
-                    { "mainsnak": { "datavalue": { "value": { "id": "Q811979" } } } },
-                    { "mainsnak": { "datavalue": { "value": { "id": "Q41176" } } } }
-                ]
-            }
-        });
-        let parents: Vec<&str> = subclass_parents(&subclass).collect();
+    fn is_instance_of_is_false_for_non_items() -> Result<(), Box<dyn std::error::Error>> {
+        let targets: HashSet<WikidataId> = [WikidataId::try_from("Q41176".to_string())?]
+            .into_iter()
+            .collect();
+
+        // Only item entities qualify, whatever their P31.
+        let property: InstanceView = serde_json::from_str(
+            r#"{"type":"property","claims":{"P31":[{"mainsnak":{"datavalue":{"value":{"id":"Q41176"}}}}]}}"#,
+        )?;
+        assert!(!property.is_instance_of(&targets));
+
+        Ok(())
+    }
+
+    #[test]
+    fn subclass_parents_reads_p279_qids_of_items_only() -> Result<(), Box<dyn std::error::Error>> {
+        let subclass: SubclassView = serde_json::from_str(
+            r#"{"type":"item","claims":{"P279":[
+                {"mainsnak":{"datavalue":{"value":{"id":"Q811979"}}}},
+                {"mainsnak":{"datavalue":{"value":{"id":"Q41176"}}}}
+            ]}}"#,
+        )?;
+        let parents: Vec<&str> = subclass.subclass_parents().collect();
         assert_eq!(parents, vec!["Q811979", "Q41176"]);
 
-        // No P279 claims, and a non-item both yield nothing.
-        assert_eq!(subclass_parents(&json!({"type": "item"})).count(), 0);
-        let property = json!({
-            "type": "property",
-            "claims": { "P279": [{ "mainsnak": { "datavalue": { "value": { "id": "Q1" } } } }] }
-        });
-        assert_eq!(subclass_parents(&property).count(), 0);
+        let no_p279: SubclassView = serde_json::from_str(r#"{"type":"item"}"#)?;
+        assert_eq!(
+            no_p279.subclass_parents().count(),
+            0,
+            "an item without P279 yields nothing"
+        );
+
+        let property: SubclassView = serde_json::from_str(
+            r#"{"type":"property","claims":{"P279":[{"mainsnak":{"datavalue":{"value":{"id":"Q1"}}}}]}}"#,
+        )?;
+        assert_eq!(
+            property.subclass_parents().count(),
+            0,
+            "non-items yield nothing"
+        );
+
+        Ok(())
     }
 
     /// A reader whose first read fails, modeling a latched decompressor error.
@@ -231,7 +243,7 @@ mod tests {
         use futures_util::StreamExt;
 
         let reader = BufReader::new(FailingReader);
-        let mut stream = std::pin::pin!(wikidata_entities(reader));
+        let mut stream = std::pin::pin!(wikidata_lines(reader));
 
         assert!(
             matches!(stream.next().await, Some(Err(_))),
@@ -241,5 +253,35 @@ mod tests {
             stream.next().await.is_none(),
             "the stream ends after a read error rather than re-reading the failed reader"
         );
+    }
+
+    #[tokio::test]
+    async fn wikidata_lines_strips_brackets_and_trailing_commas()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use futures_util::StreamExt;
+
+        let data = b"[\n{\"id\":\"Q1\"},\n{\"id\":\"Q2\"}\n]\n";
+        let reader = BufReader::new(&data[..]);
+        let mut stream = std::pin::pin!(wikidata_lines(reader));
+
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| "expected first entity".to_string())?
+            .map_err(|e| e.to_string())?;
+        assert_eq!(first, r#"{"id":"Q1"}"#);
+
+        let second = stream
+            .next()
+            .await
+            .ok_or_else(|| "expected second entity".to_string())?
+            .map_err(|e| e.to_string())?;
+        assert_eq!(second, r#"{"id":"Q2"}"#);
+
+        assert!(
+            stream.next().await.is_none(),
+            "the stream ends after the closing bracket"
+        );
+        Ok(())
     }
 }

@@ -13,11 +13,8 @@ use crate::wikidata::{WikidataClient, WikidataId};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use futures_util::stream::Stream;
-use serde_json::Value;
 
-use crate::wikidata::stream::{
-    is_instance_of, open_compressed, subclass_parents, wikidata_entities,
-};
+use crate::wikidata::stream::{InstanceView, SubclassView, open_compressed, wikidata_lines};
 
 /// Statistics from a filter run.
 #[derive(Debug, Default)]
@@ -117,7 +114,7 @@ pub async fn resolve_types_from_dump(
     }
 
     let reader = open_compressed(input_path).await?;
-    let mut entities = std::pin::pin!(wikidata_entities(reader));
+    let mut lines = std::pin::pin!(wikidata_lines(reader));
 
     // parent Q-ID -> child Q-IDs. Only subclass edges land here, so this stays
     // far smaller than the full dump.
@@ -125,14 +122,22 @@ pub async fn resolve_types_from_dump(
     let mut total: u64 = 0;
     let mut errors: u64 = 0;
 
-    while let Some(result) = entities.next().await {
+    while let Some(result) = lines.next().await {
         match result {
-            Ok(entity) => {
+            Ok(line) => {
                 total += 1;
                 if verbose && total.is_multiple_of(PROGRESS_INTERVAL) {
                     eprintln!("Scanned {total} entities, {} subclass roots", reverse.len());
                 }
-                record_subclass_edges(&mut reverse, &entity);
+                match serde_json::from_str::<SubclassView>(&line) {
+                    Ok(entity) => record_subclass_edges(&mut reverse, &entity),
+                    Err(e) => {
+                        errors += 1;
+                        if verbose {
+                            eprintln!("Error at entity {total}: {e}");
+                        }
+                    }
+                }
             }
             Err(e) => {
                 errors += 1;
@@ -159,11 +164,11 @@ pub async fn resolve_types_from_dump(
 /// (`A` is a subclass of `B`), append `A` to `B`'s child list. Entities
 /// without an `id` or without P279 add nothing, keeping the map to the
 /// subclass graph alone.
-fn record_subclass_edges(reverse: &mut HashMap<String, Vec<String>>, entity: &Value) {
-    let Some(child) = entity.get("id").and_then(|v| v.as_str()) else {
+fn record_subclass_edges(reverse: &mut HashMap<String, Vec<String>>, entity: &SubclassView) {
+    let Some(child) = entity.id() else {
         return;
     };
-    for parent in subclass_parents(entity) {
+    for parent in entity.subclass_parents() {
         reverse
             .entry(parent.to_string())
             .or_default()
@@ -275,7 +280,7 @@ pub async fn filter_dump(
     let mut writer = BufWriter::with_capacity(OUTPUT_BUFFER_SIZE, out_file);
 
     // Process entity stream
-    let base = wikidata_entities(reader);
+    let base = wikidata_lines(reader);
     let stats = if let Some(n) = limit {
         let limit = usize::try_from(n).unwrap_or(usize::MAX);
         process_entities(base.take(limit), target_types, &mut writer, verbose).await?
@@ -298,22 +303,25 @@ pub async fn filter_dump(
     Ok(stats)
 }
 
-/// Process a stream of entities, filtering and writing matches.
+/// Process a stream of raw entity lines, filtering and writing matches.
+///
+/// A matched entity's original JSON is written through verbatim, so the output
+/// preserves the dump's byte-for-byte serialization of each kept entity.
 async fn process_entities<S>(
-    entities: S,
+    lines: S,
     target_types: &HashSet<WikidataId>,
     writer: &mut BufWriter<File>,
     verbose: bool,
 ) -> Result<FilterStats>
 where
-    S: Stream<Item = Result<Value>>,
+    S: Stream<Item = Result<String>>,
 {
-    let mut entities = std::pin::pin!(entities);
+    let mut lines = std::pin::pin!(lines);
     let mut stats = FilterStats::default();
 
-    while let Some(result) = entities.next().await {
+    while let Some(result) = lines.next().await {
         match result {
-            Ok(entity) => {
+            Ok(line) => {
                 stats.total_entities += 1;
 
                 if verbose && stats.total_entities % PROGRESS_INTERVAL == 0 {
@@ -323,9 +331,19 @@ where
                     );
                 }
 
-                if is_instance_of(&entity, target_types) {
-                    writeln!(writer, "{}", serde_json::to_string(&entity)?)?;
-                    stats.matches += 1;
+                match serde_json::from_str::<InstanceView>(&line) {
+                    Ok(view) => {
+                        if view.is_instance_of(target_types) {
+                            writeln!(writer, "{line}")?;
+                            stats.matches += 1;
+                        }
+                    }
+                    Err(e) => {
+                        stats.errors += 1;
+                        if verbose {
+                            eprintln!("Error at entity {}: {}", stats.total_entities, e);
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -343,20 +361,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// A dump item `qid` subclassing each of `parents` (a P279 claim per parent).
-    fn subclass_item(qid: &str, parents: &[&str]) -> Value {
+    /// A dump item `qid` subclassing each of `parents` (a P279 claim per
+    /// parent), parsed through [`SubclassView`] so the P279 claim shape stays
+    /// realistic.
+    fn subclass_item(qid: &str, parents: &[&str]) -> Result<SubclassView> {
         let claims: Vec<Value> = parents
             .iter()
             .map(|p| json!({ "mainsnak": { "datavalue": { "value": { "id": p } } } }))
             .collect();
-        json!({ "id": qid, "type": "item", "claims": { "P279": claims } })
+        let entity = json!({ "id": qid, "type": "item", "claims": { "P279": claims } });
+        Ok(serde_json::from_value(entity)?)
     }
 
-    fn closure_of(entities: &[Value]) -> Result<HashSet<WikidataId>> {
+    fn closure_of(entities: &[SubclassView]) -> Result<HashSet<WikidataId>> {
         let mut reverse = HashMap::new();
         for e in entities {
             record_subclass_edges(&mut reverse, e);
@@ -372,12 +393,12 @@ mod tests {
         // Wikidata also files under the include tree; both it and its synthetic
         // child Q6 must be cut along with the rest of its subtree.
         let entities = vec![
-            subclass_item("Q1", &[ARCHITECTURAL_STRUCTURE_ROOT]),
-            subclass_item("Q2", &["Q1"]),
-            subclass_item("Q3", &["Q391414"]), // architectural element (exclusion root)
-            subclass_item("Q4", &["Q3"]),
-            subclass_item("Q254978", &["Q1"]), // burgh, misfiled under an included type
-            subclass_item("Q6", &["Q254978"]), // child administrative type of burgh
+            subclass_item("Q1", &[ARCHITECTURAL_STRUCTURE_ROOT])?,
+            subclass_item("Q2", &["Q1"])?,
+            subclass_item("Q3", &["Q391414"])?, // architectural element (exclusion root)
+            subclass_item("Q4", &["Q3"])?,
+            subclass_item("Q254978", &["Q1"])?, // burgh, misfiled under an included type
+            subclass_item("Q6", &["Q254978"])?, // child administrative type of burgh
         ];
 
         let types = closure_of(&entities)?;
