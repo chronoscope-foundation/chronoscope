@@ -215,6 +215,118 @@ fn EntityDetailContent(
         }
     });
 
+    // The seam the images grid pins its page-1 fetch to: `Some` once the detail
+    // resolves successfully, `None` while it's pending or errored. `EntityImages`
+    // gates its first fetch on this so the grid and the detail read one
+    // consistent snapshot, without the child reaching into the resource itself.
+    let ready_snapshot = Memo::new(move |_| match detail.get() {
+        Some(Ok(view)) => Some(view.snapshot.clone()),
+        _ => None,
+    });
+
+    // Wrap the `!Send` client so the reactive view closure that hands it to
+    // `EntityImages` stays `Send`.
+    let api_client = SendWrapper::new(api_client);
+
+    view! {
+        <div aria-live="polite">
+        <Suspense fallback=move || view! {
+            <p class="text-sm text-sepia/60">"Loading..."</p>
+        }>
+            {move || {
+                detail.get().map(|result| {
+                    match result {
+                        Ok(entity) => view! {
+                            <div>
+                                <h3 class="text-base font-semibold text-ink mb-3">
+                                    {entity.name.clone().unwrap_or_else(|| "Unnamed entity".to_string())}
+                                </h3>
+                                <EntityTimeline timeline=entity.timeline.clone()/>
+                                <EntityImages
+                                    id=id.clone()
+                                    api_client=api_client.clone()
+                                    ready_snapshot=ready_snapshot
+                                />
+                                <EntityLinks links=entity.links.clone()/>
+                            </div>
+                        }.into_any(),
+                        Err(e) => {
+                            let on_retry = move |_| set_retry_count.update(|c| *c += 1);
+                            view! {
+                                <div>
+                                    <p class="text-sm text-red-600 mb-2">{format!("Error: {e}")}</p>
+                                    <button
+                                        class="text-sm text-ink hover:underline cursor-pointer"
+                                        on:click=on_retry
+                                        aria-label="Retry loading entity details"
+                                    >
+                                        "Retry"
+                                    </button>
+                                </div>
+                            }.into_any()
+                        }
+                    }
+                })
+            }}
+        </Suspense>
+        </div>
+    }
+}
+
+/// The entity's lifecycle timeline: a header with the moment count over a list
+/// of dated rows. Renders nothing when the entity has no timeline.
+#[component]
+fn EntityTimeline(timeline: Vec<TimelineRow>) -> impl IntoView {
+    (!timeline.is_empty()).then(move || {
+        let count = timeline.len();
+        view! {
+            <div class="mb-3">
+                <p class="text-xs font-sans text-copper font-semibold mb-1">
+                    {format!("Timeline ({count})")}
+                </p>
+                <ul class="text-sm text-sepia space-y-1.5">
+                    {timeline.iter().map(|r| {
+                        let date_view = match r.date.as_ref() {
+                            Some(d) => view! {
+                                <span class="text-sepia/70">
+                                    {format!(" \u{2014} {}", format_uncertain_date(d))}
+                                </span>
+                            }.into_any(),
+                            None => view! {
+                                <span class="text-sepia/40 italic">
+                                    " \u{2014} date unknown"
+                                </span>
+                            }.into_any(),
+                        };
+                        view! {
+                            <li class="pl-2 border-l-2 border-copper/30">
+                                <span class="font-semibold">{r.label.clone()}</span>
+                                {date_view}
+                                {r.description.as_ref().map(|desc| view! {
+                                    <p class="text-xs text-sepia/70 mt-0.5">{desc.clone()}</p>
+                                })}
+                            </li>
+                        }
+                    }).collect::<Vec<_>>()}
+                </ul>
+            </div>
+        }
+    })
+}
+
+/// The entity's depicting images: a paginated grid that loads its first page as
+/// soon as the detail's snapshot is known and appends further pages on demand.
+///
+/// Page 1 waits for `ready_snapshot` to be `Some` and pins to it, so the grid
+/// reads the same point the detail was projected at; a failed or missing entity
+/// resolves no snapshot and draws no image request. Each "Load more" resumes the
+/// stored cursor, which already pins that snapshot.
+#[component]
+fn EntityImages(
+    id: EntityId,
+    api_client: SendWrapper<Rc<RefCell<Option<api::Client>>>>,
+    ready_snapshot: Memo<Option<api::Snapshot>>,
+) -> impl IntoView {
     // The depicting images load page-by-page into `media`: the first page
     // eagerly, further pages when the reader clicks "Load more". `next_cursor` is
     // the resume token for the following page (`None` once the grid is
@@ -270,226 +382,157 @@ fn EntityDetailContent(
         });
     };
 
-    // Page 1 waits for the entity detail to resolve successfully: a failed or
-    // missing entity renders its own error and depicts nothing, so gating the
-    // first fetch on a loaded detail keeps a 404 from drawing a wasted image
-    // request. Each "Load more" bump (`req > 0`) pages past the stored resume
-    // cursor regardless of the detail.
+    // Page 1 waits for the entity detail to resolve successfully: `ready_snapshot`
+    // is `Some` only once the detail loaded, so gating the first fetch on it keeps
+    // a 404 from drawing a wasted image request and pins the page to the detail's
+    // snapshot. Each "Load more" bump (`req > 0`) pages past the stored resume
+    // cursor, which already pins that snapshot.
     Effect::new(move |_| {
         let req = page_req.get();
         if req > 0 {
-            // Load-more resumes the cursor, which already pins the page-1
-            // snapshot; no separate snapshot needed.
             load_page(next_cursor.get_untracked(), None);
-        } else if let Some(Ok(view)) = detail.get() {
-            // Page 1 pins to the detail's snapshot so the grid reads the same
-            // point the detail was projected at.
-            load_page(None, Some(view.snapshot.clone()));
+        } else if let Some(snapshot) = ready_snapshot.get() {
+            load_page(None, Some(snapshot));
         }
     });
 
+    // The section shows whenever there are tiles, another page to fetch, or a
+    // recoverable error to retry, so a first page that fully filters out still
+    // surfaces "Load more" instead of stranding an empty grid.
     view! {
-        <div aria-live="polite">
-        <Suspense fallback=move || view! {
-            <p class="text-sm text-sepia/60">"Loading..."</p>
-        }>
-            {move || {
-                detail.get().map(|result| {
-                    match result {
-                        Ok(entity) => view! {
-                            <div>
-                                <h3 class="text-base font-semibold text-ink mb-3">
-                                    {entity.name.clone().unwrap_or_else(|| "Unnamed entity".to_string())}
-                                </h3>
+        {move || {
+            let tiles = media.get();
+            let has_more = next_cursor.get().is_some();
+            let error = images_error.get();
+            let show = !tiles.is_empty() || has_more || error.is_some();
+            show.then(move || {
+                let count = tiles.len();
+                // Only a retryable error offers a retry; a terminal error (the
+                // entity no longer exists) doesn't, and neither does a healthy
+                // "more to load".
+                let retryable = matches!(error, Some(ImagesFetchError::Other(_)));
+                let button_label = if retryable { "Retry" } else { "Load more" };
+                let show_button = has_more || retryable;
 
-                                // Timeline
-                                {(!entity.timeline.is_empty()).then(|| {
-                                    let count = entity.timeline.len();
-                                    view! {
-                                    <div class="mb-3">
-                                        <p class="text-xs font-sans text-copper font-semibold mb-1">
-                                            {format!("Timeline ({count})")}
-                                        </p>
-                                        <ul class="text-sm text-sepia space-y-1.5">
-                                            {entity.timeline.iter().map(|r| {
-                                                let date_view = match r.date.as_ref() {
-                                                    Some(d) => view! {
-                                                        <span class="text-sepia/70">
-                                                            {format!(" \u{2014} {}", format_uncertain_date(d))}
-                                                        </span>
-                                                    }.into_any(),
-                                                    None => view! {
-                                                        <span class="text-sepia/40 italic">
-                                                            " \u{2014} date unknown"
-                                                        </span>
-                                                    }.into_any(),
-                                                };
-                                                view! {
-                                                    <li class="pl-2 border-l-2 border-copper/30">
-                                                        <span class="font-semibold">{r.label.clone()}</span>
-                                                        {date_view}
-                                                        {r.description.as_ref().map(|desc| view! {
-                                                            <p class="text-xs text-sepia/70 mt-0.5">{desc.clone()}</p>
-                                                        })}
-                                                    </li>
-                                                }
-                                            }).collect::<Vec<_>>()}
-                                        </ul>
-                                    </div>
-                                    }
-                                })}
-
-                                // Images — a separate paginated fetch. The section
-                                // shows whenever there are tiles, another page to
-                                // fetch, or a recoverable error to retry, so a
-                                // first page that fully filters out still surfaces
-                                // "Load more" instead of stranding an empty grid.
-                                {move || {
-                                    let tiles = media.get();
-                                    let has_more = next_cursor.get().is_some();
-                                    let error = images_error.get();
-                                    let show = !tiles.is_empty() || has_more || error.is_some();
-                                    show.then(move || {
-                                        let count = tiles.len();
-                                        // Only a retryable error offers a retry; a
-                                        // terminal error (the entity no longer
-                                        // exists) doesn't, and neither does a
-                                        // healthy "more to load".
-                                        let retryable = matches!(error, Some(ImagesFetchError::Other(_)));
-                                        let button_label = if retryable { "Retry" } else { "Load more" };
-                                        let show_button = has_more || retryable;
-
-                                        view! {
-                                        <div class="mb-3">
-                                            {(!tiles.is_empty()).then(move || {
-                                                let lightbox = expect_context::<LightboxState>();
-                                                view! {
-                                                    <p class="text-xs font-sans text-copper font-semibold mb-1">
-                                                        {format!("Images ({count} loaded)")}
-                                                    </p>
-                                                    <ul class="grid grid-cols-2 gap-2" role="list">
-                                                        {tiles.iter().map(|m| {
-                                                            let alt = format!("{} view", m.label);
-                                                            let aria = format!("{alt} \u{2014} opens preview");
-                                                            let content = LightboxContent {
-                                                                url: m.display_url.clone(),
-                                                                alt: alt.clone(),
-                                                                source_url: m.source_url.clone(),
-                                                            };
-                                                            let lb = lightbox.clone();
-                                                            let on_click = move |_: leptos::ev::MouseEvent| {
-                                                                lb.open(content.clone());
-                                                            };
-                                                            view! {
-                                                                <li>
-                                                                    <button
-                                                                        class="relative w-full rounded-md overflow-hidden shadow-sm \
-                                                                               ring-1 ring-sepia/10 cursor-pointer \
-                                                                               hover:scale-[1.02] transition-transform"
-                                                                        on:click=on_click
-                                                                        aria-label=aria
-                                                                    >
-                                                                        // Loading placeholder (visible until image loads)
-                                                                        <div class="w-full aspect-square bg-sepia/10 animate-pulse absolute inset-0"/>
-                                                                        <img
-                                                                            src={m.display_url.clone()}
-                                                                            alt=alt
-                                                                            loading="lazy"
-                                                                            class="w-full aspect-square object-cover relative"
-                                                                        />
-                                                                        // Caption badge (bottom-right pill)
-                                                                        <span class="absolute bottom-1 right-1 px-1.5 py-0.5 \
-                                                                                     bg-ink/70 text-white text-xs font-sans \
-                                                                                     rounded-full">
-                                                                            {m.label.clone()}
-                                                                        </span>
-                                                                    </button>
-                                                                </li>
-                                                            }
-                                                        }).collect::<Vec<_>>()}
-                                                    </ul>
-                                                }
-                                            })}
-                                            {error.map(|e| {
-                                                let text = match e {
-                                                    ImagesFetchError::Gone => {
-                                                        "Images are no longer available; this entity no longer exists.".to_string()
-                                                    }
-                                                    ImagesFetchError::Other(m) => {
-                                                        format!("Couldn\u{2019}t load images: {m}")
-                                                    }
-                                                };
-                                                view! {
-                                                    <p class="text-sm text-red-600 mt-2">{text}</p>
-                                                }
-                                            })}
-                                            {show_button.then(move || view! {
-                                                <button
-                                                    class="mt-2 w-full text-sm text-ink hover:underline \
-                                                           cursor-pointer disabled:opacity-50 disabled:cursor-default"
-                                                    on:click=move |_: leptos::ev::MouseEvent| {
-                                                        set_page_req.update(|n| *n += 1);
-                                                    }
-                                                    disabled=move || loading.get()
-                                                    aria-label="Load more images"
-                                                >
-                                                    {button_label}
-                                                </button>
-                                            })}
-                                        </div>
-                                        }
-                                    })
-                                }}
-
-                                // Links
-                                {(!entity.links.is_empty()).then(|| {
-                                    let count = entity.links.len();
-                                    view! {
-                                    <div class="mb-3">
-                                        <p class="text-xs font-sans text-copper font-semibold mb-1">
-                                            {format!("Links ({count})")}
-                                        </p>
-                                        <ul class="text-sm space-y-1">
-                                            {entity.links.iter().map(|link| view! {
-                                                <li>
-                                                    <a
-                                                        href={link.url.clone()}
-                                                        target="_blank"
-                                                        rel="noopener noreferrer"
-                                                        class="text-copper hover:underline"
-                                                    >
-                                                        {link.label.clone()}
-                                                        <span aria-hidden="true" class="text-[0.75em]">" \u{2197}"</span>
-                                                    </a>
-                                                </li>
-                                            }).collect::<Vec<_>>()}
-                                        </ul>
-                                    </div>
-                                    }
-                                })}
-                            </div>
-                        }.into_any(),
-                        Err(e) => {
-                            let on_retry = move |_| set_retry_count.update(|c| *c += 1);
-                            view! {
-                                <div>
-                                    <p class="text-sm text-red-600 mb-2">{format!("Error: {e}")}</p>
-                                    <button
-                                        class="text-sm text-ink hover:underline cursor-pointer"
-                                        on:click=on_retry
-                                        aria-label="Retry loading entity details"
-                                    >
-                                        "Retry"
-                                    </button>
-                                </div>
-                            }.into_any()
+                view! {
+                <div class="mb-3">
+                    {(!tiles.is_empty()).then(move || {
+                        view! {
+                            <p class="text-xs font-sans text-copper font-semibold mb-1">
+                                {format!("Images ({count} loaded)")}
+                            </p>
+                            <ul class="grid grid-cols-2 gap-2" role="list">
+                                {tiles.into_iter().map(|m| view! {
+                                    <ImageTile media=m/>
+                                }).collect::<Vec<_>>()}
+                            </ul>
                         }
-                    }
-                })
-            }}
-        </Suspense>
-        </div>
+                    })}
+                    {error.map(|e| {
+                        let text = match e {
+                            ImagesFetchError::Gone => {
+                                "Images are no longer available; this entity no longer exists.".to_string()
+                            }
+                            ImagesFetchError::Other(m) => {
+                                format!("Couldn\u{2019}t load images: {m}")
+                            }
+                        };
+                        view! {
+                            <p class="text-sm text-red-600 mt-2">{text}</p>
+                        }
+                    })}
+                    {show_button.then(move || view! {
+                        <button
+                            class="mt-2 w-full text-sm text-ink hover:underline \
+                                   cursor-pointer disabled:opacity-50 disabled:cursor-default"
+                            on:click=move |_: leptos::ev::MouseEvent| {
+                                set_page_req.update(|n| *n += 1);
+                            }
+                            disabled=move || loading.get()
+                            aria-label="Load more images"
+                        >
+                            {button_label}
+                        </button>
+                    })}
+                </div>
+                }
+            })
+        }}
     }
+}
+
+/// One image grid tile: a lazy thumbnail with a caption badge that opens the
+/// lightbox on click. Reads the lightbox handle from context.
+#[component]
+fn ImageTile(media: MediaInfo) -> impl IntoView {
+    let lightbox = expect_context::<LightboxState>();
+    let alt = format!("{} view", media.label);
+    let aria = format!("{alt} \u{2014} opens preview");
+    let content = LightboxContent {
+        url: media.display_url.clone(),
+        alt: alt.clone(),
+        source_url: media.source_url.clone(),
+    };
+    let on_click = move |_: leptos::ev::MouseEvent| {
+        lightbox.open(content.clone());
+    };
+    view! {
+        <li>
+            <button
+                class="relative w-full rounded-md overflow-hidden shadow-sm \
+                       ring-1 ring-sepia/10 cursor-pointer \
+                       hover:scale-[1.02] transition-transform"
+                on:click=on_click
+                aria-label=aria
+            >
+                // Loading placeholder (visible until image loads)
+                <div class="w-full aspect-square bg-sepia/10 animate-pulse absolute inset-0"/>
+                <img
+                    src={media.display_url.clone()}
+                    alt=alt
+                    loading="lazy"
+                    class="w-full aspect-square object-cover relative"
+                />
+                // Caption badge (bottom-right pill)
+                <span class="absolute bottom-1 right-1 px-1.5 py-0.5 \
+                             bg-ink/70 text-white text-xs font-sans \
+                             rounded-full">
+                    {media.label.clone()}
+                </span>
+            </button>
+        </li>
+    }
+}
+
+/// The entity's external links: a header with the count over a list of anchors.
+/// Renders nothing when the entity has no links.
+#[component]
+fn EntityLinks(links: Vec<LinkInfo>) -> impl IntoView {
+    (!links.is_empty()).then(move || {
+        let count = links.len();
+        view! {
+            <div class="mb-3">
+                <p class="text-xs font-sans text-copper font-semibold mb-1">
+                    {format!("Links ({count})")}
+                </p>
+                <ul class="text-sm space-y-1">
+                    {links.iter().map(|link| view! {
+                        <li>
+                            <a
+                                href={link.url.clone()}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                class="text-copper hover:underline"
+                            >
+                                {link.label.clone()}
+                                <span aria-hidden="true" class="text-[0.75em]">" \u{2197}"</span>
+                            </a>
+                        </li>
+                    }).collect::<Vec<_>>()}
+                </ul>
+            </div>
+        }
+    })
 }
 
 // ==================== Lightweight detail types ====================
