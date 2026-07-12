@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use chrono::NaiveDate;
 
+use crate::algebra::semiring::Lineage;
 use crate::date::UncertainDate;
 use crate::grammar::attribute::{EntityRelationType, NameType};
 use crate::grammar::citations::{ExternalReference, Language};
@@ -13,9 +14,7 @@ use crate::location::UnresolvedLocation;
 use crate::projection::Claimed;
 use crate::store::schema::EquivClass;
 
-use crate::projection::{
-    self, Bookend, Bracket, Citation, FactMap, FactSet, MemberLineage, NameKey, NameRecord,
-};
+use crate::projection::{self, Bookend, Bracket, Citation, FactMap, FactSet, NameKey, NameRecord};
 
 use super::*;
 
@@ -188,12 +187,17 @@ where
     EvtId: Ord + Clone + std::fmt::Debug,
     ImgId: Ord + Clone,
 {
-    /// Flatten a [`projection::Entity`] into its typed DTO. Pure over the flat
-    /// member-aware lineage; the `EquivClass` carries `mention_count = members.len()`.
-    pub fn parse(
-        projected: &projection::Entity<EntId, EvtId, ImgId, MemberLineage<EntId, ImgId>>,
+    /// Flatten a [`projection::Entity`] into its typed DTO. Generic over the
+    /// support lineage — a citation-only or whole-fact support both flatten the
+    /// same typed shape, so a caller reads whichever its DTO needs. The
+    /// `EquivClass` carries `mention_count = members.len()`.
+    pub fn parse<X>(
+        projected: &projection::Entity<EntId, EvtId, ImgId, Lineage<X>>,
         class: &EquivClass<EntId>,
-    ) -> Self {
+    ) -> Self
+    where
+        X: SupportAtom<Img = ImgId>,
+    {
         let names = display_names(&projected.names);
         let relations = display_relations(&projected.relations);
         let external_refs = projected
@@ -217,12 +221,13 @@ where
     }
 }
 
-fn display_names<EntId, ImgId>(
-    names: &FactMap<NameKey, NameRecord<MemberLineage<EntId, ImgId>>, MemberLineage<EntId, ImgId>>,
-) -> Vec<Name<ImgId>>
+/// The projection's names field: dedup key → validity window record.
+type ProjectedNames<X> = FactMap<NameKey, NameRecord<Lineage<X>>, Lineage<X>>;
+
+fn display_names<X>(names: &ProjectedNames<X>) -> Vec<Name<X::Img>>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord,
 {
     names
         .iter()
@@ -238,18 +243,16 @@ where
 }
 
 /// The projection's relations field: target id → coexisting relation kinds.
-type ProjectedRelations<EntId, ImgId> = FactMap<
-    EntId,
-    FactSet<EntityRelationType, MemberLineage<EntId, ImgId>>,
-    MemberLineage<EntId, ImgId>,
->;
+type ProjectedRelations<EntId, X> =
+    FactMap<EntId, FactSet<EntityRelationType, Lineage<X>>, Lineage<X>>;
 
-fn display_relations<EntId, ImgId>(
-    relations: &ProjectedRelations<EntId, ImgId>,
-) -> Vec<Relation<EntId, ImgId>>
+fn display_relations<EntId, X>(
+    relations: &ProjectedRelations<EntId, X>,
+) -> Vec<Relation<EntId, X::Img>>
 where
     EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord,
 {
     relations
         .iter()
@@ -265,38 +268,32 @@ where
 }
 
 /// Flatten the bookend dates into a [`Period`].
-fn bookend_period<EntId, ImgId>(bookend: &Bookend<MemberLineage<EntId, ImgId>>) -> Period<ImgId>
+fn bookend_period<X>(bookend: &Bookend<Lineage<X>>) -> Period<X::Img>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord + Clone,
 {
     Period {
-        started: bracket(&bookend.started_at),
-        completed: bracket(&bookend.completed_at),
+        started: dated_bracket(&bookend.started_at),
+        completed: dated_bracket(&bookend.completed_at),
     }
 }
 
 /// Whether a bookend carries any claim — its dates or its location.
-fn bookend_present<EntId, ImgId>(bookend: &Bookend<MemberLineage<EntId, ImgId>>) -> bool
-where
-    EntId: Ord,
-    ImgId: Ord,
-{
+fn bookend_present<X>(bookend: &Bookend<Lineage<X>>) -> bool {
     touched(&bookend.started_at) || touched(&bookend.completed_at) || touched(&bookend.location)
 }
 
 /// The flattened [`EventFacts`] of one event record.
-fn event_facts<EntId, ImgId>(
-    record: &projection::Event<MemberLineage<EntId, ImgId>>,
-) -> EventFacts<ImgId>
+fn event_facts<X>(record: &projection::Event<Lineage<X>>) -> EventFacts<X::Img>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord + Clone,
 {
     EventFacts {
-        started: bracket(&record.started_at),
-        completed: bracket(&record.completed_at),
-        occurred: bracket(&record.occurred_at),
+        started: dated_bracket(&record.started_at),
+        completed: dated_bracket(&record.completed_at),
+        occurred: dated_bracket(&record.occurred_at),
         location: bracket(&record.location),
         cause: bracket(&record.cause),
         method: bracket(&record.method),
@@ -307,7 +304,9 @@ where
 
 /// The one kind a settled consensus agreed on: a singleton `Reached { Of({k}) }`.
 /// Every other shape leaves the event's kind unsettled.
-fn settled_kind(consensus: &Consensus<Claimed<LifetimeEventKind>>) -> Option<LifetimeEventKind> {
+fn settled_kind<ImgId>(
+    consensus: &Consensus<Claimed<LifetimeEventKind>, ImgId>,
+) -> Option<LifetimeEventKind> {
     match consensus {
         Consensus::Reached {
             value: Claimed::Of { values },
@@ -322,14 +321,10 @@ fn settled_kind(consensus: &Consensus<Claimed<LifetimeEventKind>>) -> Option<Lif
 /// `EventFacts` keeps the stray claims visible) and names the offending fields in
 /// its log. `descriptions` is additive and rides every kind, so it sits outside
 /// this set.
-fn off_kind_fields<EntId, ImgId>(
-    record: &projection::Event<MemberLineage<EntId, ImgId>>,
+fn off_kind_fields<X>(
+    record: &projection::Event<Lineage<X>>,
     k: LifetimeEventKind,
-) -> Vec<&'static str>
-where
-    EntId: Ord,
-    ImgId: Ord,
-{
+) -> Vec<&'static str> {
     [
         (
             "started_at",
@@ -373,14 +368,14 @@ where
 /// The single predicate selecting a typed variant is a settled singleton kind
 /// (`Reached { Of({k}) }`); every other shape routes to `Ambiguous` carrying the
 /// kind's extent as `candidates`.
-fn interior_event<EntId, EvtId, ImgId>(
-    record: &projection::Event<MemberLineage<EntId, ImgId>>,
+fn interior_event<EvtId, X>(
+    record: &projection::Event<Lineage<X>>,
     event_id: &EvtId,
-) -> (InteriorEvent<ImgId>, Vec<Citation<ImgId>>)
+) -> (InteriorEvent<X::Img>, Vec<Citation<X::Img>>)
 where
-    EntId: Ord + Clone,
     EvtId: std::fmt::Debug,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord + Clone,
 {
     let kind = bracket(&record.kind);
     let kind_sources = kind.sources.clone();
@@ -463,12 +458,10 @@ fn single<A: Clone>(set: &BTreeSet<A>) -> Option<A> {
 }
 
 /// The descriptions hoisted onto a timeline entry.
-fn descriptions<EntId, ImgId>(
-    descriptions: &FactSet<String, MemberLineage<EntId, ImgId>>,
-) -> Vec<Attributed<String, ImgId>>
+fn descriptions<X>(descriptions: &FactSet<String, Lineage<X>>) -> Vec<Attributed<String, X::Img>>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord,
 {
     descriptions
         .iter()
@@ -510,12 +503,10 @@ pub(crate) fn entry_date_bounds<EvtId, ImgId>(
 
 /// The union of a bookend's date and location bracket citations — a present
 /// bookend entry's attribution, so it never surfaces empty-sourced.
-fn bookend_sources<EntId, ImgId>(
-    bookend: &Bookend<MemberLineage<EntId, ImgId>>,
-) -> Vec<Citation<ImgId>>
+fn bookend_sources<X>(bookend: &Bookend<Lineage<X>>) -> Vec<Citation<X::Img>>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord,
 {
     bracket(&bookend.started_at)
         .sources
@@ -531,15 +522,19 @@ where
 /// construction first, the interior events by their id, demolition last. Display
 /// ordering — interleaving endpoints by date — is the [`moment`](crate::moment)
 /// layer's job, folded into [`Timeline::build`].
-fn timeline_events<EntId, EvtId, ImgId>(
-    projected: &projection::Entity<EntId, EvtId, ImgId, MemberLineage<EntId, ImgId>>,
-) -> Vec<TimelineEvent<EvtId, ImgId>>
+/// A projected entity over any support lineage.
+type ProjectedEntity<EntId, EvtId, ImgId, X> = projection::Entity<EntId, EvtId, ImgId, Lineage<X>>;
+
+fn timeline_events<EntId, EvtId, ImgId, X>(
+    projected: &ProjectedEntity<EntId, EvtId, ImgId, X>,
+) -> Vec<TimelineEvent<EvtId, X::Img>>
 where
-    EntId: Ord + Clone,
+    EntId: Ord,
     EvtId: Ord + Clone + std::fmt::Debug,
     ImgId: Ord + Clone,
+    X: SupportAtom<Img = ImgId>,
 {
-    let mut events: Vec<TimelineEvent<EvtId, ImgId>> = Vec::new();
+    let mut events: Vec<TimelineEvent<EvtId, X::Img>> = Vec::new();
 
     if bookend_present(&projected.construction) {
         events.push(TimelineEvent {
@@ -589,13 +584,13 @@ fn landing_date<ImgId>(period: &Period<ImgId>) -> Option<NaiveDate> {
 /// timeline by best-known landing date, else the construction location. The
 /// `Option<NaiveDate>` ordering puts a dated move above an undated one and the
 /// later landing on top.
-fn entity_location<EntId, EvtId, ImgId>(
-    construction_location: &Bracket<UnresolvedLocation, MemberLineage<EntId, ImgId>>,
-    events: &[TimelineEvent<EvtId, ImgId>],
-) -> Bounded<UnresolvedLocation, ImgId>
+fn entity_location<EvtId, X>(
+    construction_location: &Bracket<UnresolvedLocation, Lineage<X>>,
+    events: &[TimelineEvent<EvtId, X::Img>],
+) -> Bounded<UnresolvedLocation, X::Img>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord + Clone,
 {
     events
         .iter()
@@ -632,8 +627,8 @@ mod tests {
 
     fn date_kind(
         kind: LifetimeEventKind,
-        support: Lin,
-    ) -> Bracket<Claimed<LifetimeEventKind>, Lin> {
+        support: FactLin,
+    ) -> Bracket<Claimed<LifetimeEventKind>, FactLin> {
         claim(
             Claimed::Of {
                 values: [kind].into_iter().collect(),
@@ -643,7 +638,7 @@ mod tests {
     }
 
     /// A minimal empty event record — every slot untouched.
-    fn empty_event() -> Result<projection::Event<Lin>, Box<dyn std::error::Error>> {
+    fn empty_event() -> Result<projection::Event<FactLin>, Box<dyn std::error::Error>> {
         Ok(projection::Event {
             kind: untouched(),
             started_at: untouched(),
@@ -658,7 +653,7 @@ mod tests {
         })
     }
 
-    fn empty_bookend() -> Bookend<Lin> {
+    fn empty_bookend() -> Bookend<FactLin> {
         Bookend {
             started_at: untouched(),
             completed_at: untouched(),
@@ -667,7 +662,7 @@ mod tests {
     }
 
     /// An entity with empty everything — the per-test base to populate.
-    fn empty_entity() -> projection::Entity<EntId, EvtId, ImgId, Lin> {
+    fn empty_entity() -> projection::Entity<EntId, EvtId, ImgId, FactLin> {
         projection::Entity {
             names: FactMap::new(),
             relations: FactMap::new(),
@@ -697,13 +692,13 @@ mod tests {
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Damaged,
             },
-            lin(1, "https://a")?,
+            fact_lin(1, "https://a")?,
         );
         record.cause = claim(
             Claimed::Of {
                 values: [DamageCause::Fire].into_iter().collect(),
             },
-            lin(1, "https://a")?,
+            fact_lin(1, "https://a")?,
         );
         let (kind, _sources) = interior_event(&record, &1u64);
         let InteriorEvent::Damaged { cause, .. } = kind else {
@@ -731,19 +726,19 @@ mod tests {
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Damaged,
             },
-            lin(1, "https://a")?,
+            fact_lin(1, "https://a")?,
         );
         record.cause = claim(
             Claimed::Of {
                 values: [DamageCause::Fire].into_iter().collect(),
             },
-            lin(1, "https://a")?,
+            fact_lin(1, "https://a")?,
         );
         record.method = claim(
             Claimed::Of {
                 values: [MoveMethod::Whole].into_iter().collect(),
             },
-            lin(2, "https://m")?,
+            fact_lin(2, "https://m")?,
         );
 
         let (kind, _sources) = interior_event(&record, &1u64);
@@ -783,13 +778,13 @@ mod tests {
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Modified,
             },
-            lin(1, "https://a")?,
+            fact_lin(1, "https://a")?,
         )
         .combine(date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Repaired,
             },
-            lin(2, "https://b")?,
+            fact_lin(2, "https://b")?,
         ));
         let (kind, _sources) = interior_event(&record, &1u64);
         let InteriorEvent::Ambiguous { candidates, .. } = kind else {
@@ -817,7 +812,7 @@ mod tests {
     #[test]
     fn any_kind_routes_to_ambiguous() -> TestResult {
         let mut record = empty_event()?;
-        record.kind = claim(Claimed::Any, lin(1, "https://a")?);
+        record.kind = claim(Claimed::Any, fact_lin(1, "https://a")?);
         let (kind, _sources) = interior_event(&record, &1u64);
         let InteriorEvent::Ambiguous { candidates, .. } = kind else {
             return Err("expected Ambiguous for Any".into());
@@ -836,9 +831,11 @@ mod tests {
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Modified,
             },
-            lin(1, "https://k")?,
+            fact_lin(1, "https://k")?,
         );
-        entity.events.insert(1, cited(record, lin(1, "https://k")?));
+        entity
+            .events
+            .insert(1, cited(record, fact_lin(1, "https://k")?));
 
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         let entry = out
@@ -886,7 +883,7 @@ mod tests {
         let mut entity = empty_entity();
         entity.sameness.insert(
             OrderedDistinctPair::new(1, 2)?,
-            cited((), lin(1, "https://judgment")?),
+            cited((), fact_lin(1, "https://judgment")?),
         );
         let class = EquivClass {
             representative: 1,
@@ -908,18 +905,20 @@ mod tests {
         let mut entity = empty_entity();
         let built = resolved_point(41.0, 12.0)?;
         let moved_to = resolved_point(45.0, 9.0)?;
-        entity.construction.location = claim(built.clone(), lin(1, "https://built")?);
+        entity.construction.location = claim(built.clone(), fact_lin(1, "https://built")?);
 
         let mut moved = empty_event()?;
         moved.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
             },
-            lin(1, "https://m")?,
+            fact_lin(1, "https://m")?,
         );
-        moved.completed_at = claim(year(1900)?, lin(1, "https://m")?);
-        moved.location = claim(moved_to.clone(), lin(1, "https://m")?);
-        entity.events.insert(10, cited(moved, lin(1, "https://m")?));
+        moved.completed_at = claim(year(1900)?, fact_lin(1, "https://m")?);
+        moved.location = claim(moved_to.clone(), fact_lin(1, "https://m")?);
+        entity
+            .events
+            .insert(10, cited(moved, fact_lin(1, "https://m")?));
 
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         assert_eq!(
@@ -933,7 +932,7 @@ mod tests {
     fn location_falls_back_to_construction_without_moves() -> TestResult {
         let mut entity = empty_entity();
         let built = resolved_point(41.0, 12.0)?;
-        entity.construction.location = claim(built.clone(), lin(1, "https://built")?);
+        entity.construction.location = claim(built.clone(), fact_lin(1, "https://built")?);
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         assert_eq!(out.location.possible, built);
         Ok(())
@@ -950,26 +949,26 @@ mod tests {
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
             },
-            lin(1, "https://e")?,
+            fact_lin(1, "https://e")?,
         );
-        move_early.completed_at = claim(year(1880)?, lin(1, "https://e")?);
-        move_early.location = claim(early, lin(1, "https://e")?);
+        move_early.completed_at = claim(year(1880)?, fact_lin(1, "https://e")?);
+        move_early.location = claim(early, fact_lin(1, "https://e")?);
         entity
             .events
-            .insert(10, cited(move_early, lin(1, "https://e")?));
+            .insert(10, cited(move_early, fact_lin(1, "https://e")?));
 
         let mut move_late = empty_event()?;
         move_late.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
             },
-            lin(1, "https://l")?,
+            fact_lin(1, "https://l")?,
         );
-        move_late.completed_at = claim(year(1920)?, lin(1, "https://l")?);
-        move_late.location = claim(late.clone(), lin(1, "https://l")?);
+        move_late.completed_at = claim(year(1920)?, fact_lin(1, "https://l")?);
+        move_late.location = claim(late.clone(), fact_lin(1, "https://l")?);
         entity
             .events
-            .insert(11, cited(move_late, lin(1, "https://l")?));
+            .insert(11, cited(move_late, fact_lin(1, "https://l")?));
 
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         assert_eq!(
@@ -990,25 +989,25 @@ mod tests {
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
             },
-            lin(1, "https://d")?,
+            fact_lin(1, "https://d")?,
         );
-        move_dated.completed_at = claim(year(1900)?, lin(1, "https://d")?);
-        move_dated.location = claim(dated.clone(), lin(1, "https://d")?);
+        move_dated.completed_at = claim(year(1900)?, fact_lin(1, "https://d")?);
+        move_dated.location = claim(dated.clone(), fact_lin(1, "https://d")?);
         entity
             .events
-            .insert(10, cited(move_dated, lin(1, "https://d")?));
+            .insert(10, cited(move_dated, fact_lin(1, "https://d")?));
 
         let mut move_undated = empty_event()?;
         move_undated.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
             },
-            lin(1, "https://u")?,
+            fact_lin(1, "https://u")?,
         );
-        move_undated.location = claim(undated, lin(1, "https://u")?);
+        move_undated.location = claim(undated, fact_lin(1, "https://u")?);
         entity
             .events
-            .insert(11, cited(move_undated, lin(1, "https://u")?));
+            .insert(11, cited(move_undated, fact_lin(1, "https://u")?));
 
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         assert_eq!(
@@ -1023,16 +1022,16 @@ mod tests {
     /// Build a designated point event at a given year (or undated).
     fn designated_event(
         year_opt: Option<i32>,
-    ) -> Result<projection::Event<Lin>, Box<dyn std::error::Error>> {
+    ) -> Result<projection::Event<FactLin>, Box<dyn std::error::Error>> {
         let mut record = empty_event()?;
         record.kind = date_kind(
             LifetimeEventKind::Point {
                 kind: PointKind::Designated,
             },
-            lin(1, "https://d")?,
+            fact_lin(1, "https://d")?,
         );
         if let Some(y) = year_opt {
-            record.occurred_at = claim(year(y)?, lin(1, "https://d")?);
+            record.occurred_at = claim(year(y)?, fact_lin(1, "https://d")?);
         }
         Ok(record)
     }
@@ -1040,18 +1039,18 @@ mod tests {
     #[test]
     fn timeline_places_construction_first_demolition_last_interiors_by_id() -> TestResult {
         let mut entity = empty_entity();
-        entity.construction.started_at = claim(year(1800)?, lin(1, "https://c")?);
-        entity.demolition.completed_at = claim(year(1990)?, lin(1, "https://x")?);
+        entity.construction.started_at = claim(year(1800)?, fact_lin(1, "https://c")?);
+        entity.demolition.completed_at = claim(year(1990)?, fact_lin(1, "https://x")?);
         // Two interior events inserted with the later-dated one at the lower id,
         // so the assembly order tracks the id. Date interleaving is the `moment`
         // layer's job.
         entity.events.insert(
             1,
-            cited(designated_event(Some(1900))?, lin(1, "https://p")?),
+            cited(designated_event(Some(1900))?, fact_lin(1, "https://p")?),
         );
         entity
             .events
-            .insert(2, cited(designated_event(None)?, lin(1, "https://u")?));
+            .insert(2, cited(designated_event(None)?, fact_lin(1, "https://u")?));
 
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));
         let kinds: Vec<&str> = out
@@ -1103,7 +1102,7 @@ mod tests {
                     valid_from: untouched(),
                     valid_to: untouched(),
                 },
-                lin(1, "https://n")?,
+                fact_lin(1, "https://n")?,
             ),
         );
         let out = Entity::<EntId, EvtId, ImgId>::parse(&entity, &solo_class(1));

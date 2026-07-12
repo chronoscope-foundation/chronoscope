@@ -186,7 +186,9 @@ mod tests {
         let out = Image::<EntId, ImgId>::parse(&conflicting, &solo_image_class(1));
         assert_eq!(
             out.medium.consensus,
-            Consensus::Conflict,
+            Consensus::Conflict {
+                fighting: Vec::new()
+            },
             "two sources disagreeing on the medium over-determine it"
         );
         assert_eq!(

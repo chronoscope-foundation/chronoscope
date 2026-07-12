@@ -1,25 +1,12 @@
-//! Conflict reports — typed, enumerable records of over-determined projection
-//! slots, each with a stable id, a structured location, and a per-kind
-//! resolution menu.
+//! Date-conflict detection over a projected entity.
 //!
-//! A [`ConflictReport`] pins where a projection over-determined a slot
-//! ([`ConflictLocation`]), what evidence fought ([`ConflictKind`]-specific
-//! data), and the curator's options ([`Resolution`]). [`AnyConflictReport`] is
-//! the closed sum the API serves. Identity is content-derived
-//! ([`ConflictId`]), so a frontend URL routes to the same conflict across
-//! projection runs while the same facts keep fighting.
-//!
-//! The report types re-exported here are defined in a `report` submodule;
-//! [`minimize`] is the deletion-MUS primitive the detector uses to reduce an
-//! over-determined slot's fact set to one minimal fighting set. The detector
-//! itself lands here alongside them.
+//! [`fact_lineage`] projects each slot's support as the whole stored facts
+//! ([`FactAtom`]) behind it, so an over-determined slot reads its fighting
+//! evidence straight off its consensus support. [`minimize`] is the deletion-MUS
+//! primitive that reduces such a slot's fact set to one minimal fighting set.
 
 mod detect;
 pub mod minimize;
-mod report;
 
-pub use detect::{CitedFact, cited_lineage, detect_conflicts};
-pub use report::{
-    AnyConflictReport, BookendEndpoint, ConflictId, ConflictKind, ConflictLocation, ConflictPath,
-    ConflictReport, DateConflict, EventEndpoint, Resolution, Uninhabited,
-};
+pub use detect::{FactAtom, fact_lineage};
+pub(crate) use detect::{fact_date, minimal_fighting_sets};

@@ -21,6 +21,7 @@ mod types;
 
 pub use bracket::{Bracket, ConsensusConflict, MAX_PROJECTED_LOCATION_CIRCLES};
 pub use claimed::Claimed;
+pub(crate) use merge::citation_of;
 pub use provenance::{Citation, Cited, MemberLineage};
 pub use slot::{FactMap, FactSet, Slot};
 pub use types::{

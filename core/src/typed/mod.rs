@@ -6,24 +6,26 @@
 //! verdict, or absent), each membership becomes an attributed value, and the
 //! interior events parse into a typed timeline.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::algebra::lattice::JoinSemilattice;
-use crate::algebra::semiring::Semiring;
+use crate::algebra::semiring::Lineage;
+use crate::conflicts::{FactAtom, fact_date, minimal_fighting_sets};
+use crate::date::UncertainDate;
 use crate::grammar::depiction::Perspective;
 use crate::grammar::geometry::ImageGeometry;
 use crate::grammar::identity::OrderedDistinctPair;
+use crate::grammar::ids::{FactId, IdScheme};
 use crate::location::ConflictStatus;
+use crate::nonempty::NonEmptyVec;
 use crate::projection::Claimed;
 use crate::store::schema::EquivClass;
 
-use crate::projection::{
-    Bracket, Citation, Cited, ConsensusConflict, DepictionRecord, MemberLineage, Sameness,
-};
+use crate::projection::{Bracket, Citation, Cited, ConsensusConflict, DepictionRecord, Sameness};
 
 mod entity;
 mod image;
@@ -53,7 +55,7 @@ pub struct Bounded<V, ImgId> {
     /// The extent (join) — what any source allows, in the field's own lattice.
     pub possible: V,
     pub sources: Vec<Citation<ImgId>>,
-    pub consensus: Consensus<V>,
+    pub consensus: Consensus<V, ImgId>,
 }
 
 impl<X: Ord, ImgId> Bounded<Claimed<X>, ImgId> {
@@ -80,16 +82,37 @@ impl<X: Ord, ImgId> Bounded<Claimed<X>, ImgId> {
 /// over-determined it, was declined this layer, or never touched it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[serde(bound(deserialize = "V: ::serde::de::DeserializeOwned"))]
-pub enum Consensus<V> {
+#[serde(bound(
+    deserialize = "V: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
+))]
+pub enum Consensus<V, ImgId> {
     /// No claim touched this slot.
     Absent,
     /// The meet settled to a value all sources agree on.
     Reached { value: V },
     /// The meet bottomed out; the rival extent lives in [`Bounded::possible`].
-    Conflict,
+    /// `fighting` holds the minimal sets of facts that can't jointly hold, each
+    /// rival carrying its value and the citations behind it.
+    Conflict {
+        fighting: Vec<NonEmptyVec<Attributed<V, ImgId>>>,
+    },
     /// This layer declined to decide (circle cap / unresolved reference).
     Pending { reason: PendingReason },
+}
+
+/// The distinct rivals across a conflict's minimal fighting sets, in first-
+/// appearance order — one entry per fact, so a fact shared by several minimal
+/// sets surfaces once. The flat view a single-value display wants.
+pub fn distinct_rivals<V: PartialEq, ImgId: PartialEq>(
+    fighting: &[NonEmptyVec<Attributed<V, ImgId>>],
+) -> Vec<&Attributed<V, ImgId>> {
+    let mut out: Vec<&Attributed<V, ImgId>> = Vec::new();
+    for rival in fighting.iter().flat_map(|set| set.iter()) {
+        if !out.contains(&rival) {
+            out.push(rival);
+        }
+    }
+    out
 }
 
 /// Why a consensus is [`Pending`](Consensus::Pending). One variant today — the
@@ -152,17 +175,53 @@ pub struct Depiction<OtherId, ImgId> {
 // Flatteners
 // ----------------------------------------------------------------------------
 
-/// Iterate a lineage's `(id, citation)` atoms, keep the citations, dedup. The
-/// id rode along to make cross-id glue computable in the projection; the typed
-/// surface drops it.
-pub(super) fn sources<EntId, ImgId>(support: &MemberLineage<EntId, ImgId>) -> Vec<Citation<ImgId>>
+/// A provenance-support atom, yielding its citation when it warrants one. A
+/// member-lineage atom carries its citation beside the member id; a fact atom
+/// derives it from the stored fact. `None` for an atom that backs no value (a
+/// meta fact).
+///
+/// Public because [`Entity::parse`] is generic over it — a caller flattens
+/// either support without naming the atom.
+pub trait SupportAtom {
+    /// The image id the atom's citation references.
+    type Img;
+    fn citation(&self) -> Option<Citation<Self::Img>>;
+
+    /// The (fact id, date) this atom contributes to a date slot — the premise a
+    /// date conflict is minimized over. Absent for atoms that carry no fact.
+    fn date_premise(&self) -> Option<(FactId, UncertainDate)> {
+        None
+    }
+}
+
+impl<EntId, ImgId: Clone> SupportAtom for (EntId, Citation<ImgId>) {
+    type Img = ImgId;
+    fn citation(&self) -> Option<Citation<ImgId>> {
+        Some(self.1.clone())
+    }
+}
+
+impl<R: IdScheme> SupportAtom for FactAtom<R> {
+    type Img = R::Image;
+    fn citation(&self) -> Option<Citation<R::Image>> {
+        crate::projection::citation_of(&self.fact)
+    }
+    fn date_premise(&self) -> Option<(FactId, UncertainDate)> {
+        Some((self.id, fact_date(&self.fact)?))
+    }
+}
+
+/// The citations a lineage's atoms attribute, deduped. Each atom's own identity
+/// (a member id, a fact id) rode along to make the projection computable; the
+/// typed surface keeps only the citations.
+pub(super) fn sources<X>(support: &Lineage<X>) -> Vec<Citation<X::Img>>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord,
 {
     support
         .iter()
-        .map(|(_, citation)| citation.clone())
+        .filter_map(SupportAtom::citation)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -171,13 +230,11 @@ where
 /// Flatten a restrictive field. `Absent` when the extent support is the semiring
 /// zero (nothing contributed via `plus`); else `possible`/`sources` come from
 /// the extent and the consensus reads off `consensus.value.conflict()`.
-pub(super) fn bracket<V, EntId, ImgId>(
-    b: &Bracket<V, MemberLineage<EntId, ImgId>>,
-) -> Bounded<V, ImgId>
+pub(super) fn bracket<V, X>(b: &Bracket<V, Lineage<X>>) -> Bounded<V, X::Img>
 where
     V: JoinSemilattice + ConsensusConflict + Clone + PartialEq,
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord,
 {
     if !touched(b) {
         return Bounded {
@@ -192,7 +249,9 @@ where
         ConflictStatus::Consistent => Consensus::Reached {
             value: b.consensus.value.clone(),
         },
-        ConflictStatus::Conflict => Consensus::Conflict,
+        ConflictStatus::Conflict => Consensus::Conflict {
+            fighting: Vec::new(),
+        },
         ConflictStatus::Pending => Consensus::Pending {
             reason: PendingReason::Unresolved,
         },
@@ -219,14 +278,77 @@ where
     }
 }
 
-/// Flatten an additive entry's value to its attributing citations.
-pub(super) fn factset<E, EntId, ImgId>(
-    entry: &Cited<(), MemberLineage<EntId, ImgId>>,
-    value: E,
-) -> Attributed<E, ImgId>
+/// Flatten a date slot, filling a conflict's fighting rivals. Flattens via
+/// [`bracket`], then for an over-determined slot reads the fighting facts off the
+/// consensus support: each fact's date premise and citations, minimized into the
+/// sets whose dates can't jointly hold.
+pub(super) fn dated_bracket<X>(
+    b: &Bracket<UncertainDate, Lineage<X>>,
+) -> Bounded<UncertainDate, X::Img>
 where
-    EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord + Clone,
+{
+    let mut bounded = bracket(b);
+    if matches!(bounded.consensus, Consensus::Conflict { .. }) {
+        bounded.consensus = Consensus::Conflict {
+            fighting: fighting_sets(&b.consensus.support),
+        };
+    }
+    bounded
+}
+
+/// One fighting fact's contribution to a date slot: its claimed date and the
+/// citations attributing it.
+type DatePremise<ImgId> = (UncertainDate, Vec<Citation<ImgId>>);
+
+/// The minimal fighting sets of a date slot's consensus support: group each
+/// fact's date premise with the citations attributing it, minimize the premises
+/// into the sets whose joint meet is empty, and re-attribute each set's facts as
+/// their dates plus citations.
+fn fighting_sets<X>(support: &Lineage<X>) -> Vec<NonEmptyVec<Attributed<UncertainDate, X::Img>>>
+where
+    X: SupportAtom,
+    X::Img: Ord + Clone,
+{
+    let mut by_fact: BTreeMap<FactId, DatePremise<X::Img>> = BTreeMap::new();
+    for atom in support.iter() {
+        let Some((id, date)) = atom.date_premise() else {
+            continue;
+        };
+        let entry = by_fact.entry(id).or_insert_with(|| (date, Vec::new()));
+        if let Some(citation) = atom.citation() {
+            entry.1.push(citation);
+        }
+    }
+
+    let premises: Vec<(FactId, UncertainDate)> = by_fact
+        .iter()
+        .map(|(id, (date, _))| (*id, date.clone()))
+        .collect();
+
+    minimal_fighting_sets(&premises)
+        .into_iter()
+        .filter_map(|set| {
+            let rivals: Vec<Attributed<UncertainDate, X::Img>> = set
+                .iter()
+                .filter_map(|id| {
+                    by_fact.get(id).map(|(date, sources)| Attributed {
+                        value: date.clone(),
+                        sources: sources.clone(),
+                    })
+                })
+                .collect();
+            NonEmptyVec::try_from_vec(rivals).ok()
+        })
+        .collect()
+}
+
+/// Flatten an additive entry's value to its attributing citations.
+pub(super) fn factset<E, X>(entry: &Cited<(), Lineage<X>>, value: E) -> Attributed<E, X::Img>
+where
+    X: SupportAtom,
+    X::Img: Ord,
 {
     Attributed {
         value,
@@ -238,13 +360,13 @@ where
 /// each annotation axis `bracket()`'d, the link's existence citations from the
 /// entry's support. Shared by both reading directions — the image side passes the
 /// entity as `other`, the entity side the image — so the two views can't drift.
-pub(super) fn depiction<OtherId, SrcId, ImgId>(
+pub(super) fn depiction<OtherId, X>(
     other: OtherId,
-    entry: &Cited<DepictionRecord<MemberLineage<SrcId, ImgId>>, MemberLineage<SrcId, ImgId>>,
-) -> Depiction<OtherId, ImgId>
+    entry: &Cited<DepictionRecord<Lineage<X>>, Lineage<X>>,
+) -> Depiction<OtherId, X::Img>
 where
-    SrcId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord,
 {
     Depiction {
         other,
@@ -268,26 +390,23 @@ pub(crate) fn dated_bound<V, ImgId>(bounded: &Bounded<V, ImgId>) -> Option<&Boun
 
 /// Whether a bracket carries a claim — its extent support is past the semiring
 /// zero (something contributed via `plus`).
-pub(super) fn touched<V, EntId, ImgId>(b: &Bracket<V, MemberLineage<EntId, ImgId>>) -> bool
-where
-    EntId: Ord,
-    ImgId: Ord,
-{
-    b.extent.support != MemberLineage::zero()
+pub(super) fn touched<V, X>(b: &Bracket<V, Lineage<X>>) -> bool {
+    !matches!(b.extent.support, Lineage::Bottom)
 }
 
-pub(super) fn merge_provenance<EntId, ImgId>(
-    sameness: &Sameness<EntId, MemberLineage<EntId, ImgId>>,
+pub(super) fn merge_provenance<EntId, X>(
+    sameness: &Sameness<EntId, Lineage<X>>,
     class: &EquivClass<EntId>,
-) -> MergeProvenance<EntId, ImgId>
+) -> MergeProvenance<EntId, X::Img>
 where
     EntId: Ord + Clone,
-    ImgId: Ord + Clone,
+    X: SupportAtom,
+    X::Img: Ord,
 {
     // The class always contains its own subject, so `members` is non-empty.
     let mention_count = NonZeroUsize::new(class.members.len()).unwrap_or(NonZeroUsize::MIN);
 
-    let bridges: Vec<MergeBridge<EntId, ImgId>> = sameness
+    let bridges: Vec<MergeBridge<EntId, X::Img>> = sameness
         .iter()
         .map(|(pair, entry)| MergeBridge {
             endpoints: pair.clone(),
@@ -312,11 +431,20 @@ where
 
 #[cfg(test)]
 mod test_support {
+    use std::hash::{Hash, Hasher};
+
     use chrono::NaiveDate;
     use url::Url;
 
+    use crate::algebra::semiring::Semiring;
     use crate::date::{DatePrecision, UncertainDate};
+    use crate::grammar::assertions::FactualAssertion;
+    use crate::grammar::bookend;
     use crate::grammar::citations::{Excerpt, ExternalSource, FactualCitation};
+    use crate::grammar::ids::{FactId, IdScheme};
+    use crate::projection::MemberLineage;
+    use crate::submit::StoredFact;
+    use crate::submit::result::StoredFactualFact;
 
     use super::*;
 
@@ -326,52 +454,108 @@ mod test_support {
     pub(super) type ImgId = u64;
     pub(super) type Lin = MemberLineage<EntId, ImgId>;
 
-    /// A factual citation, distinguished by source url so distinct claims keep
-    /// distinct lineage atoms.
+    /// A bare id scheme over `u64`, so the entity typed flatten's fact-atom
+    /// support has a concrete scheme to name its stored facts under.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(super) struct TestIds;
+
+    impl IdScheme for TestIds {
+        type Entity = u64;
+        type Event = u64;
+        type Image = u64;
+    }
+
+    /// The entity typed flatten's fact-atom support, over the [`TestIds`] scheme.
+    pub(super) type FactLin = Lineage<FactAtom<TestIds>>;
+
+    /// A factual citation distinguished by source url, so distinct sources keep
+    /// distinct citations.
+    pub(super) fn factual_citation(
+        url: &str,
+    ) -> Result<FactualCitation, Box<dyn std::error::Error>> {
+        Ok(FactualCitation::new(
+            ExternalSource::Url {
+                url: Url::parse(url)?,
+                published: None,
+            },
+            vec![Excerpt::new("source-text")?],
+        )?)
+    }
+
+    /// A factual citation wrapped for a member-lineage atom.
     pub(super) fn factual(url: &str) -> Result<Citation<ImgId>, Box<dyn std::error::Error>> {
         Ok(Citation::Factual {
-            citation: FactualCitation::new(
-                ExternalSource::Url {
-                    url: Url::parse(url)?,
-                    published: None,
-                },
-                vec![Excerpt::new("source-text")?],
-            )?,
+            citation: factual_citation(url)?,
         })
     }
 
-    /// A lineage atom for one id citing one source.
+    /// A member-lineage atom for one id citing one source.
     pub(super) fn lin(id: EntId, url: &str) -> Result<Lin, Box<dyn std::error::Error>> {
         Ok(MemberLineage::Of(
             [(id, factual(url)?)].into_iter().collect(),
         ))
     }
 
+    /// A fact-atom lineage citing one source, keyed by a fact id derived from
+    /// `(id, url)` so distinct sources stay distinct facts and repeats dedup.
+    pub(super) fn fact_lin(id: u64, url: &str) -> Result<FactLin, Box<dyn std::error::Error>> {
+        fact_lin_dated(id, url, 1900)
+    }
+
+    /// A fact-atom lineage for a construction-start bound at year `y`, so a
+    /// date-conflict flatten has distinct fighting dates to recover.
+    pub(super) fn fact_lin_dated(
+        id: u64,
+        url: &str,
+        y: i32,
+    ) -> Result<FactLin, Box<dyn std::error::Error>> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (id, url).hash(&mut hasher);
+        let fact = StoredFact::Factual(StoredFactualFact {
+            assertion: FactualAssertion::Construction {
+                fact: bookend::ConstructionFact::Started {
+                    entity: 0,
+                    bound: year(y)?,
+                },
+            },
+            citation: factual_citation(url)?,
+        });
+        Ok(Lineage::Of(
+            [FactAtom {
+                id: FactId::new(hasher.finish()),
+                fact,
+            }]
+            .into_iter()
+            .collect(),
+        ))
+    }
+
     /// A single claim's bracket: both bounds the value, backed by `support`.
-    pub(super) fn claim<V: Clone>(value: V, support: Lin) -> Bracket<V, Lin> {
+    pub(super) fn claim<V: Clone, S: Clone>(value: V, support: S) -> Bracket<V, S> {
         Bracket::from((value, support))
     }
 
     /// The identity (untouched) bracket: consensus ⊤ / support one, extent ⊥ /
     /// support zero — the absent slot.
-    pub(super) fn untouched<V>() -> Bracket<V, Lin>
+    pub(super) fn untouched<V, S>() -> Bracket<V, S>
     where
         V: crate::algebra::lattice::BoundedLattice,
+        S: Semiring,
     {
         use crate::algebra::monoid::CommutativeMonoid;
         Bracket::identity()
     }
 
-    pub(super) fn cited<V>(value: V, support: Lin) -> Cited<V, Lin> {
+    pub(super) fn cited<V, S>(value: V, support: S) -> Cited<V, S> {
         Cited { value, support }
     }
 
     /// A single claim pinning one value as the settled `Claimed::Of` singleton,
     /// the bracket every restrictive value-mode field carries.
-    pub(super) fn claimed_value<V: Ord + Clone>(
+    pub(super) fn claimed_value<V: Ord + Clone, S: Clone>(
         value: V,
-        support: Lin,
-    ) -> Bracket<Claimed<V>, Lin> {
+        support: S,
+    ) -> Bracket<Claimed<V>, S> {
         claim(
             Claimed::Of {
                 values: [value].into_iter().collect(),
@@ -393,11 +577,11 @@ mod test_support {
 
     /// A depiction record with each axis present iff supplied, the shape the
     /// projection's depiction fold produces.
-    pub(super) fn depiction_record(
+    pub(super) fn depiction_record<S: Semiring + Clone>(
         localization: Option<ImageGeometry>,
         perspective: Option<Perspective>,
-        support: Lin,
-    ) -> DepictionRecord<Lin> {
+        support: S,
+    ) -> DepictionRecord<S> {
         DepictionRecord {
             localization: match localization {
                 Some(g) => claimed_value(g, support.clone()),
@@ -428,7 +612,7 @@ mod tests {
                 values: values.iter().copied().collect(),
             }
         }
-        fn with_consensus(consensus: Consensus<Claimed<u8>>) -> Bounded<Claimed<u8>, ImgId> {
+        fn with_consensus(consensus: Consensus<Claimed<u8>, ImgId>) -> Bounded<Claimed<u8>, ImgId> {
             Bounded {
                 possible: Claimed::Any,
                 sources: Vec::new(),
@@ -442,7 +626,13 @@ mod tests {
             "a settled singleton yields its value"
         );
         assert_eq!(with_consensus(Consensus::Absent).settled(), None);
-        assert_eq!(with_consensus(Consensus::Conflict).settled(), None);
+        assert_eq!(
+            with_consensus(Consensus::Conflict {
+                fighting: Vec::new()
+            })
+            .settled(),
+            None
+        );
         assert_eq!(
             with_consensus(Consensus::Pending {
                 reason: PendingReason::Unresolved
@@ -495,12 +685,80 @@ mod tests {
         let out = bracket(&b);
         assert_eq!(
             out.consensus,
-            Consensus::Conflict,
-            "two disjoint years over-determine the meet"
+            Consensus::Conflict {
+                fighting: Vec::new()
+            },
+            "two disjoint years over-determine the meet; the generic bracket leaves fighting empty"
         );
         assert!(
             out.possible.intervals().len() >= 2,
             "the extent keeps both rival years"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dated_bracket_surfaces_fighting_rivals() -> TestResult {
+        use crate::algebra::monoid::CommutativeMonoid;
+        // Two construction-start facts a decade apart over-determine the slot; the
+        // date flatten must surface the disjoint pair as one fighting set whose
+        // rivals carry the two submitted dates and their citations.
+        let b = claim(year(1850)?, fact_lin_dated(1, "https://a", 1850)?)
+            .combine(claim(year(1860)?, fact_lin_dated(2, "https://b", 1860)?));
+        let out = dated_bracket(&b);
+        let Consensus::Conflict { fighting } = &out.consensus else {
+            return Err("disjoint start dates must flatten to a Conflict".into());
+        };
+        assert_eq!(
+            fighting.len(),
+            1,
+            "a single disjoint pair yields one minimal fighting set"
+        );
+        let set = fighting.first().ok_or("no fighting set")?;
+        assert_eq!(set.len().get(), 2, "the set names both rival facts");
+        let dates: BTreeSet<UncertainDate> = set.iter().map(|r| r.value.clone()).collect();
+        assert_eq!(
+            dates,
+            [year(1850)?, year(1860)?].into_iter().collect(),
+            "the rivals carry the two submitted start dates"
+        );
+        for rival in set {
+            assert_eq!(rival.sources.len(), 1, "each rival cites its own fact");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dated_bracket_dedupes_three_pairwise_disjoint_rivals() -> TestResult {
+        use crate::algebra::monoid::CommutativeMonoid;
+        // Three mutually disjoint start dates give the pairs [A,B],[A,C],[B,C] —
+        // three minimal fighting sets. The flat rival view collapses each fact to
+        // one entry.
+        let b = claim(year(1850)?, fact_lin_dated(1, "https://a", 1850)?)
+            .combine(claim(year(1860)?, fact_lin_dated(2, "https://b", 1860)?))
+            .combine(claim(year(1870)?, fact_lin_dated(3, "https://c", 1870)?));
+        let out = dated_bracket(&b);
+        let Consensus::Conflict { fighting } = &out.consensus else {
+            return Err("three disjoint start dates must flatten to a Conflict".into());
+        };
+        assert_eq!(
+            fighting.len(),
+            3,
+            "three pairwise-disjoint dates give three minimal fighting pairs"
+        );
+        let rivals = distinct_rivals(fighting);
+        assert_eq!(
+            rivals.len(),
+            3,
+            "each fact surfaces once across the pairs it appears in"
+        );
+        let dates: BTreeSet<UncertainDate> = rivals.iter().map(|r| r.value.clone()).collect();
+        assert_eq!(
+            dates,
+            [year(1850)?, year(1860)?, year(1870)?]
+                .into_iter()
+                .collect(),
+            "the distinct rivals carry all three submitted start dates"
         );
         Ok(())
     }
@@ -525,7 +783,7 @@ mod tests {
     #[test]
     fn bracket_untouched_slot_is_absent() -> TestResult {
         use crate::algebra::lattice::JoinSemilattice;
-        let out = bracket(&untouched::<UncertainDate>());
+        let out = bracket(&untouched::<UncertainDate, Lin>());
         assert_eq!(out.consensus, Consensus::Absent);
         assert!(out.sources.is_empty(), "an absent field cites nothing");
         assert_eq!(

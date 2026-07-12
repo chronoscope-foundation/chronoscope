@@ -1109,3 +1109,179 @@ async fn test_notre_dame_interior_event_renders_between_construction_endpoints()
     })
     .await
 }
+
+/// Notre-Dame's construction start is contested: a P571 founding of 1160 fights
+/// the P793 build start of 1163, so the flattener leaves the slot in conflict.
+/// The panel must render that dispute — an amber citation bullet on the row, the
+/// honest joined value "1160 / 1163" inline, and the rival claims in the
+/// bullet's popover — rather than promoting one date to a settled value.
+#[tokio::test]
+async fn test_notre_dame_disputed_construction_start_shows_rival_years() -> TestResult {
+    web_test(async |t| {
+        open_notre_dame_panel(t).await?;
+
+        // The contested row carries an amber citation bullet, whose aria-label
+        // marks the conflict — the disputed treatment.
+        t.wait_for_selector("[role='complementary'] button[aria-label*='conflicting']")
+            .await?;
+
+        // The joined inline value names both rival years without opening anything.
+        let inline_text = t.text("[role='complementary']").await?;
+        check(
+            inline_text.contains("1160") && inline_text.contains("1163"),
+            format!(
+                "The disputed construction start must render the honest joined value \
+                 naming both rival years 1160 and 1163, got: {inline_text}"
+            ),
+        )?;
+
+        // Opening the bullet reveals the rival claims — wait for a source label
+        // only the popover carries.
+        t.click("[role='complementary'] button[aria-label*='conflicting']")
+            .await?;
+        t.wait_for_body_text("P571").await?;
+
+        // The popover is portaled to document.body, outside the complementary
+        // panel; while a bullet is open it is the page's only `role='group'`.
+        let popover_text = t.text("[role='group']").await?;
+        check(
+            popover_text.to_lowercase().contains("disputed"),
+            format!(
+                "Opening the contested bullet must reveal the disputed treatment, \
+                 got: {popover_text}"
+            ),
+        )?;
+        check(
+            popover_text.contains("1160") && popover_text.contains("1163"),
+            format!(
+                "The disputed popover must name both rival years 1160 and 1163, \
+                 got: {popover_text}"
+            ),
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// Navigate to Notre-Dame de Paris, open its detail panel, and wait for the
+/// timeline to render. A single marker sits at these coords, so the click opens
+/// the panel directly with no disambiguation picker. Shared setup for the
+/// citation-popover tests.
+async fn open_notre_dame_panel(t: &WebTest) -> TestResult {
+    t.goto_map_at(NOTRE_DAME.0, NOTRE_DAME.1, 14.0).await?;
+    t.click_map_at(NOTRE_DAME.0, NOTRE_DAME.1).await?;
+    t.wait_for_selector("[role='complementary']").await?;
+    t.wait_for_body_text("Construction started").await
+}
+
+/// A settled field's bullet opens the plain (non-disputed) popover: a
+/// "Source(s)" heading and the field's Wikidata source label, with no disputed
+/// treatment. This is the common path the disputed test never exercises, and the
+/// one the now-conditional `<Portal>` could have broken while the disputed test
+/// stayed green.
+#[tokio::test]
+async fn test_settled_citation_popover_shows_its_source() -> TestResult {
+    web_test(async |t| {
+        open_notre_dame_panel(t).await?;
+
+        // A settled bullet reads "1 source" / "N sources"; the disputed one reads
+        // "N conflicting sources", so exclude it.
+        t.click(
+            "[role='complementary'] button[aria-label*='source']:not([aria-label*='conflicting'])",
+        )
+        .await?;
+
+        let popover = t.text("[role='group']").await?.to_lowercase();
+        check(
+            popover.contains("source"),
+            format!("A settled popover must carry a Source(s) heading, got: {popover}"),
+        )?;
+        check(
+            popover.contains("wikidata"),
+            format!("Notre-Dame's settled fields are Wikidata-sourced, got: {popover}"),
+        )?;
+        check(
+            !popover.contains("disputed"),
+            format!("A settled popover reads as a source, not a dispute, got: {popover}"),
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// The popover dismisses on both Escape and an outside click, and its portaled
+/// subtree leaves the DOM each time (the `<Show>` unmount). Guards the dismissal
+/// wiring and the reactive-disposal safety behind the conditional render.
+#[tokio::test]
+async fn test_citation_popover_dismisses_on_escape_and_outside_click() -> TestResult {
+    web_test(async |t| {
+        open_notre_dame_panel(t).await?;
+
+        let bullet =
+            "[role='complementary'] button[aria-label*='source']:not([aria-label*='conflicting'])";
+
+        // Escape closes it. The keydown listener lives on the window, and
+        // press_key dispatches a bubbling event, so targeting the popover reaches
+        // it.
+        t.click(bullet).await?;
+        let popover = t.text("[role='group']").await?;
+        check(
+            !popover.is_empty(),
+            "opening a bullet must mount a non-empty popover",
+        )?;
+        t.press_key("[role='group']", "Escape").await?;
+        t.wait_for_selector_removal("[role='group']").await?;
+
+        // An outside click closes it too. The panel's title heading is a neutral,
+        // non-interactive target that neither navigates nor opens another popover.
+        t.click(bullet).await?;
+        t.wait_for_selector("[role='group']").await?;
+        t.click("[role='complementary'] h2").await?;
+        t.wait_for_selector_removal("[role='group']").await?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// A disputed rival deep-links to the exact Wikidata revision and property that
+/// sourced its date, opening in a new tab. Guards `citation_url`'s oldid +
+/// property-anchor construction and the `target=_blank` behavior.
+#[tokio::test]
+async fn test_disputed_citation_source_links_to_wikidata_revision() -> TestResult {
+    web_test(async |t| {
+        open_notre_dame_panel(t).await?;
+
+        t.click("[role='complementary'] button[aria-label*='conflicting']")
+            .await?;
+
+        // The first rival link — robust to which of P571/P793 sorts first.
+        let href = t
+            .attr("[role='group'] a", "href")
+            .await?
+            .ok_or("the disputed popover's rival must link to its source")?;
+        check(
+            href.contains("wikidata.org/wiki/Q2981")
+                && href.contains("oldid=")
+                && href.contains("#P"),
+            format!(
+                "the rival link must deep-link to the pinned Wikidata revision and \
+                 property, got: {href}"
+            ),
+        )?;
+
+        let target = t
+            .attr("[role='group'] a", "target")
+            .await?
+            .ok_or("the rival link must declare a target")?;
+        check(
+            target == "_blank",
+            format!("the rival link must open in a new tab, got: {target}"),
+        )?;
+
+        Ok(())
+    })
+    .await
+}

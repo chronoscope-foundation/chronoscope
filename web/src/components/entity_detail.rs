@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use leptos::portal::Portal;
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
 use wasm_bindgen::JsCast;
@@ -239,7 +240,16 @@ fn EntityDetailContent(
                         Ok(entity) => view! {
                             <div>
                                 <h3 class="text-base font-semibold text-ink mb-3">
-                                    {entity.name.clone().unwrap_or_else(|| "Unnamed entity".to_string())}
+                                    {match &entity.name {
+                                        Some(name) => {
+                                            let text = name.text.clone();
+                                            let bullet = name.citations.clone().map(|citations| {
+                                                view! { <CitationBullet citations=citations/> }
+                                            });
+                                            view! { <span>{text}</span>{bullet} }.into_any()
+                                        }
+                                        None => view! { <span>"Unnamed entity"</span> }.into_any(),
+                                    }}
                                 </h3>
                                 <EntityTimeline timeline=entity.timeline.clone()/>
                                 <EntityImages
@@ -285,29 +295,7 @@ fn EntityTimeline(timeline: Vec<TimelineRow>) -> impl IntoView {
                     {format!("Timeline ({count})")}
                 </p>
                 <ul class="text-sm text-sepia space-y-1.5">
-                    {timeline.iter().map(|r| {
-                        let date_view = match r.date.as_ref() {
-                            Some(d) => view! {
-                                <span class="text-sepia/70">
-                                    {format!(" \u{2014} {}", format_uncertain_date(d))}
-                                </span>
-                            }.into_any(),
-                            None => view! {
-                                <span class="text-sepia/40 italic">
-                                    " \u{2014} date unknown"
-                                </span>
-                            }.into_any(),
-                        };
-                        view! {
-                            <li class="pl-2 border-l-2 border-copper/30">
-                                <span class="font-semibold">{r.label.clone()}</span>
-                                {date_view}
-                                {r.description.as_ref().map(|desc| view! {
-                                    <p class="text-xs text-sepia/70 mt-0.5">{desc.clone()}</p>
-                                })}
-                            </li>
-                        }
-                    }).collect::<Vec<_>>()}
+                    {timeline.iter().map(timeline_row_view).collect::<Vec<_>>()}
                 </ul>
             </div>
         }
@@ -512,7 +500,11 @@ fn EntityLinks(links: Vec<LinkInfo>) -> impl IntoView {
                     {format!("Links ({count})")}
                 </p>
                 <ul class="text-sm space-y-1">
-                    {links.iter().map(|link| view! {
+                    {links.iter().map(|link| {
+                        let bullet = link.citations.clone().map(|citations| {
+                            view! { <CitationBullet citations=citations/> }
+                        });
+                        view! {
                         <li>
                             <a
                                 href={link.url.clone()}
@@ -523,7 +515,9 @@ fn EntityLinks(links: Vec<LinkInfo>) -> impl IntoView {
                                 {link.label.clone()}
                                 <span aria-hidden="true" class="text-[0.75em]">" \u{2197}"</span>
                             </a>
+                            {bullet}
                         </li>
+                        }
                     }).collect::<Vec<_>>()}
                 </ul>
             </div>
@@ -532,6 +526,35 @@ fn EntityLinks(links: Vec<LinkInfo>) -> impl IntoView {
 }
 
 // ==================== Lightweight detail types ====================
+
+/// One line in a citation popover: a value and the short label of the source
+/// that attests it. `source` is `None` when the claim carries no citation;
+/// `url` links the line to the source when it has a stable address.
+#[derive(Debug, Clone)]
+struct CiteEntry {
+    value: String,
+    source: Option<String>,
+    /// The source's clickable URL — a Wikidata item or a crawled page. `None`
+    /// for sources with no stable link (books, archives), which render as plain
+    /// text.
+    url: Option<String>,
+}
+
+/// The citation badge for one field: how many sources back it, whether it is
+/// contested, and the per-source (or, when contested, per-rival) popover lines.
+#[derive(Debug, Clone)]
+struct Citations {
+    count: usize,
+    disputed: bool,
+    entries: Vec<CiteEntry>,
+}
+
+/// The entity's display name and the badge for the sources behind it.
+#[derive(Debug, Clone)]
+struct NameInfo {
+    text: String,
+    citations: Option<Citations>,
+}
 
 /// One row in the rendered entity timeline.
 ///
@@ -542,18 +565,37 @@ fn EntityLinks(links: Vec<LinkInfo>) -> impl IntoView {
 #[derive(Debug, Clone)]
 struct TimelineRow {
     label: String,
-    /// `None` when the date for this row is unknown.
-    date: Option<UncertainDate>,
+    date: DateCell,
+    /// The badge for this row's date, `None` when the row carries no dated
+    /// claim.
+    citations: Option<Citations>,
     /// Optional secondary text shown beneath the row (free-text
     /// descriptions authored on the underlying event, plus — for
     /// `Designated` — the settled designation text).
     description: Option<String>,
 }
 
+/// The date side of a timeline row: the value rendered inline. A contested date
+/// shows its honest joined value here; the rival claims live in [`Citations`].
+#[derive(Debug, Clone)]
+enum DateCell {
+    /// No claim dated this row.
+    Unknown,
+    /// One value the sources agree on.
+    Settled(UncertainDate),
+    /// Irreconcilable rival claims, rendered as their joined extent — the honest
+    /// span of possible instants: disjoint like "1160 / 1163" when the rivals
+    /// leave a gap, contiguous when they abut.
+    Disputed { value: UncertainDate },
+    /// A value this layer left open.
+    Pending(UncertainDate),
+}
+
 #[derive(Debug, Clone)]
 struct LinkInfo {
     label: String,
     url: String,
+    citations: Option<Citations>,
 }
 
 /// One image in the detail grid: the URL the grid/lightbox load
@@ -568,7 +610,7 @@ struct MediaInfo {
 
 #[derive(Debug, Clone)]
 struct EntityDetailView {
-    name: Option<String>,
+    name: Option<NameInfo>,
     timeline: Vec<TimelineRow>,
     links: Vec<LinkInfo>,
     /// The read-consistency point the detail was served at. Passed to the
@@ -580,12 +622,17 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
 use chronoscope_core::Claimed;
-use chronoscope_core::date::{DateBound, DatePrecision, UncertainDate};
-use chronoscope_core::grammar::citations::ExternalReference;
+use chronoscope_core::date::{DateBound, DatePrecision, TimeRange, UncertainDate};
+use chronoscope_core::grammar::citations::{
+    ExternalReference, ExternalSource, JudgmentSource, WikidataField,
+};
 use chronoscope_core::grammar::lifecycle::{DamageCause, MoveMethod, Usage};
 use chronoscope_core::location::{LocationReference, UnresolvedLocation};
 use chronoscope_core::moment::TransitionRole;
-use chronoscope_core::typed::{Attributed, Bounded, EventDetail, InteriorEvent, MomentView};
+use chronoscope_core::projection::Citation;
+use chronoscope_core::typed::{
+    Attributed, Bounded, Consensus, EventDetail, InteriorEvent, MomentView, distinct_rivals,
+};
 
 use chronoscope_api_client::{
     EntityId, EventId, ImageId, ImagesButton, images_button, images_fetch_params,
@@ -610,19 +657,29 @@ async fn fetch_entity_detail(
     let api::EntityDetail {
         entity,
         display_name,
-        conflicts: _,
         snapshot,
     } = client.get_entity(id).await.map_err(|e| e.to_string())?;
 
+    let name = display_name.map(|text| {
+        // Several name records can share the display text (the same proper name
+        // spelled identically across languages or key types); the badge unions
+        // the sources behind all of them, first-appearance order, deduped.
+        let mut sources: Vec<Citation<ImageId>> = Vec::new();
+        for record in entity.names.iter().filter(|n| n.text == text) {
+            for source in &record.sources {
+                if !sources.contains(source) {
+                    sources.push(source.clone());
+                }
+            }
+        }
+        let citations = cited_field(&text, &sources);
+        NameInfo { text, citations }
+    });
     let timeline = entity.timeline.moments().map(moment_row).collect();
-    let links = entity
-        .external_refs
-        .iter()
-        .filter_map(|r| link_info(&r.value))
-        .collect();
+    let links = entity.external_refs.iter().filter_map(link_info).collect();
 
     Ok(EntityDetailView {
-        name: display_name,
+        name,
         timeline,
         links,
         snapshot,
@@ -659,13 +716,167 @@ async fn fetch_entity_images_page(
 /// a durational pair collapsed to a single undated moment), the endpoint's date,
 /// and — when this moment carries it — the event's secondary text.
 fn moment_row(moment: MomentView<'_, EventId, ImageId>) -> TimelineRow {
+    let (date, citations) = date_display(moment.date);
     TimelineRow {
         label: moment_label(moment.role, moment.collapsed).to_string(),
-        date: moment.date.map(|b| b.possible.clone()),
+        date,
+        citations,
         description: moment
             .carries_description
             .then(|| entry_description(&moment.event.detail))
             .flatten(),
+    }
+}
+
+/// Read a moment's date slot into its inline cell and citation badge. A settled
+/// or pending slot cites each source against its one value; a conflict lists
+/// each rival's own date and source and marks the badge disputed.
+fn date_display(
+    bounded: Option<&Bounded<UncertainDate, ImageId>>,
+) -> (DateCell, Option<Citations>) {
+    let Some(b) = bounded else {
+        return (DateCell::Unknown, None);
+    };
+    match &b.consensus {
+        Consensus::Absent => (DateCell::Unknown, None),
+        Consensus::Reached { .. } => {
+            let citations = cited_field(&format_uncertain_date(&b.possible), &b.sources);
+            (DateCell::Settled(b.possible.clone()), citations)
+        }
+        Consensus::Pending { .. } => {
+            let citations = cited_field(&format_uncertain_date(&b.possible), &b.sources);
+            (DateCell::Pending(b.possible.clone()), citations)
+        }
+        Consensus::Conflict { fighting } => {
+            let entries = distinct_rivals(fighting)
+                .into_iter()
+                .map(|rival| CiteEntry {
+                    value: format_uncertain_date(&rival.value),
+                    source: rival_source_label(&rival.sources),
+                    url: rival.sources.first().and_then(citation_url),
+                })
+                .collect::<Vec<_>>();
+            let citations = Citations {
+                count: entries.len(),
+                disputed: true,
+                entries,
+            };
+            (
+                DateCell::Disputed {
+                    value: b.possible.clone(),
+                },
+                Some(citations),
+            )
+        }
+    }
+}
+
+/// The badge for a single-valued cited field — a name, a link, or a
+/// settled/pending date. Each source becomes one popover line attesting the
+/// field's own display `value`. `None` when nothing cites the field.
+fn cited_field(value: &str, sources: &[Citation<ImageId>]) -> Option<Citations> {
+    let entries = sources
+        .iter()
+        .map(|source| CiteEntry {
+            value: value.to_string(),
+            source: citation_label(source),
+            url: citation_url(source),
+        })
+        .collect::<Vec<_>>();
+    (!entries.is_empty()).then_some(Citations {
+        count: entries.len(),
+        disputed: false,
+        entries,
+    })
+}
+
+/// A short source label for one rival's citations: each citation's source name,
+/// de-duplicated and joined. `None` when the rival carries no citation.
+fn rival_source_label(sources: &[Citation<ImageId>]) -> Option<String> {
+    let mut labels: Vec<String> = Vec::new();
+    for source in sources {
+        if let Some(label) = citation_label(source)
+            && !labels.contains(&label)
+        {
+            labels.push(label);
+        }
+    }
+    (!labels.is_empty()).then(|| labels.join(", "))
+}
+
+/// The source name for one citation — a factual claim's external source, or a
+/// judgment's warrant flavor.
+fn citation_label(citation: &Citation<ImageId>) -> Option<String> {
+    match citation {
+        Citation::Factual { citation } => Some(external_source_label(&citation.source)),
+        Citation::Judgment { source } => Some(judgment_source_label(source)),
+    }
+}
+
+/// The clickable URL for a citation's source. A Wikidata source links to its
+/// pinned revision, deep-linked to the cited property's statement group when the
+/// claim came from one, so the reader lands on the exact state that was ingested.
+/// A crawled page links to its URL. Books and archives have no stable link, so
+/// their lines stay plain text.
+fn citation_url(citation: &Citation<ImageId>) -> Option<String> {
+    let source = match citation {
+        Citation::Factual { citation } => &citation.source,
+        Citation::Judgment {
+            source: JudgmentSource::External { source },
+        } => source,
+        Citation::Judgment { .. } => return None,
+    };
+    match source {
+        ExternalSource::Wikidata {
+            entity_id,
+            field,
+            revision_id,
+            ..
+        } => {
+            let page = format!("https://www.wikidata.org/wiki/{entity_id}?oldid={revision_id}");
+            Some(match field {
+                WikidataField::Statement { property_id } => format!("{page}#{property_id}"),
+                WikidataField::Label { .. }
+                | WikidataField::Sitelink { .. }
+                | WikidataField::Item => page,
+            })
+        }
+        ExternalSource::Url { url, .. } => Some(url.to_string()),
+        ExternalSource::Dbpedia { .. }
+        | ExternalSource::Book { .. }
+        | ExternalSource::Archive { .. } => None,
+    }
+}
+
+/// A short name for an external source. A Wikidata statement carries the
+/// property id it was read from (e.g. "Wikidata \u{00b7} P571"); a URL shows its
+/// host.
+fn external_source_label(source: &ExternalSource) -> String {
+    match source {
+        ExternalSource::Wikidata { field, .. } => match field {
+            WikidataField::Statement { property_id } => format!("Wikidata \u{00b7} {property_id}"),
+            WikidataField::Label { .. } | WikidataField::Sitelink { .. } | WikidataField::Item => {
+                "Wikidata".to_string()
+            }
+        },
+        ExternalSource::Url { url, .. } => url
+            .host_str()
+            .map(|host| host.to_string())
+            .unwrap_or_else(|| "Source".to_string()),
+        ExternalSource::Dbpedia { .. } => "DBpedia".to_string(),
+        ExternalSource::Book { title, .. } => title.clone(),
+        ExternalSource::Archive { collection, .. } => collection.clone(),
+    }
+}
+
+/// A short name for a judgment's warrant.
+fn judgment_source_label(source: &JudgmentSource<ImageId>) -> String {
+    match source {
+        JudgmentSource::External { source } => external_source_label(source),
+        JudgmentSource::PersonalKnowledge { .. } => "Researcher".to_string(),
+        JudgmentSource::Analysis { .. } => "Analysis".to_string(),
+        JudgmentSource::Derivation { .. } => "Derivation".to_string(),
+        JudgmentSource::ImageObservation { .. } => "Image observation".to_string(),
     }
 }
 
@@ -851,6 +1062,297 @@ fn move_summary(
     }
 }
 
+// ==================== Row rendering ====================
+
+/// Render one timeline row: the role label, its inline date, the citation
+/// bullet, and any secondary description. A contested date reads its joined
+/// value inline in the darker body tone; the rivals live in the bullet's
+/// popover.
+fn timeline_row_view(row: &TimelineRow) -> AnyView {
+    let label = row.label.clone();
+    let description = row.description.clone();
+    let bullet = row
+        .citations
+        .clone()
+        .map(|citations| view! { <CitationBullet citations=citations/> });
+    let date_view = match &row.date {
+        DateCell::Unknown => {
+            view! { <span class="text-sepia/40 italic">" \u{2014} date unknown"</span> }.into_any()
+        }
+        DateCell::Settled(date) => view! {
+            <span class="text-sepia/70">{format!(" \u{2014} {}", format_uncertain_date(date))}</span>
+        }
+        .into_any(),
+        DateCell::Pending(date) => view! {
+            <span class="text-sepia/70">
+                {format!(" \u{2014} {}", format_uncertain_date(date))}
+                <span class="text-sepia/40 italic text-xs">" (pending)"</span>
+            </span>
+        }
+        .into_any(),
+        DateCell::Disputed { value } => view! {
+            <span class="text-body">{format!(" \u{2014} {}", format_uncertain_date(value))}</span>
+        }
+        .into_any(),
+    };
+    view! {
+        <li class="pl-2 border-l-2 border-copper/30">
+            <div>
+                <span class="font-semibold">{label}</span>{date_view}{bullet}
+            </div>
+            {description.map(|desc| view! {
+                <p class="text-xs text-sepia/70 mt-0.5">{desc}</p>
+            })}
+        </li>
+    }
+    .into_any()
+}
+
+// ==================== Citation bullet ====================
+
+/// A citation bullet: a small superscript mark showing a field's source count,
+/// neutral normally and amber when the field is contested. Tapping it toggles a
+/// popover listing the sources — each linked to its source when it has one — or,
+/// for a contested field, the rival claims. An outside click or Escape closes it.
+#[component]
+fn CitationBullet(citations: Citations) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    // The bullet's on-screen rect at the moment it was opened. The popover is
+    // portaled to `document.body` to escape the panel's slide transform (which
+    // would otherwise anchor its `position: fixed` to the panel) and the panel's
+    // `overflow-y-auto` clip, so the rect gives it its viewport placement.
+    let (anchor, set_anchor) = signal(None::<(f64, f64)>);
+    let root_ref = NodeRef::<leptos::html::Span>::new();
+    let popover_ref = NodeRef::<leptos::html::Div>::new();
+
+    // Close when a click lands outside both the bullet and its portaled popover.
+    // Leptos delegates the button's toggle below the window, so the toggle runs
+    // first and the fresh open survives this handler.
+    let click_handle =
+        window_event_listener(leptos::ev::click, move |ev: leptos::ev::MouseEvent| {
+            if !open.try_get_untracked().unwrap_or(false) {
+                return;
+            }
+            let Some(node) = ev
+                .target()
+                .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+            else {
+                return;
+            };
+            let inside = root_ref
+                .get_untracked()
+                .is_some_and(|root| root.contains(Some(&node)))
+                || popover_ref
+                    .get_untracked()
+                    .is_some_and(|popover| popover.contains(Some(&node)));
+            if !inside {
+                let _ = set_open.try_set(false);
+            }
+        });
+    let key_handle =
+        window_event_listener(leptos::ev::keydown, move |ev: leptos::ev::KeyboardEvent| {
+            if ev.key() == "Escape" && open.try_get_untracked() == Some(true) {
+                let _ = set_open.try_set(false);
+            }
+        });
+    on_cleanup(move || {
+        click_handle.remove();
+        key_handle.remove();
+    });
+
+    let Citations {
+        count,
+        disputed,
+        entries,
+    } = citations;
+
+    let aria_label = if disputed {
+        format!("{count} conflicting sources")
+    } else if count == 1 {
+        "1 source".to_string()
+    } else {
+        format!("{count} sources")
+    };
+    let heading = if disputed {
+        format!("Disputed \u{00b7} {count} claims")
+    } else if count == 1 {
+        "Source".to_string()
+    } else {
+        "Sources".to_string()
+    };
+
+    let toggle = move |_: leptos::ev::MouseEvent| {
+        let opening = !open.get_untracked();
+        if opening && let Some(el) = root_ref.get_untracked() {
+            let rect = el.get_bounding_client_rect();
+            set_anchor.set(Some((rect.bottom(), rect.right())));
+        }
+        set_open.set(opening);
+    };
+
+    view! {
+        <span node_ref=root_ref>
+            <button
+                type="button"
+                class=move || bullet_class(disputed, open.get())
+                aria-expanded=move || if open.get() { "true" } else { "false" }
+                aria-label=aria_label
+                on:click=toggle
+            >
+                <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]">
+                    {count.to_string()}
+                </span>
+            </button>
+        </span>
+        <Show when=move || open.get()>
+            {
+                // `Show` and `Portal` both take a reactive `Fn` children, so
+                // neither closure may move a captured value out. Clone into these
+                // block locals so the `Show` closure only borrows the originals,
+                // then clone again at each use site so the `Portal` closure only
+                // borrows the locals.
+                let heading = heading.clone();
+                let entries = entries.clone();
+                view! {
+                    <Portal>
+                        <div
+                            node_ref=popover_ref
+                            role="group"
+                            class=popover_class(disputed)
+                            style=move || popover_style(anchor.get())
+                        >
+                            <div class=top_accent_class(disputed)></div>
+                            <div class=header_class(disputed)>
+                                <span>{heading.clone()}</span>
+                            </div>
+                            <ul class="py-1 max-h-64 overflow-y-auto">
+                                {citation_entry_views(entries.clone())}
+                            </ul>
+                        </div>
+                    </Portal>
+                }
+            }
+        </Show>
+    }
+}
+
+/// The popover's source lines: one `<li>` per citation, linked to its source
+/// when the source has a stable URL. Takes the entries by value so the portaled
+/// popover can rebuild them on each render.
+fn citation_entry_views(entries: Vec<CiteEntry>) -> Vec<AnyView> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let CiteEntry { value, source, url } = entry;
+            let source = source.map(|s| {
+                view! {
+                    <div class="font-mono text-[0.65rem] text-sepia mt-0.5 tracking-wide">{s}</div>
+                }
+            });
+            let line = view! {
+                <div class="font-serif text-body text-sm tabular-nums group-hover:text-copper group-hover:underline">
+                    {value}
+                </div>
+                {source}
+            }
+            .into_any();
+            let body = match url {
+                Some(href) => view! {
+                    <a
+                        href=href
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="group block px-3 py-2 hover:bg-sepia/10 transition-colors"
+                    >
+                        {line}
+                    </a>
+                }
+                .into_any(),
+                None => view! { <div class="px-3 py-2">{line}</div> }.into_any(),
+            };
+            view! {
+                <li class="border-b border-sepia/10 last:border-b-0">{body}</li>
+            }
+            .into_any()
+        })
+        .collect()
+}
+
+/// The glyph classes: a small superscript footnote mark, sized in `em` so it
+/// scales with the host text. A neutral outline that darkens on hover/open, or
+/// the amber contested tone.
+fn bullet_class(disputed: bool, open: bool) -> String {
+    let base = "inline-flex items-center justify-center align-[0.5em] \
+                min-w-[1.3em] h-[1.3em] px-[0.25em] ml-[0.15em] \
+                rounded-full border text-[0.6em] font-sans font-bold leading-none \
+                cursor-pointer transition-colors";
+    let tone = match (disputed, open) {
+        (true, true) => "text-disputed-deep border-disputed-deep bg-disputed/20",
+        (true, false) => {
+            "text-disputed-deep border-disputed bg-disputed/10 \
+             hover:border-disputed-deep hover:bg-disputed/20"
+        }
+        (false, true) => "text-body border-body bg-sepia/10",
+        (false, false) => {
+            "text-secondary border-secondary/50 hover:text-body hover:border-body hover:bg-sepia/10"
+        }
+    };
+    format!("{base} {tone}")
+}
+
+/// The popover width in pixels — matched by the inline placement in
+/// [`popover_style`].
+const POPOVER_WIDTH_PX: f64 = 240.0;
+
+/// The popover panel classes. `position: fixed` (placed by [`popover_style`])
+/// lets it escape the panel's `overflow-y-auto` clipping. The contested panel
+/// carries an amber border. Mounted only while open (via `<Show>`), so it owns
+/// no visibility toggle.
+fn popover_class(disputed: bool) -> String {
+    let base = "fixed z-20 text-left rounded-md bg-parchment shadow-lg \
+                overflow-hidden font-sans border";
+    let border = if disputed {
+        "border-disputed/40"
+    } else {
+        "border-sepia/20"
+    };
+    format!("{base} {border}")
+}
+
+/// The popover's fixed placement from the bullet's measured rect: dropped just
+/// below the glyph with its right edge aligned to the glyph's, extending left
+/// and clamped to stay within the viewport. Empty until the bullet is measured
+/// on first open.
+fn popover_style(anchor: Option<(f64, f64)>) -> String {
+    let Some((bottom, right)) = anchor else {
+        return String::new();
+    };
+    let top = bottom + 6.0;
+    let left = (right - POPOVER_WIDTH_PX).max(8.0);
+    format!("top: {top}px; left: {left}px; width: {POPOVER_WIDTH_PX}px;")
+}
+
+/// The 2px top accent: amber for a contested field, muted otherwise.
+fn top_accent_class(disputed: bool) -> &'static str {
+    if disputed {
+        "h-0.5 bg-disputed"
+    } else {
+        "h-0.5 bg-sepia/50"
+    }
+}
+
+/// The popover header row classes.
+fn header_class(disputed: bool) -> String {
+    let base = "flex justify-between items-baseline px-3 py-2 border-b border-sepia/15 \
+                text-[0.6rem] font-bold uppercase tracking-wider";
+    let color = if disputed {
+        "text-disputed-deep"
+    } else {
+        "text-secondary"
+    };
+    format!("{base} {color}")
+}
+
 // ==================== Date formatting ====================
 
 /// Format a [`DateBound`] for display, truncating to the appropriate precision.
@@ -867,21 +1369,30 @@ fn format_date_bound(bound: &DateBound) -> String {
     }
 }
 
-/// Format an `UncertainDate` for display, truncating to the appropriate precision.
+/// Format an `UncertainDate` for display. A single interval reads as one value
+/// or range; a disjoint union — the shape a contested date takes — reads as its
+/// intervals joined by " / " (e.g. "1160 / 1163"), preserving the disjunction.
 fn format_uncertain_date(date: &UncertainDate) -> String {
-    match (date.earliest_bound(), date.latest_bound()) {
-        (Some(earliest), Some(latest)) if earliest == latest => {
-            // Symmetric / exact: format by precision
-            format_date_bound(earliest)
-        }
-        (Some(earliest), Some(latest)) => {
-            // Asymmetric range
-            format!(
-                "{} \u{2013} {}",
-                format_date_bound(earliest),
-                format_date_bound(latest)
-            )
-        }
+    let intervals = date.intervals();
+    if intervals.is_empty() {
+        return "date unknown".to_string();
+    }
+    intervals
+        .iter()
+        .map(format_interval)
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// Format one interval, truncating each bound to its precision.
+fn format_interval(range: &TimeRange) -> String {
+    match (range.earliest(), range.latest()) {
+        (Some(earliest), Some(latest)) if earliest == latest => format_date_bound(earliest),
+        (Some(earliest), Some(latest)) => format!(
+            "{} \u{2013} {}",
+            format_date_bound(earliest),
+            format_date_bound(latest)
+        ),
         (Some(earliest), None) => format!("after {}", format_date_bound(earliest)),
         (None, Some(latest)) => format!("before {}", format_date_bound(latest)),
         (None, None) => "date unknown".to_string(),
@@ -891,15 +1402,17 @@ fn format_uncertain_date(date: &UncertainDate) -> String {
 // ==================== External links ====================
 
 /// Build a display link for one external reference: the source-name label the
-/// panel shows and the canonical URL. The URL is
-/// [`ExternalReference::to_url`]'s job — this only owns the presentation label
-/// (which stays in the web). An `UnmodeledUrl` with no extractable host renders
-/// no link.
-fn link_info(reference: &ExternalReference) -> Option<LinkInfo> {
-    let label = source_label(reference)?;
+/// panel shows, the canonical URL, and the badge for the sources behind the
+/// reference. The URL is [`ExternalReference::to_url`]'s job — this only owns
+/// the presentation label (which stays in the web). An `UnmodeledUrl` with no
+/// extractable host renders no link.
+fn link_info(reference: &Attributed<ExternalReference, ImageId>) -> Option<LinkInfo> {
+    let label = source_label(&reference.value)?;
+    let citations = cited_field(&label, &reference.sources);
     Some(LinkInfo {
         label,
-        url: reference.to_url().to_string(),
+        url: reference.value.to_url().to_string(),
+        citations,
     })
 }
 
@@ -919,14 +1432,6 @@ fn source_label(reference: &ExternalReference) -> Option<String> {
         ExternalReference::Pleiades { .. } => "Pleiades".to_string(),
         ExternalReference::Nrhp { .. } => "NRHP".to_string(),
         ExternalReference::WikimediaCommonsCategory { .. } => "Wikimedia Commons".to_string(),
-        ExternalReference::UnmodeledUrl { url } => extract_domain(url.as_str())?,
+        ExternalReference::UnmodeledUrl { url } => url.host_str().map(str::to_string)?,
     })
-}
-
-/// Extract the domain from a URL string (e.g., `"https://example.com/path"` -> `"example.com"`).
-fn extract_domain(url: &str) -> Option<String> {
-    let after_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))?;
-    Some(after_scheme.split('/').next()?.to_string())
 }

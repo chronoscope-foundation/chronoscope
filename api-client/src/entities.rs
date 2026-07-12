@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use chronoscope_core::GeoPoint;
-use chronoscope_core::conflicts::AnyConflictReport;
 use chronoscope_core::grammar::depiction::Perspective;
 use chronoscope_core::grammar::image::ImageMedium;
 use chronoscope_core::{listing, typed};
@@ -27,19 +26,18 @@ use crate::ids::{EntityId, EventId, ImageId};
 /// timestamps, only per-fact provenance already carried inside the typed fields).
 pub type Entity = typed::Entity<EntityId, EventId, ImageId>;
 
-/// The `GET /entities/{id}` response: the typed entity, the display name the
-/// server negotiated from the request's `Accept-Language`, and the entity's own
-/// conflict reports. The depicting images are the paginated
-/// `GET /entities/{id}/images` sub-resource ([`EntityImagesPage`]), fetched
-/// separately.
+/// The `GET /entities/{id}` response: the typed entity and the display name the
+/// server negotiated from the request's `Accept-Language`. The depicting images
+/// are the paginated `GET /entities/{id}/images` sub-resource
+/// ([`EntityImagesPage`]), fetched separately.
 ///
 /// `entity.names` still carries every localized name with its provenance;
 /// `display_name` is just the one the panel heading shows, chosen server-side so
 /// every client agrees on it. `None` only when the entity has no name at all.
 ///
-/// `conflicts` are the over-determined date slots the detector found in this one
-/// entity's projection — each a structured report the panel renders a disputed
-/// indicator from. Empty when every date slot is consistent.
+/// Over-determined date slots surface inline on the entity's own fields as a
+/// disputed [`typed::Consensus`], carrying the fighting facts the panel renders a
+/// dispute indicator from.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(
     deserialize = "E: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, V: ::serde::de::DeserializeOwned, I: ::serde::de::DeserializeOwned"
@@ -47,7 +45,6 @@ pub type Entity = typed::Entity<EntityId, EventId, ImageId>;
 pub struct EntityDetail<E: Ord, V, I> {
     pub entity: typed::Entity<E, V, I>,
     pub display_name: Option<String>,
-    pub conflicts: Vec<AnyConflictReport<E, V>>,
     /// The read-consistency point this projection was served at. Thread it back
     /// as `?snapshot=` on the images sub-resource so the grid reads the same
     /// state as this detail.

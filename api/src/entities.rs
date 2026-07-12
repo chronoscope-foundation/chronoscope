@@ -16,7 +16,7 @@ use serde::Deserialize;
 use chronoscope_api_client::{
     Cursor, DetailImage, EntityDetail, EntityImagesPage, EntityListPage, MarkersResponse, Snapshot,
 };
-use chronoscope_core::conflicts::{cited_lineage, detect_conflicts};
+use chronoscope_core::conflicts::fact_lineage;
 use chronoscope_core::geo;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::listing::{self, ListCursor, summaries_in_viewport};
@@ -30,7 +30,7 @@ use crate::cdn;
 use crate::entity_types;
 use crate::limits;
 use crate::state::{
-    AppState, ServerEntityId, ServerEventId, ServerFactStore, ServerIds, ServerImageId,
+    AppState, ServerEntityId, ServerEventId, ServerFactStore, ServerImageId,
 };
 use crate::validation::fact_store_err;
 
@@ -375,8 +375,9 @@ pub struct GetEntityQueryParams {
 /// Get a single entity with full detail (public, no authentication required).
 ///
 /// The response is the fact store's typed entity projection plus its negotiated
-/// display name and conflict reports. External links live in
-/// `entity.external_refs`; the depicting images are the paginated
+/// display name. Over-determined date slots surface inline on the entity's own
+/// fields as a disputed consensus, carrying their fighting facts. External links
+/// live in `entity.external_refs`; the depicting images are the paginated
 /// `GET /entities/{id}/images` sub-resource.
 #[endpoint {
     method = GET,
@@ -398,7 +399,7 @@ pub async fn get_entity(
     // An id no committed fact ever named projects as `None` — the fact store's
     // "not found", since a real entity carries at least the fact that minted it.
     let Some((class, projected)) =
-        project_entity::<ServerFactStore, _, _>(&mut view, id, member_lineage)
+        project_entity::<ServerFactStore, _, _>(&mut view, id, fact_lineage)
             .await
             .map_err(fact_store_err)?
     else {
@@ -407,27 +408,16 @@ pub async fn get_entity(
             "Entity not found".to_string(),
         ));
     };
+    // The `fact_lineage` projection carries the whole fighting facts behind each
+    // slot, so `Entity::parse` surfaces any over-determined date slot inline as a
+    // disputed consensus — no second projection or separate conflict pass.
     let entity = typed::Entity::parse(&projected, &class);
-
-    // This entity's own over-determined date slots. The typed projection above
-    // carries citations for the read DTO; the detector reads the whole fighting
-    // facts, so the same class is projected again under `cited_lineage`. The id
-    // already projected `Some` above, so the cited projection matches; a `None`
-    // means the class emptied between the two reads, which carries no conflicts.
-    let conflicts = match project_entity::<ServerFactStore, _, _>(&mut view, id, cited_lineage)
-        .await
-        .map_err(fact_store_err)?
-    {
-        Some((_, cited_entity)) => detect_conflicts::<ServerIds>(&id, &cited_entity),
-        None => Vec::new(),
-    };
 
     let snapshot = view.snapshot().await.map_err(fact_store_err)?;
     let display_name = entity_types::negotiate_name(&entity.names, accept_language(&ctx));
     let detail = EntityDetail {
         entity,
         display_name,
-        conflicts,
         snapshot: encode_snapshot(snapshot)?,
     };
     Ok(vary_language(HttpResponseOk(detail)))

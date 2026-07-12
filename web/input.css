@@ -9,6 +9,8 @@
   --color-sepia: #6b5840;
   --color-copper: #9a5f28;
   --color-sage: #7a8b6f;
+  --color-amber: #b8651e;
+  --color-amber-deep: #8c4a13;
 
   --font-serif: "Source Serif 4", Georgia, serif;
   --font-sans: "DM Sans", system-ui, sans-serif;
@@ -25,6 +27,7 @@
  *   text-secondary    supporting/muted text, prose paragraphs
  *   text-accent       headings, links, interactive highlights
  *   text-verified     confidence/verification indicators (future)
+ *   text-disputed     conflicting-claim indicators (a contested date/field)
  */
 @theme {
   --color-surface: var(--color-parchment);
@@ -32,6 +35,8 @@
   --color-secondary: var(--color-sepia);
   --color-accent: var(--color-copper);
   --color-verified: var(--color-sage);
+  --color-disputed: var(--color-amber);
+  --color-disputed-deep: var(--color-amber-deep);
 }
 
 /* Prose styling for pulldown-cmark rendered markdown */

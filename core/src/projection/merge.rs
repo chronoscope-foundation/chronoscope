@@ -40,7 +40,7 @@ use super::types::{
 
 /// The citation a single fact warrants, when it warrants one. A meta fact backs
 /// no value, so it cites nothing.
-pub(super) fn citation_of<R: IdScheme>(fact: &StoredFact<R>) -> Option<Citation<R::Image>> {
+pub(crate) fn citation_of<R: IdScheme>(fact: &StoredFact<R>) -> Option<Citation<R::Image>> {
     match fact {
         StoredFact::Factual(f) => Some(Citation::Factual {
             citation: f.citation.clone(),

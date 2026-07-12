@@ -26,8 +26,7 @@ use crate::jwt::JwtConfig;
 /// production backend exists.
 pub type ServerFactStore = SqliteFactStore;
 
-/// The picked backend's id scheme — what `detect_conflicts` and the stored
-/// commit types instantiate at.
+/// The picked backend's id scheme — what the stored commit types instantiate at.
 pub type ServerIds = <ServerFactStore as FactStore>::Ids;
 
 /// The picked backend's entity id: URL path params and listing cursors carry
@@ -35,7 +34,7 @@ pub type ServerIds = <ServerFactStore as FactStore>::Ids;
 pub type ServerEntityId = EntityIdOf<ServerFactStore>;
 
 /// The picked backend's lifetime-event id: the value slot the typed entity
-/// projection and its conflict reports are keyed by.
+/// projection is keyed by.
 pub type ServerEventId = EventIdOf<ServerFactStore>;
 
 /// The picked backend's image id: the resolved-media map's key and the

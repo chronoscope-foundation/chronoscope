@@ -9,12 +9,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroU32;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
 use chronoscope_api_client::{
     ClickAction, Cursor, EntityId, EntityListPage, MarkersResponse, client::ApiError,
 };
-use chronoscope_core::conflicts::{AnyConflictReport, BookendEndpoint, ConflictPath};
 use chronoscope_core::date::{DatePrecision, UncertainDate};
 use chronoscope_core::geo::{GeoPoint, Meters};
 use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion};
@@ -24,12 +23,15 @@ use chronoscope_core::grammar::citations::{
     Excerpt, ExternalSource, FactualCitation, JudgmentSource, Language,
 };
 use chronoscope_core::grammar::depiction::{self, Perspective};
-use chronoscope_core::grammar::ids::{FactId, UserId};
+use chronoscope_core::grammar::event;
+use chronoscope_core::grammar::ids::UserId;
 use chronoscope_core::grammar::image::{self, ImageMedium};
+use chronoscope_core::grammar::lifecycle::{LifetimeEventKind, PointKind};
 use chronoscope_core::location::{Location, UnresolvedLocation};
 use chronoscope_core::submit::{
-    Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact, commit_facts,
+    Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact, commit_facts,
 };
+use chronoscope_core::typed::{Consensus, EventDetail, InteriorEvent, distinct_rivals};
 
 use super::TestContext;
 use crate::cdn::tests::TEST_CDN_BASE_URL;
@@ -75,6 +77,21 @@ fn resolved_point(
     )?))
 }
 
+/// Commit `commit` and return the single entity id it resolves.
+async fn commit_single_entity(
+    facts: &MemoryFactStore,
+    commit: Commit<MemoryIds>,
+) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let result = commit_facts(facts, commit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity 0 resolved")?
+        .id)
+}
+
 /// Commit a fresh single-entity, single-fact-set bundle: one name and one
 /// construction location. Enough to make the entity placeable (for
 /// `/markers` and `/entities`) and nameable (for `get_entity`).
@@ -118,15 +135,7 @@ async fn commit_named_entity_at(
         .collect(),
     };
 
-    let result = commit_facts(facts, commit)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let id = result
-        .entities
-        .get(&EntityIdx(0))
-        .ok_or("entity 0 resolved")?
-        .id;
-    Ok(id)
+    commit_single_entity(facts, commit).await
 }
 
 /// Commit a placeable entity carrying one name per `(language, text)` pair, so a
@@ -176,15 +185,131 @@ async fn commit_entity_with_names_at(
         facts: facts_vec.into_iter().collect(),
     };
 
-    let result = commit_facts(facts, commit)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let id = result
-        .entities
-        .get(&EntityIdx(0))
-        .ok_or("entity 0 resolved")?
-        .id;
-    Ok(id)
+    commit_single_entity(facts, commit).await
+}
+
+fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(UncertainDate::with_precision(
+        NaiveDate::from_ymd_opt(y, 1, 1).ok_or("valid year")?,
+        DatePrecision::Year,
+    )?)
+}
+
+/// Commit a named entity carrying two construction-*start* facts a few years
+/// apart — the Notre-Dame pattern, where sources disagree on when building
+/// began. Their disjoint intervals over-determine the start slot, so the typed
+/// projection surfaces a `Conflict` with fighting rivals.
+async fn commit_entity_with_conflicting_start_dates(
+    facts: &MemoryFactStore,
+    name: &str,
+    early: i32,
+    late: i32,
+) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let started =
+        |y: i32, url: &str| -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Started {
+                        entity: EntityIdx(0),
+                        bound: year(y)?,
+                    },
+                },
+                citation: citation(url)?,
+            })
+        };
+    let commit = Commit::<MemoryIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name {
+                        entity: EntityIdx(0),
+                        name: NameText::new(name),
+                        language: Language::new("en")?,
+                        name_type: NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                },
+                citation: citation("https://example.com/name")?,
+            },
+            started(early, "https://example.com/start-early")?,
+            started(late, "https://example.com/start-late")?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    commit_single_entity(facts, commit).await
+}
+
+/// Commit a named entity carrying one interior point event — a `Designated`
+/// landmark — whose date sources disagree: two disjoint `PointDate` claims a few
+/// years apart over-determine the event's `occurred_at` slot. The conflict rides
+/// the `HasEvent` reacher/backlink projection path onto the event, so the typed
+/// event's date surfaces a `Conflict` with fighting rivals.
+async fn commit_entity_with_conflicting_event_dates(
+    facts: &MemoryFactStore,
+    name: &str,
+    early: i32,
+    late: i32,
+) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let point_date =
+        |y: i32, url: &str| -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(SubmitFact::Factual {
+                assertion: FactualAssertion::Event {
+                    fact: event::Fact::PointDate {
+                        event: EventIdx(0),
+                        bound: year(y)?,
+                    },
+                },
+                citation: citation(url)?,
+            })
+        };
+    let commit = Commit::<MemoryIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: vec![Decl::Local],
+        images: Vec::new(),
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name {
+                        entity: EntityIdx(0),
+                        name: NameText::new(name),
+                        language: Language::new("en")?,
+                        name_type: NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                },
+                citation: citation("https://example.com/name")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Event {
+                    fact: event::Fact::HasEvent {
+                        entity: EntityIdx(0),
+                        event: EventIdx(0),
+                        kind: LifetimeEventKind::Point {
+                            kind: PointKind::Designated,
+                        },
+                    },
+                },
+                citation: citation("https://example.com/designation")?,
+            },
+            point_date(early, "https://example.com/date-early")?,
+            point_date(late, "https://example.com/date-late")?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    commit_single_entity(facts, commit).await
 }
 
 /// Commit a named, placeable entity depicted by one image: an exterior-picture
@@ -300,6 +425,104 @@ async fn get_entity_returns_the_typed_projection_for_a_known_id() -> TestResult 
         detail.display_name.as_deref(),
         Some("Pantheon"),
         "with no Accept-Language the negotiated display name falls back to the only name"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_surfaces_conflicting_construction_start_as_fighting_rivals() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // Two sources place the start of construction three years apart. The
+    // over-determined start slot must carry both as fighting rivals with their
+    // dates and citations — the whole point of a conflict projection.
+    let id =
+        commit_entity_with_conflicting_start_dates(&ctx.app_state.facts, "Notre-Dame", 1160, 1163)
+            .await?;
+
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
+
+    let construction = detail
+        .entity
+        .timeline
+        .events()
+        .iter()
+        .find_map(|event| match &event.detail {
+            EventDetail::Constructed { period, .. } => Some(period),
+            _ => None,
+        })
+        .ok_or("expected a construction entry in the timeline")?;
+
+    let Consensus::Conflict { fighting } = &construction.started.consensus else {
+        return Err(format!(
+            "the construction start must be a Conflict, got {:?}",
+            construction.started.consensus
+        )
+        .into());
+    };
+    assert_eq!(
+        fighting.len(),
+        1,
+        "the two disjoint start dates form one minimal fighting set"
+    );
+    let rivals = fighting.first().ok_or("no fighting set")?;
+    assert_eq!(rivals.len().get(), 2, "the set names both rival facts");
+    let rival_dates: std::collections::BTreeSet<UncertainDate> =
+        rivals.iter().map(|r| r.value.clone()).collect();
+    assert_eq!(
+        rival_dates,
+        [year(1160)?, year(1163)?].into_iter().collect(),
+        "the rivals carry the two submitted start dates, deserialized from the wire"
+    );
+    for rival in rivals {
+        assert!(
+            !rival.sources.is_empty(),
+            "each rival surfaces the citation behind its date"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_surfaces_conflicting_event_date_as_fighting_rivals() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // An interior event's date, unlike a bookend's, is populated through the
+    // HasEvent reacher/backlink path. Two disjoint designation dates must still
+    // over-determine the event's `occurred_at` slot and surface both as rivals.
+    let id = commit_entity_with_conflicting_event_dates(
+        &ctx.app_state.facts,
+        "Designated Landmark",
+        1900,
+        1905,
+    )
+    .await?;
+
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
+
+    let at = detail
+        .entity
+        .timeline
+        .events()
+        .iter()
+        .find_map(|event| match &event.detail {
+            EventDetail::Interior {
+                kind: InteriorEvent::Designated { at, .. },
+                ..
+            } => Some(at),
+            _ => None,
+        })
+        .ok_or("expected a designated interior event in the timeline")?;
+
+    let Consensus::Conflict { fighting } = &at.consensus else {
+        return Err(format!(
+            "the interior event's date must be a Conflict, got {:?}",
+            at.consensus
+        )
+        .into());
+    };
+    assert_eq!(
+        distinct_rivals(fighting).len(),
+        2,
+        "both disjoint designation dates surface as fighting rivals"
     );
     Ok(())
 }
@@ -790,89 +1013,6 @@ async fn get_entity_path_param_round_trips_the_numeric_wire_form() -> TestResult
         resp.status(),
         200,
         "a bare numeric path segment must resolve"
-    );
-    Ok(())
-}
-
-/// Commit one entity with two competing `Construction::Started` dates in
-/// disjoint years, over-determining its construction-started slot. Returns the
-/// entity id and the two minted fact ids — the fighting set the detector must
-/// attribute.
-async fn commit_competing_construction_dates(
-    facts: &ServerFactStore,
-) -> Result<(ServerEntityId, BTreeSet<FactId>), Box<dyn std::error::Error + Send + Sync>> {
-    let started =
-        |year: i32, url: &str| -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
-            let bound = UncertainDate::with_precision(
-                chrono::NaiveDate::from_ymd_opt(year, 1, 1).ok_or("valid date")?,
-                DatePrecision::Year,
-            )?;
-            Ok(SubmitFact::Factual {
-                assertion: FactualAssertion::Construction {
-                    fact: ConstructionFact::Started {
-                        entity: EntityIdx(0),
-                        bound,
-                    },
-                },
-                citation: citation(url)?,
-            })
-        };
-    let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
-        recorded_at: fixed_time()?,
-        entities: vec![Decl::Local],
-        events: Vec::new(),
-        images: Vec::new(),
-        facts: [
-            started(1887, "https://a.example/src")?,
-            started(1889, "https://b.example/src")?,
-        ]
-        .into_iter()
-        .collect(),
-    };
-
-    let result = commit_facts(facts, commit)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
-    let id = result
-        .entities
-        .get(&EntityIdx(0))
-        .ok_or("entity 0 resolved")?
-        .id;
-    let fact_ids = result.fact_ids.iter().copied().collect();
-    Ok((id, fact_ids))
-}
-
-#[tokio::test]
-async fn get_entity_surfaces_a_competing_construction_date_conflict() -> TestResult {
-    let ctx = TestContext::new().await?;
-    let (id, expected) = commit_competing_construction_dates(&ctx.app_state.facts).await?;
-
-    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
-
-    assert_eq!(
-        detail.conflicts.len(),
-        1,
-        "one over-determined slot yields one conflict report, got {:?}",
-        detail.conflicts
-    );
-    let AnyConflictReport::Date(report) = detail.conflicts.first().ok_or("no conflict report")?;
-    assert_eq!(
-        report.location.entity,
-        wire_entity_id(id),
-        "the conflict is anchored to the entity that was read"
-    );
-    assert_eq!(
-        report.location.path,
-        ConflictPath::Construction {
-            endpoint: BookendEndpoint::Started,
-        },
-        "the conflict anchors at the construction-started slot"
-    );
-    let contributing: BTreeSet<FactId> = report.data.contributing.iter().copied().collect();
-    assert_eq!(
-        contributing, expected,
-        "both competing start claims are the fighting set"
     );
     Ok(())
 }
