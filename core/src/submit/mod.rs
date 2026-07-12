@@ -38,7 +38,8 @@ pub use crate::grammar::ids::SubjectKind;
 pub use error::{DateRole, SubmitError};
 pub use pipeline::commit_facts;
 pub use result::{
-    CommitAuthor, FactLookup, Resolution, ResolutionOrigin, StoredCommit, StoredFact, SubmitResult,
+    CommitAuthor, FactLookup, LocatedSubject, Resolution, ResolutionOrigin, StoredCommit,
+    StoredFact, SubmitResult,
 };
 
 use std::collections::BTreeSet;

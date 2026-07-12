@@ -42,7 +42,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::external_ids::{OhmId, OsmElementType, OsmId};
-use crate::geo::{GeoPoint, GeoPointError, Meters, SphereCap, SpherePoint};
+use crate::geo::{
+    GeoPoint, GeoPointError, IndexRect, Meters, SphereCap, SpherePoint, Viewport,
+    cap_bounding_rects,
+};
 
 /// Sanity bound on a circle's uncertainty radius: a circle wider than this
 /// almost certainly signals a unit slip or a bad resolution, not a real claim.
@@ -560,6 +563,69 @@ impl Location {
         }
     }
 
+    /// Whether *known geometry* places this region in the viewport. Two
+    /// distinct questions live near this name: the optimistic "could this
+    /// location be here?" (unknown → yes — a solver's consistency question,
+    /// deliberately unbuilt until something consumes it) and the evidential
+    /// "does known geometry place it here?" (unknown contributes no positive
+    /// evidence — the walk's question, and the only one a spatial index can
+    /// serve). This is the evidential one.
+    ///
+    /// `Circle` is the rim-inclusive cap-vs-viewport test (the great-circle
+    /// distance from center to the viewport's nearest point against the
+    /// radius, under [`covers`](Self::covers)' tolerance); `OneOf` holds when
+    /// any member does, `AllOf` when every member does (over-approximating
+    /// the intersection region); `Empty` and `Unbounded` carry no geometry
+    /// that places anything. The canonicalizing constructors keep ⊤/⊥ out of
+    /// compounds, so these `any`/`all` arms need no unknown handling — the
+    /// unresolved lift owns that.
+    pub fn known_geometry_intersects(&self, viewport: &Viewport) -> bool {
+        match self {
+            Self::Empty | Self::Unbounded => false,
+            Self::Circle { center, radius } => SphereCap::new((*center).into(), *radius)
+                .covers_within(viewport.geodesic_distance_to(center)),
+            Self::OneOf { members } => members
+                .as_slice()
+                .iter()
+                .any(|m| m.known_geometry_intersects(viewport)),
+            Self::AllOf { members } => {
+                // Constructors enforce ≥2 members; an empty `AllOf` would
+                // wrongly read as intersecting via `all()` over no members.
+                debug_assert!(!members.is_empty(), "AllOf holds ≥2 members");
+                members
+                    .as_slice()
+                    .iter()
+                    .all(|m| m.known_geometry_intersects(viewport))
+            }
+        }
+    }
+
+    /// A covering rect set for the region: every viewport this location
+    /// [`known_geometry_intersects`](Self::known_geometry_intersects) meets
+    /// at least one rect on the plain interval test, so a spatial index
+    /// storing the rects never misses the predicate. `Circle` is its cap's
+    /// geodesic MBR (split at the ±180° seam); `OneOf` covers each branch
+    /// separately — tighter than one hull; `AllOf` needs only its first
+    /// member's rects, because the predicate requires every member to meet
+    /// the viewport; `Empty` and `Unbounded` match no viewport and
+    /// contribute none.
+    pub fn bounding_rects(&self) -> Vec<IndexRect> {
+        match self {
+            Self::Empty | Self::Unbounded => Vec::new(),
+            Self::Circle { center, radius } => cap_bounding_rects(center, *radius),
+            Self::OneOf { members } => members
+                .as_slice()
+                .iter()
+                .flat_map(Self::bounding_rects)
+                .collect(),
+            Self::AllOf { members } => members
+                .as_slice()
+                .first()
+                .map(Self::bounding_rects)
+                .unwrap_or_default(),
+        }
+    }
+
     /// The number of `Circle` leaves this geometry holds.
     pub(crate) fn circle_count(&self) -> usize {
         match self {
@@ -858,6 +924,91 @@ impl UnresolvedLocation {
         match self {
             Self::Resolved(Location::Circle { center, .. }) => Some(center),
             _ => None,
+        }
+    }
+
+    /// [`Location::known_geometry_intersects`] lifted over unresolved
+    /// locations — the evidential reading, where an unknown is the identity
+    /// of its combinator: it adds nothing to a union and removes nothing
+    /// from an intersection, so a partially-resolved conjunction still
+    /// answers on its resolved geometry. Three-valued internally
+    /// ([`geometry_evidence`](Self::geometry_evidence)); no evidence at the
+    /// top answers `false`.
+    pub fn known_geometry_intersects(&self, viewport: &Viewport) -> bool {
+        self.geometry_evidence(viewport).unwrap_or(false)
+    }
+
+    /// The three-valued core of
+    /// [`known_geometry_intersects`](Self::known_geometry_intersects):
+    /// `Some(true)`/`Some(false)` when resolved geometry decides, `None`
+    /// when nothing known bears on the question. A `Reference` carries no
+    /// evidence, and neither does a `Resolved(Unbounded)` — this level's
+    /// canonicalization can't collapse ⊤ out of a compound the way
+    /// [`Location`]'s geometric one does, so it can appear here. A `OneOf`
+    /// is true on any true member and false only when every member is
+    /// evidenced false; an `AllOf` is false on any false member, undecided
+    /// when no member is evidenced at all (an all-unknown conjunction is not
+    /// vacuously everywhere), and true otherwise.
+    fn geometry_evidence(&self, viewport: &Viewport) -> Option<bool> {
+        match self {
+            Self::Resolved(Location::Unbounded) => None,
+            Self::Resolved(loc) => Some(loc.known_geometry_intersects(viewport)),
+            Self::Reference(_) => None,
+            Self::OneOf(entries) => {
+                let mut all_false = true;
+                for entry in entries.as_slice() {
+                    match entry.geometry_evidence(viewport) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => all_false = false,
+                    }
+                }
+                all_false.then_some(false)
+            }
+            Self::AllOf(entries) => {
+                let mut evidenced = false;
+                for entry in entries.as_slice() {
+                    match entry.geometry_evidence(viewport) {
+                        Some(false) => return Some(false),
+                        Some(true) => evidenced = true,
+                        None => {}
+                    }
+                }
+                evidenced.then_some(true)
+            }
+        }
+    }
+
+    /// [`Location::bounding_rects`] lifted over unresolved locations,
+    /// mirroring the evidential predicate: a `Reference` contributes none,
+    /// and an `AllOf` indexes under a member whose geometry always speaks —
+    /// the first resolved member with rects, since the evidential
+    /// conjunction only accepts a viewport that member's geometry reaches.
+    /// Without one (unknowns and compounds only), every member's rects
+    /// together still catch whichever member ends up supplying the positive
+    /// evidence.
+    pub fn bounding_rects(&self) -> Vec<IndexRect> {
+        match self {
+            Self::Resolved(loc) => loc.bounding_rects(),
+            Self::Reference(_) => Vec::new(),
+            Self::OneOf(entries) => entries
+                .as_slice()
+                .iter()
+                .flat_map(Self::bounding_rects)
+                .collect(),
+            Self::AllOf(entries) => entries
+                .as_slice()
+                .iter()
+                .filter(|e| matches!(e, Self::Resolved(_)))
+                .map(Self::bounding_rects)
+                .find(|rects| !rects.is_empty())
+                .unwrap_or_else(|| {
+                    entries
+                        .as_slice()
+                        .iter()
+                        .flat_map(Self::bounding_rects)
+                        .collect()
+                }),
         }
     }
 
@@ -2274,6 +2425,291 @@ mod tests {
             "tighter triangle with a shared core must read non-empty"
         );
         assert!(!samples_empty(&triple, 200), "grid disagrees: triple empty");
+        Ok(())
+    }
+
+    // --- known_geometry_intersects ---
+
+    /// lat `[40, 41]`, lon `[-74, -73]` — the same box the store fixtures use.
+    fn viewport() -> Result<Viewport, Box<dyn std::error::Error>> {
+        Ok(Viewport::new(gp(40.0, -74.0)?, gp(41.0, -73.0)?)?)
+    }
+
+    #[test]
+    fn intersects_circle_center_inside() -> TestResult {
+        let v = viewport()?;
+        assert!(Location::point(gp(40.5, -73.5)?).known_geometry_intersects(&v));
+        assert!(Location::circle(gp(40.5, -73.5)?, Meters(10.0))?.known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    #[test]
+    fn intersects_circle_center_outside_cap_overlapping_edge() -> TestResult {
+        // Center ~11 km east of the east edge; a 20 km radius reaches into the
+        // box even though the center is outside — the case a center-only
+        // point-in-box check gets wrong.
+        let v = viewport()?;
+        let overlapping = Location::circle(gp(40.5, -72.9)?, Meters(20_000.0))?;
+        assert!(overlapping.known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    #[test]
+    fn intersects_circle_cap_fully_outside() -> TestResult {
+        // Center ~84 km east of the east edge; a 20 km radius falls well short.
+        let v = viewport()?;
+        let clear = Location::circle(gp(40.5, -72.0)?, Meters(20_000.0))?;
+        assert!(!clear.known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    #[test]
+    fn intersects_antimeridian_straddling_viewport() -> TestResult {
+        // Viewport [170°E .. 170°W] across the seam.
+        let v = Viewport::new(gp(-5.0, 170.0)?, gp(5.0, -170.0)?)?;
+        // Inside, just across the seam.
+        assert!(Location::point(gp(0.0, -179.0)?).known_geometry_intersects(&v));
+        // ~222 km west of the west edge, radius 250 km: overlaps through the
+        // edge.
+        assert!(
+            Location::circle(gp(0.0, 168.0)?, Meters(250_000.0))?.known_geometry_intersects(&v)
+        );
+        // Same center, radius 100 km: short of the edge.
+        assert!(
+            !Location::circle(gp(0.0, 168.0)?, Meters(100_000.0))?.known_geometry_intersects(&v)
+        );
+        // The far side of the globe.
+        assert!(!Location::point(gp(0.0, 0.0)?).known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    #[test]
+    fn intersects_near_pole_viewport_over_the_pole() -> TestResult {
+        // A box touching the north pole; a cap on the far side of the pole
+        // (~55.6 km from it) reaches the box through the pole, not around the
+        // parallel.
+        let v = Viewport::new(gp(89.0, 0.0)?, gp(90.0, 10.0)?)?;
+        assert!(
+            Location::circle(gp(89.5, 170.0)?, Meters(60_000.0))?.known_geometry_intersects(&v)
+        );
+        assert!(
+            !Location::circle(gp(89.5, 170.0)?, Meters(40_000.0))?.known_geometry_intersects(&v)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn intersects_one_of_any_member() -> TestResult {
+        let v = viewport()?;
+        let inside = Location::circle(gp(40.5, -73.5)?, Meters(10.0))?;
+        let far = Location::circle(gp(10.0, 10.0)?, Meters(10.0))?;
+        let far2 = Location::circle(gp(-10.0, 60.0)?, Meters(10.0))?;
+        assert!(Location::one_of(vec![inside, far.clone()])?.known_geometry_intersects(&v));
+        assert!(!Location::one_of(vec![far, far2])?.known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    #[test]
+    fn intersects_all_of_every_member() -> TestResult {
+        let v = viewport()?;
+        // Two overlapping circles that both reach the box: the conjunction
+        // passes the conservative test.
+        let a = Location::circle(gp(40.5, -73.5)?, Meters(50_000.0))?;
+        let b = Location::circle(gp(40.6, -73.4)?, Meters(50_000.0))?;
+        let both = Location::AllOf {
+            members: Members::canonicalize(vec![a.clone(), b], resolved::canonical_all_of),
+        };
+        assert!(both.known_geometry_intersects(&v));
+        // One member in the box, one far away: the conjunction cannot reach it.
+        let far = Location::circle(gp(10.0, 10.0)?, Meters(10.0))?;
+        let split = Location::AllOf {
+            members: Members::canonicalize(vec![a, far], resolved::canonical_all_of),
+        };
+        assert!(!split.known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    #[test]
+    fn intersects_empty_and_unbounded_match_no_viewport() -> TestResult {
+        let v = viewport()?;
+        assert!(!Location::Empty.known_geometry_intersects(&v));
+        assert!(!Location::Unbounded.known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    #[test]
+    fn intersects_unresolved_reference_matches_no_viewport() -> TestResult {
+        let v = viewport()?;
+        let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
+            name: "somewhere".to_owned(),
+        });
+        assert!(!reference.known_geometry_intersects(&v));
+        let resolved =
+            UnresolvedLocation::Resolved(Location::circle(gp(40.5, -73.5)?, Meters(10.0))?);
+        assert!(resolved.known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    /// Unknowns are the identity of their combinator under the evidential
+    /// reading: a `Reference` (or a raw ⊤) removes nothing from an `AllOf`
+    /// and adds nothing to a `OneOf`, and an all-unknown conjunction is not
+    /// vacuously everywhere.
+    #[test]
+    fn intersects_unknowns_are_combinator_identity() -> TestResult {
+        let v = viewport()?;
+        let reference = |name: &str| {
+            UnresolvedLocation::Reference(LocationReference::NamedPlace {
+                name: name.to_owned(),
+            })
+        };
+        let near = UnresolvedLocation::Resolved(Location::circle(gp(40.5, -73.5)?, Meters(10.0))?);
+        let far = UnresolvedLocation::Resolved(Location::circle(gp(10.0, 10.0)?, Meters(10.0))?);
+
+        // The intersection's resolved member decides either way.
+        assert!(
+            UnresolvedLocation::all_of(vec![reference("lot 12"), near.clone()])?
+                .known_geometry_intersects(&v)
+        );
+        assert!(
+            !UnresolvedLocation::all_of(vec![reference("lot 12"), far.clone()])?
+                .known_geometry_intersects(&v)
+        );
+        // A union's unknown adds nothing beyond its resolved members.
+        assert!(
+            UnresolvedLocation::one_of(vec![reference("lot 12"), near.clone()])?
+                .known_geometry_intersects(&v)
+        );
+        assert!(
+            !UnresolvedLocation::one_of(vec![reference("lot 12"), far])?
+                .known_geometry_intersects(&v)
+        );
+        // No evidence at all answers false.
+        assert!(
+            !UnresolvedLocation::all_of(vec![reference("lot 12"), reference("lot 13")])?
+                .known_geometry_intersects(&v)
+        );
+        // A raw ⊤ entry (this level's canonicalizer would drop it, but the
+        // arm stays total) carries no evidence either way.
+        let with_top = UnresolvedLocation::AllOf(Members::canonicalize(
+            vec![UnresolvedLocation::Resolved(Location::Unbounded), near],
+            |entries| entries,
+        ));
+        assert!(with_top.known_geometry_intersects(&v));
+        Ok(())
+    }
+
+    // --- bounding_rects agreement with known_geometry_intersects ---
+
+    /// The index-side test: some rect meets some non-wrapping half of the
+    /// viewport on the plain interval comparison — exactly what an rtree
+    /// over the rects answers for its candidate set.
+    fn rects_reach(rects: &[IndexRect], v: &Viewport) -> bool {
+        rects.iter().any(|r| {
+            v.halves()
+                .into_iter()
+                .any(|h| r.intersects(h.min_lat, h.max_lat, h.min_lon, h.max_lon))
+        })
+    }
+
+    /// The soundness invariant the sqlite spatial index rides on: whenever the
+    /// predicate accepts a viewport, the rect set reaches it too, so an index
+    /// over the rects can never hide a fact the refine step would keep. Swept
+    /// over every location/viewport pairing the other tests exercise,
+    /// including the seam and pole regimes.
+    #[test]
+    fn bounding_rects_cover_every_predicate_hit() -> TestResult {
+        // Rim boundary: a cap whose rim stops 0.4 mm short of the first
+        // viewport's east edge — inside the rim tolerance's 1 mm floor, so
+        // the predicate accepts it and the rects must reach it too. The
+        // center longitude comes from inverting the meridian-edge distance
+        // `asin(cos φ · sin Δλ)·R` for the target standoff.
+        let rim_circle = {
+            let radius = 20_000.0;
+            let standoff = radius + 0.4e-3;
+            let dlon = ((standoff / EARTH_RADIUS_M).sin() / 40.5_f64.to_radians().cos())
+                .asin()
+                .to_degrees();
+            Location::circle(gp(40.5, -73.0 + dlon)?, Meters(radius))?
+        };
+        let locations = vec![
+            rim_circle,
+            Location::point(gp(40.5, -73.5)?),
+            Location::circle(gp(40.5, -72.9)?, Meters(20_000.0))?,
+            Location::circle(gp(40.5, -72.0)?, Meters(20_000.0))?,
+            Location::circle(gp(0.0, 179.5)?, Meters(100_000.0))?,
+            Location::circle(gp(0.0, -179.5)?, Meters(100_000.0))?,
+            Location::circle(gp(89.5, 170.0)?, Meters(60_000.0))?,
+            Location::circle(gp(0.0, 168.0)?, Meters(250_000.0))?,
+            Location::one_of(vec![
+                Location::circle(gp(40.5, -73.5)?, Meters(10.0))?,
+                Location::circle(gp(10.0, 10.0)?, Meters(10.0))?,
+            ])?,
+            Location::all_of(vec![
+                Location::circle(gp(40.5, -73.5)?, Meters(50_000.0))?,
+                Location::circle(gp(40.6, -73.4)?, Meters(50_000.0))?,
+            ])?,
+            Location::Empty,
+            Location::Unbounded,
+        ];
+        let viewports = [
+            viewport()?,
+            Viewport::new(gp(-5.0, 170.0)?, gp(5.0, -170.0)?)?,
+            Viewport::new(gp(89.0, 0.0)?, gp(90.0, 10.0)?)?,
+            Viewport::new(gp(-90.0, -180.0)?, gp(90.0, 180.0)?)?,
+            Viewport::new(gp(9.0, 9.0)?, gp(11.0, 11.0)?)?,
+        ];
+        for (li, loc) in locations.iter().enumerate() {
+            for (vi, v) in viewports.iter().enumerate() {
+                if loc.known_geometry_intersects(v) {
+                    assert!(
+                        rects_reach(&loc.bounding_rects(), v),
+                        "location {li} intersects viewport {vi} but its rects miss it: {loc:?}"
+                    );
+                }
+            }
+        }
+
+        // The unresolved lift's unknown-bearing compounds: unknowns are the
+        // identity of their combinator, so evidence can come from any
+        // resolved member and the rects must still cover it.
+        let reference = |name: &str| {
+            UnresolvedLocation::Reference(LocationReference::NamedPlace {
+                name: name.to_owned(),
+            })
+        };
+        let near = UnresolvedLocation::Resolved(Location::circle(gp(40.5, -73.5)?, Meters(10.0))?);
+        let far = UnresolvedLocation::Resolved(Location::circle(gp(10.0, 10.0)?, Meters(10.0))?);
+        let unresolved = [
+            UnresolvedLocation::all_of(vec![reference("lot 12"), near.clone()])?,
+            UnresolvedLocation::one_of(vec![reference("lot 12"), near.clone()])?,
+            // Built raw: the canonicalizer drops a ⊤ entry, but the evidence
+            // arms must stay total for a value reaching them another way.
+            UnresolvedLocation::AllOf(Members::canonicalize(
+                vec![
+                    UnresolvedLocation::Resolved(Location::Unbounded),
+                    near.clone(),
+                ],
+                |entries| entries,
+            )),
+            UnresolvedLocation::all_of(vec![reference("lot 12"), reference("lot 13")])?,
+            // Both members are unknown-bearing unions: whichever union holds
+            // the positive evidence varies with the viewport, so the AllOf
+            // rects must cover both.
+            UnresolvedLocation::all_of(vec![
+                UnresolvedLocation::one_of(vec![reference("lot 12"), far])?,
+                UnresolvedLocation::one_of(vec![reference("lot 13"), near])?,
+            ])?,
+        ];
+        for (ui, loc) in unresolved.iter().enumerate() {
+            for (vi, v) in viewports.iter().enumerate() {
+                if loc.known_geometry_intersects(v) {
+                    assert!(
+                        rects_reach(&loc.bounding_rects(), v),
+                        "unresolved {ui} intersects viewport {vi} but its rects miss it: {loc:?}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }

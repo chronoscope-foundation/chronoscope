@@ -3,7 +3,7 @@
 //! The store owns the [`FactStore`] / [`FactView`] trait surface plus the
 //! machinery around it:
 //!
-//! - [`schema`] — the read query vocabulary ([`schema::Bbox`],
+//! - [`schema`] — the read query vocabulary ([`schema::Viewport`],
 //!   [`schema::TimeRange`], [`schema::FactPage`], [`schema::EquivClass`]) and
 //!   the per-subject stream enums ([`schema::EntityStream`] /
 //!   [`schema::ImageStream`]). Each subject kind has a

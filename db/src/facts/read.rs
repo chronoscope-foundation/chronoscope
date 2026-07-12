@@ -18,6 +18,7 @@
 
 use sqlx::SqliteConnection;
 
+use chronoscope_core::geo::Viewport;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::store::FactPlacement;
 use chronoscope_core::store::pagination;
@@ -25,11 +26,11 @@ use chronoscope_core::store::retraction::{RetractionEdges, effective_retractor};
 use chronoscope_core::store::schema::{
     ClassPage, ClassRow, DepictionPage, EquivClass, FactPage, PageItem,
 };
-use chronoscope_core::submit::{FactLookup, StoredFact, SubmitResult};
+use chronoscope_core::submit::{FactLookup, LocatedSubject, StoredFact, SubmitResult};
 
 use super::convert::{i64_to_u64, seed_ids, u64_to_i64};
 use super::error::{SqliteFactStoreError, json, sql};
-use super::ids::{SqliteEntityId, SqliteIds, SqliteImageId};
+use super::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
 use super::queries;
 use super::storage::{
     SubjectColumn, depiction_subjects, fact_from_json, kind_tag, result_from_json,
@@ -253,6 +254,23 @@ pub(super) async fn class_members_raw(
     Ok(rows.into_iter().map(|(member,)| member).collect())
 }
 
+/// [`resolve_rep_raw`] behind a per-walk cache: each distinct member costs
+/// one log seek, repeats are free.
+async fn resolve_rep_cached(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    kind: &str,
+    member: i64,
+    cache: &mut std::collections::HashMap<i64, i64>,
+) -> Result<i64, SqliteFactStoreError> {
+    if let Some(rep) = cache.get(&member) {
+        return Ok(*rep);
+    }
+    let rep = resolve_rep_raw(conn, bound, kind, member).await?;
+    cache.insert(member, rep);
+    Ok(rep)
+}
+
 /// The class representative of `member` at the snapshot — one log seek.
 pub(super) async fn representative<S: SubjectColumn>(
     conn: &mut SqliteConnection,
@@ -383,12 +401,33 @@ impl FacetKey<'_> {
     }
 }
 
+/// The tail every flat class walk shares: resolve each `(subject, fact_id)`
+/// pair to its class representative — one cached log seek per distinct
+/// subject — and cut the `(representative, fact_id)` rows with the
+/// backend-shared cursor semantics. The set fold also dedups pairs that
+/// arrive twice.
+async fn rep_class_page<S: SubjectColumn>(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    subjects: Vec<(S, FactId)>,
+    after: Option<(S, FactId)>,
+    limit: std::num::NonZeroUsize,
+) -> Result<ClassPage<S, (S, FactId)>, SqliteFactStoreError> {
+    let mut reps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut rows: std::collections::BTreeSet<(S, FactId)> = std::collections::BTreeSet::new();
+    for (subject, fid) in subjects {
+        let rep =
+            resolve_rep_cached(conn, bound, kind_tag(S::KIND), subject.raw(), &mut reps).await?;
+        rows.insert((S::from_raw(rep), fid));
+    }
+    Ok(pagination::class_page(&rows, after, limit))
+}
+
 /// One page of a keyed class walk (`ByName` / `ByExternalReference` /
 /// `BySourceUrl`). The candidate set is key-sized, so the walk fetches it
 /// whole: candidates off the facet index, one batched retractor closure,
-/// `subject_of` on each survivor's decoded fact, one log seek per distinct
-/// subject, and the `(representative, fact_id)` rows page in Rust with the
-/// memory backend's exact cursor semantics ([`page_rows`]).
+/// `subject_of` on each survivor's decoded fact, then the shared
+/// [`rep_class_page`] tail.
 pub(super) async fn keyed_class_page<S: SubjectColumn>(
     conn: &mut SqliteConnection,
     bound: ReadBound,
@@ -404,8 +443,7 @@ pub(super) async fn keyed_class_page<S: SubjectColumn>(
     )?;
     let retraction = retraction_edges(conn, bound, &seeds).await?;
 
-    let mut reps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-    let mut rows: std::collections::BTreeSet<(S, FactId)> = std::collections::BTreeSet::new();
+    let mut subjects: Vec<(S, FactId)> = Vec::new();
     for ((_, fact_json), fid) in candidates.iter().zip(&seeds) {
         if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
             continue;
@@ -413,17 +451,9 @@ pub(super) async fn keyed_class_page<S: SubjectColumn>(
         let Some(subject) = subject_of(&fact_from_json(fact_json)?) else {
             continue;
         };
-        let rep = match reps.get(&subject.raw()) {
-            Some(rep) => *rep,
-            None => {
-                let rep = resolve_rep_raw(conn, bound, kind_tag(S::KIND), subject.raw()).await?;
-                reps.insert(subject.raw(), rep);
-                rep
-            }
-        };
-        rows.insert((S::from_raw(rep), *fid));
+        subjects.push((subject, *fid));
     }
-    Ok(pagination::class_page(&rows, after, limit))
+    rep_class_page(conn, bound, subjects, after, limit).await
 }
 
 /// One page of the depiction walk: the depiction facts of `entity`'s
@@ -478,15 +508,14 @@ pub(super) async fn depiction_page(
         if !members.contains(&depicted) {
             continue;
         }
-        let rep = match reps.get(&image.raw()) {
-            Some(rep) => *rep,
-            None => {
-                let rep = resolve_rep_raw(conn, bound, kind_tag(SqliteImageId::KIND), image.raw())
-                    .await?;
-                reps.insert(image.raw(), rep);
-                rep
-            }
-        };
+        let rep = resolve_rep_cached(
+            conn,
+            bound,
+            kind_tag(SqliteImageId::KIND),
+            image.raw(),
+            &mut reps,
+        )
+        .await?;
         rows.insert((SqliteImageId::from_raw(rep), *fid));
         facts.insert(*fid, fact);
     }
@@ -507,6 +536,159 @@ pub(super) async fn depiction_page(
         rows: page,
         next_class,
     })
+}
+
+/// The active location-bearing facts of the stream's subject kinds whose
+/// region can meet `viewport`: rtree candidates per viewport half (the
+/// core-owned seam split, [`halves`] — deduped by fact id, since a
+/// seam-split location matches through both rect rows) narrowed to `kinds`
+/// in SQL, one batched retractor closure, then the exact refine through the
+/// shared predicate — the same [`known_geometry_intersects`] code the memory
+/// backend refines with, so the backends cannot disagree on membership.
+///
+/// [`halves`]: chronoscope_core::geo::Viewport::halves
+/// [`known_geometry_intersects`]: chronoscope_core::location::UnresolvedLocation::known_geometry_intersects
+async fn located_in_viewport(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    viewport: &Viewport,
+    kinds: (&str, &str),
+) -> Result<Vec<(FactId, StoredFact<SqliteIds>)>, SqliteFactStoreError> {
+    let mut candidates: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
+    for half in viewport.halves() {
+        let rows: Vec<(i64, String)> = sqlx::query_as(queries::SPATIAL_CANDIDATES.sql)
+            .bind(half.min_lat)
+            .bind(half.max_lat)
+            .bind(half.min_lon)
+            .bind(half.max_lon)
+            .bind(bound.bind())
+            .bind(kinds.0)
+            .bind(kinds.1)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql("fetching spatial candidates"))?;
+        candidates.extend(rows);
+    }
+    let seeds = seed_ids(candidates.keys(), "spatial candidate fact id")?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    let mut located = Vec::new();
+    for ((_, fact_json), fid) in candidates.iter().zip(&seeds) {
+        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
+            continue;
+        }
+        let fact = fact_from_json(fact_json)?;
+        let Some((location, _)) = fact.located_subject() else {
+            continue;
+        };
+        if !location.known_geometry_intersects(viewport) {
+            continue;
+        }
+        located.push((*fid, fact));
+    }
+    Ok(located)
+}
+
+/// The owning entity of each of `events` at the snapshot — memory's
+/// `event_entity_map` scoped to the events one walk needs. One batched
+/// [`EVENT_OWNERS`](super::queries::EVENT_OWNERS) fetch (an indexed probe per
+/// event) reads owners off the `event_owner` facet without decoding a fact,
+/// then one batched retractor closure gates them. Ascending fact-id
+/// insertion makes the latest active owner win, and a retracted `HasEvent`
+/// is no owner edge, matching the memory map exactly.
+async fn event_owners(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    events: &std::collections::BTreeSet<SqliteEventId>,
+) -> Result<std::collections::BTreeMap<SqliteEventId, SqliteEntityId>, SqliteFactStoreError> {
+    if events.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let event_ids: Vec<i64> = events.iter().map(|event| event.raw()).collect();
+    let event_json = serde_json::to_string(&event_ids).map_err(json("encoding event id list"))?;
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(queries::EVENT_OWNERS.sql)
+        .bind(&event_json)
+        .bind(kind_tag(SqliteEventId::KIND))
+        .bind(bound.bind())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("fetching event owners"))?;
+    // Keyed by fact id so the winner scan below runs ascending regardless of
+    // fetch order.
+    let candidates: std::collections::BTreeMap<i64, (i64, i64)> = rows
+        .into_iter()
+        .map(|(fid, event, owner)| (fid, (event, owner)))
+        .collect();
+    let seeds = seed_ids(candidates.keys(), "has-event fact id")?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    let mut owners = std::collections::BTreeMap::new();
+    for ((_, (event, owner)), fid) in candidates.iter().zip(&seeds) {
+        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
+            continue;
+        }
+        owners.insert(
+            SqliteEventId::from_raw(*event),
+            SqliteEntityId::from_raw(*owner),
+        );
+    }
+    Ok(owners)
+}
+
+/// One page of the entity `InViewport` class walk: [`located_in_viewport`] facts of
+/// the entity and event kinds, construction bookends attributed to their own
+/// entity and `MovedToLocation` facts to their [`event_owners`] entity (an
+/// orphaned move attributes to nothing), then the shared [`rep_class_page`]
+/// tail.
+pub(super) async fn spatial_entity_page(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    viewport: &Viewport,
+    after: Option<(SqliteEntityId, FactId)>,
+    limit: std::num::NonZeroUsize,
+) -> Result<ClassPage<SqliteEntityId, (SqliteEntityId, FactId)>, SqliteFactStoreError> {
+    let kinds = (
+        kind_tag(SqliteEntityId::KIND),
+        kind_tag(SqliteEventId::KIND),
+    );
+    let located = located_in_viewport(conn, bound, viewport, kinds).await?;
+    let mut subjects: Vec<(SqliteEntityId, FactId)> = Vec::new();
+    let mut moved: Vec<(SqliteEventId, FactId)> = Vec::new();
+    for (fid, fact) in &located {
+        match fact.located_subject() {
+            Some((_, LocatedSubject::Entity(entity))) => subjects.push((*entity, *fid)),
+            Some((_, LocatedSubject::Event(event))) => moved.push((*event, *fid)),
+            Some((_, LocatedSubject::Image(_))) | None => {}
+        }
+    }
+    let events: std::collections::BTreeSet<SqliteEventId> =
+        moved.iter().map(|(event, _)| *event).collect();
+    let owners = event_owners(conn, bound, &events).await?;
+    for (event, fid) in moved {
+        if let Some(entity) = owners.get(&event) {
+            subjects.push((*entity, fid));
+        }
+    }
+    rep_class_page(conn, bound, subjects, after, limit).await
+}
+
+/// One page of the image `InViewport` class walk: [`located_in_viewport`] facts of
+/// the image kind (`CapturedLocation`), then the shared [`rep_class_page`]
+/// tail.
+pub(super) async fn spatial_image_page(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    viewport: &Viewport,
+    after: Option<(SqliteImageId, FactId)>,
+    limit: std::num::NonZeroUsize,
+) -> Result<ClassPage<SqliteImageId, (SqliteImageId, FactId)>, SqliteFactStoreError> {
+    let kind = kind_tag(SqliteImageId::KIND);
+    let located = located_in_viewport(conn, bound, viewport, (kind, kind)).await?;
+    let mut subjects: Vec<(SqliteImageId, FactId)> = Vec::new();
+    for (fid, fact) in &located {
+        if let Some((_, LocatedSubject::Image(image))) = fact.located_subject() {
+            subjects.push((*image, *fid));
+        }
+    }
+    rep_class_page(conn, bound, subjects, after, limit).await
 }
 
 /// The `(rep, fact_id)` SQL binds for an All-walk cursor. `None` opens the

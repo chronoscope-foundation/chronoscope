@@ -20,7 +20,7 @@ use chronoscope_api_client::{
 use chronoscope_core::conflicts::{cited_lineage, detect_conflicts};
 use chronoscope_core::geo;
 use chronoscope_core::grammar::ids::FactId;
-use chronoscope_core::listing::{self, ListCursor, summaries_in_bbox};
+use chronoscope_core::listing::{self, ListCursor, summaries_in_viewport};
 use chronoscope_core::projection::{
     member_lineage, project_entity, project_entity_images, project_image,
 };
@@ -120,21 +120,21 @@ fn decode_images_cursor(cursor: &Cursor) -> Result<ImagesListState, HttpError> {
     decode_cursor_blob(IMAGES_CURSOR_VERSION, cursor)
 }
 
-/// Parse the four viewport query fields into the fact store's `Bbox`.
+/// Parse the four viewport query fields into the fact store's `Viewport`.
 ///
 /// Shared by `/entities` and `/markers`, whose query params carry the same
-/// bbox corners. `geo::Bbox::from_coords` range-validates each corner (admitting
+/// viewport corners. `geo::Viewport::from_coords` range-validates each corner (admitting
 /// an antimeridian-crossing `min_lon > max_lon` box) and rejects an inverted
 /// latitude span; either rejection surfaces as a CORS-tagged 400 the browser can
 /// read.
-fn request_bbox(
+fn request_viewport(
     min_lat: f64,
     max_lat: f64,
     min_lon: f64,
     max_lon: f64,
-) -> Result<geo::Bbox, HttpError> {
-    geo::Bbox::from_coords(min_lat, max_lat, min_lon, max_lon)
-        .map_err(|e| bad_request_with_cors(format!("Invalid bbox: {e}")))
+) -> Result<geo::Viewport, HttpError> {
+    geo::Viewport::from_coords(min_lat, max_lat, min_lon, max_lon)
+        .map_err(|e| bad_request_with_cors(format!("Invalid viewport: {e}")))
 }
 
 /// Project an image's `SameArtifact` class to its typed read DTO, or `None` when
@@ -173,7 +173,7 @@ pub struct EntityIdPath {
 
 /// Query parameters for the entity viewport listing endpoint.
 ///
-/// Bbox fields are declared inline because Dropshot's query parameter
+/// Viewport fields are declared inline because Dropshot's query parameter
 /// deserializer doesn't support `serde(flatten)`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EntitiesQueryParams {
@@ -193,7 +193,7 @@ pub struct EntitiesQueryParams {
 /// List entities within a geographic bounding box (public, no authentication required).
 ///
 /// Returns the placeable entities (those whose current marker resolves to a
-/// point) in `bbox`, ordered by the underlying fact-store walk. The primary
+/// point) in `viewport`, ordered by the underlying fact-store walk. The primary
 /// live consumer of viewport data is `/markers`; this endpoint keeps a
 /// straightforward first-page-plus-cursor shape rather than fully general
 /// pagination.
@@ -208,7 +208,7 @@ pub async fn list_entities(
     let state = ctx.context();
     let params = query.into_inner();
 
-    let core_bbox = request_bbox(
+    let core_viewport = request_viewport(
         params.min_lat,
         params.max_lat,
         params.min_lon,
@@ -245,7 +245,9 @@ pub async fn list_entities(
         None => state.facts.now().await.map_err(fact_store_err)?,
     };
     let page =
-        match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, cursor, limit).await {
+        match summaries_in_viewport::<MemoryFactStore, _>(&mut view, &core_viewport, cursor, limit)
+            .await
+        {
             Ok(p) => p,
             Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
         };
@@ -434,7 +436,7 @@ pub async fn get_entity_images(
 
 /// Query parameters for the unified markers endpoint.
 ///
-/// Bbox fields are declared inline because Dropshot's query parameter
+/// Viewport fields are declared inline because Dropshot's query parameter
 /// deserializer doesn't support `serde(flatten)`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MarkersQueryParams {
@@ -446,7 +448,7 @@ pub struct MarkersQueryParams {
 
 /// Unified map markers endpoint (public, no authentication required).
 ///
-/// No clustering: every placeable entity in `bbox` becomes a marker, up to
+/// No clustering: every placeable entity in `viewport` becomes a marker, up to
 /// `limits::ENTITY_LIST_MAX_PAGE_SIZE`, each carrying its representative's
 /// thumbnail URL when it depicts an image. Co-located entities (identical
 /// point) collapse into one disambiguation marker.
@@ -461,7 +463,7 @@ pub async fn list_markers(
     let state = ctx.context();
     let params = query.into_inner();
 
-    let core_bbox = request_bbox(
+    let core_viewport = request_viewport(
         params.min_lat,
         params.max_lat,
         params.min_lon,
@@ -472,7 +474,9 @@ pub async fn list_markers(
 
     let mut view = state.facts.now().await.map_err(fact_store_err)?;
     let page =
-        match summaries_in_bbox::<MemoryFactStore, _>(&mut view, &core_bbox, None, limit).await {
+        match summaries_in_viewport::<MemoryFactStore, _>(&mut view, &core_viewport, None, limit)
+            .await
+        {
             Ok(p) => p,
             Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
         };

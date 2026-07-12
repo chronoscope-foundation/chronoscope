@@ -11,7 +11,7 @@ use futures_util::TryStreamExt;
 use url::Url;
 
 use crate::date::{DatePrecision, UncertainDate};
-use crate::geo::{Bbox, GeoPoint, Meters};
+use crate::geo::{GeoPoint, Meters, Viewport};
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::grammar::attribute::{self, NameText, NameType};
 use crate::grammar::bookend;
@@ -222,8 +222,8 @@ pub fn n_circle_location(n: usize) -> Result<UnresolvedLocation, TestError> {
 
 /// The NYC-ish box the spatial walk tests query: lat `[40, 41]`, lon
 /// `[-74, -73]`.
-pub fn sample_bbox() -> Result<Bbox, TestError> {
-    Ok(Bbox::new(
+pub fn sample_viewport() -> Result<Viewport, TestError> {
+    Ok(Viewport::new(
         GeoPoint::new(40.0, -74.0)?,
         GeoPoint::new(41.0, -73.0)?,
     )?)
@@ -390,6 +390,28 @@ pub fn construction_at(entity_idx: usize, lat: f64, lon: f64) -> Result<SubmitFa
     })
 }
 
+/// A construction `Location` bookend placing the entity in a resolved circle
+/// of `radius_m` uncertainty.
+pub fn construction_circle_at(
+    entity_idx: usize,
+    lat: f64,
+    lon: f64,
+    radius_m: f64,
+) -> Result<SubmitFact, TestError> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: bookend::ConstructionFact::Location {
+                entity: EntityIdx(entity_idx),
+                location: UnresolvedLocation::Resolved(Location::circle(
+                    GeoPoint::new(lat, lon)?,
+                    Meters(radius_m),
+                )?),
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
 /// A `Construction::Started` bookend carrying an arbitrary date — the
 /// fact-payload host for the single-interval rule.
 pub fn started_with_date(entity_idx: usize, bound: UncertainDate) -> Result<SubmitFact, TestError> {
@@ -456,6 +478,28 @@ pub fn captured_date_fact(image_idx: usize) -> Result<SubmitFact, TestError> {
             fact: crate::grammar::image::Fact::CapturedDate {
                 image: ImageIdx(image_idx),
                 bound,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// A `CapturedLocation` fact placing the image's viewpoint in a resolved
+/// circle of `radius_m` uncertainty (`0.0` for a bare point).
+pub fn captured_location_at(
+    image_idx: usize,
+    lat: f64,
+    lon: f64,
+    radius_m: f64,
+) -> Result<SubmitFact, TestError> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Image {
+            fact: crate::grammar::image::Fact::CapturedLocation {
+                image: ImageIdx(image_idx),
+                location: UnresolvedLocation::Resolved(Location::circle(
+                    GeoPoint::new(lat, lon)?,
+                    Meters(radius_m),
+                )?),
             },
         },
         citation: sample_citation()?,

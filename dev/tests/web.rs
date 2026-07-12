@@ -731,12 +731,12 @@ async fn find_entity_with_media(
     t: &WebTest,
 ) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
     use chronoscope_api_client::Client;
-    use chronoscope_core::geo::Bbox;
+    use chronoscope_core::geo::Viewport;
 
     let client = Client::new(t.api_base_url());
-    // Rome's bbox — the 4 Roman entities sit here, several with seeded media.
-    let bbox = Bbox::from_coords(41.5, 42.5, 12.0, 13.0)?;
-    let response = client.list_markers(&bbox).await?;
+    // Rome's viewport — the 4 Roman entities sit here, several with seeded media.
+    let viewport = Viewport::from_coords(41.5, 42.5, 12.0, 13.0)?;
+    let response = client.list_markers(&viewport).await?;
     let images_limit = std::num::NonZeroU32::new(50).ok_or("nonzero image page size")?;
 
     // Pick the entity with the most resolved media among those whose marker

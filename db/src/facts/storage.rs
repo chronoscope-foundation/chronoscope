@@ -441,6 +441,9 @@ pub(super) struct Facets {
     pub edge_kind: Option<&'static str>,
     pub edge_a: Option<i64>,
     pub edge_b: Option<i64>,
+    /// A `HasEvent` fact's owning entity — the spatial walk's event→entity
+    /// hop reads owners off this column without decoding `fact_json`.
+    pub event_owner: Option<i64>,
     pub retracts_fact_id: Option<i64>,
     /// A `RetractCommit` target's hash; staging resolves it to the
     /// surrogate `retracts_commit_seq` column value.
@@ -520,8 +523,11 @@ pub(super) fn facet_columns(fact: &StoredFact<SqliteIds>) -> Result<Facets, Sqli
                 event::Fact::DurationalDate { bound, .. }
                 | event::Fact::PointDate { bound, .. } => Ok(Facets::date(bound)),
                 event::Fact::MovedToLocation { location, .. } => Ok(Facets::location(location)),
-                event::Fact::HasEvent { .. }
-                | event::Fact::DamageCause { .. }
+                event::Fact::HasEvent { entity, .. } => Ok(Facets {
+                    event_owner: Some(entity.0),
+                    ..Facets::default()
+                }),
+                event::Fact::DamageCause { .. }
                 | event::Fact::MoveMethod { .. }
                 | event::Fact::UsageChange { .. }
                 | event::Fact::Designation { .. }

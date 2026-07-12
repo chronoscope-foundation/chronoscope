@@ -909,8 +909,8 @@ async fn list_markers_selects_a_lone_entity() -> TestResult {
     let ctx = TestContext::new().await?;
     let id = commit_named_entity_at(&ctx.app_state.facts, "Colosseum", 41.8902, 12.4922).await?;
 
-    let bbox = chronoscope_core::geo::Bbox::from_coords(41.8, 42.0, 12.4, 12.6)?;
-    let response = ctx.client.list_markers(&bbox).await?;
+    let viewport = chronoscope_core::geo::Viewport::from_coords(41.8, 42.0, 12.4, 12.6)?;
+    let response = ctx.client.list_markers(&viewport).await?;
 
     assert_eq!(response.markers.len(), 1, "expected exactly one marker");
     let marker = &response.markers[0];
@@ -944,8 +944,8 @@ async fn list_markers_carries_a_thumbnail_for_a_depicted_entity() -> TestResult 
     let ctx =
         TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
 
-    let bbox = chronoscope_core::geo::Bbox::from_coords(41.8, 42.0, 12.4, 12.6)?;
-    let response = ctx.client.list_markers(&bbox).await?;
+    let viewport = chronoscope_core::geo::Viewport::from_coords(41.8, 42.0, 12.4, 12.6)?;
+    let response = ctx.client.list_markers(&viewport).await?;
 
     let marker = response
         .markers
@@ -967,8 +967,8 @@ async fn list_markers_disambiguates_colocated_entities() -> TestResult {
     let a = commit_named_entity_at(&ctx.app_state.facts, "Old Chapel", 45.2, 12.27).await?;
     let b = commit_named_entity_at(&ctx.app_state.facts, "New Chapel", 45.2, 12.27).await?;
 
-    let bbox = chronoscope_core::geo::Bbox::from_coords(45.0, 45.4, 12.0, 12.5)?;
-    let response = ctx.client.list_markers(&bbox).await?;
+    let viewport = chronoscope_core::geo::Viewport::from_coords(45.0, 45.4, 12.0, 12.5)?;
+    let response = ctx.client.list_markers(&viewport).await?;
 
     assert_eq!(
         response.markers.len(),
@@ -986,30 +986,30 @@ async fn list_markers_disambiguates_colocated_entities() -> TestResult {
 }
 
 #[tokio::test]
-async fn list_markers_omits_entities_outside_the_bbox() -> TestResult {
+async fn list_markers_omits_entities_outside_the_viewport() -> TestResult {
     let ctx = TestContext::new().await?;
     commit_named_entity_at(&ctx.app_state.facts, "Eiffel Tower", 48.8584, 2.2945).await?;
 
     // A box nowhere near Paris.
-    let bbox = chronoscope_core::geo::Bbox::from_coords(41.8, 42.0, 12.4, 12.6)?;
-    let response = ctx.client.list_markers(&bbox).await?;
+    let viewport = chronoscope_core::geo::Viewport::from_coords(41.8, 42.0, 12.4, 12.6)?;
+    let response = ctx.client.list_markers(&viewport).await?;
 
     assert!(response.markers.is_empty());
     Ok(())
 }
 
 #[tokio::test]
-async fn list_markers_accepts_an_antimeridian_bbox() -> TestResult {
+async fn list_markers_accepts_an_antimeridian_viewport() -> TestResult {
     let ctx = TestContext::new().await?;
     // An entity just west of the antimeridian.
     let id = commit_named_entity_at(&ctx.app_state.facts, "Dateline Light", 0.0, 179.5).await?;
 
     // A box that wraps across the antimeridian: min_lon (170) > max_lon (-170).
-    // The whole path — `Bbox::from_coords`, the server's `request_bbox`, and the
+    // The whole path — `Viewport::from_coords`, the server's `request_viewport`, and the
     // core spatial walk — must accept the wrap rather than 400, and surface the
     // entity inside it.
-    let bbox = chronoscope_core::geo::Bbox::from_coords(-1.0, 1.0, 170.0, -170.0)?;
-    let response = ctx.client.list_markers(&bbox).await?;
+    let viewport = chronoscope_core::geo::Viewport::from_coords(-1.0, 1.0, 170.0, -170.0)?;
+    let response = ctx.client.list_markers(&viewport).await?;
 
     let marker = response
         .markers
@@ -1145,7 +1145,7 @@ async fn list_markers_orders_accept_language_by_q_weight() -> TestResult {
 // ==================== list_entities ====================
 
 #[tokio::test]
-async fn list_entities_lists_placeable_entities_in_the_bbox() -> TestResult {
+async fn list_entities_lists_placeable_entities_in_the_viewport() -> TestResult {
     let ctx = TestContext::new().await?;
     let id = commit_named_entity_at(&ctx.app_state.facts, "Duomo", 43.7731, 11.2560).await?;
 
@@ -1178,7 +1178,7 @@ async fn list_entities_rejects_a_page_size_over_the_max() -> TestResult {
 #[tokio::test]
 async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
     let ctx = TestContext::new().await?;
-    // Three placeable entities inside one small bbox; limit=1 forces the walk
+    // Three placeable entities inside one small viewport; limit=1 forces the walk
     // across cursor-linked pages, exercising the encode/decode round trip.
     let expected: std::collections::BTreeSet<MemoryEntityId> = [
         commit_named_entity_at(&ctx.app_state.facts, "Alpha", 43.771, 11.251).await?,
@@ -1188,10 +1188,10 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
     .into_iter()
     .collect();
 
-    let bbox = "min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
+    let viewport = "min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
 
     // Page 1 caps at the limit and, with entities still to come, hands back a cursor.
-    let resp = ctx.get(&format!("/entities?{bbox}&limit=1")).await?;
+    let resp = ctx.get(&format!("/entities?{viewport}&limit=1")).await?;
     assert_eq!(resp.status(), 200);
     let page1: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
     assert_eq!(
@@ -1212,7 +1212,10 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
     let mut pages = 1;
     while let Some(c) = cursor.take() {
         let resp = ctx
-            .get(&format!("/entities?{bbox}&limit=1&cursor={}", c.as_str()))
+            .get(&format!(
+                "/entities?{viewport}&limit=1&cursor={}",
+                c.as_str()
+            ))
             .await?;
         assert_eq!(resp.status(), 200, "a minted cursor round-trips as a 200");
         let page: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
@@ -1238,7 +1241,7 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
 #[tokio::test]
 async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> TestResult {
     let ctx = TestContext::new().await?;
-    // Three placeable entities in one small bbox make ≥2 pages at limit=1.
+    // Three placeable entities in one small viewport make ≥2 pages at limit=1.
     let expected: std::collections::BTreeSet<MemoryEntityId> = [
         commit_named_entity_at(&ctx.app_state.facts, "Alpha", 43.771, 11.251).await?,
         commit_named_entity_at(&ctx.app_state.facts, "Beta", 43.772, 11.252).await?,
@@ -1247,10 +1250,10 @@ async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> Test
     .into_iter()
     .collect();
 
-    let bbox = "min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
+    let viewport = "min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
 
     // Page 1 pins its snapshot into the cursor it hands back.
-    let resp = ctx.get(&format!("/entities?{bbox}&limit=1")).await?;
+    let resp = ctx.get(&format!("/entities?{viewport}&limit=1")).await?;
     assert_eq!(resp.status(), 200);
     let page1: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
     let mut seen: std::collections::BTreeSet<MemoryEntityId> =
@@ -1263,7 +1266,7 @@ async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> Test
 
     // Three more in-box entities land after page 1. Their facts postdate the
     // cursor's snapshot, so the resumed walk must never surface them — a `now()`
-    // read would, since all six sit in the same bbox.
+    // read would, since all six sit in the same viewport.
     let intruders: std::collections::BTreeSet<MemoryEntityId> = [
         commit_named_entity_at(&ctx.app_state.facts, "Delta", 43.774, 11.254).await?,
         commit_named_entity_at(&ctx.app_state.facts, "Epsilon", 43.775, 11.255).await?,
@@ -1275,7 +1278,10 @@ async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> Test
     let mut pages = 1;
     while let Some(c) = cursor.take() {
         let resp = ctx
-            .get(&format!("/entities?{bbox}&limit=1&cursor={}", c.as_str()))
+            .get(&format!(
+                "/entities?{viewport}&limit=1&cursor={}",
+                c.as_str()
+            ))
             .await?;
         assert_eq!(
             resp.status(),

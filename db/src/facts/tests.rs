@@ -55,13 +55,7 @@ async fn fresh_store() -> Result<(SqliteFactStore, tempfile::TempDir), TestError
     Ok((SqliteFactStore::new(pool), dir))
 }
 
-chronoscope_core::fact_store_conformance!(
-    fresh_store(),
-    ignore(
-        walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities:
-            "the InBbox stream needs the populated facts_spatial rtree; flips green once the spatial walk lands",
-    )
-);
+chronoscope_core::fact_store_conformance!(fresh_store());
 
 /// `open` yields a migrated, usable store, and `close` tears it down inside the
 /// runtime — the teardown that keeps SpatiaLite's dlclose off the exit path.

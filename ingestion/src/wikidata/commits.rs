@@ -614,10 +614,10 @@ mod tests {
 
     use chrono::{Datelike, TimeZone};
 
-    use chronoscope_core::geo::{Bbox, GeoPoint};
+    use chronoscope_core::geo::{GeoPoint, Viewport};
     use chronoscope_core::grammar::attribute::NameType;
     use chronoscope_core::grammar::lifecycle::{DurationalKind, LifetimeEventKind, PointKind};
-    use chronoscope_core::listing::summaries_in_bbox;
+    use chronoscope_core::listing::summaries_in_viewport;
     use chronoscope_core::projection::{member_lineage, project_entity};
     use chronoscope_core::store::FactStore;
     use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds};
@@ -1199,7 +1199,7 @@ mod tests {
         Ok(())
     }
 
-    /// The Pantheon's P625 coordinate, the point the bbox listing pins it at.
+    /// The Pantheon's P625 coordinate, the point the viewport listing pins it at.
     const PANTHEON_LAT: f64 = 41.8986;
     const PANTHEON_LON: f64 = 12.4769;
 
@@ -1222,14 +1222,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bbox_listing_surfaces_pantheon_at_its_coordinate() -> TestResult {
+    async fn viewport_listing_surfaces_pantheon_at_its_coordinate() -> TestResult {
         let (store, id) = committed_pantheon().await?;
         let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
         // A box around central Rome, comfortably covering the P625 point.
-        let bbox = Bbox::new(GeoPoint::new(41.8, 12.4)?, GeoPoint::new(42.0, 12.6)?)?;
+        let viewport = Viewport::new(GeoPoint::new(41.8, 12.4)?, GeoPoint::new(42.0, 12.6)?)?;
         let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
-        let page = summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, limit)
+        let page = summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, limit)
             .await
             .map_err(|e| format!("{e:?}"))?;
 
@@ -1257,14 +1257,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bbox_listing_omits_pantheon_from_a_faraway_box() -> TestResult {
+    async fn viewport_listing_omits_pantheon_from_a_faraway_box() -> TestResult {
         let (store, id) = committed_pantheon().await?;
         let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
 
         // A box over the mid-Atlantic — nowhere near Rome.
-        let bbox = Bbox::new(GeoPoint::new(0.0, -40.0)?, GeoPoint::new(10.0, -30.0)?)?;
+        let viewport = Viewport::new(GeoPoint::new(0.0, -40.0)?, GeoPoint::new(10.0, -30.0)?)?;
         let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
-        let page = summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, limit)
+        let page = summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, limit)
             .await
             .map_err(|e| format!("{e:?}"))?;
 

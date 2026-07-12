@@ -47,10 +47,10 @@ use crate::grammar::ids::FactId;
 // Spatial / temporal query types
 // ============================================================================
 
-/// Re-export of [`crate::geo::Bbox`], where the bounding-box type lives. Keeps
-/// the `crate::store::schema::Bbox` import path working.
-pub use crate::geo::Bbox;
-pub use crate::geo::BboxError;
+/// Re-export of [`crate::geo::Viewport`], where the bounding-box type lives. Keeps
+/// the `crate::store::schema::Viewport` import path working.
+pub use crate::geo::Viewport;
+pub use crate::geo::ViewportError;
 
 /// Re-export of [`crate::date::TimeRange`], the primitive interval over
 /// [`crate::date::DateBound`]. Keeps the `crate::store::schema::TimeRange`
@@ -84,15 +84,15 @@ pub enum EntityStream<'a> {
     /// Walk every entity-touching fact in `fact_id` order, subject to
     /// snapshot + retraction scoping.
     All,
-    /// Walk facts whose location index entry intersects `bbox`.
-    InBbox(&'a Bbox),
+    /// Walk facts whose location index entry intersects `viewport`.
+    InViewport(&'a Viewport),
     /// Walk facts whose date index entry intersects `range`.
     InTimeRange(&'a TimeRange),
-    /// Walk facts/classes that satisfy both `bbox` and `range`. The
+    /// Walk facts/classes that satisfy both `viewport` and `range`. The
     /// intersection is class-level — see the archive design doc for the
     /// rationale.
-    InBboxAndTimeRange {
-        bbox: &'a Bbox,
+    InViewportAndTimeRange {
+        viewport: &'a Viewport,
         range: &'a TimeRange,
     },
     /// Walk [`crate::grammar::attribute::Fact::Name`] facts whose name and language
@@ -121,13 +121,13 @@ pub enum EntityStream<'a> {
 pub enum ImageStream<'a> {
     /// Walk every image-touching fact in `fact_id` order.
     All,
-    /// Walk facts whose location index entry intersects `bbox`.
-    InBbox(&'a Bbox),
+    /// Walk facts whose location index entry intersects `viewport`.
+    InViewport(&'a Viewport),
     /// Walk facts whose date index entry intersects `range`.
     InTimeRange(&'a TimeRange),
-    /// Walk facts/classes that satisfy both `bbox` and `range`.
-    InBboxAndTimeRange {
-        bbox: &'a Bbox,
+    /// Walk facts/classes that satisfy both `viewport` and `range`.
+    InViewportAndTimeRange {
+        viewport: &'a Viewport,
         range: &'a TimeRange,
     },
     /// Walk [`crate::grammar::image::Fact::Source`] facts whose source URL equals the

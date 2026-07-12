@@ -245,13 +245,13 @@ pub fn set_cursor(map: &Map, cursor: &str) {
 /// around the antimeridian, MapLibre reports e.g. `west = 170, east = 190`.
 /// After wrapping, that becomes `(170, -170)` — i.e. `west > east`.
 ///
-/// Our [`Bbox`] convention treats `min_lon > max_lon` as "this bbox crosses
-/// the antimeridian", and the API + DB queries already branch on that.
-/// So the wrap result feeds straight through correctly without any
+/// Our [`Viewport`] convention treats `min_lon > max_lon` as "this viewport
+/// crosses the antimeridian", and the API + DB queries already branch on
+/// that. So the wrap result feeds straight through correctly without any
 /// special-case glue. Don't "fix" the inversion here without also
 /// teaching the entity/cluster query code to ignore the flag.
 ///
-/// [`Bbox`]: chronoscope_core::geo::Bbox
+/// [`Viewport`]: chronoscope_core::geo::Viewport
 fn wrap_lon(lon: f64) -> f64 {
     ((lon + 180.0).rem_euclid(360.0)) - 180.0
 }

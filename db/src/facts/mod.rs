@@ -38,8 +38,11 @@
 //! now. The class-stream walks (`walk_entity_classes`,
 //! `walk_image_classes`) combine the facet indexes with that resolution,
 //! and `walk_entity_depictions` combines it with the subject backlinks;
-//! the spatial and temporal streams still answer empty pages until their
-//! indexes exist, with their conformance cases ignored.
+//! the spatial streams (`InViewport` for entities and images) fetch candidates
+//! from the `facts_spatial` rtree — one row per geodesic covering rect,
+//! written at stage time — and refine them through core's shared region
+//! predicate; the temporal streams still answer empty pages until their
+//! index exists, with their conformance cases ignored.
 
 mod convert;
 mod error;
@@ -76,8 +79,8 @@ pub use self::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
 use self::error::sql;
 use self::read::{FacetKey, ReadBound};
 use self::storage::{
-    commit_to_json, external_ref_key, facet_columns, fact_to_json, named_entity, referenced_entity,
-    result_to_json, sourced_image, subject_rows,
+    commit_to_json, external_ref_key, facet_columns, fact_to_json, kind_tag, named_entity,
+    referenced_entity, result_to_json, sourced_image, subject_rows,
 };
 
 use self::convert::{i64_to_u64, u64_to_i64};
@@ -377,11 +380,10 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         read::equiv_class(self.conn.conn(), self.bound, *member).await
     }
 
-    /// The spatial and temporal streams wait on their indexes
-    /// (`facts_spatial` is still unpopulated); their empty page is the
-    /// contract's nothing-found answer, and it must stay quiet rather than
-    /// error because the submit matcher drains walks on every submit with
-    /// `Local` decls. The ignored `InBbox` conformance case pins that gap.
+    /// The temporal streams wait on their date index; their empty page is
+    /// the contract's nothing-found answer, and it must stay quiet rather
+    /// than error because the submit matcher drains walks on every submit
+    /// with `Local` decls.
     async fn walk_entity_classes<'b>(
         &'b mut self,
         stream: &'b EntityStream<'b>,
@@ -403,9 +405,12 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
                 read::keyed_class_page(conn, bound, key, referenced_entity, after, limit).await
             }
             EntityStream::All => read::all_class_page(conn, bound, after, limit).await,
-            EntityStream::InBbox(_)
-            | EntityStream::InTimeRange(_)
-            | EntityStream::InBboxAndTimeRange { .. } => Ok(empty_class_page()),
+            EntityStream::InViewport(viewport) => {
+                read::spatial_entity_page(conn, bound, viewport, after, limit).await
+            }
+            EntityStream::InTimeRange(_) | EntityStream::InViewportAndTimeRange { .. } => {
+                Ok(empty_class_page())
+            }
         }
     }
 
@@ -468,8 +473,8 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
         read::equiv_class(self.conn.conn(), self.bound, *member).await
     }
 
-    /// The spatial and temporal streams answer empty pages for the same
-    /// reason as `walk_entity_classes`'s.
+    /// The temporal streams answer empty pages for the same reason as
+    /// `walk_entity_classes`'s.
     async fn walk_image_classes<'b>(
         &'b mut self,
         stream: &'b ImageStream<'b>,
@@ -484,9 +489,12 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
                 read::keyed_class_page(conn, bound, key, sourced_image, after, limit).await
             }
             ImageStream::All => read::all_class_page(conn, bound, after, limit).await,
-            ImageStream::InBbox(_)
-            | ImageStream::InTimeRange(_)
-            | ImageStream::InBboxAndTimeRange { .. } => Ok(empty_class_page()),
+            ImageStream::InViewport(viewport) => {
+                read::spatial_image_page(conn, bound, viewport, after, limit).await
+            }
+            ImageStream::InTimeRange(_) | ImageStream::InViewportAndTimeRange { .. } => {
+                Ok(empty_class_page())
+            }
         }
     }
 
@@ -585,6 +593,9 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         let conn = self.conn.conn();
         let facets = facet_columns(&fact)?;
         let subjects = subject_rows(&fact);
+        let spatial = fact
+            .located_subject()
+            .map(|(location, subject)| (location.bounding_rects(), kind_tag(subject.kind())));
         let fact_json = fact_to_json(fact)?;
         // A RetractCommit facet stores the target's surrogate seq; an
         // unrecorded target resolves NULL, and the validator rejects the
@@ -609,6 +620,7 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
             .bind(facets.edge_kind)
             .bind(facets.edge_a)
             .bind(facets.edge_b)
+            .bind(facets.event_owner)
             .bind(facets.retracts_fact_id)
             .bind(retracts_commit_seq)
             .execute(&mut *conn)
@@ -624,6 +636,20 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
                 .execute(&mut *conn)
                 .await
                 .map_err(sql("inserting fact subject row"))?;
+        }
+        if let Some((rects, subject_kind)) = &spatial {
+            for rect in rects {
+                sqlx::query(queries::INSERT_SPATIAL.sql)
+                    .bind(rect.min_lat)
+                    .bind(rect.max_lat)
+                    .bind(rect.min_lon)
+                    .bind(rect.max_lon)
+                    .bind(fid_raw)
+                    .bind(subject_kind)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(sql("inserting spatial rect row"))?;
+            }
         }
         // Representative-log maintenance runs on the same connection as the
         // staging, so a rejected submit's savepoint unwinds its rep rows

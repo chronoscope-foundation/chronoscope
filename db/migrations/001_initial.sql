@@ -225,6 +225,11 @@ CREATE TABLE facts (
     edge_kind TEXT CHECK (edge_kind IN ('entity', 'event', 'image')),
     edge_a INTEGER, edge_b INTEGER,
 
+    -- a HasEvent fact's owning entity: the spatial walk's event→entity hop
+    -- reads owners off this facet (via the fact_subjects probe on the event)
+    -- without decoding fact_json
+    event_owner INTEGER,
+
     -- retraction targets (RetractFact / SupersedeFact / RetractCommit)
     retracts_fact_id INTEGER, retracts_commit_seq INTEGER
 );
@@ -274,10 +279,23 @@ CREATE INDEX idx_subject_reps_rep ON subject_reps(kind, rep, as_of);
 
 -- SpatiaLite indexes only geometry MBRs, and polygonizing an uncertainty
 -- circle would invent precision. Honest lat/lon/radius columns plus a plain
--- rtree over the geodesic MBR, refined by the shared containment predicate;
--- keyed by fact_id.
+-- rtree over the geodesic covering rects, refined by the shared region
+-- predicate in core.
+--
+-- One row per covering rect of the fact's location (Location::bounding_rects):
+-- a region crossing the ±180° seam stores its two split halves, so stored
+-- longitude intervals never wrap and a query is a plain range test. The rtree
+-- id is a throwaway surrogate (rtree enforces id uniqueness, so rect rows of
+-- one fact can't share it); fact_id and the located subject's kind ride in
+-- the auxiliary columns — subject_kind lets each InViewport stream fetch
+-- only its own kinds. Rows are INSERT-only like every fact table — a
+-- rejected submit's savepoint unwinds them with the staging. The rtree
+-- stores 32-bit floats rounded outward, which only widens the
+-- over-approximation.
 CREATE VIRTUAL TABLE facts_spatial USING rtree(
     id,
     min_lat, max_lat,
-    min_lon, max_lon
+    min_lon, max_lon,
+    +fact_id,
+    +subject_kind
 );

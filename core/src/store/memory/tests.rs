@@ -15,7 +15,7 @@ use crate::store::SubmitCommitError;
 use crate::store::conformance::fixtures::{
     PAGE_100, commit_name, commit_result, commit_retract, construction_at,
     construction_location_in, fixed_time, has_event_fact, local_bundle, moved_kind, moved_to,
-    name_fact, same_entity_fact, sample_bbox, submit_batch, user_author,
+    name_fact, same_entity_fact, sample_viewport, submit_batch, user_author,
 };
 use crate::store::conformance::{TestResult, UnmintedIds};
 use crate::submit::{Commit as SubmitBundle, Decl, EntityIdx, SubmitError, commit_facts};
@@ -549,7 +549,7 @@ mod props {
     }
 }
 
-// --- entity listing (summaries_in_bbox) ---
+// --- entity listing (summaries_in_viewport) ---
 
 /// `extract_point` reads a resolved circle's center and declines a symbolic
 /// reference — the placeability test the listing filters on.
@@ -612,7 +612,7 @@ async fn extract_point_reads_resolved_circle_and_skips_reference() -> TestResult
 /// A located entity surfaces at its point; a `Reference`-only entity, with no
 /// resolvable circle, never enters the viewport.
 #[tokio::test]
-async fn summaries_in_bbox_surfaces_located_excludes_reference() -> TestResult {
+async fn summaries_in_viewport_surfaces_located_excludes_reference() -> TestResult {
     let store = MemoryFactStore::new();
     let inside = (40.5, -73.5);
     let a = commit_result(
@@ -634,11 +634,12 @@ async fn summaries_in_bbox_surfaces_located_excludes_reference() -> TestResult {
     .await?;
     let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id;
 
-    let bbox = sample_bbox()?;
+    let viewport = sample_viewport()?;
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, PAGE_100)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let page =
+        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
 
     let ids: std::collections::BTreeSet<MemoryEntityId> =
         page.summaries.iter().map(|s| s.id).collect();
@@ -664,7 +665,7 @@ async fn summaries_in_bbox_surfaces_located_excludes_reference() -> TestResult {
 /// An entity built outside the box but moved into it lists at its current
 /// (moved-to) marker, not its construction site.
 #[tokio::test]
-async fn summaries_in_bbox_surfaces_moved_in_entity_at_current_marker() -> TestResult {
+async fn summaries_in_viewport_surfaces_moved_in_entity_at_current_marker() -> TestResult {
     let store = MemoryFactStore::new();
     let outside = (10.0, 10.0);
     let inside = (40.5, -73.5);
@@ -685,11 +686,12 @@ async fn summaries_in_bbox_surfaces_moved_in_entity_at_current_marker() -> TestR
     .await?;
     let moved_id = moved.entities.get(&EntityIdx(0)).ok_or("missing moved")?.id;
 
-    let bbox = sample_bbox()?;
+    let viewport = sample_viewport()?;
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, PAGE_100)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let page =
+        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
 
     let summary = page
         .summaries
@@ -709,7 +711,7 @@ async fn summaries_in_bbox_surfaces_moved_in_entity_at_current_marker() -> TestR
 /// current marker is now outside, so a listed pin would fall out of view. The
 /// mirror of the built-outside/moved-in case.
 #[tokio::test]
-async fn summaries_in_bbox_excludes_built_in_moved_out_entity() -> TestResult {
+async fn summaries_in_viewport_excludes_built_in_moved_out_entity() -> TestResult {
     let store = MemoryFactStore::new();
     let inside = (40.5, -73.5);
     let outside = (10.0, 10.0);
@@ -730,11 +732,12 @@ async fn summaries_in_bbox_excludes_built_in_moved_out_entity() -> TestResult {
     .await?;
     let moved_id = moved.entities.get(&EntityIdx(0)).ok_or("missing moved")?.id;
 
-    let bbox = sample_bbox()?;
+    let viewport = sample_viewport()?;
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, PAGE_100)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let page =
+        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
 
     assert!(
         page.summaries.iter().all(|s| s.id != moved_id),
@@ -748,7 +751,7 @@ async fn summaries_in_bbox_excludes_built_in_moved_out_entity() -> TestResult {
 /// With `limit` below the in-box count, the first page carries a resume cursor;
 /// replaying it yields the rest, each entity exactly once with no overlap.
 #[tokio::test]
-async fn summaries_in_bbox_paginates_each_entity_once() -> TestResult {
+async fn summaries_in_viewport_paginates_each_entity_once() -> TestResult {
     let store = MemoryFactStore::new();
     let points = [(40.2, -73.8), (40.5, -73.5), (40.8, -73.2)];
     for (i, (lat, lon)) in points.into_iter().enumerate() {
@@ -765,21 +768,26 @@ async fn summaries_in_bbox_paginates_each_entity_once() -> TestResult {
         .await?;
     }
 
-    let bbox = sample_bbox()?;
+    let viewport = sample_viewport()?;
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let limit = std::num::NonZeroUsize::new(2).ok_or("nonzero limit")?;
 
-    let page1 = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, limit)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let page1 =
+        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, limit)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
     let cursor = page1
         .next
         .clone()
         .ok_or("limit below the count, so the first page carries a cursor")?;
-    let page2 =
-        listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, Some(cursor), limit)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+    let page2 = listing::summaries_in_viewport::<MemoryFactStore, _>(
+        &mut view,
+        &viewport,
+        Some(cursor),
+        limit,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
 
     let mut all: Vec<MemoryEntityId> = page1.summaries.iter().map(|s| s.id).collect();
     all.extend(page2.summaries.iter().map(|s| s.id));
@@ -800,7 +808,7 @@ async fn summaries_in_bbox_paginates_each_entity_once() -> TestResult {
 /// A view pinned before a later commit never sees it: the walk reads the exact
 /// snapshot the view was opened on, so a write that lands after is invisible.
 #[tokio::test]
-async fn summaries_in_bbox_pins_snapshot() -> TestResult {
+async fn summaries_in_viewport_pins_snapshot() -> TestResult {
     let store = MemoryFactStore::new();
     commit_result(
         &store,
@@ -820,10 +828,11 @@ async fn summaries_in_bbox_pins_snapshot() -> TestResult {
     )
     .await?;
 
-    let bbox = sample_bbox()?;
-    let page = listing::summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, PAGE_100)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let viewport = sample_viewport()?;
+    let page =
+        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
     assert_eq!(
         page.summaries.len(),
         1,

@@ -5,7 +5,9 @@
 //! up.
 //!
 //! - [`GeoPoint`] is a validated 2D `(lat, lon)` point in WGS-84 degrees.
-//! - [`Bbox`] is an axis-aligned bounding box built from two [`GeoPoint`]s.
+//! - [`Viewport`] is a map viewport built from two [`GeoPoint`] corners, with
+//!   a wrap convention for antimeridian-crossing spans; [`IndexRect`] is its
+//!   non-wrapping half, the shape spatial-index rows store.
 //! - [`Meters`] is a meter-valued scalar — a distance or radius on the sphere.
 //! - [`SpherePoint`] / [`SphereCap`] are the compute-side spherical primitives:
 //!   a point and a spherical cap (geodesic disk) on the unit sphere, with exact
@@ -156,25 +158,26 @@ impl std::fmt::Display for GeoPointError {
 impl std::error::Error for GeoPointError {}
 
 // ============================================================================
-// Bbox
+// Viewport
 // ============================================================================
 
-/// A bounding box for spatial queries, built from a southwest and a
+/// A map viewport for spatial queries, built from a southwest and a
 /// northeast [`GeoPoint`].
 ///
 /// Latitude is a plain interval `[sw.lat(), ne.lat()]`. Longitude follows the
 /// viewport wrap convention: when `sw.lon() <= ne.lon()` the box spans the
 /// interval `[sw.lon(), ne.lon()]`; when `sw.lon() > ne.lon()` the box wraps
 /// across the ±180° antimeridian, covering `[sw.lon(), 180]` together with
-/// `[-180, ne.lon()]`. [`Bbox::contains`] is the single membership test that
-/// honors the wrap, so spatial queries read it rather than the raw corners.
+/// `[-180, ne.lon()]`. [`Viewport::halves`] is the single interpretation of
+/// the wrap, so spatial code reads the non-wrapping halves rather than the
+/// raw corners.
 ///
-/// [`Bbox::new`] enforces latitude ordering so a transposed corner pair is
+/// [`Viewport::new`] enforces latitude ordering so a transposed corner pair is
 /// caught at construction. Coordinate range and finiteness are already
 /// enforced by [`GeoPoint::new`], so corner construction is the only place
 /// those validations live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Bbox {
+pub struct Viewport {
     /// Southwest corner: the minimum latitude and the western longitude edge
     /// (numerically the greater value on an antimeridian-wrapping box).
     sw: GeoPoint,
@@ -182,20 +185,20 @@ pub struct Bbox {
     ne: GeoPoint,
 }
 
-/// Errors from [`Bbox::new`].
+/// Errors from [`Viewport::new`].
 ///
 /// Only latitude can be checked for corner transposition. Latitude has no wrap,
 /// so `sw.lat() > ne.lat()` is a *provable* transposed corner pair. Longitude's
 /// `sw.lon() > ne.lon()` is instead the deliberate antimeridian-wrap convention
-/// (see [`Bbox`]), so it can't be canonicalized: reordering the corners would
+/// (see [`Viewport`]), so it can't be canonicalized: reordering the corners would
 /// turn a transposition into a bogus wrap box, silently corrupting the lon axis.
 /// The lat guard is the one transposition symptom we can prove, so we reject it
 /// rather than construct a wrong box.
 #[derive(Debug, Clone, PartialEq)]
-pub enum BboxError {
+pub enum ViewportError {
     /// `sw`'s latitude exceeds `ne`'s — the box is inverted north-to-south.
     /// Longitude ordering is free: `sw.lon() > ne.lon()` denotes an
-    /// antimeridian-wrapping box (see [`Bbox`]).
+    /// antimeridian-wrapping box (see [`Viewport`]).
     LatitudeInverted {
         /// The southwest corner as supplied.
         sw: GeoPoint,
@@ -204,12 +207,12 @@ pub enum BboxError {
     },
 }
 
-impl std::fmt::Display for BboxError {
+impl std::fmt::Display for ViewportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LatitudeInverted { sw, ne } => write!(
                 f,
-                "bbox sw latitude ({}) must be at or below ne latitude ({})",
+                "viewport sw latitude ({}) must be at or below ne latitude ({})",
                 sw.lat(),
                 ne.lat(),
             ),
@@ -217,66 +220,66 @@ impl std::fmt::Display for BboxError {
     }
 }
 
-impl std::error::Error for BboxError {}
+impl std::error::Error for ViewportError {}
 
-/// Errors from [`Bbox::from_coords`]: a corner coordinate out of range or
+/// Errors from [`Viewport::from_coords`]: a corner coordinate out of range or
 /// non-finite (from [`GeoPoint::new`]), or a latitude-inverted corner pair
-/// (from [`Bbox::new`]).
+/// (from [`Viewport::new`]).
 #[derive(Debug, Clone, PartialEq)]
-pub enum BboxCoordsError {
+pub enum ViewportCoordsError {
     /// The southwest corner's latitude or longitude failed [`GeoPoint::new`].
     Southwest(GeoPointError),
     /// The northeast corner's latitude or longitude failed [`GeoPoint::new`].
     Northeast(GeoPointError),
-    /// The corner pair was latitude-inverted (see [`BboxError`]).
-    Bbox(BboxError),
+    /// The corner pair was latitude-inverted (see [`ViewportError`]).
+    Viewport(ViewportError),
 }
 
-impl std::fmt::Display for BboxCoordsError {
+impl std::fmt::Display for ViewportCoordsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Southwest(e) => write!(f, "southwest bbox corner: {e}"),
-            Self::Northeast(e) => write!(f, "northeast bbox corner: {e}"),
-            Self::Bbox(e) => e.fmt(f),
+            Self::Southwest(e) => write!(f, "southwest viewport corner: {e}"),
+            Self::Northeast(e) => write!(f, "northeast viewport corner: {e}"),
+            Self::Viewport(e) => e.fmt(f),
         }
     }
 }
 
-impl std::error::Error for BboxCoordsError {}
+impl std::error::Error for ViewportCoordsError {}
 
-impl From<BboxError> for BboxCoordsError {
-    fn from(e: BboxError) -> Self {
-        Self::Bbox(e)
+impl From<ViewportError> for ViewportCoordsError {
+    fn from(e: ViewportError) -> Self {
+        Self::Viewport(e)
     }
 }
 
-impl Bbox {
-    /// Construct a bbox from southwest and northeast corners. Rejects an
+impl Viewport {
+    /// Construct a viewport from southwest and northeast corners. Rejects an
     /// inverted latitude span (`sw.lat() > ne.lat()`); a westward longitude
     /// span (`sw.lon() > ne.lon()`) is accepted as an antimeridian wrap (see
-    /// [`Bbox`]). Coordinate range and finiteness validation lives on
+    /// [`Viewport`]). Coordinate range and finiteness validation lives on
     /// [`GeoPoint::new`] — both arguments are already-validated points.
-    pub fn new(sw: GeoPoint, ne: GeoPoint) -> Result<Self, BboxError> {
+    pub fn new(sw: GeoPoint, ne: GeoPoint) -> Result<Self, ViewportError> {
         if sw.lat() > ne.lat() {
-            return Err(BboxError::LatitudeInverted { sw, ne });
+            return Err(ViewportError::LatitudeInverted { sw, ne });
         }
         Ok(Self { sw, ne })
     }
 
-    /// Construct a bbox from flat `(min_lat, max_lat, min_lon, max_lon)`
+    /// Construct a viewport from flat `(min_lat, max_lat, min_lon, max_lon)`
     /// coordinates — the shape a map-viewport query arrives in. The `min_*`
     /// pair becomes the southwest corner, `max_*` the northeast; a westward
     /// longitude span (`min_lon > max_lon`) is the antimeridian-wrap
-    /// convention (see [`Bbox`]). Per-corner range/finiteness comes from
-    /// [`GeoPoint::new`], latitude ordering from [`Bbox::new`].
+    /// convention (see [`Viewport`]). Per-corner range/finiteness comes from
+    /// [`GeoPoint::new`], latitude ordering from [`Viewport::new`].
     pub fn from_coords(
         min_lat: f64,
         max_lat: f64,
         min_lon: f64,
         max_lon: f64,
-    ) -> Result<Self, BboxCoordsError> {
-        let sw = GeoPoint::new(min_lat, min_lon).map_err(BboxCoordsError::Southwest)?;
-        let ne = GeoPoint::new(max_lat, max_lon).map_err(BboxCoordsError::Northeast)?;
+    ) -> Result<Self, ViewportCoordsError> {
+        let sw = GeoPoint::new(min_lat, min_lon).map_err(ViewportCoordsError::Southwest)?;
+        let ne = GeoPoint::new(max_lat, max_lon).map_err(ViewportCoordsError::Northeast)?;
         Ok(Self::new(sw, ne)?)
     }
 
@@ -311,22 +314,253 @@ impl Bbox {
         self.ne.lon()
     }
 
-    /// Whether `p` lies within the box, inclusive on every edge.
-    ///
-    /// Latitude is a plain interval test. Longitude honors the wrap
-    /// convention: a normal box (`sw.lon() <= ne.lon()`) tests the interval
-    /// `[sw.lon(), ne.lon()]`; a wrapped box (`sw.lon() > ne.lon()`) admits a
-    /// point at or east of `sw.lon()` or at or west of `ne.lon()`, the two
-    /// arcs meeting across the ±180° seam.
-    pub fn contains(&self, p: &GeoPoint) -> bool {
-        let lat_in = self.sw.lat() <= p.lat() && p.lat() <= self.ne.lat();
-        let (min_lon, max_lon) = (self.sw.lon(), self.ne.lon());
-        let lon_in = if min_lon <= max_lon {
-            min_lon <= p.lon() && p.lon() <= max_lon
+    /// The one or two non-wrapping [`IndexRect`]s this viewport covers —
+    /// the single place the wrap convention is interpreted. A normal box is
+    /// its own rect; a westward span splits at the seam into `[min_lon, 180]`
+    /// and `[-180, max_lon]`. Everything downstream — point membership, the
+    /// nearest-point distance, the spatial index's query ranges, the
+    /// index-soundness tests — consumes the halves, so no other code reads
+    /// the wrap.
+    pub fn halves(&self) -> ViewportHalves {
+        let (min_lat, max_lat) = (self.sw.lat(), self.ne.lat());
+        if self.sw.lon() <= self.ne.lon() {
+            ViewportHalves {
+                first: IndexRect {
+                    min_lat,
+                    max_lat,
+                    min_lon: self.sw.lon(),
+                    max_lon: self.ne.lon(),
+                },
+                second: None,
+            }
         } else {
-            p.lon() >= min_lon || p.lon() <= max_lon
-        };
-        lat_in && lon_in
+            ViewportHalves {
+                first: IndexRect {
+                    min_lat,
+                    max_lat,
+                    min_lon: self.sw.lon(),
+                    max_lon: 180.0,
+                },
+                second: Some(IndexRect {
+                    min_lat,
+                    max_lat,
+                    min_lon: -180.0,
+                    max_lon: self.ne.lon(),
+                }),
+            }
+        }
+    }
+
+    /// Whether `p` lies within the box, inclusive on every edge — some
+    /// [half](Self::halves) holds it.
+    pub fn contains(&self, p: &GeoPoint) -> bool {
+        self.halves()
+            .into_iter()
+            .any(|half| half.contains_point(p.lat(), p.lon()))
+    }
+
+    /// Great-circle distance from `p` to the nearest point of the box, zero
+    /// when the box contains it. The halves share the seam edge, so the
+    /// distance to their union is the minimum over the halves.
+    pub(crate) fn geodesic_distance_to(&self, p: &GeoPoint) -> Meters {
+        let mut best = f64::INFINITY;
+        for half in self.halves() {
+            best = best.min(half.geodesic_distance_to(p).0);
+        }
+        Meters(best)
+    }
+}
+
+/// The non-wrapping halves of a [`Viewport`] — one rect, or two for a
+/// seam-crossing span. A stack pair rather than a `Vec`: membership and
+/// distance re-derive the halves per test, so the split must cost two
+/// comparisons, not an allocation. Iterate it; the pair has no other
+/// surface.
+#[derive(Debug, Clone, Copy)]
+pub struct ViewportHalves {
+    first: IndexRect,
+    second: Option<IndexRect>,
+}
+
+impl IntoIterator for ViewportHalves {
+    type Item = IndexRect;
+    type IntoIter = std::iter::Chain<std::iter::Once<IndexRect>, std::option::IntoIter<IndexRect>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self.first).chain(self.second)
+    }
+}
+
+/// The circular gap between two longitudes, in degrees `[0, 180]`.
+fn lon_gap(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs() % 360.0;
+    d.min(360.0 - d)
+}
+
+// ============================================================================
+// IndexRect
+// ============================================================================
+
+/// A plain `min ≤ max` interval box in latitude/longitude — the only shape a
+/// spatial-index dimension can store and compare. [`Viewport`] encodes an
+/// antimeridian crossing as a westward span (`min_lon > max_lon` is
+/// meaningful); stored raw, that convention reads as an empty interval
+/// matching nothing. Keeping the index-row shape a separate type forces
+/// every region and viewport through the seam split ([`Viewport::halves`], the
+/// split rects of [`cap_bounding_rects`]) before it can touch the index — a
+/// wrapping span can't silently become an unmatchable row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexRect {
+    pub min_lat: f64,
+    pub max_lat: f64,
+    pub min_lon: f64,
+    pub max_lon: f64,
+}
+
+impl IndexRect {
+    /// Whether this rect meets an axis-aligned query window, edge-inclusive —
+    /// the interval test the sqlite rtree query performs, mirrored here so
+    /// core's tests can pin the index-soundness invariant the SQL relies on.
+    #[cfg(test)]
+    pub(crate) fn intersects(
+        &self,
+        min_lat: f64,
+        max_lat: f64,
+        min_lon: f64,
+        max_lon: f64,
+    ) -> bool {
+        self.min_lat <= max_lat
+            && self.max_lat >= min_lat
+            && self.min_lon <= max_lon
+            && self.max_lon >= min_lon
+    }
+
+    /// Whether the rect holds `(lat, lon)`, inclusive on every edge — plain
+    /// intervals on both axes, the no-wrap guarantee at work.
+    fn contains_point(&self, lat: f64, lon: f64) -> bool {
+        self.min_lat <= lat && lat <= self.max_lat && self.min_lon <= lon && lon <= self.max_lon
+    }
+
+    /// The in-interval longitude circularly nearest to `lon`: `lon` itself
+    /// when inside, otherwise the circularly closer edge — a rect against
+    /// the seam can be nearer the short way round it.
+    fn nearest_lon(&self, lon: f64) -> f64 {
+        if self.min_lon <= lon && lon <= self.max_lon {
+            return lon;
+        }
+        if lon_gap(lon, self.min_lon) <= lon_gap(lon, self.max_lon) {
+            self.min_lon
+        } else {
+            self.max_lon
+        }
+    }
+
+    /// Great-circle distance from `p` to the nearest point of the rect, zero
+    /// inside. Exact on the sphere — no projection, so the seam and the
+    /// poles need no special cases beyond the circular nearest-longitude
+    /// clamp.
+    ///
+    /// The nearest boundary point lies on one of the four edges. Along the
+    /// north/south edges (fixed latitude) the distance is monotone in the
+    /// longitude gap, so the circularly-nearest in-interval longitude is
+    /// that edge's nearest point. Along the west/east edges (fixed
+    /// longitude) the point-to-point cosine is `A·sin φ + B·cos φ` in the
+    /// edge latitude `φ`; its interior stationary point sits at
+    /// `atan2(A, B)`, and the segment maximum is there or at an endpoint, so
+    /// those three candidates cover every case.
+    fn geodesic_distance_to(&self, p: &GeoPoint) -> Meters {
+        if self.contains_point(p.lat(), p.lon()) {
+            return Meters(0.0);
+        }
+        let target: SpherePoint = (*p).into();
+        let mut best = f64::INFINITY;
+        let lon = self.nearest_lon(p.lon());
+        for lat in [self.min_lat, self.max_lat] {
+            best = best.min(target.distance(&sphere_point_from_degrees(lat, lon)).0);
+        }
+        let a = p.lat().to_radians().sin();
+        for lon in [self.min_lon, self.max_lon] {
+            let b = p.lat().to_radians().cos() * (p.lon() - lon).to_radians().cos();
+            let stationary = a.atan2(b).to_degrees();
+            for lat in [
+                stationary.clamp(self.min_lat, self.max_lat),
+                self.min_lat,
+                self.max_lat,
+            ] {
+                best = best.min(target.distance(&sphere_point_from_degrees(lat, lon)).0);
+            }
+        }
+        Meters(best)
+    }
+}
+
+/// The geodesic bounding rects of a spherical cap: latitude padded by the
+/// angular radius, longitude by `asin(sin r / cos φ)` — the exact extremal
+/// longitude of a cap clear of the poles, wider than the naive `r / cos φ`
+/// scaling in just the right amount. A cap reaching either pole spans every
+/// longitude; a longitude span crossing the ±180° seam splits into two rects,
+/// which also keeps a cap centered on the seam findable from both sides.
+pub(crate) fn cap_bounding_rects(center: &GeoPoint, radius: Meters) -> Vec<IndexRect> {
+    // Pad by the cap's effective radius — the distance the rim-inclusive
+    // predicate accepts out to — so the rects and the predicate share one
+    // rim definition.
+    let cap = SphereCap::new((*center).into(), radius);
+    let r_rad = cap.effective_radius().0 / EARTH_RADIUS_M;
+    let r_deg = r_rad.to_degrees();
+    let min_lat = center.lat() - r_deg;
+    let max_lat = center.lat() + r_deg;
+    if max_lat >= 90.0 || min_lat <= -90.0 {
+        return vec![IndexRect {
+            min_lat: min_lat.max(-90.0),
+            max_lat: max_lat.min(90.0),
+            min_lon: -180.0,
+            max_lon: 180.0,
+        }];
+    }
+    // Clear of the poles `sin r < cos φ` holds exactly; `min` absorbs the
+    // last-ulp rounding so `asin` stays in domain.
+    let dlon = (r_rad.sin() / center.lat().to_radians().cos())
+        .min(1.0)
+        .asin()
+        .to_degrees();
+    let (min_lon, max_lon) = (center.lon() - dlon, center.lon() + dlon);
+    if min_lon < -180.0 {
+        vec![
+            IndexRect {
+                min_lat,
+                max_lat,
+                min_lon: min_lon + 360.0,
+                max_lon: 180.0,
+            },
+            IndexRect {
+                min_lat,
+                max_lat,
+                min_lon: -180.0,
+                max_lon,
+            },
+        ]
+    } else if max_lon > 180.0 {
+        vec![
+            IndexRect {
+                min_lat,
+                max_lat,
+                min_lon,
+                max_lon: 180.0,
+            },
+            IndexRect {
+                min_lat,
+                max_lat,
+                min_lon: -180.0,
+                max_lon: max_lon - 360.0,
+            },
+        ]
+    } else {
+        vec![IndexRect {
+            min_lat,
+            max_lat,
+            min_lon,
+            max_lon,
+        }]
     }
 }
 
@@ -366,14 +600,22 @@ pub(crate) struct SpherePoint {
 
 impl From<GeoPoint> for SpherePoint {
     fn from(p: GeoPoint) -> Self {
-        let lat = p.lat().to_radians();
-        let lon = p.lon().to_radians();
-        let cos_lat = lat.cos();
-        Self {
-            x: cos_lat * lon.cos(),
-            y: cos_lat * lon.sin(),
-            z: lat.sin(),
-        }
+        sphere_point_from_degrees(p.lat(), p.lon())
+    }
+}
+
+/// The unit vector of a `(lat, lon)` pair in degrees. Private: the geometry
+/// in this module derives edge points from an already-validated [`Viewport`], so
+/// routing them back through [`GeoPoint::new`] would only add an unreachable
+/// error path.
+fn sphere_point_from_degrees(lat_deg: f64, lon_deg: f64) -> SpherePoint {
+    let lat = lat_deg.to_radians();
+    let lon = lon_deg.to_radians();
+    let cos_lat = lat.cos();
+    SpherePoint {
+        x: cos_lat * lon.cos(),
+        y: cos_lat * lon.sin(),
+        z: lat.sin(),
     }
 }
 
@@ -455,7 +697,23 @@ impl SphereCap {
     /// Whether `p` lies in the cap, inclusive of the rim. The meter tolerance
     /// admits a boundary point that FP rounding pushes a hair outside.
     pub fn covers(&self, p: &SpherePoint) -> bool {
-        self.center.distance(p).0 <= self.radius.0 + self.tol().0
+        self.covers_within(self.center.distance(p))
+    }
+
+    /// The distance the rim-inclusive membership tests accept out to: the
+    /// stored radius plus the tolerance. [`covers_within`](Self::covers_within)
+    /// compares against it and [`cap_bounding_rects`] pads by it — one
+    /// definition, so a tolerance-band acceptance can never fall outside the
+    /// stored rects.
+    fn effective_radius(&self) -> Meters {
+        Meters(self.radius.0 + self.tol().0)
+    }
+
+    /// Whether a point at `distance` from the cap's center lies in the cap —
+    /// [`covers`](Self::covers) with the distance supplied by the caller, for
+    /// geometry (nearest-point-of-a-region tests) that computes it elsewhere.
+    pub(crate) fn covers_within(&self, distance: Meters) -> bool {
+        distance.0 <= self.effective_radius().0
     }
 
     /// Whether this cap contains `other` entirely: the centers' separation plus
@@ -611,24 +869,24 @@ mod tests {
         Ok(())
     }
 
-    // --- Bbox tests ---
+    // --- Viewport tests ---
 
     #[test]
-    fn bbox_accepts_valid() -> TestResult {
+    fn viewport_accepts_valid() -> TestResult {
         let sw = GeoPoint::new(40.0, -74.0)?;
         let ne = GeoPoint::new(41.0, -73.0)?;
-        let b = Bbox::new(sw, ne)?;
+        let b = Viewport::new(sw, ne)?;
         assert_eq!(b.sw(), &sw);
         assert_eq!(b.ne(), &ne);
         Ok(())
     }
 
     #[test]
-    fn bbox_from_coords_maps_corners_and_validates() -> TestResult {
+    fn viewport_from_coords_maps_corners_and_validates() -> TestResult {
         // (min_lat, max_lat, min_lon, max_lon) → sw=(min_lat,min_lon),
         // ne=(max_lat,max_lon). Pins the positional mapping so a swapped
         // lat/lon argument is caught.
-        let b = Bbox::from_coords(40.0, 41.0, -74.0, -73.0)?;
+        let b = Viewport::from_coords(40.0, 41.0, -74.0, -73.0)?;
         assert_eq!(b.sw(), &GeoPoint::new(40.0, -74.0)?);
         assert_eq!(b.ne(), &GeoPoint::new(41.0, -73.0)?);
         assert_eq!(
@@ -637,47 +895,49 @@ mod tests {
         );
         // An out-of-range coordinate is rejected by the corner constructor.
         assert!(matches!(
-            Bbox::from_coords(0.0, 1.0, 0.0, 200.0),
-            Err(BboxCoordsError::Northeast(
+            Viewport::from_coords(0.0, 1.0, 0.0, 200.0),
+            Err(ViewportCoordsError::Northeast(
                 GeoPointError::LongitudeOutOfRange { .. }
             ))
         ));
-        // Inverted latitude is rejected by `Bbox::new`.
+        // Inverted latitude is rejected by `Viewport::new`.
         assert!(matches!(
-            Bbox::from_coords(50.0, 40.0, 0.0, 1.0),
-            Err(BboxCoordsError::Bbox(BboxError::LatitudeInverted { .. }))
+            Viewport::from_coords(50.0, 40.0, 0.0, 1.0),
+            Err(ViewportCoordsError::Viewport(
+                ViewportError::LatitudeInverted { .. }
+            ))
         ));
         Ok(())
     }
 
     #[test]
-    fn bbox_rejects_sw_north_of_ne() -> TestResult {
+    fn viewport_rejects_sw_north_of_ne() -> TestResult {
         // sw.lat (40) > ne.lat (30) — sw is north of ne.
         let sw = GeoPoint::new(40.0, 0.0)?;
         let ne = GeoPoint::new(30.0, 1.0)?;
         assert!(matches!(
-            Bbox::new(sw, ne),
-            Err(BboxError::LatitudeInverted { .. })
+            Viewport::new(sw, ne),
+            Err(ViewportError::LatitudeInverted { .. })
         ));
         Ok(())
     }
 
     #[test]
-    fn bbox_accepts_westward_longitude_as_antimeridian_wrap() -> TestResult {
+    fn viewport_accepts_westward_longitude_as_antimeridian_wrap() -> TestResult {
         // sw.lon (170) > ne.lon (-170): a 20°-wide box straddling the
         // antimeridian, so construction accepts it — the wrap convention, not
         // a transposition.
         let sw = GeoPoint::new(0.0, 170.0)?;
         let ne = GeoPoint::new(1.0, -170.0)?;
-        let b = Bbox::new(sw, ne)?;
+        let b = Viewport::new(sw, ne)?;
         assert_eq!(b.sw(), &sw);
         assert_eq!(b.ne(), &ne);
         Ok(())
     }
 
     #[test]
-    fn bbox_contains_is_edge_inclusive() -> TestResult {
-        let b = Bbox::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(41.0, -73.0)?)?;
+    fn viewport_contains_is_edge_inclusive() -> TestResult {
+        let b = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(41.0, -73.0)?)?;
         assert!(b.contains(&GeoPoint::new(40.5, -73.5)?), "interior point");
         assert!(b.contains(&GeoPoint::new(40.0, -74.0)?), "sw corner is in");
         assert!(b.contains(&GeoPoint::new(41.0, -73.0)?), "ne corner is in");
@@ -690,9 +950,9 @@ mod tests {
     }
 
     #[test]
-    fn bbox_contains_wrapped_box_spans_the_seam() -> TestResult {
+    fn viewport_contains_wrapped_box_spans_the_seam() -> TestResult {
         // A box from 170°E eastward across ±180° to 170°W (a 20° span).
-        let b = Bbox::new(GeoPoint::new(0.0, 170.0)?, GeoPoint::new(10.0, -170.0)?)?;
+        let b = Viewport::new(GeoPoint::new(0.0, 170.0)?, GeoPoint::new(10.0, -170.0)?)?;
         assert!(b.contains(&GeoPoint::new(5.0, 175.0)?), "175°E is inside");
         assert!(b.contains(&GeoPoint::new(5.0, -175.0)?), "175°W is inside");
         assert!(
@@ -917,6 +1177,181 @@ mod tests {
         let a = cap(40.0, -74.0, 80_000.0)?;
         let b = cap(40.0 + 1.8, -74.0, 80_000.0)?; // ~200 km north
         assert!(a.boundary_intersections(&b).is_empty());
+        Ok(())
+    }
+
+    // --- Viewport::geodesic_distance_to ---
+
+    /// lat `[40, 41]`, lon `[-74, -73]` — the spatial fixtures' box.
+    fn sample_box() -> Result<Viewport, Box<dyn std::error::Error>> {
+        Ok(Viewport::new(
+            GeoPoint::new(40.0, -74.0)?,
+            GeoPoint::new(41.0, -73.0)?,
+        )?)
+    }
+
+    #[test]
+    fn viewport_distance_zero_inside_and_on_edges() -> TestResult {
+        let b = sample_box()?;
+        assert_eq!(b.geodesic_distance_to(&GeoPoint::new(40.5, -73.5)?).0, 0.0);
+        assert_eq!(b.geodesic_distance_to(&GeoPoint::new(40.0, -74.0)?).0, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_distance_due_east_hits_the_meridian_edge() -> TestResult {
+        // 0.5° east of the east edge at the box's mid latitude: the nearest
+        // point sits on the lon = -73 edge at ~the same latitude, ≈ 0.5° of
+        // longitude scaled by cos(40.5°) ≈ 42.3 km.
+        let b = sample_box()?;
+        let d = b.geodesic_distance_to(&GeoPoint::new(40.5, -72.5)?).0;
+        let expect = 0.5_f64.to_radians() * EARTH_RADIUS_M * 40.5_f64.to_radians().cos();
+        assert!((d - expect).abs() < 100.0, "got {d}, expected ≈{expect}");
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_distance_due_north_hits_the_parallel_edge() -> TestResult {
+        // 1° north of the north edge, longitude inside the arc: one degree of
+        // meridian arc, ≈ 111.2 km.
+        let b = sample_box()?;
+        let d = b.geodesic_distance_to(&GeoPoint::new(42.0, -73.5)?).0;
+        assert!((d - 111_195.0).abs() < 100.0, "got {d}");
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_distance_to_corner_from_the_diagonal() -> TestResult {
+        // Northeast of the box on both axes: the nearest point is the NE
+        // corner itself.
+        let b = sample_box()?;
+        let p = GeoPoint::new(42.0, -72.0)?;
+        let corner: SpherePoint = GeoPoint::new(41.0, -73.0)?.into();
+        let d = b.geodesic_distance_to(&p).0;
+        let direct = SpherePoint::from(p).distance(&corner).0;
+        assert!((d - direct).abs() < 1.0, "got {d}, corner at {direct}");
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_distance_crosses_the_antimeridian_seam() -> TestResult {
+        // A wrapped box `[170°E .. 170°W]`; a point at 168°E is 2° of
+        // longitude from the west edge, not 358° the long way round.
+        let b = Viewport::new(GeoPoint::new(0.0, 170.0)?, GeoPoint::new(10.0, -170.0)?)?;
+        let d = b.geodesic_distance_to(&GeoPoint::new(5.0, 168.0)?).0;
+        let expect = 2.0_f64.to_radians() * EARTH_RADIUS_M * 5.0_f64.to_radians().cos();
+        assert!((d - expect).abs() < 500.0, "got {d}, expected ≈{expect}");
+        // A point just across the seam is inside.
+        assert_eq!(b.geodesic_distance_to(&GeoPoint::new(5.0, -175.0)?).0, 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_distance_reaches_over_the_pole() -> TestResult {
+        // A box touching the north pole; a point on the far side of the pole
+        // at a distant longitude is ~0.5° (≈ 55.6 km) away through the pole,
+        // not a quarter of the globe around the parallel.
+        let b = Viewport::new(GeoPoint::new(89.0, 0.0)?, GeoPoint::new(90.0, 10.0)?)?;
+        let d = b.geodesic_distance_to(&GeoPoint::new(89.5, 170.0)?).0;
+        let expect = 0.5_f64.to_radians() * EARTH_RADIUS_M;
+        assert!((d - expect).abs() < 500.0, "got {d}, expected ≈{expect}");
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_distance_equatorial_point_far_meridian_edge() -> TestResult {
+        // An equator point 110° of longitude from the box: past 90° of
+        // separation a higher latitude is *closer* on the sphere, so the
+        // nearest point is the (1, 10) corner, not the equatorial one — the
+        // regime where the meridian-edge stationary latitude leaves
+        // `[-90, 90]` and an endpoint must win.
+        let b = Viewport::new(GeoPoint::new(0.0, 0.0)?, GeoPoint::new(1.0, 10.0)?)?;
+        let p = GeoPoint::new(0.0, 120.0)?;
+        let ne_corner: SpherePoint = GeoPoint::new(1.0, 10.0)?.into();
+        let equatorial: SpherePoint = GeoPoint::new(0.0, 10.0)?.into();
+        let d = b.geodesic_distance_to(&p).0;
+        let sp = SpherePoint::from(p);
+        let direct = sp.distance(&ne_corner).0;
+        assert!(
+            direct < sp.distance(&equatorial).0,
+            "past 90° the higher corner is closer"
+        );
+        assert!((d - direct).abs() < 1.0, "got {d}, corner at {direct}");
+        Ok(())
+    }
+
+    // --- cap_bounding_rects ---
+
+    /// The rect set covers a query window iff some rect meets it.
+    fn rects_hit(
+        rects: &[IndexRect],
+        min_lat: f64,
+        max_lat: f64,
+        min_lon: f64,
+        max_lon: f64,
+    ) -> bool {
+        rects
+            .iter()
+            .any(|r| r.intersects(min_lat, max_lat, min_lon, max_lon))
+    }
+
+    #[test]
+    fn cap_rects_mid_latitude_single_rect_padded_by_latitude() -> TestResult {
+        let rects = cap_bounding_rects(&GeoPoint::new(60.0, 10.0)?, Meters(100_000.0));
+        assert_eq!(rects.len(), 1);
+        let r = rects[0];
+        // Expectations use the raw radius; the rects pad by the effective
+        // (tolerance-widened) radius, a shift orders below the 1e-6° bound
+        // here, which still separates the exact formula from the flat 1/cos
+        // scaling (~2e-4° apart at this latitude).
+        let r_deg = (100_000.0 / EARTH_RADIUS_M).to_degrees();
+        assert!((r.min_lat - (60.0 - r_deg)).abs() < 1e-6);
+        assert!((r.max_lat - (60.0 + r_deg)).abs() < 1e-6);
+        // At 60°N the longitude padding is about twice the latitude padding
+        // (1/cos 60° = 2) — assert the exact `asin(sin r / cos φ)`.
+        let want_dlon = ((100_000.0 / EARTH_RADIUS_M).sin() / 60.0_f64.to_radians().cos())
+            .asin()
+            .to_degrees();
+        assert!((r.max_lon - (10.0 + want_dlon)).abs() < 1e-6);
+        assert!(
+            r.max_lon - 10.0 > 2.0 * r_deg * 0.999,
+            "lon pad scales by latitude"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cap_rects_split_at_the_antimeridian() -> TestResult {
+        let rects = cap_bounding_rects(&GeoPoint::new(0.0, 179.5)?, Meters(100_000.0));
+        assert_eq!(rects.len(), 2, "seam-crossing cap covers both sides");
+        // One half ends at 180, the other starts at -180.
+        assert!(
+            rects
+                .iter()
+                .any(|r| r.max_lon == 180.0 && r.min_lon > 178.0)
+        );
+        assert!(
+            rects
+                .iter()
+                .any(|r| r.min_lon == -180.0 && r.max_lon < -179.0)
+        );
+        // Both sides of the seam are findable with plain interval queries.
+        assert!(rects_hit(&rects, -1.0, 1.0, 179.0, 180.0));
+        assert!(rects_hit(&rects, -1.0, 1.0, -180.0, -179.4));
+        assert!(!rects_hit(&rects, -1.0, 1.0, 0.0, 10.0));
+        Ok(())
+    }
+
+    #[test]
+    fn cap_rects_over_the_pole_span_every_longitude() -> TestResult {
+        let rects = cap_bounding_rects(&GeoPoint::new(89.5, 42.0)?, Meters(100_000.0));
+        assert_eq!(rects.len(), 1);
+        let r = rects[0];
+        assert_eq!((r.min_lon, r.max_lon), (-180.0, 180.0));
+        assert_eq!(r.max_lat, 90.0, "clamped at the pole");
+        assert!(r.min_lat < 89.0);
+        // Findable from any longitude near the pole.
+        assert!(rects_hit(&rects, 89.0, 90.0, -170.0, -160.0));
         Ok(())
     }
 }

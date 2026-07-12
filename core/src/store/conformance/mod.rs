@@ -232,7 +232,10 @@ macro_rules! fact_store_conformance {
             empty_bookend_date_rejected,
             disjunctive_judgment_citation_date_rejected,
             disjunctive_meta_citation_date_rejected,
-            walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities,
+            walk_entity_classes_in_viewport_surfaces_located_and_moved_in_entities,
+            walk_entity_classes_in_viewport_surfaces_cap_overlapping_viewport_edge,
+            walk_entity_classes_in_viewport_surfaces_conjunction_with_unresolved_member,
+            walk_image_classes_in_viewport_surfaces_captured_locations,
             class_walk_next_class_cursor_skips_to_the_next_representative,
         }
     };

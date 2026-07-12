@@ -30,21 +30,21 @@ use crate::submit::{
 };
 
 use super::fixtures::{
-    PAGE_100, captured_date_fact, commit_err, commit_name, commit_ok, commit_result,
-    commit_retract, construction_at, construction_location_fact, construction_started_fact,
-    construction_started_in, construction_with_location, damaged_kind, depiction_fact,
-    designated_kind, disjunctive_date, drain_entity_classes, drain_entity_depictions,
-    drain_image_classes, event_damage_cause_fact, event_description_fact,
-    event_durational_date_fact, event_move_method_fact, event_moved_to_location_fact,
-    event_point_date_fact, external_judgment_citation, external_reference_fact, fixed_time,
-    gap_from_event_fact, has_event_fact, image_observation_citation, image_source_fact,
-    local_bundle, map_medium_fact, medium_picture_fact, moved_kind, moved_to, n_circle_location,
-    name_fact, name_window_fact, observation_external_published, observation_feature_fact,
-    retract_commit_fact, retract_fact, same_entity_fact, same_event_fact, sample_bbox,
-    sample_citation, started_with_date, subimage_fact, submit_batch, supersede_fact, user_author,
-    year_date,
+    PAGE_100, captured_date_fact, captured_location_at, commit_err, commit_name, commit_ok,
+    commit_result, commit_retract, construction_at, construction_circle_at,
+    construction_location_fact, construction_started_fact, construction_started_in,
+    construction_with_location, damaged_kind, depiction_fact, designated_kind, disjunctive_date,
+    drain_entity_classes, drain_entity_depictions, drain_image_classes, event_damage_cause_fact,
+    event_description_fact, event_durational_date_fact, event_move_method_fact,
+    event_moved_to_location_fact, event_point_date_fact, external_judgment_citation,
+    external_reference_fact, fixed_time, gap_from_event_fact, has_event_fact,
+    image_observation_citation, image_source_fact, local_bundle, map_medium_fact,
+    medium_picture_fact, moved_kind, moved_to, n_circle_location, name_fact, name_window_fact,
+    observation_external_published, observation_feature_fact, retract_commit_fact, retract_fact,
+    same_entity_fact, same_event_fact, sample_citation, sample_viewport, started_with_date,
+    subimage_fact, submit_batch, supersede_fact, user_author, year_date,
 };
-use super::{TestResult, UnmintedIds};
+use super::{TestError, TestResult, UnmintedIds};
 
 // --- roundtrip & resolution ---
 
@@ -4016,13 +4016,15 @@ pub async fn disjunctive_meta_citation_date_rejected<S: FactStore>(store: S) -> 
     Ok(())
 }
 
-// --- spatial class walk (InBbox) ---
+// --- spatial class walk (InViewport) ---
 
-/// `InBbox` surfaces every entity the box holds — a construction bookend inside
+/// `InViewport` surfaces every entity the box holds — a construction bookend inside
 /// it, or a `MovedToLocation` inside it attributed through its `HasEvent` owner —
 /// and nothing else. An out-of-box construction is excluded, and a move whose
 /// `HasEvent` owner is retracted attributes to no entity.
-pub async fn walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities<S: FactStore>(
+pub async fn walk_entity_classes_in_viewport_surfaces_located_and_moved_in_entities<
+    S: FactStore,
+>(
     store: S,
 ) -> TestResult {
     let inside = (40.5, -73.5);
@@ -4102,8 +4104,8 @@ pub async fn walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities<
         .fact_id;
     commit_retract(&store, has_event_fid, 40).await?;
 
-    let bbox = sample_bbox()?;
-    let stream = EntityStream::InBbox(&bbox);
+    let viewport = sample_viewport()?;
+    let stream = EntityStream::InViewport(&viewport);
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let rows: Vec<ClassRow<EntityIdOf<S>>> =
         drain_entity_classes::<S, _>(&mut view, &stream, PAGE_100)
@@ -4114,9 +4116,184 @@ pub async fn walk_entity_classes_in_bbox_surfaces_located_and_moved_in_entities<
     let want: BTreeSet<EntityIdOf<S>> = [a_id.clone(), c_id.clone()].into_iter().collect();
     assert_eq!(
         reps, want,
-        "InBbox surfaces the in-box construction (a={a_id:?}) and the moved-in entity \
+        "InViewport surfaces the in-box construction (a={a_id:?}) and the moved-in entity \
          (c={c_id:?}); the out-of-box construction (b={b_id:?}) and the orphaned move \
          (d's event={d_event:?}) are excluded; got {rows:?}"
+    );
+    Ok(())
+}
+
+/// A location is a region, not a point: a construction circle whose center
+/// sits outside the viewport but whose radius reaches across its edge is
+/// surfaced by `InViewport`, while an equal-radius circle that falls short is
+/// not. Kills a center-only point-in-box check.
+pub async fn walk_entity_classes_in_viewport_surfaces_cap_overlapping_viewport_edge<
+    S: FactStore,
+>(
+    store: S,
+) -> TestResult {
+    // The viewport is lat [40, 41], lon [-74, -73]. Both centers sit east of
+    // it at mid latitude: ~11 km out (within a 20 km radius) and ~84 km out
+    // (well past it).
+    let overlapping = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![construction_circle_at(0, 40.5, -72.9, 20_000.0)?],
+        )?,
+    )
+    .await?;
+    let overlapping_id = overlapping
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing overlapping entity")?
+        .id
+        .clone();
+    commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![construction_circle_at(0, 40.5, -72.0, 20_000.0)?],
+        )?,
+    )
+    .await?;
+
+    let viewport = sample_viewport()?;
+    let stream = EntityStream::InViewport(&viewport);
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<EntityIdOf<S>>> =
+        drain_entity_classes::<S, _>(&mut view, &stream, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+    let reps: BTreeSet<EntityIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+    let want: BTreeSet<EntityIdOf<S>> = [overlapping_id.clone()].into_iter().collect();
+    assert_eq!(
+        reps, want,
+        "the edge-overlapping circle (center outside, {overlapping_id:?}) is surfaced and \
+         the out-of-reach circle is not; got {rows:?}"
+    );
+    Ok(())
+}
+
+/// The image `InViewport` stream surfaces images whose capture location meets the
+/// viewport — a point inside it, or a circle overlapping its edge from
+/// outside — and excludes a capture location clear of it.
+pub async fn walk_image_classes_in_viewport_surfaces_captured_locations<S: FactStore>(
+    store: S,
+) -> TestResult {
+    // A: captured inside the viewport.
+    let a = commit_result(
+        &store,
+        local_bundle(0, 0, 1, 0, vec![captured_location_at(0, 40.5, -73.5, 0.0)?])?,
+    )
+    .await?;
+    let a_id = a.images.get(&ImageIdx(0)).ok_or("missing a")?.id.clone();
+
+    // B: captured well outside.
+    commit_result(
+        &store,
+        local_bundle(0, 0, 1, 10, vec![captured_location_at(0, 10.0, 10.0, 0.0)?])?,
+    )
+    .await?;
+
+    // C: capture circle centered outside the east edge, radius reaching in.
+    let c = commit_result(
+        &store,
+        local_bundle(
+            0,
+            0,
+            1,
+            20,
+            vec![captured_location_at(0, 40.5, -72.9, 20_000.0)?],
+        )?,
+    )
+    .await?;
+    let c_id = c.images.get(&ImageIdx(0)).ok_or("missing c")?.id.clone();
+
+    let viewport = sample_viewport()?;
+    let stream = ImageStream::InViewport(&viewport);
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<ImageIdOf<S>>> =
+        drain_image_classes::<S, _>(&mut view, &stream, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+    let reps: BTreeSet<ImageIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+    let want: BTreeSet<ImageIdOf<S>> = [a_id.clone(), c_id.clone()].into_iter().collect();
+    assert_eq!(
+        reps, want,
+        "image InViewport surfaces the in-box capture (a={a_id:?}) and the edge-overlapping \
+         capture circle (c={c_id:?}), excluding the far one; got {rows:?}"
+    );
+    Ok(())
+}
+
+/// A partially-resolved conjunction still carries spatial evidence: an entity
+/// located `AllOf(Reference, circle inside the viewport)` is surfaced — the
+/// unresolved member removes nothing from the intersection — while the same
+/// shape with its circle far away is excluded on that circle's evidence.
+pub async fn walk_entity_classes_in_viewport_surfaces_conjunction_with_unresolved_member<
+    S: FactStore,
+>(
+    store: S,
+) -> TestResult {
+    let conjunction_at = |lat: f64, lon: f64| -> Result<UnresolvedLocation, TestError> {
+        Ok(UnresolvedLocation::all_of(vec![
+            UnresolvedLocation::Reference(LocationReference::NamedPlace {
+                name: "lot 12".to_owned(),
+            }),
+            UnresolvedLocation::Resolved(Location::circle(GeoPoint::new(lat, lon)?, Meters(10.0))?),
+        ])?)
+    };
+
+    // A: reference + circle inside the viewport.
+    let a = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![construction_with_location(0, conjunction_at(40.5, -73.5)?)?],
+        )?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+
+    // B: reference + circle far away.
+    commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            10,
+            vec![construction_with_location(0, conjunction_at(10.0, 10.0)?)?],
+        )?,
+    )
+    .await?;
+
+    let viewport = sample_viewport()?;
+    let stream = EntityStream::InViewport(&viewport);
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<EntityIdOf<S>>> =
+        drain_entity_classes::<S, _>(&mut view, &stream, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+    let reps: BTreeSet<EntityIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+    let want: BTreeSet<EntityIdOf<S>> = [a_id.clone()].into_iter().collect();
+    assert_eq!(
+        reps, want,
+        "the conjunction with an in-viewport circle ({a_id:?}) is surfaced despite its \
+         unresolved member, and the far conjunction is not; got {rows:?}"
     );
     Ok(())
 }

@@ -470,19 +470,20 @@ async fn load_entities_for_viewport(
     signals.set_fetch_error.set(None);
     signals.set_map_error.set(None);
 
-    let bbox = match chronoscope_core::geo::Bbox::from_coords(min_lat, max_lat, min_lon, max_lon) {
-        Ok(b) => b,
-        Err(e) => {
-            signals.set_loading.set(false);
-            signals
-                .set_fetch_error
-                .set(Some(format!("Invalid viewport bounds: {e}")));
-            return;
-        }
-    };
+    let viewport =
+        match chronoscope_core::geo::Viewport::from_coords(min_lat, max_lat, min_lon, max_lon) {
+            Ok(v) => v,
+            Err(e) => {
+                signals.set_loading.set(false);
+                signals
+                    .set_fetch_error
+                    .set(Some(format!("Invalid viewport bounds: {e}")));
+                return;
+            }
+        };
 
     // Single call to /markers — the server decides granularity.
-    let result = client.list_markers(&bbox).await;
+    let result = client.list_markers(&viewport).await;
 
     match result {
         Ok(response) => {

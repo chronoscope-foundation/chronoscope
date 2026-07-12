@@ -3,7 +3,7 @@
 //!
 //! A viewport lists placeable entities — each class projected once, kept only
 //! when it resolves to a point on the map. The walk side
-//! ([`EntityView::walk_entity_classes`] over [`EntityStream::InBbox`]) does the
+//! ([`EntityView::walk_entity_classes`] over [`EntityStream::InViewport`]) does the
 //! spatial index and equivalence grouping; this layer turns each representative
 //! into an [`EntitySummary`] and threads a snapshot-pinned cursor so a scroll
 //! resumes exactly where it stopped.
@@ -19,7 +19,7 @@ use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::geo::{Bbox, GeoPoint};
+use crate::geo::{GeoPoint, Viewport};
 use crate::grammar::depiction::Perspective;
 use crate::grammar::ids::FactId;
 use crate::projection::{
@@ -102,10 +102,10 @@ pub struct EntitySummary<EntId, ImgId> {
     pub thumbnail: Option<ImgId>,
 }
 
-/// A resume token for [`summaries_in_bbox`]: the snapshot it was minted against
-/// and the walk cursor to continue past. The snapshot lets a resume re-open the
-/// exact past view the first page read, so the walk continues over one stable
-/// snapshot and never sees writes that landed after it started.
+/// A resume token for [`summaries_in_viewport`]: the snapshot it was minted
+/// against and the walk cursor to continue past. The snapshot lets a resume
+/// re-open the exact past view the first page read, so the walk continues over
+/// one stable snapshot and never sees writes that landed after it started.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ListCursor<Cur> {
     pub snapshot: FactId,
@@ -129,13 +129,13 @@ pub enum ListError<E> {
     Backend(E),
 }
 
-/// List the entities whose current marker falls in `bbox`, at the view's
+/// List the entities whose current marker falls in `viewport`, at the view's
 /// snapshot, resuming past `cursor`.
 ///
 /// The spatial walk surfaces a representative by any of its historical in-box
 /// locations, so a built-then-moved-out entity arrives here with a marker
 /// ([`extract_point`], its current location) outside the box. Each is projected
-/// once and kept only when that current marker resolves and lands in `bbox`, so
+/// once and kept only when that current marker resolves and lands in `viewport`, so
 /// every listed pin sits in-view; an entity dropped this way never consumes a
 /// `limit` slot. The walk pages by representative, so `limit` doubles as the page
 /// size: the result holds at least `limit` summaries (or every one the viewport
@@ -145,9 +145,9 @@ pub enum ListError<E> {
 /// the view at the `cursor`'s snapshot, so the walk continues over the same
 /// pinned state the first page read. The `next` cursor carries that snapshot
 /// forward. A fresh listing passes `None`.
-pub async fn summaries_in_bbox<S, V>(
+pub async fn summaries_in_viewport<S, V>(
     view: &mut V,
-    bbox: &Bbox,
+    viewport: &Viewport,
     cursor: Option<ListCursor<S::ClassCursor<EntityIdOf<S>>>>,
     limit: NonZeroUsize,
 ) -> Result<
@@ -163,7 +163,7 @@ where
     let mut summaries: Vec<EntitySummary<EntityIdOf<S>, ImageIdOf<S>>> = Vec::new();
 
     let resume = loop {
-        let stream = EntityStream::InBbox(bbox);
+        let stream = EntityStream::InViewport(viewport);
         let page = view
             .walk_entity_classes(&stream, after, limit)
             .await
@@ -190,7 +190,7 @@ where
             };
             let entity = typed::Entity::parse(&projected, &class);
             if let Some(point) = extract_point(&entity)
-                && bbox.contains(&point)
+                && viewport.contains(&point)
             {
                 let (earliest, latest) = timeline_span(entity.timeline.events());
                 // One representative depicted-image id — the raw depiction map

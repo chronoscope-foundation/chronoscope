@@ -1,5 +1,5 @@
 //! Real-entity round trip: ingest the curated Wikidata set into the fact store
-//! and assert the read side — bbox viewport listing over the projection —
+//! and assert the read side — viewport listing over the projection —
 //! reflects it.
 //!
 //! `WIKIDATA_ENTITIES_JSONL` points at the fetched `entities.jsonl` (the
@@ -15,10 +15,10 @@
 
 use chrono::{Datelike, TimeZone, Utc};
 use chronoscope_core::external_ids::WikidataEntityId;
-use chronoscope_core::geo::{Bbox, GeoPoint};
+use chronoscope_core::geo::{GeoPoint, Viewport};
 use chronoscope_core::grammar::ids::IngesterRunId;
 use chronoscope_core::grammar::lifecycle::PointKind;
-use chronoscope_core::listing::{EntitySummary, summaries_in_bbox};
+use chronoscope_core::listing::{EntitySummary, summaries_in_viewport};
 use chronoscope_core::store::FactStore;
 use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
 use chronoscope_core::submit::commit_facts;
@@ -88,14 +88,14 @@ async fn placeable_in(
     ne: (f64, f64),
 ) -> Result<Vec<EntitySummary<MemoryEntityId, MemoryImageId>>, BoxError> {
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let bbox = Bbox::new(GeoPoint::new(sw.0, sw.1)?, GeoPoint::new(ne.0, ne.1)?)?;
+    let viewport = Viewport::new(GeoPoint::new(sw.0, sw.1)?, GeoPoint::new(ne.0, ne.1)?)?;
     let limit = NonZeroUsize::new(64).ok_or("nonzero limit")?;
-    let page = summaries_in_bbox::<MemoryFactStore, _>(&mut view, &bbox, None, limit)
+    let page = summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, limit)
         .await
         .map_err(|e| format!("{e:?}"))?;
     for s in &page.summaries {
         assert!(
-            bbox.contains(&s.point),
+            viewport.contains(&s.point),
             "summary {:?} surfaced outside the query box at {:?}",
             s.id,
             s.point
@@ -188,7 +188,7 @@ async fn every_curated_entity_builds_and_submits() -> Result<(), BoxError> {
 }
 
 #[tokio::test]
-async fn bbox_listing_projects_landmarks_with_their_dates() -> Result<(), BoxError> {
+async fn viewport_listing_projects_landmarks_with_their_dates() -> Result<(), BoxError> {
     let Some(store) = ingest_curated().await? else {
         return Ok(());
     };

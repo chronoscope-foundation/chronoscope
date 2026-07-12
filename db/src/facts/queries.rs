@@ -85,15 +85,20 @@ define_fact_queries! {
             fact_id, fact_json,
             name_norm, name_language, external_ref, source_url,
             date_earliest, date_latest, lat, lon, radius_m,
-            edge_kind, edge_a, edge_b,
+            edge_kind, edge_a, edge_b, event_owner,
             retracts_fact_id, retracts_commit_seq
         ) VALUES ((",
         next_fact_id_expr!(),
         "),
-                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
     "
     ),
     INSERT_SUBJECT: "INSERT INTO fact_subjects (fact_id, kind, subject_id) VALUES (?1, ?2, ?3)",
+
+    // One covering rect of a location-bearing fact (see the migration's
+    // facts_spatial notes: split halves at the ±180° seam, INSERT-only, the
+    // rtree id auto-assigned). ?6 is the located subject's kind tag.
+    INSERT_SPATIAL: "INSERT INTO facts_spatial (min_lat, max_lat, min_lon, max_lon, fact_id, subject_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
 
     // Commit recording: the metadata/result row, then a claim per fact
     // under the new surrogate seq. The seq comes back as the insert's rowid
@@ -263,6 +268,42 @@ define_fact_queries! {
     CLASS_CANDIDATES_BY_SRCURL: "
         SELECT fact_id, fact_json FROM facts
         WHERE source_url = ?1 AND fact_id < ?2
+    ",
+
+    // Spatial-walk candidates: every location-bearing fact with a covering
+    // rect meeting the query window (?1..?4 = the viewport's min_lat,
+    // max_lat, min_lon, max_lon — a non-wrapping window; an
+    // antimeridian-crossing viewport runs this twice, once per half), below
+    // snapshot ?5, placing a subject of kind ?6 or ?7 — the stream's own
+    // kinds, a residual filter on the aux column so the entity walk never
+    // fetches capture locations and vice versa (the one-kind image stream
+    // binds its kind twice). The rtree scan plans as `SCAN facts_spatial
+    // VIRTUAL TABLE INDEX ...`, which the verifier's virtual-table allowance
+    // already accepts — the rtree constraints bound it, so no new exemption.
+    // A seam-split location matches through both rect rows; the caller
+    // dedups by fact id. Exact refinement (the shared region predicate) and
+    // retraction filtering happen in Rust.
+    SPATIAL_CANDIDATES: "
+        SELECT facts_spatial.fact_id, facts.fact_json
+        FROM facts_spatial CROSS JOIN facts ON facts.fact_id = facts_spatial.fact_id
+        WHERE facts_spatial.max_lat >= ?1 AND facts_spatial.min_lat <= ?2
+          AND facts_spatial.max_lon >= ?3 AND facts_spatial.min_lon <= ?4
+          AND facts.fact_id < ?5
+          AND facts_spatial.subject_kind IN (?6, ?7)
+    ",
+
+    // The active-or-retracted HasEvent rows of a batch of events: ?1 is a
+    // JSON array of event ids, ?2 the event kind tag, ?3 the exclusive
+    // snapshot. Each event costs one indexed fact_subjects probe; the owner
+    // comes off the event_owner facet, so nothing decodes fact_json.
+    // Retraction filtering happens in Rust over the batched closure.
+    EVENT_OWNERS: "
+        SELECT fact_subjects.fact_id, fact_subjects.subject_id, facts.event_owner
+        FROM json_each(?1)
+        CROSS JOIN fact_subjects ON fact_subjects.kind = ?2
+            AND fact_subjects.subject_id = json_each.value
+        CROSS JOIN facts ON facts.fact_id = fact_subjects.fact_id
+        WHERE fact_subjects.fact_id < ?3 AND facts.event_owner IS NOT NULL
     ",
 
     // The All-stream class walk: every fact_subjects row of kind ?1 below

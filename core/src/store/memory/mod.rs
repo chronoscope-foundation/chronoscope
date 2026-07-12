@@ -78,8 +78,8 @@ mod equiv;
 mod scan;
 
 use self::scan::{
-    entity_ids_of, entity_in_bbox, entity_named, entity_referenced, image_ids_of,
-    image_sourced_from, same_artifact_edge, same_entity_edge,
+    entity_ids_of, entity_in_viewport, entity_named, entity_referenced, image_captured_in_viewport,
+    image_ids_of, image_sourced_from, same_artifact_edge, same_entity_edge,
 };
 
 // ============================================================================
@@ -1007,7 +1007,7 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
                     core.walk_classes(after, limit, entity_ids_of, same_entity_edge)
                 })
                 .await),
-            EntityStream::InBbox(bbox) => Ok(self
+            EntityStream::InViewport(viewport) => Ok(self
                 .with_core(move |core| {
                     // The event→entity owner map is built once for the walk; the
                     // predicate reads it to attribute a `MovedToLocation` to the
@@ -1016,12 +1016,12 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
                     core.walk_classes(
                         after,
                         limit,
-                        |fact| entity_in_bbox(fact, bbox, &owners),
+                        |fact| entity_in_viewport(fact, viewport, &owners),
                         same_entity_edge,
                     )
                 })
                 .await),
-            EntityStream::InTimeRange(_) | EntityStream::InBboxAndTimeRange { .. } => {
+            EntityStream::InTimeRange(_) | EntityStream::InViewportAndTimeRange { .. } => {
                 Ok(ClassPage {
                     rows: Vec::new(),
                     next: None,
@@ -1149,13 +1149,23 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
                     core.walk_classes(after, limit, image_ids_of, same_artifact_edge)
                 })
                 .await),
-            ImageStream::InBbox(_)
-            | ImageStream::InTimeRange(_)
-            | ImageStream::InBboxAndTimeRange { .. } => Ok(ClassPage {
-                rows: Vec::new(),
-                next: None,
-                next_class: None,
-            }),
+            ImageStream::InViewport(viewport) => Ok(self
+                .with_core(move |core| {
+                    core.walk_classes(
+                        after,
+                        limit,
+                        |fact| image_captured_in_viewport(fact, viewport),
+                        same_artifact_edge,
+                    )
+                })
+                .await),
+            ImageStream::InTimeRange(_) | ImageStream::InViewportAndTimeRange { .. } => {
+                Ok(ClassPage {
+                    rows: Vec::new(),
+                    next: None,
+                    next_class: None,
+                })
+            }
         }
     }
 

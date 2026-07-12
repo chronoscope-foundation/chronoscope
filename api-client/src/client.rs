@@ -14,7 +14,7 @@ use std::pin::Pin;
 use futures_util::FutureExt;
 use futures_util::stream::{self, Stream};
 
-use chronoscope_core::geo::Bbox;
+use chronoscope_core::geo::Viewport;
 
 use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
@@ -135,14 +135,17 @@ impl Client {
 
     /// Fetch map markers for a bounding box. Co-located entities (same point)
     /// collapse into one disambiguation marker.
-    pub async fn list_markers(&self, bbox: &Bbox) -> Result<MarkersResponse<EntityId>, ApiError> {
+    pub async fn list_markers(
+        &self,
+        viewport: &Viewport,
+    ) -> Result<MarkersResponse<EntityId>, ApiError> {
         let url = format!(
             "{}/markers?min_lat={}&max_lat={}&min_lon={}&max_lon={}",
             self.base_url,
-            bbox.min_lat(),
-            bbox.max_lat(),
-            bbox.min_lon(),
-            bbox.max_lon(),
+            viewport.min_lat(),
+            viewport.max_lat(),
+            viewport.min_lon(),
+            viewport.max_lon(),
         );
         self.get_json(&url).await
     }

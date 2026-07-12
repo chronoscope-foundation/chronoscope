@@ -252,6 +252,56 @@ impl<R: IdScheme> StoredFact<R> {
             None
         }
     }
+
+    /// The location a stored fact carries and the subject it places, when it
+    /// is location-bearing: a construction bookend locates its own entity, a
+    /// `MovedToLocation` its event (readers attribute it to the owning entity
+    /// through `HasEvent`), a `CapturedLocation` its image. The one list of
+    /// location-bearing fact kinds — the spatial index's write path and every
+    /// backend's `InViewport` refine step read it here, so the kinds can't drift.
+    pub fn located_subject(
+        &self,
+    ) -> Option<(&crate::location::UnresolvedLocation, LocatedSubject<'_, R>)> {
+        let Self::Factual(StoredFactualFact { assertion, .. }) = self else {
+            return None;
+        };
+        match assertion {
+            FactualAssertion::Construction {
+                fact: crate::grammar::bookend::ConstructionFact::Location { entity, location },
+            } => Some((location, LocatedSubject::Entity(entity))),
+            FactualAssertion::Event {
+                fact: crate::grammar::event::Fact::MovedToLocation { event, location },
+            } => Some((location, LocatedSubject::Event(event))),
+            FactualAssertion::Image {
+                fact: crate::grammar::image::Fact::CapturedLocation { image, location },
+            } => Some((location, LocatedSubject::Image(image))),
+            _ => None,
+        }
+    }
+}
+
+/// The subject a location-bearing fact places somewhere — the companion of
+/// [`StoredFact::located_subject`]. Ids stay in the scheme's own types;
+/// backends map them to their storage representation.
+#[derive(Debug, Clone, Copy)]
+pub enum LocatedSubject<'a, R: IdScheme> {
+    /// A construction bookend locating its entity.
+    Entity(&'a R::Entity),
+    /// A `MovedToLocation` locating its event.
+    Event(&'a R::Event),
+    /// A `CapturedLocation` locating its image.
+    Image(&'a R::Image),
+}
+
+impl<R: IdScheme> LocatedSubject<'_, R> {
+    /// Which subject kind the fact places.
+    pub fn kind(&self) -> crate::grammar::ids::SubjectKind {
+        match self {
+            Self::Entity(_) => crate::grammar::ids::SubjectKind::Entity,
+            Self::Event(_) => crate::grammar::ids::SubjectKind::Event,
+            Self::Image(_) => crate::grammar::ids::SubjectKind::Image,
+        }
+    }
 }
 
 // ============================================================================

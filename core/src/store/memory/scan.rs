@@ -6,16 +6,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use url::Url;
 
 use super::{MemStoredFact, MemoryEntityId, MemoryEventId, MemoryIds, MemoryImageId, ReadCore};
-use crate::geo::Bbox;
+use crate::geo::Viewport;
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::grammar::citations::{ExternalReference, Language};
 use crate::grammar::ids::FactId;
-use crate::grammar::{attribute, bookend, depiction, event, identity, image};
+use crate::grammar::{attribute, depiction, identity, image};
 use crate::store::equiv::EquivAdjacency;
 use crate::store::pagination;
 use crate::store::schema::{ClassPage, DepictionPage, PageItem, normalize_name};
-use crate::submit::StoredFact;
 use crate::submit::result::{StoredFactualFact, StoredJudgmentFact};
+use crate::submit::{LocatedSubject, StoredFact};
 
 // Aliases to keep the spellings short.
 type MemFactualAssertion = FactualAssertion<MemoryIds>;
@@ -162,27 +162,45 @@ pub(super) fn depiction_of_entity(
     }
 }
 
-/// The entity a stored fact places inside `bbox`, if any — the `InBbox` stream
-/// extractor. A construction bookend yields its own entity; a `MovedToLocation`
-/// yields the entity its event's `HasEvent` owns, read from `owners` (see
-/// [`ReadCore::event_entity_map`]). Only a resolved circle carries a point, so a
-/// symbolic or combinator location contributes nothing.
-pub(super) fn entity_in_bbox(
+/// The entity a stored fact places inside `viewport`, if any — the `InViewport` stream
+/// extractor over the shared [`StoredFact::located_subject`] peel. A
+/// construction bookend yields its own entity; a `MovedToLocation` yields the
+/// entity its event's `HasEvent` owns, read from `owners` (see
+/// [`ReadCore::event_entity_map`]). Membership is the shared region predicate
+/// [`UnresolvedLocation::known_geometry_intersects`], so a circle overlapping the
+/// box from outside counts and a symbolic reference never does.
+///
+/// [`UnresolvedLocation::known_geometry_intersects`]: crate::location::UnresolvedLocation::known_geometry_intersects
+pub(super) fn entity_in_viewport(
     fact: &MemStoredFact,
-    bbox: &Bbox,
+    viewport: &Viewport,
     owners: &BTreeMap<MemoryEventId, MemoryEntityId>,
 ) -> Option<MemoryEntityId> {
-    match factual_assertion(fact)? {
-        FactualAssertion::Construction {
-            fact: bookend::ConstructionFact::Location { entity, location },
-        } => bbox.contains(location.point()?).then_some(*entity),
-        FactualAssertion::Event {
-            fact: event::Fact::MovedToLocation { event, location },
-        } => bbox
-            .contains(location.point()?)
-            .then(|| owners.get(event).copied())
-            .flatten(),
-        _ => None,
+    let (location, subject) = fact.located_subject()?;
+    if !location.known_geometry_intersects(viewport) {
+        return None;
+    }
+    match subject {
+        LocatedSubject::Entity(entity) => Some(*entity),
+        LocatedSubject::Event(event) => owners.get(event).copied(),
+        LocatedSubject::Image(_) => None,
+    }
+}
+
+/// The image a stored `CapturedLocation` fact places inside `viewport`, if any —
+/// the image `InViewport` stream extractor, over the same shared pieces as
+/// [`entity_in_viewport`].
+pub(super) fn image_captured_in_viewport(
+    fact: &MemStoredFact,
+    viewport: &Viewport,
+) -> Option<MemoryImageId> {
+    let (location, subject) = fact.located_subject()?;
+    if let LocatedSubject::Image(image) = subject
+        && location.known_geometry_intersects(viewport)
+    {
+        Some(*image)
+    } else {
+        None
     }
 }
 

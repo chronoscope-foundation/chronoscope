@@ -109,7 +109,7 @@ pub use external_ids::{
     ExternalStringIdError, GeoNamesId, GettyTgnId, OhmId, OsmElementType, OsmId, TriggerEventId,
     WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
 };
-pub use geo::{Bbox, BboxCoordsError, BboxError, GeoPoint, GeoPointError, Meters};
+pub use geo::{GeoPoint, GeoPointError, Meters, Viewport, ViewportCoordsError, ViewportError};
 pub use location::{
     ConflictStatus, Distance, Location, LocationError, LocationReference, UnresolvedLocation,
 };
