@@ -208,6 +208,12 @@
           WEB_DIST = web.packages.web-test;
           # chromiumoxide picks up CHROME as the executable path.
           CHROME = chromeHeadlessBin;
+          # The read-only facts DB the dev servers and browser tests mount (a
+          # per-run CoW clone; see chronoscope-dev's mount_facts_db). Lives in
+          # webEnv, not apiRuntimeEnv: it drags the ingest binary build into
+          # its closure, which the web shell already pays for WEB_DIST but the
+          # lighter shells must not.
+          CHRONOSCOPE_FACTS_DB = "${wikidata.factsDbs.curated}/facts.db";
         };
 
         # Tools every shell wants on PATH.

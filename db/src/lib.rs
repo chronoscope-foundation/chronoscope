@@ -27,7 +27,8 @@ use chronoscope_integrations::IntegrationRegistry;
 
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use facts::{
-    SqliteEntityId, SqliteEventId, SqliteFactStore, SqliteFactStoreError, SqliteIds, SqliteImageId,
+    FACTS_CODEC_VERSION, SqliteEntityId, SqliteEventId, SqliteFactStore, SqliteFactStoreError,
+    SqliteIds, SqliteImageId,
 };
 pub use models::{
     FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,

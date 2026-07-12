@@ -3,7 +3,7 @@
 //! Facts are committed directly against `ctx.app_state.facts` (there's no
 //! write endpoint yet) and then read back over HTTP, exercising the real
 //! Dropshot path/query extraction and JSON wire shapes — including the
-//! `MemoryEntityId` path-param round trip (decimal-string wire form vs. the
+//! `ServerEntityId` path-param round trip (decimal-string wire form vs. the
 //! `entity-{n}` `Display` form).
 
 use std::collections::{BTreeSet, HashMap};
@@ -27,22 +27,24 @@ use chronoscope_core::grammar::depiction::{self, Perspective};
 use chronoscope_core::grammar::ids::{FactId, UserId};
 use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::location::{Location, UnresolvedLocation};
-use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
 use chronoscope_core::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact, commit_facts,
 };
 
 use super::TestContext;
 use crate::cdn::tests::TEST_CDN_BASE_URL;
-use crate::state::ResolvedImageMedia;
+use crate::state::{
+    ResolvedImageMedia, ServerEntityId, ServerFactStore, ServerIds, ServerImageId,
+    placeholder_storage_key, placeholder_thumbnail_key,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-/// The client-side wire id the server serializes a `MemoryEntityId` as: the
+/// The client-side wire id the server serializes a `ServerEntityId` as: the
 /// backend id crosses the wire as its decimal string, which the typed client
 /// reads back as an opaque [`EntityId`]. Bridges a committed backend id to the
 /// id the typed client surfaces for the same entity.
-fn wire_entity_id(id: MemoryEntityId) -> EntityId {
+fn wire_entity_id(id: ServerEntityId) -> EntityId {
     EntityId::new(id.0.to_string())
 }
 
@@ -77,12 +79,12 @@ fn resolved_point(
 /// construction location. Enough to make the entity placeable (for
 /// `/markers` and `/entities`) and nameable (for `get_entity`).
 async fn commit_named_entity_at(
-    facts: &MemoryFactStore,
+    facts: &ServerFactStore,
     name: &str,
     lat: f64,
     lon: f64,
-) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
-    let commit = Commit::<MemoryIds> {
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("test")),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
@@ -130,11 +132,11 @@ async fn commit_named_entity_at(
 /// Commit a placeable entity carrying one name per `(language, text)` pair, so a
 /// read can exercise `Accept-Language` negotiation between them.
 async fn commit_entity_with_names_at(
-    facts: &MemoryFactStore,
+    facts: &ServerFactStore,
     names: &[(&str, &str)],
     lat: f64,
     lon: f64,
-) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
     let named = |language: &str,
                  name: &str|
      -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
@@ -165,7 +167,7 @@ async fn commit_entity_with_names_at(
         },
         citation: citation("https://example.com/location")?,
     });
-    let commit = Commit::<MemoryIds> {
+    let commit = Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("test")),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
@@ -189,13 +191,13 @@ async fn commit_entity_with_names_at(
 /// depiction whose image carries a Commons `Source` URL and a `Picture` medium.
 /// Exercises the image read path (`get_entity` grid, `/markers` thumbnail).
 async fn commit_entity_with_depicted_image(
-    facts: &MemoryFactStore,
+    facts: &ServerFactStore,
     name: &str,
     lat: f64,
     lon: f64,
     image_source_url: &str,
-) -> Result<(MemoryEntityId, MemoryImageId), Box<dyn std::error::Error + Send + Sync>> {
-    let commit = Commit::<MemoryIds> {
+) -> Result<(ServerEntityId, ServerImageId), Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("test")),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
@@ -325,13 +327,13 @@ async fn get_entity_defaults_display_name_to_english_without_accept_language() -
     Ok(())
 }
 
-/// Media keys a fact-store image resolves to, mirroring the `dev` resolver's
-/// placeholder layout: single path segments under `media/` so `/media/{key}`
-/// serves them, distinct per image.
-fn resolved_media(image_id: MemoryImageId) -> ResolvedImageMedia {
+/// Media keys a fact-store image resolves to — the `dev` resolver's actual
+/// placeholder layout, through the shared key functions, so the fixture
+/// cannot drift from what the resolver writes.
+fn resolved_media(image_id: ServerImageId) -> ResolvedImageMedia {
     ResolvedImageMedia {
-        storage_key: format!("media/factimg-{}.jpg", image_id.0),
-        thumbnail_key: format!("media/factimg-{}-thumb.jpg", image_id.0),
+        storage_key: placeholder_storage_key(image_id),
+        thumbnail_key: placeholder_thumbnail_key(image_id),
     }
 }
 
@@ -363,7 +365,7 @@ async fn get_entity_images_is_empty_for_an_entity_with_no_depiction() -> TestRes
 
 #[tokio::test]
 async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult {
-    let facts = MemoryFactStore::new();
+    let (facts, facts_dir) = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Pantheon.jpg";
     let (id, image_id) =
         commit_entity_with_depicted_image(&facts, "Pantheon", 41.8986, 12.4769, src).await?;
@@ -372,8 +374,12 @@ async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult
     // original from our own /media/{key}, not from upstream Commons.
     let media = resolved_media(image_id);
     let expected_display = format!("{TEST_CDN_BASE_URL}/{}", media.storage_key);
-    let ctx =
-        TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
+    let ctx = TestContext::with_facts_and_image_media(
+        facts,
+        facts_dir,
+        HashMap::from([(image_id, media)]),
+    )
+    .await?;
 
     let page = ctx
         .client
@@ -409,12 +415,12 @@ async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult
 async fn get_entity_images_skips_a_depiction_whose_image_is_unresolved() -> TestResult {
     // The image has a Source fact but no entry in the media map — a tile that
     // can't load is worse than an absent one, so the grid drops it.
-    let facts = MemoryFactStore::new();
+    let (facts, facts_dir) = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/c/c3/Unresolved.jpg";
     let (id, _image_id) =
         commit_entity_with_depicted_image(&facts, "Unresolved", 41.9, 12.5, src).await?;
 
-    let ctx = TestContext::with_facts_and_image_media(facts, HashMap::new()).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, HashMap::new()).await?;
 
     let page = ctx
         .client
@@ -432,12 +438,12 @@ async fn get_entity_images_skips_a_depiction_whose_image_is_unresolved() -> Test
 /// carrying a Commons `Source` URL and a `Picture` medium. Returns the entity id
 /// and its image ids in declaration order. Drives the paginated image grid.
 async fn commit_entity_with_depicted_images(
-    facts: &MemoryFactStore,
+    facts: &ServerFactStore,
     name: &str,
     lat: f64,
     lon: f64,
     count: usize,
-) -> Result<(MemoryEntityId, Vec<MemoryImageId>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(ServerEntityId, Vec<ServerImageId>), Box<dyn std::error::Error + Send + Sync>> {
     let mut submit_facts = vec![
         SubmitFact::Factual {
             assertion: FactualAssertion::Attribute {
@@ -491,7 +497,7 @@ async fn commit_entity_with_depicted_images(
             },
         });
     }
-    let commit = Commit::<MemoryIds> {
+    let commit = Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("test")),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
@@ -524,11 +530,11 @@ async fn commit_entity_with_depicted_images(
 /// image that carries a Commons `Source` URL. Lands an intervening write after a
 /// page-1 read so a resume can prove it reads the pinned snapshot, not `now()`.
 async fn commit_extra_depiction_on(
-    facts: &MemoryFactStore,
-    entity_id: MemoryEntityId,
+    facts: &ServerFactStore,
+    entity_id: ServerEntityId,
     image_source_url: &str,
-) -> Result<MemoryImageId, Box<dyn std::error::Error + Send + Sync>> {
-    let commit = Commit::<MemoryIds> {
+) -> Result<ServerImageId, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("test")),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Existing { id: entity_id }],
@@ -578,19 +584,19 @@ async fn commit_extra_depiction_on(
 
 #[tokio::test]
 async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult {
-    let facts = MemoryFactStore::new();
+    let (facts, facts_dir) = super::fresh_fact_store().await?;
     // Three depicted images inside one entity; limit=1 forces the walk across
     // cursor-linked pages, exercising the images cursor encode/decode round trip.
     let (id, image_ids) =
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 3).await?;
-    let media: HashMap<MemoryImageId, ResolvedImageMedia> = image_ids
+    let media: HashMap<ServerImageId, ResolvedImageMedia> = image_ids
         .iter()
         .map(|&image_id| (image_id, resolved_media(image_id)))
         .collect();
     // The wire form of a backend image id is its decimal string, the same shape
     // the tiles carry back; compare on that rather than re-parsing.
     let expected: BTreeSet<String> = image_ids.iter().map(|id| id.0.to_string()).collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, media).await?;
 
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
@@ -642,20 +648,20 @@ async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult
 
 #[tokio::test]
 async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> TestResult {
-    let facts = MemoryFactStore::new();
+    let (facts, facts_dir) = super::fresh_fact_store().await?;
     // Three depicted images make ≥2 pages at limit=1. Media is registered for a
     // range past those three, so a later image would resolve into a tile *if* the
     // resume erroneously read `now()` rather than the cursor's pinned snapshot.
     let (id, image_ids) =
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 3).await?;
-    let media: HashMap<MemoryImageId, ResolvedImageMedia> = (0..8u64)
+    let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..8i64)
         .map(|i| {
-            let image_id = MemoryImageId(i);
+            let image_id = chronoscope_db::SqliteImageId(i);
             (image_id, resolved_media(image_id))
         })
         .collect();
     let expected: BTreeSet<String> = image_ids.iter().map(|id| id.0.to_string()).collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, media).await?;
 
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
@@ -766,7 +772,8 @@ async fn get_entity_404s_for_an_id_no_fact_ever_named() -> TestResult {
     let ctx = TestContext::new().await?;
     // A fresh store mints entity ids from 0; this id was never declared by
     // any commit, so no fact anywhere mentions it.
-    let unknown = MemoryEntityId(999_999);
+    // Constructed concretely: a raw id mints only from the backend type.
+    let unknown = chronoscope_db::SqliteEntityId(999_999);
 
     match ctx.client.get_entity(&wire_entity_id(unknown)).await {
         Ok(entity) => {
@@ -803,7 +810,7 @@ async fn get_entity_404_carries_cors_headers() -> TestResult {
 
 #[tokio::test]
 async fn get_entity_path_param_round_trips_the_numeric_wire_form() -> TestResult {
-    // `MemoryEntityId`'s `Display` renders the debug form `entity-{n}`, not the
+    // `ServerEntityId`'s `Display` renders the debug form `entity-{n}`, not the
     // wire form the path deserializer parses. Hitting the raw HTTP path with the
     // backend id's decimal-string form (what `Client::get_entity` sends) pins
     // that the server-side path extraction accepts it.
@@ -824,8 +831,8 @@ async fn get_entity_path_param_round_trips_the_numeric_wire_form() -> TestResult
 /// entity id and the two minted fact ids — the fighting set the detector must
 /// attribute.
 async fn commit_competing_construction_dates(
-    facts: &MemoryFactStore,
-) -> Result<(MemoryEntityId, BTreeSet<FactId>), Box<dyn std::error::Error + Send + Sync>> {
+    facts: &ServerFactStore,
+) -> Result<(ServerEntityId, BTreeSet<FactId>), Box<dyn std::error::Error + Send + Sync>> {
     let started =
         |year: i32, url: &str| -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
             let bound = UncertainDate::with_precision(
@@ -842,7 +849,7 @@ async fn commit_competing_construction_dates(
                 citation: citation(url)?,
             })
         };
-    let commit = Commit::<MemoryIds> {
+    let commit = Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("test")),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
@@ -934,15 +941,19 @@ async fn list_markers_selects_a_lone_entity() -> TestResult {
 
 #[tokio::test]
 async fn list_markers_carries_a_thumbnail_for_a_depicted_entity() -> TestResult {
-    let facts = MemoryFactStore::new();
+    let (facts, facts_dir) = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/b/b2/Colosseum.jpg";
     let (id, image_id) =
         commit_entity_with_depicted_image(&facts, "Colosseum", 41.8902, 12.4922, src).await?;
 
     let media = resolved_media(image_id);
     let expected_thumb = format!("{TEST_CDN_BASE_URL}/{}", media.thumbnail_key);
-    let ctx =
-        TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
+    let ctx = TestContext::with_facts_and_image_media(
+        facts,
+        facts_dir,
+        HashMap::from([(image_id, media)]),
+    )
+    .await?;
 
     let viewport = chronoscope_core::geo::Viewport::from_coords(41.8, 42.0, 12.4, 12.6)?;
     let response = ctx.client.list_markers(&viewport).await?;
@@ -1053,7 +1064,7 @@ async fn list_markers_negotiates_marker_name_by_accept_language() -> TestResult 
         Some("Accept-Language"),
         "a language-negotiated response advertises Vary: Accept-Language so caches don't cross-serve locales"
     );
-    let italian: MarkersResponse<MemoryEntityId> = italian_resp.json().await?;
+    let italian: MarkersResponse<ServerEntityId> = italian_resp.json().await?;
     assert_eq!(
         italian.markers.first().and_then(|m| m.name.as_deref()),
         Some("Firenze"),
@@ -1062,7 +1073,7 @@ async fn list_markers_negotiates_marker_name_by_accept_language() -> TestResult 
 
     // `en-US,en;q=0.9`: both entries reduce to the primary subtag `en`, so the
     // English name wins regardless of the q-weight.
-    let english: MarkersResponse<MemoryEntityId> = ctx
+    let english: MarkersResponse<ServerEntityId> = ctx
         .client
         .reqwest_client()
         .get(ctx.url(query))
@@ -1093,7 +1104,7 @@ async fn list_markers_matches_accept_language_case_insensitively() -> TestResult
     let query = "/markers?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
 
     // An uppercase `IT` must match the lowercase-canonical stored `it` tag.
-    let response: MarkersResponse<MemoryEntityId> = ctx
+    let response: MarkersResponse<ServerEntityId> = ctx
         .client
         .reqwest_client()
         .get(ctx.url(query))
@@ -1125,7 +1136,7 @@ async fn list_markers_orders_accept_language_by_q_weight() -> TestResult {
 
     // `de;q=0.5, en`: `en` carries an implicit q=1.0, outranking `de;q=0.5`
     // despite coming later in the header, so the English name wins.
-    let response: MarkersResponse<MemoryEntityId> = ctx
+    let response: MarkersResponse<ServerEntityId> = ctx
         .client
         .reqwest_client()
         .get(ctx.url(query))
@@ -1153,7 +1164,7 @@ async fn list_entities_lists_placeable_entities_in_the_viewport() -> TestResult 
         .get("/entities?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3")
         .await?;
     assert_eq!(resp.status(), 200);
-    let page: chronoscope_api_client::EntityListPage<MemoryEntityId, MemoryImageId> =
+    let page: chronoscope_api_client::EntityListPage<ServerEntityId, ServerImageId> =
         resp.json().await?;
 
     assert!(
@@ -1180,7 +1191,7 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
     let ctx = TestContext::new().await?;
     // Three placeable entities inside one small viewport; limit=1 forces the walk
     // across cursor-linked pages, exercising the encode/decode round trip.
-    let expected: std::collections::BTreeSet<MemoryEntityId> = [
+    let expected: std::collections::BTreeSet<ServerEntityId> = [
         commit_named_entity_at(&ctx.app_state.facts, "Alpha", 43.771, 11.251).await?,
         commit_named_entity_at(&ctx.app_state.facts, "Beta", 43.772, 11.252).await?,
         commit_named_entity_at(&ctx.app_state.facts, "Gamma", 43.773, 11.253).await?,
@@ -1193,13 +1204,13 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
     // Page 1 caps at the limit and, with entities still to come, hands back a cursor.
     let resp = ctx.get(&format!("/entities?{viewport}&limit=1")).await?;
     assert_eq!(resp.status(), 200);
-    let page1: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
+    let page1: EntityListPage<ServerEntityId, ServerImageId> = resp.json().await?;
     assert_eq!(
         page1.summaries.len(),
         1,
         "limit=1 caps the first page at a single summary"
     );
-    let mut seen: std::collections::BTreeSet<MemoryEntityId> =
+    let mut seen: std::collections::BTreeSet<ServerEntityId> =
         page1.summaries.iter().map(|s| s.id).collect();
     let mut cursor: Option<Cursor> = Some(
         page1
@@ -1218,7 +1229,7 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
             ))
             .await?;
         assert_eq!(resp.status(), 200, "a minted cursor round-trips as a 200");
-        let page: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
+        let page: EntityListPage<ServerEntityId, ServerImageId> = resp.json().await?;
         for summary in &page.summaries {
             assert!(
                 seen.insert(summary.id),
@@ -1242,7 +1253,7 @@ async fn list_entities_cursor_walks_every_entity_exactly_once() -> TestResult {
 async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> TestResult {
     let ctx = TestContext::new().await?;
     // Three placeable entities in one small viewport make ≥2 pages at limit=1.
-    let expected: std::collections::BTreeSet<MemoryEntityId> = [
+    let expected: std::collections::BTreeSet<ServerEntityId> = [
         commit_named_entity_at(&ctx.app_state.facts, "Alpha", 43.771, 11.251).await?,
         commit_named_entity_at(&ctx.app_state.facts, "Beta", 43.772, 11.252).await?,
         commit_named_entity_at(&ctx.app_state.facts, "Gamma", 43.773, 11.253).await?,
@@ -1255,8 +1266,8 @@ async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> Test
     // Page 1 pins its snapshot into the cursor it hands back.
     let resp = ctx.get(&format!("/entities?{viewport}&limit=1")).await?;
     assert_eq!(resp.status(), 200);
-    let page1: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
-    let mut seen: std::collections::BTreeSet<MemoryEntityId> =
+    let page1: EntityListPage<ServerEntityId, ServerImageId> = resp.json().await?;
+    let mut seen: std::collections::BTreeSet<ServerEntityId> =
         page1.summaries.iter().map(|s| s.id).collect();
     let mut cursor: Option<Cursor> = Some(
         page1
@@ -1267,7 +1278,7 @@ async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> Test
     // Three more in-box entities land after page 1. Their facts postdate the
     // cursor's snapshot, so the resumed walk must never surface them — a `now()`
     // read would, since all six sit in the same viewport.
-    let intruders: std::collections::BTreeSet<MemoryEntityId> = [
+    let intruders: std::collections::BTreeSet<ServerEntityId> = [
         commit_named_entity_at(&ctx.app_state.facts, "Delta", 43.774, 11.254).await?,
         commit_named_entity_at(&ctx.app_state.facts, "Epsilon", 43.775, 11.255).await?,
         commit_named_entity_at(&ctx.app_state.facts, "Zeta", 43.776, 11.256).await?,
@@ -1288,7 +1299,7 @@ async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> Test
             200,
             "a snapshot-pinned cursor resumes as a 200, never a stale-snapshot 400"
         );
-        let page: EntityListPage<MemoryEntityId, MemoryImageId> = resp.json().await?;
+        let page: EntityListPage<ServerEntityId, ServerImageId> = resp.json().await?;
         for summary in &page.summaries {
             assert!(
                 seen.insert(summary.id),
@@ -1321,7 +1332,7 @@ async fn list_entities_reads_only_the_pinned_snapshots_entities() -> TestResult 
 
     // One entity in the box, then capture the point the listing was served at.
     let alpha = commit_named_entity_at(&ctx.app_state.facts, "Alpha", 43.771, 11.251).await?;
-    let page: EntityListPage<MemoryEntityId, MemoryImageId> =
+    let page: EntityListPage<ServerEntityId, ServerImageId> =
         ctx.get(&format!("/entities?{bbox}")).await?.json().await?;
     let s1 = page.snapshot;
 
@@ -1329,12 +1340,12 @@ async fn list_entities_reads_only_the_pinned_snapshots_entities() -> TestResult 
     let beta = commit_named_entity_at(&ctx.app_state.facts, "Beta", 43.772, 11.252).await?;
 
     // Re-reading pinned at S1 sees only Alpha.
-    let pinned: EntityListPage<MemoryEntityId, MemoryImageId> = ctx
+    let pinned: EntityListPage<ServerEntityId, ServerImageId> = ctx
         .get(&format!("/entities?{bbox}&snapshot={}", s1.as_str()))
         .await?
         .json()
         .await?;
-    let pinned_ids: BTreeSet<MemoryEntityId> = pinned.summaries.iter().map(|s| s.id).collect();
+    let pinned_ids: BTreeSet<ServerEntityId> = pinned.summaries.iter().map(|s| s.id).collect();
     assert_eq!(
         pinned_ids,
         BTreeSet::from([alpha]),
@@ -1342,9 +1353,9 @@ async fn list_entities_reads_only_the_pinned_snapshots_entities() -> TestResult 
     );
 
     // The live read sees both — so the snapshot, not the bbox, excludes Beta.
-    let live: EntityListPage<MemoryEntityId, MemoryImageId> =
+    let live: EntityListPage<ServerEntityId, ServerImageId> =
         ctx.get(&format!("/entities?{bbox}")).await?.json().await?;
-    let live_ids: BTreeSet<MemoryEntityId> = live.summaries.iter().map(|s| s.id).collect();
+    let live_ids: BTreeSet<ServerEntityId> = live.summaries.iter().map(|s| s.id).collect();
     assert_eq!(
         live_ids,
         BTreeSet::from([alpha, beta]),
@@ -1358,20 +1369,20 @@ async fn entity_images_at_the_detail_snapshot_exclude_later_writes() -> TestResu
     // The web panel reads entity detail, then its images as a second request.
     // Pinning the images fetch to the detail's snapshot keeps the grid from
     // showing depictions committed between the two requests.
-    let facts = MemoryFactStore::new();
+    let (facts, facts_dir) = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Original.jpg";
     let (id, original) =
         commit_entity_with_depicted_image(&facts, "Pantheon", 41.8986, 12.4769, src).await?;
     // Media for a range past the first image, so a later intruder *would* resolve
     // into a tile if the read weren't pinned — making the pin the sole reason it
     // doesn't.
-    let media: HashMap<MemoryImageId, ResolvedImageMedia> = (0..4u64)
+    let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..4i64)
         .map(|i| {
-            let image_id = MemoryImageId(i);
+            let image_id = chronoscope_db::SqliteImageId(i);
             (image_id, resolved_media(image_id))
         })
         .collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, media).await?;
 
     // Detail read pins the snapshot the panel threads into the grid.
     let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
@@ -1426,17 +1437,17 @@ async fn entity_images_at_the_detail_snapshot_exclude_later_writes() -> TestResu
 
 #[tokio::test]
 async fn get_entity_images_cursor_and_snapshot_must_agree() -> TestResult {
-    let facts = MemoryFactStore::new();
+    let (facts, facts_dir) = super::fresh_fact_store().await?;
     // Two depictions so limit=1 hands back a resume cursor pinned at S1.
     let (id, _image_ids) =
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 2).await?;
-    let media: HashMap<MemoryImageId, ResolvedImageMedia> = (0..8u64)
+    let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..8i64)
         .map(|i| {
-            let image_id = MemoryImageId(i);
+            let image_id = chronoscope_db::SqliteImageId(i);
             (image_id, resolved_media(image_id))
         })
         .collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, media).await?;
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
     // Page 1 mints a cursor pinned at S1 and echoes S1.

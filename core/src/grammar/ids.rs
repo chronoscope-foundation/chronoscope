@@ -155,6 +155,78 @@ macro_rules! string_id_newtype {
 }
 
 // ============================================================================
+// Subject-ID macro (integer-backed, string wire form)
+// ============================================================================
+
+/// Emit an integer-backed subject-id newtype with the wire convention every
+/// backend id scheme shares: `Serialize` writes the number as its canonical
+/// decimal string and the `JsonSchema` is a non-referenceable bare `string`,
+/// so the read wire's id stays a `string` for every backend and no consumer
+/// bakes in an integer-shaped id (or a backend type name). `Deserialize`
+/// accepts ONLY the canonical rendering — input that parses but re-renders
+/// differently (`007`, `+7`, `-0`) is rejected, so every string-decoded
+/// position (path params, cursors, stored JSON) admits exactly one spelling
+/// per id. One macro, consumed by every backend's id scheme, so the schemes
+/// cannot drift in wire behavior.
+#[macro_export]
+macro_rules! subject_id_newtype {
+    ($name:ident, $repr:ty, $prefix:literal, $doc:expr) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub $repr);
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                write!(f, concat!($prefix, "-{}"), self.0)
+            }
+        }
+
+        impl ::serde::Serialize for $name {
+            fn serialize<S: ::serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> ::std::result::Result<S::Ok, S::Error> {
+                serializer.collect_str(&self.0)
+            }
+        }
+
+        impl<'de> ::serde::Deserialize<'de> for $name {
+            fn deserialize<D: ::serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> ::std::result::Result<Self, D::Error> {
+                let s = ::std::string::String::deserialize(deserializer)?;
+                let value = s.parse::<$repr>().map_err(|e| {
+                    ::serde::de::Error::custom(format!("invalid {} {s:?}: {e}", stringify!($name)))
+                })?;
+                if value.to_string() != s {
+                    return Err(::serde::de::Error::custom(format!(
+                        "invalid {} {s:?}: non-canonical rendering of {value}",
+                        stringify!($name)
+                    )));
+                }
+                Ok(Self(value))
+            }
+        }
+
+        impl ::schemars::JsonSchema for $name {
+            fn schema_name() -> ::std::string::String {
+                <::std::string::String as ::schemars::JsonSchema>::schema_name()
+            }
+
+            fn json_schema(
+                generator: &mut ::schemars::r#gen::SchemaGenerator,
+            ) -> ::schemars::schema::Schema {
+                <::std::string::String as ::schemars::JsonSchema>::json_schema(generator)
+            }
+
+            fn is_referenceable() -> bool {
+                false
+            }
+        }
+    };
+}
+
+// ============================================================================
 // Validated-string-newtype macro and shared error
 // ============================================================================
 
@@ -629,5 +701,69 @@ mod tests {
         let parsed = CommitId::parse(hex.clone())?;
         assert_eq!(parsed.as_str(), hex);
         Ok(())
+    }
+
+    // --- subject_id_newtype wire behavior ---
+
+    crate::subject_id_newtype!(
+        TestUnsignedId,
+        u64,
+        "unsigned",
+        "A u64-backed instantiation for the wire-behavior tests."
+    );
+    crate::subject_id_newtype!(
+        TestSignedId,
+        i64,
+        "signed",
+        "An i64-backed instantiation for the wire-behavior tests."
+    );
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn subject_id_serializes_as_canonical_decimal_string() -> TestResult {
+        assert_eq!(
+            serde_json::to_value(TestUnsignedId(7))?,
+            serde_json::json!("7")
+        );
+        assert_eq!(
+            serde_json::to_value(TestSignedId(-7))?,
+            serde_json::json!("-7")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn subject_id_round_trips_canonical_input() -> TestResult {
+        assert_eq!(
+            serde_json::from_value::<TestUnsignedId>(serde_json::json!("7"))?,
+            TestUnsignedId(7)
+        );
+        assert_eq!(
+            serde_json::from_value::<TestSignedId>(serde_json::json!("-7"))?,
+            TestSignedId(-7)
+        );
+        Ok(())
+    }
+
+    /// Every parseable-but-non-canonical spelling is refused, so one id has
+    /// exactly one wire form at every string-decoded position (path params,
+    /// cursors, stored JSON alike).
+    #[test]
+    fn subject_id_rejects_non_canonical_spellings() {
+        for aliased in ["007", "+7", " 7", "7 ", ""] {
+            assert!(
+                serde_json::from_value::<TestUnsignedId>(serde_json::json!(aliased)).is_err(),
+                "u64 spelling {aliased:?} must be rejected"
+            );
+        }
+        for aliased in ["-0", "+7", "007", "-07"] {
+            assert!(
+                serde_json::from_value::<TestSignedId>(serde_json::json!(aliased)).is_err(),
+                "i64 spelling {aliased:?} must be rejected"
+            );
+        }
+        // An integer-shaped wire value is the wrong type outright.
+        assert!(serde_json::from_value::<TestUnsignedId>(serde_json::json!(7)).is_err());
     }
 }

@@ -3,10 +3,10 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chronoscope_core::store::memory::{MemoryFactStore, MemoryImageId};
-use chronoscope_db::Database;
+use chronoscope_core::store::{EntityIdOf, FactStore, ImageIdOf};
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::MediaStore;
+use chronoscope_db::{Database, SqliteFactStore};
 use dropshot::HttpError;
 use hickory_resolver::Resolver;
 use hickory_resolver::name_server::TokioConnectionProvider;
@@ -15,6 +15,28 @@ use url::Url;
 use webauthn_rs::prelude::*;
 
 use crate::jwt::JwtConfig;
+
+// ==================== Fact-store backend ====================
+
+/// The one place the server's fact-store backend is picked. Everything below
+/// the endpoint boundary is generic over `S: FactStore` (core listing /
+/// projection, ingestion, the api helpers); the handlers and [`AppState`]
+/// instantiate at this alias, so re-backending the whole server is this line
+/// plus the test fixtures. Runtime backend selection waits until a second
+/// production backend exists.
+pub type ServerFactStore = SqliteFactStore;
+
+/// The picked backend's id scheme — what `detect_conflicts` and the stored
+/// commit types instantiate at.
+pub type ServerIds = <ServerFactStore as FactStore>::Ids;
+
+/// The picked backend's entity id: URL path params and listing cursors carry
+/// it. Its wire form is an opaque decimal string for every backend.
+pub type ServerEntityId = EntityIdOf<ServerFactStore>;
+
+/// The picked backend's image id: the resolved-media map's key and the
+/// images-cursor payload.
+pub type ServerImageId = ImageIdOf<ServerFactStore>;
 
 // ==================== DNS Resolution ====================
 
@@ -122,6 +144,20 @@ pub struct ResolvedImageMedia {
     pub thumbnail_key: String,
 }
 
+/// Placeholder-mode media key for a fact-store image's original — the layout
+/// the dev resolver writes and `GET /media/{key}` serves back. A single path
+/// segment under `media/`, so the route matches it. Exported so the resolver
+/// and its test mirrors share one definition.
+pub fn placeholder_storage_key(image_id: impl std::fmt::Display) -> String {
+    format!("media/factimg-{image_id}.jpg")
+}
+
+/// Placeholder-mode media key for a fact-store image's thumbnail — the twin
+/// of [`placeholder_storage_key`].
+pub fn placeholder_thumbnail_key(image_id: impl std::fmt::Display) -> String {
+    format!("media/factimg-{image_id}-thumb.jpg")
+}
+
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("Invalid bind address: {0}")]
@@ -195,12 +231,13 @@ pub struct AppState {
     pub config: Config,
     #[cfg(feature = "embedded-media")]
     pub media_store: Arc<dyn MediaStore>,
-    /// In-memory fact store of submitted entity and image facts.
-    pub facts: MemoryFactStore,
+    /// The fact store of submitted entity and image facts — the
+    /// [`ServerFactStore`] backend, sharing the server's SQLite pool.
+    pub facts: ServerFactStore,
     /// Resolved media keys for every fact-store image, keyed by image id. The
     /// entity read path serves thumbnails and detail images from these keys; an
     /// image absent from the map is unresolved and contributes no thumbnail/tile.
-    pub image_media: Arc<HashMap<MemoryImageId, ResolvedImageMedia>>,
+    pub image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
 }
 
 impl AppState {
@@ -215,8 +252,8 @@ impl AppState {
         jwt: JwtConfig,
         dns_resolver: Box<dyn DnsResolver>,
         #[cfg(feature = "embedded-media")] media_store: Arc<dyn MediaStore>,
-        facts: MemoryFactStore,
-        image_media: Arc<HashMap<MemoryImageId, ResolvedImageMedia>>,
+        facts: ServerFactStore,
+        image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
     ) -> Result<Self, AppStateError> {
         let rp_origin = Url::parse(&config.rp_origin)
             .map_err(|e| AppStateError::InvalidOrigin(format!("{e}")))?;

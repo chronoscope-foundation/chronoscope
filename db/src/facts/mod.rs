@@ -97,6 +97,14 @@ type Error = SqliteFactStoreError;
 // SqliteFactStore
 // ============================================================================
 
+/// The stored-facts codec version. Bump on ANY change to the stored
+/// `fact_json` / `result_json` shapes or the id encoding conventions —
+/// anything that would make a previously built facts-DB artifact decode
+/// wrongly. Built artifacts carry it in `PRAGMA user_version`
+/// ([`SqliteFactStore::stamp_codec_version`]); the dev mount refuses a
+/// mismatch, so a stale artifact fails loudly instead of decoding garbage.
+pub const FACTS_CODEC_VERSION: i32 = 1;
+
 /// SQLite implementation of [`FactStore`] over a shared [`SqlitePool`].
 #[derive(Debug, Clone)]
 pub struct SqliteFactStore {
@@ -125,6 +133,20 @@ impl SqliteFactStore {
     /// SpatiaLite's `dlclose` finishes before process exit.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+
+    /// Stamp the database with [`FACTS_CODEC_VERSION`] via `PRAGMA
+    /// user_version` — the artifact builder's final step, so consumers can
+    /// refuse a stale codec before decoding anything. A PRAGMA takes no bind
+    /// parameters; the value is a compile-time constant, not input.
+    ///
+    /// # Errors
+    /// Returns [`DbError`](crate::DbError) if the write fails.
+    pub async fn stamp_codec_version(&self) -> crate::DbResult<()> {
+        sqlx::query(&format!("PRAGMA user_version = {FACTS_CODEC_VERSION}"))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

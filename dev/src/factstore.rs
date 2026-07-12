@@ -1,17 +1,17 @@
 //! Curated-JSONL fact store loader.
 //!
 //! Dev/test fixture concern: reads the curated Wikidata `entities.jsonl`
-//! snapshot (one [`WikidataEntity`] per line) and ingests it into a fresh
-//! [`MemoryFactStore`]. The production API server has no such data source —
-//! it starts with an empty store (see `chronoscope-api`'s `main.rs`) — so
-//! this loader lives here rather than in `chronoscope-core` or
-//! `chronoscope-api`.
+//! snapshot (one [`WikidataEntity`] per line) and ingests it into a
+//! caller-provided store. The dev servers mount a pre-built facts DB instead
+//! of boot-ingesting, so this remains only for tests that want the curated
+//! set in a store they build themselves; it lives here rather than in
+//! `chronoscope-core` or `chronoscope-api`.
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use chronoscope_core::grammar::ids::IngesterRunId;
-use chronoscope_core::store::memory::MemoryFactStore;
+use chronoscope_core::store::FactStore;
 use chronoscope_ingestion::wikidata::commits::{IngestError, IngestStats, ingest_entities};
 use chronoscope_integrations::wikidata::WikidataEntity;
 
@@ -46,16 +46,16 @@ pub enum LoadError {
 }
 
 /// Read `jsonl_path`, parse each non-empty line as a [`WikidataEntity`], and
-/// ingest all of them into a fresh [`MemoryFactStore`] under one ingester
-/// run. Returns the populated store alongside the ingest tally so the caller
-/// can log it.
+/// ingest all of them into `store` under one ingester run. Returns the
+/// ingest tally so the caller can log it.
 ///
 /// Every entity is recorded under the same fixed timestamp — the curated
 /// snapshot's own date, not the load time — so re-loading the same snapshot
 /// content-addresses to the same `CommitId`s.
-pub async fn load_curated_fact_store(
+pub async fn load_curated_fact_store<S: FactStore>(
+    store: &S,
     jsonl_path: &Path,
-) -> Result<(MemoryFactStore, IngestStats), LoadError> {
+) -> Result<IngestStats, LoadError> {
     let content = tokio::fs::read_to_string(jsonl_path)
         .await
         .map_err(|source| LoadError::Read {
@@ -79,9 +79,8 @@ pub async fn load_curated_fact_store(
 
     let recorded_at = curated_snapshot_recorded_at()?;
     let run = IngesterRunId::new("dev-startup");
-    let store = MemoryFactStore::new();
-    let stats = ingest_entities(&store, entities, &run, recorded_at).await?;
-    Ok((store, stats))
+    let stats = ingest_entities(store, entities, &run, recorded_at).await?;
+    Ok(stats)
 }
 
 /// The curated snapshot's pinned date: 2022-01-03T00:00:00Z. Matches the

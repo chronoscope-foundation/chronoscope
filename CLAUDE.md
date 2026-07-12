@@ -126,7 +126,7 @@ just clippy [target]        # cargo clippy
 #   e.g. just clippy core   → cargo clippy -p chronoscope-core -- -D warnings
 
 # Concrete actions
-just web-dev                # integrated dev server (API + Trunk live reload; auto-picks free ports)
+just web-dev [subset]       # integrated dev server over a facts-DB clone (default curated; auto-picks free ports)
 just openapi                # build the raw OpenAPI spec (inspect the contract)
 just xcodegen               # splice store paths into the xcodegen spec, regenerate the Xcode project
 just corpus-hash            # add hashes for new corpus URLs

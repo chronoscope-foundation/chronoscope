@@ -11,7 +11,7 @@
 //! Every fact-store image cites an upstream source URL (a Wikimedia Commons
 //! file, typically). Rather than pointing browsers at that upstream host, we
 //! serve each image — original and thumbnail — from our own `GET /media/{key}`
-//! endpoint. This module walks every image in a [`MemoryFactStore`], resolves
+//! endpoint. This module walks every image in the store, resolves
 //! each one into a pair of media-store keys, and returns the map the API's
 //! read path consumes (`AppState::image_media`).
 //!
@@ -34,11 +34,12 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chronoscope_api::state::ResolvedImageMedia;
+use chronoscope_api::state::{
+    ResolvedImageMedia, placeholder_storage_key, placeholder_thumbnail_key,
+};
 use chronoscope_core::projection::{member_lineage, project_image};
-use chronoscope_core::store::memory::{MemoryError, MemoryFactStore, MemoryImageId};
 use chronoscope_core::store::schema::ImageStream;
-use chronoscope_core::store::{FactStore, ImageView};
+use chronoscope_core::store::{FactStore, ImageIdOf, ImageView};
 use chronoscope_core::typed;
 use chronoscope_db::media_store::MediaStore;
 use chronoscope_workers::url_fetcher::{ContentType, detect_content_type, store_image};
@@ -94,18 +95,22 @@ const WALK_PAGE: NonZeroUsize = match NonZeroUsize::new(256) {
 /// `http_client` is consulted only in [`ImageResolveMode::Fetch`]. Failures for
 /// individual images are logged and skipped, so the returned map may be smaller
 /// than the store's image count; the call itself never errors.
-pub async fn resolve_fact_store_images(
-    store: &MemoryFactStore,
+pub async fn resolve_fact_store_images<S>(
+    store: &S,
     media_store: &Arc<dyn MediaStore>,
     http_client: &Arc<dyn HttpClient>,
     mode: ImageResolveMode,
-) -> HashMap<MemoryImageId, ResolvedImageMedia> {
+) -> HashMap<ImageIdOf<S>, ResolvedImageMedia>
+where
+    S: FactStore,
+    ImageIdOf<S>: Copy + std::fmt::Display,
+{
     let mut resolved = HashMap::new();
 
     let mut view = match store.now().await {
         Ok(view) => view,
         Err(e) => {
-            tracing::warn!(error = %e, "fact-store image resolve: snapshot unavailable");
+            tracing::warn!(error = ?e, "fact-store image resolve: snapshot unavailable");
             return resolved;
         }
     };
@@ -113,7 +118,7 @@ pub async fn resolve_fact_store_images(
     let image_ids = match image_representatives(&mut view).await {
         Ok(ids) => ids,
         Err(e) => {
-            tracing::warn!(error = %e, "fact-store image resolve: enumeration failed");
+            tracing::warn!(error = ?e, "fact-store image resolve: enumeration failed");
             return resolved;
         }
     };
@@ -149,12 +154,14 @@ pub async fn resolve_fact_store_images(
 /// Every image's `SameArtifact` representative, deduplicated. Paging by
 /// `next_class` visits each class once; consecutive-row dedup collapses a
 /// class's multiple rows within a page.
-async fn image_representatives<V>(view: &mut V) -> Result<Vec<MemoryImageId>, MemoryError>
+async fn image_representatives<S, V>(view: &mut V) -> Result<Vec<ImageIdOf<S>>, S::Error>
 where
-    V: ImageView<MemoryFactStore> + Sync,
+    S: FactStore,
+    ImageIdOf<S>: Copy,
+    V: ImageView<S> + Sync,
 {
     let mut after = None;
-    let mut ids: Vec<MemoryImageId> = Vec::new();
+    let mut ids: Vec<ImageIdOf<S>> = Vec::new();
     loop {
         let page = view
             .walk_image_classes(&ImageStream::All, after, WALK_PAGE)
@@ -174,18 +181,21 @@ where
 
 /// Resolve one image to its media keys, or `None` when it carries no source URL
 /// to serve.
-async fn resolve_one<V>(
+async fn resolve_one<S, V>(
     view: &mut V,
-    image_id: MemoryImageId,
+    image_id: ImageIdOf<S>,
     media_store: &Arc<dyn MediaStore>,
     http_client: &Arc<dyn HttpClient>,
     mode: ImageResolveMode,
 ) -> Result<Option<ResolvedImageMedia>, Box<dyn std::error::Error + Send + Sync>>
 where
-    V: ImageView<MemoryFactStore> + Sync,
+    S: FactStore,
+    ImageIdOf<S>: Copy + std::fmt::Display,
+    V: ImageView<S> + Sync,
 {
-    let Some((class, projected)) =
-        project_image::<MemoryFactStore, _, _>(&mut *view, image_id, member_lineage).await?
+    let Some((class, projected)) = project_image::<S, _, _>(&mut *view, image_id, member_lineage)
+        .await
+        .map_err(|e| format!("{e:?}"))?
     else {
         return Ok(None);
     };
@@ -309,22 +319,12 @@ fn retry_after(response: &HttpResponse) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-/// Placeholder-mode key for an image's original. Single path segment under
-/// `media/` so `GET /media/{key}` serves it; distinct and stable per image.
-fn placeholder_storage_key(image_id: MemoryImageId) -> String {
-    format!("media/factimg-{}.jpg", image_id.0)
-}
-
-/// Placeholder-mode key for an image's thumbnail.
-fn placeholder_thumbnail_key(image_id: MemoryImageId) -> String {
-    format!("media/factimg-{}-thumb.jpg", image_id.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use bytes::Bytes;
+    use chronoscope_core::store::memory::MemoryFactStore;
     use chronoscope_integrations::MockHttpClient;
     use reqwest::StatusCode;
     use reqwest::header::HeaderMap;

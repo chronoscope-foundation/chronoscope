@@ -20,7 +20,7 @@ pub fn db_err(e: DbError) -> HttpError {
 
 /// Convert a fact-store backend error to an `HttpError`, mirroring [`db_err`].
 ///
-/// Covers both `MemoryFactStore`'s own `Error` and the `listing`/`projection`
+/// Covers any backend's `FactStore::Error` and the `listing`/`projection`
 /// module wrapper errors (`ListError<E>` and friends) — none of them impl
 /// `Display`, so this formats via `Debug`.
 pub fn fact_store_err(e: impl std::fmt::Debug) -> HttpError {

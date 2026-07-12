@@ -95,7 +95,7 @@ async fn cmd_build_db(
 
     // Tear the pool down inside the runtime whatever the outcome, so
     // SpatiaLite's dlclose stays off the process-exit path even on error.
-    let result = ingest_jsonl(&store, input, &run, recorded_at, limit).await;
+    let result = build_and_stamp(&store, input, &run, recorded_at, limit).await;
     store.close().await;
     let stats = result?;
 
@@ -104,6 +104,23 @@ async fn cmd_build_db(
         stats.entities, stats.commits, stats.facts, stats.skipped, stats.issues
     );
     Ok(())
+}
+
+/// Ingest the dump, then stamp the finished artifact with the facts codec
+/// version — the consumer-side mount refuses an unstamped or mismatched DB.
+async fn build_and_stamp(
+    store: &chronoscope_db::SqliteFactStore,
+    input: &Path,
+    run: &chronoscope_core::grammar::ids::IngesterRunId,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+    limit: Option<u64>,
+) -> Result<IngestStats> {
+    let stats = ingest_jsonl(store, input, run, recorded_at, limit).await?;
+    store
+        .stamp_codec_version()
+        .await
+        .context("stamping facts codec version")?;
+    Ok(stats)
 }
 
 /// Stream the JSONL dump into `store` in batches, stopping at `limit` entities.

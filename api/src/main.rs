@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use chronoscope_api::jwt::JwtConfig;
-use chronoscope_api::state::{AppState, Config, default_dns_resolver};
-use chronoscope_core::store::memory::MemoryFactStore;
+use chronoscope_api::state::{AppState, Config, ServerFactStore, default_dns_resolver};
 use chronoscope_db::Database;
 use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,
@@ -33,11 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let jwt = JwtConfig::from_env()?;
     let dns_resolver = default_dns_resolver()?;
 
-    // No production data source feeds the fact store yet — it starts empty.
-    // The entity read endpoints project from it directly; the SQLite
-    // `Database` still exists (auth, research, media) but no longer backs
-    // entity reads. With no images to resolve, the media map is empty.
-    let facts = MemoryFactStore::new();
+    // The fact store rides the same pool as everything else (auth, research,
+    // media) — its tables are part of the one migrated schema, so whatever
+    // facts the database file holds persist across restarts. No boot-time
+    // resolver runs here, so the media map starts empty.
+    let facts = ServerFactStore::new(db.pool_ref().clone());
     let image_media = Arc::new(std::collections::HashMap::new());
 
     // When embedded-media feature is enabled (e.g., dev builds), we need a media store.

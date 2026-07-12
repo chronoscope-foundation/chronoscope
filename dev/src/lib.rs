@@ -9,14 +9,13 @@
 //! - Integration tests (with VCR HTTP client and localhost)
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
-use chronoscope_api::state::{AppState, Config};
-use chronoscope_core::store::memory::MemoryFactStore;
+use chronoscope_api::state::{AppState, Config, ServerFactStore};
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId};
 use chronoscope_workers::analysis::AnalysisWorker;
@@ -54,6 +53,143 @@ fn placeholder_jpeg() -> Result<bytes::Bytes, Box<dyn std::error::Error + Send +
         image::ExtendedColorType::Rgb8,
     )?;
     Ok(bytes::Bytes::from(jpeg_buf.into_inner()))
+}
+
+/// The env var naming the read-only facts database to mount: `just web-dev`
+/// resolves the pinned `fetch-wikidata-db` output into it, and the hermetic
+/// test environment points it at the curated build.
+pub const FACTS_DB_ENV: &str = "CHRONOSCOPE_FACTS_DB";
+
+/// Clone a read-only facts database (a Nix store artifact) into `dest`,
+/// copy-on-write where the filesystem supports it: APFS clonefile via the
+/// system BSD `/bin/cp -c` on macOS — by absolute path, because nix dev
+/// shells put GNU coreutils first in `PATH` and GNU `cp` doesn't know `-c` —
+/// and PATH-resolved `cp --reflink=auto` elsewhere (which itself degrades to
+/// a plain copy on non-reflink filesystems). A failed clone attempt falls
+/// back quietly to a plain copy, so the worst case is a full copy — the
+/// store path itself is never opened read-write; the attempt's stderr
+/// surfaces only if the fallback also fails. The clone is made
+/// user-writable, since the source carries the store's read-only mode.
+pub fn clone_facts_db(source: &Path, dest: &Path) -> Result<(), DevServerError> {
+    let (cp, cow_flag) = if cfg!(target_os = "macos") {
+        ("/bin/cp", "-c")
+    } else {
+        ("cp", "--reflink=auto")
+    };
+    // Capture rather than inherit stderr: an unsupported-filesystem failure
+    // is an expected branch, not console noise.
+    let attempt = std::process::Command::new(cp)
+        .arg(cow_flag)
+        .arg(source)
+        .arg(dest)
+        .output();
+    let clone_failure = match &attempt {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(clone_failure) = clone_failure {
+        std::fs::copy(source, dest).map_err(|e| {
+            DevServerError(format!(
+                "copying facts DB {}: {e} (after the copy-on-write attempt failed: \
+                 {clone_failure})",
+                source.display()
+            ))
+        })?;
+    }
+    let mut perms = std::fs::metadata(dest)
+        .map_err(|e| DevServerError(format!("reading facts DB clone metadata: {e}")))?
+        .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o644);
+    std::fs::set_permissions(dest, perms)
+        .map_err(|e| DevServerError(format!("making facts DB clone writable: {e}")))?;
+    Ok(())
+}
+
+/// The first 16 bytes of every SQLite database file.
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// Validate the mount source before anything clones or opens it: a real,
+/// non-empty SQLite file whose `PRAGMA user_version` stamp matches this
+/// build's [`FACTS_CODEC_VERSION`](chronoscope_db::FACTS_CODEC_VERSION). The
+/// stamp is read straight off the file header (bytes 60..64, big-endian) —
+/// artifacts are checkpointed with no WAL sidecar, so the header is
+/// authoritative — and an unstamped or garbage file fails here with the
+/// fetch command to run, never boots as a silently-empty migrated store.
+fn validate_facts_db_source(source: &Path, subset: &str) -> Result<(), DevServerError> {
+    use std::io::Read;
+
+    let refuse = |what: String| {
+        DevServerError(format!(
+            "facts DB {} {what} — re-fetch it with `just fetch-wikidata-db {subset}`",
+            source.display()
+        ))
+    };
+
+    let len = std::fs::metadata(source)
+        .map_err(|e| refuse(format!("is unreadable ({e})")))?
+        .len();
+    if len < 64 {
+        return Err(refuse(format!(
+            "is not a SQLite database ({len} bytes, shorter than the 64-byte header)"
+        )));
+    }
+    let mut file =
+        std::fs::File::open(source).map_err(|e| refuse(format!("failed to open ({e})")))?;
+    let mut header = [0u8; 64];
+    file.read_exact(&mut header)
+        .map_err(|e| refuse(format!("header read failed ({e})")))?;
+    if &header[0..16] != SQLITE_MAGIC {
+        return Err(refuse(
+            "is not a SQLite database (magic header mismatch)".to_owned(),
+        ));
+    }
+    let stamped = i32::from_be_bytes([header[60], header[61], header[62], header[63]]);
+    if stamped != chronoscope_db::FACTS_CODEC_VERSION {
+        return Err(refuse(format!(
+            "carries facts codec version {stamped}, but this build expects {} \
+             (an unstamped artifact reads 0)",
+            chronoscope_db::FACTS_CODEC_VERSION
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve [`FACTS_DB_ENV`], validate the named artifact
+/// ([`validate_facts_db_source`]), and clone it into `dest_dir`, returning
+/// the clone's `sqlite:` URL for [`DevServerConfig::database_url`]. The
+/// server opens the clone read-write as its whole database — facts plus
+/// mutable test data on top. `subset` names the fetch to run in every
+/// refusal, so a missing, stale, or garbage artifact fails with the exact
+/// command.
+pub fn mount_facts_db(dest_dir: &Path, subset: &str) -> Result<String, DevServerError> {
+    let source = std::env::var(FACTS_DB_ENV).map_err(|_| {
+        DevServerError(format!(
+            "{FACTS_DB_ENV} not set — run inside the web shell (`nix develop .#web`; \
+             `just web-dev` enters it for you), or fetch a facts DB with \
+             `just fetch-wikidata-db {subset}` and export the path"
+        ))
+    })?;
+    let source = PathBuf::from(source);
+    if !source.is_file() {
+        return Err(DevServerError(format!(
+            "{FACTS_DB_ENV}={} is not a file — re-fetch with `just fetch-wikidata-db {subset}`",
+            source.display()
+        )));
+    }
+    validate_facts_db_source(&source, subset)?;
+    let dest = dest_dir.join("facts.db");
+    clone_facts_db(&source, &dest)?;
+    Ok(format!("sqlite:{}", dest.display()))
+}
+
+/// The facts-DB subset in play: `CHRONOSCOPE_FACTS_DB_SUBSET` when set (the
+/// `just web-dev` recipe exports it beside the DB path), else `curated`.
+/// Only used to name the right `just fetch-wikidata-db <subset>` command in
+/// mount refusals.
+pub fn facts_db_subset() -> String {
+    std::env::var("CHRONOSCOPE_FACTS_DB_SUBSET").unwrap_or_else(|_| "curated".to_owned())
 }
 
 /// Error type for dev server setup.
@@ -179,11 +315,6 @@ pub struct DevServerConfig {
     /// Use `default_dns_resolver()` for system DNS or `permissive_dns_resolver()`
     /// for offline environments (e.g., tests).
     pub dns_resolver: Box<dyn chronoscope_api::state::DnsResolver>,
-
-    /// Optional: path to a curated Wikidata `entities.jsonl` snapshot to
-    /// load into the in-memory fact store at startup. `None` starts with an
-    /// empty store.
-    pub wikidata_entities_jsonl: Option<PathBuf>,
 }
 
 /// Find an available port by binding to port 0 and reading the assigned port.
@@ -317,7 +448,7 @@ fn spawn_analysis_worker(
 /// Start the development server with the given configuration.
 ///
 /// This sets up:
-/// - In-memory SQLite database
+/// - The SQLite database (facts + app tables in one file)
 /// - In-memory media store
 /// - System user for workers
 /// - Test user with JWT token (for API authentication)
@@ -460,23 +591,10 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         ..Default::default()
     };
 
-    // Load the curated fact store, if configured; otherwise start empty.
-    let facts = match &config.wikidata_entities_jsonl {
-        Some(path) => {
-            let (facts, stats) = load_curated_fact_store(path)
-                .await
-                .map_err(|e| format!("Failed to load curated fact store: {e}"))?;
-            info!(log, "Loaded curated fact store";
-                "entities" => stats.entities,
-                "commits" => stats.commits,
-                "facts" => stats.facts,
-                "skipped" => stats.skipped,
-                "issues" => stats.issues,
-            );
-            facts
-        }
-        None => MemoryFactStore::new(),
-    };
+    // The fact store rides the same pool as the rest of the schema, so
+    // whatever facts the database file holds — a mounted clone of a
+    // pre-built facts DB, typically — are served as-is; no boot-time ingest.
+    let facts = ServerFactStore::new(db.pool_ref().clone());
 
     // Resolve every fact-store image into the media store, so the read path
     // serves thumbnails and detail images from our own `/media/{key}` rather

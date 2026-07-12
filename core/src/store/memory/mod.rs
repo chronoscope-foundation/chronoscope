@@ -60,7 +60,6 @@ use std::ops::Bound;
 use async_lock::{Mutex, MutexGuard};
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 use crate::grammar::assertions::MetaAssertion;
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
@@ -86,72 +85,23 @@ use self::scan::{
 // Concrete id types
 // ============================================================================
 
-/// Define a `u64`-newtype backend id.
-///
-/// `Copy`/`Ord`/`Hash` for use as an index and map key, a `<prefix>-N` `Display`
-/// for logs, and a wire form that renders the `u64` as a decimal *string* (via
-/// [`Serializer::collect_str`](serde::Serializer::collect_str)). Serializing the
-/// key as a string keeps the read wire's id a `string` for every backend, so no
-/// consumer bakes in an integer-shaped id. `Deserialize` parses that string back
-/// to the `u64`; the `JsonSchema` is a non-referenceable bare `string`, so the
-/// backend's id type name never reaches the OpenAPI spec.
-macro_rules! memory_id {
-    ($name:ident, $prefix:literal, $doc:expr) => {
-        #[doc = $doc]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(pub u64);
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, concat!($prefix, "-{}"), self.0)
-            }
-        }
-
-        impl Serialize for $name {
-            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                serializer.collect_str(&self.0)
-            }
-        }
-
-        impl<'de> Deserialize<'de> for $name {
-            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let s = String::deserialize(deserializer)?;
-                s.parse::<u64>().map(Self).map_err(|e| {
-                    serde::de::Error::custom(format!("invalid {} {s:?}: {e}", stringify!($name)))
-                })
-            }
-        }
-
-        impl JsonSchema for $name {
-            fn schema_name() -> String {
-                <String as JsonSchema>::schema_name()
-            }
-
-            fn json_schema(
-                generator: &mut schemars::r#gen::SchemaGenerator,
-            ) -> schemars::schema::Schema {
-                <String as JsonSchema>::json_schema(generator)
-            }
-
-            fn is_referenceable() -> bool {
-                false
-            }
-        }
-    };
-}
-
-memory_id!(
+// The shared wire convention (canonical decimal-string ids, bare-string
+// schema) lives on `subject_id_newtype!` in `crate::grammar::ids`.
+crate::subject_id_newtype!(
     MemoryEntityId,
+    u64,
     "entity",
     "In-memory entity id — a `u64` newtype minted from the store's entity counter."
 );
-memory_id!(
+crate::subject_id_newtype!(
     MemoryEventId,
+    u64,
     "event",
     "In-memory lifetime-event id — a `u64` newtype minted from the store's event counter."
 );
-memory_id!(
+crate::subject_id_newtype!(
     MemoryImageId,
+    u64,
     "image",
     "In-memory image id — a `u64` newtype minted from the store's image counter."
 );

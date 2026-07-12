@@ -11,7 +11,6 @@ use std::num::NonZeroUsize;
 
 use chronoscope_api_client::{ClickAction, EntityPickerEntry, Marker};
 use chronoscope_core::listing::EntitySummary;
-use chronoscope_core::store::memory::{MemoryEntityId, MemoryImageId};
 use chronoscope_core::typed::{self, find_by_language};
 use dropshot::HttpError;
 
@@ -100,8 +99,8 @@ fn quality_value(segment: &str) -> Option<f64> {
 /// The one display name to show for a viewer's `Accept-Language`: the first name
 /// matching the highest-priority language the viewer requested, else the English
 /// [`DEFAULT_LANGUAGE`], else the first name, `None` for an entity with no names.
-pub fn negotiate_name(
-    names: &[typed::Name<MemoryImageId>],
+pub fn negotiate_name<I>(
+    names: &[typed::Name<I>],
     accept_language: Option<&str>,
 ) -> Option<String> {
     negotiate_name_for_prefixes(names, &parse_accept_language(accept_language))
@@ -112,10 +111,7 @@ pub fn negotiate_name(
 /// The English [`DEFAULT_LANGUAGE`] rides after the viewer's prefixes, so a
 /// header-less request still lands on the English name before the first-listed
 /// fallback.
-fn negotiate_name_for_prefixes(
-    names: &[typed::Name<MemoryImageId>],
-    prefixes: &[String],
-) -> Option<String> {
+fn negotiate_name_for_prefixes<I>(names: &[typed::Name<I>], prefixes: &[String]) -> Option<String> {
     prefixes
         .iter()
         .map(String::as_str)
@@ -135,14 +131,14 @@ fn negotiate_name_for_prefixes(
 /// resolves that id to a URL — kept out of this step because the resolution
 /// reads the fact store.
 ///
-/// Assembling markers per-summary in memory is a stopgap for the in-memory
-/// backend; a real backend paginates and indexes the viewport instead.
-pub fn markers_from_summaries(
-    summaries: Vec<EntitySummary<MemoryEntityId, MemoryImageId>>,
+/// Assembling markers per-summary in memory is a stopgap at dev scale; a
+/// production listing paginates and indexes the viewport instead.
+pub fn markers_from_summaries<E: Clone, I: Clone>(
+    summaries: Vec<EntitySummary<E, I>>,
     accept_language: Option<&str>,
-) -> Vec<(Marker<MemoryEntityId>, Option<MemoryImageId>)> {
+) -> Vec<(Marker<E>, Option<I>)> {
     let prefixes = parse_accept_language(accept_language);
-    let mut coord_groups: EntityGroups = HashMap::new();
+    let mut coord_groups: EntityGroups<E, I> = HashMap::new();
     for summary in summaries {
         let key = (summary.point.lat().to_bits(), summary.point.lon().to_bits());
         coord_groups.entry(key).or_default().push(summary);
@@ -153,7 +149,7 @@ pub fn markers_from_summaries(
         .collect()
 }
 
-type EntityGroups = HashMap<(u64, u64), Vec<EntitySummary<MemoryEntityId, MemoryImageId>>>;
+type EntityGroups<E, I> = HashMap<(u64, u64), Vec<EntitySummary<E, I>>>;
 
 /// One coordinate group's marker: a lone entity selects directly; several
 /// co-located entities disambiguate, sorted by earliest date (undated last).
@@ -161,19 +157,21 @@ type EntityGroups = HashMap<(u64, u64), Vec<EntitySummary<MemoryEntityId, Memory
 /// name, and thumbnail either way. Names are negotiated against `prefixes`.
 /// Returns the representative's thumbnail image id beside the marker for the
 /// handler to resolve.
-fn marker_from_group(
-    mut group: Vec<EntitySummary<MemoryEntityId, MemoryImageId>>,
+fn marker_from_group<E: Clone, I: Clone>(
+    mut group: Vec<EntitySummary<E, I>>,
     prefixes: &[String],
-) -> (Marker<MemoryEntityId>, Option<MemoryImageId>) {
+) -> (Marker<E>, Option<I>) {
     group.sort_by_key(|e| (e.earliest.is_none(), e.earliest));
 
     let click_action = if let [only] = group.as_slice() {
-        ClickAction::Select { entity_id: only.id }
+        ClickAction::Select {
+            entity_id: only.id.clone(),
+        }
     } else {
         let entries = group
             .iter()
             .map(|e| EntityPickerEntry {
-                id: e.id,
+                id: e.id.clone(),
                 name: negotiate_name_for_prefixes(&e.names, prefixes),
             })
             .collect();
@@ -184,11 +182,11 @@ fn marker_from_group(
     // push that creates it — so the sorted group's first entry always exists.
     let representative = &group[0];
     let marker = Marker {
-        id: representative.id,
+        id: representative.id.clone(),
         point: representative.point,
         name: negotiate_name_for_prefixes(&representative.names, prefixes),
         thumbnail_url: None,
         click_action,
     };
-    (marker, representative.thumbnail)
+    (marker, representative.thumbnail.clone())
 }

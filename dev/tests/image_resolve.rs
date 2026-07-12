@@ -34,7 +34,8 @@ async fn curated() -> Result<Option<MemoryFactStore>, BoxError> {
         eprintln!("WIKIDATA_ENTITIES_JSONL unset — skipping resolver coverage test");
         return Ok(None);
     };
-    let (store, _stats) = load_curated_fact_store(std::path::Path::new(&path)).await?;
+    let store = MemoryFactStore::new();
+    load_curated_fact_store(&store, std::path::Path::new(&path)).await?;
     Ok(Some(store))
 }
 

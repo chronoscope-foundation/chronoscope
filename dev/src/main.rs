@@ -21,7 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_api::state::default_dns_resolver;
-use chronoscope_dev::{DevServerConfig, ImageResolveMode, start_dev_server};
+use chronoscope_dev::{
+    DevServerConfig, ImageResolveMode, facts_db_subset, mount_facts_db, start_dev_server,
+};
 use chronoscope_workers::{ApifyConfig, ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::{error, info, warn};
@@ -263,9 +265,15 @@ async fn run_dev_server(
         ApifyConfig::new(api_token)
     });
 
-    // 8. Start the dev server with ngrok URL as CDN base
+    // 8. Mount the pre-built facts DB (a fresh copy-on-write clone of the
+    // artifact `CHRONOSCOPE_FACTS_DB` names) as this run's database. The
+    // TempDir guard cleans up on every exit path, early errors included.
+    let db_dir = tempfile::TempDir::with_prefix("chronoscope-dev-")?;
+    let database_url = mount_facts_db(db_dir.path(), &facts_db_subset())?;
+
+    // 9. Start the dev server with ngrok URL as CDN base
     let server = start_dev_server(DevServerConfig {
-        database_url: None,
+        database_url: Some(database_url),
         http_client,
         worker_idle_backoff: Duration::from_secs(5),
         retry_config: RetryConfig::default(),
@@ -289,10 +297,6 @@ async fn run_dev_server(
         },
         dns_resolver: default_dns_resolver()
             .map_err(|e| format!("Failed to create DNS resolver: {e}"))?,
-        wikidata_entities_jsonl: Some(std::path::PathBuf::from(
-            std::env::var("WIKIDATA_ENTITIES_JSONL")
-                .map_err(|_| "WIKIDATA_ENTITIES_JSONL not set — run inside nix develop")?,
-        )),
     })
     .await
     .map_err(|e| format!("Failed to start dev server: {e}"))?;
@@ -324,6 +328,7 @@ async fn run_dev_server(
 
     // Kill ngrok
     ngrok.kill().ok();
+    drop(db_dir);
 
     Ok(())
 }

@@ -61,6 +61,7 @@ tokio.workspace = true
 # Utilities
 url.workspace = true
 uuid.workspace = true
+tempfile = "3"
 thiserror.workspace = true
 
 # Logging
@@ -97,7 +98,6 @@ tokio-test = "0.4"
 test-with = "0.14"
 
 # Temp dirs (browser profiles, frontend serve dirs)
-tempfile = "3"
 url.workspace = true
 
 # Browser testing (headless Chrome via CDP)

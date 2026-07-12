@@ -249,18 +249,27 @@ clippy target="all":
 # Dev servers and concrete actions.
 # ---------------------------------------------------------------------------
 
-# Start the integrated web dev server (API + Trunk live reload).
-# The binary picks free ports for API + Trunk automatically — no need to
-# kill anything else on common ports.
-web-dev:
+# Start the integrated web dev server (API + Trunk live reload) over a
+# mounted facts DB (curated|1k|100k|full — the pinned fetch-wikidata-db
+# output for that subset, cloned copy-on-write per launch). The binary picks
+# free ports for API + Trunk automatically — no need to kill anything else
+# on common ports.
+web-dev subset="curated":
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _ensure_nix }}
     _ensure_nix
     if [ -z "${IN_NIX_SHELL:-}" ]; then
-        exec nix develop .#web --command just web-dev
+        exec nix develop .#web --command just web-dev "{{ subset }}"
     fi
-    cargo run -p chronoscope-dev --bin web-dev
+    db=".nix-gc-roots/wikidata-facts-db-{{ subset }}/facts.db"
+    if [ ! -f "$db" ]; then
+        echo "error: facts DB '{{ subset }}' is not fetched" >&2
+        echo "run: just fetch-wikidata-db \"{{ subset }}\"" >&2
+        exit 1
+    fi
+    CHRONOSCOPE_FACTS_DB="$PWD/$db" CHRONOSCOPE_FACTS_DB_SUBSET="{{ subset }}" \
+        cargo run -p chronoscope-dev --bin web-dev
 
 # Build the OpenAPI spec (Nix) and report its store path — inspect the contract.
 openapi:

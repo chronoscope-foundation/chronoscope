@@ -2,7 +2,7 @@
 //!
 //! Read side of the fact store, with resolved image URLs: markers carry a
 //! representative thumbnail and entity detail carries an image grid, both
-//! projected from `AppState.facts` (a `MemoryFactStore`) — the single read
+//! projected from `AppState.facts` (a `ServerFactStore`) — the single read
 //! source. No region clustering.
 
 use std::num::NonZeroUsize;
@@ -24,14 +24,13 @@ use chronoscope_core::listing::{self, ListCursor, summaries_in_viewport};
 use chronoscope_core::projection::{
     member_lineage, project_entity, project_entity_images, project_image,
 };
-use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
-use chronoscope_core::store::{EntityView, FactStore, FactView, ImageView};
+use chronoscope_core::store::{EntityIdOf, EntityView, FactStore, FactView, ImageIdOf, ImageView};
 use chronoscope_core::typed;
 
 use crate::cdn;
 use crate::entity_types;
 use crate::limits;
-use crate::state::AppState;
+use crate::state::{AppState, ServerEntityId, ServerFactStore, ServerIds, ServerImageId};
 use crate::validation::{
     bad_request_with_cors, cors_preflight, error_with_cors, fact_store_err,
     internal_error_with_cors, json_with_cors, json_with_cors_vary_language,
@@ -50,12 +49,12 @@ fn accept_language(ctx: &RequestContext<Arc<AppState>>) -> Option<&str> {
 /// The server-internal resume cursor: the fact-store snapshot the listing was
 /// pinned to plus the walk position. Encoded into the opaque wire [`Cursor`]
 /// token via [`encode_cursor`], never exposed structurally.
-type ListState = ListCursor<(MemoryEntityId, FactId)>;
+type ListState = ListCursor<(ServerEntityId, FactId)>;
 
 /// The `/entities/{id}/images` resume cursor: the pinned snapshot plus the
 /// depiction walk's image-class position. Its own version namespace, so a token
 /// minted for the entity listing can't be replayed here.
-type ImagesListState = ListCursor<(MemoryImageId, FactId)>;
+type ImagesListState = ListCursor<(ServerImageId, FactId)>;
 
 /// Version byte prefixing an encoded entity-listing cursor. A token minted under
 /// a different version is rejected rather than misparsed.
@@ -227,17 +226,17 @@ fn request_viewport(
 /// Project an image's `SameArtifact` class to its typed read DTO, or `None` when
 /// no fact ever named the id. Shared by the detail grid and the marker thumbnail
 /// path; a backend error maps to a 500.
-async fn typed_image<V>(
+async fn typed_image<S, V>(
     view: &mut V,
-    image_id: MemoryImageId,
-) -> Result<Option<typed::Image<MemoryEntityId, MemoryImageId>>, HttpError>
+    image_id: ImageIdOf<S>,
+) -> Result<Option<typed::Image<EntityIdOf<S>, ImageIdOf<S>>>, HttpError>
 where
-    V: ImageView<MemoryFactStore> + Sync,
+    S: FactStore,
+    V: ImageView<S> + Sync,
 {
-    let Some((class, projected)) =
-        project_image::<MemoryFactStore, _, _>(&mut *view, image_id, member_lineage)
-            .await
-            .map_err(fact_store_err)?
+    let Some((class, projected)) = project_image::<S, _, _>(&mut *view, image_id, member_lineage)
+        .await
+        .map_err(fact_store_err)?
     else {
         return Ok(None);
     };
@@ -247,13 +246,13 @@ where
 // ==================== Path params ====================
 
 // EntityIdPath is required by Dropshot — Path<T> needs a struct with named
-// fields matching the URL template parameter. `MemoryEntityId` now deserializes
+// fields matching the URL template parameter. `ServerEntityId` deserializes
 // from an opaque string, so the `/entities/5` segment arrives as the string
-// "5" and parses back to the `u64` — and the generated path-param schema is a
-// bare `string`, carrying no backend id type name.
+// "5" and parses back to the backend's integer — and the generated path-param
+// schema is a bare `string`, carrying no backend id type name.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct EntityIdPath {
-    pub id: MemoryEntityId,
+    pub id: ServerEntityId,
 }
 
 // ==================== Endpoints ====================
@@ -328,7 +327,7 @@ pub async fn list_entities(
     let cursor_snapshot = cursor.as_ref().map(|c| c.snapshot);
     let mut view = open_read_view(&state.facts, params.snapshot, cursor_snapshot).await?;
     let page =
-        match summaries_in_viewport::<MemoryFactStore, _>(&mut view, &core_viewport, cursor, limit)
+        match summaries_in_viewport::<ServerFactStore, _>(&mut view, &core_viewport, cursor, limit)
             .await
         {
             Ok(p) => p,
@@ -380,7 +379,7 @@ pub async fn get_entity(
     // An id no committed fact ever named projects as `None` — the fact store's
     // "not found", since a real entity carries at least the fact that minted it.
     let Some((class, projected)) =
-        project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
+        project_entity::<ServerFactStore, _, _>(&mut view, id, member_lineage)
             .await
             .map_err(fact_store_err)?
     else {
@@ -393,11 +392,11 @@ pub async fn get_entity(
     // facts, so the same class is projected again under `cited_lineage`. The id
     // already projected `Some` above, so the cited projection matches; a `None`
     // means the class emptied between the two reads, which carries no conflicts.
-    let conflicts = match project_entity::<MemoryFactStore, _, _>(&mut view, id, cited_lineage)
+    let conflicts = match project_entity::<ServerFactStore, _, _>(&mut view, id, cited_lineage)
         .await
         .map_err(fact_store_err)?
     {
-        Some((_, cited_entity)) => detect_conflicts::<MemoryIds>(&id, &cited_entity),
+        Some((_, cited_entity)) => detect_conflicts::<ServerIds>(&id, &cited_entity),
         None => Vec::new(),
     };
 
@@ -486,7 +485,7 @@ pub async fn get_entity_images(
     let after = cursor.map(|c| c.walk);
 
     let (depictions, next_walk) =
-        project_entity_images::<MemoryFactStore, _>(&mut view, id, after, limit)
+        project_entity_images::<ServerFactStore, _>(&mut view, id, after, limit)
             .await
             .map_err(fact_store_err)?;
 
@@ -584,7 +583,7 @@ pub async fn list_markers(
 
     let mut view = open_read_view(&state.facts, params.snapshot, None).await?;
     let page =
-        match summaries_in_viewport::<MemoryFactStore, _>(&mut view, &core_viewport, None, limit)
+        match summaries_in_viewport::<ServerFactStore, _>(&mut view, &core_viewport, None, limit)
             .await
         {
             Ok(p) => p,
@@ -732,9 +731,11 @@ mod tests {
         // strings), so only the version byte separates them. An `/entities`
         // cursor must be refused by the images decoder, never silently misparsed
         // into an image walk position.
+        // Constructed concretely: a raw id mints only from the backend type;
+        // the alias flip updates this fixture alongside the store pick.
         let entity_cursor = encode_cursor(&ListCursor {
             snapshot: FactId::new(0),
-            walk: (MemoryEntityId(1), FactId::new(2)),
+            walk: (chronoscope_db::SqliteEntityId(1), FactId::new(2)),
         })
         .map_err(|e| format!("{e:?}"))?;
         assert_rejected_400(decode_images_cursor(&entity_cursor))
@@ -745,9 +746,10 @@ mod tests {
         // A cursor and a snapshot are shape-identical opaque strings; only the
         // version byte separates them. An entity-listing cursor (version 1) fed
         // as a snapshot must be refused, never misread as a read watermark.
+        // Constructed concretely: a raw id mints only from the backend type.
         let entity_cursor = encode_cursor(&ListCursor {
             snapshot: FactId::new(0),
-            walk: (MemoryEntityId(1), FactId::new(2)),
+            walk: (chronoscope_db::SqliteEntityId(1), FactId::new(2)),
         })
         .map_err(|e| format!("{e:?}"))?;
         let as_snapshot = Snapshot::new(entity_cursor.as_str().to_string());
@@ -772,7 +774,11 @@ mod tests {
         // so a future value would yield a view that silently grows as writes
         // land — the loud 400 stops that. Runs only on the standalone-snapshot
         // branch (no cursor).
-        let facts = MemoryFactStore::new();
+        // An empty store through the server's backend alias — one operation,
+        // no held views, so `sqlite::memory:` suffices here.
+        let facts = ServerFactStore::open("sqlite::memory:")
+            .await
+            .map_err(|e| format!("{e:?}"))?;
         let future = encode_snapshot(FactId::new(1)).map_err(|e| format!("{e:?}"))?;
         let result = open_read_view(&facts, Some(future), None).await;
         assert_rejected_400(result.map(|_| ()))

@@ -10,13 +10,16 @@
 //! Or via justfile:
 //!   just web-dev
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_api::state::permissive_dns_resolver;
-use chronoscope_dev::{DevServerConfig, ImageResolveMode, find_available_port, start_dev_server};
+use chronoscope_dev::{
+    DevServerConfig, ImageResolveMode, facts_db_subset, find_available_port, mount_facts_db,
+    start_dev_server,
+};
 use chronoscope_workers::{ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::info;
@@ -42,20 +45,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(log, "API server will bind to port {}", api_port);
     info!(log, "Trunk will bind to port {}", trunk_port);
 
-    // 2. Curated Wikidata entities.jsonl for the fact store.
-    let wikidata_entities_jsonl = PathBuf::from(
-        std::env::var("WIKIDATA_ENTITIES_JSONL")
-            .map_err(|_| "WIKIDATA_ENTITIES_JSONL not set — run inside nix develop")?,
-    );
-
-    // 3. Fresh file-backed SQLite DB for this run — the pool reaps idle
-    // connections, and a shared-cache in-memory DB would vanish with its last
-    // one during a quiet stretch. A dedicated directory because SQLite writes
-    // -wal/-shm siblings next to the .db; removed on shutdown.
-    let db_dir = std::env::temp_dir().join(format!("chronoscope-web-dev-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&db_dir)?;
-    let database_url = format!("sqlite:{}", db_dir.join("web-dev.db").display());
-    info!(log, "Database at {}", db_dir.join("web-dev.db").display());
+    // 2. Mount the pre-built facts DB: a fresh copy-on-write clone of the
+    // read-only artifact `CHRONOSCOPE_FACTS_DB` names (resolved by
+    // `just web-dev [subset]` from the pinned fetch), opened read-write as
+    // this run's whole database. A TempDir guard because SQLite writes
+    // -wal/-shm siblings next to the .db; dropping it cleans up on every
+    // exit path, early errors included.
+    let db_dir = tempfile::TempDir::with_prefix("chronoscope-web-dev-")?;
+    let database_url = mount_facts_db(db_dir.path(), &facts_db_subset())?;
+    info!(log, "Facts DB clone at {database_url}");
 
     // 4. Start the API server
     let http_client =
@@ -77,7 +75,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         apify_config: None,
         triton: None,
         dns_resolver: permissive_dns_resolver(),
-        wikidata_entities_jsonl: Some(wikidata_entities_jsonl),
     })
     .await
     .map_err(|e| format!("Failed to start API server: {e}"))?;
@@ -111,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(log, "Shutting down...");
     trunk.kill().ok();
     server.shutdown().await;
-    std::fs::remove_dir_all(&db_dir).ok();
+    drop(db_dir);
 
     Ok(())
 }

@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chronoscope_api_client::client::{ApiError, AuthClient};
-use chronoscope_core::store::memory::{MemoryFactStore, MemoryImageId};
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{
@@ -44,7 +43,22 @@ use crate::auth::{
 use crate::jwt::JwtConfig;
 use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
 use crate::research_types::{FollowedUrlSummary, ResearchUrlDossier, ResearchUrlSummary};
-use crate::state::{AppState, Config, DnsResolver, ResolvedImageMedia, SAFE_PUBLIC_IP};
+use crate::state::{
+    AppState, Config, DnsResolver, ResolvedImageMedia, SAFE_PUBLIC_IP, ServerFactStore,
+    ServerImageId,
+};
+
+/// A fresh file-backed fact store per test, plus the tempdir holding it.
+/// Views hold read transactions for their lifetime, and only a file-backed
+/// database gives WAL's reader/writer independence — a shared-cache in-memory
+/// database serializes them at table locks.
+async fn fresh_fact_store()
+-> Result<(ServerFactStore, tempfile::TempDir), Box<dyn std::error::Error + Send + Sync>> {
+    let dir = tempfile::tempdir()?;
+    let url = format!("sqlite:{}", dir.path().join("facts.sqlite3").display());
+    let store = ServerFactStore::open(&url).await?;
+    Ok((store, dir))
+}
 
 // ==================== Test Utilities ====================
 
@@ -117,6 +131,9 @@ struct TestContext {
     /// The server runs in a background task and is dropped when `TestContext` is dropped.
     #[allow(dead_code)]
     server: dropshot::HttpServer<Arc<AppState>>,
+    /// The tempdir holding the fact store's database file, kept alive for the
+    /// test's duration.
+    _facts_dir: tempfile::TempDir,
 }
 
 impl TestContext {
@@ -142,12 +159,14 @@ impl TestContext {
     async fn with_media_store()
     -> Result<(Self, Arc<InMemoryMediaStore>), Box<dyn std::error::Error + Send + Sync>> {
         let media_store = Arc::new(InMemoryMediaStore::new());
+        let (facts, facts_dir) = fresh_fact_store().await?;
         let ctx = Self::with_options_and_media(
             None,
             None,
             None,
             Some(media_store.clone()),
-            MemoryFactStore::new(),
+            facts,
+            facts_dir,
             Arc::new(HashMap::new()),
         )
         .await?;
@@ -159,7 +178,7 @@ impl TestContext {
         jwt_config: Option<JwtConfig>,
         dns_resolver: Option<TestResolver>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let facts = MemoryFactStore::new();
+        let (facts, facts_dir) = fresh_fact_store().await?;
         let image_media = Arc::new(HashMap::new());
         #[cfg(feature = "embedded-media")]
         return Self::with_options_and_media(
@@ -168,6 +187,7 @@ impl TestContext {
             dns_resolver,
             None,
             facts,
+            facts_dir,
             image_media,
         )
         .await;
@@ -177,6 +197,7 @@ impl TestContext {
             jwt_config,
             dns_resolver,
             facts,
+            facts_dir,
             image_media,
         )
         .await;
@@ -184,17 +205,20 @@ impl TestContext {
 
     /// Build a context around a pre-populated fact store and its resolved image
     /// media map. Image-resolution tests commit their facts (and mint image ids)
-    /// before the server exists, then hand the store and a matching media map in
-    /// — mirroring the startup path where images resolve before `AppState`.
+    /// before the server exists, then hand the store, the tempdir holding its
+    /// database file, and a matching media map in — mirroring the startup path
+    /// where images resolve before `AppState`.
     async fn with_facts_and_image_media(
-        facts: MemoryFactStore,
-        image_media: HashMap<MemoryImageId, ResolvedImageMedia>,
+        facts: ServerFactStore,
+        facts_dir: tempfile::TempDir,
+        image_media: HashMap<ServerImageId, ResolvedImageMedia>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let image_media = Arc::new(image_media);
         #[cfg(feature = "embedded-media")]
-        return Self::with_options_and_media(None, None, None, None, facts, image_media).await;
+        return Self::with_options_and_media(None, None, None, None, facts, facts_dir, image_media)
+            .await;
         #[cfg(not(feature = "embedded-media"))]
-        return Self::with_options_and_media(None, None, None, facts, image_media).await;
+        return Self::with_options_and_media(None, None, None, facts, facts_dir, image_media).await;
     }
 
     async fn with_options_and_media(
@@ -202,8 +226,9 @@ impl TestContext {
         jwt_config: Option<JwtConfig>,
         dns_resolver: Option<TestResolver>,
         #[cfg(feature = "embedded-media")] media_store: Option<Arc<InMemoryMediaStore>>,
-        facts: MemoryFactStore,
-        image_media: Arc<HashMap<MemoryImageId, ResolvedImageMedia>>,
+        facts: ServerFactStore,
+        facts_dir: tempfile::TempDir,
+        image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = jwt_config.unwrap_or_else(|| {
             JwtConfig::new(
@@ -275,6 +300,7 @@ impl TestContext {
             client,
             app_state,
             server,
+            _facts_dir: facts_dir,
         })
     }
 

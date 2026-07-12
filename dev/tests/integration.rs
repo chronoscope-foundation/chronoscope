@@ -81,6 +81,9 @@ fn vcr_mode() -> CacheMode {
 struct TestServer {
     server: RunningDevServer,
     auth: AuthClient,
+    /// The tempdir holding the server's database file, kept alive for the
+    /// harness's duration.
+    _db_dir: tempfile::TempDir,
 }
 
 impl TestServer {
@@ -117,8 +120,14 @@ impl TestServer {
         let port = chronoscope_dev::find_available_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
 
+        // Fresh file-backed SQLite DB per harness — the fact store's views
+        // hold read transactions, which a shared-cache in-memory database
+        // would serialize at table locks.
+        let db_dir = tempfile::tempdir()?;
+        let database_url = format!("sqlite:{}", db_dir.path().join("test.db").display());
+
         let server = start_dev_server(DevServerConfig {
-            database_url: None,
+            database_url: Some(database_url),
             http_client,
             worker_idle_backoff: Duration::from_millis(50),
             retry_config: RetryConfig {
@@ -137,15 +146,17 @@ impl TestServer {
             apify_config,
             triton,
             dns_resolver: permissive_dns_resolver(),
-            // URL-fetch pipeline tests don't need fact-store data.
-            wikidata_entities_jsonl: None,
         })
         .await?;
 
         let client = Client::new(base_url);
         let auth = AuthClient::new(client, server.auth_token.clone());
 
-        Ok(Self { server, auth })
+        Ok(Self {
+            server,
+            auth,
+            _db_dir: db_dir,
+        })
     }
 
     /// Submit a URL for research.

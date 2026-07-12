@@ -262,17 +262,13 @@ impl WebTest {
         let http_client: Arc<dyn chronoscope_workers::HttpClient> =
             Arc::new(chronoscope_workers::ReqwestClient::new()?);
 
-        // Fresh file-backed SQLite DB per test — the pool reaps idle
-        // connections, and a shared-cache in-memory DB would vanish with its
-        // last one during a long suite run. TempDir so the -wal/-shm siblings
-        // SQLite writes next to the .db are cleaned up together.
+        // Fresh copy-on-write clone of the curated facts DB per test (the
+        // artifact `CHRONOSCOPE_FACTS_DB` names, provided by the nix test
+        // env), opened read-write as the test's whole database. TempDir so
+        // the -wal/-shm siblings SQLite writes next to the .db are cleaned
+        // up together.
         let db_dir = tempfile::tempdir()?;
-        let database_url = format!("sqlite:{}", db_dir.path().join("web-test.db").display());
-
-        let wikidata_entities_jsonl = PathBuf::from(
-            std::env::var("WIKIDATA_ENTITIES_JSONL")
-                .map_err(|_| "WIKIDATA_ENTITIES_JSONL not set \u{2014} run inside nix develop")?,
-        );
+        let database_url = chronoscope_dev::mount_facts_db(db_dir.path(), "curated")?;
 
         let server = start_dev_server(DevServerConfig {
             database_url: Some(database_url),
@@ -290,7 +286,6 @@ impl WebTest {
             apify_config: None,
             triton: None,
             dns_resolver: chronoscope_api::state::permissive_dns_resolver(),
-            wikidata_entities_jsonl: Some(wikidata_entities_jsonl),
         })
         .await?;
 
