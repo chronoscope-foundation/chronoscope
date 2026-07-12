@@ -47,6 +47,10 @@ pub struct EntityDetail<E: Ord, V, I> {
     pub entity: typed::Entity<E, V, I>,
     pub display_name: Option<String>,
     pub conflicts: Vec<AnyConflictReport<E, V>>,
+    /// The read-consistency point this projection was served at. Thread it back
+    /// as `?snapshot=` on the images sub-resource so the grid reads the same
+    /// state as this detail.
+    pub snapshot: Snapshot,
 }
 
 /// One image in an entity's detail grid: the id it is keyed by, the URL the
@@ -127,6 +131,33 @@ impl std::fmt::Display for Cursor {
     }
 }
 
+/// An opaque read-consistency handle a client can pin its reads to. Every read
+/// DTO echoes the point it was served at as one of these; a client threads it
+/// back as `?snapshot=` so a multi-request view (entity detail plus its images)
+/// reads one stable state even as the store advances. Its contents — a position
+/// in the append-only log — are server-internal and never inspected
+/// client-side. Distinct from [`Cursor`]: a snapshot pins *where* to read, a
+/// cursor pins where a paginated walk resumes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct Snapshot(String);
+
+impl Snapshot {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// One page of a `GET /entities` viewport listing: the summaries gathered this
 /// page and the opaque [`Cursor`] for the next, `None` once the viewport is
 /// exhausted.
@@ -135,6 +166,9 @@ impl std::fmt::Display for Cursor {
 pub struct EntityListPage<E, I> {
     pub summaries: Vec<listing::EntitySummary<E, I>>,
     pub next: Option<Cursor>,
+    /// The read-consistency point this page was served at. Thread it back as
+    /// `?snapshot=` to pin a follow-up read to the same state.
+    pub snapshot: Snapshot,
 }
 
 /// One page of an entity's depicting images: the resolved [`DetailImage`] tiles
@@ -146,6 +180,10 @@ pub struct EntityListPage<E, I> {
 pub struct EntityImagesPage<I> {
     pub images: Vec<DetailImage<I>>,
     pub next: Option<Cursor>,
+    /// The read-consistency point this page was served at, echoing the
+    /// `?snapshot=` the client pinned to (or the live point, first page
+    /// unpinned).
+    pub snapshot: Snapshot,
 }
 
 // ==================== Unified Markers ====================
@@ -199,6 +237,9 @@ pub struct MarkersResponse<E> {
     pub markers: Vec<Marker<E>>,
     /// True if results were truncated at the server limit.
     pub truncated: bool,
+    /// The read-consistency point these markers were served at. Thread it back
+    /// as `?snapshot=` to pin a follow-up read to the same state.
+    pub snapshot: Snapshot,
 }
 
 #[cfg(test)]

@@ -350,7 +350,7 @@ async fn get_entity_images_is_empty_for_an_entity_with_no_depiction() -> TestRes
 
     let page = ctx
         .client
-        .get_entity_images(&wire_entity_id(id), image_page_size()?, None)
+        .get_entity_images(&wire_entity_id(id), image_page_size()?, None, None)
         .await?;
     assert!(
         page.images.is_empty(),
@@ -377,7 +377,7 @@ async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult
 
     let page = ctx
         .client
-        .get_entity_images(&wire_entity_id(id), image_page_size()?, None)
+        .get_entity_images(&wire_entity_id(id), image_page_size()?, None, None)
         .await?;
 
     let image = page.images.first().ok_or("expected one detail image")?;
@@ -418,7 +418,7 @@ async fn get_entity_images_skips_a_depiction_whose_image_is_unresolved() -> Test
 
     let page = ctx
         .client
-        .get_entity_images(&wire_entity_id(id), image_page_size()?, None)
+        .get_entity_images(&wire_entity_id(id), image_page_size()?, None, None)
         .await?;
     assert!(
         page.images.is_empty(),
@@ -597,7 +597,7 @@ async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult
     // Page 1 caps at one image and hands back a cursor while images remain.
     let page1 = ctx
         .client
-        .get_entity_images(&wire_entity_id(id), one, None)
+        .get_entity_images(&wire_entity_id(id), one, None, None)
         .await?;
     assert_eq!(
         page1.images.len(),
@@ -619,7 +619,7 @@ async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult
     while let Some(c) = cursor.take() {
         let page = ctx
             .client
-            .get_entity_images(&wire_entity_id(id), one, Some(&c))
+            .get_entity_images(&wire_entity_id(id), one, Some(&c), None)
             .await?;
         for tile in &page.images {
             assert!(
@@ -662,7 +662,7 @@ async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> 
     // Page 1 pins its snapshot into the cursor it hands back.
     let page1 = ctx
         .client
-        .get_entity_images(&wire_entity_id(id), one, None)
+        .get_entity_images(&wire_entity_id(id), one, None, None)
         .await?;
     let mut seen: BTreeSet<String> = page1
         .images
@@ -691,7 +691,7 @@ async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> 
         // 400 into an `Err` the `?` would surface.
         let page = ctx
             .client
-            .get_entity_images(&wire_entity_id(id), one, Some(&c))
+            .get_entity_images(&wire_entity_id(id), one, Some(&c), None)
             .await?;
         for tile in &page.images {
             assert!(
@@ -1309,5 +1309,179 @@ async fn list_entities_resume_reads_the_pinned_snapshot_despite_writes() -> Test
         seen.is_disjoint(&intruders),
         "entities committed after the cursor's snapshot must not surface mid-walk"
     );
+    Ok(())
+}
+
+// ==================== snapshot pinning ====================
+
+#[tokio::test]
+async fn list_entities_reads_only_the_pinned_snapshots_entities() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let bbox = "min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
+
+    // One entity in the box, then capture the point the listing was served at.
+    let alpha = commit_named_entity_at(&ctx.app_state.facts, "Alpha", 43.771, 11.251).await?;
+    let page: EntityListPage<MemoryEntityId, MemoryImageId> =
+        ctx.get(&format!("/entities?{bbox}")).await?.json().await?;
+    let s1 = page.snapshot;
+
+    // A second in-box entity lands after the snapshot.
+    let beta = commit_named_entity_at(&ctx.app_state.facts, "Beta", 43.772, 11.252).await?;
+
+    // Re-reading pinned at S1 sees only Alpha.
+    let pinned: EntityListPage<MemoryEntityId, MemoryImageId> = ctx
+        .get(&format!("/entities?{bbox}&snapshot={}", s1.as_str()))
+        .await?
+        .json()
+        .await?;
+    let pinned_ids: BTreeSet<MemoryEntityId> = pinned.summaries.iter().map(|s| s.id).collect();
+    assert_eq!(
+        pinned_ids,
+        BTreeSet::from([alpha]),
+        "a read pinned at S1 sees only the entity that existed then, not Beta"
+    );
+
+    // The live read sees both — so the snapshot, not the bbox, excludes Beta.
+    let live: EntityListPage<MemoryEntityId, MemoryImageId> =
+        ctx.get(&format!("/entities?{bbox}")).await?.json().await?;
+    let live_ids: BTreeSet<MemoryEntityId> = live.summaries.iter().map(|s| s.id).collect();
+    assert_eq!(
+        live_ids,
+        BTreeSet::from([alpha, beta]),
+        "the live read sees both, proving S1 is what held Beta back"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn entity_images_at_the_detail_snapshot_exclude_later_writes() -> TestResult {
+    // The web panel reads entity detail, then its images as a second request.
+    // Pinning the images fetch to the detail's snapshot keeps the grid from
+    // showing depictions committed between the two requests.
+    let facts = MemoryFactStore::new();
+    let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Original.jpg";
+    let (id, original) =
+        commit_entity_with_depicted_image(&facts, "Pantheon", 41.8986, 12.4769, src).await?;
+    // Media for a range past the first image, so a later intruder *would* resolve
+    // into a tile if the read weren't pinned — making the pin the sole reason it
+    // doesn't.
+    let media: HashMap<MemoryImageId, ResolvedImageMedia> = (0..4u64)
+        .map(|i| {
+            let image_id = MemoryImageId(i);
+            (image_id, resolved_media(image_id))
+        })
+        .collect();
+    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+
+    // Detail read pins the snapshot the panel threads into the grid.
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
+    let snapshot = detail.snapshot;
+
+    // A second depiction lands after the detail read.
+    let intruder = commit_extra_depiction_on(
+        &ctx.app_state.facts,
+        id,
+        "https://commons.wikimedia.org/intruder.jpg",
+    )
+    .await?;
+
+    // Grid pinned to the detail's snapshot: only the original tile.
+    let pinned = ctx
+        .client
+        .get_entity_images(
+            &wire_entity_id(id),
+            image_page_size()?,
+            None,
+            Some(&snapshot),
+        )
+        .await?;
+    let pinned_ids: BTreeSet<String> = pinned
+        .images
+        .iter()
+        .map(|t| t.id.as_str().to_string())
+        .collect();
+    assert_eq!(
+        pinned_ids,
+        BTreeSet::from([original.0.to_string()]),
+        "the grid pinned to the detail's snapshot shows only the depiction that existed then"
+    );
+
+    // The live grid shows both, proving the pin is what excludes the intruder.
+    let live = ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), image_page_size()?, None, None)
+        .await?;
+    let live_ids: BTreeSet<String> = live
+        .images
+        .iter()
+        .map(|t| t.id.as_str().to_string())
+        .collect();
+    assert_eq!(
+        live_ids,
+        BTreeSet::from([original.0.to_string(), intruder.0.to_string()]),
+        "the live grid shows the intruder too, so the pin is what held it back"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_images_cursor_and_snapshot_must_agree() -> TestResult {
+    let facts = MemoryFactStore::new();
+    // Two depictions so limit=1 hands back a resume cursor pinned at S1.
+    let (id, _image_ids) =
+        commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 2).await?;
+    let media: HashMap<MemoryImageId, ResolvedImageMedia> = (0..8u64)
+        .map(|i| {
+            let image_id = MemoryImageId(i);
+            (image_id, resolved_media(image_id))
+        })
+        .collect();
+    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    let one = NonZeroU32::new(1).ok_or("nonzero")?;
+
+    // Page 1 mints a cursor pinned at S1 and echoes S1.
+    let page1 = ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), one, None, None)
+        .await?;
+    let s1 = page1.snapshot;
+    let cursor = page1
+        .next
+        .ok_or("page 1 carries a cursor while images remain")?;
+
+    // Advance the store, then read fresh to mint a *different* snapshot S2.
+    commit_extra_depiction_on(
+        &ctx.app_state.facts,
+        id,
+        "https://commons.wikimedia.org/later.jpg",
+    )
+    .await?;
+    let s2 = ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), one, None, None)
+        .await?
+        .snapshot;
+    assert_ne!(
+        s1, s2,
+        "the store advanced, so the fresh read pins a later snapshot"
+    );
+
+    // Cursor + its own snapshot: accepted (the two agree).
+    ctx.client
+        .get_entity_images(&wire_entity_id(id), one, Some(&cursor), Some(&s1))
+        .await?;
+
+    // Cursor + a mismatched snapshot: a loud 400.
+    match ctx
+        .client
+        .get_entity_images(&wire_entity_id(id), one, Some(&cursor), Some(&s2))
+        .await
+    {
+        Ok(_) => return Err("a snapshot mismatched with the cursor must 400".into()),
+        Err(ApiError::Api { status, .. }) => assert_eq!(status, 400),
+        Err(ApiError::Request(e)) => {
+            return Err(format!("expected an API 400, got a transport error: {e}").into());
+        }
+    }
     Ok(())
 }

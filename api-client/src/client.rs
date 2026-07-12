@@ -20,7 +20,7 @@ use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-use crate::entities::{Cursor, EntityDetail, EntityImagesPage, MarkersResponse};
+use crate::entities::{Cursor, EntityDetail, EntityImagesPage, MarkersResponse, Snapshot};
 use crate::ids::{Email, EntityId, EventId, ImageId, ResearchUrlId};
 use crate::pagination::{PageToken, ResultsPage};
 use crate::users::{UpdateUserRequest, UserResponse};
@@ -114,12 +114,15 @@ impl Client {
 
     /// Fetch one page of the images depicting an entity, resolved into detail
     /// tiles. `cursor` is `None` for the first page, then the previous page's
-    /// `next`. The server clamps `limit` to its own maximum.
+    /// `next`. `snapshot` pins the read to a point (typically the detail
+    /// response's `snapshot`) so the grid reads the same state as the detail;
+    /// `None` reads the live point. The server clamps `limit` to its own maximum.
     pub async fn get_entity_images(
         &self,
         id: &EntityId,
         limit: NonZeroU32,
         cursor: Option<&Cursor>,
+        snapshot: Option<&Snapshot>,
     ) -> Result<EntityImagesPage<ImageId>, ApiError> {
         let mut url = format!(
             "{}/entities/{}/images?limit={limit}",
@@ -129,6 +132,10 @@ impl Client {
         if let Some(cursor) = cursor {
             url.push_str("&cursor=");
             url.push_str(cursor.as_str());
+        }
+        if let Some(snapshot) = snapshot {
+            url.push_str("&snapshot=");
+            url.push_str(snapshot.as_str());
         }
         self.get_json(&url).await
     }

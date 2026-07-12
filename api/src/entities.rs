@@ -15,7 +15,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use chronoscope_api_client::{
-    Cursor, DetailImage, EntityDetail, EntityImagesPage, EntityListPage, MarkersResponse,
+    Cursor, DetailImage, EntityDetail, EntityImagesPage, EntityListPage, MarkersResponse, Snapshot,
 };
 use chronoscope_core::conflicts::{cited_lineage, detect_conflicts};
 use chronoscope_core::geo;
@@ -68,36 +68,64 @@ const CURSOR_VERSION: u8 = 1;
 /// tells them apart.
 const IMAGES_CURSOR_VERSION: u8 = 2;
 
-/// Encode an internal cursor state into the opaque wire token: a `version` byte
-/// then its JSON form, base64url-encoded. Each cursor family owns its own
-/// version byte, so this is the one place the wire envelope lives.
-fn encode_cursor_blob<T: serde::Serialize>(version: u8, state: &T) -> Result<Cursor, HttpError> {
+/// Version byte prefixing an encoded read [`Snapshot`]. Distinct from the two
+/// cursor versions so a snapshot token can't be replayed as a cursor (whose
+/// walk payload it lacks) nor a cursor mistaken for a snapshot — the version
+/// byte is what keeps the three token families apart.
+const SNAPSHOT_VERSION: u8 = 3;
+
+/// The opaque-token wire envelope: a `version` byte then the value's JSON form,
+/// base64url-encoded. Each token family (cursors, snapshots) owns a version
+/// byte, so this is the one place the envelope lives; `noun` names the family
+/// for the diagnostic.
+fn encode_blob<T: serde::Serialize>(
+    version: u8,
+    noun: &str,
+    value: &T,
+) -> Result<String, HttpError> {
     let mut bytes = vec![version];
-    serde_json::to_writer(&mut bytes, state)
-        .map_err(|e| internal_error_with_cors(format!("cursor encode failed: {e}")))?;
-    Ok(Cursor::new(BASE64_URL_SAFE_NO_PAD.encode(&bytes)))
+    serde_json::to_writer(&mut bytes, value)
+        .map_err(|e| internal_error_with_cors(format!("{noun} encode failed: {e}")))?;
+    Ok(BASE64_URL_SAFE_NO_PAD.encode(&bytes))
 }
 
-/// Decode an opaque wire token back into a cursor state. A malformed blob or a
-/// token from a different `version` surfaces as a CORS-tagged 400 the browser
-/// can read. The inverse of [`encode_cursor_blob`].
+/// Decode an opaque wire token back into its value. A malformed blob or a token
+/// from a different `version` surfaces as a CORS-tagged 400 the browser can
+/// read. The inverse of [`encode_blob`]; `noun` names the family for the
+/// diagnostic.
+fn decode_blob<T: serde::de::DeserializeOwned>(
+    version: u8,
+    noun: &str,
+    token: &str,
+) -> Result<T, HttpError> {
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|e| bad_request_with_cors(format!("Invalid {noun}: {e}")))?;
+    let (&found, payload) = bytes
+        .split_first()
+        .ok_or_else(|| bad_request_with_cors(format!("Invalid {noun}: empty token")))?;
+    if found != version {
+        return Err(bad_request_with_cors(format!(
+            "Invalid {noun}: unsupported version {found}"
+        )));
+    }
+    serde_json::from_slice(payload)
+        .map_err(|e| bad_request_with_cors(format!("Invalid {noun}: {e}")))
+}
+
+/// Encode a cursor state into the opaque wire token, tagged with its family's
+/// `version` byte.
+fn encode_cursor_blob<T: serde::Serialize>(version: u8, state: &T) -> Result<Cursor, HttpError> {
+    Ok(Cursor::new(encode_blob(version, "cursor", state)?))
+}
+
+/// Decode an opaque wire token back into a cursor state, requiring its family's
+/// `version` byte.
 fn decode_cursor_blob<T: serde::de::DeserializeOwned>(
     version: u8,
     cursor: &Cursor,
 ) -> Result<T, HttpError> {
-    let bytes = BASE64_URL_SAFE_NO_PAD
-        .decode(cursor.as_str())
-        .map_err(|e| bad_request_with_cors(format!("Invalid cursor: {e}")))?;
-    let (&found, payload) = bytes
-        .split_first()
-        .ok_or_else(|| bad_request_with_cors("Invalid cursor: empty token".to_string()))?;
-    if found != version {
-        return Err(bad_request_with_cors(format!(
-            "Invalid cursor: unsupported version {found}"
-        )));
-    }
-    serde_json::from_slice(payload)
-        .map_err(|e| bad_request_with_cors(format!("Invalid cursor: {e}")))
+    decode_blob(version, "cursor", cursor.as_str())
 }
 
 /// Encode the entity-listing resume cursor.
@@ -118,6 +146,65 @@ fn encode_images_cursor(state: &ImagesListState) -> Result<Cursor, HttpError> {
 /// Decode the entity-images resume cursor.
 fn decode_images_cursor(cursor: &Cursor) -> Result<ImagesListState, HttpError> {
     decode_cursor_blob(IMAGES_CURSOR_VERSION, cursor)
+}
+
+/// Encode a read watermark into the opaque client-facing [`Snapshot`] token.
+fn encode_snapshot(id: FactId) -> Result<Snapshot, HttpError> {
+    Ok(Snapshot::new(encode_blob(
+        SNAPSHOT_VERSION,
+        "snapshot",
+        &id,
+    )?))
+}
+
+/// Decode a client-supplied [`Snapshot`] token back into the read watermark it
+/// pins. A cursor token (a different version byte) is refused here, never
+/// misread as a snapshot.
+fn decode_snapshot(snapshot: &Snapshot) -> Result<FactId, HttpError> {
+    decode_blob(SNAPSHOT_VERSION, "snapshot", snapshot.as_str())
+}
+
+/// Open the read view the four entity endpoints share, reconciling an optional
+/// client-supplied `?snapshot=` against a cursor's already-pinned snapshot.
+///
+/// | `snapshot_param` | `cursor_snapshot` | action |
+/// |---|---|---|
+/// | `Some(r)` | `Some(c)`, `r != c` | **400** mismatch |
+/// | `Some(r)` | `Some(c)`, `r == c` | `no_later_than(c)` |
+/// | `None`    | `Some(c)`           | `no_later_than(c)` |
+/// | `Some(r)` | `None`              | `r > next_fact_id()` ⇒ **400** future; else `no_later_than(r)` |
+/// | `None`    | `None`              | `now()` |
+///
+/// The future-check reads `next_fact_id()` only on the standalone-snapshot
+/// branch: a cursor-derived snapshot is one this server minted, always real.
+async fn open_read_view<S: FactStore>(
+    facts: &S,
+    snapshot_param: Option<Snapshot>,
+    cursor_snapshot: Option<FactId>,
+) -> Result<S::View<'_>, HttpError> {
+    let requested = snapshot_param.as_ref().map(decode_snapshot).transpose()?;
+    match (requested, cursor_snapshot) {
+        (Some(r), Some(c)) if r != c => Err(bad_request_with_cors(format!(
+            "snapshot {r} does not match the cursor's pinned snapshot {c}"
+        ))),
+        // Equal-to-cursor or no explicit snapshot: read at the cursor's snapshot.
+        // A cursor is one we minted, so its snapshot is always real — no check.
+        (_, Some(c)) => facts.no_later_than(c).await.map_err(fact_store_err),
+        (Some(r), None) => {
+            // `next_fact_id()` is exact on a single-writer monotonic log. A
+            // multi-node backend (Postgres read-replicas) or a rebuilt store makes
+            // it node-local, so a snapshot a lagging node hasn't reached reads as
+            // future here; pin-aware read routing is the Postgres backend's call.
+            let watermark = facts.next_fact_id().await.map_err(fact_store_err)?;
+            if r > watermark {
+                return Err(bad_request_with_cors(format!(
+                    "snapshot {r} is in the future (store watermark {watermark})"
+                )));
+            }
+            facts.no_later_than(r).await.map_err(fact_store_err)
+        }
+        (None, None) => facts.now().await.map_err(fact_store_err),
+    }
 }
 
 /// Parse the four viewport query fields into the fact store's `Viewport`.
@@ -188,6 +275,11 @@ pub struct EntitiesQueryParams {
     /// page.
     #[serde(default)]
     pub cursor: Option<Cursor>,
+    /// Pin the read to a previously echoed [`Snapshot`]. Absent reads the live
+    /// point; present alongside a `cursor` it must equal the cursor's pinned
+    /// snapshot.
+    #[serde(default)]
+    pub snapshot: Option<Snapshot>,
 }
 
 /// List entities within a geographic bounding box (public, no authentication required).
@@ -228,22 +320,13 @@ pub async fn list_entities(
     let limit = NonZeroUsize::new(requested_limit as usize)
         .ok_or_else(|| bad_request_with_cors("limit must be at least 1".to_string()))?;
 
-    let cursor: Option<ListState> = match params.cursor {
-        None => None,
-        Some(c) => Some(decode_cursor(&c)?),
-    };
+    let cursor: Option<ListState> = params.cursor.as_ref().map(decode_cursor).transpose()?;
 
-    // Resume reads at the cursor's pinned snapshot; the first page reads `now()`.
-    // The log is append-only, so a pinned snapshot stays readable forever — a
-    // cursor is never stale.
-    let mut view = match &cursor {
-        Some(c) => state
-            .facts
-            .no_later_than(c.snapshot)
-            .await
-            .map_err(fact_store_err)?,
-        None => state.facts.now().await.map_err(fact_store_err)?,
-    };
+    // Resume reads at the cursor's pinned snapshot; a bare `?snapshot=` pins a
+    // fresh read; the first page reads `now()`. The log is append-only, so a
+    // pinned snapshot stays readable forever — a cursor is never stale.
+    let cursor_snapshot = cursor.as_ref().map(|c| c.snapshot);
+    let mut view = open_read_view(&state.facts, params.snapshot, cursor_snapshot).await?;
     let page =
         match summaries_in_viewport::<MemoryFactStore, _>(&mut view, &core_viewport, cursor, limit)
             .await
@@ -252,12 +335,26 @@ pub async fn list_entities(
             Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
         };
 
+    // The pinned snapshot the walk latched is echoed here and embedded in
+    // `page.next`, so the DTO's snapshot and the cursor's can't drift apart.
+    let snapshot = encode_snapshot(page.snapshot)?;
     let next = page.next.map(|c| encode_cursor(&c)).transpose()?;
     let response = EntityListPage {
         summaries: page.summaries,
         next,
+        snapshot,
     };
     json_with_cors(&response)
+}
+
+/// Query parameters for the entity detail endpoint.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetEntityQueryParams {
+    /// Pin the read to a previously echoed [`Snapshot`]. Absent reads the live
+    /// point. The response echoes the point it served, which a client threads
+    /// into the images sub-resource so both read one state.
+    #[serde(default)]
+    pub snapshot: Option<Snapshot>,
 }
 
 /// Get a single entity with full detail (public, no authentication required).
@@ -273,11 +370,13 @@ pub async fn list_entities(
 pub async fn get_entity(
     ctx: RequestContext<Arc<AppState>>,
     path: dropshot::Path<EntityIdPath>,
+    query: Query<GetEntityQueryParams>,
 ) -> Result<Response<Body>, HttpError> {
     let state = ctx.context();
     let id = path.into_inner().id;
+    let params = query.into_inner();
 
-    let mut view = state.facts.now().await.map_err(fact_store_err)?;
+    let mut view = open_read_view(&state.facts, params.snapshot, None).await?;
     // An id no committed fact ever named projects as `None` — the fact store's
     // "not found", since a real entity carries at least the fact that minted it.
     let Some((class, projected)) =
@@ -302,11 +401,13 @@ pub async fn get_entity(
         None => Vec::new(),
     };
 
+    let snapshot = view.snapshot().await.map_err(fact_store_err)?;
     let display_name = entity_types::negotiate_name(&entity.names, accept_language(&ctx));
     let detail = EntityDetail {
         entity,
         display_name,
         conflicts,
+        snapshot: encode_snapshot(snapshot)?,
     };
     json_with_cors_vary_language(&detail)
 }
@@ -325,6 +426,12 @@ pub struct EntityImagesQueryParams {
     /// page.
     #[serde(default)]
     pub cursor: Option<Cursor>,
+    /// Pin the read to a previously echoed [`Snapshot`] (typically the entity
+    /// detail's, so the grid reads the detail's state). Absent reads the live
+    /// point; present alongside a `cursor` it must equal the cursor's pinned
+    /// snapshot.
+    #[serde(default)]
+    pub snapshot: Option<Snapshot>,
 }
 
 /// Page the images depicting an entity (public, no authentication required).
@@ -364,22 +471,17 @@ pub async fn get_entity_images(
     let limit = NonZeroUsize::new(effective as usize)
         .ok_or_else(|| bad_request_with_cors("limit must be at least 1".to_string()))?;
 
-    let cursor: Option<ImagesListState> = match params.cursor {
-        None => None,
-        Some(c) => Some(decode_images_cursor(&c)?),
-    };
+    let cursor: Option<ImagesListState> = params
+        .cursor
+        .as_ref()
+        .map(decode_images_cursor)
+        .transpose()?;
 
-    // Resume reads at the cursor's pinned snapshot; the first page reads `now()`.
-    // The log is append-only, so a pinned snapshot stays readable forever — a
-    // cursor is never stale.
-    let mut view = match &cursor {
-        Some(c) => state
-            .facts
-            .no_later_than(c.snapshot)
-            .await
-            .map_err(fact_store_err)?,
-        None => state.facts.now().await.map_err(fact_store_err)?,
-    };
+    // Resume reads at the cursor's pinned snapshot; a bare `?snapshot=` pins a
+    // fresh read; the first page reads `now()`. The log is append-only, so a
+    // pinned snapshot stays readable forever — a cursor is never stale.
+    let cursor_snapshot = cursor.as_ref().map(|c| c.snapshot);
+    let mut view = open_read_view(&state.facts, params.snapshot, cursor_snapshot).await?;
     let snapshot = view.snapshot().await.map_err(fact_store_err)?;
     let after = cursor.map(|c| c.walk);
 
@@ -428,7 +530,11 @@ pub async fn get_entity_images(
     let next = next_walk
         .map(|walk| encode_images_cursor(&ListCursor { snapshot, walk }))
         .transpose()?;
-    let response = EntityImagesPage { images, next };
+    let response = EntityImagesPage {
+        images,
+        next,
+        snapshot: encode_snapshot(snapshot)?,
+    };
     json_with_cors(&response)
 }
 
@@ -444,6 +550,10 @@ pub struct MarkersQueryParams {
     pub max_lat: f64,
     pub min_lon: f64,
     pub max_lon: f64,
+    /// Pin the read to a previously echoed [`Snapshot`]. Absent reads the live
+    /// point.
+    #[serde(default)]
+    pub snapshot: Option<Snapshot>,
 }
 
 /// Unified map markers endpoint (public, no authentication required).
@@ -472,7 +582,7 @@ pub async fn list_markers(
 
     let limit = entity_types::max_page_limit()?;
 
-    let mut view = state.facts.now().await.map_err(fact_store_err)?;
+    let mut view = open_read_view(&state.facts, params.snapshot, None).await?;
     let page =
         match summaries_in_viewport::<MemoryFactStore, _>(&mut view, &core_viewport, None, limit)
             .await
@@ -480,6 +590,7 @@ pub async fn list_markers(
             Ok(p) => p,
             Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
         };
+    let snapshot = page.snapshot;
 
     // Serve each marker's representative thumbnail from our own `/media/{key}`.
     // The summary's thumbnail id is a class member; resolving it to the
@@ -505,7 +616,11 @@ pub async fn list_markers(
     }
     let truncated = page.next.is_some();
 
-    let response = MarkersResponse { markers, truncated };
+    let response = MarkersResponse {
+        markers,
+        truncated,
+        snapshot: encode_snapshot(snapshot)?,
+    };
     json_with_cors_vary_language(&response)
 }
 
@@ -623,5 +738,43 @@ mod tests {
         })
         .map_err(|e| format!("{e:?}"))?;
         assert_rejected_400(decode_images_cursor(&entity_cursor))
+    }
+
+    #[test]
+    fn decode_snapshot_rejects_a_cursor_token() -> Result<(), String> {
+        // A cursor and a snapshot are shape-identical opaque strings; only the
+        // version byte separates them. An entity-listing cursor (version 1) fed
+        // as a snapshot must be refused, never misread as a read watermark.
+        let entity_cursor = encode_cursor(&ListCursor {
+            snapshot: FactId::new(0),
+            walk: (MemoryEntityId(1), FactId::new(2)),
+        })
+        .map_err(|e| format!("{e:?}"))?;
+        let as_snapshot = Snapshot::new(entity_cursor.as_str().to_string());
+        assert_rejected_400(decode_snapshot(&as_snapshot))
+    }
+
+    #[test]
+    fn decode_cursor_rejects_a_snapshot_token() -> Result<(), String> {
+        // The mirror: a snapshot token (version 3) carries no walk payload, so
+        // both cursor decoders must refuse it rather than misparse it into a
+        // walk position.
+        let snapshot = encode_snapshot(FactId::new(7)).map_err(|e| format!("{e:?}"))?;
+        let as_cursor = Cursor::new(snapshot.as_str().to_string());
+        assert_rejected_400(decode_cursor(&as_cursor))?;
+        assert_rejected_400(decode_images_cursor(&as_cursor))
+    }
+
+    #[tokio::test]
+    async fn open_read_view_rejects_a_future_snapshot() -> Result<(), String> {
+        // On an empty store `next_fact_id()` is 0, so any snapshot past it names
+        // facts that don't exist yet. A pinned view echoes its requested bound,
+        // so a future value would yield a view that silently grows as writes
+        // land — the loud 400 stops that. Runs only on the standalone-snapshot
+        // branch (no cursor).
+        let facts = MemoryFactStore::new();
+        let future = encode_snapshot(FactId::new(1)).map_err(|e| format!("{e:?}"))?;
+        let result = open_read_view(&facts, Some(future), None).await;
+        assert_rejected_400(result.map(|_| ()))
     }
 }

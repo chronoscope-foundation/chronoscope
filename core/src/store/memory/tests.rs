@@ -838,5 +838,9 @@ async fn summaries_in_viewport_pins_snapshot() -> TestResult {
         1,
         "the fact committed after the snapshot is invisible"
     );
+    assert_eq!(
+        page.snapshot, snapshot,
+        "the page reports the snapshot it read at, the one its resume cursor pins"
+    );
     Ok(())
 }

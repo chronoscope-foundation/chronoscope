@@ -6,7 +6,7 @@
 use wasm_bindgen::JsCast;
 
 pub use chronoscope_api_client::{
-    ApiError, Client, Cursor, EntityId, EventId, ImageId, image_caption,
+    ApiError, Client, Cursor, EntityId, EventId, ImageId, Snapshot, image_caption,
 };
 
 /// Client-facing instantiations of the generic read DTOs at the opaque wire ids.

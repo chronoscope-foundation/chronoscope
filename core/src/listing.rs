@@ -112,14 +112,18 @@ pub struct ListCursor<Cur> {
     pub walk: Cur,
 }
 
-/// One page of a viewport listing: the summaries gathered this page and the
-/// cursor to fetch the next, `None` once the viewport is exhausted.
+/// One page of a viewport listing: the summaries gathered this page, the
+/// snapshot the walk was pinned to, and the cursor to fetch the next (`None`
+/// once the viewport is exhausted). The `snapshot` is the same value the `next`
+/// cursor embeds, so a caller echoing the pinned snapshot and the caller's
+/// resume token can never disagree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(
     deserialize = "EntId: ::serde::Deserialize<'de>, ImgId: ::serde::de::DeserializeOwned, Cur: ::serde::Deserialize<'de>"
 ))]
 pub struct EntityListPage<EntId, ImgId, Cur> {
     pub summaries: Vec<EntitySummary<EntId, ImgId>>,
+    pub snapshot: FactId,
     pub next: Option<ListCursor<Cur>>,
 }
 
@@ -219,6 +223,7 @@ where
 
     Ok(EntityListPage {
         summaries,
+        snapshot,
         next: resume.map(|walk| ListCursor { snapshot, walk }),
     })
 }

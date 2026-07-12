@@ -749,7 +749,7 @@ async fn find_entity_with_media(
                 _ => continue,
             };
             let page = client
-                .get_entity_images(&entity_id, images_limit, None)
+                .get_entity_images(&entity_id, images_limit, None, None)
                 .await?;
             let count = page.images.len();
             if best.as_ref().is_none_or(|b| count > b.2) {

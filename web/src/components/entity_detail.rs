@@ -231,10 +231,10 @@ fn EntityDetailContent(
     // re-triggering a fetch that can only fail again.
     let (images_error, set_images_error) = signal(Option::<ImagesFetchError>::None);
 
-    // Fetch one page past `cursor` and fold it into the accumulator. Holds the
-    // `!Send` API client, so it lives here in the component body rather than in
-    // the view.
-    let load_page = move |cursor: Option<api::Cursor>| {
+    // Fetch one page past `cursor`, pinned to `snapshot`, and fold it into the
+    // accumulator. Holds the `!Send` API client, so it lives here in the
+    // component body rather than in the view.
+    let load_page = move |cursor: Option<api::Cursor>, snapshot: Option<api::Snapshot>| {
         if loading.get_untracked() {
             return;
         }
@@ -244,7 +244,9 @@ fn EntityDetailContent(
         let id = id.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let result = match crate::api::get_or_init_client(&api).await {
-                Some(client) => fetch_entity_images_page(&id, cursor.as_ref(), &client).await,
+                Some(client) => {
+                    fetch_entity_images_page(&id, cursor.as_ref(), snapshot.as_ref(), &client).await
+                }
                 None => Err(ImagesFetchError::Other(
                     "Failed to load API configuration".to_string(),
                 )),
@@ -276,9 +278,13 @@ fn EntityDetailContent(
     Effect::new(move |_| {
         let req = page_req.get();
         if req > 0 {
-            load_page(next_cursor.get_untracked());
-        } else if matches!(detail.get(), Some(Ok(_))) {
-            load_page(None);
+            // Load-more resumes the cursor, which already pins the page-1
+            // snapshot; no separate snapshot needed.
+            load_page(next_cursor.get_untracked(), None);
+        } else if let Some(Ok(view)) = detail.get() {
+            // Page 1 pins to the detail's snapshot so the grid reads the same
+            // point the detail was projected at.
+            load_page(None, Some(view.snapshot.clone()));
         }
     });
 
@@ -526,6 +532,9 @@ struct EntityDetailView {
     name: Option<String>,
     timeline: Vec<TimelineRow>,
     links: Vec<LinkInfo>,
+    /// The read-consistency point the detail was served at. Passed to the
+    /// images fetch so the grid reads the same state as the detail.
+    snapshot: api::Snapshot,
 }
 
 use std::collections::BTreeSet;
@@ -559,6 +568,7 @@ async fn fetch_entity_detail(
         entity,
         display_name,
         conflicts: _,
+        snapshot,
     } = client.get_entity(id).await.map_err(|e| e.to_string())?;
 
     let timeline = entity.timeline.moments().map(moment_row).collect();
@@ -572,6 +582,7 @@ async fn fetch_entity_detail(
         name: display_name,
         timeline,
         links,
+        snapshot,
     })
 }
 
@@ -593,10 +604,11 @@ enum ImagesFetchError {
 async fn fetch_entity_images_page(
     id: &EntityId,
     cursor: Option<&api::Cursor>,
+    snapshot: Option<&api::Snapshot>,
     client: &api::Client,
 ) -> Result<(Vec<MediaInfo>, Option<api::Cursor>), ImagesFetchError> {
     let page = client
-        .get_entity_images(id, IMAGES_PAGE_SIZE, cursor)
+        .get_entity_images(id, IMAGES_PAGE_SIZE, cursor, snapshot)
         .await
         .map_err(|e| match e {
             // A snapshot-pinned cursor never goes stale and the client always
