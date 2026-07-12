@@ -786,6 +786,9 @@ async fn get_entity_404s_for_an_id_no_fact_ever_named() -> TestResult {
         Err(ApiError::Request(e)) => {
             return Err(format!("expected an API error, got a transport error: {e}").into());
         }
+        Err(ApiError::Client(e)) => {
+            return Err(format!("expected an API error, got a client error: {e}").into());
+        }
     }
     Ok(())
 }
@@ -1492,6 +1495,9 @@ async fn get_entity_images_cursor_and_snapshot_must_agree() -> TestResult {
         Err(ApiError::Api { status, .. }) => assert_eq!(status, 400),
         Err(ApiError::Request(e)) => {
             return Err(format!("expected an API 400, got a transport error: {e}").into());
+        }
+        Err(ApiError::Client(e)) => {
+            return Err(format!("expected an API 400, got a client error: {e}").into());
         }
     }
     Ok(())

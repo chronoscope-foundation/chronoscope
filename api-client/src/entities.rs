@@ -18,6 +18,7 @@ use chronoscope_core::grammar::depiction::Perspective;
 use chronoscope_core::grammar::image::ImageMedium;
 use chronoscope_core::{listing, typed};
 
+use crate::client::ApiError;
 use crate::ids::{EntityId, EventId, ImageId};
 
 /// The client-facing entity projection: [`typed::Entity`] at the opaque wire ids.
@@ -158,6 +159,47 @@ impl std::fmt::Display for Snapshot {
     }
 }
 
+/// The paging affordance the images grid shows, when it shows one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImagesButton {
+    /// A transient error offers a retry of the failed fetch.
+    Retry,
+    /// Another page is available to append.
+    LoadMore,
+}
+
+/// The images grid's button decision (`None` = hidden). A retryable error offers
+/// a retry; a terminal error (a 4xx) hides the button even if a cursor lingers,
+/// so an unexpected error can't loop a dead fetch; an otherwise healthy grid
+/// offers "Load more" while another page remains.
+pub fn images_button(has_more: bool, error: Option<&ApiError>) -> Option<ImagesButton> {
+    match error {
+        Some(e) if e.is_retryable() => Some(ImagesButton::Retry),
+        Some(_) => None, // terminal (a 4xx): hide the button so an unexpected error can't loop a dead action
+        None => has_more.then_some(ImagesButton::LoadMore),
+    }
+}
+
+/// The images grid's fetch decision for a given `page_req` (`None` = don't
+/// fetch). A stored cursor makes a page bump a real "Load more" (the cursor pins
+/// the snapshot); with no cursor it's a retry of a failed page 1, which re-pins
+/// to the detail's snapshot. Page 1 waits for that snapshot too. Every path pins
+/// a snapshot, so the grid never reads live head.
+pub fn images_fetch_params(
+    req: u32,
+    next_cursor: Option<Cursor>,
+    ready_snapshot: Option<Snapshot>,
+) -> Option<(Option<Cursor>, Option<Snapshot>)> {
+    if req > 0 {
+        match next_cursor {
+            Some(c) => Some((Some(c), None)), // load-more: the cursor pins the snapshot
+            None => ready_snapshot.map(|s| (None, Some(s))), // retry page-1: re-pin (skip if detail not ready)
+        }
+    } else {
+        ready_snapshot.map(|s| (None, Some(s))) // page 1: pin (skip if detail not ready)
+    }
+}
+
 /// One page of a `GET /entities` viewport listing: the summaries gathered this
 /// page and the opaque [`Cursor`] for the next, `None` once the viewport is
 /// exhausted.
@@ -275,5 +317,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn terminal_error_hides_button_even_with_more_pages() {
+        // A terminal 4xx suppresses the button even when a stale cursor still
+        // reports more pages — the reader isn't handed a fetch that can only fail.
+        assert_eq!(
+            images_button(
+                true,
+                Some(&ApiError::Api {
+                    status: 404,
+                    message: String::new()
+                })
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn transient_error_offers_retry() {
+        assert_eq!(
+            images_button(
+                false,
+                Some(&ApiError::Api {
+                    status: 503,
+                    message: String::new()
+                })
+            ),
+            Some(ImagesButton::Retry)
+        );
+    }
+
+    #[test]
+    fn more_pages_offers_load_more() {
+        assert_eq!(images_button(true, None), Some(ImagesButton::LoadMore));
+    }
+
+    #[test]
+    fn healthy_and_exhausted_shows_no_button() {
+        assert_eq!(images_button(false, None), None);
+    }
+
+    #[test]
+    fn retry_page_one_repins_to_snapshot() {
+        // A page bump with no stored cursor is a retry of a failed page 1; it
+        // re-pins to the detail's snapshot rather than reading live head.
+        let snapshot = Snapshot::new("snap");
+        assert_eq!(
+            images_fetch_params(1, None, Some(snapshot.clone())),
+            Some((None, Some(snapshot)))
+        );
+    }
+
+    #[test]
+    fn load_more_rides_cursor_without_snapshot() {
+        // A stored cursor already pins the snapshot, so load-more passes none.
+        let cursor = Cursor::new("cur");
+        let snapshot = Snapshot::new("snap");
+        assert_eq!(
+            images_fetch_params(1, Some(cursor.clone()), Some(snapshot)),
+            Some((Some(cursor), None))
+        );
+    }
+
+    #[test]
+    fn page_one_pins_to_snapshot() {
+        let snapshot = Snapshot::new("snap");
+        assert_eq!(
+            images_fetch_params(0, None, Some(snapshot.clone())),
+            Some((None, Some(snapshot)))
+        );
+    }
+
+    #[test]
+    fn page_one_before_ready_does_not_fetch() {
+        assert_eq!(images_fetch_params(0, None, None), None);
+    }
+
+    #[test]
+    fn retry_before_ready_never_reads_live_head() {
+        // A page bump before the detail resolves has neither cursor nor snapshot;
+        // it must not fetch (which would read live head), it waits.
+        assert_eq!(images_fetch_params(1, None, None), None);
     }
 }

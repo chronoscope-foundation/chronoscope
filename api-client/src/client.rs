@@ -38,6 +38,21 @@ pub enum ApiError {
     Request(#[from] reqwest::Error),
     #[error("API error (HTTP {status}): {message}")]
     Api { status: u16, message: String },
+    #[error("client error: {0}")]
+    Client(String),
+}
+
+impl ApiError {
+    /// Whether re-issuing the identical request could plausibly succeed. A
+    /// transport failure never got an HTTP verdict and a pre-request setup
+    /// failure never left the client, so a retry may help; a 5xx or 429 is
+    /// server-side or back-pressure. A 4xx is a client error a retry can't fix.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Request(_) | Self::Client(_) => true,
+            Self::Api { status, .. } => *status >= 500 || *status == 429,
+        }
+    }
 }
 
 // ==================== Client (unauthenticated) ====================
@@ -511,5 +526,42 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ApiE
             status: resp.status().as_u16(),
             message: resp.text().await.unwrap_or_default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The `Request` transport arm isn't unit-tested because `reqwest::Error`
+    // has no public constructor; the `Api` and `Client` arms are exercised.
+    fn api_error(status: u16) -> ApiError {
+        ApiError::Api {
+            status,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn server_error_is_retryable() {
+        assert!(api_error(500).is_retryable());
+        assert!(api_error(503).is_retryable());
+    }
+
+    #[test]
+    fn rate_limit_is_retryable() {
+        assert!(api_error(429).is_retryable());
+    }
+
+    #[test]
+    fn client_error_is_not_retryable() {
+        assert!(!api_error(400).is_retryable());
+        assert!(!api_error(403).is_retryable());
+        assert!(!api_error(404).is_retryable());
+    }
+
+    #[test]
+    fn client_setup_failure_is_retryable() {
+        assert!(ApiError::Client("config missing".to_string()).is_retryable());
     }
 }

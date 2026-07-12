@@ -338,10 +338,10 @@ fn EntityImages(
     let (loading, set_loading) = signal(false);
     let (page_req, set_page_req) = signal(0u32);
     // The error for the images section, `None` while healthy. A failed fetch
-    // surfaces here; a retryable error offers a retry, a terminal one (the
-    // entity no longer exists) reports without one so the reader isn't stranded
+    // surfaces here; a retryable error offers a retry, a terminal one (a 4xx
+    // client error) reports without one so the reader isn't stranded
     // re-triggering a fetch that can only fail again.
-    let (images_error, set_images_error) = signal(Option::<ImagesFetchError>::None);
+    let (images_error, set_images_error) = signal(Option::<ApiError>::None);
 
     // Fetch one page past `cursor`, pinned to `snapshot`, and fold it into the
     // accumulator. Holds the `!Send` API client, so it lives here in the
@@ -359,7 +359,10 @@ fn EntityImages(
                 Some(client) => {
                     fetch_entity_images_page(&id, cursor.as_ref(), snapshot.as_ref(), &client).await
                 }
-                None => Err(ImagesFetchError::Other(
+                // Config discovery failed before any request went out — a
+                // pre-request client failure, retryable so the grid offers a retry
+                // that re-attempts the `/config.json` fetch.
+                None => Err(ApiError::Client(
                     "Failed to load API configuration".to_string(),
                 )),
             };
@@ -382,17 +385,16 @@ fn EntityImages(
         });
     };
 
-    // Page 1 waits for the entity detail to resolve successfully: `ready_snapshot`
-    // is `Some` only once the detail loaded, so gating the first fetch on it keeps
-    // a 404 from drawing a wasted image request and pins the page to the detail's
-    // snapshot. Each "Load more" bump (`req > 0`) pages past the stored resume
-    // cursor, which already pins that snapshot.
+    // `ready_snapshot.get()` is tracked so page 1 fires when the detail resolves;
+    // it's write-once-terminal, so tracking it on every run adds no extra fires.
+    // `next_cursor` stays untracked — a "Load more" bumps `page_req`, which is
+    // what should re-drive the effect, not a cursor write.
     Effect::new(move |_| {
         let req = page_req.get();
-        if req > 0 {
-            load_page(next_cursor.get_untracked(), None);
-        } else if let Some(snapshot) = ready_snapshot.get() {
-            load_page(None, Some(snapshot));
+        if let Some((cursor, snapshot)) =
+            images_fetch_params(req, next_cursor.get_untracked(), ready_snapshot.get())
+        {
+            load_page(cursor, snapshot);
         }
     });
 
@@ -403,16 +405,14 @@ fn EntityImages(
         {move || {
             let tiles = media.get();
             let has_more = next_cursor.get().is_some();
-            let error = images_error.get();
-            let show = !tiles.is_empty() || has_more || error.is_some();
+            // `ApiError` isn't `Clone` (it wraps a `reqwest::Error`), so read the
+            // signal by reference rather than cloning it out: the view only needs
+            // whether an error is present and which button it implies.
+            let (has_error, button) = images_error
+                .with(|error| (error.is_some(), images_button(has_more, error.as_ref())));
+            let show = !tiles.is_empty() || has_more || has_error;
             show.then(move || {
                 let count = tiles.len();
-                // Only a retryable error offers a retry; a terminal error (the
-                // entity no longer exists) doesn't, and neither does a healthy
-                // "more to load".
-                let retryable = matches!(error, Some(ImagesFetchError::Other(_)));
-                let button_label = if retryable { "Retry" } else { "Load more" };
-                let show_button = has_more || retryable;
 
                 view! {
                 <div class="mb-3">
@@ -428,20 +428,15 @@ fn EntityImages(
                             </ul>
                         }
                     })}
-                    {error.map(|e| {
-                        let text = match e {
-                            ImagesFetchError::Gone => {
-                                "Images are no longer available; this entity no longer exists.".to_string()
-                            }
-                            ImagesFetchError::Other(m) => {
-                                format!("Couldn\u{2019}t load images: {m}")
-                            }
+                    {has_error.then(|| view! {
+                        <p class="text-sm text-red-600 mt-2">"Couldn\u{2019}t load images."</p>
+                    })}
+                    {button.map(move |b| {
+                        let label = match b {
+                            ImagesButton::Retry => "Retry",
+                            ImagesButton::LoadMore => "Load more",
                         };
                         view! {
-                            <p class="text-sm text-red-600 mt-2">{text}</p>
-                        }
-                    })}
-                    {show_button.then(move || view! {
                         <button
                             class="mt-2 w-full text-sm text-ink hover:underline \
                                    cursor-pointer disabled:opacity-50 disabled:cursor-default"
@@ -451,8 +446,9 @@ fn EntityImages(
                             disabled=move || loading.get()
                             aria-label="Load more images"
                         >
-                            {button_label}
+                            {label}
                         </button>
+                        }
                     })}
                 </div>
                 }
@@ -591,7 +587,11 @@ use chronoscope_core::location::{LocationReference, UnresolvedLocation};
 use chronoscope_core::moment::TransitionRole;
 use chronoscope_core::typed::{Attributed, Bounded, EventDetail, InteriorEvent, MomentView};
 
-use chronoscope_api_client::{EntityId, EventId, ImageId};
+use chronoscope_api_client::{
+    EntityId, EventId, ImageId, ImagesButton, images_button, images_fetch_params,
+};
+
+use crate::api::ApiError;
 
 /// Image tiles fetched per grid page. The panel loads the first page eagerly and
 /// appends further pages on demand via "Load more".
@@ -629,18 +629,6 @@ async fn fetch_entity_detail(
     })
 }
 
-/// Why an image-page fetch failed, split by whether a retry can help.
-#[derive(Clone)]
-enum ImagesFetchError {
-    /// The entity no longer exists — a 404. Terminal: a snapshot-pinned cursor
-    /// never goes stale, so only a page-1 read (at the live snapshot) can hit
-    /// this, when the entity was deleted after the detail load. A retry would
-    /// just 404 again.
-    Gone,
-    /// Any other failure; surfaced with a retry affordance.
-    Other(String),
-}
-
 /// Fetch one page of an entity's depicting images, flattening each tile into a
 /// [`MediaInfo`] and returning the resume cursor for the next page (`None` once
 /// the grid is exhausted).
@@ -649,17 +637,10 @@ async fn fetch_entity_images_page(
     cursor: Option<&api::Cursor>,
     snapshot: Option<&api::Snapshot>,
     client: &api::Client,
-) -> Result<(Vec<MediaInfo>, Option<api::Cursor>), ImagesFetchError> {
+) -> Result<(Vec<MediaInfo>, Option<api::Cursor>), ApiError> {
     let page = client
         .get_entity_images(id, IMAGES_PAGE_SIZE, cursor, snapshot)
-        .await
-        .map_err(|e| match e {
-            // A snapshot-pinned cursor never goes stale and the client always
-            // sends a valid limit, so a 404 here means the entity was deleted
-            // between the detail load and this fetch.
-            api::ApiError::Api { status: 404, .. } => ImagesFetchError::Gone,
-            other => ImagesFetchError::Other(other.to_string()),
-        })?;
+        .await?;
     let tiles = page
         .images
         .into_iter()
