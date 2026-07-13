@@ -55,6 +55,14 @@ pub struct Bounded<V, ImgId> {
     /// The extent (join) — what any source allows, in the field's own lattice.
     pub possible: V,
     pub sources: Vec<Citation<ImgId>>,
+    /// The fact ids backing the extent — the provenance-by-id complement to
+    /// `sources`. A consumer correlates a slot across fields by shared id: a
+    /// timeline row matches an entity-level
+    /// [`TemporalConflict`](crate::solvers::TemporalConflict) when a fact id here
+    /// rides its `facts`. Empty when the support carries no fact ids (a
+    /// member-lineage read).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facts: Vec<FactId>,
     pub consensus: Consensus<V, ImgId>,
 }
 
@@ -187,6 +195,12 @@ pub trait SupportAtom {
     type Img;
     fn citation(&self) -> Option<Citation<Self::Img>>;
 
+    /// The fact id this atom names, when it carries one. Absent for an atom that
+    /// rode only a member id.
+    fn fact_id(&self) -> Option<FactId> {
+        None
+    }
+
     /// The (fact id, date) this atom contributes to a date slot — the premise a
     /// date conflict is minimized over. Absent for atoms that carry no fact.
     fn date_premise(&self) -> Option<(FactId, UncertainDate)> {
@@ -205,6 +219,9 @@ impl<R: IdScheme> SupportAtom for FactAtom<R> {
     type Img = R::Image;
     fn citation(&self) -> Option<Citation<R::Image>> {
         crate::projection::citation_of(&self.fact)
+    }
+    fn fact_id(&self) -> Option<FactId> {
+        Some(self.id)
     }
     fn date_premise(&self) -> Option<(FactId, UncertainDate)> {
         Some((self.id, fact_date(&self.fact)?))
@@ -227,6 +244,20 @@ where
         .collect()
 }
 
+/// The fact ids a lineage's atoms name, deduped and ordered — the
+/// provenance-by-id mirror of [`sources`]. Empty for a member-lineage support.
+pub(super) fn fact_ids<X>(support: &Lineage<X>) -> Vec<FactId>
+where
+    X: SupportAtom,
+{
+    support
+        .iter()
+        .filter_map(SupportAtom::fact_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Flatten a restrictive field. `Absent` when the extent support is the semiring
 /// zero (nothing contributed via `plus`); else `possible`/`sources` come from
 /// the extent and the consensus reads off `consensus.value.conflict()`.
@@ -240,6 +271,7 @@ where
         return Bounded {
             possible: V::bottom(),
             sources: Vec::new(),
+            facts: Vec::new(),
             consensus: Consensus::Absent,
         };
     }
@@ -274,6 +306,7 @@ where
     Bounded {
         possible,
         sources: srcs,
+        facts: fact_ids(&b.extent.support),
         consensus,
     }
 }
@@ -616,6 +649,7 @@ mod tests {
             Bounded {
                 possible: Claimed::Any,
                 sources: Vec::new(),
+                facts: Vec::new(),
                 consensus,
             }
         }

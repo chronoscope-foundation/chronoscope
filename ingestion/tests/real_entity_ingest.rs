@@ -14,13 +14,16 @@
 //! deliberate act that updates these like a golden.
 
 use chrono::{Datelike, TimeZone, Utc};
+use chronoscope_core::conflicts::fact_lineage;
 use chronoscope_core::external_ids::WikidataEntityId;
 use chronoscope_core::geo::{GeoPoint, Viewport};
 use chronoscope_core::grammar::ids::IngesterRunId;
 use chronoscope_core::grammar::lifecycle::PointKind;
 use chronoscope_core::listing::{EntitySummary, summaries_in_viewport};
+use chronoscope_core::projection::project_entity;
+use chronoscope_core::solvers::temporal_conflicts;
 use chronoscope_core::store::FactStore;
-use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryImageId};
+use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
 use chronoscope_core::submit::commit_facts;
 use chronoscope_ingestion::wikidata::ItemContext;
 use chronoscope_ingestion::wikidata::commits::build_commit;
@@ -236,15 +239,15 @@ async fn viewport_listing_projects_landmarks_with_their_dates() -> Result<(), Bo
 }
 
 #[tokio::test]
-async fn notre_dame_founding_survives_as_construction_start() -> Result<(), BoxError> {
+async fn notre_dame_founding_witnesses_existence_before_construction() -> Result<(), BoxError> {
     let Some(store) = ingest_curated().await? else {
         return Ok(());
     };
 
     // Notre-Dame de Paris (Q2981) carries a P571 founding of 1160 alongside a
-    // P793 construction (1163–1345) that already has a completion. The founding
-    // must survive as a competing construction start bound — the earlier
-    // "fill the empty completion" reading dropped it, pushing `earliest` to 1163.
+    // P793 construction (1163–1345). The founding witnesses existence, so it
+    // anchors the summary's span: the earliest is the 1160 founding, not the 1163
+    // build start, and the read-time solver reports exactly one conflict.
     let paris = placeable_in(&store, (48.84, 2.28), (48.87, 2.36)).await?;
     let notre_dame = paris
         .iter()
@@ -253,37 +256,45 @@ async fn notre_dame_founding_survives_as_construction_start() -> Result<(), BoxE
     assert_eq!(
         notre_dame.earliest.map(|d| d.year()),
         Some(1160),
-        "the 1160 founding is the earliest date, ahead of the 1163 build start, got {:?}",
+        "the 1160 founding witness anchors the earliest span, got {:?}",
         notre_dame.earliest
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, projected) =
+        project_entity::<MemoryFactStore, _, _>(&mut view, notre_dame.id, fact_lineage)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .ok_or("Notre-Dame projects")?;
+    let conflicts = temporal_conflicts::<MemoryIds>(&projected);
+    assert_eq!(
+        conflicts.len(),
+        1,
+        "the 1160 founding before the 1163 build start is one conflict, got {conflicts:?}"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn demolish_rebuild_splits_into_two_dated_entities() -> Result<(), BoxError> {
+async fn chioggia_p571_only_rebuild_projects_one_placeable_entity() -> Result<(), BoxError> {
     let Some(store) = ingest_curated().await? else {
         return Ok(());
     };
 
-    // Chioggia Cathedral was demolished and rebuilt, so it splits into two
-    // entities sharing one location, each with its own lifetime.
+    // Chioggia Cathedral (Q1111481) carries a P576 demolition (1623) and a P571
+    // founding (1633), with no P793 construction. The founding witnesses the
+    // rebuilt cathedral's existence, so the item projects as one placeable entity
+    // at its P625 coordinate.
     let chioggia = placeable_in(&store, (45.20, 12.26), (45.23, 12.29)).await?;
     let cathedrals: Vec<_> = chioggia
         .iter()
         .filter(|s| has_name(s, "Chioggia Cathedral"))
         .collect();
-    assert!(
-        cathedrals.len() >= 2,
-        "the demolish-rebuild splits into at least two entities, got {}",
+    assert_eq!(
+        cathedrals.len(),
+        1,
+        "the P571-only rebuild projects one placeable entity, got {}",
         cathedrals.len()
-    );
-    let years: std::collections::BTreeSet<i32> = cathedrals
-        .iter()
-        .filter_map(|s| s.earliest.map(|d| d.year()))
-        .collect();
-    assert!(
-        years.len() >= 2,
-        "the split entities carry distinct construction dates, got {years:?}"
     );
     Ok(())
 }

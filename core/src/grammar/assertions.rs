@@ -20,6 +20,7 @@
 //! |----------------------------------|----------------------------------|
 //! | [`crate::grammar::attribute`]      | `FactualAssertion::Attribute`    |
 //! | [`crate::grammar::bookend`]        | `FactualAssertion::Construction`, `FactualAssertion::Demolition` |
+//! | [`crate::grammar::existence`]      | `FactualAssertion::Existence`    |
 //! | [`crate::grammar::event`]          | `FactualAssertion::Event`        |
 //! | [`crate::grammar::image`]          | `FactualAssertion::Image`        |
 //! | [`crate::grammar::identity`]       | `JudgmentAssertion::Identity`    |
@@ -38,7 +39,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
 use crate::grammar::{
-    attribute, bookend, composites, depiction, event, identity, image, observation,
+    attribute, bookend, composites, depiction, event, existence, identity, image, observation,
 };
 
 /// The id-traversal error over a scheme `R` — [`identity::IdMapError`] projected
@@ -49,8 +50,9 @@ type IdMapErrorOf<R> =
 /// Factual assertion — a claim about the external world.
 ///
 /// Construction and demolition are flat per-entity bookend facts, not
-/// event-mediated, so once-ness is structural. Other life-stage information
-/// attaches to a lifetime-event id via the event cluster.
+/// event-mediated, so once-ness is structural. An existence witness is a flat
+/// per-entity date the entity is attested to have existed at. Other life-stage
+/// information attaches to a lifetime-event id via the event cluster.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
@@ -66,6 +68,8 @@ pub enum FactualAssertion<R: IdScheme> {
     Demolition {
         fact: bookend::DemolitionFact<R::Entity>,
     },
+    /// An existence witness — the entity provably existed at a date.
+    Existence { fact: existence::Fact<R::Entity> },
     /// Interior-lifetime event facts.
     Event {
         fact: event::Fact<R::Entity, R::Event>,
@@ -99,6 +103,7 @@ impl<R: IdScheme> FactualAssertion<R> {
             Self::Attribute { fact } => fact.for_each_id(fe),
             Self::Construction { fact } => fact.for_each_id(fe),
             Self::Demolition { fact } => fact.for_each_id(fe),
+            Self::Existence { fact } => fact.for_each_id(fe),
             Self::Event { fact } => fact.for_each_id(fe, fv),
             Self::Gap { bounds } => bounds.for_each_id(fe, fv),
             Self::Image { fact } => fact.for_each_id(fi),
@@ -130,6 +135,9 @@ impl<R: IdScheme> FactualAssertion<R> {
                 fact: fact.try_map_ids(fe)?,
             }),
             Self::Demolition { fact } => Ok(FactualAssertion::Demolition {
+                fact: fact.try_map_ids(fe)?,
+            }),
+            Self::Existence { fact } => Ok(FactualAssertion::Existence {
                 fact: fact.try_map_ids(fe)?,
             }),
             Self::Event { fact } => Ok(FactualAssertion::Event {
@@ -323,7 +331,7 @@ mod traversal_props {
     };
     use crate::grammar::spatial::TopologicalRel;
     use crate::grammar::{
-        attribute, bookend, composites, depiction, event, identity, image, observation,
+        attribute, bookend, composites, depiction, event, existence, identity, image, observation,
     };
     use crate::location::{LocationReference, UnresolvedLocation};
     use crate::store::memory::{MemoryEntityId, MemoryEventId, MemoryIds, MemoryImageId};
@@ -480,6 +488,12 @@ mod traversal_props {
                 location: sentinel_location(),
             }),
         ]
+    }
+
+    /// `existence::Fact` — a single entity witness, backing the `Existence` arm
+    /// in `arb_factual_assertion`.
+    fn arb_existence_fact() -> impl Strategy<Value = existence::Fact<MemoryEntityId>> {
+        (arb_entity(), sentinel_date()).prop_map(|(entity, at)| existence::Fact { entity, at })
     }
 
     /// `bookend::DemolitionFact` — start and completion, backing the
@@ -713,6 +727,7 @@ mod traversal_props {
             arb_attribute().prop_map(|fact| FactualAssertion::Attribute { fact }),
             arb_construction_fact().prop_map(|fact| FactualAssertion::Construction { fact }),
             arb_demolition_fact().prop_map(|fact| FactualAssertion::Demolition { fact }),
+            arb_existence_fact().prop_map(|fact| FactualAssertion::Existence { fact }),
             arb_event_fact().prop_map(|fact| FactualAssertion::Event { fact }),
             arb_gap_bounds().prop_map(|bounds| FactualAssertion::Gap { bounds }),
             arb_image_fact().prop_map(|fact| FactualAssertion::Image { fact }),

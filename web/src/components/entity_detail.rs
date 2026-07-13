@@ -251,7 +251,10 @@ fn EntityDetailContent(
                                         None => view! { <span>"Unnamed entity"</span> }.into_any(),
                                     }}
                                 </h3>
-                                <EntityTimeline timeline=entity.timeline.clone()/>
+                                <EntityTimeline
+                                    timeline=entity.timeline.clone()
+                                    conflicts=entity.conflicts.clone()
+                                />
                                 <EntityImages
                                     id=id.clone()
                                     api_client=api_client.clone()
@@ -284,18 +287,25 @@ fn EntityDetailContent(
 }
 
 /// The entity's lifecycle timeline: a header with the moment count over a list
-/// of dated rows. Renders nothing when the entity has no timeline.
+/// of dated rows. Renders nothing when the entity has no timeline. Entity-level
+/// temporal conflicts ride inline on the participating rows (an amber marker
+/// beside the citation bullet), not as a detached card.
 #[component]
-fn EntityTimeline(timeline: Vec<TimelineRow>) -> impl IntoView {
+fn EntityTimeline(timeline: Vec<TimelineRow>, conflicts: Vec<ConflictInfo>) -> impl IntoView {
     (!timeline.is_empty()).then(move || {
         let count = timeline.len();
+        let points = conflict_points(&timeline);
+        let rows = timeline
+            .iter()
+            .map(|row| timeline_row_view(row, row_conflicts(row, &conflicts, &points)))
+            .collect::<Vec<_>>();
         view! {
             <div class="mb-3">
                 <p class="text-xs font-sans text-copper font-semibold mb-1">
                     {format!("Timeline ({count})")}
                 </p>
                 <ul class="text-sm text-sepia space-y-1.5">
-                    {timeline.iter().map(timeline_row_view).collect::<Vec<_>>()}
+                    {rows}
                 </ul>
             </div>
         }
@@ -564,8 +574,15 @@ struct NameInfo {
 /// endpoints are both dateless collapses to a single bare row.
 #[derive(Debug, Clone)]
 struct TimelineRow {
+    /// The moment's role — drives the label, the subtle existence styling, and
+    /// which side of a conflict (witness vs bookend) this row plays.
+    role: TransitionRole,
     label: String,
     date: DateCell,
+    /// The fact ids behind this row's date, carried from the moment's
+    /// [`Bounded::facts`]. A row participates in a conflict when one of these
+    /// rides the conflict's own `facts`.
+    facts: Vec<FactId>,
     /// The badge for this row's date, `None` when the row carries no dated
     /// claim.
     citations: Option<Citations>,
@@ -591,6 +608,64 @@ enum DateCell {
     Pending(UncertainDate),
 }
 
+impl DateCell {
+    /// The representative instant this row sits at — its earliest possible date —
+    /// or `None` for an undated row.
+    fn instant(&self) -> Option<NaiveDate> {
+        match self {
+            DateCell::Unknown => None,
+            DateCell::Settled(d) | DateCell::Pending(d) => d.earliest(),
+            DateCell::Disputed { value } => value.earliest(),
+        }
+    }
+}
+
+impl TimelineRow {
+    /// This row as a point on a conflict's time axis, when it carries a date.
+    /// The witness flag marks a mid-life row — an existence witness or interior
+    /// event — the out-of-lifetime side a conflict highlights.
+    fn point(&self) -> Option<ConflictPoint> {
+        let instant = self.date.instant()?;
+        Some(ConflictPoint {
+            label: self.label.clone(),
+            // Bare year, matching the conflict line's bare year; `%Y` would
+            // zero-pad an ancient year ("0082") and read apart from it.
+            year: instant.year().to_string(),
+            pos: f64::from(instant.num_days_from_ce()),
+            is_witness: self.role.is_midlife(),
+        })
+    }
+}
+
+/// One entity-level temporal conflict surfaced inline: the structured clash and
+/// the fact ids it names. The plain-language line is built at render time from
+/// `kind` ([`conflict_summary`]), so localizing it never touches the fetch path.
+/// A timeline row participates when a fact id here is among its own.
+#[derive(Debug, Clone)]
+struct ConflictInfo {
+    kind: TemporalConflictKind,
+    facts: Vec<FactId>,
+}
+
+/// One participant plotted on a conflict's time axis: the row's label, the year
+/// it sits at, a monotonic position for scaling, and whether it's the witness —
+/// the out-of-lifetime evidence the conflict highlights.
+#[derive(Debug, Clone)]
+struct ConflictPoint {
+    label: String,
+    year: String,
+    pos: f64,
+    is_witness: bool,
+}
+
+/// A conflict resolved against the timeline for one marker: its summary and the
+/// distinct participant points, left-to-right.
+#[derive(Debug, Clone)]
+struct ResolvedConflict {
+    summary: String,
+    points: Vec<ConflictPoint>,
+}
+
 #[derive(Debug, Clone)]
 struct LinkInfo {
     label: String,
@@ -611,6 +686,9 @@ struct MediaInfo {
 #[derive(Debug, Clone)]
 struct EntityDetailView {
     name: Option<NameInfo>,
+    /// Entity-level temporal conflicts — facts that can't jointly hold. Surfaced
+    /// inline on the participating timeline rows, not as a detached card.
+    conflicts: Vec<ConflictInfo>,
     timeline: Vec<TimelineRow>,
     links: Vec<LinkInfo>,
     /// The read-consistency point the detail was served at. Passed to the
@@ -618,18 +696,22 @@ struct EntityDetailView {
     snapshot: api::Snapshot,
 }
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
+
+use chrono::{Datelike, NaiveDate};
 
 use chronoscope_core::Claimed;
 use chronoscope_core::date::{DateBound, DatePrecision, TimeRange, UncertainDate};
 use chronoscope_core::grammar::citations::{
     ExternalReference, ExternalSource, JudgmentSource, WikidataField,
 };
+use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::grammar::lifecycle::{DamageCause, MoveMethod, Usage};
 use chronoscope_core::location::{LocationReference, UnresolvedLocation};
 use chronoscope_core::moment::TransitionRole;
 use chronoscope_core::projection::Citation;
+use chronoscope_core::solvers::TemporalConflictKind;
 use chronoscope_core::typed::{
     Attributed, Bounded, Consensus, EventDetail, InteriorEvent, MomentView, distinct_rivals,
 };
@@ -657,17 +739,23 @@ async fn fetch_entity_detail(
     let api::EntityDetail {
         entity,
         display_name,
+        temporal_conflicts,
         snapshot,
     } = client.get_entity(id).await.map_err(|e| e.to_string())?;
 
     let name = display_name.map(|text| {
         // Several name records can share the display text (the same proper name
         // spelled identically across languages or key types); the badge unions
-        // the sources behind all of them, first-appearance order, deduped.
+        // the sources behind all of them in first-appearance order, keyed on the
+        // attestation the reader sees — its source label and link — so a dozen
+        // identical Wikidata labels collapse to their one attestation.
         let mut sources: Vec<Citation<ImageId>> = Vec::new();
+        let mut seen: Vec<(Option<String>, Option<String>)> = Vec::new();
         for record in entity.names.iter().filter(|n| n.text == text) {
             for source in &record.sources {
-                if !sources.contains(source) {
+                let key = (citation_label(source), citation_url(source));
+                if !seen.contains(&key) {
+                    seen.push(key);
                     sources.push(source.clone());
                 }
             }
@@ -677,9 +765,21 @@ async fn fetch_entity_detail(
     });
     let timeline = entity.timeline.moments().map(moment_row).collect();
     let links = entity.external_refs.iter().filter_map(link_info).collect();
+    // The entity-level temporal conflicts the server's read-time solver found —
+    // each the structured clash plus the fact ids it blames, so the panel can
+    // mark the participating rows and phrase the line at render time. Empty when
+    // the facts are jointly consistent.
+    let conflicts = temporal_conflicts
+        .into_iter()
+        .map(|conflict| ConflictInfo {
+            kind: conflict.kind,
+            facts: conflict.facts.iter().copied().collect(),
+        })
+        .collect();
 
     Ok(EntityDetailView {
         name,
+        conflicts,
         timeline,
         links,
         snapshot,
@@ -717,9 +817,12 @@ async fn fetch_entity_images_page(
 /// and — when this moment carries it — the event's secondary text.
 fn moment_row(moment: MomentView<'_, EventId, ImageId>) -> TimelineRow {
     let (date, citations) = date_display(moment.date);
+    let facts = moment.date.map(|b| b.facts.clone()).unwrap_or_default();
     TimelineRow {
+        role: moment.role,
         label: moment_label(moment.role, moment.collapsed).to_string(),
         date,
+        facts,
         citations,
         description: moment
             .carries_description
@@ -886,10 +989,11 @@ fn judgment_source_label(source: &JudgmentSource<ImageId>) -> String {
 fn moment_label(role: TransitionRole, collapsed: bool) -> &'static str {
     use TransitionRole::{
         Ambiguous, ConstructionEnd, ConstructionStart, DamagedEnd, DamagedStart, DemolitionEnd,
-        DemolitionStart, Designated, ModificationEnd, ModificationStart, MovedEnd, MovedStart,
-        RepairEnd, RepairStart, UsageModified,
+        DemolitionStart, Designated, KnownToExist, ModificationEnd, ModificationStart, MovedEnd,
+        MovedStart, RepairEnd, RepairStart, UsageModified,
     };
     match (role, collapsed) {
+        (KnownToExist, _) => "Known to exist",
         (ConstructionStart, true) => "Constructed",
         (ModificationStart, true) => "Modified",
         (RepairStart, true) => "Repaired",
@@ -919,7 +1023,9 @@ fn moment_label(role: TransitionRole, collapsed: bool) -> &'static str {
 /// with the entry's free-text descriptions. Bookends carry none.
 fn entry_description(detail: &EventDetail<EventId, ImageId>) -> Option<String> {
     let (descriptions, kind) = match detail {
-        EventDetail::Constructed { .. } | EventDetail::Demolished { .. } => return None,
+        EventDetail::Constructed { .. }
+        | EventDetail::Demolished { .. }
+        | EventDetail::Existed { .. } => return None,
         EventDetail::Interior {
             descriptions, kind, ..
         } => (descriptions, kind),
@@ -1068,13 +1174,17 @@ fn move_summary(
 /// bullet, and any secondary description. A contested date reads its joined
 /// value inline in the darker body tone; the rivals live in the bullet's
 /// popover.
-fn timeline_row_view(row: &TimelineRow) -> AnyView {
+fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> AnyView {
     let label = row.label.clone();
     let description = row.description.clone();
+    // Existence witnesses are evidence, not a lifecycle phase — muted, not bold,
+    // with a fainter rule.
+    let existence = row.role == TransitionRole::KnownToExist;
     let bullet = row
         .citations
         .clone()
         .map(|citations| view! { <CitationBullet citations=citations/> });
+    let marker = (!conflicts.is_empty()).then(|| view! { <ConflictMarker conflicts=conflicts/> });
     let date_view = match &row.date {
         DateCell::Unknown => {
             view! { <span class="text-sepia/40 italic">" \u{2014} date unknown"</span> }.into_any()
@@ -1095,10 +1205,20 @@ fn timeline_row_view(row: &TimelineRow) -> AnyView {
         }
         .into_any(),
     };
+    let li_class = if existence {
+        "pl-2 border-l-2 border-sepia/20"
+    } else {
+        "pl-2 border-l-2 border-copper/30"
+    };
+    let label_class = if existence {
+        "text-sepia/70 italic"
+    } else {
+        "font-semibold"
+    };
     view! {
-        <li class="pl-2 border-l-2 border-copper/30">
+        <li class=li_class>
             <div>
-                <span class="font-semibold">{label}</span>{date_view}{bullet}
+                <span class=label_class>{label}</span>{date_view}{bullet}{marker}
             </div>
             {description.map(|desc| view! {
                 <p class="text-xs text-sepia/70 mt-0.5">{desc}</p>
@@ -1106,6 +1226,98 @@ fn timeline_row_view(row: &TimelineRow) -> AnyView {
         </li>
     }
     .into_any()
+}
+
+/// The plottable point behind each fact id in the timeline, so a conflict marker
+/// can resolve its `facts` to labeled points on a shared axis. A fact id backs the
+/// one row whose date it dates.
+fn conflict_points(timeline: &[TimelineRow]) -> BTreeMap<FactId, ConflictPoint> {
+    let mut points = BTreeMap::new();
+    for row in timeline {
+        if let Some(point) = row.point() {
+            for fact in &row.facts {
+                points.entry(*fact).or_insert_with(|| point.clone());
+            }
+        }
+    }
+    points
+}
+
+/// The conflicts one row participates in, each resolved to its distinct
+/// participant points. A row participates when it shares a fact id with the
+/// conflict's own `facts`.
+fn row_conflicts(
+    row: &TimelineRow,
+    conflicts: &[ConflictInfo],
+    points: &BTreeMap<FactId, ConflictPoint>,
+) -> Vec<ResolvedConflict> {
+    conflicts
+        .iter()
+        .filter(|conflict| conflict.facts.iter().any(|fact| row.facts.contains(fact)))
+        .map(|conflict| ResolvedConflict {
+            summary: conflict_summary(&conflict.kind),
+            points: resolve_points(&conflict.facts, points),
+        })
+        .collect()
+}
+
+/// The plain-language line for one temporal conflict. English for now, phrased
+/// from the structured [`TemporalConflictKind`] so a future locale layer swaps
+/// only this template. The witness and the bound it crossed render at a matched
+/// precision ([`matched_precision`]).
+fn conflict_summary(kind: &TemporalConflictKind) -> String {
+    match kind {
+        TemporalConflictKind::ExistedBeforeConstruction {
+            witness,
+            construction_started,
+        } => {
+            let (witness, started) = matched_precision(witness, *construction_started);
+            format!("Existed at {witness} but construction started {started}")
+        }
+        TemporalConflictKind::ExistedAfterDemolition {
+            witness,
+            demolished,
+        } => {
+            let (witness, demolished) = matched_precision(witness, *demolished);
+            format!("Existed at {witness} but demolished {demolished}")
+        }
+    }
+}
+
+/// Render a conflict's witness date and the lifetime bound it crossed so both stay
+/// legible. The witness keeps its own precision via [`format_uncertain_date`]; the
+/// bound reads as a bare year, or reveals its month and day when it shares the
+/// witness's year, so a same-year clash shows the ordering instead of a
+/// self-negating "1850 but 1850".
+fn matched_precision(witness: &UncertainDate, bound: NaiveDate) -> (String, String) {
+    let witness_text = format_uncertain_date(witness);
+    let same_year = witness.earliest().map(|d| d.year()) == Some(bound.year());
+    let bound_text = if same_year {
+        bound.format("%Y-%m-%d").to_string()
+    } else {
+        bound.year().to_string()
+    };
+    (witness_text, bound_text)
+}
+
+/// The distinct participant points a conflict's facts resolve to, left-to-right.
+/// Facts landing on the same row collapse to one point.
+fn resolve_points(
+    facts: &[FactId],
+    points: &BTreeMap<FactId, ConflictPoint>,
+) -> Vec<ConflictPoint> {
+    let mut out: Vec<ConflictPoint> = Vec::new();
+    for fact in facts {
+        if let Some(point) = points.get(fact)
+            && !out
+                .iter()
+                .any(|seen| seen.label == point.label && seen.year == point.year)
+        {
+            out.push(point.clone());
+        }
+    }
+    out.sort_by(|a, b| a.pos.total_cmp(&b.pos));
+    out
 }
 
 // ==================== Citation bullet ====================
@@ -1351,6 +1563,273 @@ fn header_class(disputed: bool) -> String {
         "text-secondary"
     };
     format!("{base} {color}")
+}
+
+// ==================== Conflict marker ====================
+
+/// A conflict marker: a small amber alert disc beside the citation bullet on a
+/// timeline row whose date takes part in an entity-level temporal conflict.
+/// Tapping it opens a popover naming each clash in plain language and plotting
+/// its participating facts on a small inline time-axis. Mirrors
+/// [`CitationBullet`]'s disposal-safe popover: portaled to `document.body`,
+/// closed on an outside click or Escape, with guarded signal access so a teardown
+/// mid-handler can't panic.
+#[component]
+fn ConflictMarker(conflicts: Vec<ResolvedConflict>) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    // The glyph's on-screen rect at open, so the portaled popover can place
+    // itself outside the panel's slide transform and overflow clip.
+    let (anchor, set_anchor) = signal(None::<(f64, f64)>);
+    let root_ref = NodeRef::<leptos::html::Span>::new();
+    let popover_ref = NodeRef::<leptos::html::Div>::new();
+
+    let click_handle =
+        window_event_listener(leptos::ev::click, move |ev: leptos::ev::MouseEvent| {
+            if !open.try_get_untracked().unwrap_or(false) {
+                return;
+            }
+            let Some(node) = ev
+                .target()
+                .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+            else {
+                return;
+            };
+            let inside = root_ref
+                .get_untracked()
+                .is_some_and(|root| root.contains(Some(&node)))
+                || popover_ref
+                    .get_untracked()
+                    .is_some_and(|popover| popover.contains(Some(&node)));
+            if !inside {
+                let _ = set_open.try_set(false);
+            }
+        });
+    let key_handle =
+        window_event_listener(leptos::ev::keydown, move |ev: leptos::ev::KeyboardEvent| {
+            if ev.key() == "Escape" && open.try_get_untracked() == Some(true) {
+                let _ = set_open.try_set(false);
+            }
+        });
+    on_cleanup(move || {
+        click_handle.remove();
+        key_handle.remove();
+    });
+
+    let count = conflicts.len();
+    let aria_label = if count == 1 {
+        "1 date conflict".to_string()
+    } else {
+        format!("{count} date conflicts")
+    };
+    let heading = if count == 1 {
+        "Date conflict".to_string()
+    } else {
+        format!("{count} date conflicts")
+    };
+
+    let toggle = move |_: leptos::ev::MouseEvent| {
+        let opening = !open.get_untracked();
+        if opening && let Some(el) = root_ref.get_untracked() {
+            let rect = el.get_bounding_client_rect();
+            set_anchor.set(Some((rect.bottom(), rect.right())));
+        }
+        set_open.set(opening);
+    };
+
+    view! {
+        <span node_ref=root_ref>
+            <button
+                type="button"
+                class=move || conflict_glyph_class(open.get())
+                aria-expanded=move || if open.get() { "true" } else { "false" }
+                aria-label=aria_label
+                on:click=toggle
+            >
+                <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]" aria-hidden="true">
+                    "!"
+                </span>
+            </button>
+        </span>
+        <Show when=move || open.get()>
+            {
+                // Clone into block locals so the `Show` closure borrows the
+                // originals; clone again at each use so the `Portal` closure does
+                // too — the same discipline `CitationBullet` follows.
+                let heading = heading.clone();
+                let conflicts = conflicts.clone();
+                view! {
+                    <Portal>
+                        <div
+                            node_ref=popover_ref
+                            role="group"
+                            class=popover_class(true)
+                            style=move || popover_style(anchor.get())
+                        >
+                            <div class=top_accent_class(true)></div>
+                            <div class=header_class(true)>
+                                <span>{heading.clone()}</span>
+                            </div>
+                            <div class="p-3 space-y-4 max-h-80 overflow-y-auto">
+                                {conflict_detail_views(conflicts.clone())}
+                            </div>
+                        </div>
+                    </Portal>
+                }
+            }
+        </Show>
+    }
+}
+
+/// The popover body: one block per conflict — its plain-language summary and the
+/// inline time-axis plotting its participating facts.
+fn conflict_detail_views(conflicts: Vec<ResolvedConflict>) -> Vec<AnyView> {
+    conflicts
+        .into_iter()
+        .map(|conflict| {
+            let summary = conflict.summary.clone();
+            let axis = conflict_axis(&conflict);
+            view! {
+                <div>
+                    <p class="font-serif text-sm text-body mb-2">{summary}</p>
+                    {axis}
+                </div>
+            }
+            .into_any()
+        })
+        .collect()
+}
+
+/// One conflict's time-axis: each participant plotted at its date, the witness
+/// (out-of-lifetime evidence) in the conflict color and bracketed to the bookend
+/// it sits on the wrong side of. A self-contained inline SVG set via `inner_html`,
+/// its colors drawn from the theme's CSS custom properties.
+fn conflict_axis(conflict: &ResolvedConflict) -> AnyView {
+    match build_conflict_svg(conflict) {
+        Some(markup) => view! { <div class="w-full" inner_html=markup></div> }.into_any(),
+        None => view! {
+            <p class="text-xs text-sepia/50 italic">"No dated participants to plot"</p>
+        }
+        .into_any(),
+    }
+}
+
+/// Build the inline-SVG markup for a conflict's time-axis, or `None` when no
+/// participant carries a plottable date. Positions scale to the participants'
+/// date range with padding; the witness point and the "before"/"after" bracket
+/// use the amber conflict tones.
+fn build_conflict_svg(conflict: &ResolvedConflict) -> Option<String> {
+    const VB_W: f64 = 240.0;
+    const VB_H: f64 = 88.0;
+    const PAD_X: f64 = 30.0;
+    const AXIS_Y: f64 = 54.0;
+
+    if conflict.points.is_empty() {
+        return None;
+    }
+
+    let inner = VB_W - 2.0 * PAD_X;
+    let right = VB_W - PAD_X;
+    let tick_top = AXIS_Y - 5.0;
+    let tick_bot = AXIS_Y + 5.0;
+    let label_y = AXIS_Y - 11.0;
+    let year_y = AXIS_Y + 17.0;
+
+    let min = conflict
+        .points
+        .iter()
+        .map(|p| p.pos)
+        .fold(f64::INFINITY, f64::min);
+    let max = conflict
+        .points
+        .iter()
+        .map(|p| p.pos)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let range = if (max - min).abs() < 1.0 {
+        1.0
+    } else {
+        max - min
+    };
+    let lo = min - 0.18 * range;
+    let span = (max + 0.18 * range) - lo;
+    let x_of = |pos: f64| PAD_X + (pos - lo) / span * inner;
+
+    let mut body = String::new();
+    body.push_str(&format!(
+        r#"<line x1="{PAD_X:.1}" y1="{AXIS_Y:.1}" x2="{right:.1}" y2="{AXIS_Y:.1}" style="stroke:var(--color-sepia);stroke-opacity:0.3" stroke-width="1"/>"#
+    ));
+
+    // The impossible ordering: the witness bracketed to the bookend it can't
+    // precede (a construction start) or follow (a demolition).
+    let witness = conflict.points.iter().find(|p| p.is_witness);
+    let anchor = conflict.points.iter().find(|p| !p.is_witness);
+    if let (Some(w), Some(a)) = (witness, anchor) {
+        let wx = x_of(w.pos);
+        let ax = x_of(a.pos);
+        let (x1, x2) = if wx <= ax { (wx, ax) } else { (ax, wx) };
+        let mid = (x1 + x2) / 2.0;
+        let bracket_y = AXIS_Y - 24.0;
+        let foot = AXIS_Y - 9.0;
+        let label_pos = bracket_y - 3.0;
+        let relation = if w.pos < a.pos { "before" } else { "after" };
+        body.push_str(&format!(
+            r#"<path d="M {x1:.1} {foot:.1} L {x1:.1} {bracket_y:.1} L {x2:.1} {bracket_y:.1} L {x2:.1} {foot:.1}" style="stroke:var(--color-disputed)" fill="none" stroke-width="1"/>"#
+        ));
+        body.push_str(&format!(
+            r#"<text x="{mid:.1}" y="{label_pos:.1}" text-anchor="middle" font-size="8" font-style="italic" style="fill:var(--color-disputed-deep)">{relation}</text>"#
+        ));
+    }
+
+    for point in &conflict.points {
+        let cx = x_of(point.pos);
+        let (dot, year_fill) = if point.is_witness {
+            ("var(--color-disputed)", "var(--color-disputed-deep)")
+        } else {
+            ("var(--color-sepia)", "var(--color-sepia)")
+        };
+        let label = svg_escape(&point.label);
+        let year = svg_escape(&point.year);
+        body.push_str(&format!(
+            r#"<line x1="{cx:.1}" y1="{tick_top:.1}" x2="{cx:.1}" y2="{tick_bot:.1}" style="stroke:var(--color-sepia);stroke-opacity:0.4" stroke-width="1"/>"#
+        ));
+        body.push_str(&format!(
+            r#"<circle cx="{cx:.1}" cy="{AXIS_Y:.1}" r="4" style="fill:{dot}"/>"#
+        ));
+        body.push_str(&format!(
+            r#"<text x="{cx:.1}" y="{label_y:.1}" text-anchor="middle" font-size="7.5" style="fill:var(--color-sepia);fill-opacity:0.85">{label}</text>"#
+        ));
+        body.push_str(&format!(
+            r#"<text x="{cx:.1}" y="{year_y:.1}" text-anchor="middle" font-size="9" style="fill:{year_fill}">{year}</text>"#
+        ));
+    }
+
+    Some(format!(
+        r#"<svg viewBox="0 0 {VB_W:.0} {VB_H:.0}" class="w-full h-auto" role="img" aria-hidden="true">{body}</svg>"#
+    ))
+}
+
+/// The conflict marker classes: a solid amber disc the size of a citation
+/// bullet, its parchment `!` reading as a cut-out, deepening while its popover
+/// is open. Mirrors [`bullet_class`]'s dimensions so it rides the row as the
+/// same-sized superscript — solid alert against the bullet's neutral outline.
+fn conflict_glyph_class(open: bool) -> String {
+    let base = "inline-flex items-center justify-center align-[0.5em] \
+                min-w-[1.3em] h-[1.3em] px-[0.25em] ml-[0.15em] \
+                rounded-full text-parchment text-[0.6em] font-sans font-bold leading-none \
+                cursor-pointer transition-colors";
+    let tone = if open {
+        "bg-disputed-deep"
+    } else {
+        "bg-disputed hover:bg-disputed-deep"
+    };
+    format!("{base} {tone}")
+}
+
+/// Neutralize the ampersand and angle brackets before splicing generated text
+/// into the raw inline-SVG markup.
+fn svg_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 // ==================== Date formatting ====================

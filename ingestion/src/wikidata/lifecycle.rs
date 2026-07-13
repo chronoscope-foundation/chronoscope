@@ -1,10 +1,11 @@
 //! Lifecycle extraction from Wikidata claims.
 //!
-//! Extracts construction/demolition bookends and interior lifetime events from
-//! Wikidata properties as fact-shaped [`Contribution`]s, each date and
-//! location paired with its [`FactualCitation`] at the point of extraction.
-//! Handles entity splitting when demolish→rebuild patterns indicate a new
-//! entity.
+//! Extracts construction/demolition bookends, existence witnesses, and interior
+//! lifetime events from Wikidata properties as fact-shaped [`Contribution`]s,
+//! each date and location paired with its [`FactualCitation`] at the point of
+//! extraction. Construction phases come from P793's start/end qualifiers; P571
+//! inception dates the entity's existence. Handles entity splitting when
+//! demolish→rebuild patterns indicate a new entity.
 //!
 //! Date and location fields are `Vec`s because parallel claims (multiple
 //! non-deprecated statements about one slot) each contribute a competing
@@ -60,6 +61,9 @@ pub enum Contribution {
         started: Vec<CitedDate>,
         completed: Vec<CitedDate>,
     },
+    /// Existence witnesses: dates the entity is attested to have existed at,
+    /// each becoming its own existence fact.
+    Existence { dates: Vec<CitedDate> },
     /// An interior lifetime event.
     Event(Box<InteriorEvent>),
 }
@@ -623,8 +627,9 @@ fn usage_changed(
 /// Build lifecycles from claims.
 ///
 /// Extracts P571, P576, P625, P793, and the usage-transition properties
-/// (P1619, P3999, P729, P730), fuses them into complete contributions, and
-/// sorts chronologically. Returns (`entity_lifecycles`, warnings). Multiple
+/// (P1619, P3999, P729, P730) into contributions, and sorts chronologically.
+/// P571 becomes existence witnesses; construction bookends come from P793;
+/// P625 is the build location. Returns (`entity_lifecycles`, warnings). Multiple
 /// inner vecs when demolish→construct indicates entity splitting; the caller
 /// creates `Replaces` relationships between them.
 pub fn build_lifecycles(
@@ -667,58 +672,50 @@ pub fn build_lifecycles(
         }
     }
 
-    // 3. Build construction contributions, fusing P571/P625 with P793:
-    //    P571 inception is a competing construction *start* bound (existence
-    //    onset ≈ construction start), and P625 is the build location. With no
-    //    P793 construction, the inceptions stand as their own construction;
-    //    otherwise they join the earliest P793 construction's start bounds.
+    // 3. P571 inceptions are existence witnesses — the entity provably existed
+    //    at each. A witness before the construction start surfaces as a
+    //    read-time contradiction.
+    if !inceptions.is_empty() {
+        let sort_key = earliest_of(&inceptions);
+        dated.push(DatedContribution {
+            contribution: Contribution::Existence { dates: inceptions },
+            sort_key,
+        });
+    }
+
+    // 4. Construction bookends come from P793's start/end qualifiers; P625 is the
+    //    build location. It rides the earliest P793 construction, or — with no
+    //    dated construction — its own location-only construction, so a placeable
+    //    entity keeps its site.
     if p793_constructions.is_empty() {
-        if !inceptions.is_empty() || !locations.is_empty() {
-            let sort_key = earliest_of(&inceptions);
+        if !locations.is_empty() {
             dated.push(DatedContribution {
                 contribution: Contribution::Construction {
-                    started: inceptions,
+                    started: Vec::new(),
                     completed: Vec::new(),
                     location: locations,
                 },
-                sort_key,
+                sort_key: None,
             });
         }
     } else {
-        // The earliest P793 construction takes the location and absorbs the
-        // P571 inceptions as competing start bounds — every non-deprecated
-        // inception is asserted, never conditionally dropped.
         p793_constructions.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
         let mut remaining_locations = locations;
-        let mut remaining_inceptions = inceptions;
 
         for (i, mut dc) in p793_constructions.into_iter().enumerate() {
             if i == 0
-                && let Contribution::Construction {
-                    started,
-                    completed,
-                    location,
-                } = &mut dc.contribution
+                && let Contribution::Construction { location, .. } = &mut dc.contribution
             {
                 *location = std::mem::take(&mut remaining_locations);
-                started.append(&mut remaining_inceptions);
-                // An absorbed inception can predate the construction's own
-                // start; keep the sort key equal to the earliest emitted bound.
-                let earliest = started
-                    .iter()
-                    .chain(completed.iter())
-                    .filter_map(|d| d.bound.earliest())
-                    .min();
-                dc.sort_key = earliest;
             }
             dated.push(dc);
         }
     }
 
-    // 4. Add non-construction P793 events
+    // 5. Add non-construction P793 events
     dated.extend(p793_other);
 
-    // 5. Add P576 demolition
+    // 6. Add P576 demolition
     if !demolition_dates.is_empty() {
         let sort_key = earliest_of(&demolition_dates);
         dated.push(DatedContribution {
@@ -730,7 +727,7 @@ pub fn build_lifecycles(
         });
     }
 
-    // 6. Add usage-transition events, one per distinct claimed date. One
+    // 7. Add usage-transition events, one per distinct claimed date. One
     //    property can carry several genuine transitions — a station reopened
     //    over decades — so each distinct date becomes its own event, and claims
     //    sharing a date merge into one, pooling their citations.
@@ -751,10 +748,10 @@ pub fn build_lifecycles(
     // P730 service retirement: ceased use.
     push_usage(service_retirements, Some(BTreeSet::new()));
 
-    // 7. Sort chronologically
+    // 8. Sort chronologically
     dated.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
 
-    // 8. Split on demolish->construct boundaries
+    // 9. Split on demolish->construct boundaries
     let entities = split_on_rebuild(dated);
 
     (entities, warnings)
@@ -1152,7 +1149,7 @@ mod tests {
     // build_lifecycles integration tests
     // =========================================================================
 
-    /// P571 inception date only -> single Construction start bound
+    /// P571 inception date only -> a single existence witness, no construction.
     #[test]
     fn build_p571_inception_only() -> TestResult {
         let claims = claims_from(vec![(
@@ -1169,34 +1166,24 @@ mod tests {
 
         let contributions = &lifecycles[0];
         assert_eq!(contributions.len(), 1);
-        let Contribution::Construction {
-            started,
-            completed,
-            location,
-        } = &contributions[0]
-        else {
-            return Err("expected Construction".into());
+        let Contribution::Existence { dates } = &contributions[0] else {
+            return Err("expected Existence".into());
         };
-        // P571 is a construction start bound (inception = existence onset)
-        assert_eq!(started.len(), 1);
+        // P571 witnesses existence, cited to P571.
+        assert_eq!(dates.len(), 1);
         assert_eq!(
-            started[0]
-                .bound
-                .earliest()
-                .ok_or("expected earliest")?
-                .year(),
+            dates[0].bound.earliest().ok_or("expected earliest")?.year(),
             1920
         );
         assert_eq!(
-            citation_property(&started[0].citation)?,
+            citation_property(&dates[0].citation)?,
             WikidataPropertyId::new(571)
         );
-        assert!(completed.is_empty());
-        assert!(location.is_empty());
         Ok(())
     }
 
-    /// P571 + P625 -> Construction with date and location
+    /// P571 + P625 -> an existence witness (P571) plus a dateless construction
+    /// carrying the P625 build location, since no P793 dates the construction.
     #[test]
     fn build_p571_with_p625_location() -> TestResult {
         let claims = claims_from(vec![
@@ -1210,18 +1197,35 @@ mod tests {
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
-        assert_eq!(lifecycles[0].len(), 1);
+        assert_eq!(lifecycles[0].len(), 2);
 
-        let Contribution::Construction {
-            started, location, ..
-        } = &lifecycles[0][0]
-        else {
-            return Err("expected Construction".into());
-        };
-        assert_eq!(started.len(), 1);
+        let existence = lifecycles[0]
+            .iter()
+            .find_map(|c| match c {
+                Contribution::Existence { dates } => Some(dates),
+                _ => None,
+            })
+            .ok_or("expected an existence witness")?;
+        assert_eq!(existence.len(), 1);
         assert_eq!(
-            citation_property(&started[0].citation)?,
+            citation_property(&existence[0].citation)?,
             WikidataPropertyId::new(571)
+        );
+
+        let (started, completed, location) = lifecycles[0]
+            .iter()
+            .find_map(|c| match c {
+                Contribution::Construction {
+                    started,
+                    completed,
+                    location,
+                } => Some((started, completed, location)),
+                _ => None,
+            })
+            .ok_or("expected a location-only construction")?;
+        assert!(
+            started.is_empty() && completed.is_empty(),
+            "no construction date is invented from P571"
         );
         assert_eq!(location.len(), 1);
         assert_eq!(
@@ -1238,9 +1242,10 @@ mod tests {
         Ok(())
     }
 
-    /// P571 + P576 -> Construction + Demolition
+    /// P571 + P576 -> an existence witness (P571) + a demolition (P576), sorted
+    /// chronologically. No construction, since nothing dates a build phase.
     #[test]
-    fn build_p571_p576_construction_and_demolition() -> TestResult {
+    fn build_p571_p576_existence_and_demolition() -> TestResult {
         let claims = claims_from(vec![
             (
                 "P571",
@@ -1263,12 +1268,12 @@ mod tests {
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
-        // Sorted chronologically: Construction (P571) 1900, Demolition (P576) 1960
-        let Contribution::Construction { started, .. } = &lifecycles[0][0] else {
-            return Err("expected Construction".into());
+        // Sorted chronologically: Existence (P571) 1900, Demolition (P576) 1960
+        let Contribution::Existence { dates } = &lifecycles[0][0] else {
+            return Err("expected Existence".into());
         };
         assert_eq!(
-            citation_property(&started[0].citation)?,
+            citation_property(&dates[0].citation)?,
             WikidataPropertyId::new(571)
         );
 
@@ -1532,13 +1537,10 @@ mod tests {
         assert_eq!(lifecycles.len(), 1);
 
         let contributions = &lifecycles[0];
-        // Construction (1850), Opening (1855), Renovation (1920), Demolition (1960)
+        // Existence (1850), Opening (1855), Renovation (1920), Demolition (1960)
         assert_eq!(contributions.len(), 4);
 
-        assert!(matches!(
-            &contributions[0],
-            Contribution::Construction { .. }
-        ));
+        assert!(matches!(&contributions[0], Contribution::Existence { .. }));
         assert!(matches!(
             &contributions[1],
             Contribution::Event(e) if matches!(
@@ -1595,10 +1597,11 @@ mod tests {
         Ok(())
     }
 
-    /// P571 joins a P793 construction as a competing start bound, cited to
-    /// P571, alongside the P793 start — it fuses, it does not stand alone.
+    /// P571 and a P793 construction stand as separate contributions: the P793
+    /// start dates the build, the P571 inception witnesses existence, each cited
+    /// to its own property.
     #[test]
-    fn p571_inception_joins_p793_construction_as_competing_start() -> TestResult {
+    fn p571_inception_and_p793_construction_are_separate() -> TestResult {
         let claims = claims_from(vec![
             (
                 "P571",
@@ -1620,41 +1623,48 @@ mod tests {
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
-        assert_eq!(
-            lifecycles[0].len(),
-            1,
-            "P571 fuses, it does not stand alone"
-        );
+        assert_eq!(lifecycles[0].len(), 2);
 
-        let Contribution::Construction {
-            started, completed, ..
-        } = &lifecycles[0][0]
-        else {
-            return Err("expected Construction".into());
-        };
+        // The P793 construction start (1887), cited to P793, dates the build.
+        let (started, completed) = lifecycles[0]
+            .iter()
+            .find_map(|c| match c {
+                Contribution::Construction {
+                    started, completed, ..
+                } => Some((started, completed)),
+                _ => None,
+            })
+            .ok_or("expected a construction")?;
         assert!(completed.is_empty(), "no completion is invented");
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            citation_property(&started[0].citation)?,
+            WikidataPropertyId::new(793)
+        );
+        assert_eq!(started[0].bound.earliest().ok_or("earliest")?.year(), 1887);
 
-        // Both the P793 start (1887) and the P571 inception (1889) are asserted
-        // as competing start bounds, each cited to its own property.
-        let p793_start = started
+        // The P571 inception (1889) survives as an existence witness, cited to P571.
+        let dates = lifecycles[0]
             .iter()
-            .find(|d| citation_property(&d.citation) == Ok(WikidataPropertyId::new(793)))
-            .ok_or("expected a P793-cited start bound")?;
-        assert_eq!(p793_start.bound.earliest().ok_or("earliest")?.year(), 1887);
-        let p571_start = started
-            .iter()
-            .find(|d| citation_property(&d.citation) == Ok(WikidataPropertyId::new(571)))
+            .find_map(|c| match c {
+                Contribution::Existence { dates } => Some(dates),
+                _ => None,
+            })
             .ok_or("the P571 inception is asserted, not dropped")?;
-        assert_eq!(p571_start.bound.earliest().ok_or("earliest")?.year(), 1889);
+        assert_eq!(dates.len(), 1);
+        assert_eq!(
+            citation_property(&dates[0].citation)?,
+            WikidataPropertyId::new(571)
+        );
+        assert_eq!(dates[0].bound.earliest().ok_or("earliest")?.year(), 1889);
         Ok(())
     }
 
-    /// Mirrors Notre-Dame (Q2981): a P571 founding date plus a P793 construction
-    /// that already carries a completion. The inception must survive as a
-    /// construction start bound rather than being dropped for lack of an empty
-    /// completion slot.
+    /// Mirrors Notre-Dame (Q2981): a P571 founding of 1160 plus a P793
+    /// construction (1163–1345). The founding is an existence witness before the
+    /// build start — the read-time conflict the solver surfaces.
     #[test]
-    fn p571_inception_survives_alongside_completed_p793_construction() -> TestResult {
+    fn p571_founding_witnesses_existence_before_p793_construction() -> TestResult {
         let claims = claims_from(vec![
             (
                 "P571",
@@ -1676,26 +1686,40 @@ mod tests {
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
-        assert_eq!(lifecycles[0].len(), 1, "one fused construction");
+        assert_eq!(lifecycles[0].len(), 2);
 
-        let Contribution::Construction {
-            started, completed, ..
-        } = &lifecycles[0][0]
-        else {
-            return Err("expected Construction".into());
-        };
-        // The P793 completion (1345) is retained.
+        // The P793 construction dates the build: 1163 start through 1345 completion.
+        let (started, completed) = lifecycles[0]
+            .iter()
+            .find_map(|c| match c {
+                Contribution::Construction {
+                    started, completed, ..
+                } => Some((started, completed)),
+                _ => None,
+            })
+            .ok_or("expected a construction")?;
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].bound.earliest().ok_or("earliest")?.year(), 1163);
         assert_eq!(completed.len(), 1);
         assert_eq!(
             completed[0].bound.earliest().ok_or("earliest")?.year(),
             1345
         );
-        // The P571 founding (1160) survives as a competing start bound.
-        let p571_start = started
+
+        // The P571 founding (1160) witnesses existence before the build start.
+        let dates = lifecycles[0]
             .iter()
-            .find(|d| citation_property(&d.citation) == Ok(WikidataPropertyId::new(571)))
-            .ok_or("the P571 founding date is not dropped")?;
-        assert_eq!(p571_start.bound.earliest().ok_or("earliest")?.year(), 1160);
+            .find_map(|c| match c {
+                Contribution::Existence { dates } => Some(dates),
+                _ => None,
+            })
+            .ok_or("the P571 founding is not dropped")?;
+        assert_eq!(dates.len(), 1);
+        assert_eq!(
+            citation_property(&dates[0].citation)?,
+            WikidataPropertyId::new(571)
+        );
+        assert_eq!(dates[0].bound.earliest().ok_or("earliest")?.year(), 1160);
         Ok(())
     }
 
@@ -1849,16 +1873,12 @@ mod tests {
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
-        let Contribution::Construction { started, .. } = &lifecycles[0][0] else {
-            return Err("expected Construction".into());
+        let Contribution::Existence { dates } = &lifecycles[0][0] else {
+            return Err("expected Existence".into());
         };
-        assert_eq!(started.len(), 1, "the deprecated bound contributes nothing");
+        assert_eq!(dates.len(), 1, "the deprecated bound contributes nothing");
         assert_eq!(
-            started[0]
-                .bound
-                .earliest()
-                .ok_or("expected earliest")?
-                .year(),
+            dates[0].bound.earliest().ok_or("expected earliest")?.year(),
             1920
         );
         Ok(())
@@ -1877,9 +1897,10 @@ mod tests {
         Ok(())
     }
 
-    /// Multiple non-deprecated claims all assert, as competing citations
+    /// Multiple non-deprecated P571 claims each witness existence, pooled in one
+    /// existence contribution.
     #[test]
-    fn parallel_p571_claims_yield_competing_start_bounds() -> TestResult {
+    fn parallel_p571_claims_yield_multiple_existence_witnesses() -> TestResult {
         let claims = claims_from(vec![(
             "P571",
             vec![
@@ -1891,15 +1912,11 @@ mod tests {
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
-        assert_eq!(
-            lifecycles[0].len(),
-            1,
-            "one construction, two parallel bounds"
-        );
-        let Contribution::Construction { started, .. } = &lifecycles[0][0] else {
-            return Err("expected Construction".into());
+        assert_eq!(lifecycles[0].len(), 1, "one existence contribution");
+        let Contribution::Existence { dates } = &lifecycles[0][0] else {
+            return Err("expected Existence".into());
         };
-        let years: Vec<i32> = started
+        let years: Vec<i32> = dates
             .iter()
             .filter_map(|d| d.bound.earliest().map(|e| e.year()))
             .collect();

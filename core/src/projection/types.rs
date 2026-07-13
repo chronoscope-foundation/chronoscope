@@ -203,6 +203,9 @@ pub struct Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T> {
     pub construction: Bookend<T>,
     /// The demolition bookend.
     pub demolition: Bookend<T>,
+    /// Existence witnesses — dates the entity is attested to have existed at,
+    /// each an additive membership carrying its own support.
+    pub existence: FactSet<UncertainDate, T>,
     /// Interior lifetime events, keyed by `SameEvent` class.
     pub events: FactMap<EvtId, Event<T>, T>,
     /// Images depicting this entity, keyed by image id, each with its
@@ -214,7 +217,7 @@ pub struct Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T> {
 }
 
 derive_slot!(Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T: Semiring>, {
-    names, relations, refs, construction, demolition, events, depictions, sameness
+    names, relations, refs, construction, demolition, existence, events, depictions, sameness
 });
 
 /// A pure projected image: a product of slots over the image's `SameArtifact`

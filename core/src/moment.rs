@@ -40,6 +40,7 @@ use crate::typed::{
 pub enum TransitionRole {
     ConstructionStart,
     ConstructionEnd,
+    KnownToExist,
     ModificationStart,
     ModificationEnd,
     RepairStart,
@@ -210,6 +211,9 @@ pub(crate) fn decompose<EvtId, ImgId>(
                 &period.started,
                 &period.completed,
             ),
+            EventDetail::Existed { at } => {
+                push_point(&mut out, i, TransitionRole::KnownToExist, dated_bound(at));
+            }
             EventDetail::Interior { kind, .. } => match kind {
                 InteriorEvent::Modified { period } => push_durational(
                     &mut out,
@@ -402,6 +406,7 @@ mod tests {
         Ok(Bounded {
             possible: value.clone(),
             sources: Vec::new(),
+            facts: Vec::new(),
             consensus: Consensus::Reached { value },
         })
     }
@@ -411,6 +416,7 @@ mod tests {
         Bounded {
             possible: V::bottom(),
             sources: Vec::new(),
+            facts: Vec::new(),
             consensus: Consensus::Absent,
         }
     }

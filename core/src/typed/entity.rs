@@ -14,7 +14,9 @@ use crate::location::UnresolvedLocation;
 use crate::projection::Claimed;
 use crate::store::schema::EquivClass;
 
-use crate::projection::{self, Bookend, Bracket, Citation, FactMap, FactSet, NameKey, NameRecord};
+use crate::projection::{
+    self, Bookend, Bracket, Citation, Cited, FactMap, FactSet, NameKey, NameRecord,
+};
 
 use super::*;
 
@@ -96,6 +98,10 @@ pub enum EventDetail<EvtId, ImgId> {
     /// Synthesized from the `demolition` bookend. Carries no location — a
     /// demolition derives the entity's last-known position.
     Demolished { period: Period<ImgId> },
+    /// Synthesized from the `existence` slot — a date the entity is attested to
+    /// have existed at. Evidence, not a lifecycle phase, so it carries only its
+    /// date.
+    Existed { at: Bounded<UncertainDate, ImgId> },
     /// One interior lifetime event: its id, its descriptions, and its parsed
     /// kind.
     Interior {
@@ -497,6 +503,7 @@ pub(crate) fn entry_date_bounds<EvtId, ImgId>(
         EventDetail::Constructed { period, .. } | EventDetail::Demolished { period } => {
             vec![&period.started, &period.completed]
         }
+        EventDetail::Existed { at } => vec![at],
         EventDetail::Interior { kind, .. } => interior_event_bounds(kind),
     }
 }
@@ -518,10 +525,29 @@ where
         .collect()
 }
 
+/// One existence witness as a settled date bound: the attested date, the facts
+/// behind it, and their citations. The date is the slot's key, so the consensus
+/// is reached by construction.
+fn existence_bounded<X>(
+    at: &UncertainDate,
+    entry: &Cited<(), Lineage<X>>,
+) -> Bounded<UncertainDate, X::Img>
+where
+    X: SupportAtom,
+    X::Img: Ord,
+{
+    Bounded {
+        possible: at.clone(),
+        sources: sources(&entry.support),
+        facts: fact_ids(&entry.support),
+        consensus: Consensus::Reached { value: at.clone() },
+    }
+}
+
 /// Assemble the timeline events in a deterministic structural order:
-/// construction first, the interior events by their id, demolition last. Display
-/// ordering — interleaving endpoints by date — is the [`moment`](crate::moment)
-/// layer's job, folded into [`Timeline::build`].
+/// construction first, existence witnesses by date, the interior events by their
+/// id, demolition last. Display ordering — interleaving endpoints by date — is
+/// the [`moment`](crate::moment) layer's job, folded into [`Timeline::build`].
 /// A projected entity over any support lineage.
 type ProjectedEntity<EntId, EvtId, ImgId, X> = projection::Entity<EntId, EvtId, ImgId, Lineage<X>>;
 
@@ -543,6 +569,18 @@ where
                 location: bracket(&projected.construction.location),
             },
             sources: bookend_sources(&projected.construction),
+        });
+    }
+
+    // Existence witnesses — each attested date the entity was already there. The
+    // moment layer interleaves them by date, so an out-of-lifetime witness sorts
+    // to where it visibly clashes with a bookend.
+    for (at, entry) in &projected.existence {
+        events.push(TimelineEvent {
+            detail: EventDetail::Existed {
+                at: existence_bounded(at, entry),
+            },
+            sources: sources(&entry.support),
         });
     }
 
@@ -669,6 +707,7 @@ mod tests {
             refs: FactMap::new(),
             construction: empty_bookend(),
             demolition: empty_bookend(),
+            existence: FactMap::new(),
             events: FactMap::new(),
             depictions: FactMap::new(),
             sameness: FactMap::new(),

@@ -165,6 +165,14 @@ where
             inject_demolition(fact, support, &mut entity.demolition);
             entity
         }
+        FactualAssertion::Existence { fact } => {
+            let support = provenance(fact_id, fact.subject(), stored);
+            let mut entity = Entity::identity();
+            entity
+                .existence
+                .insert(fact.at.clone(), Cited { value: (), support });
+            entity
+        }
         FactualAssertion::Event { fact } => {
             inject_event_fact(fact_id, fact, stored, reachers, provenance)
         }

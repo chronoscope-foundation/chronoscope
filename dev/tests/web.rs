@@ -13,8 +13,10 @@ use harness::{TestResult, WebTest, check, web_test};
 
 /// Hagia Sophia, Istanbul — single entity, good for detail panel tests (lng, lat).
 const HAGIA_SOPHIA: (f64, f64) = (28.979917, 41.008528);
-/// Torcello Cathedral, Venice — two co-located entities for disambiguation (lng, lat).
-const TORCELLO: (f64, f64) = (12.27725, 45.217056);
+/// Chioggia Cathedral, Venice lagoon (lng, lat). Demolished 1623 and refounded
+/// 1633 with no rebuild construction, so it projects as one entity carrying an
+/// existence-after-demolition conflict.
+const CHIOGGIA_CATHEDRAL: (f64, f64) = (12.27725, 45.217056);
 
 /// Assert the three sidebar/nav links (Explore, About, FAQ) are present.
 async fn check_nav_links(t: &WebTest) -> TestResult {
@@ -286,9 +288,9 @@ async fn test_entity_click_opens_detail() -> TestResult {
 
         // The panel renders "Loading..." while fetching the entity detail.
         // Wait for a loaded-state token instead of polling for absence of
-        // "Loading..." — "Construction started" is asserted on below, so
-        // its presence proves the fetch settled and rendered.
-        t.wait_for_body_text("Construction started").await?;
+        // "Loading..." — "Known to exist" is asserted on below, so its
+        // presence proves the fetch settled and rendered.
+        t.wait_for_body_text("Known to exist").await?;
 
         let panel_text = t.text("[role='complementary']").await?;
 
@@ -298,26 +300,24 @@ async fn test_entity_click_opens_detail() -> TestResult {
             format!("Panel should have content after clicking entity, got: {panel_text}"),
         )?;
 
-        // Verify timeline section — Hagia Sophia has Constructed transitions
+        // Verify timeline section renders.
         check(
             panel_text.contains("Timeline") || panel_text.contains("constructed"),
             format!("Panel should show timeline section, got: {panel_text}"),
         )?;
 
-        // Hagia Sophia's construction carries only a start bound (its P571
-        // inception, year 0537). The year must reach the panel labeled as the
-        // start endpoint, not the bare verb.
+        // Hagia Sophia's only lifecycle date is its P571 inception (year 0537),
+        // read as an existence witness. The year reaches the panel on its
+        // "Known to exist" row.
         check(
             panel_text.contains("537"),
-            format!(
-                "Panel should show Hagia Sophia's construction start year 537, got: {panel_text}"
-            ),
+            format!("Panel should show Hagia Sophia's 537 existence witness, got: {panel_text}"),
         )?;
         check(
-            panel_text.contains("Construction started"),
+            panel_text.contains("Known to exist"),
             format!(
-                "Panel should label Hagia Sophia's dated construction row as \
-                 'Construction started' (not the bare 'Constructed'), got: {panel_text}"
+                "Panel should label Hagia Sophia's P571 inception as 'Known to exist', \
+                 got: {panel_text}"
             ),
         )?;
 
@@ -334,76 +334,60 @@ async fn test_entity_click_opens_detail() -> TestResult {
     .await
 }
 
+/// Chioggia's 1633 refounding witnesses existence *after* its 1623 demolition —
+/// the demolition-ceiling side of the temporal solver, complementing Notre-Dame's
+/// construction-floor conflict. The item projects as one entity (the demolition
+/// and refounding no longer split it), so the click opens the detail directly,
+/// and the conflict rides its participating rows as an amber "!" marker.
 #[tokio::test]
-async fn test_disambiguation_picker() -> TestResult {
+async fn test_chioggia_existence_after_demolition_conflict() -> TestResult {
     web_test(async |t| {
-        t.goto_map_at(TORCELLO.0, TORCELLO.1, 14.0).await?;
-
-        t.click_map_at(TORCELLO.0, TORCELLO.1).await?;
-
-        // Wait for the panel
+        t.goto_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1, 14.0)
+            .await?;
+        t.click_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1)
+            .await?;
         t.wait_for_selector("[role='complementary']").await?;
 
+        // A single entity here, so the click lands on the detail, not a picker.
+        t.wait_for_body_text("Known to exist").await?;
         let panel_text = t.text("[role='complementary']").await?;
-
-        // Torcello has two co-located entities — should get disambiguation picker
         check(
-            panel_text.contains("Multiple entities"),
-            format!("Expected disambiguation picker at Torcello, got: {panel_text}"),
+            !panel_text.contains("Multiple entities"),
+            format!("Chioggia projects one entity, not a disambiguation picker, got: {panel_text}"),
         )?;
-
-        // Should list co-located entities (both are Cathedrals at this location)
-        check(
-            panel_text.contains("Cathedral"),
-            format!("Picker should list co-located entities, got: {panel_text}"),
-        )?;
-
-        t.screenshot("test_disambiguation_picker").await?;
-
-        // Click the first picker entry (not the dismiss button). Picker
-        // buttons have aria-labels containing the entity name.
-        t.click("[role='complementary'] button[aria-label*='Cathedral']")
-            .await?;
-        // Wait for entity detail to load (async API fetch) — the timeline
-        // section only appears in the detail view, not the picker.
-        t.wait_for_body_text("Timeline").await?;
-
-        let detail_text = t.text("[role='complementary']").await?;
-        check(
-            !detail_text.contains("Multiple entities") && detail_text.len() > 20,
-            format!("Should show entity detail after picker selection, got: {detail_text}"),
-        )?;
-
-        // The first picker entry is v1 Chioggia (earliest_date = 1623, the
-        // demolition year): a dateless `Constructed` plus `Demolished
-        // completed 1623-12-26`. The dateless Constructed must still render
-        // *before* the dated Demolished — lifecycle phase order, not date
-        // order.
-        check(
-            detail_text.contains("date unknown"),
-            format!(
-                "v1 Chioggia Cathedral should surface its dateless Constructed \
-                 row as 'date unknown', got: {detail_text}"
-            ),
-        )?;
-        // The detail panel should show timeline events for this Chioggia
-        // Cathedral variant. Verify it has at least a Construction entry.
-        check(
-            detail_text.contains("Construct"),
-            format!(
-                "Expected a Constructed/Construction row in Chioggia detail, got: {detail_text}"
-            ),
-        )?;
-
-        t.screenshot("test_disambiguation_picker_detail").await?;
-
-        // Click back button to return to picker
-        if t.exists("button[aria-label*='Back']").await? {
-            t.click("button[aria-label*='Back']").await?;
-
-            // Should be back at the picker
-            t.wait_for_body_text("Multiple entities").await?;
+        for token in [
+            "Chioggia Cathedral",
+            "Demolition completed",
+            "1623",
+            "Known to exist",
+            "1633",
+        ] {
+            check(
+                panel_text.contains(token),
+                format!("Chioggia's detail should render '{token}', got: {panel_text}"),
+            )?;
         }
+
+        t.screenshot("test_chioggia_existence_after_demolition_conflict")
+            .await?;
+
+        // The conflict marker's aria-label names the date conflict; opening it
+        // reveals the clash and a time-axis plotting the rival instants.
+        let marker = "[role='complementary'] button[aria-label*='date conflict']";
+        t.wait_for_selector(marker).await?;
+        t.click(marker).await?;
+        t.wait_for_selector("[role='group']").await?;
+        let popover = t.text("[role='group']").await?.to_lowercase();
+        for token in ["existed", "1633", "1623", "demolished"] {
+            check(
+                popover.contains(token),
+                format!("the conflict popover must name '{token}', got: {popover}"),
+            )?;
+        }
+        check(
+            t.exists("[role='group'] svg").await?,
+            "the conflict popover must plot its participants on a time-axis",
+        )?;
 
         Ok(())
     })
@@ -1110,53 +1094,35 @@ async fn test_notre_dame_interior_event_renders_between_construction_endpoints()
     .await
 }
 
-/// Notre-Dame's construction start is contested: a P571 founding of 1160 fights
-/// the P793 build start of 1163, so the flattener leaves the slot in conflict.
-/// The panel must render that dispute — an amber citation bullet on the row, the
-/// honest joined value "1160 / 1163" inline, and the rival claims in the
-/// bullet's popover — rather than promoting one date to a settled value.
+/// Notre-Dame is attested existing (P571, 1160) before its construction started
+/// (P793, 1163) — a contradiction spanning two fields with no per-slot home, so it
+/// surfaces as an entity-level temporal conflict. The panel rides it inline on the
+/// participating rows as an amber "!" marker; opening it reveals the plain-language
+/// clash and a time-axis plotting the rival instants.
 #[tokio::test]
-async fn test_notre_dame_disputed_construction_start_shows_rival_years() -> TestResult {
+async fn test_notre_dame_existence_before_construction_conflict() -> TestResult {
     web_test(async |t| {
         open_notre_dame_panel(t).await?;
 
-        // The contested row carries an amber citation bullet, whose aria-label
-        // marks the conflict — the disputed treatment.
-        t.wait_for_selector("[role='complementary'] button[aria-label*='conflicting']")
-            .await?;
+        // The conflict marker's aria-label names the date conflict, distinguishing
+        // it from a citation bullet's "conflicting sources".
+        let marker = "[role='complementary'] button[aria-label*='date conflict']";
+        t.wait_for_selector(marker).await?;
+        t.click(marker).await?;
 
-        // The joined inline value names both rival years without opening anything.
-        let inline_text = t.text("[role='complementary']").await?;
+        // The popover portals to document.body with role='group'; wait for it,
+        // then read the clash and confirm the time-axis rendered.
+        t.wait_for_selector("[role='group']").await?;
+        let popover = t.text("[role='group']").await?.to_lowercase();
+        for token in ["existed", "1160", "1163", "construction"] {
+            check(
+                popover.contains(token),
+                format!("the conflict popover must name '{token}', got: {popover}"),
+            )?;
+        }
         check(
-            inline_text.contains("1160") && inline_text.contains("1163"),
-            format!(
-                "The disputed construction start must render the honest joined value \
-                 naming both rival years 1160 and 1163, got: {inline_text}"
-            ),
-        )?;
-
-        // Opening the bullet reveals the rival claims — wait for a source label
-        // only the popover carries.
-        t.click("[role='complementary'] button[aria-label*='conflicting']")
-            .await?;
-        t.wait_for_body_text("P571").await?;
-
-        // The popover is portaled to document.body, outside the complementary
-        // panel; while a bullet is open it is the page's only `role='group'`.
-        let popover_text = t.text("[role='group']").await?;
-        check(
-            popover_text.to_lowercase().contains("disputed"),
-            format!(
-                "Opening the contested bullet must reveal the disputed treatment, \
-                 got: {popover_text}"
-            ),
-        )?;
-        check(
-            popover_text.contains("1160") && popover_text.contains("1163"),
-            format!(
-                "The disputed popover must name both rival years 1160 and 1163, \
-                 got: {popover_text}"
-            ),
+            t.exists("[role='group'] svg").await?,
+            "the conflict popover must plot its participants on a time-axis",
         )?;
 
         Ok(())
@@ -1177,9 +1143,8 @@ async fn open_notre_dame_panel(t: &WebTest) -> TestResult {
 
 /// A settled field's bullet opens the plain (non-disputed) popover: a
 /// "Source(s)" heading and the field's Wikidata source label, with no disputed
-/// treatment. This is the common path the disputed test never exercises, and the
-/// one the now-conditional `<Portal>` could have broken while the disputed test
-/// stayed green.
+/// treatment. Guards the common source-listing path and the conditional
+/// `<Portal>` mount behind it.
 #[tokio::test]
 async fn test_settled_citation_popover_shows_its_source() -> TestResult {
     web_test(async |t| {
@@ -1246,39 +1211,44 @@ async fn test_citation_popover_dismisses_on_escape_and_outside_click() -> TestRe
     .await
 }
 
-/// A disputed rival deep-links to the exact Wikidata revision and property that
-/// sourced its date, opening in a new tab. Guards `citation_url`'s oldid +
-/// property-anchor construction and the `target=_blank` behavior.
+/// A settled Wikidata-statement citation deep-links to the exact pinned revision
+/// and property that sourced its date, opening in a new tab. Guards
+/// `citation_url`'s oldid + property-anchor construction and the `target=_blank`
+/// behavior.
 #[tokio::test]
-async fn test_disputed_citation_source_links_to_wikidata_revision() -> TestResult {
+async fn test_settled_citation_source_links_to_wikidata_revision() -> TestResult {
     web_test(async |t| {
         open_notre_dame_panel(t).await?;
 
-        t.click("[role='complementary'] button[aria-label*='conflicting']")
-            .await?;
+        // A timeline-row date bullet cites a Wikidata *statement* (its P-property),
+        // so its link carries the property anchor; scoping to the timeline list
+        // skips the name bullet, whose label source has none.
+        t.click(
+            "[role='complementary'] li button[aria-label*='source']:not([aria-label*='conflicting'])",
+        )
+        .await?;
 
-        // The first rival link — robust to which of P571/P793 sorts first.
         let href = t
             .attr("[role='group'] a", "href")
             .await?
-            .ok_or("the disputed popover's rival must link to its source")?;
+            .ok_or("the settled source must link to its Wikidata revision")?;
         check(
             href.contains("wikidata.org/wiki/Q2981")
                 && href.contains("oldid=")
                 && href.contains("#P"),
             format!(
-                "the rival link must deep-link to the pinned Wikidata revision and \
-                 property, got: {href}"
+                "the settled statement link must deep-link to the pinned Wikidata \
+                 revision and property, got: {href}"
             ),
         )?;
 
         let target = t
             .attr("[role='group'] a", "target")
             .await?
-            .ok_or("the rival link must declare a target")?;
+            .ok_or("the settled source link must declare a target")?;
         check(
             target == "_blank",
-            format!("the rival link must open in a new tab, got: {target}"),
+            format!("the source link must open in a new tab, got: {target}"),
         )?;
 
         Ok(())

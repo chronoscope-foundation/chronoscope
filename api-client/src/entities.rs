@@ -15,6 +15,7 @@ use url::Url;
 use chronoscope_core::GeoPoint;
 use chronoscope_core::grammar::depiction::Perspective;
 use chronoscope_core::grammar::image::ImageMedium;
+use chronoscope_core::solvers::TemporalConflict;
 use chronoscope_core::{listing, typed};
 
 use crate::client::ApiError;
@@ -38,6 +39,12 @@ pub type Entity = typed::Entity<EntityId, EventId, ImageId>;
 /// Over-determined date slots surface inline on the entity's own fields as a
 /// disputed [`typed::Consensus`], carrying the fighting facts the panel renders a
 /// dispute indicator from.
+///
+/// `temporal_conflicts` are the entity-level contradictions a read-time solver
+/// found — facts that each hold alone but can't jointly, so they have no
+/// per-field home. Each names the facts to blame; the panel surfaces them apart
+/// from the per-field dispute badge. Empty when the entity's facts are jointly
+/// consistent.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(bound(
     deserialize = "E: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, V: ::serde::de::DeserializeOwned, I: ::serde::de::DeserializeOwned"
@@ -45,6 +52,7 @@ pub type Entity = typed::Entity<EntityId, EventId, ImageId>;
 pub struct EntityDetail<E: Ord, V, I> {
     pub entity: typed::Entity<E, V, I>,
     pub display_name: Option<String>,
+    pub temporal_conflicts: Vec<TemporalConflict>,
     /// The read-consistency point this projection was served at. Thread it back
     /// as `?snapshot=` on the images sub-resource so the grid reads the same
     /// state as this detail.

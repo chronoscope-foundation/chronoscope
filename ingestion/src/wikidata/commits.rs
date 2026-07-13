@@ -16,6 +16,7 @@ use chronoscope_core::grammar::citations::{
 };
 use chronoscope_core::grammar::depiction::{self, Perspective};
 use chronoscope_core::grammar::event;
+use chronoscope_core::grammar::existence;
 use chronoscope_core::grammar::ids::{IdScheme, IngesterRunId};
 use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::grammar::lifecycle::DurationalRole;
@@ -258,6 +259,17 @@ fn push_lifecycle_facts(facts: &mut Vec<SubmitFact>, splits: &[Vec<Contribution>
                         ));
                     }
                 }
+                Contribution::Existence { dates } => {
+                    for d in dates {
+                        facts.push(existence_fact(
+                            existence::Fact {
+                                entity,
+                                at: d.bound.clone(),
+                            },
+                            d.citation.clone(),
+                        ));
+                    }
+                }
                 Contribution::Event(interior) => {
                     let event = EventIdx(event_count);
                     event_count += 1;
@@ -492,6 +504,13 @@ fn demolition_fact(
 ) -> SubmitFact {
     SubmitFact::Factual {
         assertion: FactualAssertion::Demolition { fact },
+        citation,
+    }
+}
+
+fn existence_fact(fact: existence::Fact<EntityIdx>, citation: FactualCitation) -> SubmitFact {
+    SubmitFact::Factual {
+        assertion: FactualAssertion::Existence { fact },
         citation,
     }
 }
@@ -810,13 +829,26 @@ mod tests {
             commit.facts.iter().any(|f| matches!(
                 f,
                 SubmitFact::Factual {
-                    assertion: FactualAssertion::Construction {
-                        fact: bookend::ConstructionFact::Started { entity, .. }
+                    assertion: FactualAssertion::Existence {
+                        fact: existence::Fact { entity, .. }
                     },
                     ..
                 } if *entity == EntityIdx(0)
             )),
-            "the P571 inception is a construction-start bookend"
+            "the P571 inception is an existence witness"
+        );
+
+        assert!(
+            commit.facts.iter().any(|f| matches!(
+                f,
+                SubmitFact::Factual {
+                    assertion: FactualAssertion::Construction {
+                        fact: bookend::ConstructionFact::Location { entity, .. }
+                    },
+                    ..
+                } if *entity == EntityIdx(0)
+            )),
+            "the P625 coordinate is the construction location bookend"
         );
 
         assert!(
@@ -1094,17 +1126,20 @@ mod tests {
             "the QID reference reads back off the projection"
         );
 
-        let construction_year = entity.timeline.events().iter().find_map(|entry| {
+        // P625 gives a construction location, but no source dates the build —
+        // P571 witnesses existence, off the timeline. The Constructed row is
+        // present yet undated.
+        let construction_start = entity.timeline.events().iter().find_map(|entry| {
             if let typed::EventDetail::Constructed { period, .. } = &entry.detail {
-                period.started.possible.earliest()
+                Some(period.started.possible.earliest())
             } else {
                 None
             }
         });
         assert_eq!(
-            construction_year.map(|d| d.year()),
-            Some(1800),
-            "the P571 inception survives as a construction start date on the timeline"
+            construction_start,
+            Some(None),
+            "the construction is a location-only bookend with no start date"
         );
 
         assert!(
@@ -1248,10 +1283,12 @@ mod tests {
             "the summary carries the ingested name: {:?}",
             summary.names
         );
+        // The P571 inception (1800) witnesses existence and anchors the span's
+        // earliest bound; the fire (1900) is a later interior event.
         assert_eq!(
             summary.earliest.map(|d| d.year()),
             Some(1800),
-            "the P571 inception bounds the summary's timeline span"
+            "the P571 inception anchors the summary's earliest span bound"
         );
         Ok(())
     }

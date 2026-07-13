@@ -28,6 +28,7 @@ use chronoscope_core::grammar::ids::UserId;
 use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::grammar::lifecycle::{LifetimeEventKind, PointKind};
 use chronoscope_core::location::{Location, UnresolvedLocation};
+use chronoscope_core::solvers::TemporalConflictKind;
 use chronoscope_core::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact, commit_facts,
 };
@@ -79,9 +80,9 @@ fn resolved_point(
 
 /// Commit `commit` and return the single entity id it resolves.
 async fn commit_single_entity(
-    facts: &MemoryFactStore,
-    commit: Commit<MemoryIds>,
-) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    facts: &ServerFactStore,
+    commit: Commit<ServerIds>,
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
     let result = commit_facts(facts, commit)
         .await
         .map_err(|e| format!("{e:?}"))?;
@@ -200,11 +201,11 @@ fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error + Send + Sync
 /// began. Their disjoint intervals over-determine the start slot, so the typed
 /// projection surfaces a `Conflict` with fighting rivals.
 async fn commit_entity_with_conflicting_start_dates(
-    facts: &MemoryFactStore,
+    facts: &ServerFactStore,
     name: &str,
     early: i32,
     late: i32,
-) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
     let started =
         |y: i32, url: &str| -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
             Ok(SubmitFact::Factual {
@@ -217,7 +218,7 @@ async fn commit_entity_with_conflicting_start_dates(
                 citation: citation(url)?,
             })
         };
-    let commit = Commit::<MemoryIds> {
+    let commit = Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("test")),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
@@ -253,11 +254,11 @@ async fn commit_entity_with_conflicting_start_dates(
 /// the `HasEvent` reacher/backlink projection path onto the event, so the typed
 /// event's date surfaces a `Conflict` with fighting rivals.
 async fn commit_entity_with_conflicting_event_dates(
-    facts: &MemoryFactStore,
+    facts: &ServerFactStore,
     name: &str,
     early: i32,
     late: i32,
-) -> Result<MemoryEntityId, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
     let point_date =
         |y: i32, url: &str| -> Result<SubmitFact, Box<dyn std::error::Error + Send + Sync>> {
             Ok(SubmitFact::Factual {
@@ -270,7 +271,7 @@ async fn commit_entity_with_conflicting_event_dates(
                 citation: citation(url)?,
             })
         };
-    let commit = Commit::<MemoryIds> {
+    let commit = Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("test")),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
@@ -304,6 +305,74 @@ async fn commit_entity_with_conflicting_event_dates(
             },
             point_date(early, "https://example.com/date-early")?,
             point_date(late, "https://example.com/date-late")?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    commit_single_entity(facts, commit).await
+}
+
+/// Commit a named entity whose interior point event predates its construction:
+/// a `UsageChanged` opening dated `event`, but construction starts in `started >
+/// event`. Each fact holds alone; jointly they can't, so the entity-level
+/// temporal solver reports one conflict — the Colosseum/Mole shape.
+async fn commit_entity_with_event_before_construction(
+    facts: &ServerFactStore,
+    name: &str,
+    started: i32,
+    event: i32,
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: vec![Decl::Local],
+        images: Vec::new(),
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name {
+                        entity: EntityIdx(0),
+                        name: NameText::new(name),
+                        language: Language::new("en")?,
+                        name_type: NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                },
+                citation: citation("https://example.com/name")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Started {
+                        entity: EntityIdx(0),
+                        bound: year(started)?,
+                    },
+                },
+                citation: citation("https://example.com/inception")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Event {
+                    fact: event::Fact::HasEvent {
+                        entity: EntityIdx(0),
+                        event: EventIdx(0),
+                        kind: LifetimeEventKind::Point {
+                            kind: PointKind::UsageChanged,
+                        },
+                    },
+                },
+                citation: citation("https://example.com/opening")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Event {
+                    fact: event::Fact::PointDate {
+                        event: EventIdx(0),
+                        bound: year(event)?,
+                    },
+                },
+                citation: citation("https://example.com/opening-date")?,
+            },
         ]
         .into_iter()
         .collect(),
@@ -524,6 +593,46 @@ async fn get_entity_surfaces_conflicting_event_date_as_fighting_rivals() -> Test
         2,
         "both disjoint designation dates surface as fighting rivals"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_surfaces_a_temporal_conflict_for_an_event_before_construction() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // Construction starts in 82; an opening dated 81 can't precede it. Each date
+    // is fine on its own field — the contradiction lives across them, so it rides
+    // the entity-level `temporal_conflicts` channel, not a per-slot dispute.
+    let id =
+        commit_entity_with_event_before_construction(&ctx.app_state.facts, "Colosseum", 82, 81)
+            .await?;
+
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
+
+    assert_eq!(
+        detail.temporal_conflicts.len(),
+        1,
+        "the event-before-construction pair is one entity-level conflict, got {:?}",
+        detail.temporal_conflicts
+    );
+    let conflict = detail.temporal_conflicts.first().ok_or("one conflict")?;
+    assert_eq!(
+        conflict.facts.len().get(),
+        2,
+        "the conflict names the event's date fact and the construction-start fact"
+    );
+    // The structured kind survives the serde round-trip through the client,
+    // carrying the 82 construction floor the 81 opening predates.
+    match &conflict.kind {
+        TemporalConflictKind::ExistedBeforeConstruction {
+            construction_started,
+            ..
+        } => assert_eq!(
+            *construction_started,
+            NaiveDate::from_ymd_opt(82, 1, 1).ok_or("valid date")?,
+            "the kind carries the 82 construction floor"
+        ),
+        other => return Err(format!("expected a before-construction kind, got {other:?}").into()),
+    }
     Ok(())
 }
 

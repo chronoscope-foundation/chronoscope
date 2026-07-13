@@ -26,6 +26,8 @@ pub enum DateRole {
     NameValidTo,
     /// A construction/demolition bookend bound (`Started` / `Completed`).
     BookendBound,
+    /// An existence witness's date (`existence::Fact { at }`).
+    ExistenceWitness,
     /// A lifetime-event date (`PointDate` / `DurationalDate`).
     EventDate,
     /// `image::Fact::CreatedDate`.
@@ -43,6 +45,7 @@ impl std::fmt::Display for DateRole {
             Self::NameValidFrom => "name valid-from",
             Self::NameValidTo => "name valid-to",
             Self::BookendBound => "bookend bound",
+            Self::ExistenceWitness => "existence witness",
             Self::EventDate => "event date",
             Self::ImageCreated => "image created-date",
             Self::ImageCaptured => "image captured-date",

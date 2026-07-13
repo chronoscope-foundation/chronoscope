@@ -95,6 +95,7 @@ pub mod location;
 pub mod moment;
 pub mod nonempty;
 pub mod projection;
+pub mod solvers;
 pub mod store;
 pub mod submit;
 pub mod typed;

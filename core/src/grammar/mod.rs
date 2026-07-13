@@ -35,6 +35,8 @@
 //!   relationships).
 //! - [`bookend`] — construction / demolition flat per-entity facts
 //!   (shared shape; the outer variant tag distinguishes the phase).
+//! - [`existence`] — a flat per-entity existence witness (the entity
+//!   provably existed at a date).
 //! - [`event`] — interior-lifetime event facts plus cross-event gap
 //!   primitives ([`event::OrderableEvent`], [`event::GapBounds`]).
 //! - [`image`] — image-level facts: source URL, author, created date,
@@ -57,6 +59,7 @@ pub mod citations;
 pub mod composites;
 pub mod depiction;
 pub mod event;
+pub mod existence;
 pub mod features;
 pub mod geometry;
 pub mod identity;

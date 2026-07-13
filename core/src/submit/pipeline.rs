@@ -829,6 +829,9 @@ fn for_each_assertion_date<R: IdScheme>(
             | bookend::DemolitionFact::Completed { bound, .. }) = fact;
             visit(DateRole::BookendBound, bound);
         }
+        FactualAssertion::Existence { fact } => {
+            visit(DateRole::ExistenceWitness, &fact.at);
+        }
         FactualAssertion::Event { fact } => {
             if let event::Fact::PointDate { bound, .. }
             | event::Fact::DurationalDate { bound, .. } = fact
@@ -938,6 +941,7 @@ fn for_each_stored_location<R: IdScheme>(
         FactualAssertion::Attribute { .. }
         | FactualAssertion::Construction { .. }
         | FactualAssertion::Demolition { .. }
+        | FactualAssertion::Existence { .. }
         | FactualAssertion::Event { .. }
         | FactualAssertion::Gap { .. } => {}
     }

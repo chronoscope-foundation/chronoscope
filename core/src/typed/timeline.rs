@@ -130,6 +130,7 @@ fn resolve_moment_date<'a, EvtId, ImgId>(
         EventDetail::Constructed { period, .. } | EventDetail::Demolished { period } => {
             endpoint(period)
         }
+        EventDetail::Existed { at } => dated_bound(at),
         EventDetail::Interior { kind, .. } => match kind {
             InteriorEvent::Modified { period }
             | InteriorEvent::Repaired { period }
@@ -268,6 +269,7 @@ mod tests {
         Ok(Bounded {
             possible: value.clone(),
             sources: Vec::new(),
+            facts: Vec::new(),
             consensus: Consensus::Reached { value },
         })
     }
@@ -278,6 +280,7 @@ mod tests {
         Bounded {
             possible: V::bottom(),
             sources: Vec::new(),
+            facts: Vec::new(),
             consensus: Consensus::Absent,
         }
     }

@@ -40,6 +40,7 @@ use crate::grammar::citations::{
 use crate::grammar::composites::{self, SubimageRegion};
 use crate::grammar::depiction::{self, Perspective};
 use crate::grammar::event;
+use crate::grammar::existence;
 use crate::grammar::features::Feature;
 use crate::grammar::geometry::{ImageGeometry, ProportionalPolyline};
 use crate::grammar::identity;
@@ -206,6 +207,18 @@ fn golden_demolition_fact_started() -> Result<()> {
     assert_golden_roundtrip(
         &f,
         r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":"1","type":"started"}"#,
+    )
+}
+
+#[test]
+fn golden_existence_fact() -> Result<()> {
+    let f: existence::Fact<MemoryEntityId> = existence::Fact {
+        entity: ent(1)?,
+        at: sample_date()?,
+    };
+    assert_golden_roundtrip(
+        &f,
+        r#"{"at":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"entity":"1"}"#,
     )
 }
 

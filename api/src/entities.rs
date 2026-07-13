@@ -23,6 +23,7 @@ use chronoscope_core::listing::{self, ListCursor, summaries_in_viewport};
 use chronoscope_core::projection::{
     member_lineage, project_entity, project_entity_images, project_image,
 };
+use chronoscope_core::solvers;
 use chronoscope_core::store::{EntityIdOf, EntityView, FactStore, FactView, ImageIdOf, ImageView};
 use chronoscope_core::typed;
 
@@ -30,7 +31,7 @@ use crate::cdn;
 use crate::entity_types;
 use crate::limits;
 use crate::state::{
-    AppState, ServerEntityId, ServerEventId, ServerFactStore, ServerImageId,
+    AppState, ServerEntityId, ServerEventId, ServerFactStore, ServerIds, ServerImageId,
 };
 use crate::validation::fact_store_err;
 
@@ -408,9 +409,11 @@ pub async fn get_entity(
             "Entity not found".to_string(),
         ));
     };
-    // The `fact_lineage` projection carries the whole fighting facts behind each
-    // slot, so `Entity::parse` surfaces any over-determined date slot inline as a
-    // disputed consensus — no second projection or separate conflict pass.
+    // The `fact_lineage` projection carries the whole facts behind each slot, so
+    // one read serves both surfaces: `Entity::parse` flattens the typed view
+    // (over-determined date slots ride inline as a disputed consensus), and
+    // `temporal_conflicts` reads the same support for cross-field contradictions.
+    let temporal_conflicts = solvers::temporal_conflicts::<ServerIds>(&projected);
     let entity = typed::Entity::parse(&projected, &class);
 
     let snapshot = view.snapshot().await.map_err(fact_store_err)?;
@@ -418,6 +421,7 @@ pub async fn get_entity(
     let detail = EntityDetail {
         entity,
         display_name,
+        temporal_conflicts,
         snapshot: encode_snapshot(snapshot)?,
     };
     Ok(vary_language(HttpResponseOk(detail)))

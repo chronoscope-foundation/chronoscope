@@ -931,6 +931,7 @@ dependencies = [
 name = "chronoscope-web"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "chronoscope-api-client",
  "chronoscope-core",
  "console_error_panic_hook",

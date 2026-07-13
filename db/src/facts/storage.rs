@@ -519,6 +519,7 @@ pub(super) fn facet_columns(fact: &StoredFact<SqliteIds>) -> Result<Facets, Sqli
                 bookend::DemolitionFact::Started { bound, .. }
                 | bookend::DemolitionFact::Completed { bound, .. } => Ok(Facets::date(bound)),
             },
+            FactualAssertion::Existence { fact } => Ok(Facets::date(&fact.at)),
             FactualAssertion::Event { fact } => match fact {
                 event::Fact::DurationalDate { bound, .. }
                 | event::Fact::PointDate { bound, .. } => Ok(Facets::date(bound)),
