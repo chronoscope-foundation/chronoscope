@@ -12,8 +12,10 @@
   lib,
   fenix,
   crane,
+  craneLib,
   system,
   src,
+  rustCommonArgs,
 }:
 
 let
@@ -165,6 +167,33 @@ let
     }
   );
 
+  # The crate's plain #[test]s (e.g. faq.rs's `parse_faq` suite) run on the
+  # host, not wasm — a workspace `cargo test` never reaches them because
+  # chronoscope-web is excluded from default-members. Built with the native
+  # craneLib against webSrc (the shared workspace filter drops the `.md`
+  # content that the pages `include_str!`). Test-profile deps-only so the
+  # release LTO profile doesn't recompile the dependency tree.
+  webNativeTestDeps = craneLib.buildDepsOnly (
+    rustCommonArgs
+    // {
+      src = webSrc;
+      pname = "chronoscope-web-native-test-deps";
+      CARGO_PROFILE = "test";
+      cargoExtraArgs = "-p chronoscope-web";
+    }
+  );
+
+  webNativeTest = craneLib.cargoTest (
+    rustCommonArgs
+    // {
+      src = webSrc;
+      pname = "chronoscope-web-native-test";
+      CARGO_PROFILE = "test";
+      cargoArtifacts = webNativeTestDeps;
+      cargoExtraArgs = "-p chronoscope-web";
+    }
+  );
+
 in
 {
   packages = {
@@ -176,5 +205,6 @@ in
     web-build = web;
     web-test-build = webTest;
     web-clippy = webClippy;
+    web-native-test = webNativeTest;
   };
 }

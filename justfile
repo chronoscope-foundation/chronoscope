@@ -117,6 +117,7 @@ check target="all":
                 ".#checks.$SYS.web-build" \
                 ".#checks.$SYS.web-test-build" \
                 ".#checks.$SYS.web-clippy" \
+                ".#checks.$SYS.web-native-test" \
                 --no-link
             ;;
         triton)
@@ -198,6 +199,7 @@ test target="all":
     case "{{ target }}" in
         all)
             cargo test
+            cargo test -p chronoscope-web
             cargo test -p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4
             (cd analysis/triton && pytest -v)
             ;;
@@ -205,6 +207,7 @@ test target="all":
             cargo test
             ;;
         web)
+            cargo test -p chronoscope-web
             cargo test -p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4
             ;;
         triton)

@@ -104,9 +104,13 @@
             lib
             fenix
             crane
+            craneLib
             system
             src
             ;
+          # Native (non-wasm) crane bits for the host-target `web-native-test`
+          # check — the wasm pipeline can't run the crate's plain #[test]s.
+          rustCommonArgs = rust.commonArgs;
         };
 
         api = import ./nix/api.nix {
