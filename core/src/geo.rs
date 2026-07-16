@@ -14,11 +14,11 @@
 //!   crossing all solve on WGS84 via [`geographiclib_rs`]
 //!   ([`Circle::boundary_intersections`]). It is never serialized.
 
-use std::cmp::Ordering;
-
 use geographiclib_rs::{DirectGeodesic, Geodesic, InverseGeodesic};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::finite::Finite;
 
 /// A nominal Earth radius in meters. Distances and membership are WGS84 (see
 /// [`Circle`]); this sphere is only the scaffold for the
@@ -38,92 +38,68 @@ pub(crate) const EARTH_RADIUS_M: f64 = 6_371_000.0;
 /// `[-180, 180]`). Deserialization routes through it so wire-invalid points
 /// fail at the boundary.
 ///
-/// `Eq` / `Hash` / `Ord` are hand-implemented (the type carries `f64`, needed
-/// for `BTreeSet<SubmitFact>` ordering): the constructor rejects NaN/Inf and
-/// normalizes `-0.0` to `+0.0`, so the manual `Hash` (via `f64::to_bits`) and
-/// `Ord` (via `f64::total_cmp`) stay consistent with the derived `PartialEq`
-/// (under which `-0.0 == +0.0`). Every constructed `GeoPoint` is finite and
-/// free of negative zero, so equality is honest.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema)]
+/// The `lat`/`lon` fields are [`Finite`](crate::finite::Finite): finite by
+/// construction with `-0.0` normalized, so `Eq`/`Hash`/`Ord` derive honestly —
+/// the total ordering `BTreeSet<SubmitFact>` relies on, with no `f64`
+/// knife-edges to hand-handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, JsonSchema)]
 pub struct GeoPoint {
-    lat: f64,
-    lon: f64,
-}
-
-impl Eq for GeoPoint {}
-
-impl std::hash::Hash for GeoPoint {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.lat.to_bits().hash(state);
-        self.lon.to_bits().hash(state);
-    }
-}
-
-// Manual Ord via `total_cmp` field-by-field; the smart constructor
-// rejects NaN/Inf so every constructed value compares cleanly.
-impl PartialOrd for GeoPoint {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for GeoPoint {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.lat
-            .total_cmp(&other.lat)
-            .then_with(|| self.lon.total_cmp(&other.lon))
-    }
+    lat: Finite,
+    lon: Finite,
 }
 
 impl GeoPoint {
     /// Construct a geo-point. `lat` must lie in `[-90, 90]`, `lon` in
-    /// `[-180, 180]`, and both must be finite.
-    ///
-    /// `-0.0` is normalized to `+0.0` so the manual `Hash`/`Ord`
-    /// (bit-level / `total_cmp`) stay consistent with the derived
-    /// `PartialEq`.
+    /// `[-180, 180]`, and both must be finite. `Finite` normalizes `-0.0`
+    /// to `+0.0`.
     pub fn new(lat: f64, lon: f64) -> Result<Self, GeoPointError> {
-        if !lat.is_finite() || !lon.is_finite() {
-            return Err(GeoPointError::NotFinite { lat, lon });
-        }
+        let lat_v = Finite::new(lat).ok_or(GeoPointError::NotFinite { lat, lon })?;
+        let lon_v = Finite::new(lon).ok_or(GeoPointError::NotFinite { lat, lon })?;
         if !(-90.0..=90.0).contains(&lat) {
             return Err(GeoPointError::LatitudeOutOfRange { lat });
         }
         if !(-180.0..=180.0).contains(&lon) {
             return Err(GeoPointError::LongitudeOutOfRange { lon });
         }
-        // Normalize `-0.0` to `+0.0`: `-0.0 + 0.0 == +0.0`, and adding
-        // `0.0` is a no-op for every other finite value.
-        let lat = lat + 0.0;
-        let lon = lon + 0.0;
-        Ok(Self { lat, lon })
+        Ok(Self {
+            lat: lat_v,
+            lon: lon_v,
+        })
     }
 
     /// Latitude in degrees, in `[-90, 90]`.
     pub fn lat(&self) -> f64 {
-        self.lat
+        self.lat.get()
     }
 
     /// Longitude in degrees, in `[-180, 180]`.
     pub fn lon(&self) -> f64 {
-        self.lon
+        self.lon.get()
     }
 
     /// The WGS84 geodesic distance to another point (Karney's inverse solution).
     fn distance(&self, other: &GeoPoint) -> Meters {
-        Meters(Geodesic::wgs84().inverse(self.lat, self.lon, other.lat, other.lon))
+        Meters(Geodesic::wgs84().inverse(
+            self.lat.get(),
+            self.lon.get(),
+            other.lat.get(),
+            other.lon.get(),
+        ))
     }
 
     /// A point minted from a WGS84 geodesic solve (`direct`/`inverse` outputs),
     /// which geographiclib already returns in-range; the clamp absorbs last-ulp
     /// drift so this is total without a fallible check in the solver hot paths.
     fn from_wgs84(lat: f64, lon: f64) -> Self {
+        // Finiteness is the geodesic solver's promise; check the raw output,
+        // since the clamp below maps only last-ulp range drift.
         debug_assert!(
             lat.is_finite() && lon.is_finite(),
-            "geodesic output must be finite"
+            "geodesic output must be finite: ({lat}, {lon})"
         );
         Self {
-            lat: lat.clamp(-90.0, 90.0) + 0.0,
-            lon: lon.clamp(-180.0, 180.0) + 0.0,
+            lat: Finite::new_unchecked(lat.clamp(-90.0, 90.0)),
+            lon: Finite::new_unchecked(lon.clamp(-180.0, 180.0)),
         }
     }
 }
@@ -808,7 +784,7 @@ mod tests {
 
         // `-0.0` in either coordinate must normalize to `+0.0`, so the two
         // forms are fully indistinguishable under Eq, Hash, and Ord — the
-        // contract the manual Hash/Ord impls would otherwise violate.
+        // contract `Finite` upholds so the derived impls stay consistent.
         let neg = GeoPoint::new(-0.0, -0.0)?;
         let pos = GeoPoint::new(0.0, 0.0)?;
 

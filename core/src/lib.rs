@@ -88,6 +88,7 @@ pub mod algebra;
 pub mod conflicts;
 pub mod date;
 pub mod external_ids;
+mod finite;
 pub mod geo;
 pub mod grammar;
 pub mod listing;
