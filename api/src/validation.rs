@@ -1,8 +1,7 @@
 //! Shared validation utilities for request data.
 
 use chronoscope_db::DbError;
-use dropshot::{Body, HttpError};
-use http::Response;
+use dropshot::HttpError;
 
 // Re-export from db crate for convenience
 pub use chronoscope_db::is_unique_violation;
@@ -10,12 +9,9 @@ pub use chronoscope_db::is_unique_violation;
 /// Convert a `DbError` to an `HttpError` for use in API handlers.
 ///
 /// This logs the detailed error internally (visible in Dropshot logs) while
-/// returning a generic "Internal Server Error" to clients. CORS headers are
-/// included so cross-origin clients can read the error response.
+/// returning a generic "Internal Server Error" to clients.
 pub fn db_err(e: DbError) -> HttpError {
-    let mut err = HttpError::for_internal_error(e.to_string());
-    add_cors_headers(&mut err);
-    err
+    HttpError::for_internal_error(e.to_string())
 }
 
 /// Convert a fact-store backend error to an `HttpError`, mirroring [`db_err`].
@@ -24,120 +20,7 @@ pub fn db_err(e: DbError) -> HttpError {
 /// module wrapper errors (`ListError<E>` and friends) — none of them impl
 /// `Display`, so this formats via `Debug`.
 pub fn fact_store_err(e: impl std::fmt::Debug) -> HttpError {
-    let mut err = HttpError::for_internal_error(format!("{e:?}"));
-    add_cors_headers(&mut err);
-    err
-}
-
-/// A `400 Bad Request` carrying CORS headers, for the public no-auth endpoints
-/// whose malformed-input rejections a browser must be able to read cross-origin.
-pub fn bad_request_with_cors(message: String) -> HttpError {
-    let mut err = HttpError::for_bad_request(None, message);
-    add_cors_headers(&mut err);
-    err
-}
-
-/// A `500 Internal Server Error` carrying CORS headers, so a browser on the
-/// public no-auth endpoints can read the diagnostic body cross-origin.
-pub fn internal_error_with_cors(message: String) -> HttpError {
-    let mut err = HttpError::for_internal_error(message);
-    add_cors_headers(&mut err);
-    err
-}
-
-/// CORS headers applied to all cross-origin responses — defined once,
-/// used by both success responses (via `cors_builder`) and error
-/// responses (via `add_cors_headers`).
-const CORS_HEADERS: &[(http::HeaderName, &str)] = &[
-    (http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
-    (http::header::ACCESS_CONTROL_ALLOW_METHODS, "GET, OPTIONS"),
-    (http::header::ACCESS_CONTROL_ALLOW_HEADERS, "Content-Type"),
-    (http::header::ACCESS_CONTROL_MAX_AGE, "86400"),
-];
-
-/// Add CORS headers to an `HttpError` so cross-origin clients can read it.
-fn add_cors_headers(err: &mut HttpError) {
-    for (name, value) in CORS_HEADERS {
-        if let Err(e) = err.add_header(name.clone(), http::HeaderValue::from_static(value)) {
-            eprintln!("warn: failed to add CORS header {name} to error response: {e}");
-        }
-    }
-}
-
-/// Standard CORS headers for cross-origin access.
-pub(crate) fn cors_builder() -> http::response::Builder {
-    let mut builder = Response::builder();
-    for (name, value) in CORS_HEADERS {
-        builder = builder.header(name, *value);
-    }
-    builder
-}
-
-/// Wrap a serializable value in a JSON response with CORS headers.
-///
-/// Used by endpoints that need cross-origin access (e.g., entity endpoints
-/// called from the web frontend on a different port).
-pub fn json_with_cors<T: serde::Serialize>(value: &T) -> Result<Response<Body>, HttpError> {
-    json_with_cors_headers(value, &[])
-}
-
-/// Like [`json_with_cors`], plus `Vary: Accept-Language` — for responses whose
-/// body is content-negotiated on the request's `Accept-Language`, so a shared
-/// cache keys the negotiated form by language instead of cross-serving one
-/// locale's copy to another.
-pub fn json_with_cors_vary_language<T: serde::Serialize>(
-    value: &T,
-) -> Result<Response<Body>, HttpError> {
-    json_with_cors_headers(value, &[(http::header::VARY, "Accept-Language")])
-}
-
-/// Shared body of the `json_with_cors*` responses: serialize `value` to JSON,
-/// attach CORS + content-type, and append each `(name, value)` in
-/// `extra_headers`.
-fn json_with_cors_headers<T: serde::Serialize>(
-    value: &T,
-    extra_headers: &[(http::HeaderName, &str)],
-) -> Result<Response<Body>, HttpError> {
-    let body_bytes = serde_json::to_vec(value)
-        .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize response: {e}")))?;
-
-    let mut builder = cors_builder()
-        .status(http::StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json");
-    for (name, value) in extra_headers {
-        builder = builder.header(name, *value);
-    }
-    builder
-        .body(body_bytes.into())
-        .map_err(|e| HttpError::for_internal_error(format!("Failed to build response: {e}")))
-}
-
-/// Return a JSON error response with CORS headers and the given status code.
-///
-/// Dropshot's `HttpError` path doesn't attach CORS headers, so cross-origin
-/// clients (e.g., the web frontend on a different port) can't read the error
-/// body. This helper attaches CORS headers so the browser lets the JS read
-/// the 400 message.
-pub fn error_with_cors(
-    status: http::StatusCode,
-    message: &str,
-) -> Result<Response<Body>, HttpError> {
-    let body_bytes = serde_json::to_vec(&serde_json::json!({"message": message}))
-        .unwrap_or_else(|_| message.as_bytes().to_vec());
-
-    cors_builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(body_bytes.into())
-        .map_err(|e| HttpError::for_internal_error(format!("Failed to build error response: {e}")))
-}
-
-/// Empty CORS preflight response for OPTIONS requests.
-pub fn cors_preflight() -> Result<Response<Body>, HttpError> {
-    cors_builder()
-        .status(http::StatusCode::NO_CONTENT)
-        .body(Body::empty())
-        .map_err(|e| HttpError::for_internal_error(format!("Failed to build response: {e}")))
+    HttpError::for_internal_error(format!("{e:?}"))
 }
 
 /// Validate username format.

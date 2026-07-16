@@ -31,10 +31,7 @@ use crate::cdn;
 use crate::entity_types;
 use crate::limits;
 use crate::state::{AppState, ServerEntityId, ServerFactStore, ServerIds, ServerImageId};
-use crate::validation::{
-    bad_request_with_cors, cors_preflight, error_with_cors, fact_store_err,
-    internal_error_with_cors, json_with_cors, json_with_cors_vary_language,
-};
+use crate::validation::fact_store_err;
 
 /// The `Accept-Language` header value, when present and valid UTF-8. Read off
 /// the raw request (mirroring `auth::extract_bearer_token`) so the entity read
@@ -44,6 +41,41 @@ fn accept_language(ctx: &RequestContext<Arc<AppState>>) -> Option<&str> {
         .headers()
         .get(http::header::ACCEPT_LANGUAGE)
         .and_then(|v| v.to_str().ok())
+}
+
+/// Serialize `value` to a `200 OK` JSON response. The read endpoints still hand
+/// back `Response<Body>` (typed responses land later); this is the plain body
+/// builder they share.
+fn json_response<T: serde::Serialize>(value: &T) -> Result<Response<Body>, HttpError> {
+    json_response_with_headers(value, &[])
+}
+
+/// Like [`json_response`], plus `Vary: Accept-Language` — for the two endpoints
+/// whose body is content-negotiated on the request's `Accept-Language`, so a
+/// shared cache keys the negotiated form by language.
+fn json_response_vary_language<T: serde::Serialize>(
+    value: &T,
+) -> Result<Response<Body>, HttpError> {
+    json_response_with_headers(value, &[(http::header::VARY, "Accept-Language")])
+}
+
+/// Shared body of the JSON responses: serialize `value`, set the content type,
+/// and append each `(name, value)` in `extra_headers`.
+fn json_response_with_headers<T: serde::Serialize>(
+    value: &T,
+    extra_headers: &[(http::HeaderName, &str)],
+) -> Result<Response<Body>, HttpError> {
+    let body_bytes = serde_json::to_vec(value)
+        .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize response: {e}")))?;
+    let mut builder = Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json");
+    for (name, value) in extra_headers {
+        builder = builder.header(name, *value);
+    }
+    builder
+        .body(body_bytes.into())
+        .map_err(|e| HttpError::for_internal_error(format!("Failed to build response: {e}")))
 }
 
 /// The server-internal resume cursor: the fact-store snapshot the listing was
@@ -84,14 +116,13 @@ fn encode_blob<T: serde::Serialize>(
 ) -> Result<String, HttpError> {
     let mut bytes = vec![version];
     serde_json::to_writer(&mut bytes, value)
-        .map_err(|e| internal_error_with_cors(format!("{noun} encode failed: {e}")))?;
+        .map_err(|e| HttpError::for_internal_error(format!("{noun} encode failed: {e}")))?;
     Ok(BASE64_URL_SAFE_NO_PAD.encode(&bytes))
 }
 
 /// Decode an opaque wire token back into its value. A malformed blob or a token
-/// from a different `version` surfaces as a CORS-tagged 400 the browser can
-/// read. The inverse of [`encode_blob`]; `noun` names the family for the
-/// diagnostic.
+/// from a different `version` is rejected with a 400. The inverse of
+/// [`encode_blob`]; `noun` names the family for the diagnostic.
 fn decode_blob<T: serde::de::DeserializeOwned>(
     version: u8,
     noun: &str,
@@ -99,17 +130,18 @@ fn decode_blob<T: serde::de::DeserializeOwned>(
 ) -> Result<T, HttpError> {
     let bytes = BASE64_URL_SAFE_NO_PAD
         .decode(token)
-        .map_err(|e| bad_request_with_cors(format!("Invalid {noun}: {e}")))?;
+        .map_err(|e| HttpError::for_bad_request(None, format!("Invalid {noun}: {e}")))?;
     let (&found, payload) = bytes
         .split_first()
-        .ok_or_else(|| bad_request_with_cors(format!("Invalid {noun}: empty token")))?;
+        .ok_or_else(|| HttpError::for_bad_request(None, format!("Invalid {noun}: empty token")))?;
     if found != version {
-        return Err(bad_request_with_cors(format!(
-            "Invalid {noun}: unsupported version {found}"
-        )));
+        return Err(HttpError::for_bad_request(
+            None,
+            format!("Invalid {noun}: unsupported version {found}"),
+        ));
     }
     serde_json::from_slice(payload)
-        .map_err(|e| bad_request_with_cors(format!("Invalid {noun}: {e}")))
+        .map_err(|e| HttpError::for_bad_request(None, format!("Invalid {noun}: {e}")))
 }
 
 /// Encode a cursor state into the opaque wire token, tagged with its family's
@@ -183,9 +215,10 @@ async fn open_read_view<S: FactStore>(
 ) -> Result<S::View<'_>, HttpError> {
     let requested = snapshot_param.as_ref().map(decode_snapshot).transpose()?;
     match (requested, cursor_snapshot) {
-        (Some(r), Some(c)) if r != c => Err(bad_request_with_cors(format!(
-            "snapshot {r} does not match the cursor's pinned snapshot {c}"
-        ))),
+        (Some(r), Some(c)) if r != c => Err(HttpError::for_bad_request(
+            None,
+            format!("snapshot {r} does not match the cursor's pinned snapshot {c}"),
+        )),
         // Equal-to-cursor or no explicit snapshot: read at the cursor's snapshot.
         // A cursor is one we minted, so its snapshot is always real — no check.
         (_, Some(c)) => facts.no_later_than(c).await.map_err(fact_store_err),
@@ -196,9 +229,10 @@ async fn open_read_view<S: FactStore>(
             // future here; pin-aware read routing is the Postgres backend's call.
             let watermark = facts.next_fact_id().await.map_err(fact_store_err)?;
             if r > watermark {
-                return Err(bad_request_with_cors(format!(
-                    "snapshot {r} is in the future (store watermark {watermark})"
-                )));
+                return Err(HttpError::for_bad_request(
+                    None,
+                    format!("snapshot {r} is in the future (store watermark {watermark})"),
+                ));
             }
             facts.no_later_than(r).await.map_err(fact_store_err)
         }
@@ -211,8 +245,7 @@ async fn open_read_view<S: FactStore>(
 /// Shared by `/entities` and `/markers`, whose query params carry the same
 /// viewport corners. `geo::Viewport::from_coords` range-validates each corner (admitting
 /// an antimeridian-crossing `min_lon > max_lon` box) and rejects an inverted
-/// latitude span; either rejection surfaces as a CORS-tagged 400 the browser can
-/// read.
+/// latitude span; either rejection is a 400.
 fn request_viewport(
     min_lat: f64,
     max_lat: f64,
@@ -220,7 +253,7 @@ fn request_viewport(
     max_lon: f64,
 ) -> Result<geo::Viewport, HttpError> {
     geo::Viewport::from_coords(min_lat, max_lat, min_lon, max_lon)
-        .map_err(|e| bad_request_with_cors(format!("Invalid viewport: {e}")))
+        .map_err(|e| HttpError::for_bad_request(None, format!("Invalid viewport: {e}")))
 }
 
 /// Project an image's `SameArtifact` class to its typed read DTO, or `None` when
@@ -308,16 +341,16 @@ pub async fn list_entities(
 
     let requested_limit = params.limit.unwrap_or(limits::ENTITY_LIST_MAX_PAGE_SIZE);
     if requested_limit > limits::ENTITY_LIST_MAX_PAGE_SIZE {
-        return error_with_cors(
-            http::StatusCode::BAD_REQUEST,
-            &format!(
+        return Err(HttpError::for_bad_request(
+            None,
+            format!(
                 "Requested page size {requested_limit} exceeds maximum {}",
                 limits::ENTITY_LIST_MAX_PAGE_SIZE
             ),
-        );
+        ));
     }
     let limit = NonZeroUsize::new(requested_limit as usize)
-        .ok_or_else(|| bad_request_with_cors("limit must be at least 1".to_string()))?;
+        .ok_or_else(|| HttpError::for_bad_request(None, "limit must be at least 1".to_string()))?;
 
     let cursor: Option<ListState> = params.cursor.as_ref().map(decode_cursor).transpose()?;
 
@@ -343,7 +376,7 @@ pub async fn list_entities(
         next,
         snapshot,
     };
-    json_with_cors(&response)
+    json_response(&response)
 }
 
 /// Query parameters for the entity detail endpoint.
@@ -383,7 +416,10 @@ pub async fn get_entity(
             .await
             .map_err(fact_store_err)?
     else {
-        return error_with_cors(http::StatusCode::NOT_FOUND, "Entity not found");
+        return Err(HttpError::for_not_found(
+            None,
+            "Entity not found".to_string(),
+        ));
     };
     let entity = typed::Entity::parse(&projected, &class);
 
@@ -408,7 +444,7 @@ pub async fn get_entity(
         conflicts,
         snapshot: encode_snapshot(snapshot)?,
     };
-    json_with_cors_vary_language(&detail)
+    json_response_vary_language(&detail)
 }
 
 /// Query parameters for the entity images sub-resource.
@@ -416,9 +452,8 @@ pub async fn get_entity(
 pub struct EntityImagesQueryParams {
     /// Page size, counting distinct depicted images; required, and the server
     /// clamps it down to `limits::ENTITY_IMAGES_MAX_PAGE_SIZE`. Optional at the
-    /// deserialize layer so a missing or zero value surfaces as a CORS-readable
-    /// 400 from the handler, not a header-less Dropshot rejection a browser
-    /// can't read.
+    /// deserialize layer so a missing or zero value reaches the handler and 400s
+    /// there, rather than a Dropshot deserialize rejection before it.
     #[serde(default)]
     pub limit: Option<u32>,
     /// Opaque resume cursor from a previous page's `next`. Absent for the first
@@ -459,16 +494,16 @@ pub async fn get_entity_images(
     let params = query.into_inner();
 
     // `limit` is required, but declared `Option` so a missing/zero value reaches
-    // the handler and rejects with a CORS-readable 400 (mirroring `/entities`),
-    // rather than a header-less Dropshot rejection a browser can't read. Over-max
-    // requests clamp down instead of 400 (the intentional divergence from
-    // `/entities`), so a client can ask for "as many as allowed".
+    // the handler and 400s there (mirroring `/entities`), rather than a Dropshot
+    // deserialize rejection before it. Over-max requests clamp down instead of
+    // 400 (the intentional divergence from `/entities`), so a client can ask for
+    // "as many as allowed".
     let requested_limit = params
         .limit
-        .ok_or_else(|| bad_request_with_cors("limit is required".to_string()))?;
+        .ok_or_else(|| HttpError::for_bad_request(None, "limit is required".to_string()))?;
     let effective = requested_limit.min(limits::ENTITY_IMAGES_MAX_PAGE_SIZE);
     let limit = NonZeroUsize::new(effective as usize)
-        .ok_or_else(|| bad_request_with_cors("limit must be at least 1".to_string()))?;
+        .ok_or_else(|| HttpError::for_bad_request(None, "limit must be at least 1".to_string()))?;
 
     let cursor: Option<ImagesListState> = params
         .cursor
@@ -492,16 +527,19 @@ pub async fn get_entity_images(
     // An empty page hides two cases: an entity that depicts nothing here, or an
     // id no fact ever named. A single-fact backlink probe tells them apart —
     // present facts mean an existing entity with an empty grid (200), an empty
-    // probe means no such entity (a CORS-tagged 404, mirroring `get_entity`). A
-    // non-empty page already proves existence, so the probe runs only when the
-    // page comes back empty.
+    // probe means no such entity (a 404, mirroring `get_entity`). A non-empty
+    // page already proves existence, so the probe runs only when the page comes
+    // back empty.
     if depictions.is_empty() {
         let id_facts = view
             .all_facts_about_entity(&id, None, NonZeroUsize::MIN)
             .await
             .map_err(fact_store_err)?;
         if id_facts.items.is_empty() {
-            return error_with_cors(http::StatusCode::NOT_FOUND, "Entity not found");
+            return Err(HttpError::for_not_found(
+                None,
+                "Entity not found".to_string(),
+            ));
         }
     }
 
@@ -534,7 +572,7 @@ pub async fn get_entity_images(
         next,
         snapshot: encode_snapshot(snapshot)?,
     };
-    json_with_cors(&response)
+    json_response(&response)
 }
 
 // ==================== Unified Markers ====================
@@ -620,55 +658,7 @@ pub async fn list_markers(
         truncated,
         snapshot: encode_snapshot(snapshot)?,
     };
-    json_with_cors_vary_language(&response)
-}
-
-// ==================== CORS Preflight ====================
-
-/// CORS preflight for entity endpoints.
-#[endpoint {
-    method = OPTIONS,
-    path = "/entities",
-}]
-pub async fn entities_options(
-    _ctx: RequestContext<Arc<AppState>>,
-) -> Result<Response<Body>, HttpError> {
-    cors_preflight()
-}
-
-/// CORS preflight for entity detail endpoint.
-#[endpoint {
-    method = OPTIONS,
-    path = "/entities/{id}",
-}]
-pub async fn entity_options(
-    _ctx: RequestContext<Arc<AppState>>,
-    _path: dropshot::Path<EntityIdPath>,
-) -> Result<Response<Body>, HttpError> {
-    cors_preflight()
-}
-
-/// CORS preflight for the entity images sub-resource.
-#[endpoint {
-    method = OPTIONS,
-    path = "/entities/{id}/images",
-}]
-pub async fn entity_images_options(
-    _ctx: RequestContext<Arc<AppState>>,
-    _path: dropshot::Path<EntityIdPath>,
-) -> Result<Response<Body>, HttpError> {
-    cors_preflight()
-}
-
-/// CORS preflight for unified markers endpoint.
-#[endpoint {
-    method = OPTIONS,
-    path = "/markers",
-}]
-pub async fn markers_options(
-    _ctx: RequestContext<Arc<AppState>>,
-) -> Result<Response<Body>, HttpError> {
-    cors_preflight()
+    json_response_vary_language(&response)
 }
 
 #[cfg(test)]

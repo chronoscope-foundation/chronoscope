@@ -66,7 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         retry_config: RetryConfig::default(),
         log: log.clone(),
         port: api_port,
-        cdn_base_url: format!("http://127.0.0.1:{api_port}"),
+        // Thumbnails resolve to the Trunk front door's `/api` proxy, so the
+        // browser fetches them same-origin and Trunk forwards to `/media`.
+        cdn_base_url: format!("http://127.0.0.1:{trunk_port}/api"),
         // Interactive dev serves the real Commons images from our media store.
         image_resolve: ImageResolveMode::Fetch,
         rp_id: None,

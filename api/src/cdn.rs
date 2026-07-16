@@ -84,4 +84,17 @@ pub mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn test_full_url_appends_under_a_front_door_api_mount() -> TestResult {
+        // Dev and test serve thumbnails same-origin through a `/api` front-door
+        // proxy, so the base carries an `/api` path segment. The storage key must
+        // land *under* it (`/api/media/...`), not replace the segment.
+        let base = Url::parse("http://127.0.0.1:8080/api")?;
+        assert_eq!(
+            full_url(&base, "media/abc123.jpg").as_str(),
+            "http://127.0.0.1:8080/api/media/abc123.jpg"
+        );
+        Ok(())
+    }
 }

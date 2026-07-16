@@ -725,9 +725,7 @@ async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> 
 #[tokio::test]
 async fn get_entity_images_404s_for_an_id_no_fact_ever_named() -> TestResult {
     // The images sub-resource mirrors `get_entity`'s "not found": an id no
-    // committed fact named 404s rather than returning an empty grid, and the
-    // 404 carries CORS so the cross-origin web panel reads it as a clean "not
-    // found" instead of an opaque transport error.
+    // committed fact named 404s rather than returning an empty grid.
     let ctx = TestContext::new().await?;
     // A fresh store mints entity ids from 0; this id was never declared.
     let resp = ctx.get("/entities/999999/images?limit=50").await?;
@@ -736,34 +734,19 @@ async fn get_entity_images_404s_for_an_id_no_fact_ever_named() -> TestResult {
         404,
         "an id no fact named must 404, not return an empty grid"
     );
-    assert_eq!(
-        resp.headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok()),
-        Some("*"),
-        "the 404 must carry CORS so a cross-origin client can read it"
-    );
     Ok(())
 }
 
 #[tokio::test]
-async fn get_entity_images_requires_a_limit_with_cors() -> TestResult {
+async fn get_entity_images_requires_a_limit() -> TestResult {
     // `limit` is required, but declared `Option` at the deserialize layer so a
-    // missing value reaches the handler and 400s *with* CORS. A required
-    // `NonZeroU32` would make Dropshot reject a missing limit before the handler,
-    // with no CORS headers — unreadable to the cross-origin web client.
+    // missing value reaches the handler and 400s there. A required `NonZeroU32`
+    // would make Dropshot reject a missing limit before the handler ever runs.
     let ctx = TestContext::new().await?;
     let id = commit_named_entity_at(&ctx.app_state.facts, "Pantheon", 41.8986, 12.4769).await?;
 
     let resp = ctx.get(&format!("/entities/{}/images", id.0)).await?;
     assert_eq!(resp.status(), 400, "a missing limit is a bad request");
-    assert_eq!(
-        resp.headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok()),
-        Some("*"),
-        "the 400 must carry CORS so the browser can read the message"
-    );
     Ok(())
 }
 
@@ -790,24 +773,6 @@ async fn get_entity_404s_for_an_id_no_fact_ever_named() -> TestResult {
             return Err(format!("expected an API error, got a client error: {e}").into());
         }
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn get_entity_404_carries_cors_headers() -> TestResult {
-    // The web detail panel calls this cross-origin; a 404 without CORS headers
-    // is blocked by the browser, so the panel sees an opaque transport error
-    // instead of a clean "not found".
-    let ctx = TestContext::new().await?;
-    let resp = ctx.get("/entities/999999").await?;
-    assert_eq!(resp.status(), 404, "an unnamed id must 404");
-    assert_eq!(
-        resp.headers()
-            .get("access-control-allow-origin")
-            .and_then(|v| v.to_str().ok()),
-        Some("*"),
-        "the 404 must carry CORS so a cross-origin client can read it"
-    );
     Ok(())
 }
 

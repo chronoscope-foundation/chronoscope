@@ -301,6 +301,12 @@ impl WebTest {
         let port = find_available_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
 
+        // The front-door origin the browser loads the page (and its thumbnails)
+        // from. Reserved up front so the API's `cdn_base_url` can point at this
+        // origin's `/api` proxy, keeping thumbnail `<img>` loads same-origin.
+        let frontend_port = find_available_port()?;
+        let frontend_url = format!("http://127.0.0.1:{frontend_port}");
+
         let log = ConfigLogging::StderrTerminal {
             level: dropshot::ConfigLoggingLevel::Warn,
         }
@@ -324,8 +330,11 @@ impl WebTest {
             retry_config: RetryConfig::default(),
             log,
             port,
-            cdn_base_url: base_url.clone(),
-            // Browser thumbnail tests need deterministic, same-origin images.
+            // Thumbnails resolve to the front door's `/api` proxy, so the browser
+            // fetches them same-origin (matching the page origin) and the proxy
+            // forwards to `/media`.
+            cdn_base_url: format!("{frontend_url}/api"),
+            // Placeholder images keep the browser thumbnail tests deterministic.
             image_resolve: ImageResolveMode::Placeholder,
             rp_id: None,
             rp_origin: None,
@@ -339,7 +348,6 @@ impl WebTest {
         // Serve the prebuilt dist directly (nothing per-test is injected into
         // it any more) with an SPA fallback: any path that doesn't match a file
         // serves index.html so client-side routing works.
-        let frontend_port = find_available_port()?;
         let index_html = dist_dir.join("index.html");
         let serve_dir = tower_http::services::ServeDir::new(&dist_dir)
             .append_index_html_on_directories(true)
@@ -357,8 +365,6 @@ impl WebTest {
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
-
-        let frontend_url = format!("http://127.0.0.1:{frontend_port}");
 
         // Wait for the static file server to be ready by probing it.
         // Generous deadline because the whole test suite spins up dozens of
