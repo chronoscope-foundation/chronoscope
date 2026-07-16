@@ -75,6 +75,23 @@ just fetch-wikidata-db [size]              # build+pin a SQLite facts DB (curate
 
 Fetched data is pinned as GC roots under `.nix-gc-roots/` (gitignored).
 
+**Never reference a `.nix-gc-roots/` path in code** — not in Rust, not in
+`justfile` recipes, nowhere. It exists *only* to keep Nix's GC from reclaiming a
+realized derivation; it is a keep-alive symlink, not a dependency handle. Reading
+from it breaks Nix's ability to analyze what needs realizing, which is exactly
+what forces "not fetched, run `just fetch-…`" errors instead of Nix just building
+the thing. Always realize via the Nix expression and use the store path Nix
+reports:
+
+```bash
+path="$(nix build .#attr --out-link .nix-gc-roots/attr --print-out-paths)"
+```
+
+`--print-out-paths` gives the `/nix/store/…` path your code uses; `--out-link`
+pins the GC root as a side effect. The *only* place `.nix-gc-roots/` may appear is
+as the argument to `--out-link` / `--add-root` (the code that produces the root).
+See the `web-dev` / `openapi` / `xcodegen` recipes for the pattern.
+
 ## Commit gate: `just check`
 
 The **full** `just check` (no target) is the hermetic ground-truth gate

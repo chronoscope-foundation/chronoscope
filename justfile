@@ -253,8 +253,8 @@ clippy target="all":
 # ---------------------------------------------------------------------------
 
 # Start the integrated web dev server (API + Trunk live reload) over a
-# mounted facts DB (curated|1k|100k|full — the pinned fetch-wikidata-db
-# output for that subset, cloned copy-on-write per launch). The binary picks
+# mounted facts DB (curated|1k|100k|full — realized on demand via Nix,
+# cloned copy-on-write per launch). The binary picks
 # free ports for API + Trunk automatically — no need to kill anything else
 # on common ports.
 web-dev subset="curated":
@@ -265,13 +265,13 @@ web-dev subset="curated":
     if [ -z "${IN_NIX_SHELL:-}" ]; then
         exec nix develop .#web --command just web-dev "{{ subset }}"
     fi
-    db=".nix-gc-roots/wikidata-facts-db-{{ subset }}/facts.db"
-    if [ ! -f "$db" ]; then
-        echo "error: facts DB '{{ subset }}' is not fetched" >&2
-        echo "run: just fetch-wikidata-db \"{{ subset }}\"" >&2
-        exit 1
-    fi
-    CHRONOSCOPE_FACTS_DB="$PWD/$db" CHRONOSCOPE_FACTS_DB_SUBSET="{{ subset }}" \
+    # Realize the facts DB on demand and use the store path Nix reports; the
+    # `--out-link` pins a GC root so it survives collection. Never read from
+    # `.nix-gc-roots/` — that symlink is a keep-alive, not a dependency handle.
+    mkdir -p .nix-gc-roots
+    db="$(nix build ".#wikidata-facts-db-{{ subset }}" \
+        --out-link ".nix-gc-roots/wikidata-facts-db-{{ subset }}" --print-out-paths)/facts.db"
+    CHRONOSCOPE_FACTS_DB="$db" CHRONOSCOPE_FACTS_DB_SUBSET="{{ subset }}" \
         cargo run -p chronoscope-dev --bin web-dev
 
 # Build the OpenAPI spec (Nix) and report its store path — inspect the contract.
