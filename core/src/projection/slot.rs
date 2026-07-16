@@ -149,23 +149,29 @@ pub(super) use derive_slot;
 
 #[cfg(test)]
 mod laws {
-    use std::collections::BTreeSet;
-
     use proptest::prelude::*;
 
     use super::*;
-    use crate::algebra::semiring::Lineage;
+    use crate::algebra::semiring::Label;
     use crate::projection::Claimed;
 
-    type Support = Lineage<u8>;
+    type Support = Label<u8>;
     type ValueSlot = Bracket<Claimed<u8>, Support>;
     type Map = FactMap<u8, ValueSlot, Support>;
 
     fn arb_support() -> impl Strategy<Value = Support> {
-        prop_oneof![
-            1 => Just(Lineage::Bottom),
-            4 => prop::collection::btree_set(0u8..=8, 0..=2).prop_map(Lineage::Of),
-        ]
+        prop::collection::vec(prop::collection::btree_set(0u8..=8, 0..=2), 0..=3).prop_map(
+            |environments| {
+                environments
+                    .into_iter()
+                    .map(|atoms| {
+                        atoms
+                            .into_iter()
+                            .fold(Label::one(), |env, atom| env.times(Label::premise(atom)))
+                    })
+                    .fold(Label::empty(), |label, env| label.plus(env))
+            },
+        )
     }
 
     fn arb_value_slot() -> impl Strategy<Value = ValueSlot> {
@@ -205,7 +211,7 @@ mod laws {
         fn membership_never_conflicts(elements in prop::collection::vec(0u8..=8, 0..=6)) {
             let set: FactSet<u8, Support> = elements
                 .into_iter()
-                .map(|e| (e, Cited { value: (), support: Lineage::Of(BTreeSet::new()) }))
+                .map(|e| (e, Cited { value: (), support: Label::one() }))
                 .collect();
             prop_assert_eq!(set.conflict(), ConflictStatus::Consistent);
         }

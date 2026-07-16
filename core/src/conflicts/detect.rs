@@ -7,7 +7,7 @@
 //! an over-determined slot's premises into the minimal sets whose joint meet is
 //! ⊥.
 
-use crate::algebra::semiring::Lineage;
+use crate::algebra::semiring::Label;
 use crate::date::UncertainDate;
 use crate::grammar::assertions::FactualAssertion;
 use crate::grammar::ids::{FactId, IdScheme};
@@ -21,7 +21,7 @@ use super::minimize::minimize;
 /// support holds the fighting facts themselves.
 ///
 /// Identity is the [`FactId`] alone — fact ids are unique, so keying on the id
-/// dedups a fact to one atom in the [`Lineage`] set and spares [`StoredFact`] an
+/// dedups a fact to one atom in the [`Label`] and spares [`StoredFact`] an
 /// `Ord`/`Hash` it doesn't carry.
 #[derive(Debug, Clone)]
 pub struct FactAtom<R: IdScheme> {
@@ -58,7 +58,7 @@ impl<R: IdScheme> std::hash::Hash for FactAtom<R> {
 }
 
 /// The provenance closure for a fact-carrying projection: the fact's atom is the
-/// singleton `{(id, fact)}`. A caller passes this to
+/// premise `{{(id, fact)}}`. A caller passes this to
 /// [`project_entity`](crate::projection::project_entity) to get a projection whose
 /// slot support carries the whole facts behind each field, which the typed
 /// flatten reads for citations and a date-conflict pass reads for fighting dates.
@@ -66,15 +66,11 @@ pub fn fact_lineage<R: IdScheme>(
     fact_id: &FactId,
     _subject: &R::Entity,
     fact: &StoredFact<R>,
-) -> Lineage<FactAtom<R>> {
-    Lineage::Of(
-        [FactAtom {
-            id: *fact_id,
-            fact: fact.clone(),
-        }]
-        .into_iter()
-        .collect(),
-    )
+) -> Label<FactAtom<R>> {
+    Label::premise(FactAtom {
+        id: *fact_id,
+        fact: fact.clone(),
+    })
 }
 
 /// The date a bookend or event date fact carries. A date-conflict pass needs each

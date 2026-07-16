@@ -1,4 +1,4 @@
-//! Provenance carried through the merge: the [`Lineage`] instance and the
+//! Provenance carried through the merge: the [`Label`] instance and the
 //! citation atoms it accumulates.
 //!
 //! A projected value is a join of many facts. Provenance records *why* a bound
@@ -9,7 +9,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::algebra::semiring::Lineage;
+use crate::algebra::semiring::Label;
 use crate::grammar::citations::{FactualCitation, JudgmentSource};
 
 /// A lattice value paired with the provenance of one derivation of it. The two
@@ -39,11 +39,11 @@ pub enum Citation<ImgId> {
     Judgment { source: JudgmentSource<ImgId> },
 }
 
-/// The member-aware lineage: a [`Lineage`] over citation atoms, each atom
+/// The member-aware lineage: a [`Label`] over citation atoms, each atom
 /// retaining the source id (the minted entity the fact spoke to) beside its
 /// citation.
 ///
 /// Keeping the id makes load-bearing computable downstream — a field's
 /// contributing ids fall out of the support set, so the read side can ask which
 /// `SameEntity` judgments span them (see [`connecting_glue`](super::connecting_glue)).
-pub type MemberLineage<EntId, ImgId> = Lineage<(EntId, Citation<ImgId>)>;
+pub type MemberLineage<EntId, ImgId> = Label<(EntId, Citation<ImgId>)>;

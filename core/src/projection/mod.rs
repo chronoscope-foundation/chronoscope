@@ -34,7 +34,7 @@ use std::future::Future;
 use std::num::NonZeroUsize;
 
 use crate::algebra::monoid::CommutativeMonoid;
-use crate::algebra::semiring::{Lineage, Semiring};
+use crate::algebra::semiring::{Label, Semiring};
 use crate::grammar::assertions::JudgmentAssertion;
 use crate::grammar::ids::{FactId, IdScheme};
 use crate::store::pagination::PAGE_SIZE;
@@ -49,8 +49,8 @@ use crate::typed;
 /// atom `{(id, citation)}`, keyed by the source id the fact spoke to. The
 /// provenance public callers pass to [`project_entity`] / [`project_image`] for
 /// [`MemberLineage`]-typed projections; keeping the id in the atom is what makes
-/// [`connecting_glue`] computable. A meta fact cites nothing, lifting to the
-/// multiplicative identity.
+/// [`connecting_glue`] computable. A meta fact contributes no derivation — the
+/// additive identity.
 pub fn member_lineage<R, Id>(
     _fact_id: &FactId,
     id: &Id,
@@ -61,8 +61,8 @@ where
     Id: Ord + Clone,
 {
     match merge::citation_of(fact) {
-        Some(citation) => Lineage::Of([(id.clone(), citation)].into_iter().collect()),
-        None => Lineage::one(),
+        Some(citation) => Label::premise((id.clone(), citation)),
+        None => Label::empty(),
     }
 }
 

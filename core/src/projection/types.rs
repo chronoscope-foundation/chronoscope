@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use url::Url;
 
-use crate::algebra::semiring::Semiring;
+use crate::algebra::semiring::{Semiring, Support};
 use crate::date::UncertainDate;
 use crate::grammar::attribute::{EntityRelationType, NameText, NameType};
 use crate::grammar::citations::{ExternalReference, Language};
@@ -169,7 +169,7 @@ where
     EntId: Ord + Clone + 'e,
     ImgId: Ord + Clone + 'e,
 {
-    let ids: BTreeSet<&EntId> = support.iter().map(|(id, _)| id).collect();
+    let ids: BTreeSet<&EntId> = support.atoms().map(|(id, _)| id).collect();
     sameness
         .iter()
         .filter(|(pair, _)| ids.contains(pair.a()) && ids.contains(pair.b()))

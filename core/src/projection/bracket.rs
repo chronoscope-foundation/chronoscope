@@ -146,11 +146,11 @@ mod laws {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::algebra::semiring::Lineage;
+    use crate::algebra::semiring::Label;
     use crate::projection::Claimed;
     use crate::projection::slot::Slot;
 
-    type Support = Lineage<u8>;
+    type Support = Label<u8>;
     type B = Bracket<Claimed<u8>, Support>;
 
     fn arb_claim() -> impl Strategy<Value = Claimed<u8>> {
@@ -162,10 +162,18 @@ mod laws {
     }
 
     fn arb_support() -> impl Strategy<Value = Support> {
-        prop_oneof![
-            1 => Just(Lineage::Bottom),
-            4 => prop::collection::btree_set(0u8..=8, 0..=3).prop_map(Lineage::Of),
-        ]
+        prop::collection::vec(prop::collection::btree_set(0u8..=8, 0..=3), 0..=3).prop_map(
+            |environments| {
+                environments
+                    .into_iter()
+                    .map(|atoms| {
+                        atoms
+                            .into_iter()
+                            .fold(Label::one(), |env, atom| env.times(Label::premise(atom)))
+                    })
+                    .fold(Label::empty(), |label, env| label.plus(env))
+            },
+        )
     }
 
     fn arb_bracket() -> impl Strategy<Value = B> {
@@ -201,14 +209,14 @@ mod laws {
                 Claimed::Of {
                     values: [x].into_iter().collect(),
                 },
-                Lineage::one(),
+                Label::one(),
             ));
             prop_assert_eq!(cx.conflict(), ConflictStatus::Consistent);
             let cy = B::from((
                 Claimed::Of {
                     values: [y].into_iter().collect(),
                 },
-                Lineage::one(),
+                Label::one(),
             ));
             let joined = cx.combine(cy);
             let expected = if x == y {

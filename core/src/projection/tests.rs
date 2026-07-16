@@ -6,6 +6,7 @@ use futures_util::TryStreamExt;
 use url::Url;
 
 use super::*;
+use crate::algebra::semiring::Support;
 use crate::date::{DatePrecision, UncertainDate};
 use crate::grammar::assertions::{
     FactualAssertion, JudgmentAssertion, MetaAssertion, RetractionReason,
@@ -226,7 +227,7 @@ async fn single_name_projects_one_slot() -> TestResult {
     assert_eq!(key.language.as_str(), "en");
     assert_eq!(key.name_type, NameType::Common);
     // The membership key carries the one fact backing its presence.
-    assert_eq!(entry.support.iter().count(), 1);
+    assert_eq!(entry.support.atoms().count(), 1);
     Ok(())
 }
 
@@ -265,7 +266,7 @@ async fn multiple_names_all_languages_preserved() -> TestResult {
     // The collapsed `en` key cites BOTH backing facts.
     let (_, en) = name_by_language(&entity, "en").ok_or("no en name")?;
     assert_eq!(
-        en.support.iter().count(),
+        en.support.atoms().count(),
         2,
         "a value-deduped key cites every fact that fed it"
     );
@@ -316,8 +317,8 @@ async fn two_overlapping_date_claims_tighten_the_consensus() -> TestResult {
     );
     assert_eq!(started.conflict(), ConflictStatus::Consistent);
     // Both facts cite the merged bound, on each end.
-    assert_eq!(started.consensus.support.iter().count(), 2);
-    assert_eq!(started.extent.support.iter().count(), 2);
+    assert_eq!(started.consensus.support.atoms().count(), 2);
+    assert_eq!(started.extent.support.atoms().count(), 2);
     Ok(())
 }
 
@@ -561,7 +562,7 @@ async fn populated_fields_carry_factual_support() -> TestResult {
     // Every populated value field carries its in-band support.
     for entry in entity.names.values() {
         assert!(
-            entry.support.iter().next().is_some(),
+            entry.support.atoms().next().is_some(),
             "each name key cites its fact"
         );
     }
@@ -571,25 +572,25 @@ async fn populated_fields_carry_factual_support() -> TestResult {
             .started_at
             .consensus
             .support
-            .iter()
+            .atoms()
             .next()
             .is_some(),
         "the bookend start cites its fact"
     );
     let (_, ref_entry) = entity.refs.iter().next().ok_or("no ref")?;
-    assert!(ref_entry.support.iter().next().is_some());
+    assert!(ref_entry.support.atoms().next().is_some());
     let (rel_key, rel_entry) = entity.relations.iter().next().ok_or("no relation")?;
     assert_eq!(
         *rel_key, target,
         "the outgoing relation is keyed by its external target, not a class member"
     );
-    assert!(rel_entry.support.iter().next().is_some());
+    assert!(rel_entry.support.atoms().next().is_some());
 
     // No field's support cites a meta fact — meta facts back no value. The
     // SameEntity judgment drives grouping, not a field, so every value's
     // support is factual.
     for entry in entity.names.values() {
-        assert!(entry.support.iter().all(is_factual));
+        assert!(entry.support.atoms().all(is_factual));
     }
     assert!(
         entity
@@ -597,7 +598,7 @@ async fn populated_fields_carry_factual_support() -> TestResult {
             .started_at
             .consensus
             .support
-            .iter()
+            .atoms()
             .all(is_factual)
     );
     Ok(())
@@ -938,8 +939,8 @@ fn durational_event_splits_start_and_completion() -> TestResult {
         record.completed_at.consensus.value
     );
     // Each role's bound cites its own fact, not the other's.
-    assert_eq!(record.started_at.consensus.support.iter().count(), 1);
-    assert_eq!(record.completed_at.consensus.support.iter().count(), 1);
+    assert_eq!(record.started_at.consensus.support.atoms().count(), 1);
+    assert_eq!(record.completed_at.consensus.support.atoms().count(), 1);
     Ok(())
 }
 
@@ -1185,7 +1186,7 @@ async fn shared_field_surfaces_the_connecting_glue() -> TestResult {
     // support carries both ids and the connecting judgment is load-bearing.
     let started = &entity.construction.started_at;
     let support_ids: BTreeSet<&MemEntId> =
-        started.extent.support.iter().map(|(id, _)| id).collect();
+        started.extent.support.atoms().map(|(id, _)| id).collect();
     assert_eq!(
         support_ids,
         BTreeSet::from([&x, &y]),
@@ -1219,7 +1220,7 @@ async fn single_member_field_has_no_glue() -> TestResult {
     // The name was asserted by one member only; no SameEntity edge fits
     // inside a single-id support set, so nothing is load-bearing for it.
     let (_, name) = name_by_language(&entity, "en").ok_or("no name")?;
-    let name_ids: BTreeSet<&MemEntId> = name.support.iter().map(|(id, _)| id).collect();
+    let name_ids: BTreeSet<&MemEntId> = name.support.atoms().map(|(id, _)| id).collect();
     assert_eq!(
         name_ids,
         BTreeSet::from([&x]),
@@ -1246,7 +1247,7 @@ async fn identity_root_accumulates_the_merge_judgment() -> TestResult {
     // SameEntity edge is tagged symmetrically, so the root carries both
     // endpoints' ids.
     let root = sameness_summary(&entity.sameness);
-    let root_ids: BTreeSet<&MemEntId> = root.iter().map(|(id, _)| id).collect();
+    let root_ids: BTreeSet<&MemEntId> = root.atoms().map(|(id, _)| id).collect();
     assert_eq!(
         root_ids,
         BTreeSet::from([&x, &y]),
@@ -1269,7 +1270,7 @@ async fn judgment_citation_is_live_in_provenance() -> TestResult {
     // no longer drops judgments: it lands on the `sameness` edge.
     let root = sameness_summary(&entity.sameness);
     assert!(
-        root.iter()
+        root.atoms()
             .any(|(_, c)| matches!(c, Citation::Judgment { .. })),
         "the merge judgment's citation surfaces on the derived root"
     );
@@ -1277,7 +1278,7 @@ async fn judgment_citation_is_live_in_provenance() -> TestResult {
     let edge = entity.sameness.get(&pair).ok_or("no sameness edge")?;
     assert!(
         edge.support
-            .iter()
+            .atoms()
             .any(|(_, c)| matches!(c, Citation::Judgment { .. })),
         "the same judgment citation backs the recorded glue edge"
     );
@@ -1739,17 +1740,17 @@ fn bare_depiction_records_membership_with_untouched_axes() -> TestResult {
     );
     let (_, entry) = image.depicts.iter().next().ok_or("no depiction")?;
     assert_eq!(
-        entry.support.iter().count(),
+        entry.support.atoms().count(),
         1,
         "the membership cites the depiction fact"
     );
     assert_eq!(
-        entry.value.localization.extent.support.iter().count(),
+        entry.value.localization.extent.support.atoms().count(),
         0,
         "an absent localization leaves its bracket untouched"
     );
     assert_eq!(
-        entry.value.perspective.extent.support.iter().count(),
+        entry.value.perspective.extent.support.atoms().count(),
         0,
         "an absent perspective leaves its bracket untouched"
     );
@@ -1898,7 +1899,7 @@ async fn project_image_records_same_artifact_glue() -> TestResult {
         "the glue edge is keyed by the canonical-ordered endpoint pair"
     );
     assert!(
-        entry.support.iter().next().is_some(),
+        entry.support.atoms().next().is_some(),
         "the recorded glue edge carries the judgment's support"
     );
     Ok(())

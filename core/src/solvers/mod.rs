@@ -18,7 +18,7 @@ use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::algebra::semiring::Lineage;
+use crate::algebra::semiring::{Label, Support};
 use crate::conflicts::{FactAtom, fact_date};
 use crate::date::UncertainDate;
 use crate::grammar::assertions::FactualAssertion;
@@ -68,7 +68,7 @@ type CitedEntity<R> = projection::Entity<
     <R as IdScheme>::Entity,
     <R as IdScheme>::Event,
     <R as IdScheme>::Image,
-    Lineage<FactAtom<R>>,
+    Label<FactAtom<R>>,
 >;
 
 /// The entity-level temporal contradictions in one entity's projection.
@@ -100,7 +100,7 @@ pub fn temporal_conflicts<R: IdScheme>(entity: &CitedEntity<R>) -> Vec<TemporalC
     for (date, entry) in &entity.existence {
         let dates: Vec<(FactId, UncertainDate)> = entry
             .support
-            .iter()
+            .atoms()
             .map(|atom| (atom.id, date.clone()))
             .collect();
         bundle_conflicts(
@@ -120,7 +120,7 @@ pub fn temporal_conflicts<R: IdScheme>(entity: &CitedEntity<R>) -> Vec<TemporalC
         let dates: Vec<(FactId, UncertainDate)> =
             [&event.occurred_at, &event.started_at, &event.completed_at]
                 .into_iter()
-                .flat_map(|slot| slot.extent.support.iter())
+                .flat_map(|slot| slot.extent.support.atoms())
                 .filter_map(|atom| fact_date(&atom.fact).map(|date| (atom.id, date)))
                 .collect();
         bundle_conflicts(
@@ -155,7 +155,7 @@ fn construction_floor<R: IdScheme>(entity: &CitedEntity<R>) -> Option<LifetimeBo
     let facts: Vec<FactId> = started
         .extent
         .support
-        .iter()
+        .atoms()
         .filter(|atom| is_construction_start(&atom.fact))
         .map(|atom| atom.id)
         .collect();
@@ -175,7 +175,7 @@ fn demolition_ceiling<R: IdScheme>(entity: &CitedEntity<R>) -> Option<LifetimeBo
     let facts: Vec<FactId> = completed
         .extent
         .support
-        .iter()
+        .atoms()
         .filter(|atom| is_demolition_completed(&atom.fact))
         .map(|atom| atom.id)
         .collect();
@@ -465,7 +465,7 @@ mod tests {
             .started_at
             .extent
             .support
-            .iter()
+            .atoms()
             .find(|atom| is_construction_start(&atom.fact))
             .map(|atom| atom.id)
     }
@@ -475,7 +475,7 @@ mod tests {
             .existence
             .values()
             .next()
-            .and_then(|entry| entry.support.iter().next())
+            .and_then(|entry| entry.support.atoms().next())
             .map(|atom| atom.id)
     }
 
@@ -487,7 +487,7 @@ mod tests {
             .completed_at
             .extent
             .support
-            .iter()
+            .atoms()
             .find(|atom| is_demolition_completed(&atom.fact))
             .map(|atom| atom.id)
     }
@@ -648,7 +648,7 @@ mod tests {
             .occurred_at
             .extent
             .support
-            .iter()
+            .atoms()
             .next()
             .ok_or("event date fact")?
             .id;
@@ -820,7 +820,7 @@ mod tests {
             .started_at
             .extent
             .support
-            .iter()
+            .atoms()
             .filter(|atom| is_construction_start(&atom.fact))
             .map(|atom| atom.id)
             .collect();

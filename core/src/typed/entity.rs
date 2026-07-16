@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use chrono::NaiveDate;
 
-use crate::algebra::semiring::Lineage;
+use crate::algebra::semiring::Support;
 use crate::date::UncertainDate;
 use crate::grammar::attribute::{EntityRelationType, NameType};
 use crate::grammar::citations::{ExternalReference, Language};
@@ -197,11 +197,12 @@ where
     /// support lineage — a citation-only or whole-fact support both flatten the
     /// same typed shape, so a caller reads whichever its DTO needs. The
     /// `EquivClass` carries `mention_count = members.len()`.
-    pub fn parse<X>(
-        projected: &projection::Entity<EntId, EvtId, ImgId, Lineage<X>>,
+    pub fn parse<S, X>(
+        projected: &projection::Entity<EntId, EvtId, ImgId, S>,
         class: &EquivClass<EntId>,
     ) -> Self
     where
+        S: Support<Atom = X>,
         X: SupportAtom<Img = ImgId>,
     {
         let names = display_names(&projected.names);
@@ -228,10 +229,11 @@ where
 }
 
 /// The projection's names field: dedup key → validity window record.
-type ProjectedNames<X> = FactMap<NameKey, NameRecord<Lineage<X>>, Lineage<X>>;
+type ProjectedNames<S> = FactMap<NameKey, NameRecord<S>, S>;
 
-fn display_names<X>(names: &ProjectedNames<X>) -> Vec<Name<X::Img>>
+fn display_names<S, X>(names: &ProjectedNames<S>) -> Vec<Name<X::Img>>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -249,14 +251,14 @@ where
 }
 
 /// The projection's relations field: target id → coexisting relation kinds.
-type ProjectedRelations<EntId, X> =
-    FactMap<EntId, FactSet<EntityRelationType, Lineage<X>>, Lineage<X>>;
+type ProjectedRelations<EntId, S> = FactMap<EntId, FactSet<EntityRelationType, S>, S>;
 
-fn display_relations<EntId, X>(
-    relations: &ProjectedRelations<EntId, X>,
+fn display_relations<EntId, S, X>(
+    relations: &ProjectedRelations<EntId, S>,
 ) -> Vec<Relation<EntId, X::Img>>
 where
     EntId: Ord + Clone,
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -274,8 +276,9 @@ where
 }
 
 /// Flatten the bookend dates into a [`Period`].
-fn bookend_period<X>(bookend: &Bookend<Lineage<X>>) -> Period<X::Img>
+fn bookend_period<S, X>(bookend: &Bookend<S>) -> Period<X::Img>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord + Clone,
 {
@@ -286,13 +289,14 @@ where
 }
 
 /// Whether a bookend carries any claim — its dates or its location.
-fn bookend_present<X>(bookend: &Bookend<Lineage<X>>) -> bool {
+fn bookend_present<S: Support>(bookend: &Bookend<S>) -> bool {
     touched(&bookend.started_at) || touched(&bookend.completed_at) || touched(&bookend.location)
 }
 
 /// The flattened [`EventFacts`] of one event record.
-fn event_facts<X>(record: &projection::Event<Lineage<X>>) -> EventFacts<X::Img>
+fn event_facts<S, X>(record: &projection::Event<S>) -> EventFacts<X::Img>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord + Clone,
 {
@@ -327,8 +331,8 @@ fn settled_kind<ImgId>(
 /// `EventFacts` keeps the stray claims visible) and names the offending fields in
 /// its log. `descriptions` is additive and rides every kind, so it sits outside
 /// this set.
-fn off_kind_fields<X>(
-    record: &projection::Event<Lineage<X>>,
+fn off_kind_fields<S: Support>(
+    record: &projection::Event<S>,
     k: LifetimeEventKind,
 ) -> Vec<&'static str> {
     [
@@ -374,12 +378,13 @@ fn off_kind_fields<X>(
 /// The single predicate selecting a typed variant is a settled singleton kind
 /// (`Reached { Of({k}) }`); every other shape routes to `Ambiguous` carrying the
 /// kind's extent as `candidates`.
-fn interior_event<EvtId, X>(
-    record: &projection::Event<Lineage<X>>,
+fn interior_event<EvtId, S, X>(
+    record: &projection::Event<S>,
     event_id: &EvtId,
 ) -> (InteriorEvent<X::Img>, Vec<Citation<X::Img>>)
 where
     EvtId: std::fmt::Debug,
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord + Clone,
 {
@@ -464,8 +469,9 @@ fn single<A: Clone>(set: &BTreeSet<A>) -> Option<A> {
 }
 
 /// The descriptions hoisted onto a timeline entry.
-fn descriptions<X>(descriptions: &FactSet<String, Lineage<X>>) -> Vec<Attributed<String, X::Img>>
+fn descriptions<S, X>(descriptions: &FactSet<String, S>) -> Vec<Attributed<String, X::Img>>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -510,8 +516,9 @@ pub(crate) fn entry_date_bounds<EvtId, ImgId>(
 
 /// The union of a bookend's date and location bracket citations — a present
 /// bookend entry's attribution, so it never surfaces empty-sourced.
-fn bookend_sources<X>(bookend: &Bookend<Lineage<X>>) -> Vec<Citation<X::Img>>
+fn bookend_sources<S, X>(bookend: &Bookend<S>) -> Vec<Citation<X::Img>>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -528,11 +535,12 @@ where
 /// One existence witness as a settled date bound: the attested date, the facts
 /// behind it, and their citations. The date is the slot's key, so the consensus
 /// is reached by construction.
-fn existence_bounded<X>(
+fn existence_bounded<S, X>(
     at: &UncertainDate,
-    entry: &Cited<(), Lineage<X>>,
+    entry: &Cited<(), S>,
 ) -> Bounded<UncertainDate, X::Img>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -548,16 +556,17 @@ where
 /// construction first, existence witnesses by date, the interior events by their
 /// id, demolition last. Display ordering — interleaving endpoints by date — is
 /// the [`moment`](crate::moment) layer's job, folded into [`Timeline::build`].
-/// A projected entity over any support lineage.
-type ProjectedEntity<EntId, EvtId, ImgId, X> = projection::Entity<EntId, EvtId, ImgId, Lineage<X>>;
+/// A projected entity over any support container.
+type ProjectedEntity<EntId, EvtId, ImgId, S> = projection::Entity<EntId, EvtId, ImgId, S>;
 
-fn timeline_events<EntId, EvtId, ImgId, X>(
-    projected: &ProjectedEntity<EntId, EvtId, ImgId, X>,
+fn timeline_events<EntId, EvtId, ImgId, S, X>(
+    projected: &ProjectedEntity<EntId, EvtId, ImgId, S>,
 ) -> Vec<TimelineEvent<EvtId, X::Img>>
 where
     EntId: Ord,
     EvtId: Ord + Clone + std::fmt::Debug,
     ImgId: Ord + Clone,
+    S: Support<Atom = X>,
     X: SupportAtom<Img = ImgId>,
 {
     let mut events: Vec<TimelineEvent<EvtId, X::Img>> = Vec::new();
@@ -622,11 +631,12 @@ fn landing_date<ImgId>(period: &Period<ImgId>) -> Option<NaiveDate> {
 /// timeline by best-known landing date, else the construction location. The
 /// `Option<NaiveDate>` ordering puts a dated move above an undated one and the
 /// later landing on top.
-fn entity_location<EvtId, X>(
-    construction_location: &Bracket<UnresolvedLocation, Lineage<X>>,
+fn entity_location<EvtId, S, X>(
+    construction_location: &Bracket<UnresolvedLocation, S>,
     events: &[TimelineEvent<EvtId, X::Img>],
 ) -> Bounded<UnresolvedLocation, X::Img>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord + Clone,
 {

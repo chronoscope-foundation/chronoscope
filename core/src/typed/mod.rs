@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::algebra::lattice::JoinSemilattice;
-use crate::algebra::semiring::Lineage;
+use crate::algebra::semiring::Support;
 use crate::conflicts::{FactAtom, fact_date, minimal_fighting_sets};
 use crate::date::UncertainDate;
 use crate::grammar::depiction::Perspective;
@@ -228,30 +228,32 @@ impl<R: IdScheme> SupportAtom for FactAtom<R> {
     }
 }
 
-/// The citations a lineage's atoms attribute, deduped. Each atom's own identity
+/// The citations a support's atoms attribute, deduped. Each atom's own identity
 /// (a member id, a fact id) rode along to make the projection computable; the
 /// typed surface keeps only the citations.
-pub(super) fn sources<X>(support: &Lineage<X>) -> Vec<Citation<X::Img>>
+pub(super) fn sources<S, X>(support: &S) -> Vec<Citation<X::Img>>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
     support
-        .iter()
+        .atoms()
         .filter_map(SupportAtom::citation)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
 }
 
-/// The fact ids a lineage's atoms name, deduped and ordered — the
+/// The fact ids a support's atoms name, deduped and ordered — the
 /// provenance-by-id mirror of [`sources`]. Empty for a member-lineage support.
-pub(super) fn fact_ids<X>(support: &Lineage<X>) -> Vec<FactId>
+pub(super) fn fact_ids<S, X>(support: &S) -> Vec<FactId>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
 {
     support
-        .iter()
+        .atoms()
         .filter_map(SupportAtom::fact_id)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -261,9 +263,10 @@ where
 /// Flatten a restrictive field. `Absent` when the extent support is the semiring
 /// zero (nothing contributed via `plus`); else `possible`/`sources` come from
 /// the extent and the consensus reads off `consensus.value.conflict()`.
-pub(super) fn bracket<V, X>(b: &Bracket<V, Lineage<X>>) -> Bounded<V, X::Img>
+pub(super) fn bracket<V, S, X>(b: &Bracket<V, S>) -> Bounded<V, X::Img>
 where
     V: JoinSemilattice + ConsensusConflict + Clone + PartialEq,
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -315,10 +318,9 @@ where
 /// [`bracket`], then for an over-determined slot reads the fighting facts off the
 /// consensus support: each fact's date premise and citations, minimized into the
 /// sets whose dates can't jointly hold.
-pub(super) fn dated_bracket<X>(
-    b: &Bracket<UncertainDate, Lineage<X>>,
-) -> Bounded<UncertainDate, X::Img>
+pub(super) fn dated_bracket<S, X>(b: &Bracket<UncertainDate, S>) -> Bounded<UncertainDate, X::Img>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord + Clone,
 {
@@ -339,13 +341,14 @@ type DatePremise<ImgId> = (UncertainDate, Vec<Citation<ImgId>>);
 /// fact's date premise with the citations attributing it, minimize the premises
 /// into the sets whose joint meet is empty, and re-attribute each set's facts as
 /// their dates plus citations.
-fn fighting_sets<X>(support: &Lineage<X>) -> Vec<NonEmptyVec<Attributed<UncertainDate, X::Img>>>
+fn fighting_sets<S, X>(support: &S) -> Vec<NonEmptyVec<Attributed<UncertainDate, X::Img>>>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord + Clone,
 {
     let mut by_fact: BTreeMap<FactId, DatePremise<X::Img>> = BTreeMap::new();
-    for atom in support.iter() {
+    for atom in support.atoms() {
         let Some((id, date)) = atom.date_premise() else {
             continue;
         };
@@ -378,8 +381,9 @@ where
 }
 
 /// Flatten an additive entry's value to its attributing citations.
-pub(super) fn factset<E, X>(entry: &Cited<(), Lineage<X>>, value: E) -> Attributed<E, X::Img>
+pub(super) fn factset<E, S, X>(entry: &Cited<(), S>, value: E) -> Attributed<E, X::Img>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -393,11 +397,12 @@ where
 /// each annotation axis `bracket()`'d, the link's existence citations from the
 /// entry's support. Shared by both reading directions — the image side passes the
 /// entity as `other`, the entity side the image — so the two views can't drift.
-pub(super) fn depiction<OtherId, X>(
+pub(super) fn depiction<OtherId, S, X>(
     other: OtherId,
-    entry: &Cited<DepictionRecord<Lineage<X>>, Lineage<X>>,
+    entry: &Cited<DepictionRecord<S>, S>,
 ) -> Depiction<OtherId, X::Img>
 where
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -423,16 +428,20 @@ pub(crate) fn dated_bound<V, ImgId>(bounded: &Bounded<V, ImgId>) -> Option<&Boun
 
 /// Whether a bracket carries a claim — its extent support is past the semiring
 /// zero (something contributed via `plus`).
-pub(super) fn touched<V, X>(b: &Bracket<V, Lineage<X>>) -> bool {
-    !matches!(b.extent.support, Lineage::Bottom)
+pub(super) fn touched<V, S>(b: &Bracket<V, S>) -> bool
+where
+    S: Support,
+{
+    !b.extent.support.is_zero()
 }
 
-pub(super) fn merge_provenance<EntId, X>(
-    sameness: &Sameness<EntId, Lineage<X>>,
+pub(super) fn merge_provenance<EntId, S, X>(
+    sameness: &Sameness<EntId, S>,
     class: &EquivClass<EntId>,
 ) -> MergeProvenance<EntId, X::Img>
 where
     EntId: Ord + Clone,
+    S: Support<Atom = X>,
     X: SupportAtom,
     X::Img: Ord,
 {
@@ -469,7 +478,7 @@ mod test_support {
     use chrono::NaiveDate;
     use url::Url;
 
-    use crate::algebra::semiring::Semiring;
+    use crate::algebra::semiring::{Label, Semiring};
     use crate::date::{DatePrecision, UncertainDate};
     use crate::grammar::assertions::FactualAssertion;
     use crate::grammar::bookend;
@@ -499,7 +508,7 @@ mod test_support {
     }
 
     /// The entity typed flatten's fact-atom support, over the [`TestIds`] scheme.
-    pub(super) type FactLin = Lineage<FactAtom<TestIds>>;
+    pub(super) type FactLin = Label<FactAtom<TestIds>>;
 
     /// A factual citation distinguished by source url, so distinct sources keep
     /// distinct citations.
@@ -522,11 +531,9 @@ mod test_support {
         })
     }
 
-    /// A member-lineage atom for one id citing one source.
+    /// A member-lineage premise for one id citing one source.
     pub(super) fn lin(id: EntId, url: &str) -> Result<Lin, Box<dyn std::error::Error>> {
-        Ok(MemberLineage::Of(
-            [(id, factual(url)?)].into_iter().collect(),
-        ))
+        Ok(Label::premise((id, factual(url)?)))
     }
 
     /// A fact-atom lineage citing one source, keyed by a fact id derived from
@@ -553,14 +560,10 @@ mod test_support {
             },
             citation: factual_citation(url)?,
         });
-        Ok(Lineage::Of(
-            [FactAtom {
-                id: FactId::new(hasher.finish()),
-                fact,
-            }]
-            .into_iter()
-            .collect(),
-        ))
+        Ok(Label::premise(FactAtom {
+            id: FactId::new(hasher.finish()),
+            fact,
+        }))
     }
 
     /// A single claim's bracket: both bounds the value, backed by `support`.
