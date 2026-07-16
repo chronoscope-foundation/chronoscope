@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::external_ids::{OhmId, OsmElementType, OsmId};
 use crate::geo::{
     GeoPoint, GeoPointError, IndexRect, Meters, SphereCap, SpherePoint, Viewport,
-    WGS84_SPHERE_REL_GAP, cap_bounding_rects,
+    cap_bounding_rects,
 };
 
 /// Sanity bound on a circle's uncertainty radius: a circle wider than this
@@ -463,33 +463,17 @@ impl Location {
     /// membership, a `OneOf` holds if any child does, an `AllOf` if every child
     /// does, `Empty` never, `Unbounded` always.
     fn covers_point(&self, pt: &SpherePoint) -> bool {
-        self.covers_point_inflated(pt, 0.0)
-    }
-
-    /// [`covers_point`](Self::covers_point) with every `Circle` grown by `rel`
-    /// of its radius (shrunk for `rel < 0`). `denotes_empty` passes
-    /// [`WGS84_SPHERE_REL_GAP`] so a spherically-derived candidate the ellipsoid
-    /// nudges a fraction past a rim still counts as inside.
-    fn covers_point_inflated(&self, pt: &SpherePoint, rel: f64) -> bool {
         match self {
             Self::Empty => false,
             Self::Unbounded => true,
-            Self::Circle { center, radius } => {
-                SphereCap::new((*center).into(), *radius).covers_inflated(pt, rel)
-            }
-            Self::OneOf { members } => members
-                .as_slice()
-                .iter()
-                .any(|m| m.covers_point_inflated(pt, rel)),
+            Self::Circle { center, radius } => SphereCap::new((*center).into(), *radius).covers(pt),
+            Self::OneOf { members } => members.as_slice().iter().any(|m| m.covers_point(pt)),
             Self::AllOf { members } => {
                 // Constructors enforce ≥2 members; an empty `AllOf` (the empty
                 // intersection = whole sphere) would wrongly read as covered via
                 // `all()` over no members.
                 debug_assert!(!members.is_empty(), "AllOf holds ≥2 members");
-                members
-                    .as_slice()
-                    .iter()
-                    .all(|m| m.covers_point_inflated(pt, rel))
+                members.as_slice().iter().all(|m| m.covers_point(pt))
             }
         }
     }
@@ -536,34 +520,33 @@ impl Location {
     /// # Method
     ///
     /// Candidate-point coverage, polynomial in the cap count, no DNF. For an
-    /// `AllOf`, gather the caps in this node's subtree and test each cap center
-    /// and every pairwise rim crossing against this whole `AllOf`; the
-    /// intersection is non-empty iff some candidate is covered.
+    /// `AllOf`, gather the caps in this node's subtree and test each cap center,
+    /// every pairwise rim crossing, and every pairwise balance point against
+    /// this whole `AllOf`; the intersection is non-empty iff some candidate is
+    /// covered.
     ///
     /// Correctness. An `AllOf`'s region is a finite union of geodesically-convex
     /// pieces, each an intersection of closed caps (distributing its inner unions
     /// out yields a DNF whose terms are cap-intersections; we never materialize
     /// it). For caps no larger than a hemisphere, a non-empty closed convex
     /// cap-intersection contains an extreme point of itself, and the extreme
-    /// points of a cap-intersection are cap centers and pairwise rim crossings —
-    /// a tangency is a single feasible point kept by the inclusive cap
-    /// membership. Each piece's caps are a subset of this node's gathered caps,
-    /// so its witness sits among the node's candidates. Hence some candidate is
-    /// covered exactly when this `AllOf` is non-empty. Scoping candidate
-    /// generation to each `AllOf` node still captures a cross-branch witness like
-    /// the `A∩C` crossing in `(A∪B)∩(C∪D)`: the node's subtree gathers `A` and
-    /// `C` both.
+    /// points of a cap-intersection are cap centers and pairwise rim crossings.
+    /// A pair that overlaps only tangentially has its rim crossings within the
+    /// coverage tolerance of one point, so the pairwise balance point — the
+    /// deepest shared point along the two centers' geodesic — carries the witness
+    /// where the crossings degenerate. Each piece's caps are a subset of this
+    /// node's gathered caps, so its witness sits among the node's candidates.
+    /// Hence some candidate is covered exactly when this `AllOf` is non-empty.
+    /// Scoping candidate generation to each `AllOf` node still captures a
+    /// cross-branch witness like the `A∩C` crossing in `(A∪B)∩(C∪D)`: the node's
+    /// subtree gathers `A` and `C` both.
     ///
-    /// Model. The boundary solve runs on the sphere (no ellipsoidal closed
-    /// form), but membership is the WGS84 [`covers`](Self::covers). Two
-    /// inflations bridge the two models: the caps fed to the boundary solve are
-    /// grown by `WGS84_SPHERE_REL_GAP`, so any WGS84-feasible overlap still
-    /// yields a crossing candidate, and coverage is tested at the compounded gap
-    /// a grown-rim crossing carries. A WGS84 disk sits inside its gap-grown
-    /// sphere disk, so this makes the routine a sound over-approximation:
-    /// `denotes_empty` never reports empty for a feasible WGS84 intersection. It
-    /// may keep an intersection that misses by less than the gap — the safe
-    /// direction for a submit-time feasibility check.
+    /// Model. The pairwise crossings, the balance points, and membership are all
+    /// WGS84: [`SphereCap::boundary_intersections`] and
+    /// [`SphereCap::balance_point`] solve on the ellipsoid, and
+    /// [`covers`](Self::covers) measures the geodesic distance. The intersection
+    /// is empty exactly when no candidate — a cap center, a pairwise crossing, or
+    /// a pairwise balance point — is covered.
     pub fn denotes_empty(&self) -> bool {
         match self {
             Self::Empty => true,
@@ -576,23 +559,18 @@ impl Location {
                 debug_assert!(!members.is_empty(), "AllOf holds ≥2 members");
                 let mut caps: Vec<SphereCap> = Vec::new();
                 self.gather_caps(&mut caps);
-                // Grow the caps by the gap so a crossing survives whenever the
-                // WGS84 disks could overlap; a grown crossing lands on the
-                // (1+gap) rim, so coverage must reach out to (1+gap)².
-                let grown: Vec<SphereCap> = caps
-                    .iter()
-                    .map(|c| c.inflated(WGS84_SPHERE_REL_GAP))
-                    .collect();
-                let coverage_rel = (1.0 + WGS84_SPHERE_REL_GAP).powi(2) - 1.0;
                 let mut candidates: Vec<SpherePoint> = caps.iter().map(SphereCap::center).collect();
-                for i in 0..grown.len() {
-                    for j in (i + 1)..grown.len() {
-                        candidates.extend(grown[i].boundary_intersections(&grown[j]));
+                for i in 0..caps.len() {
+                    for j in (i + 1)..caps.len() {
+                        // A pair far enough apart never contributes a covered
+                        // candidate; skipping those would save the two solves, but
+                        // the pair count is small at submit time — defer the
+                        // early-out until a benchmark shows it pays.
+                        candidates.extend(caps[i].boundary_intersections(&caps[j]));
+                        candidates.extend(caps[i].balance_point(&caps[j]));
                     }
                 }
-                !candidates
-                    .iter()
-                    .any(|pt| self.covers_point_inflated(pt, coverage_rel))
+                !candidates.iter().any(|pt| self.covers_point(pt))
             }
         }
     }
@@ -2120,12 +2098,33 @@ mod tests {
     }
 
     #[test]
+    fn near_tangent_pair_within_tolerance_is_non_empty() -> TestResult {
+        // Two 80 km circles due north-south, centers a half-millimeter past their
+        // radius sum: the bare rims fall just short of touching, so the rim
+        // crossings vanish, yet the coverage tolerance still admits the point
+        // between them. The pairwise balance point is the sole witness — without
+        // it the meet would read as empty across this near-tangency band.
+        let r = 80_000.0;
+        let a = gp(40.0, -74.0)?;
+        let (lat_b, lon_b): (f64, f64) = Geodesic::wgs84().direct(40.0, -74.0, 0.0, 2.0 * r + 5e-4);
+        let b = gp(lat_b, lon_b)?;
+        let meet = Location::all_of(vec![
+            Location::circle(a, Meters(r))?,
+            Location::circle(b, Meters(r))?,
+        ])?;
+        assert!(
+            !meet.denotes_empty(),
+            "near-tangent caps within tolerance overlap"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sphere_disjoint_but_wgs84_overlapping_pair_is_non_empty() -> TestResult {
-        // Two 100 km circles due N-S near the equator, WGS84-separated by 199.4 km
-        // (< 200 km, so they overlap on the ellipsoid) but sphere-separated by
-        // ~200.5 km (> 200 km, so the spherical boundary solve finds no crossing).
-        // The gap-grown scaffold must still witness the overlap; without it the
-        // routine would report this feasible region empty.
+        // Two 100 km circles due N-S near the equator: their WGS84 separation is
+        // 199.4 km, just under the 200 km radius sum, so the ellipsoid puts them
+        // 0.6 km into overlap. The circle-circle solve finds the crossing, so the
+        // routine reads the pair as non-empty.
         let a = gp(0.0, 0.0)?;
         let (lat_b, lon_b): (f64, f64) = Geodesic::wgs84().direct(0.0, 0.0, 0.0, 199_400.0);
         let b = gp(lat_b, lon_b)?;
