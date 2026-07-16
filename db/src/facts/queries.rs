@@ -95,10 +95,13 @@ define_fact_queries! {
     ),
     INSERT_SUBJECT: "INSERT INTO fact_subjects (fact_id, kind, subject_id) VALUES (?1, ?2, ?3)",
 
-    // One covering rect of a location-bearing fact (see the migration's
-    // facts_spatial notes: split halves at the ±180° seam, INSERT-only, the
-    // rtree id auto-assigned). ?6 is the located subject's kind tag.
-    INSERT_SPATIAL: "INSERT INTO facts_spatial (min_lat, max_lat, min_lon, max_lon, fact_id, subject_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    // One covering-rect envelope of a location-bearing fact (see the migration's
+    // facts_spatial notes: seam-split halves, INSERT-only). The rect corners
+    // become a SpatiaLite MBR polygon in the `region` geometry column, whose
+    // managed spatial index SpatiaLite keeps in sync. ?2 is the located
+    // subject's kind tag; ?3..?6 are min_lon, min_lat, max_lon, max_lat
+    // (`BuildMbr`'s x/y order).
+    INSERT_SPATIAL: "INSERT INTO facts_spatial (fact_id, subject_kind, region) VALUES (?1, ?2, BuildMbr(?3, ?4, ?5, ?6, 4326))",
 
     // Commit recording: the metadata/result row, then a claim per fact
     // under the new surrogate seq. The seq comes back as the insert's rowid
@@ -270,26 +273,37 @@ define_fact_queries! {
         WHERE source_url = ?1 AND fact_id < ?2
     ",
 
-    // Spatial-walk candidates: every location-bearing fact with a covering
-    // rect meeting the query window (?1..?4 = the viewport's min_lat,
-    // max_lat, min_lon, max_lon — a non-wrapping window; an
-    // antimeridian-crossing viewport runs this twice, once per half), below
-    // snapshot ?5, placing a subject of kind ?6 or ?7 — the stream's own
-    // kinds, a residual filter on the aux column so the entity walk never
-    // fetches capture locations and vice versa (the one-kind image stream
-    // binds its kind twice). The rtree scan plans as `SCAN facts_spatial
-    // VIRTUAL TABLE INDEX ...`, which the verifier's virtual-table allowance
-    // already accepts — the rtree constraints bound it, so no new exemption.
-    // A seam-split location matches through both rect rows; the caller
-    // dedups by fact id. Exact refinement (the shared region predicate) and
-    // retraction filtering happen in Rust.
+    // Spatial-walk candidates: every location-bearing fact whose covering-rect
+    // envelope meets the query window (?1..?4 = the viewport's min_lat, max_lat,
+    // min_lon, max_lon — a non-wrapping window; an antimeridian-crossing
+    // viewport runs this twice, once per half), below snapshot ?5, placing a
+    // subject of kind ?6 or ?7. The `rowid IN (SELECT rowid FROM SpatialIndex
+    // ...)` form is SpatiaLite's idiom for its rtree over the `region` MBRs —
+    // the pre-filter — which the query plan drives before probing facts_spatial
+    // and facts by rowid.
+    //
+    // Single circles (lat/lon/radius set on `facts`) get their exact ellipsoidal
+    // test here: ST_Distance(center, viewport-box, 1) — WGS84 meters, the same
+    // geodesic core measures — within `radius_m` plus a 1 m margin. The margin
+    // keeps this a conservative superset of core's `known_geometry_intersects`
+    // (whose nearest-point distance over-estimates by sub-meter and admits a mm
+    // rim tolerance), so the Rust refine that runs next stays the final arbiter
+    // and the backends can't disagree. Compound/unresolved locations have NULL
+    // radius and pass straight through to that refine. A seam-split location
+    // matches through both envelope rows; the caller dedups by fact id.
     SPATIAL_CANDIDATES: "
-        SELECT facts_spatial.fact_id, facts.fact_json
-        FROM facts_spatial CROSS JOIN facts ON facts.fact_id = facts_spatial.fact_id
-        WHERE facts_spatial.max_lat >= ?1 AND facts_spatial.min_lat <= ?2
-          AND facts_spatial.max_lon >= ?3 AND facts_spatial.min_lon <= ?4
+        SELECT facts.fact_id, facts.fact_json
+        FROM facts_spatial
+        JOIN facts ON facts.fact_id = facts_spatial.fact_id
+        WHERE facts_spatial.rowid IN (
+                SELECT rowid FROM SpatialIndex
+                WHERE f_table_name = 'facts_spatial' AND f_geometry_column = 'region'
+                  AND search_frame = BuildMbr(?3, ?1, ?4, ?2, 4326))
           AND facts.fact_id < ?5
           AND facts_spatial.subject_kind IN (?6, ?7)
+          AND (facts.radius_m IS NULL
+               OR ST_Distance(MakePoint(facts.lon, facts.lat, 4326),
+                              BuildMbr(?3, ?1, ?4, ?2, 4326), 1) <= facts.radius_m + 1.0)
     ",
 
     // The active-or-retracted HasEvent rows of a batch of events: ?1 is a

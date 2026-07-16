@@ -277,25 +277,25 @@ CREATE TABLE subject_reps (
 ) WITHOUT ROWID;
 CREATE INDEX idx_subject_reps_rep ON subject_reps(kind, rep, as_of);
 
--- SpatiaLite indexes only geometry MBRs, and polygonizing an uncertainty
--- circle would invent precision. Honest lat/lon/radius columns plus a plain
--- rtree over the geodesic covering rects, refined by the shared region
--- predicate in core.
+-- Polygonizing an uncertainty circle would invent precision, so a circle is
+-- stored honest — lat/lon/radius on `facts` — and tested by ellipsoidal
+-- ST_Distance. `facts_spatial` holds one geodesic covering-rect envelope per
+-- location (Location::bounding_rects, split at the ±180° seam so stored MBRs
+-- never wrap) in a SpatiaLite geometry column, whose managed spatial index is
+-- the viewport pre-filter. `region` is generic GEOMETRY so a future real shape
+-- (polygon/line, tested by ST_Intersects) reuses the same indexed seat.
+-- fact_id and the located subject's kind ride alongside — subject_kind lets
+-- each InViewport stream fetch only its own kinds. Rows are INSERT-only like
+-- every fact table — a rejected submit's savepoint unwinds them with the
+-- staging.
 --
--- One row per covering rect of the fact's location (Location::bounding_rects):
--- a region crossing the ±180° seam stores its two split halves, so stored
--- longitude intervals never wrap and a query is a plain range test. The rtree
--- id is a throwaway surrogate (rtree enforces id uniqueness, so rect rows of
--- one fact can't share it); fact_id and the located subject's kind ride in
--- the auxiliary columns — subject_kind lets each InViewport stream fetch
--- only its own kinds. Rows are INSERT-only like every fact table — a
--- rejected submit's savepoint unwinds them with the staging. The rtree
--- stores 32-bit floats rounded outward, which only widens the
--- over-approximation.
-CREATE VIRTUAL TABLE facts_spatial USING rtree(
-    id,
-    min_lat, max_lat,
-    min_lon, max_lon,
-    +fact_id,
-    +subject_kind
+-- InitSpatialMetaData(0, ...): the 0 leaves transaction control to the
+-- migration (which sqlx already wraps in one); 'WGS84' loads only the WGS84
+-- SRID subset rather than the full ~6000-row spatial_ref_sys.
+SELECT InitSpatialMetaData(0, 'WGS84');
+CREATE TABLE facts_spatial (
+    fact_id INTEGER NOT NULL,
+    subject_kind TEXT NOT NULL
 );
+SELECT AddGeometryColumn('facts_spatial', 'region', 4326, 'GEOMETRY', 'XY');
+SELECT CreateSpatialIndex('facts_spatial', 'region');

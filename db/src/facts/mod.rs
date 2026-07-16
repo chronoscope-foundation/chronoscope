@@ -39,9 +39,10 @@
 //! `walk_image_classes`) combine the facet indexes with that resolution,
 //! and `walk_entity_depictions` combines it with the subject backlinks;
 //! the spatial streams (`InViewport` for entities and images) fetch candidates
-//! from the `facts_spatial` rtree — one row per geodesic covering rect,
-//! written at stage time — and refine them through core's shared region
-//! predicate; the temporal streams still answer empty pages until their
+//! from the `facts_spatial` SpatiaLite geometry index — one covering-rect
+//! envelope per location, written at stage time — filter single circles by
+//! ellipsoidal `ST_Distance` in SQL, and refine the rest through core's shared
+//! region predicate; the temporal streams still answer empty pages until their
 //! index exists, with their conformance cases ignored.
 
 mod convert;
@@ -662,15 +663,15 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         if let Some((rects, subject_kind)) = &spatial {
             for rect in rects {
                 sqlx::query(queries::INSERT_SPATIAL.sql)
-                    .bind(rect.min_lat)
-                    .bind(rect.max_lat)
-                    .bind(rect.min_lon)
-                    .bind(rect.max_lon)
                     .bind(fid_raw)
                     .bind(subject_kind)
+                    .bind(rect.min_lon)
+                    .bind(rect.min_lat)
+                    .bind(rect.max_lon)
+                    .bind(rect.max_lat)
                     .execute(&mut *conn)
                     .await
-                    .map_err(sql("inserting spatial rect row"))?;
+                    .map_err(sql("inserting spatial envelope row"))?;
             }
         }
         // Representative-log maintenance runs on the same connection as the
