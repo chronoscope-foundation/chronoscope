@@ -79,17 +79,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await
     .map_err(|e| format!("Failed to start API server: {e}"))?;
 
-    // 5. Start Trunk with CHRONOSCOPE_API_URL set.
-    // Trunk's post_build hook writes config.json to dist/ using this env var.
+    // 5. Start Trunk, serving the app and reverse-proxying `/api/*` to the API.
+    // `--proxy-rewrite=/api/` strips the mount prefix, so `/api/markers` reaches
+    // the root `/markers` route — same-origin, so the browser never sees CORS.
     let web_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("no parent")?
         .join("web");
     info!(log, "Starting Trunk live-reload server...");
     let trunk_port_str = trunk_port.to_string();
+    let proxy_backend = format!("--proxy-backend=http://127.0.0.1:{api_port}/");
     let mut trunk = Command::new("trunk")
-        .args(["serve", "--port", &trunk_port_str])
-        .env("CHRONOSCOPE_API_URL", &server.base_url)
+        .args([
+            "serve",
+            "--port",
+            &trunk_port_str,
+            &proxy_backend,
+            "--proxy-rewrite=/api/",
+        ])
         .current_dir(&web_dir)
         .spawn()
         .map_err(|e| format!("Failed to start trunk: {e}"))?;

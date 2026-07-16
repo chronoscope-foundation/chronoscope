@@ -1,9 +1,8 @@
 //! API client integration for the web frontend.
 //!
-//! Uses the shared [`Client`] from `chronoscope-api-client` for typed
-//! API access. Handles runtime configuration discovery from `/config.json`.
-
-use wasm_bindgen::JsCast;
+//! Uses the shared [`Client`] from `chronoscope-api-client` for typed API
+//! access. The client's base URL is the current page origin plus the `/api`
+//! mount that the front door reverse-proxies to the backend.
 
 pub use chronoscope_api_client::{
     ApiError, Client, Cursor, EntityId, EventId, ImageId, Snapshot, image_caption,
@@ -15,63 +14,45 @@ pub use chronoscope_api_client::{
 pub type ClickAction = chronoscope_api_client::ClickAction<EntityId>;
 pub type EntityDetail = chronoscope_api_client::EntityDetail<EntityId, EventId, ImageId>;
 
-// ==================== Runtime Configuration ====================
+// ==================== Client construction ====================
 
-/// Runtime configuration loaded from `/config.json`.
-#[derive(serde::Deserialize)]
-struct AppConfig {
-    api_url: String,
-}
-
-/// Discover the API URL from `/config.json` and create a client.
+/// Build a [`Client`] pointed at the same-origin `/api` mount.
 ///
-/// Uses the browser's native fetch API (via `web_sys`) instead of reqwest,
-/// because reqwest's WASM backend requires runtime feature configuration
-/// that doesn't work reliably with `default-features = false`.
+/// The front door — Trunk in dev, the harness proxy in tests, Cloudflare in
+/// prod — serves this bundle and reverse-proxies `/api/*` to the backend, so
+/// the base is `window.location.origin` + `/api`. Per-endpoint paths stay
+/// root-relative, so `{origin}/api` joined with `/entities` yields
+/// `{origin}/api/entities`.
 ///
-/// Returns `None` if the config fetch fails (e.g., no API server running).
-pub async fn client_from_config() -> Option<Client> {
+/// Returns `None` when the browser context is unavailable; callers treat a
+/// missing client as "API features disabled".
+fn client_from_origin() -> Option<Client> {
     let window = web_sys::window()?;
-    let resp_value = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str("/config.json"))
-        .await
+    let origin = window
+        .location()
+        .origin()
         .map_err(|e| {
-            web_sys::console::warn_1(&format!("fetch /config.json failed: {e:?}").into());
+            web_sys::console::warn_1(
+                &format!("failed to read window.location.origin: {e:?}").into(),
+            );
         })
         .ok()?;
-    let resp: web_sys::Response = resp_value.dyn_into().ok()?;
-    if !resp.ok() {
-        web_sys::console::warn_1(&"Failed to load /config.json — API features disabled".into());
-        return None;
-    }
-    let json = wasm_bindgen_futures::JsFuture::from(resp.json().ok()?)
-        .await
-        .map_err(|e| {
-            web_sys::console::warn_1(&format!("Failed to read /config.json body: {e:?}").into());
-        })
-        .ok()?;
-    let config: AppConfig = serde_wasm_bindgen::from_value(json)
-        .map_err(|e| {
-            web_sys::console::warn_1(&format!("Failed to parse /config.json: {e}").into());
-        })
-        .ok()?;
-    Some(Client::new(config.api_url))
+    Some(Client::new(format!("{origin}/api")))
 }
 
 // ==================== Lazy initialization ====================
 
-/// Lazily initialize the API client, fetching `/config.json` on first call.
+/// Lazily initialize the API client on first call, memoizing the result.
 ///
-/// Returns a clone of the initialized client, or `None` if config loading
-/// fails. [`Client`] is cheap to clone (just a URL string + `reqwest::Client`).
+/// Returns a clone of the initialized client, or `None` if the origin can't be
+/// read. [`Client`] is cheap to clone (just a URL string + `reqwest::Client`).
 pub async fn get_or_init_client(
     handle: &std::rc::Rc<std::cell::RefCell<Option<Client>>>,
 ) -> Option<Client> {
     let needs_init = handle.borrow().is_none();
     if needs_init {
-        let client = client_from_config().await?;
+        let client = client_from_origin()?;
         *handle.borrow_mut() = Some(client);
     }
     handle.borrow().clone()
 }
-
-// ==================== Constants ====================

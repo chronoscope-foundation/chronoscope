@@ -45,6 +45,29 @@ Defined in `nix/web.nix` — Cargo configuration alone won't reproduce it.
 If you need to alter how the bundle is shaped (e.g. different wasm-opt
 flags, additional asset processing), edit `mkDist` in `nix/web.nix`.
 
+## Serving topology (same-origin)
+
+The web app and the API are served **same-origin**: a front door serves the
+static bundle and reverse-proxies `/api/*` to the API (Dropshot), which owns its
+routes at root (`/entities`, `/markers`, …). The front door strips the `/api`
+mount, and the web client's base is `window.location.origin + "/api"`, so the
+browser never makes a cross-origin request and no in-app CORS is needed.
+
+Three environments implement that one front-door role with **different servers**,
+because their needs diverge — same role, not redundancy:
+
+| Environment | Front door | Proxy mechanism |
+|---|---|---|
+| `web-dev` (dev iteration) | **Trunk** (`trunk serve`) | built-in `--proxy-backend` + `--proxy-rewrite=/api/` |
+| browser tests (`dev/tests/harness`) | minimal **axum** `ServeDir` | hand-written `proxy_api` handler (`ServeDir` can't proxy) |
+| production | **Cloudflare** (Pages + edge route) | edge route |
+
+Dev uses Trunk for its live-rebuild + auto-reload. The browser tests can't use
+Trunk — they serve a fixed, hermetic prebuilt `WEB_DIST`, not a live rebuild — so
+they use a lightweight axum static server plus a small reverse-proxy. Prod is
+Cloudflare. Each is the same "serve static + proxy `/api`" shape in the tool that
+fits its environment.
+
 ## Browser tests
 
 Live in `dev/tests/web.rs`. Run via `just test web` (or `just web-test`'s

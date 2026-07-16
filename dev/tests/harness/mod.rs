@@ -13,6 +13,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::response::Response;
 use chromiumoxide::Page;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
@@ -110,6 +114,50 @@ pub fn check(condition: bool, msg: impl std::fmt::Display) -> TestResult {
     } else {
         Err(msg.to_string().into())
     }
+}
+
+/// Reverse-proxy `/api/*` to the API server so the browser sees a single
+/// origin — mirroring Trunk's `--proxy-rewrite` in dev and Cloudflare in prod.
+/// Strips the `/api` mount prefix and forwards the method, path, query,
+/// headers, and body to the API root, then relays the upstream status,
+/// headers, and body back. `api_base` is the API server's `http://host:port`.
+async fn proxy_api(State(api_base): State<String>, req: Request) -> Result<Response, StatusCode> {
+    let path = req.uri().path();
+    let rest = path.strip_prefix("/api").unwrap_or(path);
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let url = format!("{api_base}{rest}{query}");
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let upstream = reqwest::Client::new()
+        .request(parts.method, url.as_str())
+        .headers(parts.headers)
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let status = upstream.status();
+    let headers = upstream.headers().clone();
+    let bytes = upstream
+        .bytes()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+
+    let mut builder = Response::builder().status(status);
+    if let Some(dst) = builder.headers_mut() {
+        *dst = headers;
+    }
+    builder
+        .body(Body::from(bytes))
+        .map_err(|_| StatusCode::BAD_GATEWAY)
 }
 
 /// Build the single JS expression used to invoke a `window.__test.<hook>(...)`
@@ -217,7 +265,6 @@ pub struct WebTest {
     server: RunningDevServer,
     // RAII guards: each holds a TempDir that's cleaned up when the WebTest
     // drops. Underscore prefix tells rustc the read-only nature is intentional.
-    _tmp_dir: tempfile::TempDir,
     _browser_data_dir: tempfile::TempDir,
     _db_dir: tempfile::TempDir,
 }
@@ -289,31 +336,23 @@ impl WebTest {
         })
         .await?;
 
-        // Create temp dir with config.json + symlinks to dist/
-        let tmp_dir = tempfile::tempdir()?;
-        let config_json = format!(r#"{{"api_url":"{base_url}"}}"#);
-        std::fs::write(tmp_dir.path().join("config.json"), config_json)?;
-
-        // Symlink all dist files except config.json
-        for entry in std::fs::read_dir(dist_dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name != "config.json" {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(entry.path(), tmp_dir.path().join(&name))?;
-            }
-        }
-
-        // Start static file server with SPA fallback (serve index.html for
-        // any path that doesn't match a file, so client-side routing works).
+        // Serve the prebuilt dist directly (nothing per-test is injected into
+        // it any more) with an SPA fallback: any path that doesn't match a file
+        // serves index.html so client-side routing works.
         let frontend_port = find_available_port()?;
-        let serve_dir = tmp_dir.path().to_path_buf();
-        let index_html = serve_dir.join("index.html");
-        let app = axum::Router::new().fallback_service(
-            tower_http::services::ServeDir::new(serve_dir)
-                .append_index_html_on_directories(true)
-                .fallback(tower_http::services::ServeFile::new(index_html)),
-        );
+        let index_html = dist_dir.join("index.html");
+        let serve_dir = tower_http::services::ServeDir::new(&dist_dir)
+            .append_index_html_on_directories(true)
+            .fallback(tower_http::services::ServeFile::new(index_html));
+        // Reverse-proxy `/api/*` to the API so the browser talks to one origin
+        // (page derives its base from `window.location.origin` + `/api`). The
+        // route is registered ahead of `fallback_service`, so `/api/*` never
+        // falls through to the SPA index.html (which would answer JSON requests
+        // with an HTML 200 and break parsing).
+        let app = axum::Router::new()
+            .route("/api/{*rest}", axum::routing::any(proxy_api))
+            .fallback_service(serve_dir)
+            .with_state(base_url.clone());
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{frontend_port}")).await?;
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
@@ -328,10 +367,10 @@ impl WebTest {
         // CPU racing other tests that are already saturating the runtime.
         // The TCP listener is already bound, but until axum's `serve` future
         // is scheduled there's no signal we can wait on — only polling.
-        let config_url = format!("{frontend_url}/config.json");
+        let probe_url = format!("{frontend_url}/");
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if reqwest::get(&config_url).await.is_ok() {
+                if reqwest::get(&probe_url).await.is_ok() {
                     return;
                 }
                 #[allow(
@@ -377,7 +416,6 @@ impl WebTest {
             console_logs,
             screenshot_dir: screenshot_dir()?,
             server,
-            _tmp_dir: tmp_dir,
             _browser_data_dir: browser_data_dir,
             _db_dir: db_dir,
         })

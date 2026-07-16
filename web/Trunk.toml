@@ -13,11 +13,3 @@ dist = "../target/web-dist"
 stage = "pre_build"
 command = "tailwindcss"
 command_arguments = ["-i", "input.css", "-o", "tailwind.css"]
-
-# Write runtime config to dist/ after each build.
-# CHRONOSCOPE_API_URL must be set (the web_dev binary sets it).
-# Fails if unset — use `just web-dev` instead of bare `trunk serve`.
-[[hooks]]
-stage = "post_build"
-command = "sh"
-command_arguments = ["-c", ": ${CHRONOSCOPE_API_URL:?'not set — use just web-dev instead of bare trunk serve'} && printf '{\"api_url\":\"%s\"}' \"$CHRONOSCOPE_API_URL\" > \"${TRUNK_STAGING_DIR:?}/config.json\""]
