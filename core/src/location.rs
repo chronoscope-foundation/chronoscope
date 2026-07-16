@@ -43,8 +43,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::external_ids::{OhmId, OsmElementType, OsmId};
 use crate::geo::{
-    GeoPoint, GeoPointError, IndexRect, Meters, SphereCap, SpherePoint, Viewport,
-    cap_bounding_rects,
+    Circle, GeoPoint, GeoPointError, IndexRect, Meters, Viewport, cap_bounding_rects,
 };
 
 /// Sanity bound on a circle's uncertainty radius: a circle wider than this
@@ -420,7 +419,7 @@ impl Location {
                     center: c2,
                     radius: r2,
                 },
-            ) => SphereCap::new((*c1).into(), *r1).contains(&SphereCap::new((*c2).into(), *r2)),
+            ) => Circle::new(*c1, *r1).contains(&Circle::new(*c2, *r2)),
             // An intersection sits below each of its members, so self contains
             // it once self contains any one member. Checked before the OneOf
             // arms so an `AllOf` object never falls into them.
@@ -455,18 +454,18 @@ impl Location {
     /// counts), `OneOf` is the union, `AllOf` the intersection, `Empty` the
     /// empty set, `Unbounded` the whole sphere.
     pub fn covers(&self, point: &GeoPoint) -> bool {
-        self.covers_point(&(*point).into())
+        self.covers_point(point)
     }
 
-    /// Whether `pt` (already a unit vector) lies in the region. Recurses the
-    /// location directly: a `Circle` rebuilds its [`SphereCap`] inline and tests
-    /// membership, a `OneOf` holds if any child does, an `AllOf` if every child
-    /// does, `Empty` never, `Unbounded` always.
-    fn covers_point(&self, pt: &SpherePoint) -> bool {
+    /// Whether `pt` lies in the region. Recurses the location directly: the
+    /// `Circle` variant builds a [`Circle`] and tests membership, a `OneOf`
+    /// holds if any child does, an `AllOf` if every child does, `Empty` never,
+    /// `Unbounded` always.
+    fn covers_point(&self, pt: &GeoPoint) -> bool {
         match self {
             Self::Empty => false,
             Self::Unbounded => true,
-            Self::Circle { center, radius } => SphereCap::new((*center).into(), *radius).covers(pt),
+            Self::Circle { center, radius } => Circle::new(*center, *radius).covers(pt),
             Self::OneOf { members } => members.as_slice().iter().any(|m| m.covers_point(pt)),
             Self::AllOf { members } => {
                 // Constructors enforce ≥2 members; an empty `AllOf` (the empty
@@ -478,12 +477,13 @@ impl Location {
         }
     }
 
-    /// Push every [`SphereCap`] in this subtree into `out` — the candidate caps a
-    /// containing `AllOf` draws its witness points from.
-    fn gather_caps(&self, out: &mut Vec<SphereCap>) {
+    /// Collect a [`Circle`] for every `Circle` variant in this subtree into
+    /// `out` — the candidate caps a containing `AllOf` draws its witness points
+    /// from.
+    fn gather_caps(&self, out: &mut Vec<Circle>) {
         match self {
             Self::Empty | Self::Unbounded => {}
-            Self::Circle { center, radius } => out.push(SphereCap::new((*center).into(), *radius)),
+            Self::Circle { center, radius } => out.push(Circle::new(*center, *radius)),
             Self::OneOf { members } | Self::AllOf { members } => {
                 members.as_slice().iter().for_each(|m| m.gather_caps(out));
             }
@@ -542,8 +542,8 @@ impl Location {
     /// subtree gathers `A` and `C` both.
     ///
     /// Model. The pairwise crossings, the balance points, and membership are all
-    /// WGS84: [`SphereCap::boundary_intersections`] and
-    /// [`SphereCap::balance_point`] solve on the ellipsoid, and
+    /// WGS84: [`Circle::boundary_intersections`] and
+    /// [`Circle::balance_point`] solve on the ellipsoid, and
     /// [`covers`](Self::covers) measures the geodesic distance. The intersection
     /// is empty exactly when no candidate — a cap center, a pairwise crossing, or
     /// a pairwise balance point — is covered.
@@ -557,9 +557,9 @@ impl Location {
                 // intersection = whole sphere) gathers no candidates and would
                 // wrongly read as empty.
                 debug_assert!(!members.is_empty(), "AllOf holds ≥2 members");
-                let mut caps: Vec<SphereCap> = Vec::new();
+                let mut caps: Vec<Circle> = Vec::new();
                 self.gather_caps(&mut caps);
-                let mut candidates: Vec<SpherePoint> = caps.iter().map(SphereCap::center).collect();
+                let mut candidates: Vec<GeoPoint> = caps.iter().map(Circle::center).collect();
                 for i in 0..caps.len() {
                     for j in (i + 1)..caps.len() {
                         // A pair far enough apart never contributes a covered
@@ -594,8 +594,9 @@ impl Location {
     pub fn known_geometry_intersects(&self, viewport: &Viewport) -> bool {
         match self {
             Self::Empty | Self::Unbounded => false,
-            Self::Circle { center, radius } => SphereCap::new((*center).into(), *radius)
-                .covers_within(viewport.geodesic_distance_to(center)),
+            Self::Circle { center, radius } => {
+                Circle::new(*center, *radius).covers_within(viewport.geodesic_distance_to(center))
+            }
             Self::OneOf { members } => members
                 .as_slice()
                 .iter()

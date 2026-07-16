@@ -9,11 +9,10 @@
 //!   a wrap convention for antimeridian-crossing spans; [`IndexRect`] is its
 //!   non-wrapping half, the shape spatial-index rows store.
 //! - [`Meters`] is a meter-valued scalar — a WGS84 geodesic distance or radius.
-//! - [`SpherePoint`] / [`SphereCap`] are the compute-side primitives: a
-//!   direction and a cap (disk) about it. Distance, membership, and the cap-cap
-//!   boundary crossing are all WGS84 ([`SpherePoint::distance`] and
-//!   [`SphereCap::boundary_intersections`] route through [`geographiclib_rs`]).
-//!   They are never serialized.
+//! - [`Circle`] is the compute-side primitive: a cap (disk) about a
+//!   [`GeoPoint`] center. Distance, membership, and the circle-circle boundary
+//!   crossing all solve on WGS84 via [`geographiclib_rs`]
+//!   ([`Circle::boundary_intersections`]). It is never serialized.
 
 use std::cmp::Ordering;
 
@@ -22,7 +21,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// A nominal Earth radius in meters. Distances and membership are WGS84 (see
-/// [`SpherePoint::distance`]); this sphere is only the scaffold for the
+/// [`Circle`]); this sphere is only the scaffold for the
 /// conservative longitude half-width in [`cap_bounding_rects`], whose
 /// `asin(sin r / cos φ)` over-covers the wider-radius ellipsoid. (≈ the WGS84
 /// mean radius `(2a+b)/3`; as a scaffold its exact value is immaterial.)
@@ -107,6 +106,25 @@ impl GeoPoint {
     /// Longitude in degrees, in `[-180, 180]`.
     pub fn lon(&self) -> f64 {
         self.lon
+    }
+
+    /// The WGS84 geodesic distance to another point (Karney's inverse solution).
+    fn distance(&self, other: &GeoPoint) -> Meters {
+        Meters(Geodesic::wgs84().inverse(self.lat, self.lon, other.lat, other.lon))
+    }
+
+    /// A point minted from a WGS84 geodesic solve (`direct`/`inverse` outputs),
+    /// which geographiclib already returns in-range; the clamp absorbs last-ulp
+    /// drift so this is total without a fallible check in the solver hot paths.
+    fn from_wgs84(lat: f64, lon: f64) -> Self {
+        debug_assert!(
+            lat.is_finite() && lon.is_finite(),
+            "geodesic output must be finite"
+        );
+        Self {
+            lat: lat.clamp(-90.0, 90.0) + 0.0,
+            lon: lon.clamp(-180.0, 180.0) + 0.0,
+        }
     }
 }
 
@@ -481,11 +499,10 @@ impl IndexRect {
         if self.contains_point(p.lat(), p.lon()) {
             return Meters(0.0);
         }
-        let target: SpherePoint = (*p).into();
         let mut best = f64::INFINITY;
         let lon = self.nearest_lon(p.lon());
         for lat in [self.min_lat, self.max_lat] {
-            best = best.min(target.distance(&sphere_point_from_degrees(lat, lon)).0);
+            best = best.min(p.distance(&GeoPoint::from_wgs84(lat, lon)).0);
         }
         let a = p.lat().to_radians().sin();
         for lon in [self.min_lon, self.max_lon] {
@@ -496,7 +513,7 @@ impl IndexRect {
                 self.min_lat,
                 self.max_lat,
             ] {
-                best = best.min(target.distance(&sphere_point_from_degrees(lat, lon)).0);
+                best = best.min(p.distance(&GeoPoint::from_wgs84(lat, lon)).0);
             }
         }
         Meters(best)
@@ -513,7 +530,7 @@ pub(crate) fn cap_bounding_rects(center: &GeoPoint, radius: Meters) -> Vec<Index
     // Pad by the cap's effective radius — the distance the rim-inclusive
     // predicate accepts out to — so the rects and the predicate share one
     // rim definition.
-    let cap = SphereCap::new((*center).into(), radius);
+    let cap = Circle::new(*center, radius);
     let r_m = cap.effective_radius().0;
     // Latitude: the disk's poleward extent is reached by a meridian geodesic, so
     // bound it by the shortest WGS84 meridian degree — the equatorial one,
@@ -604,87 +621,27 @@ pub(crate) fn cap_bounding_rects(center: &GeoPoint, radius: Meters) -> Vec<Index
 pub struct Meters(pub f64);
 
 // ============================================================================
-// SpherePoint / SphereCap
+// Circle
 // ============================================================================
 
-/// A point on the unit sphere. Compute-side only — never serialized;
-/// [`GeoPoint`] is the stored form. The only constructor is `From<GeoPoint>`,
-/// so every `SpherePoint` is a genuine unit vector from a validated geo-point.
-///
-/// No `Eq`: the fields are `f64` from trigonometric arithmetic, with no
-/// NaN-free smart-constructor guarantee.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct SpherePoint {
-    x: f64,
-    y: f64,
-    z: f64,
-}
-
-impl From<GeoPoint> for SpherePoint {
-    fn from(p: GeoPoint) -> Self {
-        sphere_point_from_degrees(p.lat(), p.lon())
-    }
-}
-
-/// The unit vector of a `(lat, lon)` pair in degrees. Private: the geometry
-/// in this module derives edge points from an already-validated [`Viewport`], so
-/// routing them back through [`GeoPoint::new`] would only add an unreachable
-/// error path.
-fn sphere_point_from_degrees(lat_deg: f64, lon_deg: f64) -> SpherePoint {
-    let lat = lat_deg.to_radians();
-    let lon = lon_deg.to_radians();
-    let cos_lat = lat.cos();
-    SpherePoint {
-        x: cos_lat * lon.cos(),
-        y: cos_lat * lon.sin(),
-        z: lat.sin(),
-    }
-}
-
-impl SpherePoint {
-    /// The `(lat, lon)` degrees this direction encodes, recovered by the
-    /// inverse of [`sphere_point_from_degrees`]. A `SpherePoint` is a pure unit
-    /// direction built from a lat/lon pair, so `asin`/`atan2` recover the exact
-    /// angles it was built from. The `clamp` guards `asin`'s domain against a
-    /// last-ulp `z` past `±1`.
-    fn to_lat_lon(self) -> (f64, f64) {
-        let lat = self.z.clamp(-1.0, 1.0).asin().to_degrees();
-        let lon = self.y.atan2(self.x).to_degrees();
-        (lat, lon)
-    }
-
-    /// WGS84 geodesic distance to another point, in meters — Karney's inverse
-    /// solution, exact and total (antipodal and coincident points are handled
-    /// by the algorithm). This is the one atomic distance; cap membership and
-    /// the viewport nearest-point measure inherit the ellipsoid through it, so
-    /// every observable distance matches `PostGIS`/`SpatiaLite` `geography`.
-    /// `Geodesic::wgs84` reads the library's own cached ellipsoid, so no series
-    /// coefficients are recomputed per call.
-    pub fn distance(&self, other: &SpherePoint) -> Meters {
-        let (lat1, lon1) = self.to_lat_lon();
-        let (lat2, lon2) = other.to_lat_lon();
-        Meters(Geodesic::wgs84().inverse(lat1, lon1, lat2, lon2))
-    }
-}
-
-/// A cap: every point within a meter radius of a center direction, the WGS84
-/// disk [`crate::location::Location::Circle`] denotes. Compute-side only —
-/// never serialized.
+/// A cap: every point within a meter radius of a center point, the WGS84 disk
+/// [`crate::location::Location::Circle`] denotes. Compute-side only — never
+/// serialized.
 ///
 /// Membership is WGS84 at any radius up to a hemisphere, with no projection,
 /// frame, or seam: [`covers`](Self::covers) compares the geodesic distance to
 /// the radius within a tolerance, and
-/// [`boundary_intersections`](Self::boundary_intersections) solves the cap-cap
-/// crossing on the same ellipsoid.
+/// [`boundary_intersections`](Self::boundary_intersections) solves the
+/// circle-circle crossing on the same ellipsoid.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct SphereCap {
-    center: SpherePoint,
+pub(crate) struct Circle {
+    center: GeoPoint,
     radius: Meters,
 }
 
 /// Relative meter tolerance for cap membership and containment — absorbs the
-/// rounding of the trig that builds a [`SpherePoint`] from lat/lon, scaled by
-/// the radius so a continental cap gets proportionally more slack.
+/// rounding of the geodesic trig, scaled by the radius so a continental cap
+/// gets proportionally more slack.
 const CAP_TOL_REL: f64 = 1e-9;
 /// Absolute meter floor for the tolerance, so a zero-radius cap (a point) still
 /// admits its own center under rounding.
@@ -705,10 +662,10 @@ const CAP_TOL_ABS_M: f64 = 1e-3;
 /// sub-quarter-meridian radii the caps carry; only a rim near the quarter-
 /// meridian — well past `MAX_UNCERTAINTY_RADIUS` — could fold and hide a second
 /// root.
-fn circle_crossings(c1: SpherePoint, r1: Meters, c2: SpherePoint, r2: Meters) -> Vec<SpherePoint> {
+fn circle_crossings(c1: GeoPoint, r1: Meters, c2: GeoPoint, r2: Meters) -> Vec<GeoPoint> {
     let geod = Geodesic::wgs84();
-    let (lat1, lon1) = c1.to_lat_lon();
-    let (lat2, lon2) = c2.to_lat_lon();
+    let (lat1, lon1) = (c1.lat(), c1.lon());
+    let (lat2, lon2) = (c2.lat(), c2.lon());
     let (d, azi12, _, _): (f64, f64, f64, f64) = geod.inverse(lat1, lon1, lat2, lon2);
     if d > r1.0 + r2.0 || d < (r1.0 - r2.0).abs() || d < 1e-9 {
         return Vec::new();
@@ -722,7 +679,7 @@ fn circle_crossings(c1: SpherePoint, r1: Meters, c2: SpherePoint, r2: Meters) ->
     };
     // Bisect the one root on `[lo, hi]`: `g(0) ≤ 0` and `g(±180) ≥ 0`, so the
     // invariant `g(lo) ≤ 0 < g(hi)` holds and 60 halvings pin the crossing.
-    let solve = |mut lo: f64, mut hi: f64| -> SpherePoint {
+    let solve = |mut lo: f64, mut hi: f64| -> GeoPoint {
         for _ in 0..60 {
             let mid = (lo + hi) * 0.5;
             if g(mid) <= 0.0 {
@@ -732,19 +689,19 @@ fn circle_crossings(c1: SpherePoint, r1: Meters, c2: SpherePoint, r2: Meters) ->
             }
         }
         let (plat, plon): (f64, f64) = geod.direct(lat1, lon1, azi12 + (lo + hi) * 0.5, r1.0);
-        sphere_point_from_degrees(plat, plon)
+        GeoPoint::from_wgs84(plat, plon)
     };
     vec![solve(0.0, 180.0), solve(0.0, -180.0)]
 }
 
-impl SphereCap {
-    /// A cap of the given meter radius about a center direction.
-    pub fn new(center: SpherePoint, radius: Meters) -> Self {
+impl Circle {
+    /// A cap of the given meter radius about a center point.
+    pub fn new(center: GeoPoint, radius: Meters) -> Self {
         Self { center, radius }
     }
 
-    /// The cap's center direction — a candidate point for an emptiness witness.
-    pub fn center(&self) -> SpherePoint {
+    /// The cap's center — a candidate point for an emptiness witness.
+    pub fn center(&self) -> GeoPoint {
         self.center
     }
 
@@ -757,7 +714,7 @@ impl SphereCap {
     /// Plain rim-inclusive membership: the geodesic distance from the center to
     /// `p` is within the cap's [`effective_radius`](Self::effective_radius) —
     /// the stored radius plus the tolerance.
-    pub(crate) fn covers(&self, p: &SpherePoint) -> bool {
+    pub(crate) fn covers(&self, p: &GeoPoint) -> bool {
         self.covers_within(self.center.distance(p))
     }
 
@@ -779,7 +736,7 @@ impl SphereCap {
 
     /// Whether this cap contains `other` entirely: the centers' separation plus
     /// `other`'s radius fits within this radius, up to the tolerance.
-    pub fn contains(&self, other: &SphereCap) -> bool {
+    pub fn contains(&self, other: &Circle) -> bool {
         let between = self.center.distance(&other.center).0;
         between + other.radius.0 <= self.radius.0 + self.tol().0
     }
@@ -788,7 +745,7 @@ impl SphereCap {
     /// nested, or concentric centers), or two — coincident at exact tangency.
     /// The two crossings are the corners of the lens-shaped overlap of the two
     /// caps. Delegates to [`circle_crossings`], the numeric ellipsoidal solve.
-    pub fn boundary_intersections(&self, other: &SphereCap) -> Vec<SpherePoint> {
+    pub fn boundary_intersections(&self, other: &Circle) -> Vec<GeoPoint> {
         circle_crossings(self.center, self.radius, other.center, other.radius)
     }
 
@@ -800,17 +757,17 @@ impl SphereCap {
     /// [`boundary_intersections`](Self::boundary_intersections) returns nothing
     /// for. `None` for coincident centers, where the shared center already
     /// witnesses any overlap.
-    pub fn balance_point(&self, other: &SphereCap) -> Option<SpherePoint> {
+    pub fn balance_point(&self, other: &Circle) -> Option<GeoPoint> {
         let geod = Geodesic::wgs84();
-        let (lat1, lon1) = self.center.to_lat_lon();
-        let (lat2, lon2) = other.center.to_lat_lon();
+        let (lat1, lon1) = (self.center.lat(), self.center.lon());
+        let (lat2, lon2) = (other.center.lat(), other.center.lon());
         let (d, azi12, _, _): (f64, f64, f64, f64) = geod.inverse(lat1, lon1, lat2, lon2);
         if d < 1e-9 {
             return None;
         }
         let t = ((d + self.radius.0 - other.radius.0) * 0.5).clamp(0.0, d);
         let (plat, plon): (f64, f64) = geod.direct(lat1, lon1, azi12, t);
-        Some(sphere_point_from_degrees(plat, plon))
+        Some(GeoPoint::from_wgs84(plat, plon))
     }
 }
 
@@ -993,21 +950,18 @@ mod tests {
         Ok(())
     }
 
-    // --- SpherePoint / SphereCap tests ---
+    // --- Circle tests ---
     //
     // These exercise the regimes a `Location` proptest can't reach: the
     // `MAX_UNCERTAINTY_RADIUS` cap bounds radii through `Location::circle`, but
-    // `SphereCap::new` is uncapped, so continental and near-hemisphere caps,
+    // `Circle::new` is uncapped, so continental and near-hemisphere caps,
     // high latitude, and antimeridian straddles all live here. Each would be
     // wrong under a planar projection — the seam wrap, the `cos(lat)` collapse,
     // and the flat-distance error at large radius are exactly what the geodesic
     // model removes.
 
-    fn cap(lat: f64, lon: f64, radius_m: f64) -> Result<SphereCap, GeoPointError> {
-        Ok(SphereCap::new(
-            GeoPoint::new(lat, lon)?.into(),
-            Meters(radius_m),
-        ))
+    fn cap(lat: f64, lon: f64, radius_m: f64) -> Result<Circle, GeoPointError> {
+        Ok(Circle::new(GeoPoint::new(lat, lon)?, Meters(radius_m)))
     }
 
     #[test]
@@ -1015,8 +969,8 @@ mod tests {
         // One degree of latitude along the equatorial meridian is ~110.57 km on
         // WGS84 — the ellipsoid's shortest meridian degree, notably under the
         // sphere's uniform 111.19 km.
-        let a: SpherePoint = GeoPoint::new(0.0, 0.0)?.into();
-        let b: SpherePoint = GeoPoint::new(1.0, 0.0)?.into();
+        let a = GeoPoint::new(0.0, 0.0)?;
+        let b = GeoPoint::new(1.0, 0.0)?;
         let d = a.distance(&b).0;
         assert!((d - 110_574.4).abs() < 1.0, "got {d}");
         Ok(())
@@ -1026,8 +980,8 @@ mod tests {
     fn distance_antipodal_is_half_circumference_no_nan() -> TestResult {
         // Karney's inverse solution must stay total at the near-antipodal
         // degenerate — the regime where naive great-circle code returns NaN.
-        let a: SpherePoint = GeoPoint::new(0.0, 0.0)?.into();
-        let b: SpherePoint = GeoPoint::new(0.0, 180.0)?.into();
+        let a = GeoPoint::new(0.0, 0.0)?;
+        let b = GeoPoint::new(0.0, 180.0)?;
         let d = a.distance(&b).0;
         assert!(d.is_finite(), "antipodal distance must be finite");
         // Equatorial antipodes connect over the pole on an oblate ellipsoid, so
@@ -1039,7 +993,7 @@ mod tests {
 
     #[test]
     fn distance_coincident_is_zero() -> TestResult {
-        let a: SpherePoint = GeoPoint::new(12.3, 45.6)?.into();
+        let a = GeoPoint::new(12.3, 45.6)?;
         assert!(a.distance(&a).0.abs() < 1e-6);
         Ok(())
     }
@@ -1050,7 +1004,7 @@ mod tests {
         // point just east of it — the two are physically ~22 km apart. A planar
         // `lon − lon0` projection would place them ~40000 km apart and miss.
         let c = cap(0.0, 179.9, 50_000.0)?;
-        let east: SpherePoint = GeoPoint::new(0.0, -179.9)?.into();
+        let east = GeoPoint::new(0.0, -179.9)?;
         assert!(c.covers(&east), "across-seam point must be inside");
         Ok(())
     }
@@ -1062,7 +1016,7 @@ mod tests {
         // collapses to ~0 here, squashing all longitudes together; the sphere
         // keeps them honestly close, so a small cap covers across the pole.
         let c = cap(89.99, 0.0, 5_000.0)?;
-        let across: SpherePoint = GeoPoint::new(89.99, 180.0)?.into();
+        let across = GeoPoint::new(89.99, 180.0)?;
         assert!(c.covers(&across), "across-pole point must be inside");
         Ok(())
     }
@@ -1074,8 +1028,8 @@ mod tests {
         // this radius a flat metric is meaningless; the great-circle test is
         // exact.
         let c = cap(0.0, 0.0, 9_000_000.0)?;
-        let near_edge: SpherePoint = GeoPoint::new(0.0, 80.0)?.into();
-        let past_rim: SpherePoint = GeoPoint::new(0.0, 100.0)?.into();
+        let near_edge = GeoPoint::new(0.0, 80.0)?;
+        let past_rim = GeoPoint::new(0.0, 100.0)?;
         assert!(c.covers(&near_edge), "point inside the ~81° rim must be in");
         assert!(!c.covers(&past_rim), "point past the rim must be out");
         Ok(())
@@ -1088,7 +1042,7 @@ mod tests {
         // measures — inclusive under the tolerance.
         let c = cap(40.0, -74.0, 100_000.0)?;
         let (lat, lon): (f64, f64) = Geodesic::wgs84().direct(40.0, -74.0, 0.0, 100_000.0);
-        let rim: SpherePoint = GeoPoint::new(lat, lon)?.into();
+        let rim = GeoPoint::new(lat, lon)?;
         assert!(c.covers(&rim), "rim point must count as inside");
         Ok(())
     }
@@ -1172,12 +1126,12 @@ mod tests {
         // float noise of the distance solve so a crossing reliably exists, yet
         // small enough that the two crossings collapse toward the single tangent
         // locus — within centimeters on these ~80 km rims.
-        let center_a: SpherePoint = GeoPoint::new(40.0, -74.0)?.into();
-        let center_b: SpherePoint = GeoPoint::new(41.5, -74.0)?.into();
+        let center_a = GeoPoint::new(40.0, -74.0)?;
+        let center_b = GeoPoint::new(41.5, -74.0)?;
         let d = center_a.distance(&center_b).0;
         let r_a = 80_000.0;
-        let a = SphereCap::new(center_a, Meters(r_a));
-        let b = SphereCap::new(center_b, Meters(d - r_a + 1e-9));
+        let a = Circle::new(center_a, Meters(r_a));
+        let b = Circle::new(center_b, Meters(d - r_a + 1e-9));
         let pts = a.boundary_intersections(&b);
         assert_eq!(pts.len(), 2, "near-tangent caps meet");
         assert!(
@@ -1244,9 +1198,9 @@ mod tests {
         // corner itself.
         let b = sample_box()?;
         let p = GeoPoint::new(42.0, -72.0)?;
-        let corner: SpherePoint = GeoPoint::new(41.0, -73.0)?.into();
+        let corner = GeoPoint::new(41.0, -73.0)?;
         let d = b.geodesic_distance_to(&p).0;
-        let direct = SpherePoint::from(p).distance(&corner).0;
+        let direct = p.distance(&corner).0;
         assert!((d - direct).abs() < 1.0, "got {d}, corner at {direct}");
         Ok(())
     }
@@ -1288,13 +1242,12 @@ mod tests {
         // `[-90, 90]` and an endpoint must win.
         let b = Viewport::new(GeoPoint::new(0.0, 0.0)?, GeoPoint::new(1.0, 10.0)?)?;
         let p = GeoPoint::new(0.0, 120.0)?;
-        let ne_corner: SpherePoint = GeoPoint::new(1.0, 10.0)?.into();
-        let equatorial: SpherePoint = GeoPoint::new(0.0, 10.0)?.into();
+        let ne_corner = GeoPoint::new(1.0, 10.0)?;
+        let equatorial = GeoPoint::new(0.0, 10.0)?;
         let d = b.geodesic_distance_to(&p).0;
-        let sp = SpherePoint::from(p);
-        let direct = sp.distance(&ne_corner).0;
+        let direct = p.distance(&ne_corner).0;
         assert!(
-            direct < sp.distance(&equatorial).0,
+            direct < p.distance(&equatorial).0,
             "past 90° the higher corner is closer"
         );
         assert!((d - direct).abs() < 1.0, "got {d}, corner at {direct}");
