@@ -22,7 +22,9 @@ use std::env;
 
 use dropshot::ApiDescription;
 use indexmap::IndexMap;
-use openapiv3::{Discriminator, OpenAPI, ReferenceOr, Schema, SchemaKind, StringType, Type};
+use openapiv3::{
+    Discriminator, OpenAPI, ReferenceOr, Schema, SchemaKind, Server, StringType, Type,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut api = ApiDescription::new();
@@ -32,6 +34,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         api.openapi("Chronoscope API", semver::Version::new(0, 1, 0))
             .json()?,
     )?;
+
+    // The front door mounts the API under `/api` and strips the prefix; routes
+    // are defined at root. Declaring the server base keeps the spec's public
+    // URLs honest without baking `/api` into every route.
+    spec.servers = vec![Server {
+        url: "/api".to_string(),
+        ..Default::default()
+    }];
 
     if let Some(components) = &mut spec.components {
         components.schemas = std::mem::take(&mut components.schemas)

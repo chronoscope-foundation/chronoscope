@@ -9,8 +9,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use base64::prelude::*;
-use dropshot::{Body, HttpError, Query, RequestContext, endpoint};
-use http::Response;
+use dropshot::{HttpError, HttpResponseHeaders, HttpResponseOk, Query, RequestContext, endpoint};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -30,7 +29,9 @@ use chronoscope_core::typed;
 use crate::cdn;
 use crate::entity_types;
 use crate::limits;
-use crate::state::{AppState, ServerEntityId, ServerFactStore, ServerIds, ServerImageId};
+use crate::state::{
+    AppState, ServerEntityId, ServerEventId, ServerFactStore, ServerIds, ServerImageId,
+};
 use crate::validation::fact_store_err;
 
 /// The `Accept-Language` header value, when present and valid UTF-8. Read off
@@ -43,39 +44,21 @@ fn accept_language(ctx: &RequestContext<Arc<AppState>>) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
-/// Serialize `value` to a `200 OK` JSON response. The read endpoints still hand
-/// back `Response<Body>` (typed responses land later); this is the plain body
-/// builder they share.
-fn json_response<T: serde::Serialize>(value: &T) -> Result<Response<Body>, HttpError> {
-    json_response_with_headers(value, &[])
-}
-
-/// Like [`json_response`], plus `Vary: Accept-Language` — for the two endpoints
-/// whose body is content-negotiated on the request's `Accept-Language`, so a
-/// shared cache keys the negotiated form by language.
-fn json_response_vary_language<T: serde::Serialize>(
-    value: &T,
-) -> Result<Response<Body>, HttpError> {
-    json_response_with_headers(value, &[(http::header::VARY, "Accept-Language")])
-}
-
-/// Shared body of the JSON responses: serialize `value`, set the content type,
-/// and append each `(name, value)` in `extra_headers`.
-fn json_response_with_headers<T: serde::Serialize>(
-    value: &T,
-    extra_headers: &[(http::HeaderName, &str)],
-) -> Result<Response<Body>, HttpError> {
-    let body_bytes = serde_json::to_vec(value)
-        .map_err(|e| HttpError::for_internal_error(format!("Failed to serialize response: {e}")))?;
-    let mut builder = Response::builder()
-        .status(http::StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json");
-    for (name, value) in extra_headers {
-        builder = builder.header(name, *value);
-    }
-    builder
-        .body(body_bytes.into())
-        .map_err(|e| HttpError::for_internal_error(format!("Failed to build response: {e}")))
+/// Tag a `200 OK` body with `Vary: Accept-Language`. Both content-negotiated
+/// read endpoints (`get_entity`, `list_markers`) pick their display name from
+/// the request's `Accept-Language`, so a shared cache must key each negotiated
+/// form by that header. The body schema is carried through `T`; the header
+/// stays out of the schema.
+fn vary_language<T>(body: HttpResponseOk<T>) -> HttpResponseHeaders<HttpResponseOk<T>>
+where
+    T: JsonSchema + serde::Serialize + Send + Sync + 'static,
+{
+    let mut response = HttpResponseHeaders::new_unnamed(body);
+    response.headers_mut().insert(
+        http::header::VARY,
+        http::HeaderValue::from_static("Accept-Language"),
+    );
+    response
 }
 
 /// The server-internal resume cursor: the fact-store snapshot the listing was
@@ -328,7 +311,7 @@ pub struct EntitiesQueryParams {
 pub async fn list_entities(
     ctx: RequestContext<Arc<AppState>>,
     query: Query<EntitiesQueryParams>,
-) -> Result<Response<Body>, HttpError> {
+) -> Result<HttpResponseOk<EntityListPage<ServerEntityId, ServerImageId>>, HttpError> {
     let state = ctx.context();
     let params = query.into_inner();
 
@@ -376,7 +359,7 @@ pub async fn list_entities(
         next,
         snapshot,
     };
-    json_response(&response)
+    Ok(HttpResponseOk(response))
 }
 
 /// Query parameters for the entity detail endpoint.
@@ -403,7 +386,10 @@ pub async fn get_entity(
     ctx: RequestContext<Arc<AppState>>,
     path: dropshot::Path<EntityIdPath>,
     query: Query<GetEntityQueryParams>,
-) -> Result<Response<Body>, HttpError> {
+) -> Result<
+    HttpResponseHeaders<HttpResponseOk<EntityDetail<ServerEntityId, ServerEventId, ServerImageId>>>,
+    HttpError,
+> {
     let state = ctx.context();
     let id = path.into_inner().id;
     let params = query.into_inner();
@@ -444,7 +430,7 @@ pub async fn get_entity(
         conflicts,
         snapshot: encode_snapshot(snapshot)?,
     };
-    json_response_vary_language(&detail)
+    Ok(vary_language(HttpResponseOk(detail)))
 }
 
 /// Query parameters for the entity images sub-resource.
@@ -488,7 +474,7 @@ pub async fn get_entity_images(
     ctx: RequestContext<Arc<AppState>>,
     path: dropshot::Path<EntityIdPath>,
     query: Query<EntityImagesQueryParams>,
-) -> Result<Response<Body>, HttpError> {
+) -> Result<HttpResponseOk<EntityImagesPage<ServerImageId>>, HttpError> {
     let state = ctx.context();
     let id = path.into_inner().id;
     let params = query.into_inner();
@@ -572,7 +558,7 @@ pub async fn get_entity_images(
         next,
         snapshot: encode_snapshot(snapshot)?,
     };
-    json_response(&response)
+    Ok(HttpResponseOk(response))
 }
 
 // ==================== Unified Markers ====================
@@ -606,7 +592,7 @@ pub struct MarkersQueryParams {
 pub async fn list_markers(
     ctx: RequestContext<Arc<AppState>>,
     query: Query<MarkersQueryParams>,
-) -> Result<Response<Body>, HttpError> {
+) -> Result<HttpResponseHeaders<HttpResponseOk<MarkersResponse<ServerEntityId>>>, HttpError> {
     let state = ctx.context();
     let params = query.into_inner();
 
@@ -658,7 +644,7 @@ pub async fn list_markers(
         truncated,
         snapshot: encode_snapshot(snapshot)?,
     };
-    json_response_vary_language(&response)
+    Ok(vary_language(HttpResponseOk(response)))
 }
 
 #[cfg(test)]

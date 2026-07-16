@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chronoscope_core::store::{EntityIdOf, FactStore, ImageIdOf};
+use chronoscope_core::store::{EntityIdOf, EventIdOf, FactStore, ImageIdOf};
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::MediaStore;
 use chronoscope_db::{Database, SqliteFactStore};
@@ -33,6 +33,10 @@ pub type ServerIds = <ServerFactStore as FactStore>::Ids;
 /// The picked backend's entity id: URL path params and listing cursors carry
 /// it. Its wire form is an opaque decimal string for every backend.
 pub type ServerEntityId = EntityIdOf<ServerFactStore>;
+
+/// The picked backend's lifetime-event id: the value slot the typed entity
+/// projection and its conflict reports are keyed by.
+pub type ServerEventId = EventIdOf<ServerFactStore>;
 
 /// The picked backend's image id: the resolved-media map's key and the
 /// images-cursor payload.
