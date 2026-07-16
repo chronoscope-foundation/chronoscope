@@ -792,6 +792,7 @@ dependencies = [
  "chrono",
  "chronoscope-macros",
  "futures-util",
+ "geographiclib-rs",
  "hex",
  "oxilangtag",
  "proptest",

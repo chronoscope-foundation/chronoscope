@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::external_ids::{OhmId, OsmElementType, OsmId};
 use crate::geo::{
     GeoPoint, GeoPointError, IndexRect, Meters, SphereCap, SpherePoint, Viewport,
-    cap_bounding_rects,
+    WGS84_SPHERE_REL_GAP, cap_bounding_rects,
 };
 
 /// Sanity bound on a circle's uncertainty radius: a circle wider than this
@@ -463,17 +463,33 @@ impl Location {
     /// membership, a `OneOf` holds if any child does, an `AllOf` if every child
     /// does, `Empty` never, `Unbounded` always.
     fn covers_point(&self, pt: &SpherePoint) -> bool {
+        self.covers_point_inflated(pt, 0.0)
+    }
+
+    /// [`covers_point`](Self::covers_point) with every `Circle` grown by `rel`
+    /// of its radius (shrunk for `rel < 0`). `denotes_empty` passes
+    /// [`WGS84_SPHERE_REL_GAP`] so a spherically-derived candidate the ellipsoid
+    /// nudges a fraction past a rim still counts as inside.
+    fn covers_point_inflated(&self, pt: &SpherePoint, rel: f64) -> bool {
         match self {
             Self::Empty => false,
             Self::Unbounded => true,
-            Self::Circle { center, radius } => SphereCap::new((*center).into(), *radius).covers(pt),
-            Self::OneOf { members } => members.as_slice().iter().any(|m| m.covers_point(pt)),
+            Self::Circle { center, radius } => {
+                SphereCap::new((*center).into(), *radius).covers_inflated(pt, rel)
+            }
+            Self::OneOf { members } => members
+                .as_slice()
+                .iter()
+                .any(|m| m.covers_point_inflated(pt, rel)),
             Self::AllOf { members } => {
                 // Constructors enforce ≥2 members; an empty `AllOf` (the empty
                 // intersection = whole sphere) would wrongly read as covered via
                 // `all()` over no members.
                 debug_assert!(!members.is_empty(), "AllOf holds ≥2 members");
-                members.as_slice().iter().all(|m| m.covers_point(pt))
+                members
+                    .as_slice()
+                    .iter()
+                    .all(|m| m.covers_point_inflated(pt, rel))
             }
         }
     }
@@ -538,8 +554,16 @@ impl Location {
     /// the `A∩C` crossing in `(A∪B)∩(C∪D)`: the node's subtree gathers `A` and
     /// `C` both.
     ///
-    /// The geometry is exact on the unit sphere — seam- and pole-free, with no
-    /// projection and no radius-scale assumption.
+    /// Model. The boundary solve runs on the sphere (no ellipsoidal closed
+    /// form), but membership is the WGS84 [`covers`](Self::covers). Two
+    /// inflations bridge the two models: the caps fed to the boundary solve are
+    /// grown by [`WGS84_SPHERE_REL_GAP`], so any WGS84-feasible overlap still
+    /// yields a crossing candidate, and coverage is tested at the compounded gap
+    /// a grown-rim crossing carries. A WGS84 disk sits inside its gap-grown
+    /// sphere disk, so this makes the routine a sound over-approximation:
+    /// `denotes_empty` never reports empty for a feasible WGS84 intersection. It
+    /// may keep an intersection that misses by less than the gap — the safe
+    /// direction for a submit-time feasibility check.
     pub fn denotes_empty(&self) -> bool {
         match self {
             Self::Empty => true,
@@ -552,13 +576,23 @@ impl Location {
                 debug_assert!(!members.is_empty(), "AllOf holds ≥2 members");
                 let mut caps: Vec<SphereCap> = Vec::new();
                 self.gather_caps(&mut caps);
+                // Grow the caps by the gap so a crossing survives whenever the
+                // WGS84 disks could overlap; a grown crossing lands on the
+                // (1+gap) rim, so coverage must reach out to (1+gap)².
+                let grown: Vec<SphereCap> = caps
+                    .iter()
+                    .map(|c| c.inflated(WGS84_SPHERE_REL_GAP))
+                    .collect();
+                let coverage_rel = (1.0 + WGS84_SPHERE_REL_GAP).powi(2) - 1.0;
                 let mut candidates: Vec<SpherePoint> = caps.iter().map(SphereCap::center).collect();
-                for i in 0..caps.len() {
-                    for j in (i + 1)..caps.len() {
-                        candidates.extend(caps[i].boundary_intersections(&caps[j]));
+                for i in 0..grown.len() {
+                    for j in (i + 1)..grown.len() {
+                        candidates.extend(grown[i].boundary_intersections(&grown[j]));
                     }
                 }
-                !candidates.iter().any(|pt| self.covers_point(pt))
+                !candidates
+                    .iter()
+                    .any(|pt| self.covers_point_inflated(pt, coverage_rel))
             }
         }
     }
@@ -1775,7 +1809,7 @@ mod tests {
     // denoting the same region. `denotes_same` decides equivalence by sampling
     // `covers` over a point set drawn from both expressions.
 
-    use crate::geo::EARTH_RADIUS_M;
+    use geographiclib_rs::{DirectGeodesic, Geodesic};
 
     /// Every `(center, radius)` circle reachable in `loc`, gathered through the
     /// production [`Location::for_each_circle`] walk so the sampling oracle can't
@@ -1786,32 +1820,23 @@ mod tests {
         loc.for_each_circle(&mut |center, radius| out.push((*center, radius.0)));
     }
 
-    /// The point reached by walking `angle` radians along the great circle from
-    /// `center` on `bearing` (radians, clockwise from north) — the standard
-    /// spherical direct solution, total and free of seam/pole bias. Sampling by
-    /// geodesic offset (not a lat/lon box) keeps the point cloud even at every
-    /// latitude, where a `cos(lat)` longitude span would compress to a sliver
-    /// near the poles.
-    fn offset_point(center: &GeoPoint, angle: f64, bearing: f64) -> Option<GeoPoint> {
-        let lat1 = center.lat().to_radians();
-        let lon1 = center.lon().to_radians();
-        let lat2 = (lat1.sin() * angle.cos() + lat1.cos() * angle.sin() * bearing.cos())
-            .clamp(-1.0, 1.0)
-            .asin();
-        let lon2 = lon1
-            + (bearing.sin() * angle.sin() * lat1.cos())
-                .atan2(angle.cos() - lat1.sin() * lat2.sin());
-        // Wrap longitude back into [-180, 180]; latitude is already in range.
-        let mut lon_deg = lon2.to_degrees();
-        lon_deg = (lon_deg + 540.0).rem_euclid(360.0) - 180.0;
-        GeoPoint::new(lat2.to_degrees(), lon_deg).ok()
+    /// The point reached by walking `distance` meters along the WGS84 geodesic
+    /// from `center` on `bearing` (degrees, clockwise from north) — Karney's
+    /// direct solution, on the same ellipsoid the `covers` predicate measures,
+    /// so a rim sample lands on the ellipsoidal rim. Sampling by geodesic offset
+    /// (not a lat/lon box) keeps the point cloud even at every latitude, where a
+    /// `cos(lat)` longitude span would compress to a sliver near the poles.
+    fn offset_point(center: &GeoPoint, distance_m: f64, bearing_deg: f64) -> Option<GeoPoint> {
+        let (lat, lon): (f64, f64) =
+            Geodesic::wgs84().direct(center.lat(), center.lon(), bearing_deg, distance_m);
+        GeoPoint::new(lat, lon).ok()
     }
 
     /// A geodesic point cloud around each circle: its center plus a fan of
-    /// offsets at a ring of bearings and radial steps reaching just past the
-    /// rim. The angular reach is `radius / EARTH_RADIUS` scaled by `SPAN`, so the
-    /// samples straddle the rim at any latitude.
-    fn sphere_samples(
+    /// offsets at a ring of bearings and radial steps reaching `span`× the rim.
+    /// Distances are WGS84 meters, so the samples straddle the ellipsoidal rim
+    /// at any latitude.
+    fn geodesic_samples(
         circles: &[(GeoPoint, f64)],
         span: f64,
         rings: usize,
@@ -1820,12 +1845,12 @@ mod tests {
         let mut points: Vec<GeoPoint> = Vec::new();
         for (center, r) in circles {
             points.push(*center);
-            let max_angle = (r / EARTH_RADIUS_M * span).max(1e-9);
+            let max_dist = (r * span).max(1e-6);
             for ring in 1..=rings {
-                let angle = max_angle * ring as f64 / rings as f64;
+                let dist = max_dist * ring as f64 / rings as f64;
                 for spoke in 0..spokes {
-                    let bearing = std::f64::consts::TAU * spoke as f64 / spokes as f64;
-                    if let Some(p) = offset_point(center, angle, bearing) {
+                    let bearing = 360.0 * spoke as f64 / spokes as f64;
+                    if let Some(p) = offset_point(center, dist, bearing) {
                         points.push(p);
                     }
                 }
@@ -1857,7 +1882,7 @@ mod tests {
 
         // 1.5× the radius reaches just past each rim, so points land on both
         // sides of it.
-        let points = sphere_samples(&circles, 1.5, 8, 12);
+        let points = geodesic_samples(&circles, 1.5, 8, 12);
         points.iter().all(|p| a.covers(p) == b.covers(p))
     }
 
@@ -2015,7 +2040,7 @@ mod tests {
 
     // --- denotes_empty: geometric emptiness ---
 
-    /// A dense sampling oracle for emptiness, evaluated with the spherical
+    /// A dense sampling oracle for emptiness, evaluated with the WGS84
     /// [`Location::covers`] — the actual denotation, independent of
     /// `denotes_empty`'s candidate routine. The feasible region, if any, sits
     /// inside some cap, so fan a geodesic point cloud over each cap's own
@@ -2036,28 +2061,22 @@ mod tests {
         }
         // Reach to the rim (span 1.0) with a dense ring/spoke fan; the witness,
         // if any, lies within a cap, so its own neighborhood is enough.
-        sphere_samples(&circles, 1.0, grid_steps, grid_steps)
+        geodesic_samples(&circles, 1.0, grid_steps, grid_steps)
             .iter()
             .all(|p| !loc.covers(p))
     }
 
     proptest! {
         /// The candidate-point routine agrees with a dense geodesic point cloud
-        /// over the same region. The witness lemma makes the agreement exact: a
-        /// non-empty region has a witness among the candidates, so any
-        /// disagreement is a real bug, not a sampling artifact. (Sampling can
-        /// only *miss* a sliver and call a non-empty region empty; it never
-        /// invents coverage. So the one-sided risk is the routine reporting empty
-        /// while sampling finds a point — caught here.)
+        /// over the same region. `denotes_empty` is a sound over-approximation, so
+        /// any grid-covered point (the region is non-empty) forbids a routine
+        /// "empty"; the grid can only false-negative a sliver, so that opposite
+        /// disagreement is the sole failure direction.
         #[test]
         fn prop_denotes_empty_matches_dense_grid(loc in arb_location()) {
-            let routine = loc.denotes_empty();
-            let grid = samples_empty(&loc, 200);
-            // The grid can false-negative on a tiny feasible sliver the routine
-            // catches exactly; treat only the opposite disagreement as a failure.
-            if !grid {
+            if !samples_empty(&loc, 200) {
                 prop_assert!(
-                    !routine,
+                    !loc.denotes_empty(),
                     "grid found a covered point but routine reported empty: {loc:?}"
                 );
             }
@@ -2097,6 +2116,35 @@ mod tests {
         let b = Location::circle(gp(40.005, -74.0)?, Meters(5000.0))?;
         let meet = Location::all_of(vec![a, b])?;
         assert!(!meet.denotes_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sphere_disjoint_but_wgs84_overlapping_pair_is_non_empty() -> TestResult {
+        // Two 100 km circles due N-S near the equator, WGS84-separated by 199.4 km
+        // (< 200 km, so they overlap on the ellipsoid) but sphere-separated by
+        // ~200.5 km (> 200 km, so the spherical boundary solve finds no crossing).
+        // The gap-grown scaffold must still witness the overlap; without it the
+        // routine would report this feasible region empty.
+        let a = gp(0.0, 0.0)?;
+        let (lat_b, lon_b): (f64, f64) = Geodesic::wgs84().direct(0.0, 0.0, 0.0, 199_400.0);
+        let b = gp(lat_b, lon_b)?;
+        let meet = Location::all_of(vec![
+            Location::circle(a, Meters(100_000.0))?,
+            Location::circle(b, Meters(100_000.0))?,
+        ])?;
+        // The geodesic midpoint sits 99.7 km from each center — a real interior
+        // witness, so the region is genuinely non-empty.
+        let (mid_lat, mid_lon): (f64, f64) =
+            Geodesic::wgs84().direct(0.0, 0.0, 0.0, 199_400.0 / 2.0);
+        assert!(
+            meet.covers(&gp(mid_lat, mid_lon)?),
+            "midpoint lies in both disks"
+        );
+        assert!(
+            !meet.denotes_empty(),
+            "sphere-disjoint but WGS84-overlapping AllOf must not read empty"
+        );
         Ok(())
     }
 
@@ -2315,10 +2363,12 @@ mod tests {
     }
 
     proptest! {
-        /// `denotes_empty` agrees with the dense spherical sampler on `AllOf` and
-        /// mixed `OneOf`/`AllOf` expressions over genuinely-overlapping clustered
-        /// circles. The sampler can only false-negative a sliver, so the only
-        /// real disagreement — routine empty, grid covered — is the failure.
+        /// `denotes_empty` agrees with the dense grid on `AllOf` and mixed
+        /// `OneOf`/`AllOf` expressions over genuinely-overlapping clustered
+        /// circles — the 3+-cap witness path, in the near-equatorial regime where
+        /// the sphere↔WGS84 gap peaks. A grid-covered point forbids a routine
+        /// "empty"; the sound over-approximation makes that hold at every overlap
+        /// depth, marginal ones included.
         #[test]
         fn prop_denotes_empty_overlapping_cluster(
             circles in prop::collection::vec(arb_clustered_circle(), 3..=5),
@@ -2336,11 +2386,9 @@ mod tests {
             let mixed =
                 resolved::one_of_from_members(resolved::canonical_one_of(vec![head, mixed_inner]));
             for loc in [all_of, mixed] {
-                let routine = loc.denotes_empty();
-                let grid = samples_empty(&loc, 200);
-                if !grid {
+                if !samples_empty(&loc, 200) {
                     prop_assert!(
-                        !routine,
+                        !loc.denotes_empty(),
                         "grid found a covered point but routine reported empty: {loc:?}"
                     );
                 }
@@ -2619,17 +2667,14 @@ mod tests {
     #[test]
     fn bounding_rects_cover_every_predicate_hit() -> TestResult {
         // Rim boundary: a cap whose rim stops 0.4 mm short of the first
-        // viewport's east edge — inside the rim tolerance's 1 mm floor, so
-        // the predicate accepts it and the rects must reach it too. The
-        // center longitude comes from inverting the meridian-edge distance
-        // `asin(cos φ · sin Δλ)·R` for the target standoff.
+        // viewport's east edge — inside the rim tolerance's 1 mm floor, so the
+        // predicate accepts it and the rects must reach it too. The radius comes
+        // from the production WGS84 viewport distance to a fixed east-of-box
+        // center, so the 0.4 mm margin is exact on the ellipsoid.
         let rim_circle = {
-            let radius = 20_000.0;
-            let standoff = radius + 0.4e-3;
-            let dlon = ((standoff / EARTH_RADIUS_M).sin() / 40.5_f64.to_radians().cos())
-                .asin()
-                .to_degrees();
-            Location::circle(gp(40.5, -73.0 + dlon)?, Meters(radius))?
+            let center = gp(40.5, -72.8)?;
+            let standoff = viewport()?.geodesic_distance_to(&center).0;
+            Location::circle(center, Meters(standoff - 0.4e-3))?
         };
         let locations = vec![
             rim_circle,
@@ -2711,5 +2756,44 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    proptest! {
+        /// Every point on a circle's WGS84 rim lies inside one of its bounding
+        /// rects — the superset guarantee the spatial index rides on, checked
+        /// directly on the ellipsoid across latitudes and radii up to the cap.
+        /// This is the empirical guard on `cap_bounding_rects`' conservatism: the
+        /// latitude pad uses the shortest WGS84 meridian degree and the longitude
+        /// pad keeps the sphere's (wider-covering) extremal formula, and a rim
+        /// point escaping every rect would be a real hit the index could drop.
+        /// A full ring of bearings per case reaches the extreme-longitude point,
+        /// where any longitude under-coverage would first surface.
+        #[test]
+        fn prop_cap_bounding_rects_cover_wgs84_rim(
+            lat in -89.9f64..=89.9,
+            lon in -180.0f64..=180.0,
+            radius in 1.0f64..=MAX_UNCERTAINTY_RADIUS.0,
+        ) {
+            let Ok(center) = GeoPoint::new(lat, lon) else {
+                return Ok(());
+            };
+            let rects = cap_bounding_rects(&center, Meters(radius));
+            // A full 1° ring so the extreme-longitude bearing (a stationary point
+            // near due-east/west, where any under-coverage surfaces) is bracketed
+            // tightly rather than skipped between coarse samples.
+            for bearing in 0..360 {
+                let bearing = bearing as f64;
+                let (rlat, rlon): (f64, f64) = Geodesic::wgs84().direct(lat, lon, bearing, radius);
+                // Normalize into the [-180, 180] interval the rects span.
+                let rlon = (rlon + 180.0).rem_euclid(360.0) - 180.0;
+                prop_assert!(
+                    rects.iter().any(|r| {
+                        r.min_lat <= rlat && rlat <= r.max_lat && r.min_lon <= rlon && rlon <= r.max_lon
+                    }),
+                    "rim point ({rlat}, {rlon}) at bearing {bearing} escaped the rects of cap \
+                     ({lat}, {lon}) r={radius}"
+                );
+            }
+        }
     }
 }

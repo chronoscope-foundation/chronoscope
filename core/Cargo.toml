@@ -19,6 +19,7 @@ test-support = []
 async-lock.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+geographiclib-rs = { version = "0.2", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true

@@ -172,13 +172,22 @@ mod extract {
         };
 
         // Wikidata coordinate precision is an angular grid size in degrees. The
-        // largest physical extent of that uncertainty is along the meridian
-        // (~111 km per degree, at every latitude), so measure the radius there.
+        // largest physical extent of that uncertainty is along the meridian, so
+        // measure the radius there — on WGS84, the same ellipsoid the spatial
+        // predicate uses. Step toward the equator when a poleward step would
+        // leave `[-90, 90]` (a near-pole center); the meridian arc is the same
+        // length either way, and an out-of-range latitude gives a NaN distance.
         let radius_m = coord.precision.map(|deg| {
-            use geo::{Distance, Haversine};
+            use geo::{Distance, Geodesic};
+            let deg = deg.abs();
+            let offset_lat = if coord.latitude + deg <= 90.0 {
+                coord.latitude + deg
+            } else {
+                coord.latitude - deg
+            };
             let center = geo::Point::new(coord.longitude, coord.latitude);
-            let offset = geo::Point::new(coord.longitude, coord.latitude + deg.abs());
-            Haversine::distance(center, offset)
+            let offset = geo::Point::new(coord.longitude, offset_lat);
+            Geodesic::distance(center, offset)
         });
 
         let result = GeoPoint::new(coord.latitude, coord.longitude).map(|center| match radius_m {
@@ -964,6 +973,33 @@ mod tests {
     }
 
     #[test]
+    fn near_pole_coordinate_precision_still_yields_a_finite_radius() -> TestResult {
+        // A poleward meridian step from a near-pole center leaves [-90, 90]
+        // (89.5° + 1° = 90.5°), where the WGS84 geodesic returns NaN and the
+        // location would be dropped. The equatorward step keeps the arc finite.
+        let claim_near_pole = Claim {
+            mainsnak: Snak::Value(DataValue::GlobeCoordinate(CoordinateValue {
+                latitude: 89.5,
+                longitude: 25.0,
+                precision: Some(1.0),
+            })),
+            qualifiers: BTreeMap::new(),
+            rank: Rank::Normal,
+        };
+        let (loc, warnings) = extract::mainsnak_coordinates(&claim_near_pole);
+        assert!(warnings.is_empty(), "a valid near-pole coord warns nothing");
+        let Some(UnresolvedLocation::Resolved(Location::Circle { radius, .. })) = loc else {
+            return Err("near-pole coordinate must keep a finite-radius circle".into());
+        };
+        assert!(
+            radius.0.is_finite() && (100_000.0..120_000.0).contains(&radius.0),
+            "1° of meridian near the pole is ~111.7 km, got {}m",
+            radius.0
+        );
+        Ok(())
+    }
+
+    #[test]
     fn coordinate_precision_uses_meridian_extent() -> TestResult {
         // Precision is an angular grid size applied to both axes; its largest
         // physical extent is the meridian arc, ~111 km per degree at every
@@ -983,15 +1019,16 @@ mod tests {
         let loc = loc.ok_or("expected Some")?;
 
         if let UnresolvedLocation::Resolved(Location::Circle { radius, .. }) = loc {
-            // Meridian arc of 1° latitude ≈ 111,195 m, latitude-independent.
+            // Meridian arc of 1° latitude on WGS84 ≈ 110.6–111.7 km across
+            // latitudes (≈ 111.4 km at 60°N), so the radius lands in this band.
             let radius_m = radius.0;
             assert!(
                 radius_m > 100_000.0,
-                "meridian extent of 1° is ~111 km regardless of latitude, got {radius_m}m"
+                "1° of WGS84 meridian is ~111 km, got {radius_m}m"
             );
             assert!(
                 radius_m < 120_000.0,
-                "meridian extent of 1° is ~111 km regardless of latitude, got {radius_m}m"
+                "1° of WGS84 meridian is ~111 km, got {radius_m}m"
             );
         } else {
             return Err("expected Resolved(Circle)".into());

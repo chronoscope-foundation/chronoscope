@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c36a390705f095e41492a27e88d5fd117571266db0cae7e213015cc908f69c41 # shrinks to circles = [Circle { center: GeoPoint { lat: -0.017656037065034862, lon: 0.0 }, radius: Meters(3213.475254632335) }, Circle { center: GeoPoint { lat: 0.0, lon: 0.0 }, radius: Meters(3344.2581428494996) }, Circle { center: GeoPoint { lat: 0.029928438994871416, lon: -0.024922952378289114 }, radius: Meters(3059.758998197242) }]
+cc 7bfb1350215dc646e1f2bf2cd6f48c1abdfb6dcc9c65f96fb5ed58b6fde3b307 # shrinks to circles = [Circle { center: GeoPoint { lat: -0.020831748017917474, lon: 0.0 }, radius: Meters(3143.1406633214324) }, Circle { center: GeoPoint { lat: 0.012393990763919099, lon: -0.009135483316746781 }, radius: Meters(3348.0120054704726) }, Circle { center: GeoPoint { lat: 0.0, lon: 0.0 }, radius: Meters(5801.220440617194) }]
