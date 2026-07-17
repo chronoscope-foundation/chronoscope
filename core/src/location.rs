@@ -52,19 +52,19 @@ use crate::geo::{
 /// radius below which [`Location::denotes_empty`]'s witness lemma holds — that
 /// lemma extracts an extreme point from a cap-intersection, which exists only
 /// for geodesically-convex (sub-hemisphere) caps.
-pub const MAX_UNCERTAINTY_RADIUS: Meters = Meters(5_000_000.0);
+pub const MAX_UNCERTAINTY_RADIUS: Meters = Meters::new_unchecked(5_000_000.0);
 
 /// Errors from location construction or validation.
 ///
 /// Coordinate validation (range / finiteness / negative-zero normalization)
-/// lives on [`GeoPoint`]; a circle's center error surfaces through the
-/// [`Self::Center`] wrapper. `LocationError`'s own variants are the
-/// location-specific checks: the radius bounds and the minimum-entry count for
-/// `OneOf`/`AllOf`.
+/// lives on [`GeoPoint`], radius finiteness on [`Meters`]; a circle's center
+/// error surfaces through the [`Self::Center`] wrapper. `LocationError`'s own
+/// variants are the location-specific checks: the radius bounds and the
+/// minimum-entry count for `OneOf`/`AllOf`.
 ///
-/// `PartialEq` only — the radius variants carry pre-validation `f64` that may be
-/// NaN/Inf. Errors aren't part of the content-addressed-fact graph, so missing
-/// `Eq`/`Ord` doesn't ripple.
+/// `PartialEq` only — the radius variants carry a bare `f64`, which has no total
+/// `Eq`/`Ord`. Errors aren't part of the content-addressed-fact graph, so that
+/// doesn't ripple.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocationError {
     /// `OneOf` / `AllOf` requires at least 2 entries.
@@ -73,8 +73,6 @@ pub enum LocationError {
     Center(GeoPointError),
     /// Radius was negative.
     NegativeRadius { radius: f64 },
-    /// Radius was `NaN` or infinite.
-    NonFiniteRadius { radius: f64 },
     /// Radius exceeded [`MAX_UNCERTAINTY_RADIUS`].
     RadiusTooLarge { radius: f64 },
 }
@@ -89,13 +87,10 @@ impl fmt::Display for LocationError {
             Self::NegativeRadius { radius } => {
                 write!(f, "radius must be non-negative, got {radius}")
             }
-            Self::NonFiniteRadius { radius } => {
-                write!(f, "radius must be finite, got {radius}")
-            }
             Self::RadiusTooLarge { radius } => write!(
                 f,
                 "radius {radius} exceeds the {} m sanity bound",
-                MAX_UNCERTAINTY_RADIUS.0
+                MAX_UNCERTAINTY_RADIUS.get()
             ),
         }
     }
@@ -180,13 +175,11 @@ pub use canonical::Members;
 /// [`JoinSemilattice`](crate::algebra::lattice::JoinSemilattice) impl folds a stream to
 /// the canonical join.
 ///
-/// `Eq`/`Ord`/`Hash` are hand-implemented because the `Circle` variant carries
-/// an [`Meters`] radius wrapping an `f64` (needed for `BTreeSet<SubmitFact>`
-/// dedup of facts that transitively reach `Location`). The center's coordinate
-/// handling is [`GeoPoint`]'s; these impls delegate the center to it and reach
-/// the radius `.0` for `total_cmp`/`to_bits`. The smart constructor
-/// [`Location::circle`] rejects NaN/Inf radii and normalizes `-0.0` so the
-/// manual `Hash`/`Ord` stay consistent with the derived `PartialEq`.
+/// `Eq`/`Ord`/`Hash` are hand-implemented so a new variant must state its own
+/// ordering. Every field carries a total `Eq`/`Ord`/`Hash` of its own — the
+/// `Circle` center through [`GeoPoint`], its radius through [`Meters`] — so the
+/// impls delegate per field. Facts that transitively reach `Location` rely on
+/// that total order for `BTreeSet<SubmitFact>` dedup.
 #[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Location {
@@ -226,8 +219,8 @@ impl PartialOrd for Location {
 
 impl Ord for Location {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Variant discriminant first, then payload. `Circle`'s f64s use
-        // `total_cmp` (NaN/Inf rejected at construction).
+        // Variant discriminant first, then payload; each field orders through
+        // its own total `Ord`.
         fn variant_index(loc: &Location) -> u8 {
             match loc {
                 Location::Empty => 0,
@@ -253,9 +246,8 @@ impl Ord for Location {
                     center: c2,
                     radius: r2,
                 },
-                // `center` orders via `GeoPoint`'s `total_cmp`-based `Ord`; the
-                // radius `f64` uses `total_cmp` for the same NaN-free reason.
-            ) => c1.cmp(c2).then_with(|| r1.0.total_cmp(&r2.0)),
+                // Both `center` and `radius` order through their own total `Ord`.
+            ) => c1.cmp(c2).then_with(|| r1.cmp(r2)),
             (Self::OneOf { members: a }, Self::OneOf { members: b }) => a.cmp(b),
             (Self::AllOf { members: a }, Self::AllOf { members: b }) => a.cmp(b),
             (Self::Unbounded, Self::Unbounded) => Ordering::Equal,
@@ -276,10 +268,9 @@ impl std::hash::Hash for Location {
         std::mem::discriminant(self).hash(state);
         match self {
             Self::Circle { center, radius } => {
-                // `center` hashes via `GeoPoint`'s `to_bits`-based `Hash`;
-                // the radius hashes by bits for the same reason.
+                // Both `center` and `radius` hash through their own `Hash`.
                 center.hash(state);
-                radius.0.to_bits().hash(state);
+                radius.hash(state);
             }
             Self::OneOf { members } => members.hash(state),
             Self::AllOf { members } => members.hash(state),
@@ -323,24 +314,20 @@ impl Location {
     /// Create a validated `Circle` location from an already-validated
     /// [`GeoPoint`] center and a radius.
     ///
-    /// The center carries [`GeoPoint`]'s guarantees (in-range, finite,
-    /// negative-zero-normalized). This constructor adds the radius checks:
-    /// finite, non-negative, and within [`MAX_UNCERTAINTY_RADIUS`]. `-0.0`
-    /// radius is normalized to `+0.0` so the manual `Hash`/`Ord` (bit-level /
-    /// `total_cmp`) stay consistent with the derived `PartialEq`.
+    /// The center carries [`GeoPoint`]'s guarantees and the radius is finite by
+    /// [`Meters`]'s. This constructor adds the remaining radius checks:
+    /// non-negative and within [`MAX_UNCERTAINTY_RADIUS`].
     pub fn circle(center: GeoPoint, radius: Meters) -> Result<Self, LocationError> {
-        if !radius.0.is_finite() {
-            return Err(LocationError::NonFiniteRadius { radius: radius.0 });
+        if radius.get() < 0.0 {
+            return Err(LocationError::NegativeRadius {
+                radius: radius.get(),
+            });
         }
-        if radius.0 < 0.0 {
-            return Err(LocationError::NegativeRadius { radius: radius.0 });
+        if radius.get() > MAX_UNCERTAINTY_RADIUS.get() {
+            return Err(LocationError::RadiusTooLarge {
+                radius: radius.get(),
+            });
         }
-        if radius.0 > MAX_UNCERTAINTY_RADIUS.0 {
-            return Err(LocationError::RadiusTooLarge { radius: radius.0 });
-        }
-        // Normalize `-0.0` to `+0.0`: `-0.0 + 0.0 == +0.0`, and adding
-        // `0.0` is a no-op for every other finite value.
-        let radius = Meters(radius.0 + 0.0);
         Ok(Self::Circle { center, radius })
     }
 
@@ -353,7 +340,7 @@ impl Location {
     pub fn point(center: GeoPoint) -> Self {
         Self::Circle {
             center,
-            radius: Meters(0.0),
+            radius: Meters::new_unchecked(0.0),
         }
     }
 
@@ -1300,6 +1287,7 @@ pub enum Distance {
 mod tests {
     use super::*;
     use super::{resolved, unresolved};
+    use crate::geo::MetersError;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1313,7 +1301,7 @@ mod tests {
 
     #[test]
     fn valid_circle() -> TestResult {
-        let loc = Location::circle(gp(40.7505, -73.9934)?, Meters(10.0));
+        let loc = Location::circle(gp(40.7505, -73.9934)?, Meters::new_unchecked(10.0));
         assert!(loc.is_ok());
         Ok(())
     }
@@ -1322,28 +1310,36 @@ mod tests {
     fn valid_point() -> TestResult {
         assert!(matches!(
             Location::point(gp(40.7505, -73.9934)?),
-            Location::Circle { radius, .. } if radius.0 == 0.0
+            Location::Circle { radius, .. } if radius.get() == 0.0
         ));
         Ok(())
     }
 
     #[test]
     fn circle_rejects_negative_radius() -> TestResult {
-        let loc = Location::circle(gp(0.0, 0.0)?, Meters(-1.0));
+        let loc = Location::circle(gp(0.0, 0.0)?, Meters::new_unchecked(-1.0));
         assert!(matches!(loc, Err(LocationError::NegativeRadius { .. })));
         Ok(())
     }
 
     #[test]
-    fn circle_rejects_non_finite_radius() -> TestResult {
-        let loc = Location::circle(gp(0.0, 0.0)?, Meters(f64::INFINITY));
-        assert!(matches!(loc, Err(LocationError::NonFiniteRadius { .. })));
-        Ok(())
+    fn meters_try_new_rejects_non_finite() {
+        // Finiteness now lives on `Meters::try_new`, upstream of `circle`, so a
+        // non-finite radius can't even be built to hand to it.
+        assert!(matches!(
+            Meters::try_new(f64::NAN),
+            Err(MetersError::NonFinite { .. })
+        ));
+        assert!(matches!(
+            Meters::try_new(f64::INFINITY),
+            Err(MetersError::NonFinite { .. })
+        ));
+        assert!(Meters::try_new(42.0).is_ok());
     }
 
     #[test]
     fn circle_rejects_radius_over_sanity_bound() -> TestResult {
-        let over = Meters(MAX_UNCERTAINTY_RADIUS.0 + 1.0);
+        let over = Meters::new_unchecked(MAX_UNCERTAINTY_RADIUS.get() + 1.0);
         assert!(matches!(
             Location::circle(gp(0.0, 0.0)?, over),
             Err(LocationError::RadiusTooLarge { .. })
@@ -1369,8 +1365,8 @@ mod tests {
 
     #[test]
     fn circle_boundary_values() -> TestResult {
-        assert!(Location::circle(gp(90.0, 180.0)?, Meters(0.0)).is_ok());
-        assert!(Location::circle(gp(-90.0, -180.0)?, Meters(0.0)).is_ok());
+        assert!(Location::circle(gp(90.0, 180.0)?, Meters::new_unchecked(0.0)).is_ok());
+        assert!(Location::circle(gp(-90.0, -180.0)?, Meters::new_unchecked(0.0)).is_ok());
         Ok(())
     }
 
@@ -1385,8 +1381,8 @@ mod tests {
         // normalization is `GeoPoint`'s, covered in `geo.rs`; here the
         // same center is reused so the radius is the only variable.)
         let center = gp(0.0, 0.0)?;
-        let neg = Location::circle(center, Meters(-0.0))?;
-        let pos = Location::circle(center, Meters(0.0))?;
+        let neg = Location::circle(center, Meters::new_unchecked(-0.0))?;
+        let pos = Location::circle(center, Meters::new_unchecked(0.0))?;
 
         assert_eq!(neg, pos, "negative and positive zero radius must be equal");
 
@@ -1443,8 +1439,10 @@ mod tests {
 
     #[test]
     fn resolved_serde_roundtrip() -> TestResult {
-        let loc =
-            UnresolvedLocation::Resolved(Location::circle(gp(48.8584, 2.2945)?, Meters(10.0))?);
+        let loc = UnresolvedLocation::Resolved(Location::circle(
+            gp(48.8584, 2.2945)?,
+            Meters::new_unchecked(10.0),
+        )?);
         let json = serde_json::to_string(&loc)?;
         let deserialized: UnresolvedLocation = serde_json::from_str(&json)?;
         assert_eq!(loc, deserialized);
@@ -1470,8 +1468,8 @@ mod tests {
     #[test]
     fn one_of_member_order_is_canonical() -> TestResult {
         // Two orderings of the same disjoint circles produce one wire form.
-        let paris = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
-        let london = Location::circle(gp(51.5, -0.1)?, Meters(10.0))?;
+        let paris = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(10.0))?;
+        let london = Location::circle(gp(51.5, -0.1)?, Meters::new_unchecked(10.0))?;
         let forward = Location::one_of(vec![paris.clone(), london.clone()])?;
         let reversed = Location::one_of(vec![london, paris])?;
         assert_eq!(
@@ -1485,9 +1483,9 @@ mod tests {
     fn one_of_flattens_nested() -> TestResult {
         // A nested OneOf child flattens — the only useful part of the removed
         // `merge` now lives in the constructor.
-        let a = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
-        let b = Location::circle(gp(51.5, -0.1)?, Meters(10.0))?;
-        let c = Location::circle(gp(40.7, -74.0)?, Meters(10.0))?;
+        let a = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(10.0))?;
+        let b = Location::circle(gp(51.5, -0.1)?, Meters::new_unchecked(10.0))?;
+        let c = Location::circle(gp(40.7, -74.0)?, Meters::new_unchecked(10.0))?;
         let nested = Location::one_of(vec![Location::one_of(vec![a, b])?, c])?;
         assert!(matches!(nested, Location::OneOf { ref members } if members.len() == 3));
         Ok(())
@@ -1498,9 +1496,9 @@ mod tests {
         // A small circle inside a big one is redundant in a union, so it drops;
         // what survives is the big circle plus a disjoint third, leaving two
         // members.
-        let big = Location::circle(gp(0.0, 0.0)?, Meters(90_000.0))?;
-        let small = Location::circle(gp(0.5, 0.5)?, Meters(10.0))?; // ~79 km out, inside big
-        let elsewhere = Location::circle(gp(40.7, -74.0)?, Meters(10.0))?;
+        let big = Location::circle(gp(0.0, 0.0)?, Meters::new_unchecked(90_000.0))?;
+        let small = Location::circle(gp(0.5, 0.5)?, Meters::new_unchecked(10.0))?; // ~79 km out, inside big
+        let elsewhere = Location::circle(gp(40.7, -74.0)?, Meters::new_unchecked(10.0))?;
         let union = Location::one_of(vec![big.clone(), small, elsewhere.clone()])?;
         let Location::OneOf { members } = &union else {
             return Err("expected a union".into());
@@ -1514,8 +1512,8 @@ mod tests {
     fn one_of_all_subsumed_collapses_and_is_rejected() -> TestResult {
         // Every member contained by one big circle leaves a single survivor;
         // a one-member union is degenerate and rejected.
-        let big = Location::circle(gp(0.0, 0.0)?, Meters(90_000.0))?;
-        let small = Location::circle(gp(0.5, 0.5)?, Meters(10.0))?;
+        let big = Location::circle(gp(0.0, 0.0)?, Meters::new_unchecked(90_000.0))?;
+        let small = Location::circle(gp(0.5, 0.5)?, Meters::new_unchecked(10.0))?;
         let result = Location::one_of(vec![big, small]);
         assert!(matches!(result, Err(LocationError::TooFewEntries { .. })));
         Ok(())
@@ -1604,7 +1602,7 @@ mod tests {
             "valid circle",
             |(lat, lon, r)| {
                 let center = GeoPoint::new(lat, lon).ok()?;
-                Location::circle(center, Meters(r)).ok()
+                Location::circle(center, Meters::new_unchecked(r)).ok()
             },
         )
     }
@@ -1621,7 +1619,7 @@ mod tests {
                     "distinct-center circle",
                     |(lat, lon)| {
                         let center = GeoPoint::new(lat, lon).ok()?;
-                        Location::circle(center, Meters(1.0)).ok()
+                        Location::circle(center, Meters::new_unchecked(1.0)).ok()
                     },
                 ),
                 2..=5,
@@ -1660,16 +1658,17 @@ mod tests {
         // A big circle around a small one at the same center is redundant in an
         // intersection — the small one is the tighter constraint, so the big
         // one drops and the meet collapses to the small circle alone.
-        let big = Location::circle(gp(0.0, 0.0)?, Meters(90_000.0))?;
-        let small = Location::circle(gp(0.0, 0.0)?, Meters(10.0))?;
+        let big = Location::circle(gp(0.0, 0.0)?, Meters::new_unchecked(90_000.0))?;
+        let small = Location::circle(gp(0.0, 0.0)?, Meters::new_unchecked(10.0))?;
         let result = Location::all_of(vec![big, small.clone()]);
         // One survivor → rejected as degenerate, the dual of union's collapse.
         assert!(matches!(result, Err(LocationError::TooFewEntries { .. })));
         // Through the lattice meet, the same collapse yields the lone survivor.
         assert_eq!(
-            small
-                .clone()
-                .meet(Location::circle(gp(0.0, 0.0)?, Meters(90_000.0))?),
+            small.clone().meet(Location::circle(
+                gp(0.0, 0.0)?,
+                Meters::new_unchecked(90_000.0)
+            )?),
             small
         );
         Ok(())
@@ -1678,7 +1677,7 @@ mod tests {
     #[test]
     fn meet_unbounded_is_identity() -> TestResult {
         use crate::algebra::lattice::MeetSemilattice;
-        let c = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
+        let c = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(10.0))?;
         assert_eq!(c.clone().meet(Location::Unbounded), c);
         Ok(())
     }
@@ -1686,7 +1685,7 @@ mod tests {
     #[test]
     fn meet_empty_is_empty() -> TestResult {
         use crate::algebra::lattice::MeetSemilattice;
-        let c = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
+        let c = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(10.0))?;
         assert_eq!(c.meet(Location::Empty), Location::Empty);
         Ok(())
     }
@@ -1696,8 +1695,8 @@ mod tests {
         use crate::algebra::lattice::MeetSemilattice;
         // Two far-apart circles meet to a symbolic `AllOf`; recognizing that the
         // region is actually empty is a separate concern.
-        let paris = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
-        let tokyo = Location::circle(gp(35.6, 139.7)?, Meters(10.0))?;
+        let paris = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(10.0))?;
+        let tokyo = Location::circle(gp(35.6, 139.7)?, Meters::new_unchecked(10.0))?;
         let meet = paris.meet(tokyo);
         assert!(matches!(meet, Location::AllOf { ref members } if members.len() == 2));
         Ok(())
@@ -1705,9 +1704,9 @@ mod tests {
 
     #[test]
     fn all_of_flattens_nested() -> TestResult {
-        let a = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
-        let b = Location::circle(gp(51.5, -0.1)?, Meters(10.0))?;
-        let c = Location::circle(gp(40.7, -74.0)?, Meters(10.0))?;
+        let a = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(10.0))?;
+        let b = Location::circle(gp(51.5, -0.1)?, Meters::new_unchecked(10.0))?;
+        let c = Location::circle(gp(40.7, -74.0)?, Meters::new_unchecked(10.0))?;
         let nested = Location::all_of(vec![Location::all_of(vec![a, b])?, c])?;
         assert!(matches!(nested, Location::AllOf { ref members } if members.len() == 3));
         Ok(())
@@ -1715,8 +1714,8 @@ mod tests {
 
     #[test]
     fn all_of_member_order_is_canonical() -> TestResult {
-        let paris = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
-        let london = Location::circle(gp(51.5, -0.1)?, Meters(10.0))?;
+        let paris = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(10.0))?;
+        let london = Location::circle(gp(51.5, -0.1)?, Meters::new_unchecked(10.0))?;
         let forward = Location::all_of(vec![paris.clone(), london.clone()])?;
         let reversed = Location::all_of(vec![london, paris])?;
         assert_eq!(
@@ -1728,8 +1727,8 @@ mod tests {
 
     #[test]
     fn all_of_serde_roundtrip() -> TestResult {
-        let paris = Location::circle(gp(48.8, 2.3)?, Meters(10.0))?;
-        let tokyo = Location::circle(gp(35.6, 139.7)?, Meters(10.0))?;
+        let paris = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(10.0))?;
+        let tokyo = Location::circle(gp(35.6, 139.7)?, Meters::new_unchecked(10.0))?;
         let loc = Location::all_of(vec![paris, tokyo])?;
         let json = serde_json::to_string(&loc)?;
         let back: Location = serde_json::from_str(&json)?;
@@ -1796,7 +1795,7 @@ mod tests {
     /// coverage-sensitive locus, so its neighborhood is where an off-center law
     /// violation shows up.
     fn circles_of(loc: &Location, out: &mut Vec<(GeoPoint, f64)>) {
-        loc.for_each_circle(&mut |center, radius| out.push((*center, radius.0)));
+        loc.for_each_circle(&mut |center, radius| out.push((*center, radius.get())));
     }
 
     /// The point reached by walking `distance` meters along the WGS84 geodesic
@@ -1870,9 +1869,9 @@ mod tests {
         // The oracle must reject genuinely different regions, else the order
         // laws would pass vacuously. A circle and a far-disjoint circle cover
         // different points; the same circle covers identically.
-        let paris = Location::circle(gp(48.8, 2.3)?, Meters(5000.0))?;
-        let paris_again = Location::circle(gp(48.8, 2.3)?, Meters(5000.0))?;
-        let tokyo = Location::circle(gp(35.6, 139.7)?, Meters(5000.0))?;
+        let paris = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(5000.0))?;
+        let paris_again = Location::circle(gp(48.8, 2.3)?, Meters::new_unchecked(5000.0))?;
+        let tokyo = Location::circle(gp(35.6, 139.7)?, Meters::new_unchecked(5000.0))?;
         assert!(denotes_same(&paris, &paris_again));
         assert!(!denotes_same(&paris, &tokyo));
         // A union is strictly larger than one of its disjoint members.
@@ -1970,7 +1969,7 @@ mod tests {
                 };
                 GeoPoint::new(lat, lon)
                     .ok()
-                    .and_then(|c| Location::circle(c, Meters(5000.0)).ok())
+                    .and_then(|c| Location::circle(c, Meters::new_unchecked(5000.0)).ok())
                     .unwrap_or(Location::Unbounded)
             }
             UnresolvedLocation::Reference(_) => Location::Unbounded,
@@ -2071,7 +2070,7 @@ mod tests {
     #[test]
     fn single_circle_is_non_empty() -> TestResult {
         // A circle always covers its own center, zero radius included.
-        assert!(!Location::circle(gp(40.0, -74.0)?, Meters(100.0))?.denotes_empty());
+        assert!(!Location::circle(gp(40.0, -74.0)?, Meters::new_unchecked(100.0))?.denotes_empty());
         assert!(!Location::point(gp(40.0, -74.0)?).denotes_empty());
         Ok(())
     }
@@ -2080,8 +2079,8 @@ mod tests {
     fn disjoint_intersection_denotes_empty() -> TestResult {
         // Two circles whose centers are far apart relative to their radii share
         // no point; the symbolic intersection denotes nothing.
-        let paris = Location::circle(gp(48.8566, 2.3522)?, Meters(1000.0))?;
-        let tokyo = Location::circle(gp(35.6762, 139.6503)?, Meters(1000.0))?;
+        let paris = Location::circle(gp(48.8566, 2.3522)?, Meters::new_unchecked(1000.0))?;
+        let tokyo = Location::circle(gp(35.6762, 139.6503)?, Meters::new_unchecked(1000.0))?;
         let meet = Location::all_of(vec![paris, tokyo])?;
         assert!(meet.denotes_empty());
         Ok(())
@@ -2091,8 +2090,8 @@ mod tests {
     fn overlapping_intersection_is_non_empty() -> TestResult {
         // Two circles ~500 m apart with 5 km radii overlap broadly; their
         // intersection is a lens, far from empty.
-        let a = Location::circle(gp(40.0, -74.0)?, Meters(5000.0))?;
-        let b = Location::circle(gp(40.005, -74.0)?, Meters(5000.0))?;
+        let a = Location::circle(gp(40.0, -74.0)?, Meters::new_unchecked(5000.0))?;
+        let b = Location::circle(gp(40.005, -74.0)?, Meters::new_unchecked(5000.0))?;
         let meet = Location::all_of(vec![a, b])?;
         assert!(!meet.denotes_empty());
         Ok(())
@@ -2110,8 +2109,8 @@ mod tests {
         let (lat_b, lon_b): (f64, f64) = Geodesic::wgs84().direct(40.0, -74.0, 0.0, 2.0 * r + 5e-4);
         let b = gp(lat_b, lon_b)?;
         let meet = Location::all_of(vec![
-            Location::circle(a, Meters(r))?,
-            Location::circle(b, Meters(r))?,
+            Location::circle(a, Meters::new_unchecked(r))?,
+            Location::circle(b, Meters::new_unchecked(r))?,
         ])?;
         assert!(
             !meet.denotes_empty(),
@@ -2130,8 +2129,8 @@ mod tests {
         let (lat_b, lon_b): (f64, f64) = Geodesic::wgs84().direct(0.0, 0.0, 0.0, 199_400.0);
         let b = gp(lat_b, lon_b)?;
         let meet = Location::all_of(vec![
-            Location::circle(a, Meters(100_000.0))?,
-            Location::circle(b, Meters(100_000.0))?,
+            Location::circle(a, Meters::new_unchecked(100_000.0))?,
+            Location::circle(b, Meters::new_unchecked(100_000.0))?,
         ])?;
         // The geodesic midpoint sits 99.7 km from each center — a real interior
         // witness, so the region is genuinely non-empty.
@@ -2153,8 +2152,8 @@ mod tests {
         // A small circle inside a large one (canonicalization keeps the tighter
         // one alone, but build the meet directly): every point of the small disk
         // is covered, so the region is the small disk — non-empty.
-        let big = Location::circle(gp(40.0, -74.0)?, Meters(10_000.0))?;
-        let small = Location::circle(gp(40.001, -74.001)?, Meters(100.0))?;
+        let big = Location::circle(gp(40.0, -74.0)?, Meters::new_unchecked(10_000.0))?;
+        let small = Location::circle(gp(40.001, -74.001)?, Meters::new_unchecked(100.0))?;
         // Containment collapses this to the lone small circle; assert that the
         // collapsed result still denotes a place.
         let meet = small.clone();
@@ -2176,9 +2175,9 @@ mod tests {
         // ends are far apart: there is no point common to all three. Spacing 8 km
         // with 5 km radii — neighbors overlap (gap 8 < 10), ends are 16 km apart
         // (> 10), and the middle disk doesn't reach into both ends at once.
-        let a = Location::circle(gp(40.0, -74.0)?, Meters(5000.0))?;
-        let b = Location::circle(gp(40.0719, -74.0)?, Meters(5000.0))?; // ~8 km north of a
-        let c = Location::circle(gp(40.1438, -74.0)?, Meters(5000.0))?; // ~8 km north of b
+        let a = Location::circle(gp(40.0, -74.0)?, Meters::new_unchecked(5000.0))?;
+        let b = Location::circle(gp(40.0719, -74.0)?, Meters::new_unchecked(5000.0))?; // ~8 km north of a
+        let c = Location::circle(gp(40.1438, -74.0)?, Meters::new_unchecked(5000.0))?; // ~8 km north of b
         let meet = Location::AllOf {
             members: Members::canonicalize(vec![a, b, c], resolved::canonical_all_of),
         };
@@ -2190,9 +2189,9 @@ mod tests {
     fn three_circle_chain_with_common_point_is_non_empty() -> TestResult {
         // The same three circles tightened together (2 km spacing, 5 km radii):
         // all three now overlap a shared core, so the meet is non-empty.
-        let a = Location::circle(gp(40.0, -74.0)?, Meters(5000.0))?;
-        let b = Location::circle(gp(40.018, -74.0)?, Meters(5000.0))?; // ~2 km north
-        let c = Location::circle(gp(40.036, -74.0)?, Meters(5000.0))?; // ~4 km north of a
+        let a = Location::circle(gp(40.0, -74.0)?, Meters::new_unchecked(5000.0))?;
+        let b = Location::circle(gp(40.018, -74.0)?, Meters::new_unchecked(5000.0))?; // ~2 km north
+        let c = Location::circle(gp(40.036, -74.0)?, Meters::new_unchecked(5000.0))?; // ~4 km north of a
         let meet = Location::AllOf {
             members: Members::canonicalize(vec![a, b, c], resolved::canonical_all_of),
         };
@@ -2204,8 +2203,8 @@ mod tests {
     fn one_of_disjoint_circles_is_non_empty() -> TestResult {
         // A union of two disjoint circles covers each one's center; emptiness is
         // an intersection phenomenon, not a union one.
-        let paris = Location::circle(gp(48.8566, 2.3522)?, Meters(1000.0))?;
-        let tokyo = Location::circle(gp(35.6762, 139.6503)?, Meters(1000.0))?;
+        let paris = Location::circle(gp(48.8566, 2.3522)?, Meters::new_unchecked(1000.0))?;
+        let tokyo = Location::circle(gp(35.6762, 139.6503)?, Meters::new_unchecked(1000.0))?;
         assert!(!Location::one_of(vec![paris, tokyo])?.denotes_empty());
         Ok(())
     }
@@ -2216,8 +2215,8 @@ mod tests {
         // apart on the sphere) overlap broadly. Native spherical geometry has no
         // seam, so the meet reads non-empty — a regression guard against any
         // longitude-wrapping creeping back in.
-        let west = Location::circle(gp(0.0, 179.95)?, Meters(20_000.0))?;
-        let east = Location::circle(gp(0.0, -179.95)?, Meters(20_000.0))?;
+        let west = Location::circle(gp(0.0, 179.95)?, Meters::new_unchecked(20_000.0))?;
+        let east = Location::circle(gp(0.0, -179.95)?, Meters::new_unchecked(20_000.0))?;
         let meet = Location::all_of(vec![west, east])?;
         assert!(
             !meet.denotes_empty(),
@@ -2225,8 +2224,14 @@ mod tests {
         );
 
         let unresolved = UnresolvedLocation::all_of(vec![
-            UnresolvedLocation::Resolved(Location::circle(gp(0.0, 179.95)?, Meters(20_000.0))?),
-            UnresolvedLocation::Resolved(Location::circle(gp(0.0, -179.95)?, Meters(20_000.0))?),
+            UnresolvedLocation::Resolved(Location::circle(
+                gp(0.0, 179.95)?,
+                Meters::new_unchecked(20_000.0),
+            )?),
+            UnresolvedLocation::Resolved(Location::circle(
+                gp(0.0, -179.95)?,
+                Meters::new_unchecked(20_000.0),
+            )?),
         ])?;
         assert_ne!(unresolved.conflict_status(), ConflictStatus::Conflict);
         Ok(())
@@ -2238,8 +2243,8 @@ mod tests {
         // overlap across it (centers ~2.2 km apart on the sphere). Native
         // spherical geometry keeps them honestly close, with no pole
         // singularity — a regression guard against any `cos(lat)` metric.
-        let a = Location::circle(gp(89.99, 0.0)?, Meters(5_000.0))?;
-        let b = Location::circle(gp(89.99, 180.0)?, Meters(5_000.0))?;
+        let a = Location::circle(gp(89.99, 0.0)?, Meters::new_unchecked(5_000.0))?;
+        let b = Location::circle(gp(89.99, 180.0)?, Meters::new_unchecked(5_000.0))?;
         let meet = Location::all_of(vec![a, b])?;
         assert!(
             !meet.denotes_empty(),
@@ -2252,8 +2257,8 @@ mod tests {
     fn far_disjoint_intersection_stays_empty() -> TestResult {
         // The fix must not flip genuinely-disjoint regions to non-empty: two
         // small circles a continent apart still share no point.
-        let paris = Location::circle(gp(48.8566, 2.3522)?, Meters(1000.0))?;
-        let tokyo = Location::circle(gp(35.6762, 139.6503)?, Meters(1000.0))?;
+        let paris = Location::circle(gp(48.8566, 2.3522)?, Meters::new_unchecked(1000.0))?;
+        let tokyo = Location::circle(gp(35.6762, 139.6503)?, Meters::new_unchecked(1000.0))?;
         let meet = Location::all_of(vec![paris, tokyo])?;
         assert!(meet.denotes_empty());
         Ok(())
@@ -2265,10 +2270,14 @@ mod tests {
     fn resolved_disjoint_all_of_conflicts() -> TestResult {
         // Two fully-resolved far-apart circles: the skeleton is the disjoint
         // intersection, which denotes nothing, so the status is Conflict.
-        let paris =
-            UnresolvedLocation::Resolved(Location::circle(gp(48.8566, 2.3522)?, Meters(1000.0))?);
-        let tokyo =
-            UnresolvedLocation::Resolved(Location::circle(gp(35.6762, 139.6503)?, Meters(1000.0))?);
+        let paris = UnresolvedLocation::Resolved(Location::circle(
+            gp(48.8566, 2.3522)?,
+            Meters::new_unchecked(1000.0),
+        )?);
+        let tokyo = UnresolvedLocation::Resolved(Location::circle(
+            gp(35.6762, 139.6503)?,
+            Meters::new_unchecked(1000.0),
+        )?);
         let loc = UnresolvedLocation::all_of(vec![paris, tokyo])?;
         assert_eq!(loc.conflict_status(), ConflictStatus::Conflict);
         Ok(())
@@ -2280,8 +2289,10 @@ mod tests {
         // skeleton replaces the reference with ⊤, leaving the non-empty circle,
         // so it isn't a Conflict — but the reference could still empty it, so
         // Pending.
-        let circle =
-            UnresolvedLocation::Resolved(Location::circle(gp(40.0, -74.0)?, Meters(1000.0))?);
+        let circle = UnresolvedLocation::Resolved(Location::circle(
+            gp(40.0, -74.0)?,
+            Meters::new_unchecked(1000.0),
+        )?);
         let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
             name: "Paris".to_string(),
         });
@@ -2294,8 +2305,14 @@ mod tests {
     fn resolved_overlapping_all_of_is_consistent() -> TestResult {
         // Two fully-resolved overlapping circles: the skeleton is a non-empty
         // intersection with no remaining reference, so Consistent.
-        let a = UnresolvedLocation::Resolved(Location::circle(gp(40.0, -74.0)?, Meters(5000.0))?);
-        let b = UnresolvedLocation::Resolved(Location::circle(gp(40.005, -74.0)?, Meters(5000.0))?);
+        let a = UnresolvedLocation::Resolved(Location::circle(
+            gp(40.0, -74.0)?,
+            Meters::new_unchecked(5000.0),
+        )?);
+        let b = UnresolvedLocation::Resolved(Location::circle(
+            gp(40.005, -74.0)?,
+            Meters::new_unchecked(5000.0),
+        )?);
         let loc = UnresolvedLocation::all_of(vec![a, b])?;
         assert_eq!(loc.conflict_status(), ConflictStatus::Consistent);
         Ok(())
@@ -2357,7 +2374,7 @@ mod tests {
             "clustered circle",
             |(dlat, dlon, r)| {
                 let center = GeoPoint::new(dlat, dlon).ok()?;
-                Location::circle(center, Meters(r)).ok()
+                Location::circle(center, Meters::new_unchecked(r)).ok()
             },
         )
     }
@@ -2412,7 +2429,10 @@ mod tests {
             let theta = std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * k as f64 / 3.0;
             let lat = circumradius_deg * theta.sin();
             let lon = circumradius_deg * theta.cos();
-            circles.push(Location::circle(gp(lat, lon)?, Meters(radius_m))?);
+            circles.push(Location::circle(
+                gp(lat, lon)?,
+                Meters::new_unchecked(radius_m),
+            )?);
         }
         Ok(Location::AllOf {
             members: Members::canonicalize(circles, resolved::canonical_all_of),
@@ -2487,7 +2507,10 @@ mod tests {
     fn intersects_circle_center_inside() -> TestResult {
         let v = viewport()?;
         assert!(Location::point(gp(40.5, -73.5)?).known_geometry_intersects(&v));
-        assert!(Location::circle(gp(40.5, -73.5)?, Meters(10.0))?.known_geometry_intersects(&v));
+        assert!(
+            Location::circle(gp(40.5, -73.5)?, Meters::new_unchecked(10.0))?
+                .known_geometry_intersects(&v)
+        );
         Ok(())
     }
 
@@ -2497,7 +2520,7 @@ mod tests {
         // box even though the center is outside — the case a center-only
         // point-in-box check gets wrong.
         let v = viewport()?;
-        let overlapping = Location::circle(gp(40.5, -72.9)?, Meters(20_000.0))?;
+        let overlapping = Location::circle(gp(40.5, -72.9)?, Meters::new_unchecked(20_000.0))?;
         assert!(overlapping.known_geometry_intersects(&v));
         Ok(())
     }
@@ -2506,7 +2529,7 @@ mod tests {
     fn intersects_circle_cap_fully_outside() -> TestResult {
         // Center ~84 km east of the east edge; a 20 km radius falls well short.
         let v = viewport()?;
-        let clear = Location::circle(gp(40.5, -72.0)?, Meters(20_000.0))?;
+        let clear = Location::circle(gp(40.5, -72.0)?, Meters::new_unchecked(20_000.0))?;
         assert!(!clear.known_geometry_intersects(&v));
         Ok(())
     }
@@ -2520,11 +2543,13 @@ mod tests {
         // ~222 km west of the west edge, radius 250 km: overlaps through the
         // edge.
         assert!(
-            Location::circle(gp(0.0, 168.0)?, Meters(250_000.0))?.known_geometry_intersects(&v)
+            Location::circle(gp(0.0, 168.0)?, Meters::new_unchecked(250_000.0))?
+                .known_geometry_intersects(&v)
         );
         // Same center, radius 100 km: short of the edge.
         assert!(
-            !Location::circle(gp(0.0, 168.0)?, Meters(100_000.0))?.known_geometry_intersects(&v)
+            !Location::circle(gp(0.0, 168.0)?, Meters::new_unchecked(100_000.0))?
+                .known_geometry_intersects(&v)
         );
         // The far side of the globe.
         assert!(!Location::point(gp(0.0, 0.0)?).known_geometry_intersects(&v));
@@ -2538,10 +2563,12 @@ mod tests {
         // parallel.
         let v = Viewport::new(gp(89.0, 0.0)?, gp(90.0, 10.0)?)?;
         assert!(
-            Location::circle(gp(89.5, 170.0)?, Meters(60_000.0))?.known_geometry_intersects(&v)
+            Location::circle(gp(89.5, 170.0)?, Meters::new_unchecked(60_000.0))?
+                .known_geometry_intersects(&v)
         );
         assert!(
-            !Location::circle(gp(89.5, 170.0)?, Meters(40_000.0))?.known_geometry_intersects(&v)
+            !Location::circle(gp(89.5, 170.0)?, Meters::new_unchecked(40_000.0))?
+                .known_geometry_intersects(&v)
         );
         Ok(())
     }
@@ -2549,9 +2576,9 @@ mod tests {
     #[test]
     fn intersects_one_of_any_member() -> TestResult {
         let v = viewport()?;
-        let inside = Location::circle(gp(40.5, -73.5)?, Meters(10.0))?;
-        let far = Location::circle(gp(10.0, 10.0)?, Meters(10.0))?;
-        let far2 = Location::circle(gp(-10.0, 60.0)?, Meters(10.0))?;
+        let inside = Location::circle(gp(40.5, -73.5)?, Meters::new_unchecked(10.0))?;
+        let far = Location::circle(gp(10.0, 10.0)?, Meters::new_unchecked(10.0))?;
+        let far2 = Location::circle(gp(-10.0, 60.0)?, Meters::new_unchecked(10.0))?;
         assert!(Location::one_of(vec![inside, far.clone()])?.known_geometry_intersects(&v));
         assert!(!Location::one_of(vec![far, far2])?.known_geometry_intersects(&v));
         Ok(())
@@ -2562,14 +2589,14 @@ mod tests {
         let v = viewport()?;
         // Two overlapping circles that both reach the box: the conjunction
         // passes the conservative test.
-        let a = Location::circle(gp(40.5, -73.5)?, Meters(50_000.0))?;
-        let b = Location::circle(gp(40.6, -73.4)?, Meters(50_000.0))?;
+        let a = Location::circle(gp(40.5, -73.5)?, Meters::new_unchecked(50_000.0))?;
+        let b = Location::circle(gp(40.6, -73.4)?, Meters::new_unchecked(50_000.0))?;
         let both = Location::AllOf {
             members: Members::canonicalize(vec![a.clone(), b], resolved::canonical_all_of),
         };
         assert!(both.known_geometry_intersects(&v));
         // One member in the box, one far away: the conjunction cannot reach it.
-        let far = Location::circle(gp(10.0, 10.0)?, Meters(10.0))?;
+        let far = Location::circle(gp(10.0, 10.0)?, Meters::new_unchecked(10.0))?;
         let split = Location::AllOf {
             members: Members::canonicalize(vec![a, far], resolved::canonical_all_of),
         };
@@ -2592,8 +2619,10 @@ mod tests {
             name: "somewhere".to_owned(),
         });
         assert!(!reference.known_geometry_intersects(&v));
-        let resolved =
-            UnresolvedLocation::Resolved(Location::circle(gp(40.5, -73.5)?, Meters(10.0))?);
+        let resolved = UnresolvedLocation::Resolved(Location::circle(
+            gp(40.5, -73.5)?,
+            Meters::new_unchecked(10.0),
+        )?);
         assert!(resolved.known_geometry_intersects(&v));
         Ok(())
     }
@@ -2610,8 +2639,14 @@ mod tests {
                 name: name.to_owned(),
             })
         };
-        let near = UnresolvedLocation::Resolved(Location::circle(gp(40.5, -73.5)?, Meters(10.0))?);
-        let far = UnresolvedLocation::Resolved(Location::circle(gp(10.0, 10.0)?, Meters(10.0))?);
+        let near = UnresolvedLocation::Resolved(Location::circle(
+            gp(40.5, -73.5)?,
+            Meters::new_unchecked(10.0),
+        )?);
+        let far = UnresolvedLocation::Resolved(Location::circle(
+            gp(10.0, 10.0)?,
+            Meters::new_unchecked(10.0),
+        )?);
 
         // The intersection's resolved member decides either way.
         assert!(
@@ -2673,25 +2708,25 @@ mod tests {
         // center, so the 0.4 mm margin is exact on the ellipsoid.
         let rim_circle = {
             let center = gp(40.5, -72.8)?;
-            let standoff = viewport()?.geodesic_distance_to(&center).0;
-            Location::circle(center, Meters(standoff - 0.4e-3))?
+            let standoff = viewport()?.geodesic_distance_to(&center).get();
+            Location::circle(center, Meters::new_unchecked(standoff - 0.4e-3))?
         };
         let locations = vec![
             rim_circle,
             Location::point(gp(40.5, -73.5)?),
-            Location::circle(gp(40.5, -72.9)?, Meters(20_000.0))?,
-            Location::circle(gp(40.5, -72.0)?, Meters(20_000.0))?,
-            Location::circle(gp(0.0, 179.5)?, Meters(100_000.0))?,
-            Location::circle(gp(0.0, -179.5)?, Meters(100_000.0))?,
-            Location::circle(gp(89.5, 170.0)?, Meters(60_000.0))?,
-            Location::circle(gp(0.0, 168.0)?, Meters(250_000.0))?,
+            Location::circle(gp(40.5, -72.9)?, Meters::new_unchecked(20_000.0))?,
+            Location::circle(gp(40.5, -72.0)?, Meters::new_unchecked(20_000.0))?,
+            Location::circle(gp(0.0, 179.5)?, Meters::new_unchecked(100_000.0))?,
+            Location::circle(gp(0.0, -179.5)?, Meters::new_unchecked(100_000.0))?,
+            Location::circle(gp(89.5, 170.0)?, Meters::new_unchecked(60_000.0))?,
+            Location::circle(gp(0.0, 168.0)?, Meters::new_unchecked(250_000.0))?,
             Location::one_of(vec![
-                Location::circle(gp(40.5, -73.5)?, Meters(10.0))?,
-                Location::circle(gp(10.0, 10.0)?, Meters(10.0))?,
+                Location::circle(gp(40.5, -73.5)?, Meters::new_unchecked(10.0))?,
+                Location::circle(gp(10.0, 10.0)?, Meters::new_unchecked(10.0))?,
             ])?,
             Location::all_of(vec![
-                Location::circle(gp(40.5, -73.5)?, Meters(50_000.0))?,
-                Location::circle(gp(40.6, -73.4)?, Meters(50_000.0))?,
+                Location::circle(gp(40.5, -73.5)?, Meters::new_unchecked(50_000.0))?,
+                Location::circle(gp(40.6, -73.4)?, Meters::new_unchecked(50_000.0))?,
             ])?,
             Location::Empty,
             Location::Unbounded,
@@ -2722,8 +2757,14 @@ mod tests {
                 name: name.to_owned(),
             })
         };
-        let near = UnresolvedLocation::Resolved(Location::circle(gp(40.5, -73.5)?, Meters(10.0))?);
-        let far = UnresolvedLocation::Resolved(Location::circle(gp(10.0, 10.0)?, Meters(10.0))?);
+        let near = UnresolvedLocation::Resolved(Location::circle(
+            gp(40.5, -73.5)?,
+            Meters::new_unchecked(10.0),
+        )?);
+        let far = UnresolvedLocation::Resolved(Location::circle(
+            gp(10.0, 10.0)?,
+            Meters::new_unchecked(10.0),
+        )?);
         let unresolved = [
             UnresolvedLocation::all_of(vec![reference("lot 12"), near.clone()])?,
             UnresolvedLocation::one_of(vec![reference("lot 12"), near.clone()])?,
@@ -2772,12 +2813,12 @@ mod tests {
         fn prop_cap_bounding_rects_cover_wgs84_rim(
             lat in -89.9f64..=89.9,
             lon in -180.0f64..=180.0,
-            radius in 1.0f64..=MAX_UNCERTAINTY_RADIUS.0,
+            radius in 1.0f64..=MAX_UNCERTAINTY_RADIUS.get(),
         ) {
             let Ok(center) = GeoPoint::new(lat, lon) else {
                 return Ok(());
             };
-            let rects = cap_bounding_rects(&center, Meters(radius));
+            let rects = cap_bounding_rects(&center, Meters::new_unchecked(radius));
             // A full 1° ring so the extreme-longitude bearing (a stationary point
             // near due-east/west, where any under-coverage surfaces) is bracketed
             // tightly rather than skipped between coarse samples.

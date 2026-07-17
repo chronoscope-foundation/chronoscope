@@ -486,8 +486,8 @@ fn golden_location_one_of_locks_nested_internal_tag() -> Result<()> {
     // `OneOf` nests `Location` values themselves tagged on `type`. Locks
     // that the nesting keeps the tag keys in separate maps.
     let location = Location::one_of(vec![
-        Location::circle(GeoPoint::new(48.8, 2.3)?, Meters(10.0))?,
-        Location::circle(GeoPoint::new(51.5, -0.1)?, Meters(10.0))?,
+        Location::circle(GeoPoint::new(48.8, 2.3)?, Meters::new_unchecked(10.0))?,
+        Location::circle(GeoPoint::new(51.5, -0.1)?, Meters::new_unchecked(10.0))?,
     ])?;
     assert_golden_roundtrip(
         &location,

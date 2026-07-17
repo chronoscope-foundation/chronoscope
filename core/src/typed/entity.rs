@@ -669,7 +669,7 @@ mod tests {
         use crate::geo::{GeoPoint, Meters};
         Ok(UnresolvedLocation::Resolved(Location::circle(
             GeoPoint::new(lat, lon)?,
-            Meters(10.0),
+            Meters::new_unchecked(10.0),
         )?))
     }
 

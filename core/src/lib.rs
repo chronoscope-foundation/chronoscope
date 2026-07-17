@@ -111,7 +111,9 @@ pub use external_ids::{
     ExternalStringIdError, GeoNamesId, GettyTgnId, OhmId, OsmElementType, OsmId, TriggerEventId,
     WikidataEntityId, WikidataIdParseError, WikidataPropertyId,
 };
-pub use geo::{GeoPoint, GeoPointError, Meters, Viewport, ViewportCoordsError, ViewportError};
+pub use geo::{
+    GeoPoint, GeoPointError, Meters, MetersError, Viewport, ViewportCoordsError, ViewportError,
+};
 pub use location::{
     ConflictStatus, Distance, Location, LocationError, LocationReference, UnresolvedLocation,
 };

@@ -467,7 +467,7 @@ impl Facets {
             UnresolvedLocation::Resolved(Location::Circle { center, radius }) => Self {
                 lat: Some(center.lat()),
                 lon: Some(center.lon()),
-                radius_m: Some(radius.0),
+                radius_m: Some(radius.get()),
                 ..Self::default()
             },
             _ => Self::default(),

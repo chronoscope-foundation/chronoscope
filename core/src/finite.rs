@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// An `f64` guaranteed finite — no `NaN`, no `±∞` — with `-0.0` normalized to
 /// `+0.0`. That makes `Eq`, `Ord`, and `Hash` total and honest, so a type built
@@ -28,10 +28,10 @@ impl Finite {
     /// Mint a value already known finite — a geodesic-solver output or
     /// arithmetic over finite values. The `debug_assert` catches a broken
     /// promise in dev; release trusts the caller.
-    pub(crate) fn new_unchecked(value: f64) -> Self {
+    pub(crate) const fn new_unchecked(value: f64) -> Self {
         debug_assert!(
             value.is_finite(),
-            "Finite::new_unchecked on non-finite value: {value}"
+            "Finite::new_unchecked on a non-finite value"
         );
         Self(value + 0.0)
     }
@@ -59,6 +59,17 @@ impl PartialOrd for Finite {
 impl Ord for Finite {
     fn cmp(&self, other: &Self) -> Ordering {
         self.0.total_cmp(&other.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Finite {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = f64::deserialize(deserializer)?;
+        Self::new(value)
+            .ok_or_else(|| serde::de::Error::custom(format!("value must be finite, got {value}")))
     }
 }
 
@@ -103,5 +114,13 @@ mod tests {
         let b = Finite::new(2.0).ok_or("finite")?;
         assert!(a < b);
         Ok(())
+    }
+
+    #[test]
+    fn deserialize_rejects_non_finite_wire_value() {
+        // serde_json parses 1e400 as f64::INFINITY (or errors); either way the
+        // wire value is rejected. A finite number round-trips.
+        assert!(serde_json::from_str::<Finite>("1e400").is_err());
+        assert!(serde_json::from_str::<Finite>("1.5").is_ok());
     }
 }

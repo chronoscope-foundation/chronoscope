@@ -215,7 +215,10 @@ pub fn n_circle_location(n: usize) -> Result<UnresolvedLocation, TestError> {
     let mut circles = Vec::with_capacity(n);
     for i in 0..n {
         let lon = -120.0 + i as f64 * 0.01;
-        circles.push(Location::circle(GeoPoint::new(0.0, lon)?, Meters(1.0))?);
+        circles.push(Location::circle(
+            GeoPoint::new(0.0, lon)?,
+            Meters::new_unchecked(1.0),
+        )?);
     }
     Ok(UnresolvedLocation::Resolved(Location::one_of(circles)?))
 }
@@ -404,7 +407,7 @@ pub fn construction_circle_at(
                 entity: EntityIdx(entity_idx),
                 location: UnresolvedLocation::Resolved(Location::circle(
                     GeoPoint::new(lat, lon)?,
-                    Meters(radius_m),
+                    Meters::new_unchecked(radius_m),
                 )?),
             },
         },
@@ -498,7 +501,7 @@ pub fn captured_location_at(
                 image: ImageIdx(image_idx),
                 location: UnresolvedLocation::Resolved(Location::circle(
                     GeoPoint::new(lat, lon)?,
-                    Meters(radius_m),
+                    Meters::new_unchecked(radius_m),
                 )?),
             },
         },

@@ -195,7 +195,10 @@ mod extract {
         });
 
         let result = GeoPoint::new(coord.latitude, coord.longitude).map(|center| match radius_m {
-            Some(r) => Location::circle(center, Meters(r)),
+            Some(r) => match Meters::try_new(r) {
+                Ok(m) => Location::circle(center, m).map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            },
             None => Ok(Location::point(center)),
         });
 
@@ -989,9 +992,9 @@ mod tests {
             return Err("near-pole coordinate must keep a finite-radius circle".into());
         };
         assert!(
-            radius.0.is_finite() && (100_000.0..120_000.0).contains(&radius.0),
+            radius.get().is_finite() && (100_000.0..120_000.0).contains(&radius.get()),
             "1° of meridian near the pole is ~111.7 km, got {}m",
-            radius.0
+            radius.get()
         );
         Ok(())
     }
@@ -1018,7 +1021,7 @@ mod tests {
         if let UnresolvedLocation::Resolved(Location::Circle { radius, .. }) = loc {
             // Meridian arc of 1° latitude on WGS84 ≈ 110.6–111.7 km across
             // latitudes (≈ 111.4 km at 60°N), so the radius lands in this band.
-            let radius_m = radius.0;
+            let radius_m = radius.get();
             assert!(
                 radius_m > 100_000.0,
                 "1° of WGS84 meridian is ~111 km, got {radius_m}m"

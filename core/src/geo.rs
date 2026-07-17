@@ -79,7 +79,7 @@ impl GeoPoint {
 
     /// The WGS84 geodesic distance to another point (Karney's inverse solution).
     fn distance(&self, other: &GeoPoint) -> Meters {
-        Meters(Geodesic::wgs84().inverse(
+        Meters::new_unchecked(Geodesic::wgs84().inverse(
             self.lat.get(),
             self.lon.get(),
             other.lat.get(),
@@ -365,9 +365,9 @@ impl Viewport {
     pub(crate) fn geodesic_distance_to(&self, p: &GeoPoint) -> Meters {
         let mut best = f64::INFINITY;
         for half in self.halves() {
-            best = best.min(half.geodesic_distance_to(p).0);
+            best = best.min(half.geodesic_distance_to(p).get());
         }
-        Meters(best)
+        Meters::new_unchecked(best)
     }
 }
 
@@ -473,12 +473,12 @@ impl IndexRect {
     /// those three candidates cover every case.
     fn geodesic_distance_to(&self, p: &GeoPoint) -> Meters {
         if self.contains_point(p.lat(), p.lon()) {
-            return Meters(0.0);
+            return Meters::new_unchecked(0.0);
         }
         let mut best = f64::INFINITY;
         let lon = self.nearest_lon(p.lon());
         for lat in [self.min_lat, self.max_lat] {
-            best = best.min(p.distance(&GeoPoint::from_wgs84(lat, lon)).0);
+            best = best.min(p.distance(&GeoPoint::from_wgs84(lat, lon)).get());
         }
         let a = p.lat().to_radians().sin();
         for lon in [self.min_lon, self.max_lon] {
@@ -489,10 +489,10 @@ impl IndexRect {
                 self.min_lat,
                 self.max_lat,
             ] {
-                best = best.min(p.distance(&GeoPoint::from_wgs84(lat, lon)).0);
+                best = best.min(p.distance(&GeoPoint::from_wgs84(lat, lon)).get());
             }
         }
-        Meters(best)
+        Meters::new_unchecked(best)
     }
 }
 
@@ -507,7 +507,7 @@ pub(crate) fn cap_bounding_rects(center: &GeoPoint, radius: Meters) -> Vec<Index
     // predicate accepts out to — so the rects and the predicate share one
     // rim definition.
     let cap = Circle::new(*center, radius);
-    let r_m = cap.effective_radius().0;
+    let r_m = cap.effective_radius().get();
     // Latitude: the disk's poleward extent is reached by a meridian geodesic, so
     // bound it by the shortest WGS84 meridian degree — the equatorial one,
     // `M(0)·π/180 = a(1−e²)·π/180`, derived from the ellipsoid the library ships.
@@ -587,14 +587,56 @@ pub(crate) fn cap_bounding_rects(center: &GeoPoint, radius: Meters) -> Vec<Index
 /// unit in the type keeps `_m`-suffixed names off the call surface and stops a
 /// raw `f64` being passed where a meter count is meant.
 ///
-/// No smart constructor yet — callers that need a finite, non-negative value
-/// (e.g. [`crate::location::Location::circle`]) validate `.0` themselves. No
-/// `Ord`: equal-value comparison flows through `f64::total_cmp` on `.0` at the
-/// few sites that order meter-bearing values.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// The inner value is a [`Finite`]: finite by construction with `-0.0`
+/// normalized, so `Eq`/`Hash`/`Ord` derive honestly for the meter-bearing types
+/// (a circle radius) that reach `BTreeSet<SubmitFact>`. [`try_new`](Meters::try_new)
+/// validates an untrusted `f64` at the boundary; the typed interior mints from
+/// trusted arithmetic with [`new_unchecked`](Meters::new_unchecked).
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct Meters(pub f64);
+pub struct Meters(Finite);
+
+impl Meters {
+    /// A meter value known finite by construction — a geodesic-solver output,
+    /// arithmetic over finite values, or a literal. `debug_assert` catches a
+    /// broken promise in dev.
+    pub(crate) const fn new_unchecked(value: f64) -> Self {
+        Self(Finite::new_unchecked(value))
+    }
+
+    /// A meter value from an untrusted `f64` (external input crossing into the
+    /// typed interior); `Err` when it is not finite.
+    pub fn try_new(value: f64) -> Result<Self, MetersError> {
+        Finite::new(value)
+            .map(Self)
+            .ok_or(MetersError::NonFinite { value })
+    }
+
+    /// The wrapped meter count.
+    pub fn get(self) -> f64 {
+        self.0.get()
+    }
+}
+
+/// Errors from [`Meters::try_new`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetersError {
+    /// The value was not finite.
+    NonFinite { value: f64 },
+}
+
+impl std::fmt::Display for MetersError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite { value } => write!(f, "meter value must be finite, got {value}"),
+        }
+    }
+}
+
+impl std::error::Error for MetersError {}
 
 // ============================================================================
 // Circle
@@ -643,15 +685,15 @@ fn circle_crossings(c1: GeoPoint, r1: Meters, c2: GeoPoint, r2: Meters) -> Vec<G
     let (lat1, lon1) = (c1.lat(), c1.lon());
     let (lat2, lon2) = (c2.lat(), c2.lon());
     let (d, azi12, _, _): (f64, f64, f64, f64) = geod.inverse(lat1, lon1, lat2, lon2);
-    if d > r1.0 + r2.0 || d < (r1.0 - r2.0).abs() || d < 1e-9 {
+    if d > r1.get() + r2.get() || d < (r1.get() - r2.get()).abs() || d < 1e-9 {
         return Vec::new();
     }
     // Signed miss of the rim point at bearing `azi12 + α`: its WGS84 distance to
     // `c2` less `r2`. Negative inside `c2`'s circle, positive outside.
     let g = |alpha_deg: f64| -> f64 {
-        let (plat, plon): (f64, f64) = geod.direct(lat1, lon1, azi12 + alpha_deg, r1.0);
+        let (plat, plon): (f64, f64) = geod.direct(lat1, lon1, azi12 + alpha_deg, r1.get());
         let dist: f64 = geod.inverse(plat, plon, lat2, lon2);
-        dist - r2.0
+        dist - r2.get()
     };
     // Bisect the one root on `[lo, hi]`: `g(0) ≤ 0` and `g(±180) ≥ 0`, so the
     // invariant `g(lo) ≤ 0 < g(hi)` holds and 60 halvings pin the crossing.
@@ -664,7 +706,7 @@ fn circle_crossings(c1: GeoPoint, r1: Meters, c2: GeoPoint, r2: Meters) -> Vec<G
                 hi = mid;
             }
         }
-        let (plat, plon): (f64, f64) = geod.direct(lat1, lon1, azi12 + (lo + hi) * 0.5, r1.0);
+        let (plat, plon): (f64, f64) = geod.direct(lat1, lon1, azi12 + (lo + hi) * 0.5, r1.get());
         GeoPoint::from_wgs84(plat, plon)
     };
     vec![solve(0.0, 180.0), solve(0.0, -180.0)]
@@ -684,7 +726,7 @@ impl Circle {
     /// The cap's meter tolerance: a relative slop that grows with the radius,
     /// plus a fixed floor.
     fn tol(&self) -> Meters {
-        Meters(self.radius.0 * CAP_TOL_REL + CAP_TOL_ABS_M)
+        Meters::new_unchecked(self.radius.get() * CAP_TOL_REL + CAP_TOL_ABS_M)
     }
 
     /// Plain rim-inclusive membership: the geodesic distance from the center to
@@ -700,21 +742,21 @@ impl Circle {
     /// definition, so a tolerance-band acceptance can never fall outside the
     /// stored rects.
     fn effective_radius(&self) -> Meters {
-        Meters(self.radius.0 + self.tol().0)
+        Meters::new_unchecked(self.radius.get() + self.tol().get())
     }
 
     /// Whether a point at `distance` from the cap's center lies in the cap —
     /// [`covers`](Self::covers) with the distance supplied by the caller, for
     /// geometry (nearest-point-of-a-region tests) that computes it elsewhere.
     pub(crate) fn covers_within(&self, distance: Meters) -> bool {
-        distance.0 <= self.effective_radius().0
+        distance.get() <= self.effective_radius().get()
     }
 
     /// Whether this cap contains `other` entirely: the centers' separation plus
     /// `other`'s radius fits within this radius, up to the tolerance.
     pub fn contains(&self, other: &Circle) -> bool {
-        let between = self.center.distance(&other.center).0;
-        between + other.radius.0 <= self.radius.0 + self.tol().0
+        let between = self.center.distance(&other.center).get();
+        between + other.radius.get() <= self.radius.get() + self.tol().get()
     }
 
     /// The WGS84 crossing points of two caps' bounding circles: zero (disjoint,
@@ -741,7 +783,7 @@ impl Circle {
         if d < 1e-9 {
             return None;
         }
-        let t = ((d + self.radius.0 - other.radius.0) * 0.5).clamp(0.0, d);
+        let t = ((d + self.radius.get() - other.radius.get()) * 0.5).clamp(0.0, d);
         let (plat, plon): (f64, f64) = geod.direct(lat1, lon1, azi12, t);
         Some(GeoPoint::from_wgs84(plat, plon))
     }
@@ -937,7 +979,10 @@ mod tests {
     // model removes.
 
     fn cap(lat: f64, lon: f64, radius_m: f64) -> Result<Circle, GeoPointError> {
-        Ok(Circle::new(GeoPoint::new(lat, lon)?, Meters(radius_m)))
+        Ok(Circle::new(
+            GeoPoint::new(lat, lon)?,
+            Meters::new_unchecked(radius_m),
+        ))
     }
 
     #[test]
@@ -947,7 +992,7 @@ mod tests {
         // sphere's uniform 111.19 km.
         let a = GeoPoint::new(0.0, 0.0)?;
         let b = GeoPoint::new(1.0, 0.0)?;
-        let d = a.distance(&b).0;
+        let d = a.distance(&b).get();
         assert!((d - 110_574.4).abs() < 1.0, "got {d}");
         Ok(())
     }
@@ -958,7 +1003,7 @@ mod tests {
         // degenerate — the regime where naive great-circle code returns NaN.
         let a = GeoPoint::new(0.0, 0.0)?;
         let b = GeoPoint::new(0.0, 180.0)?;
-        let d = a.distance(&b).0;
+        let d = a.distance(&b).get();
         assert!(d.is_finite(), "antipodal distance must be finite");
         // Equatorial antipodes connect over the pole on an oblate ellipsoid, so
         // this is the pole-to-pole (half-meridian) distance, not the equatorial
@@ -970,7 +1015,7 @@ mod tests {
     #[test]
     fn distance_coincident_is_zero() -> TestResult {
         let a = GeoPoint::new(12.3, 45.6)?;
-        assert!(a.distance(&a).0.abs() < 1e-6);
+        assert!(a.distance(&a).get().abs() < 1e-6);
         Ok(())
     }
 
@@ -1072,8 +1117,14 @@ mod tests {
         let pts = a.boundary_intersections(&b);
         assert_eq!(pts.len(), 2, "overlapping caps meet at two points");
         for p in &pts {
-            assert!((a.center().distance(p).0 - r).abs() < 1e-2, "on a's rim");
-            assert!((b.center().distance(p).0 - r).abs() < 1e-2, "on b's rim");
+            assert!(
+                (a.center().distance(p).get() - r).abs() < 1e-2,
+                "on a's rim"
+            );
+            assert!(
+                (b.center().distance(p).get() - r).abs() < 1e-2,
+                "on b's rim"
+            );
         }
         Ok(())
     }
@@ -1089,8 +1140,14 @@ mod tests {
         let pts = a.boundary_intersections(&b);
         assert_eq!(pts.len(), 2, "small overlapping caps meet at two points");
         for p in &pts {
-            assert!((a.center().distance(p).0 - r).abs() < 1e-2, "on a's rim");
-            assert!((b.center().distance(p).0 - r).abs() < 1e-2, "on b's rim");
+            assert!(
+                (a.center().distance(p).get() - r).abs() < 1e-2,
+                "on a's rim"
+            );
+            assert!(
+                (b.center().distance(p).get() - r).abs() < 1e-2,
+                "on b's rim"
+            );
         }
         Ok(())
     }
@@ -1104,14 +1161,14 @@ mod tests {
         // locus — within centimeters on these ~80 km rims.
         let center_a = GeoPoint::new(40.0, -74.0)?;
         let center_b = GeoPoint::new(41.5, -74.0)?;
-        let d = center_a.distance(&center_b).0;
+        let d = center_a.distance(&center_b).get();
         let r_a = 80_000.0;
-        let a = Circle::new(center_a, Meters(r_a));
-        let b = Circle::new(center_b, Meters(d - r_a + 1e-9));
+        let a = Circle::new(center_a, Meters::new_unchecked(r_a));
+        let b = Circle::new(center_b, Meters::new_unchecked(d - r_a + 1e-9));
         let pts = a.boundary_intersections(&b);
         assert_eq!(pts.len(), 2, "near-tangent caps meet");
         assert!(
-            pts[0].distance(&pts[1]).0 < 1e-1,
+            pts[0].distance(&pts[1]).get() < 1e-1,
             "the two crossings collapse toward the tangent locus"
         );
         Ok(())
@@ -1140,8 +1197,14 @@ mod tests {
     #[test]
     fn viewport_distance_zero_inside_and_on_edges() -> TestResult {
         let b = sample_box()?;
-        assert_eq!(b.geodesic_distance_to(&GeoPoint::new(40.5, -73.5)?).0, 0.0);
-        assert_eq!(b.geodesic_distance_to(&GeoPoint::new(40.0, -74.0)?).0, 0.0);
+        assert_eq!(
+            b.geodesic_distance_to(&GeoPoint::new(40.5, -73.5)?).get(),
+            0.0
+        );
+        assert_eq!(
+            b.geodesic_distance_to(&GeoPoint::new(40.0, -74.0)?).get(),
+            0.0
+        );
         Ok(())
     }
 
@@ -1151,7 +1214,7 @@ mod tests {
         // point sits on the lon = -73 edge at ~the same latitude, ≈ 0.5° of
         // longitude at 40.5°N ≈ 42.4 km on Geodesic::wgs84().
         let b = sample_box()?;
-        let d = b.geodesic_distance_to(&GeoPoint::new(40.5, -72.5)?).0;
+        let d = b.geodesic_distance_to(&GeoPoint::new(40.5, -72.5)?).get();
         let expect: f64 = Geodesic::wgs84().inverse(40.5, -72.5, 40.5, -73.0);
         assert!((d - expect).abs() < 100.0, "got {d}, expected ≈{expect}");
         Ok(())
@@ -1162,7 +1225,7 @@ mod tests {
         // 1° north of the north edge, longitude inside the arc: one degree of
         // WGS84 meridian arc at ~41°N ≈ 111.06 km.
         let b = sample_box()?;
-        let d = b.geodesic_distance_to(&GeoPoint::new(42.0, -73.5)?).0;
+        let d = b.geodesic_distance_to(&GeoPoint::new(42.0, -73.5)?).get();
         let expect: f64 = Geodesic::wgs84().inverse(42.0, -73.5, 41.0, -73.5);
         assert!((d - expect).abs() < 1.0, "got {d}, expected ≈{expect}");
         Ok(())
@@ -1175,8 +1238,8 @@ mod tests {
         let b = sample_box()?;
         let p = GeoPoint::new(42.0, -72.0)?;
         let corner = GeoPoint::new(41.0, -73.0)?;
-        let d = b.geodesic_distance_to(&p).0;
-        let direct = p.distance(&corner).0;
+        let d = b.geodesic_distance_to(&p).get();
+        let direct = p.distance(&corner).get();
         assert!((d - direct).abs() < 1.0, "got {d}, corner at {direct}");
         Ok(())
     }
@@ -1186,12 +1249,15 @@ mod tests {
         // A wrapped box `[170°E .. 170°W]`; a point at 168°E is 2° of
         // longitude from the west edge, not 358° the long way round.
         let b = Viewport::new(GeoPoint::new(0.0, 170.0)?, GeoPoint::new(10.0, -170.0)?)?;
-        let d = b.geodesic_distance_to(&GeoPoint::new(5.0, 168.0)?).0;
+        let d = b.geodesic_distance_to(&GeoPoint::new(5.0, 168.0)?).get();
         // Nearest point is (5, 170) on the west edge — 2° of longitude at 5°N.
         let expect: f64 = Geodesic::wgs84().inverse(5.0, 168.0, 5.0, 170.0);
         assert!((d - expect).abs() < 100.0, "got {d}, expected ≈{expect}");
         // A point just across the seam is inside.
-        assert_eq!(b.geodesic_distance_to(&GeoPoint::new(5.0, -175.0)?).0, 0.0);
+        assert_eq!(
+            b.geodesic_distance_to(&GeoPoint::new(5.0, -175.0)?).get(),
+            0.0
+        );
         Ok(())
     }
 
@@ -1201,7 +1267,7 @@ mod tests {
         // at a distant longitude is ~0.5° (≈ 55.6 km) away through the pole,
         // not a quarter of the globe around the parallel.
         let b = Viewport::new(GeoPoint::new(89.0, 0.0)?, GeoPoint::new(90.0, 10.0)?)?;
-        let d = b.geodesic_distance_to(&GeoPoint::new(89.5, 170.0)?).0;
+        let d = b.geodesic_distance_to(&GeoPoint::new(89.5, 170.0)?).get();
         // The pole corner (90, 10) is the nearest point: 0.5° of meridian
         // through the pole, ≈ 55.8 km on Geodesic::wgs84().
         let expect: f64 = Geodesic::wgs84().inverse(89.5, 170.0, 90.0, 10.0);
@@ -1220,10 +1286,10 @@ mod tests {
         let p = GeoPoint::new(0.0, 120.0)?;
         let ne_corner = GeoPoint::new(1.0, 10.0)?;
         let equatorial = GeoPoint::new(0.0, 10.0)?;
-        let d = b.geodesic_distance_to(&p).0;
-        let direct = p.distance(&ne_corner).0;
+        let d = b.geodesic_distance_to(&p).get();
+        let direct = p.distance(&ne_corner).get();
         assert!(
-            direct < p.distance(&equatorial).0,
+            direct < p.distance(&equatorial).get(),
             "past 90° the higher corner is closer"
         );
         assert!((d - direct).abs() < 1.0, "got {d}, corner at {direct}");
@@ -1247,7 +1313,10 @@ mod tests {
 
     #[test]
     fn cap_rects_mid_latitude_padded_by_wgs84_meridian() -> TestResult {
-        let rects = cap_bounding_rects(&GeoPoint::new(60.0, 10.0)?, Meters(100_000.0));
+        let rects = cap_bounding_rects(
+            &GeoPoint::new(60.0, 10.0)?,
+            Meters::new_unchecked(100_000.0),
+        );
         assert_eq!(rects.len(), 1);
         let r = rects[0];
         // The poleward edges cover the disk's true meridian extent (the due
@@ -1272,7 +1341,10 @@ mod tests {
 
     #[test]
     fn cap_rects_split_at_the_antimeridian() -> TestResult {
-        let rects = cap_bounding_rects(&GeoPoint::new(0.0, 179.5)?, Meters(100_000.0));
+        let rects = cap_bounding_rects(
+            &GeoPoint::new(0.0, 179.5)?,
+            Meters::new_unchecked(100_000.0),
+        );
         assert_eq!(rects.len(), 2, "seam-crossing cap covers both sides");
         // One half ends at 180, the other starts at -180.
         assert!(
@@ -1294,7 +1366,10 @@ mod tests {
 
     #[test]
     fn cap_rects_over_the_pole_span_every_longitude() -> TestResult {
-        let rects = cap_bounding_rects(&GeoPoint::new(89.5, 42.0)?, Meters(100_000.0));
+        let rects = cap_bounding_rects(
+            &GeoPoint::new(89.5, 42.0)?,
+            Meters::new_unchecked(100_000.0),
+        );
         assert_eq!(rects.len(), 1);
         let r = rects[0];
         assert_eq!((r.min_lon, r.max_lon), (-180.0, 180.0));

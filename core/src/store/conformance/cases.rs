@@ -3067,11 +3067,11 @@ pub async fn construction_location_accepted<S: FactStore>(store: S) -> TestResul
 pub async fn disjoint_conjunction_location_rejected<S: FactStore>(store: S) -> TestResult {
     let paris = UnresolvedLocation::Resolved(Location::circle(
         GeoPoint::new(48.8566, 2.3522)?,
-        Meters(1000.0),
+        Meters::new_unchecked(1000.0),
     )?);
     let tokyo = UnresolvedLocation::Resolved(Location::circle(
         GeoPoint::new(35.6762, 139.6503)?,
-        Meters(1000.0),
+        Meters::new_unchecked(1000.0),
     )?);
     let disjoint = UnresolvedLocation::all_of(vec![paris, tokyo])?;
     let errs = commit_err(
@@ -3093,7 +3093,7 @@ pub async fn disjoint_conjunction_location_rejected<S: FactStore>(store: S) -> T
 pub async fn pending_conjunction_location_accepted<S: FactStore>(store: S) -> TestResult {
     let circle = UnresolvedLocation::Resolved(Location::circle(
         GeoPoint::new(40.0, -74.0)?,
-        Meters(1000.0),
+        Meters::new_unchecked(1000.0),
     )?);
     let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
         name: "Paris".to_owned(),
@@ -3111,11 +3111,11 @@ pub async fn pending_conjunction_location_accepted<S: FactStore>(store: S) -> Te
 pub async fn consistent_conjunction_location_accepted<S: FactStore>(store: S) -> TestResult {
     let a = UnresolvedLocation::Resolved(Location::circle(
         GeoPoint::new(40.0, -74.0)?,
-        Meters(5000.0),
+        Meters::new_unchecked(5000.0),
     )?);
     let b = UnresolvedLocation::Resolved(Location::circle(
         GeoPoint::new(40.005, -74.0)?,
-        Meters(5000.0),
+        Meters::new_unchecked(5000.0),
     )?);
     let consistent = UnresolvedLocation::all_of(vec![a, b])?;
     commit_ok(
@@ -4249,7 +4249,10 @@ pub async fn walk_entity_classes_in_viewport_surfaces_conjunction_with_unresolve
             UnresolvedLocation::Reference(LocationReference::NamedPlace {
                 name: "lot 12".to_owned(),
             }),
-            UnresolvedLocation::Resolved(Location::circle(GeoPoint::new(lat, lon)?, Meters(10.0))?),
+            UnresolvedLocation::Resolved(Location::circle(
+                GeoPoint::new(lat, lon)?,
+                Meters::new_unchecked(10.0),
+            )?),
         ])?)
     };
 

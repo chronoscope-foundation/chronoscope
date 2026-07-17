@@ -74,7 +74,7 @@ fn resolved_point(
 ) -> Result<UnresolvedLocation, Box<dyn std::error::Error + Send + Sync>> {
     Ok(UnresolvedLocation::Resolved(Location::circle(
         GeoPoint::new(lat, lon)?,
-        Meters(10.0),
+        Meters::try_new(10.0)?,
     )?))
 }
 
