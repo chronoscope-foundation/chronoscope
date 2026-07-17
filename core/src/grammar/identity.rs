@@ -170,7 +170,7 @@ fn check_distinct<Id: PartialEq>(a: Id, b: Id) -> Result<(Id, Id), SelfPairError
 ///
 /// `Deserialize` routes through the constructor (via
 /// [`serde(try_from)`](https://serde.rs/container-attrs.html#try_from) over
-/// [`OrderedPairMirror`]), so a wire payload lands canonical-ordered and a
+/// `OrderedPairMirror`), so a wire payload lands canonical-ordered and a
 /// self-equivalence is rejected at parse time. The mirror copies the derived
 /// `{a, b}` serialize shape, so the two directions can't drift.
 #[derive(
@@ -276,7 +276,7 @@ impl<Id: Ord> OrderedDistinctPair<Id> {
 ///
 /// `Deserialize` routes through the constructor (via
 /// [`serde(try_from)`](https://serde.rs/container-attrs.html#try_from) over
-/// [`DistinctPairMirror`]), so a wire `from == to` is rejected at parse time.
+/// `DistinctPairMirror`), so a wire `from == to` is rejected at parse time.
 /// The mirror copies the derived `{from, to}` shape, so the two directions
 /// can't drift.
 #[derive(

@@ -29,7 +29,7 @@
 //!
 //! `with_tx` holds the `Inner` mutex guard for the whole closure — the
 //! writer serialisation, mirroring a SQL write lock. [`MemoryTx`] sees the
-//! committed state under that guard plus the [`Pending`] overlay of
+//! committed state under that guard plus the `Pending` overlay of
 //! everything the transaction staged: facts, minted counters, backlink /
 //! reverse-retraction edges, and the metadata and cached results of commits
 //! recorded so far. Reads through the handle union the two, so the match →
@@ -42,7 +42,7 @@
 //! transaction). Here those futures are always ready — the overlay is owned
 //! state read on the same task — so the held lock never serialises real I/O.
 //!
-//! `Inner` is mutated only at [`apply_pending`], once per transaction, when
+//! `Inner` is mutated only at `apply_pending`, once per transaction, when
 //! the `with_tx` closure returns `Ok`. A closure that returns `Err` or
 //! panics drops the [`MemoryTx`] — overlay and all — leaving `Inner`
 //! untouched, with no rollback path because nothing was mutated. The
@@ -524,8 +524,8 @@ trait CoreSource {
 ///
 /// Holds a store borrow plus a frozen exclusive-upper-bound snapshot; every
 /// lookup is filtered to `id < snapshot()`. Awaits the inner mutex per
-/// [`CoreSource::with_core`] call (committed state only — no pending). The
-/// snapshot is stored, so [`CoreSource::snapshot`] reads it lock-free.
+/// `CoreSource::with_core` call (committed state only — no pending). The
+/// snapshot is stored, so `CoreSource::snapshot` reads it lock-free.
 #[derive(Debug)]
 pub struct MemorySource<'a> {
     store: &'a MemoryFactStore,
@@ -650,7 +650,7 @@ impl Pending {
 /// `with_tx` holds the store's `Inner` guard for the whole closure (the
 /// writer serialisation: readers block until the transaction ends, mirroring
 /// a SQL write lock); the handle carries a shared borrow of that committed
-/// state plus an exclusive borrow of the [`Pending`] overlay. Reads union
+/// state plus an exclusive borrow of the `Pending` overlay. Reads union
 /// the two; mints, staging, and commit recording accumulate in the overlay,
 /// leaving `Inner` untouched until `with_tx` applies on `Ok`.
 ///
@@ -666,7 +666,7 @@ impl Pending {
 ///
 /// Cross-instance misuse is a compile error — see
 /// `CrossInstanceBrandIsCompileError` below for the `compile_fail` doctest,
-/// and [`tests::two_commits_share_one_with_tx_brand`] for the positive
+/// and `tests::two_commits_share_one_with_tx_brand` for the positive
 /// intra-store check.
 pub struct MemoryTx<'brand> {
     committed: &'brand Inner,

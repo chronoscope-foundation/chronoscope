@@ -24,8 +24,8 @@ pub fn content_hash(body: &Bytes) -> Vec<u8> {
 
 /// Generate a thumbnail from an image.
 ///
-/// Resizes the image so the longest edge is at most [`THUMBNAIL_SIZE`] pixels,
-/// then encodes as JPEG with quality [`THUMBNAIL_QUALITY`]. Always JPEG, so the
+/// Resizes the image so the longest edge is at most `THUMBNAIL_SIZE` pixels,
+/// then encodes as JPEG with quality `THUMBNAIL_QUALITY`. Always JPEG, so the
 /// key produced by [`thumbnail_key`] matches the encoded bytes' format.
 ///
 /// # Errors

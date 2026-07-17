@@ -89,7 +89,7 @@ impl std::fmt::Display for LocationRole {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SubmitError<EntId, EvtId, ImgId> {
-    /// An [`EntityIdx`](super::EntityIdx) inside a fact pointed
+    /// An [`EntityIdx`] inside a fact pointed
     /// past the end of the bundle's entity declarations.
     #[error("EntityIdx({idx}) out of range; bundle has {decl_count} entity declarations")]
     EntityIdxOutOfRange {
@@ -99,7 +99,7 @@ pub enum SubmitError<EntId, EvtId, ImgId> {
         /// the commit bundle.
         decl_count: usize,
     },
-    /// An [`EventIdx`](super::EventIdx) inside a fact pointed past
+    /// An [`EventIdx`] inside a fact pointed past
     /// the end of the bundle's event declarations.
     #[error("EventIdx({idx}) out of range; bundle has {decl_count} event declarations")]
     EventIdxOutOfRange {
@@ -109,7 +109,7 @@ pub enum SubmitError<EntId, EvtId, ImgId> {
         /// the commit bundle.
         decl_count: usize,
     },
-    /// An [`ImageIdx`](super::ImageIdx) inside a fact pointed past
+    /// An [`ImageIdx`] inside a fact pointed past
     /// the end of the bundle's image declarations.
     #[error("ImageIdx({idx}) out of range; bundle has {decl_count} image declarations")]
     ImageIdxOutOfRange {
@@ -123,7 +123,7 @@ pub enum SubmitError<EntId, EvtId, ImgId> {
     /// store at submit time — a typo'd or not-yet-minted id.
     ///
     /// `decl_position` is the index into the bundle's `entities` list (the
-    /// [`EntityIdx`](super::EntityIdx) naming this decl).
+    /// [`EntityIdx`] naming this decl).
     #[error("Decl::Existing entity at decl position {decl_position:?} not found in store")]
     UnknownExistingEntity {
         /// Position of the offending decl in `Commit::entities`.

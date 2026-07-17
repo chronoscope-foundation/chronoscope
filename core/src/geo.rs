@@ -9,9 +9,9 @@
 //!   a wrap convention for antimeridian-crossing spans; [`IndexRect`] is its
 //!   non-wrapping half, the shape spatial-index rows store.
 //! - [`Meters`] is a meter-valued scalar — a WGS84 geodesic distance or radius.
-//! - [`SpherePoint`] / [`SphereCap`] are the compute-side primitives: a
+//! - `SpherePoint` / `SphereCap` are the compute-side primitives: a
 //!   direction and a cap (disk) about it. Distance and membership are WGS84
-//!   ([`SpherePoint::distance`] routes through [`geographiclib_rs`]); the unit
+//!   (`SpherePoint::distance` routes through [`geographiclib_rs`]); the unit
 //!   sphere serves only as the scaffold for the cap-cap boundary solve, which
 //!   has no ellipsoidal closed form. They are never serialized.
 
@@ -423,7 +423,7 @@ fn lon_gap(a: f64, b: f64) -> f64 {
 /// meaningful); stored raw, that convention reads as an empty interval
 /// matching nothing. Keeping the index-row shape a separate type forces
 /// every region and viewport through the seam split ([`Viewport::halves`], the
-/// split rects of [`cap_bounding_rects`]) before it can touch the index — a
+/// split rects of `cap_bounding_rects`) before it can touch the index — a
 /// wrapping span can't silently become an unmatchable row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IndexRect {

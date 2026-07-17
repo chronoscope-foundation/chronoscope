@@ -157,7 +157,7 @@ fn validate_facts_db_source(source: &Path, subset: &str) -> Result<(), DevServer
 }
 
 /// Resolve [`FACTS_DB_ENV`], validate the named artifact
-/// ([`validate_facts_db_source`]), and clone it into `dest_dir`, returning
+/// (`validate_facts_db_source`), and clone it into `dest_dir`, returning
 /// the clone's `sqlite:` URL for [`DevServerConfig::database_url`]. The
 /// server opens the clone read-write as its whole database — facts plus
 /// mutable test data on top. `subset` names the fetch to run in every

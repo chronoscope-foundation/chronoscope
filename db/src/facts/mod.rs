@@ -27,12 +27,12 @@
 //! statement, not at BEGIN — the fact-id bound is the semantic snapshot.
 //! Retraction resolves through the backend-shared fixpoint in
 //! [`chronoscope_core::store::retraction`] over edges fetched by recursive
-//! CTE — see [`read`] for the shapes.
+//! CTE — see the `read` module for the shapes.
 //!
 //! Representatives and classes read the append-only `subject_reps` log: one
 //! descending seek resolves any member at any snapshot (no row = self), and
 //! the reverse gather answers a whole class. The log is maintained at write
-//! time ([`maintain`]) — staging an identity edge logs the merge it
+//! time (the `maintain` module) — staging an identity edge logs the merge it
 //! performs, staging a retraction that touches identity edges recomputes
 //! the affected components — so historical views cost the same one seek as
 //! now. The class-stream walks (`walk_entity_classes`,

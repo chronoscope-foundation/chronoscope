@@ -2,7 +2,8 @@
 //!
 //! Provides typed access to the Wikidata Action API, SPARQL endpoint, and
 //! Wikimedia Commons. Generic over [`HttpClient`] so tests can use
-//! [`CachingClient`] or [`MockHttpClient`] without hitting the network.
+//! [`CachingClient`](crate::http::CachingClient) or `MockHttpClient` without
+//! hitting the network.
 //!
 //! # Example
 //!

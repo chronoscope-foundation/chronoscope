@@ -1,7 +1,7 @@
 //! Cursor pagination as a stream, and the backend-shared page cutters.
 //!
 //! A [`FactStore`](crate::store::FactStore) backlink or class read comes
-//! back one page at a time behind a cursor. [`paginate`] turns any such read
+//! back one page at a time behind a cursor. `paginate` turns any such read
 //! into a flat [`TryStream`] of rows, leaving the terminal choice — collect,
 //! fold, count — to each caller's own stream combinators.
 //!

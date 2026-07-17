@@ -46,10 +46,10 @@ impl Database {
     /// that makes content-based deduplication unreliable, and preserving the 1:1
     /// URL→page relationship maintains clear provenance.
     ///
-    /// Compare with [`get_or_create_media`], which *does* deduplicate by content hash
+    /// Compare with [`Database::get_or_create_media`], which *does* deduplicate by content hash
     /// since identical images/videos are truly identical regardless of source URL.
     ///
-    /// After creating a page, call [`mark_url_resolved_to_page`] to link the
+    /// After creating a page, call [`Database::mark_url_resolved_to_page`] to link the
     /// research URL to this page.
     ///
     /// This is transactional: either everything succeeds or nothing is committed.
@@ -128,7 +128,7 @@ impl Database {
 
     /// Create new media or return existing if hash matches.
     ///
-    /// Unlike [`create_page`], this *does* deduplicate: if media with the same
+    /// Unlike [`Database::create_page`], this *does* deduplicate: if media with the same
     /// `exact_hash` already exists, the existing media ID is returned instead of
     /// creating a duplicate. This makes sense for media because identical bytes
     /// are truly identical regardless of which URL they came from - the same
@@ -137,7 +137,7 @@ impl Database {
     /// This means multiple research URLs can resolve to the same media record
     /// (N:1 relationship), whereas pages are always 1:1 with their source URL.
     ///
-    /// After getting/creating media, call [`mark_url_resolved_to_media`] to link
+    /// After getting/creating media, call [`Database::mark_url_resolved_to_media`] to link
     /// the research URL to this media.
     ///
     /// Uses `ON CONFLICT DO UPDATE SET id = id RETURNING id` to atomically

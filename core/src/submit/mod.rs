@@ -130,7 +130,7 @@ pub enum Decl<Id> {
 // ============================================================================
 
 /// A submission-side factual assertion. The same
-/// [`FactualAssertion`](crate::grammar::assertions::FactualAssertion) shape
+/// [`FactualAssertion`] shape
 /// as storage, over the [`BundleLocal`] scheme (the bundle-local index
 /// newtypes).
 pub type SubmitFactualAssertion = FactualAssertion<BundleLocal>;
@@ -152,9 +152,9 @@ pub type SubmitJudgmentAssertion = JudgmentAssertion<BundleLocal>;
 /// halves — a `Factual` variant holds a [`FactualAssertion`] and a
 /// [`FactualCitation`], and a `JudgmentSource` in the `Factual` arm is
 /// unrepresentable. The submission-side analogue of
-/// [`StoredFact`](result::StoredFact).
+/// [`StoredFact`].
 ///
-/// Through [`grammar_type`](chronoscope_macros::grammar_type): the `type` tag
+/// Through [`grammar_type`]: the `type` tag
 /// discriminates and the inner shape is the payload; [`Commit::id`] feeds
 /// these to `serde_jcs::to_string` directly.
 ///
@@ -241,11 +241,11 @@ pub struct Commit<R: IdScheme> {
     pub author: CommitAuthor,
     /// When the commit was recorded.
     pub recorded_at: DateTime<Utc>,
-    /// Entity declarations. [`EntityIdx(i)`] inside a fact indexes here.
+    /// Entity declarations. [`EntityIdx`]`(i)` inside a fact indexes here.
     pub entities: Vec<Decl<R::Entity>>,
-    /// Event declarations. [`EventIdx(i)`] inside a fact indexes here.
+    /// Event declarations. [`EventIdx`]`(i)` inside a fact indexes here.
     pub events: Vec<Decl<R::Event>>,
-    /// Image declarations. [`ImageIdx(i)`] inside a fact indexes here.
+    /// Image declarations. [`ImageIdx`]`(i)` inside a fact indexes here.
     pub images: Vec<Decl<R::Image>>,
     pub facts: BTreeSet<SubmitFact>,
 }
@@ -285,7 +285,7 @@ impl<R: IdScheme> Commit<R> {
     /// bytes, and routes the hex digest through [`CommitId::parse`].
     ///
     /// The declaration lists are hashed because they carry the
-    /// mint-vs-adopt-existing identity decision — see [`CommitHashView`].
+    /// mint-vs-adopt-existing identity decision — see `CommitHashView`.
     /// `recorded_at` is quantized to whole seconds so sub-second jitter doesn't
     /// defeat content addressing. The author is the
     /// [`CommitAuthor::canonical_string`] form. The id-type `Serialize` bounds

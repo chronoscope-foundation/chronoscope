@@ -51,17 +51,30 @@
 
         # Source filtering: Cargo sources + .proto (protobuf) + .sql (migrations)
         # + .json (test fixtures, schemas) + .html/.css (web frontend).
+        srcFilterBase =
+          path: type:
+          (craneLib.filterCargoSources path type)
+          || (lib.hasSuffix ".proto" path)
+          || (lib.hasSuffix ".sql" path)
+          || (lib.hasSuffix ".json" path)
+          || (lib.hasSuffix ".html" path)
+          || (lib.hasSuffix ".css" path);
+
         src = lib.cleanSourceWith {
           src = craneLib.path ./.;
-          filter =
-            path: type:
-            (craneLib.filterCargoSources path type)
-            || (lib.hasSuffix ".proto" path)
-            || (lib.hasSuffix ".sql" path)
-            || (lib.hasSuffix ".json" path)
-            || (lib.hasSuffix ".html" path)
-            || (lib.hasSuffix ".css" path);
+          filter = srcFilterBase;
           name = "chronoscope-source";
+        };
+
+        # The `doc` check builds the whole workspace incl. chronoscope-web on
+        # the host target, and web include_str!s page content (.md) from web/.
+        # Superset of `src`; scoped to web/ so doc/README markdown edits don't
+        # churn the other checks' source hash.
+        docSrc = lib.cleanSourceWith {
+          src = craneLib.path ./.;
+          filter =
+            path: type: srcFilterBase path type || (lib.hasInfix "/web/" path && lib.hasSuffix ".md" path);
+          name = "chronoscope-doc-source";
         };
 
         rust = import ./nix/rust.nix {
@@ -70,6 +83,7 @@
             craneLib
             lib
             src
+            docSrc
             ;
           # Lazy: only `test`/`llvm-cov` force these, so the wikidata/web
           # cycle stays unresolved at eval time.

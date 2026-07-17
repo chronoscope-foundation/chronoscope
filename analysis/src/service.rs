@@ -9,7 +9,7 @@ use crate::schema::AnalysisResult;
 ///
 /// Implementations include:
 /// - [`GrpcTritonClient`](crate::grpc::GrpcTritonClient): Live gRPC with optional fixture caching
-/// - [`MockTritonService`](crate::mock::MockTritonService): In-memory mock for unit tests
+/// - `MockTritonService` (`crate::mock`): In-memory mock for unit tests
 #[async_trait]
 pub trait TritonService: Send + Sync {
     /// Check if the Triton server is ready.

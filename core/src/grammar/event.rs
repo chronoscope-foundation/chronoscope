@@ -516,7 +516,7 @@ impl<EntId, EvtId> OrderableEvent<EntId, EvtId> {
 ///
 /// `Deserialize` routes through [`GapBounds::new`] via
 /// [`serde(try_from)`](https://serde.rs/container-attrs.html#try_from) over
-/// [`RawGapBounds`], so the cross-field invariants (at least one bound present;
+/// `RawGapBounds`, so the cross-field invariants (at least one bound present;
 /// `min <= max`) are enforced at the parse boundary rather than materializing an
 /// unconstrained gap. The mirror copies the derived serialize shape, so the two
 /// directions can't drift.

@@ -98,7 +98,7 @@ pub struct EntitySummary<EntId, ImgId> {
     pub latest: Option<NaiveDate>,
     /// The image whose thumbnail stands in for this entity on the map, or
     /// `None` when the entity has no depiction. The marker read path resolves
-    /// it to a URL; see [`representative_image`].
+    /// it to a URL; see `representative_image`.
     pub thumbnail: Option<ImgId>,
 }
 

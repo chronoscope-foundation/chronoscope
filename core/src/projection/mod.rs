@@ -8,7 +8,7 @@
 //! [`project_image`] does the same over an image's `SameArtifact` class.
 //!
 //! Provenance is in-band — each bracket bound and each membership key carries its
-//! own support, threaded through a [`Semiring`](crate::algebra::semiring::Semiring).
+//! own support, threaded through a [`Semiring`].
 //! Conflict is read off the same structure: a restrictive field's consensus
 //! collapses to ⊥ under over-determination, surfaced through [`Slot::conflict`].
 
@@ -260,8 +260,8 @@ type ImageDepiction<S> = Cited<
 ///
 /// [`EntityView::walk_entity_depictions`] pages the depicting images — distinct
 /// images, each image's raw depiction facts contiguous under its `SameArtifact`
-/// rep. Each image's facts fold through [`merge::inject_depiction`] +
-/// [`typed::depiction`] into one tile keyed by that rep, so competing depictions
+/// rep. Each image's facts fold through `merge::inject_depiction` +
+/// `typed::depiction` into one tile keyed by that rep, so competing depictions
 /// of the same artifact merge; two sources disagreeing on a merged artifact's
 /// perspective leave that axis unsettled. Region-aware disambiguation of the
 /// distinct depictions is deferred. The rows carry their facts, so there is no

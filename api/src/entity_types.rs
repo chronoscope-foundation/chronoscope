@@ -98,7 +98,7 @@ fn quality_value(segment: &str) -> Option<f64> {
 
 /// The one display name to show for a viewer's `Accept-Language`: the first name
 /// matching the highest-priority language the viewer requested, else the English
-/// [`DEFAULT_LANGUAGE`], else the first name, `None` for an entity with no names.
+/// `DEFAULT_LANGUAGE`, else the first name, `None` for an entity with no names.
 pub fn negotiate_name<I>(
     names: &[typed::Name<I>],
     accept_language: Option<&str>,

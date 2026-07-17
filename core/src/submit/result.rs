@@ -153,7 +153,7 @@ impl CommitAuthor {
 // ============================================================================
 
 /// A stored factual fact: the post-resolution
-/// [`FactualAssertion`](crate::grammar::assertions::FactualAssertion) plus its
+/// [`FactualAssertion`] plus its
 /// citation. Resolution substitutes every entity/event/image index with
 /// the corresponding persistent id.
 #[derive(Debug, Clone, PartialEq)]
@@ -165,7 +165,7 @@ pub struct StoredFactualFact<R: IdScheme> {
 }
 
 /// A stored judgment fact: the post-resolution
-/// [`JudgmentAssertion`](crate::grammar::assertions::JudgmentAssertion) plus
+/// [`JudgmentAssertion`] plus
 /// its source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredJudgmentFact<R: IdScheme> {

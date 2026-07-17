@@ -1,6 +1,6 @@
 //! Shared submit-pipeline machinery.
 //!
-//! [`FactStore::submit_commit`](crate::store::FactStore::submit_commit)
+//! [`FactStore::submit_commit`]
 //! is provided: the shared driver composes the free functions here with the
 //! [`FactWrite`](crate::store::FactWrite) primitives a backend's
 //! transaction supplies, so every backend reuses the orchestration.

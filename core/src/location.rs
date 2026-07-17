@@ -557,7 +557,7 @@ impl Location {
     /// Model. The boundary solve runs on the sphere (no ellipsoidal closed
     /// form), but membership is the WGS84 [`covers`](Self::covers). Two
     /// inflations bridge the two models: the caps fed to the boundary solve are
-    /// grown by [`WGS84_SPHERE_REL_GAP`], so any WGS84-feasible overlap still
+    /// grown by `WGS84_SPHERE_REL_GAP`, so any WGS84-feasible overlap still
     /// yields a crossing candidate, and coverage is tested at the compounded gap
     /// a grown-rim crossing carries. A WGS84 disk sits inside its gap-grown
     /// sphere disk, so this makes the routine a sound over-approximation:
@@ -966,7 +966,7 @@ impl UnresolvedLocation {
     /// of its combinator: it adds nothing to a union and removes nothing
     /// from an intersection, so a partially-resolved conjunction still
     /// answers on its resolved geometry. Three-valued internally
-    /// ([`geometry_evidence`](Self::geometry_evidence)); no evidence at the
+    /// (`geometry_evidence`); no evidence at the
     /// top answers `false`.
     pub fn known_geometry_intersects(&self, viewport: &Viewport) -> bool {
         self.geometry_evidence(viewport).unwrap_or(false)

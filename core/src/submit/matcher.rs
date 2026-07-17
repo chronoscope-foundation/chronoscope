@@ -33,7 +33,7 @@ use crate::store::{ClassWalkPage, EntityIdOf, EntityView, FactStore, ImageIdOf, 
 /// and the `process` of their derivation citations.
 const MATCHER_PROCESS: &str = "submit-matcher";
 
-/// The submit matcher's analyzer identity: [`MATCHER_PROCESS`] at this
+/// The submit matcher's analyzer identity: `MATCHER_PROCESS` at this
 /// build's [`BUILD_VERSION`](crate::BUILD_VERSION).
 pub fn matcher_identity() -> (AnalyzerProcess, AnalyzerVersion) {
     (

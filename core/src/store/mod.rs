@@ -20,19 +20,19 @@
 //! - `conformance` — backend-agnostic [`FactStore`] test suite, available to
 //!   other crates behind the `test-support` feature.
 //!
-//! The store trait's associated types are written in [`submit`](crate::submit)'s
+//! The store trait's associated types are written in [`submit`]'s
 //! data types ([`Commit`](crate::submit::Commit),
-//! [`StoredFact`](crate::submit::StoredFact),
-//! [`SubmitResult`](crate::submit::SubmitResult),
-//! [`FactLookup`](crate::submit::FactLookup),
-//! [`SubmitError`](crate::submit::SubmitError)), while `submit`'s pipeline and
+//! [`StoredFact`],
+//! [`SubmitResult`],
+//! [`FactLookup`],
+//! [`SubmitError`]), while `submit`'s pipeline and
 //! matcher consume this trait. So `store` and `submit` are co-recursive peers,
 //! read together, rather than a clean one-directional stack.
 //!
 //! - [`FactStore`] is the writeable handle: it owns the clock
-//!   ([`Self::next_fact_id`], [`Self::now`]), accepts commits
-//!   ([`Self::submit_commit`]), and builds snapshot-scoped read views
-//!   ([`Self::no_later_than`]).
+//!   ([`FactStore::next_fact_id`], [`FactStore::now`]), accepts commits
+//!   ([`FactStore::submit_commit`]), and builds snapshot-scoped read views
+//!   ([`FactStore::no_later_than`]).
 //! - [`FactView`] is a snapshot-scoped read handle with subject-agnostic
 //!   methods (fact lookup, snapshot inquiry).
 //!
@@ -60,7 +60,7 @@
 //! Snapshots and pagination cursors are plain [`FactId`] under "next id"
 //! semantics:
 //!
-//! - [`Self::next_fact_id`] returns the next id the store would mint — one
+//! - [`FactStore::next_fact_id`] returns the next id the store would mint — one
 //!   past the highest stored fact, or `FactId::new(0)` on an empty store.
 //! - `no_later_than(snapshot) -> View` is an exclusive upper bound: the
 //!   view exposes facts with `id < snapshot`. `FactId::new(0)` is the
@@ -70,8 +70,8 @@
 //! - Every paginated walk pages on an opaque resume token: `None` opens the
 //!   walk, `Some(token)` resumes at the previous page's token. The backlink
 //!   walks (`all_facts_about_*`) page on
-//!   [`Cursor`](Self::Cursor); the class walks (`walk_entity_classes` /
-//!   `walk_image_classes`) page on [`ClassCursor`](Self::ClassCursor). A caller
+//!   [`Cursor`](FactStore::Cursor); the class walks (`walk_entity_classes` /
+//!   `walk_image_classes`) page on [`ClassCursor`](FactStore::ClassCursor). A caller
 //!   threads the token back verbatim, never constructing or inspecting it, so a
 //!   walk's inclusive-vs-exclusive resume polarity stays the backend's own
 //!   business. A page's token is `None` when the walk is exhausted, `Some` when
@@ -79,14 +79,14 @@
 //!   backend may return a short or empty page that still carries a token. Page
 //!   size is never a completion signal; only the token is.
 //!
-//! [`Self::next_fact_id`] gives the scalar watermark; [`Self::now`] returns
+//! [`FactStore::next_fact_id`] gives the scalar watermark; [`FactStore::now`] returns
 //! a snapshot view directly (its method doc says why it isn't a default
 //! composing the two).
 //!
 //! ## Transaction-scoped writes
 //!
-//! Callers enter a transaction via [`Self::with_tx`], submit commits through
-//! the supplied [`Self::Tx`] handle, and return `Ok` to commit or
+//! Callers enter a transaction via [`FactStore::with_tx`], submit commits through
+//! the supplied [`FactStore::Tx`] handle, and return `Ok` to commit or
 //! `Err`/panic to roll back. The transaction is the unit of atomicity: every
 //! commit submitted through the handle applies together on `Ok`, and none of
 //! them on `Err` — a multi-commit closure that fails partway leaves the
@@ -94,7 +94,7 @@
 //!
 //! The handle implements [`FactWrite`]: the full read surface over
 //! committed ∪ staged state plus the primitives only a live transaction can
-//! offer (minting, staging, commit recording). [`Self::submit_commit`] is a
+//! offer (minting, staging, commit recording). [`FactStore::submit_commit`] is a
 //! provided method — the shared submit driver — built on those primitives,
 //! so a backend implements the primitives and inherits the orchestration.
 //! The submit sequence is match → resolve/mint → validate → stage. It reads
@@ -209,7 +209,7 @@ pub trait FactStore: Send + Sync + Sized {
     /// in-memory, a compound key for a SQL backend keying off several columns.
     ///
     /// `Send` because the walk futures are `Send` and the cursor rides inside
-    /// one, both in each page and in [`paginate`](crate::store::pagination::paginate)'s
+    /// one, both in each page and in `paginate`'s
     /// resume state.
     type Cursor: Send;
 

@@ -94,7 +94,7 @@ pub trait IdScheme: Clone + std::fmt::Debug + Eq + Ord + std::hash::Hash + 'stat
 
 /// Emit a transparent string newtype with infallible construction.
 ///
-/// The generated type carries: constructor [`Self::new`], `as_str`,
+/// The generated type carries: constructor `new`, `as_str`,
 /// `Display`, `AsRef<str>`, `From<String>` / `From<&str>`, `JsonSchema`,
 /// `Serialize`, `Deserialize`. Construction is infallible — these wrappers
 /// give a string type-distinct identity.
@@ -230,7 +230,7 @@ macro_rules! subject_id_newtype {
 // Validated-string-newtype macro and shared error
 // ============================================================================
 
-/// Errors from [`validated_string_newtype`]-generated constructors.
+/// Errors from [`validated_string_newtype`](crate::validated_string_newtype)-generated constructors.
 ///
 /// Single shared error type so the macro doesn't have to mint a fresh
 /// `<Name>Error` per invocation. Variants cover the length-bound checks

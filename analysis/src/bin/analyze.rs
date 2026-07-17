@@ -1,7 +1,7 @@
 //! CLI for analyzing images via Triton.
 //!
 //! Usage:
-//!   analyze [--endpoint URL] <image>
+//!   `analyze [--endpoint URL] <image>`
 //!
 //! Examples:
 //!   # Analyze a local image (gRPC endpoint, default port 8001)

@@ -452,8 +452,8 @@ pub enum AnalysisResult {
 /// produce the final [`SubimageAnalysis`].
 ///
 /// These types must stay in sync with their assembled counterparts:
-/// - [`SubimageOutput`] ↔ [`SubimageAnalysis`]
-/// - [`AnalyzedOutput`] ↔ [`SubimageAnalysis::Analyzed`]
+/// - [`SubimageOutput`](vlm_schema::SubimageOutput) ↔ [`SubimageAnalysis`]
+/// - [`AnalyzedOutput`](vlm_schema::AnalyzedOutput) ↔ [`SubimageAnalysis::Analyzed`]
 ///
 /// The shared leaf types ([`SceneAnalysis`], [`RegionAnalysis`], etc.) are
 /// defined in the parent module and used by both.

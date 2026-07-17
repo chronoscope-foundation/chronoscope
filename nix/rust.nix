@@ -3,6 +3,9 @@
   craneLib,
   lib,
   src,
+  # Whole-workspace source (adds web's include_str!'d assets) for the `doc`
+  # check, which documents chronoscope-web alongside the native crates.
+  docSrc,
   # Defaulting to {} keeps this module loadable before wikidata/web exist
   # — see flake.nix for how the lazy cycle resolves.
   testExtraEnv ? { },
@@ -66,6 +69,22 @@ let
     }
   );
 
+  # Rustdoc over the whole workspace (`--workspace` pulls in chronoscope-web,
+  # which default-members excludes; it documents fine on the host target).
+  # `-D warnings` is the doc analog of clippy's `-D warnings`: broken and
+  # private intra-doc links, redundant link targets, and bad HTML all fail the
+  # gate. `--no-deps` keeps it to first-party crates; links into dependencies
+  # still resolve.
+  doc = craneLib.cargoDoc (
+    checkArgs
+    // {
+      pname = "chronoscope-doc";
+      src = docSrc;
+      cargoDocExtraArgs = "--no-deps --workspace";
+      RUSTDOCFLAGS = "-D warnings";
+    }
+  );
+
   # Coverage doubles as the workspace test run: it executes the unit +
   # integration suite (a failing test fails the check) and enforces the line
   # threshold, so there is no separate plain test derivation. The
@@ -94,7 +113,12 @@ in
       version = "0.1.0";
     };
 
-    inherit clippy doctest llvm-cov;
+    inherit
+      clippy
+      doc
+      doctest
+      llvm-cov
+      ;
 
     # Dedicated check for the browser test suite, with `--test-threads=4`.
     # More concurrent Chromes than that starve `chromiumoxide`'s CDP-response
@@ -114,7 +138,7 @@ in
       // {
         pname = "chronoscope-web-tests";
         cargoTestExtraArgs = "-p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4";
-        CHRONOSCOPE_RUN_AFTER = "${clippy} ${doctest} ${llvm-cov}";
+        CHRONOSCOPE_RUN_AFTER = "${clippy} ${doc} ${doctest} ${llvm-cov}";
       }
     );
   };

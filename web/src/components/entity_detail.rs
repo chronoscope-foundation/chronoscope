@@ -568,7 +568,7 @@ struct NameInfo {
 
 /// One row in the rendered entity timeline.
 ///
-/// Each row is one ordered [`Moment`]: a durational endpoint (construction,
+/// Each row is one ordered [`MomentView`]: a durational endpoint (construction,
 /// demolition, or an interior span like modification or repair) or a
 /// point-shaped interior event (usage change, designation). A durational whose
 /// endpoints are both dateless collapses to a single bare row.

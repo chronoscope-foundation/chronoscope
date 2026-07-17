@@ -4,9 +4,9 @@
 //! A [`TimelineEvent`] bundles a durational event's two endpoints together: a
 //! construction carries both `started` and `completed` in one
 //! [`Period`](crate::typed::Period). To render — and sort — endpoints
-//! independently, [`decompose`] splits each
-//! durational event into a start and an end [`Moment`] and leaves each point
-//! event as one. [`topological_order`] then sorts the moments over structural
+//! independently, `decompose` splits each
+//! durational event into a start and an end `Moment` and leaves each point
+//! event as one. `topological_order` then sorts the moments over structural
 //! lifecycle edges and date edges, so an interior event interleaves between
 //! construction's endpoints when its date falls there.
 
@@ -23,12 +23,12 @@ use crate::typed::{
     interior_event_bounds,
 };
 
-/// The role of a [`Moment`] within an entity's lifecycle.
+/// The role of a `Moment` within an entity's lifecycle.
 ///
 /// Variants are declared in canonical lifecycle order: construction endpoints,
 /// then mid-life events (durational pairs, then point events), then demolition
 /// endpoints. The `derive(Ord)` impl provides a deterministic tiebreaker for
-/// [`topological_order`] when two moments have no edge between them. Reordering
+/// `topological_order` when two moments have no edge between them. Reordering
 /// variants changes tie-breaking behavior.
 ///
 /// Serializes `snake_case` on the wire — it drives a client's per-moment label

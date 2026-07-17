@@ -1,6 +1,6 @@
 //! The bounded-lattice abstractions shared by the value lattices.
 //!
-//! A join-semilattice is a [`CommutativeMonoid`](super::monoid::CommutativeMonoid)
+//! A join-semilattice is a [`CommutativeMonoid`]
 //! whose `combine` is also idempotent. [`JoinSemilattice`] names that floor — its
 //! ⊥ ([`bottom`](JoinSemilattice::bottom)) and ⊔
 //! ([`join`](JoinSemilattice::join)) are the monoid's `identity` and `combine`
