@@ -48,7 +48,7 @@ pub struct RleMask {
 /// One coordinate component in `0.0..=1.0` proportional image space — the
 /// shared building block of [`ProportionalRect`] and [`ProportionalPoint`].
 ///
-/// The inner value is a [`Finite`], which rejects `NaN`/`±∞` and normalizes
+/// The inner value is a `Finite`, which rejects `NaN`/`±∞` and normalizes
 /// `-0.0` to `+0.0`. That is what lets `Eq`, `Hash`, and `Ord` derive and stay
 /// consistent with `PartialEq` (under which `-0.0 == +0.0`), so every type built
 /// from coordinates derives its own `Eq`/`Hash`/`Ord` through this one. The

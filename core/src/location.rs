@@ -529,8 +529,8 @@ impl Location {
     /// subtree gathers `A` and `C` both.
     ///
     /// Model. The pairwise crossings, the balance points, and membership are all
-    /// WGS84: [`Circle::boundary_intersections`] and
-    /// [`Circle::balance_point`] solve on the ellipsoid, and
+    /// WGS84: `Circle::boundary_intersections` and
+    /// `Circle::balance_point` solve on the ellipsoid, and
     /// [`covers`](Self::covers) measures the geodesic distance. The intersection
     /// is empty exactly when no candidate — a cap center, a pairwise crossing, or
     /// a pairwise balance point — is covered.

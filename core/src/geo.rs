@@ -9,10 +9,10 @@
 //!   a wrap convention for antimeridian-crossing spans; [`IndexRect`] is its
 //!   non-wrapping half, the shape spatial-index rows store.
 //! - [`Meters`] is a meter-valued scalar — a WGS84 geodesic distance or radius.
-//! - [`Circle`] is the compute-side primitive: a cap (disk) about a
+//! - `Circle` is the compute-side primitive: a cap (disk) about a
 //!   [`GeoPoint`] center. Distance, membership, and the circle-circle boundary
 //!   crossing all solve on WGS84 via [`geographiclib_rs`]
-//!   ([`Circle::boundary_intersections`]). It is never serialized.
+//!   (`Circle::boundary_intersections`). It is never serialized.
 
 use geographiclib_rs::{DirectGeodesic, Geodesic, InverseGeodesic};
 use schemars::JsonSchema;
@@ -38,7 +38,7 @@ pub(crate) const EARTH_RADIUS_M: f64 = 6_371_000.0;
 /// `[-180, 180]`). Deserialization routes through it so wire-invalid points
 /// fail at the boundary.
 ///
-/// The `lat`/`lon` fields are [`Finite`](crate::finite::Finite): finite by
+/// The `lat`/`lon` fields are `Finite`: finite by
 /// construction with `-0.0` normalized, so `Eq`/`Hash`/`Ord` derive honestly —
 /// the total ordering `BTreeSet<SubmitFact>` relies on, with no `f64`
 /// knife-edges to hand-handle.
@@ -587,11 +587,11 @@ pub(crate) fn cap_bounding_rects(center: &GeoPoint, radius: Meters) -> Vec<Index
 /// unit in the type keeps `_m`-suffixed names off the call surface and stops a
 /// raw `f64` being passed where a meter count is meant.
 ///
-/// The inner value is a [`Finite`]: finite by construction with `-0.0`
+/// The inner value is a `Finite`: finite by construction with `-0.0`
 /// normalized, so `Eq`/`Hash`/`Ord` derive honestly for the meter-bearing types
 /// (a circle radius) that reach `BTreeSet<SubmitFact>`. [`try_new`](Meters::try_new)
 /// validates an untrusted `f64` at the boundary; the typed interior mints from
-/// trusted arithmetic with [`new_unchecked`](Meters::new_unchecked).
+/// trusted arithmetic with `new_unchecked`.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
