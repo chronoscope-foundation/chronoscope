@@ -34,64 +34,58 @@
 use chronoscope_macros::grammar_type;
 
 use crate::grammar::features::Feature;
+use crate::grammar::ids::IdScheme;
 use crate::grammar::spatial::TopologicalRel;
 
 /// Observation-cluster fact.
 ///
-/// Generic only over the entity reference type.
+/// Generic over one id scheme `R: IdScheme`, reading only `R::Entity`.
 ///
-/// The `Spatial` variant carries a [`crate::grammar::identity::DistinctPair<EntId>`]
-/// so the directional `from != to` invariant is structurally enforced:
-/// `from` is the subject (`a` side), `to` is the object (`b` side).
-/// Topological relations like `PartOf` and `Surrounds` are directional;
-/// preserving the order is the whole point of using `DistinctPair`
-/// rather than [`crate::grammar::identity::OrderedDistinctPair`].
-// `EntId: DeserializeOwned` (not `Deserialize<'de>`) because the
-// `Spatial` variant's `relation: TopologicalRel<EntId>` field deserializes
-// through `TopologicalRel`'s own derive, whose bound is `DeserializeOwned`.
-// `Debug` is the `Display` requirement of the `DistinctPair` deserialize's
-// `SelfPairError`.
+/// The `Spatial` variant carries a
+/// [`crate::grammar::identity::DistinctPair<R::Entity>`] so the directional
+/// `from != to` invariant is structurally enforced: `from` is the subject
+/// (`a` side), `to` is the object (`b` side). Topological relations like
+/// `PartOf` and `Surrounds` are directional; preserving the order is the whole
+/// point of using `DistinctPair` rather than
+/// [`crate::grammar::identity::OrderedDistinctPair`].
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "EntId: ::serde::Serialize + Ord",
-    deserialize = "EntId: ::serde::de::DeserializeOwned + Ord + std::fmt::Debug"
-))]
-#[schemars(bound = "EntId: ::schemars::JsonSchema + Ord")]
-pub enum Fact<EntId: Ord> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub enum Fact<R: IdScheme> {
     /// A claim that an entity has a particular feature. The evidence —
     /// which image grounded the observation, which region of that image,
     /// who or what observer made it — lives in the citation.
-    Feature { entity: EntId, feature: Feature },
+    Feature { entity: R::Entity, feature: Feature },
     /// A claim that two entities stand in a topological relation. The
     /// evidence — which image grounded the observation, which text
     /// source described it, who made the call — lives in the citation.
     Spatial {
         /// The two entities, structurally distinct, in subject-object
         /// order for directional relations.
-        pair: crate::grammar::identity::DistinctPair<EntId>,
-        relation: TopologicalRel<EntId>,
+        pair: crate::grammar::identity::DistinctPair<R::Entity>,
+        relation: TopologicalRel<R>,
     },
 }
 
-impl<EntId: Ord> Fact<EntId> {
+impl<R: IdScheme> Fact<R> {
     /// Construct a `Spatial`, rejecting `a == b`.
     pub fn spatial(
-        a: EntId,
-        b: EntId,
-        relation: TopologicalRel<EntId>,
-    ) -> Result<Self, crate::grammar::identity::SelfPairError<EntId>> {
+        a: R::Entity,
+        b: R::Entity,
+        relation: TopologicalRel<R>,
+    ) -> Result<Self, crate::grammar::identity::SelfPairError<R::Entity>> {
         let pair = crate::grammar::identity::DistinctPair::new(a, b)?;
         Ok(Self::Spatial { pair, relation })
     }
 }
 
-impl<EntId: Ord> Fact<EntId> {
+impl<R: IdScheme> Fact<R> {
     /// Visit every entity id this fact mentions.
     ///
     /// The `Spatial` arm threads the closure into both the `from`/`to` pair
     /// (visited first) and the relation's separator / axis (visited second).
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId)) {
+    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
         match self {
             Self::Feature { entity, .. } => fe(entity),
             Self::Spatial { pair, relation } => {
@@ -114,11 +108,11 @@ impl<EntId: Ord> Fact<EntId> {
     /// Generic over the error type `Err`: both the leaf closure `fe` and
     /// the `on_self_loop` collapse closure produce `Err`, so the cluster
     /// never names the concrete error the assertion layer chooses.
-    pub fn try_map_ids<E2: Ord, Err>(
+    pub fn try_map_ids<R2: IdScheme, Err>(
         &self,
-        fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
-        on_self_loop: impl FnOnce(E2) -> Err,
-    ) -> Result<Fact<E2>, Err> {
+        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
+        on_self_loop: impl FnOnce(R2::Entity) -> Err,
+    ) -> Result<Fact<R2>, Err> {
         match self {
             Self::Feature { entity, feature } => Ok(Fact::Feature {
                 entity: fe(entity)?,

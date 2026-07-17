@@ -23,19 +23,20 @@
 
 use chronoscope_macros::grammar_type;
 
+use crate::grammar::ids::IdScheme;
+
 /// A qualitative topological relation between two entities.
 ///
-/// Generic over `EntId` so the ternary variants (`AcrossFrom`, `SameSide`,
-/// `LinedAlong`) carry an `EntId` separator or axis. Every involved entity has
-/// a minted id by the time a topological observation is recorded, so the
-/// relation never carries a description-shaped reference.
+/// Generic over one id scheme `R: IdScheme` so the ternary variants
+/// (`AcrossFrom`, `SameSide`, `LinedAlong`) carry an `R::Entity` separator or
+/// axis. Every involved entity has a minted id by the time a topological
+/// observation is recorded, so the relation never carries a description-shaped
+/// reference.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "EntId: ::serde::Serialize",
-    deserialize = "EntId: ::serde::de::DeserializeOwned"
-))]
-pub enum TopologicalRel<EntId> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub enum TopologicalRel<R: IdScheme> {
     /// The two entities share a boundary, or sit boundary-to-boundary,
     /// in real space — "next to each other".
     Adjacent,
@@ -43,7 +44,7 @@ pub enum TopologicalRel<EntId> {
     /// a wall, a river).
     AcrossFrom {
         /// The shared third party that divides them.
-        separator: EntId,
+        separator: R::Entity,
     },
     /// The first entity (`a` on the wrapper) is a component of the
     /// second (`b` on the wrapper) — mereological, not set-theoretic.
@@ -52,13 +53,13 @@ pub enum TopologicalRel<EntId> {
     /// Both entities are on the same side of `separator`.
     SameSide {
         /// The shared third party they're both on one side of.
-        separator: EntId,
+        separator: R::Entity,
     },
     /// The two entities are arranged along the named linear feature
     /// `axis` (a street, a riverfront, a wall).
     LinedAlong {
         /// The linear feature they're aligned along.
-        axis: EntId,
+        axis: R::Entity,
     },
     /// The first entity (`a` on the wrapper) borders the second
     /// (`b` on the wrapper) on multiple sides — containment-flavored,
@@ -66,13 +67,13 @@ pub enum TopologicalRel<EntId> {
     Surrounds,
 }
 
-impl<EntId> TopologicalRel<EntId> {
+impl<R: IdScheme> TopologicalRel<R> {
     /// Visit the separator / axis entity id this relation carries, if any.
     ///
     /// `AcrossFrom` / `SameSide` carry a `separator`, `LinedAlong` an `axis`;
     /// `Adjacent` / `PartOf` / `Surrounds` carry none. Takes only the entity
     /// closure — the relation carries no other id kind.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId)) {
+    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
         match self {
             Self::Adjacent | Self::PartOf | Self::Surrounds => {}
             Self::AcrossFrom { separator } | Self::SameSide { separator } => fe(separator),
@@ -81,11 +82,11 @@ impl<EntId> TopologicalRel<EntId> {
     }
 
     /// Relabel the separator / axis entity id (if any) through the fallible
-    /// closure, producing a `TopologicalRel<E2>`.
-    pub fn try_map_ids<E2, Err>(
+    /// closure, producing a `TopologicalRel<R2>`.
+    pub fn try_map_ids<R2: IdScheme, Err>(
         &self,
-        fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
-    ) -> Result<TopologicalRel<E2>, Err> {
+        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
+    ) -> Result<TopologicalRel<R2>, Err> {
         match self {
             Self::Adjacent => Ok(TopologicalRel::Adjacent),
             Self::PartOf => Ok(TopologicalRel::PartOf),

@@ -64,6 +64,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::date::UncertainDate;
 use crate::grammar::citations::{ExternalReference, Language};
+use crate::grammar::ids::IdScheme;
 
 // ============================================================================
 // NameText — NFC-canonical name text
@@ -148,21 +149,18 @@ impl std::error::Error for NameTextError {}
 
 /// Attribute-cluster fact.
 ///
-/// The `Relationship` variant carries a [`crate::grammar::identity::DistinctPair<EntId>`]
-/// so the directional `from != to` invariant is structurally enforced; see the
-/// cluster docs for the rule that surfaces this rejection in
-/// [`crate::submit::SubmitError`].
+/// The `Relationship` variant carries a
+/// [`crate::grammar::identity::DistinctPair<R::Entity>`] so the directional
+/// `from != to` invariant is structurally enforced; see the cluster docs for
+/// the rule that surfaces this rejection in [`crate::submit::SubmitError`].
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "EntId: ::serde::Serialize + Ord",
-    deserialize = "EntId: ::serde::Deserialize<'de> + Ord + std::fmt::Debug"
-))]
-#[schemars(bound = "EntId: ::schemars::JsonSchema + Ord")]
-pub enum Fact<EntId: Ord> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub enum Fact<R: IdScheme> {
     /// A name applied to the entity, with temporal validity bounds.
     Name {
-        entity: EntId,
+        entity: R::Entity,
         /// The name as the source used it, NFC-normalized.
         name: NameText,
         /// BCP-47 language tag, in canonical form.
@@ -178,7 +176,7 @@ pub enum Fact<EntId: Ord> {
     /// (Wikidata QID, OSM element id, Wikipedia title). The identifier
     /// itself lives inline in the [`ExternalReference`] variant.
     ExternalReference {
-        entity: EntId,
+        entity: R::Entity,
         /// The typed external reference (system + identifier).
         reference: ExternalReference,
     },
@@ -187,28 +185,28 @@ pub enum Fact<EntId: Ord> {
     /// self-loops fail at construction; see the cluster docs.
     Relationship {
         /// Source and target entity, structurally distinct.
-        pair: crate::grammar::identity::DistinctPair<EntId>,
+        pair: crate::grammar::identity::DistinctPair<R::Entity>,
         relation: EntityRelationType,
     },
 }
 
-impl<EntId: Ord> Fact<EntId> {
+impl<R: IdScheme> Fact<R> {
     /// Construct a `Relationship`, rejecting `from == to`.
     pub fn relationship(
-        from: EntId,
-        to: EntId,
+        from: R::Entity,
+        to: R::Entity,
         relation: EntityRelationType,
-    ) -> Result<Self, crate::grammar::identity::SelfPairError<EntId>> {
+    ) -> Result<Self, crate::grammar::identity::SelfPairError<R::Entity>> {
         let pair = crate::grammar::identity::DistinctPair::new(from, to)?;
         Ok(Self::Relationship { pair, relation })
     }
 }
 
-impl<EntId: Ord> Fact<EntId> {
+impl<R: IdScheme> Fact<R> {
     /// The entity this fact is a claim about. A relationship's subject is the
     /// directed pair's source (`from`); the projected relation slot keys off the
     /// target, but the fact belongs to the source entity.
-    pub fn subject(&self) -> &EntId {
+    pub fn subject(&self) -> &R::Entity {
         match self {
             Self::Name { entity, .. } | Self::ExternalReference { entity, .. } => entity,
             Self::Relationship { pair, .. } => pair.from(),
@@ -216,7 +214,7 @@ impl<EntId: Ord> Fact<EntId> {
     }
 
     /// Visit every entity id this fact mentions.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId)) {
+    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
         match self {
             Self::Name { entity, .. } | Self::ExternalReference { entity, .. } => fe(entity),
             Self::Relationship { pair, .. } => pair.for_each_id(fe),
@@ -237,11 +235,11 @@ impl<EntId: Ord> Fact<EntId> {
     /// Generic over the error type `Err`: both the leaf closure `fe` and the
     /// `on_self_loop` collapse closure produce `Err`, so the cluster never names
     /// the concrete error the assertion layer chooses.
-    pub fn try_map_ids<E2: Ord, Err>(
+    pub fn try_map_ids<R2: IdScheme, Err>(
         &self,
-        fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
-        on_self_loop: impl FnOnce(E2) -> Err,
-    ) -> Result<Fact<E2>, Err> {
+        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
+        on_self_loop: impl FnOnce(R2::Entity) -> Err,
+    ) -> Result<Fact<R2>, Err> {
         match self {
             Self::Name {
                 entity,

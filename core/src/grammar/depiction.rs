@@ -36,6 +36,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::grammar::geometry::ImageGeometry;
+use crate::grammar::ids::IdScheme;
 
 /// View or framing classification of a depiction relative to its
 /// depicted entity.
@@ -67,40 +68,37 @@ pub enum Perspective {
 /// [`crate::grammar::assertions::JudgmentAssertion::Depiction`] wrapper already
 /// tags it, so the inner fact needs no tag of its own.
 ///
-/// Generic over the entity and image reference types.
+/// Generic over one id scheme `R: IdScheme`, reading `R::Entity` and `R::Image`.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "EntId: ::serde::Serialize, ImgId: ::serde::Serialize",
-    deserialize = "EntId: ::serde::de::DeserializeOwned, ImgId: ::serde::de::DeserializeOwned"
-))]
-#[schemars(bound = "EntId: ::schemars::JsonSchema, ImgId: ::schemars::JsonSchema")]
-pub struct Fact<EntId, ImgId> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub struct Fact<R: IdScheme> {
     /// The depicted entity.
-    pub entity: EntId,
+    pub entity: R::Entity,
     /// The image the entity appears in.
-    pub image: ImgId,
+    pub image: R::Image,
     /// Where in the image the entity sits, when localized.
     pub localization: Option<ImageGeometry>,
     /// The view classification, when a source supplies one.
     pub perspective: Option<Perspective>,
 }
 
-impl<EntId, ImgId> Fact<EntId, ImgId> {
+impl<R: IdScheme> Fact<R> {
     /// Visit every id this fact mentions, dispatching to the closure for
     /// the id's kind. Entity before image, matching the field order.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId), fi: &mut impl FnMut(&ImgId)) {
+    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity), fi: &mut impl FnMut(&R::Image)) {
         fe(&self.entity);
         fi(&self.image);
     }
 
     /// Relabel every id through the kind-matching fallible closure,
-    /// producing a `Fact<E2, I2>`.
-    pub fn try_map_ids<E2, I2, Err>(
+    /// producing a `Fact<R2>`.
+    pub fn try_map_ids<R2: IdScheme, Err>(
         &self,
-        fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
-        fi: &mut impl FnMut(&ImgId) -> Result<I2, Err>,
-    ) -> Result<Fact<E2, I2>, Err> {
+        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
+        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, Err>,
+    ) -> Result<Fact<R2>, Err> {
         Ok(Fact {
             entity: fe(&self.entity)?,
             image: fi(&self.image)?,

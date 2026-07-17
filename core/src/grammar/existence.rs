@@ -15,44 +15,42 @@
 use chronoscope_macros::grammar_type;
 
 use crate::date::UncertainDate;
+use crate::grammar::ids::IdScheme;
 
 /// Existence-cluster fact — the entity provably existed at `at`.
 ///
-/// Generic over the entity reference type `EntId`. Backs
+/// Generic over one id scheme `R: IdScheme`, reading `R::Entity`. Backs
 /// [`FactualAssertion::Existence`](crate::grammar::assertions::FactualAssertion::Existence).
 /// A single grammar struct (a product): the outer variant wrapper tags it, so the
 /// inner fact needs no tag of its own.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "EntId: ::serde::Serialize",
-    deserialize = "EntId: ::serde::de::DeserializeOwned"
-))]
-#[schemars(bound = "EntId: ::schemars::JsonSchema")]
-pub struct Fact<EntId> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub struct Fact<R: IdScheme> {
     /// The entity the witness is about.
-    pub entity: EntId,
+    pub entity: R::Entity,
     /// A date the entity is attested to have existed at, as an uncertain interval.
     pub at: UncertainDate,
 }
 
-impl<EntId> Fact<EntId> {
+impl<R: IdScheme> Fact<R> {
     /// The entity this witness is a claim about.
-    pub fn subject(&self) -> &EntId {
+    pub fn subject(&self) -> &R::Entity {
         &self.entity
     }
 
     /// Visit the single entity id this fact mentions.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&EntId)) {
+    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
         fe(&self.entity);
     }
 
     /// Relabel the single entity id through the fallible closure, producing a
-    /// `Fact<E2>`. The only failure is the leaf closure rejecting a reference.
-    pub fn try_map_ids<E2, Err>(
+    /// `Fact<R2>`. The only failure is the leaf closure rejecting a reference.
+    pub fn try_map_ids<R2: IdScheme, Err>(
         &self,
-        fe: &mut impl FnMut(&EntId) -> Result<E2, Err>,
-    ) -> Result<Fact<E2>, Err> {
+        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
+    ) -> Result<Fact<R2>, Err> {
         Ok(Fact {
             entity: fe(&self.entity)?,
             at: self.at.clone(),

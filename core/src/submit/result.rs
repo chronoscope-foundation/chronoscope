@@ -232,7 +232,7 @@ impl<R: IdScheme> StoredFact<R> {
     /// submit consistency rules and the projection's entity→event hop read
     /// before classifying — one place to recognize an event fact, so the two
     /// can't drift.
-    pub fn event_fact(&self) -> Option<&crate::grammar::event::Fact<R::Entity, R::Event>> {
+    pub fn event_fact(&self) -> Option<&crate::grammar::event::Fact<R>> {
         match self {
             Self::Factual(StoredFactualFact {
                 assertion: FactualAssertion::Event { fact },

@@ -48,7 +48,7 @@ use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::grammar::ids::SubjectKind;
+use crate::grammar::ids::{IdScheme, SubjectKind};
 
 // ============================================================================
 // SelfPairError — shared self-pair rejection
@@ -146,6 +146,12 @@ pub enum IdMapError<E, V, I> {
         decl_count: usize,
     },
 }
+
+/// The id-traversal error over a scheme `R` — [`IdMapError`] projected onto
+/// `R`'s three id kinds. Keeps the `Fact::try_map_ids` signature readable, the
+/// same alias the assertion layer uses.
+type IdMapErrorOf<R> =
+    IdMapError<<R as IdScheme>::Entity, <R as IdScheme>::Event, <R as IdScheme>::Image>;
 
 /// Reject `a == b`, return the pair otherwise. Shared between
 /// [`OrderedDistinctPair`] and [`DistinctPair`].
@@ -366,30 +372,19 @@ impl<Id> DistinctPair<Id> {
 
 /// Identity-cluster fact.
 ///
-/// Generic over the three reference kinds. Each variant wraps an
-/// [`OrderedDistinctPair`], so there's no path to a self-equivalence or an
+/// Generic over one id scheme `R: IdScheme`, reading `R::Entity`, `R::Event`,
+/// and `R::Image`. Each variant wraps an [`OrderedDistinctPair`] over the one
+/// kind it relates, so there's no path to a self-equivalence or an
 /// out-of-order pair.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "EntId: ::serde::Serialize + Ord, EvtId: ::serde::Serialize + Ord, ImgId: ::serde::Serialize + Ord",
-    deserialize = "EntId: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, \
-                   EvtId: ::serde::Deserialize<'de> + Ord + std::fmt::Debug, \
-                   ImgId: ::serde::Deserialize<'de> + Ord + std::fmt::Debug"
-))]
-#[schemars(
-    bound = "EntId: ::schemars::JsonSchema + Ord, EvtId: ::schemars::JsonSchema + Ord, ImgId: ::schemars::JsonSchema + Ord"
-)]
-pub enum Fact<EntId, EvtId, ImgId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub enum Fact<R: IdScheme> {
     /// Two entity references describe the same entity.
     SameEntity {
         /// The two distinct entity references, in canonical order.
-        pair: OrderedDistinctPair<EntId>,
+        pair: OrderedDistinctPair<R::Entity>,
     },
     /// Two images represent the same physical artifact — different scans,
     /// resolutions, or color treatments of one photograph, painting, or
@@ -397,37 +392,32 @@ where
     /// across the class.
     SameArtifact {
         /// The two distinct image references, in canonical order.
-        pair: OrderedDistinctPair<ImgId>,
+        pair: OrderedDistinctPair<R::Image>,
     },
     /// Two lifetime-event references describe the same event.
     SameEvent {
         /// The two distinct event references, in canonical order.
-        pair: OrderedDistinctPair<EvtId>,
+        pair: OrderedDistinctPair<R::Event>,
     },
 }
 
-impl<EntId, EvtId, ImgId> Fact<EntId, EvtId, ImgId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
+impl<R: IdScheme> Fact<R> {
     /// Sorts `(a, b)` canonically by `Ord` and rejects `a == b`.
-    pub fn same_entity(a: EntId, b: EntId) -> Result<Self, SelfPairError<EntId>> {
+    pub fn same_entity(a: R::Entity, b: R::Entity) -> Result<Self, SelfPairError<R::Entity>> {
         Ok(Self::SameEntity {
             pair: OrderedDistinctPair::new(a, b)?,
         })
     }
 
     /// Sorts `(a, b)` canonically by `Ord` and rejects `a == b`.
-    pub fn same_artifact(a: ImgId, b: ImgId) -> Result<Self, SelfPairError<ImgId>> {
+    pub fn same_artifact(a: R::Image, b: R::Image) -> Result<Self, SelfPairError<R::Image>> {
         Ok(Self::SameArtifact {
             pair: OrderedDistinctPair::new(a, b)?,
         })
     }
 
     /// Sorts `(a, b)` canonically by `Ord` and rejects `a == b`.
-    pub fn same_event(a: EvtId, b: EvtId) -> Result<Self, SelfPairError<EvtId>> {
+    pub fn same_event(a: R::Event, b: R::Event) -> Result<Self, SelfPairError<R::Event>> {
         Ok(Self::SameEvent {
             pair: OrderedDistinctPair::new(a, b)?,
         })
@@ -440,9 +430,9 @@ where
     /// `(fe, fv, fi)` shape lets one caller drive every cluster's traversal.
     pub fn for_each_id(
         &self,
-        fe: &mut impl FnMut(&EntId),
-        fv: &mut impl FnMut(&EvtId),
-        fi: &mut impl FnMut(&ImgId),
+        fe: &mut impl FnMut(&R::Entity),
+        fv: &mut impl FnMut(&R::Event),
+        fi: &mut impl FnMut(&R::Image),
     ) {
         match self {
             Self::SameEntity { pair } => pair.for_each_id(fe),
@@ -452,35 +442,25 @@ where
     }
 }
 
-impl<EntId, EvtId, ImgId> Fact<EntId, EvtId, ImgId>
-where
-    EntId: Ord,
-    EvtId: Ord,
-    ImgId: Ord,
-{
+impl<R: IdScheme> Fact<R> {
     /// Relabel every id through the kind-matching fallible closure, rebuilding
     /// through the same constructors the wire boundary uses. Produces a
-    /// `Fact<E2, V2, I2>`.
+    /// `Fact<R2>`.
     ///
-    /// Error is fixed to [`IdMapError<E2, V2, I2>`]; each arm builds its own
-    /// [`SelfLoop`] wrapper — `SameEntity` → [`SelfLoop::IdentityEntity`],
-    /// `SameEvent` → [`SelfLoop::IdentityEvent`], `SameArtifact` →
-    /// [`SelfLoop::IdentityArtifact`] — carrying the typed output id. The
-    /// submit layer maps that variant to its own `SubmitError`.
+    /// Error is fixed to [`IdMapError`] over `R2`'s three id kinds; each arm
+    /// builds its own [`SelfLoop`] wrapper — `SameEntity` →
+    /// [`SelfLoop::IdentityEntity`], `SameEvent` → [`SelfLoop::IdentityEvent`],
+    /// `SameArtifact` → [`SelfLoop::IdentityArtifact`] — carrying the typed
+    /// output id. The submit layer maps that variant to its own `SubmitError`.
     ///
-    /// Three closures, like [`Self::for_each_id`]. All three output params
+    /// Three closures, like [`Self::for_each_id`]. All three output kinds
     /// build the carried ids, so none is phantom.
-    pub fn try_map_ids<E2, V2, I2>(
+    pub fn try_map_ids<R2: IdScheme>(
         &self,
-        fe: &mut impl FnMut(&EntId) -> Result<E2, IdMapError<E2, V2, I2>>,
-        fv: &mut impl FnMut(&EvtId) -> Result<V2, IdMapError<E2, V2, I2>>,
-        fi: &mut impl FnMut(&ImgId) -> Result<I2, IdMapError<E2, V2, I2>>,
-    ) -> Result<Fact<E2, V2, I2>, IdMapError<E2, V2, I2>>
-    where
-        E2: Ord,
-        V2: Ord,
-        I2: Ord,
-    {
+        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, IdMapErrorOf<R2>>,
+        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, IdMapErrorOf<R2>>,
+        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, IdMapErrorOf<R2>>,
+    ) -> Result<Fact<R2>, IdMapErrorOf<R2>> {
         match self {
             Self::SameEntity { pair } => Ok(Fact::SameEntity {
                 pair: pair
@@ -502,10 +482,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::memory::{MemoryEntityId, MemoryEventId, MemoryImageId};
+    use crate::store::memory::{MemoryEntityId, MemoryEventId, MemoryIds, MemoryImageId};
+
+    /// A test-only scheme whose three id kinds are all `u64` — the input side
+    /// of the relabel tests, mirroring the raw ids a traversal starts from.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct U64Ids;
+
+    impl IdScheme for U64Ids {
+        type Entity = u64;
+        type Event = u64;
+        type Image = u64;
+    }
+
+    /// A test-only scheme whose three id kinds are all `String` — the output
+    /// side of the relabel tests. `String` has `Ord` but the relabel error
+    /// carries the id rather than rendering it, so no `Display` is needed.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct StrIds;
+
+    impl IdScheme for StrIds {
+        type Entity = String;
+        type Event = String;
+        type Image = String;
+    }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
-    type MemFact = Fact<MemoryEntityId, MemoryEventId, MemoryImageId>;
+    type MemFact = Fact<MemoryIds>;
 
     #[test]
     fn same_entity_rejects_self_equivalence() -> TestResult {
@@ -608,7 +611,7 @@ mod tests {
     // `u64`, output ids `String` (Ord; no Display — the id is carried, not
     // rendered).
 
-    type IdFact = Fact<u64, u64, u64>;
+    type IdFact = Fact<U64Ids>;
 
     #[test]
     fn try_map_ids_collapsing_same_entity_yields_kinded_self_loop() -> TestResult {
@@ -616,7 +619,7 @@ mod tests {
         // the collision; the `SameEntity` arm wraps it as `IdentityEntity`
         // carrying the typed id.
         let fact: IdFact = Fact::same_entity(1, 2)?;
-        let result: Result<Fact<String, String, String>, _> = fact.try_map_ids(
+        let result: Result<Fact<StrIds>, _> = fact.try_map_ids(
             &mut |_e: &u64| Ok("collapsed".to_owned()),
             &mut |v: &u64| Ok(format!("evt-{v}")),
             &mut |i: &u64| Ok(format!("img-{i}")),
@@ -635,7 +638,7 @@ mod tests {
     #[test]
     fn try_map_ids_collapsing_same_artifact_yields_artifact_kind() -> TestResult {
         let fact: IdFact = Fact::same_artifact(10, 20)?;
-        let result: Result<Fact<String, String, String>, _> = fact.try_map_ids(
+        let result: Result<Fact<StrIds>, _> = fact.try_map_ids(
             &mut |e: &u64| Ok(format!("ent-{e}")),
             &mut |v: &u64| Ok(format!("evt-{v}")),
             &mut |_i: &u64| Ok("collapsed-img".to_owned()),
@@ -652,7 +655,7 @@ mod tests {
         // Distinct inputs to distinct outputs: the pair survives,
         // relabeled and re-canonicalised.
         let fact: IdFact = Fact::same_event(5, 9)?;
-        let mapped: Fact<String, String, String> = fact.try_map_ids(
+        let mapped: Fact<StrIds> = fact.try_map_ids(
             &mut |e: &u64| Ok(format!("ent-{e}")),
             &mut |v: &u64| Ok(format!("evt-{v}")),
             &mut |i: &u64| Ok(format!("img-{i}")),

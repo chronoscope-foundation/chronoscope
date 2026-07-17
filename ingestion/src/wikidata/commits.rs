@@ -23,7 +23,8 @@ use chronoscope_core::grammar::lifecycle::DurationalRole;
 use chronoscope_core::nonempty::NonEmptyVec;
 use chronoscope_core::store::FactStore;
 use chronoscope_core::submit::{
-    Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact, commit_facts,
+    BundleLocal, Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact,
+    commit_facts,
 };
 use chronoscope_integrations::wikidata::{CommonsFilename, WikidataEntity, url_for_filename};
 
@@ -481,7 +482,7 @@ fn bookend_raw_value(split: &[Contribution], phase: BookendPhase) -> Option<Stri
 // SubmitFact constructors
 // ============================================================================
 
-fn attribute_fact(fact: attribute::Fact<EntityIdx>, citation: FactualCitation) -> SubmitFact {
+fn attribute_fact(fact: attribute::Fact<BundleLocal>, citation: FactualCitation) -> SubmitFact {
     SubmitFact::Factual {
         assertion: FactualAssertion::Attribute { fact },
         citation,
@@ -489,7 +490,7 @@ fn attribute_fact(fact: attribute::Fact<EntityIdx>, citation: FactualCitation) -
 }
 
 fn construction_fact(
-    fact: bookend::ConstructionFact<EntityIdx>,
+    fact: bookend::ConstructionFact<BundleLocal>,
     citation: FactualCitation,
 ) -> SubmitFact {
     SubmitFact::Factual {
@@ -499,7 +500,7 @@ fn construction_fact(
 }
 
 fn demolition_fact(
-    fact: bookend::DemolitionFact<EntityIdx>,
+    fact: bookend::DemolitionFact<BundleLocal>,
     citation: FactualCitation,
 ) -> SubmitFact {
     SubmitFact::Factual {
@@ -508,21 +509,21 @@ fn demolition_fact(
     }
 }
 
-fn existence_fact(fact: existence::Fact<EntityIdx>, citation: FactualCitation) -> SubmitFact {
+fn existence_fact(fact: existence::Fact<BundleLocal>, citation: FactualCitation) -> SubmitFact {
     SubmitFact::Factual {
         assertion: FactualAssertion::Existence { fact },
         citation,
     }
 }
 
-fn event_fact(fact: event::Fact<EntityIdx, EventIdx>, citation: FactualCitation) -> SubmitFact {
+fn event_fact(fact: event::Fact<BundleLocal>, citation: FactualCitation) -> SubmitFact {
     SubmitFact::Factual {
         assertion: FactualAssertion::Event { fact },
         citation,
     }
 }
 
-fn image_fact(fact: image::Fact<ImageIdx>, citation: FactualCitation) -> SubmitFact {
+fn image_fact(fact: image::Fact<BundleLocal>, citation: FactualCitation) -> SubmitFact {
     SubmitFact::Factual {
         assertion: FactualAssertion::Image { fact },
         citation,

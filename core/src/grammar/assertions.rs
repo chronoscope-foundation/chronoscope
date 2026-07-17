@@ -59,31 +59,25 @@ type IdMapErrorOf<R> =
 #[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum FactualAssertion<R: IdScheme> {
     /// Entity-level attribute claims (names, external refs, relationships).
-    Attribute { fact: attribute::Fact<R::Entity> },
+    Attribute { fact: attribute::Fact<R> },
     /// Construction bookend (start / completion / location).
-    Construction {
-        fact: bookend::ConstructionFact<R::Entity>,
-    },
+    Construction { fact: bookend::ConstructionFact<R> },
     /// Demolition bookend (start / completion).
-    Demolition {
-        fact: bookend::DemolitionFact<R::Entity>,
-    },
+    Demolition { fact: bookend::DemolitionFact<R> },
     /// An existence witness — the entity provably existed at a date.
-    Existence { fact: existence::Fact<R::Entity> },
+    Existence { fact: existence::Fact<R> },
     /// Interior-lifetime event facts.
-    Event {
-        fact: event::Fact<R::Entity, R::Event>,
-    },
+    Event { fact: event::Fact<R> },
     /// A temporal-ordering relationship between two events or entity bookends.
     /// A gap names two endpoints rather than one event subject, so it sits
     /// beside the event cluster rather than inside [`event::Fact`].
     Gap {
         /// The cross-event gap bounds (endpoints plus day range).
-        bounds: event::GapBounds<R::Entity, R::Event>,
+        bounds: event::GapBounds<R>,
     },
     /// Image-level facts: source URL, author, created / capture dates,
     /// capture location, and the descriptive medium.
-    Image { fact: image::Fact<R::Image> },
+    Image { fact: image::Fact<R> },
 }
 
 impl<R: IdScheme> FactualAssertion<R> {
@@ -164,18 +158,14 @@ impl<R: IdScheme> FactualAssertion<R> {
 #[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum JudgmentAssertion<R: IdScheme> {
     /// Same-entity / same-artifact / same-event equivalence judgments.
-    Identity {
-        fact: identity::Fact<R::Entity, R::Event, R::Image>,
-    },
+    Identity { fact: identity::Fact<R> },
     /// Entity-in-image depiction judgments.
-    Depiction {
-        fact: depiction::Fact<R::Entity, R::Image>,
-    },
+    Depiction { fact: depiction::Fact<R> },
     /// Feature and spatial-relation claims about entities (basis lives
     /// in the citation).
-    Observation { fact: observation::Fact<R::Entity> },
+    Observation { fact: observation::Fact<R> },
     /// Composite-image sub-region structural facts.
-    Composite { fact: composites::Fact<R::Image> },
+    Composite { fact: composites::Fact<R> },
 }
 
 impl<R: IdScheme> JudgmentAssertion<R> {
@@ -452,7 +442,7 @@ mod traversal_props {
 
     /// `attribute::Fact` — all three variants. `Relationship` feeds two
     /// distinct entities into the directional `DistinctPair`.
-    fn arb_attribute() -> impl Strategy<Value = attribute::Fact<MemoryEntityId>> {
+    fn arb_attribute() -> impl Strategy<Value = attribute::Fact<MemoryIds>> {
         prop_oneof![
             (arb_entity(), sentinel_language()).prop_map(|(entity, language)| {
                 attribute::Fact::Name {
@@ -477,7 +467,7 @@ mod traversal_props {
 
     /// `bookend::ConstructionFact` — all three variants, backing the
     /// `Construction` arm in `arb_factual_assertion`.
-    fn arb_construction_fact() -> impl Strategy<Value = bookend::ConstructionFact<MemoryEntityId>> {
+    fn arb_construction_fact() -> impl Strategy<Value = bookend::ConstructionFact<MemoryIds>> {
         prop_oneof![
             (arb_entity(), sentinel_date())
                 .prop_map(|(entity, bound)| bookend::ConstructionFact::Started { entity, bound }),
@@ -492,13 +482,13 @@ mod traversal_props {
 
     /// `existence::Fact` — a single entity witness, backing the `Existence` arm
     /// in `arb_factual_assertion`.
-    fn arb_existence_fact() -> impl Strategy<Value = existence::Fact<MemoryEntityId>> {
+    fn arb_existence_fact() -> impl Strategy<Value = existence::Fact<MemoryIds>> {
         (arb_entity(), sentinel_date()).prop_map(|(entity, at)| existence::Fact { entity, at })
     }
 
     /// `bookend::DemolitionFact` — start and completion, backing the
     /// `Demolition` arm in `arb_factual_assertion`.
-    fn arb_demolition_fact() -> impl Strategy<Value = bookend::DemolitionFact<MemoryEntityId>> {
+    fn arb_demolition_fact() -> impl Strategy<Value = bookend::DemolitionFact<MemoryIds>> {
         prop_oneof![
             (arb_entity(), sentinel_date())
                 .prop_map(|(entity, bound)| bookend::DemolitionFact::Started { entity, bound }),
@@ -510,8 +500,7 @@ mod traversal_props {
     /// `event::OrderableEvent` — all three variants. `Event` carries an
     /// event id, the two bookend-anchored ones an entity id, so a mixed
     /// `Gap` routes through both closures.
-    fn arb_orderable_event()
-    -> impl Strategy<Value = event::OrderableEvent<MemoryEntityId, MemoryEventId>> {
+    fn arb_orderable_event() -> impl Strategy<Value = event::OrderableEvent<MemoryIds>> {
         prop_oneof![
             arb_event().prop_map(|event| event::OrderableEvent::Event { event }),
             arb_entity()
@@ -523,7 +512,7 @@ mod traversal_props {
     /// `event::Fact` — all nine variants, including `HasEvent` (the only one
     /// carrying both an entity and an event ref, with a random declared kind so
     /// both category arms and every subtype are exercised).
-    fn arb_event_fact() -> impl Strategy<Value = event::Fact<MemoryEntityId, MemoryEventId>> {
+    fn arb_event_fact() -> impl Strategy<Value = event::Fact<MemoryIds>> {
         prop_oneof![
             (arb_entity(), arb_event(), arb_lifetime_event_kind()).prop_map(
                 |(entity, event, kind)| event::Fact::HasEvent {
@@ -587,7 +576,7 @@ mod traversal_props {
     /// `event::GapBounds` — both endpoints generated independently, so a mixed
     /// gap routes through both id closures. Forces the nested
     /// `GapBounds -> OrderableEvent` recursion.
-    fn arb_gap_bounds() -> impl Strategy<Value = event::GapBounds<MemoryEntityId, MemoryEventId>> {
+    fn arb_gap_bounds() -> impl Strategy<Value = event::GapBounds<MemoryIds>> {
         (arb_orderable_event(), arb_orderable_event()).prop_filter_map(
             "valid gap bounds",
             |(from, to)| {
@@ -604,7 +593,7 @@ mod traversal_props {
 
     /// `image::Fact` — all six variants (`Source`, `Author`, `CreatedDate`,
     /// `CapturedDate`, `CapturedLocation`, `Medium`).
-    fn arb_image_fact() -> impl Strategy<Value = image::Fact<MemoryImageId>> {
+    fn arb_image_fact() -> impl Strategy<Value = image::Fact<MemoryIds>> {
         prop_oneof![
             (arb_image(), sentinel_url())
                 .prop_map(|(image, url)| image::Fact::Source { image, url }),
@@ -628,8 +617,7 @@ mod traversal_props {
 
     /// `identity::Fact` — all three variants, each fed two distinct
     /// same-kind ids through its `OrderedDistinctPair`.
-    fn arb_identity()
-    -> impl Strategy<Value = identity::Fact<MemoryEntityId, MemoryEventId, MemoryImageId>> {
+    fn arb_identity() -> impl Strategy<Value = identity::Fact<MemoryIds>> {
         prop_oneof![
             arb_distinct_entities().prop_filter_map("distinct same_entity", |(a, b)| {
                 identity::Fact::same_entity(a, b).ok()
@@ -646,7 +634,7 @@ mod traversal_props {
     /// `depiction::Fact` — the merged depiction struct, generated across the
     /// localization-present and bare shapes (the optional fields carry no ids,
     /// so the identity law pins the entity/image reconstruction either way).
-    fn arb_depiction() -> impl Strategy<Value = depiction::Fact<MemoryEntityId, MemoryImageId>> {
+    fn arb_depiction() -> impl Strategy<Value = depiction::Fact<MemoryIds>> {
         prop_oneof![
             (arb_entity(), arb_image(), sentinel_image_bbox()).prop_map(
                 |(entity, image, geometry)| depiction::Fact {
@@ -675,7 +663,7 @@ mod traversal_props {
 
     /// `spatial::TopologicalRel` — all six variants; three carry a
     /// separator/axis entity id, three carry none.
-    fn arb_topological_rel() -> impl Strategy<Value = TopologicalRel<MemoryEntityId>> {
+    fn arb_topological_rel() -> impl Strategy<Value = TopologicalRel<MemoryIds>> {
         prop_oneof![
             Just(TopologicalRel::Adjacent),
             arb_entity().prop_map(|separator| TopologicalRel::AcrossFrom { separator }),
@@ -689,7 +677,7 @@ mod traversal_props {
     /// `observation::Fact` — both variants. `Spatial` carries a
     /// `DistinctPair` plus a `TopologicalRel` whose separator/axis is a
     /// third, independent entity id — the traversal visits the pair first.
-    fn arb_observation() -> impl Strategy<Value = observation::Fact<MemoryEntityId>> {
+    fn arb_observation() -> impl Strategy<Value = observation::Fact<MemoryIds>> {
         prop_oneof![
             arb_entity().prop_map(|entity| observation::Fact::Feature {
                 entity,
@@ -705,7 +693,7 @@ mod traversal_props {
     /// `composites::Fact` — the single `IsSubimageOf` variant. The two image
     /// ids don't canonicalize, so they're drawn distinct to make a
     /// `subimage`/`parent` swap observable under the identity law.
-    fn arb_composite() -> impl Strategy<Value = composites::Fact<MemoryImageId>> {
+    fn arb_composite() -> impl Strategy<Value = composites::Fact<MemoryIds>> {
         (arb_distinct_images(), sentinel_subimage_region()).prop_map(
             |((subimage, parent), region)| composites::Fact::IsSubimageOf {
                 subimage,

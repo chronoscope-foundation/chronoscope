@@ -163,7 +163,7 @@ where
 
 #[test]
 fn golden_attribute_fact_name() -> Result<()> {
-    let f: attribute::Fact<MemoryEntityId> = attribute::Fact::Name {
+    let f: attribute::Fact<MemoryIds> = attribute::Fact::Name {
         entity: ent(1)?,
         name: NameText::new("Pantheon"),
         language: en()?,
@@ -179,7 +179,8 @@ fn golden_attribute_fact_name() -> Result<()> {
 
 #[test]
 fn golden_attribute_fact_relationship() -> Result<()> {
-    let f = attribute::Fact::relationship(ent(1)?, ent(2)?, EntityRelationType::Contains)?;
+    let f =
+        attribute::Fact::<MemoryIds>::relationship(ent(1)?, ent(2)?, EntityRelationType::Contains)?;
     assert_golden_roundtrip(
         &f,
         r#"{"pair":{"from":"1","to":"2"},"relation":"contains","type":"relationship"}"#,
@@ -188,7 +189,7 @@ fn golden_attribute_fact_relationship() -> Result<()> {
 
 #[test]
 fn golden_construction_fact_started() -> Result<()> {
-    let f: bookend::ConstructionFact<MemoryEntityId> = bookend::ConstructionFact::Started {
+    let f: bookend::ConstructionFact<MemoryIds> = bookend::ConstructionFact::Started {
         entity: ent(1)?,
         bound: sample_date()?,
     };
@@ -200,7 +201,7 @@ fn golden_construction_fact_started() -> Result<()> {
 
 #[test]
 fn golden_demolition_fact_started() -> Result<()> {
-    let f: bookend::DemolitionFact<MemoryEntityId> = bookend::DemolitionFact::Started {
+    let f: bookend::DemolitionFact<MemoryIds> = bookend::DemolitionFact::Started {
         entity: ent(1)?,
         bound: sample_date()?,
     };
@@ -212,7 +213,7 @@ fn golden_demolition_fact_started() -> Result<()> {
 
 #[test]
 fn golden_existence_fact() -> Result<()> {
-    let f: existence::Fact<MemoryEntityId> = existence::Fact {
+    let f: existence::Fact<MemoryIds> = existence::Fact {
         entity: ent(1)?,
         at: sample_date()?,
     };
@@ -224,7 +225,7 @@ fn golden_existence_fact() -> Result<()> {
 
 #[test]
 fn golden_event_fact_durational_date() -> Result<()> {
-    let f: event::Fact<MemoryEntityId, MemoryEventId> = event::Fact::DurationalDate {
+    let f: event::Fact<MemoryIds> = event::Fact::DurationalDate {
         event: evt(1)?,
         role: DurationalRole::Started,
         bound: sample_date()?,
@@ -237,7 +238,7 @@ fn golden_event_fact_durational_date() -> Result<()> {
 
 #[test]
 fn golden_event_fact_has_event() -> Result<()> {
-    let f: event::Fact<MemoryEntityId, MemoryEventId> = event::Fact::HasEvent {
+    let f: event::Fact<MemoryIds> = event::Fact::HasEvent {
         entity: ent(1)?,
         event: evt(1)?,
         kind: LifetimeEventKind::Durational {
@@ -252,7 +253,7 @@ fn golden_event_fact_has_event() -> Result<()> {
 
 #[test]
 fn golden_event_fact_move_method() -> Result<()> {
-    let f: event::Fact<MemoryEntityId, MemoryEventId> = event::Fact::MoveMethod {
+    let f: event::Fact<MemoryIds> = event::Fact::MoveMethod {
         event: evt(1)?,
         method: MoveMethod::Whole,
     };
@@ -261,7 +262,7 @@ fn golden_event_fact_move_method() -> Result<()> {
 
 #[test]
 fn golden_image_fact_source() -> Result<()> {
-    let f: image::Fact<MemoryImageId> = image::Fact::Source {
+    let f: image::Fact<MemoryIds> = image::Fact::Source {
         image: img(1)?,
         url: Url::parse("https://example.com/img")?,
     };
@@ -273,7 +274,7 @@ fn golden_image_fact_source() -> Result<()> {
 
 #[test]
 fn golden_image_fact_medium() -> Result<()> {
-    let f: image::Fact<MemoryImageId> = image::Fact::Medium {
+    let f: image::Fact<MemoryIds> = image::Fact::Medium {
         image: img(1)?,
         medium: ImageMedium::PictorialMap,
     };
@@ -285,10 +286,7 @@ fn golden_image_fact_medium() -> Result<()> {
 
 #[test]
 fn golden_identity_fact_same_entity() -> Result<()> {
-    let f = identity::Fact::<MemoryEntityId, MemoryEventId, MemoryImageId>::same_entity(
-        ent(1)?,
-        ent(2)?,
-    )?;
+    let f = identity::Fact::<MemoryIds>::same_entity(ent(1)?, ent(2)?)?;
     assert_golden_roundtrip(&f, r#"{"pair":{"a":"1","b":"2"},"type":"same_entity"}"#)
 }
 
@@ -297,7 +295,7 @@ fn golden_depiction_fact_bare() -> Result<()> {
     // The common P18 case: an entity↔image link with no localization and no
     // perspective. The struct carries no inner tag — the
     // `JudgmentAssertion::Depiction` wrapper tags it.
-    let f: depiction::Fact<MemoryEntityId, MemoryImageId> = depiction::Fact {
+    let f: depiction::Fact<MemoryIds> = depiction::Fact {
         entity: ent(1)?,
         image: img(1)?,
         localization: None,
@@ -313,7 +311,7 @@ fn golden_depiction_fact_bare() -> Result<()> {
 fn golden_depiction_fact_localized() -> Result<()> {
     // A localized, classified depiction: the `ImageGeometry` bbox rides under
     // `localization`, the leaf `Perspective` value under `perspective`.
-    let f: depiction::Fact<MemoryEntityId, MemoryImageId> = depiction::Fact {
+    let f: depiction::Fact<MemoryIds> = depiction::Fact {
         entity: ent(1)?,
         image: img(1)?,
         localization: Some(ImageGeometry::bbox(0.1, 0.2, 0.3, 0.4)?),
@@ -331,7 +329,7 @@ fn golden_observation_fact_feature() -> Result<()> {
     // Naming the field lets internal tagging wrap a fieldless inner enum like
     // `RoofShape`; a bare newtype payload would flatten beside the tag and
     // collide.
-    let f: observation::Fact<MemoryEntityId> = observation::Fact::Feature {
+    let f: observation::Fact<MemoryIds> = observation::Fact::Feature {
         entity: ent(1)?,
         feature: crate::grammar::features::Feature::RoofShape {
             shape: crate::grammar::features::RoofShape::Gabled,
@@ -345,7 +343,7 @@ fn golden_observation_fact_feature() -> Result<()> {
 
 #[test]
 fn golden_observation_fact_spatial() -> Result<()> {
-    let f = observation::Fact::spatial(ent(1)?, ent(2)?, TopologicalRel::Adjacent)?;
+    let f = observation::Fact::<MemoryIds>::spatial(ent(1)?, ent(2)?, TopologicalRel::Adjacent)?;
     assert_golden_roundtrip(
         &f,
         r#"{"pair":{"from":"1","to":"2"},"relation":{"type":"adjacent"},"type":"spatial"}"#,
@@ -355,7 +353,7 @@ fn golden_observation_fact_spatial() -> Result<()> {
 #[test]
 fn golden_composites_fact_is_subimage_of() -> Result<()> {
     let region = SubimageRegion::rect(0.0, 0.0, 0.5, 0.5)?;
-    let f: composites::Fact<MemoryImageId> = composites::Fact::IsSubimageOf {
+    let f: composites::Fact<MemoryIds> = composites::Fact::IsSubimageOf {
         subimage: img(1)?,
         parent: img(2)?,
         region,

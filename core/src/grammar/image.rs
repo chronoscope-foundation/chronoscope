@@ -49,6 +49,7 @@ use url::Url;
 
 use crate::date::UncertainDate;
 use crate::grammar::citations::Language;
+use crate::grammar::ids::IdScheme;
 use crate::location::UnresolvedLocation;
 
 /// What kind of image this is — a render hint, never a gate.
@@ -73,22 +74,19 @@ pub enum ImageMedium {
 /// Image-cluster fact. Claims about the image's bytes and the
 /// underlying artifact those bytes represent.
 ///
-/// Generic over the image reference type `ImgId`. A capture location carries an
-/// [`UnresolvedLocation`] whose entity-scale containment is expressed via
-/// [`crate::grammar::attribute::Fact::Relationship`] on the relevant entities, not
-/// embedded in the location reference.
+/// Generic over one id scheme `R: IdScheme`, reading `R::Image`. A capture
+/// location carries an [`UnresolvedLocation`] whose entity-scale containment is
+/// expressed via [`crate::grammar::attribute::Fact::Relationship`] on the
+/// relevant entities, not embedded in the location reference.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "ImgId: ::serde::Serialize",
-    deserialize = "ImgId: ::serde::de::DeserializeOwned"
-))]
-#[schemars(bound = "ImgId: ::schemars::JsonSchema")]
-pub enum Fact<ImgId> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub enum Fact<R: IdScheme> {
     /// URL the image was sourced from. A re-scan or alternate-resolution
     /// copy has a different image id and its own `Source` fact.
     Source {
-        image: ImgId,
+        image: R::Image,
         #[schemars(with = "String")]
         url: Url,
     },
@@ -104,7 +102,7 @@ pub enum Fact<ImgId> {
     /// classes: every scan of the same painting carries the same author
     /// claim.
     Author {
-        image: ImgId,
+        image: R::Image,
         /// The author's name as the source recorded it.
         name: String,
         /// BCP-47 language tag for the name, in canonical form.
@@ -120,7 +118,7 @@ pub enum Fact<ImgId> {
     /// [`crate::grammar::identity::Fact::SameArtifact`] equivalence
     /// classes.
     CreatedDate {
-        image: ImgId,
+        image: R::Image,
         /// The source-claimed interval for the creation.
         bound: UncertainDate,
     },
@@ -130,14 +128,14 @@ pub enum Fact<ImgId> {
     /// [`Fact::CreatedDate`].
     CapturedDate {
         /// Which image the bound applies to.
-        image: ImgId,
+        image: R::Image,
         /// The source-claimed interval for the capture.
         bound: UncertainDate,
     },
     /// Where this image was captured — the viewpoint location.
     CapturedLocation {
         /// Which image the location applies to.
-        image: ImgId,
+        image: R::Image,
         /// The capture location.
         location: UnresolvedLocation,
     },
@@ -146,15 +144,15 @@ pub enum Fact<ImgId> {
     /// without constraining any other fact.
     Medium {
         /// Which image the medium describes.
-        image: ImgId,
+        image: R::Image,
         /// The descriptive medium.
         medium: ImageMedium,
     },
 }
 
-impl<ImgId> Fact<ImgId> {
+impl<R: IdScheme> Fact<R> {
     /// Visit the single image id this fact mentions.
-    pub fn for_each_id(&self, fi: &mut impl FnMut(&ImgId)) {
+    pub fn for_each_id(&self, fi: &mut impl FnMut(&R::Image)) {
         match self {
             Self::Source { image, .. }
             | Self::Author { image, .. }
@@ -166,11 +164,11 @@ impl<ImgId> Fact<ImgId> {
     }
 
     /// Relabel the single image id through the fallible closure, producing
-    /// a `Fact<I2>`.
-    pub fn try_map_ids<I2, Err>(
+    /// a `Fact<R2>`.
+    pub fn try_map_ids<R2: IdScheme, Err>(
         &self,
-        fi: &mut impl FnMut(&ImgId) -> Result<I2, Err>,
-    ) -> Result<Fact<I2>, Err> {
+        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, Err>,
+    ) -> Result<Fact<R2>, Err> {
         match self {
             Self::Source { image, url } => Ok(Fact::Source {
                 image: fi(image)?,

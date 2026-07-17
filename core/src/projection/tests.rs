@@ -758,7 +758,7 @@ fn evt(id: u64) -> MemEvtId {
 /// Wrap an event-cluster fact as a stored factual fact at the given id.
 fn event_stored(
     fact_id: u64,
-    fact: event::Fact<MemEntId, MemEvtId>,
+    fact: event::Fact<MemoryIds>,
 ) -> Result<(FactId, StoredEventFact), Box<dyn std::error::Error>> {
     Ok((
         FactId::new(fact_id),

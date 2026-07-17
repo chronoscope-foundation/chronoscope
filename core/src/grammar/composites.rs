@@ -33,38 +33,36 @@
 use chronoscope_macros::grammar_type;
 
 use crate::grammar::geometry::{ProportionalCoordError, ProportionalRect};
+use crate::grammar::ids::IdScheme;
 
 /// Composite-cluster fact.
 ///
-/// Generic over the image reference type `ImgId`.
+/// Generic over one id scheme `R: IdScheme`, reading `R::Image`.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "ImgId: ::serde::Serialize",
-    deserialize = "ImgId: ::serde::de::DeserializeOwned"
-))]
-#[schemars(bound = "ImgId: ::schemars::JsonSchema")]
-pub enum Fact<ImgId> {
+#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
+#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
+pub enum Fact<R: IdScheme> {
     /// One image is a sub-region of another (a composite's panel,
     /// inset, or grid cell). See the module docs for the submit-time
     /// invariants (no chains, one parent per subimage, no self-parent).
     IsSubimageOf {
         /// The smaller image — the panel or cell.
-        subimage: ImgId,
+        subimage: R::Image,
         /// The parent image — the composite as a whole.
-        parent: ImgId,
+        parent: R::Image,
         /// The region of the parent occupied by the subimage.
         region: SubimageRegion,
     },
 }
 
-impl<ImgId> Fact<ImgId> {
+impl<R: IdScheme> Fact<R> {
     /// Visit every image id this fact mentions.
     ///
     /// `IsSubimageOf` carries two image ids (`subimage` then `parent`); both
     /// go to the same closure, in field order. The no-self-parent invariant
     /// is a submit-layer rule, not a structural pair constraint.
-    pub fn for_each_id(&self, fi: &mut impl FnMut(&ImgId)) {
+    pub fn for_each_id(&self, fi: &mut impl FnMut(&R::Image)) {
         match self {
             Self::IsSubimageOf {
                 subimage, parent, ..
@@ -76,11 +74,11 @@ impl<ImgId> Fact<ImgId> {
     }
 
     /// Relabel every image id through the fallible closure, producing a
-    /// `Fact<I2>`.
-    pub fn try_map_ids<I2, Err>(
+    /// `Fact<R2>`.
+    pub fn try_map_ids<R2: IdScheme, Err>(
         &self,
-        fi: &mut impl FnMut(&ImgId) -> Result<I2, Err>,
-    ) -> Result<Fact<I2>, Err> {
+        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, Err>,
+    ) -> Result<Fact<R2>, Err> {
         match self {
             Self::IsSubimageOf {
                 subimage,

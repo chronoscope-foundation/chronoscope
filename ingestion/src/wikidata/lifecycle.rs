@@ -18,6 +18,7 @@ use chronoscope_core::date::UncertainDate;
 use chronoscope_core::external_ids::WikidataPropertyId;
 use chronoscope_core::grammar::citations::FactualCitation;
 use chronoscope_core::grammar::event;
+use chronoscope_core::grammar::ids::IdScheme;
 use chronoscope_core::grammar::lifecycle::{
     DamageCause, DurationalKind, LifetimeEventKind, PointKind, Usage,
 };
@@ -114,7 +115,7 @@ pub enum InteriorPayload {
 
 impl InteriorPayload {
     /// The event-cluster fact this payload asserts about `event`.
-    pub fn fact<EntId: Ord, EvtId: Ord>(&self, event: EvtId) -> event::Fact<EntId, EvtId> {
+    pub fn fact<R: IdScheme>(&self, event: R::Event) -> event::Fact<R> {
         match self {
             Self::DamageCause { cause } => event::Fact::DamageCause {
                 event,

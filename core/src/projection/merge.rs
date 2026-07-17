@@ -245,15 +245,12 @@ fn cross_space_target<'a, N: Ord, F>(near: &N, far: &'a F, members: &BTreeSet<N>
     members.contains(near).then_some(far)
 }
 
-fn inject_attribute<EntId, EvtId, ImgId, T>(
-    fact: &attribute::Fact<EntId>,
-    members: &BTreeSet<EntId>,
+fn inject_attribute<R: IdScheme, T>(
+    fact: &attribute::Fact<R>,
+    members: &BTreeSet<R::Entity>,
     support: T,
-    entity: &mut Entity<EntId, EvtId, ImgId, T>,
+    entity: &mut Entity<R::Entity, R::Event, R::Image, T>,
 ) where
-    EntId: Ord + Clone,
-    EvtId: Ord,
-    ImgId: Ord,
     T: Semiring + Clone,
 {
     match fact {
@@ -309,8 +306,8 @@ fn inject_attribute<EntId, EvtId, ImgId, T>(
     }
 }
 
-fn inject_construction<EntId, T>(
-    fact: &bookend::ConstructionFact<EntId>,
+fn inject_construction<R: IdScheme, T>(
+    fact: &bookend::ConstructionFact<R>,
     support: T,
     bookend: &mut Bookend<T>,
 ) where
@@ -329,8 +326,8 @@ fn inject_construction<EntId, T>(
     }
 }
 
-fn inject_demolition<EntId, T>(
-    fact: &bookend::DemolitionFact<EntId>,
+fn inject_demolition<R: IdScheme, T>(
+    fact: &bookend::DemolitionFact<R>,
     support: T,
     bookend: &mut Bookend<T>,
 ) where
@@ -349,17 +346,14 @@ fn inject_demolition<EntId, T>(
 /// An interior event fact's contribution, tagged with the one entity whose
 /// `HasEvent` owns the event. An event with no owner (no `HasEvent` in the bag)
 /// contributes nothing.
-fn inject_event_fact<EntId, EvtId, ImgId, Stored, T>(
+fn inject_event_fact<R: IdScheme, Stored, T>(
     fact_id: &FactId,
-    fact: &event::Fact<EntId, EvtId>,
+    fact: &event::Fact<R>,
     stored: &Stored,
-    reachers: &BTreeMap<EvtId, EntId>,
-    provenance: &impl Fn(&FactId, &EntId, &Stored) -> T,
-) -> Entity<EntId, EvtId, ImgId, T>
+    reachers: &BTreeMap<R::Event, R::Entity>,
+    provenance: &impl Fn(&FactId, &R::Entity, &Stored) -> T,
+) -> Entity<R::Entity, R::Event, R::Image, T>
 where
-    EntId: Ord + Clone,
-    EvtId: Ord + Clone,
-    ImgId: Ord + Clone,
     T: Semiring + Clone,
 {
     let Some(owner) = reachers.get(fact.subject()) else {
@@ -371,14 +365,11 @@ where
     entity
 }
 
-fn inject_event<EntId, EvtId, ImgId, T>(
-    fact: &event::Fact<EntId, EvtId>,
+fn inject_event<R: IdScheme, T>(
+    fact: &event::Fact<R>,
     support: T,
-    entity: &mut Entity<EntId, EvtId, ImgId, T>,
+    entity: &mut Entity<R::Entity, R::Event, R::Image, T>,
 ) where
-    EntId: Ord,
-    EvtId: Ord + Clone,
-    ImgId: Ord,
     T: Semiring + Clone,
 {
     let mut record = Event::identity();
@@ -471,8 +462,8 @@ where
 /// claimed value, an absent axis stays at the identity bracket. Shared by the
 /// entity-side `depictions` and the image-side `depicts`, so both views pin the
 /// same axes; each side's support cites its own subject.
-pub(super) fn inject_depiction<EntId, ImgId, T>(
-    fact: &depiction::Fact<EntId, ImgId>,
+pub(super) fn inject_depiction<R: IdScheme, T>(
+    fact: &depiction::Fact<R>,
     support: &T,
 ) -> DepictionRecord<T>
 where
@@ -501,9 +492,9 @@ where
 /// passes `near = entity`, `far = image`; the image side swaps them. Both run
 /// through here so the gate, the support, and the pinned axes stay identical
 /// across the two views.
-fn depiction_edge<'f, EntId, ImgId, N, F, Stored, T>(
+fn depiction_edge<'f, R: IdScheme, N, F, Stored, T>(
     fact_id: &FactId,
-    fact: &depiction::Fact<EntId, ImgId>,
+    fact: &depiction::Fact<R>,
     near: &N,
     far: &'f F,
     members: &BTreeSet<N>,
@@ -591,15 +582,13 @@ where
 
 /// An image fact's contribution: only `Source` (→ `urls`) and `Medium` (→ the
 /// restrictive `medium`) carry image-field projections.
-fn inject_image_fact<EntId, ImgId, Stored, T>(
+fn inject_image_fact<R: IdScheme, Stored, T>(
     fact_id: &FactId,
-    fact: &image::Fact<ImgId>,
+    fact: &image::Fact<R>,
     stored: &Stored,
-    provenance: &impl Fn(&FactId, &ImgId, &Stored) -> T,
-) -> Image<EntId, ImgId, T>
+    provenance: &impl Fn(&FactId, &R::Image, &Stored) -> T,
+) -> Image<R::Entity, R::Image, T>
 where
-    EntId: Ord,
-    ImgId: Ord + Clone,
     T: Semiring + Clone,
 {
     let mut image = Image::identity();
