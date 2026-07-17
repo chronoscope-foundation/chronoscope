@@ -158,6 +158,7 @@ macro_rules! fact_store_conformance {
             event_representative_is_canonical_across_same_event_members,
             image_class_contains_both_same_artifact_members,
             image_representative_is_canonical_across_same_artifact_members,
+            image_representatives_batch_matches_per_id_resolution,
             fact_referencing_out_of_range_entity_idx_returns_error,
             fact_referencing_out_of_range_event_idx_returns_error,
             fact_referencing_out_of_range_image_idx_returns_error,

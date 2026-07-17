@@ -613,25 +613,33 @@ pub async fn list_markers(
         };
     let snapshot = page.snapshot;
 
-    // Serve each marker's representative thumbnail from our own `/media/{key}`.
-    // The summary's thumbnail id is a class member; resolving it to the
-    // `SameArtifact` representative matches the key the resolver stored under.
-    // An unresolved representative leaves the marker with no thumbnail. Marker
-    // assembly is pure; the fact-store read lives here.
+    // `markers_from_summaries` is pure assembly; the one fact-store read is the
+    // batched representative resolution below. Each summary's thumbnail id is a
+    // class member; resolving it to the `SameArtifact` representative matches the
+    // key the resolver stored under, and a distinct set keeps co-located markers
+    // sharing a thumbnail to a single resolution. An unresolved representative or
+    // missing media leaves the marker with no thumbnail.
     let assembled = entity_types::markers_from_summaries(page.summaries, accept_language(&ctx));
+    let thumbnail_ids: Vec<ServerImageId> = assembled
+        .iter()
+        .filter_map(|(_, thumbnail)| *thumbnail)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let representatives = view
+        .image_representatives(&thumbnail_ids)
+        .await
+        .map_err(fact_store_err)?;
     let mut markers = Vec::with_capacity(assembled.len());
     for (mut marker, thumbnail) in assembled {
-        if let Some(image_id) = thumbnail {
-            let representative = view
-                .image_representative(&image_id)
-                .await
-                .map_err(fact_store_err)?;
-            if let Some(media) = state.image_media.get(&representative) {
-                marker.thumbnail_url = Some(cdn::full_url(
-                    &state.config.cdn_base_url,
-                    &media.thumbnail_key,
-                ));
-            }
+        if let Some(media) = thumbnail
+            .and_then(|image_id| representatives.get(&image_id))
+            .and_then(|representative| state.image_media.get(representative))
+        {
+            marker.thumbnail_url = Some(cdn::full_url(
+                &state.config.cdn_base_url,
+                &media.thumbnail_key,
+            ));
         }
         markers.push(marker);
     }

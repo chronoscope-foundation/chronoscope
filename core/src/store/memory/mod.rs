@@ -1057,13 +1057,18 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
 }
 
 impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
-    async fn image_representative(
+    async fn image_representatives(
         &mut self,
-        member: &MemoryImageId,
-    ) -> Result<MemoryImageId, MemoryError> {
-        let member = *member;
+        members: &[MemoryImageId],
+    ) -> Result<HashMap<MemoryImageId, MemoryImageId>, MemoryError> {
+        let members = members.to_vec();
         Ok(self
-            .with_core(move |core| core.equiv_class(member, same_artifact_edge).representative)
+            .with_core(move |core| {
+                members
+                    .into_iter()
+                    .map(|m| (m, core.equiv_class(m, same_artifact_edge).representative))
+                    .collect::<HashMap<MemoryImageId, MemoryImageId>>()
+            })
             .await)
     }
 

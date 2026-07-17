@@ -173,6 +173,23 @@ define_fact_queries! {
     // probe (the representative itself, rowless when it never moved, is the
     // caller's to add).
     RESOLVE_REP: resolve_rep_expr!("?2", "?3"),
+
+    // Batch representative resolution: the RESOLVE_REP rule applied to every
+    // member of a JSON array (?2) in one query — kind ?1, bound ?3. The
+    // json_each virtual table drives the outer rows; each member resolves
+    // through the same shared one-seek log rule (COALESCE to the member where
+    // it has no log row), so the batch and point paths can't disagree. Each
+    // member's inner resolve is one descending covering seek on the primary
+    // key, exactly as RESOLVE_REP's.
+    RESOLVE_REPS: concat!(
+        "
+        SELECT je.value AS member,
+               COALESCE((",
+        resolve_rep_expr!("je.value", "?3"),
+        "), je.value) AS rep
+        FROM json_each(?2) je
+    "
+    ),
     CLASS_MEMBERS: "
         SELECT s.member FROM subject_reps s
         WHERE s.kind = ?1 AND s.rep = ?2 AND s.as_of < ?3

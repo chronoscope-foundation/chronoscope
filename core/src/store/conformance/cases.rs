@@ -1595,6 +1595,85 @@ pub async fn image_representative_is_canonical_across_same_artifact_members<S: F
     Ok(())
 }
 
+/// The batch [`ImageView::image_representatives`] returns, for every member,
+/// exactly what [`ImageView::image_representative`] returns per id. Seeds a
+/// `SameArtifact` pair and a lone image, then cross-checks the map against the
+/// per-id resolution — so resolving the whole batch at once and resolving one
+/// member at a time (a singleton batch) must agree, and the pair collapses to
+/// one rep while the lone image maps to itself.
+pub async fn image_representatives_batch_matches_per_id_resolution<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let identity_pair = identity::Fact::same_artifact(ImageIdx(0), ImageIdx(1))?;
+    let bundle: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local, Decl::Local],
+        facts: [
+            crate::submit::SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Identity {
+                    fact: identity_pair,
+                },
+                citation: JudgmentSource::PersonalKnowledge {
+                    user: UserId::new("alice"),
+                    justification: Justification::new("These two scans are the same artifact.")?,
+                },
+            },
+            image_source_fact(2, "https://example.org/lone.jpg")?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let ids: Vec<ImageIdOf<S>> = [ImageIdx(0), ImageIdx(1), ImageIdx(2)]
+        .into_iter()
+        .map(|idx| {
+            result
+                .images
+                .get(&idx)
+                .map(|resolution| resolution.id.clone())
+                .ok_or_else(|| format!("missing image {idx:?}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+
+    let mut per_id: HashMap<ImageIdOf<S>, ImageIdOf<S>> = HashMap::new();
+    for id in &ids {
+        let rep = view
+            .image_representative(id)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        per_id.insert(id.clone(), rep);
+    }
+
+    let batch = view
+        .image_representatives(&ids)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    assert_eq!(
+        batch, per_id,
+        "batch representatives must match the per-id resolution for every member"
+    );
+    assert_eq!(
+        batch.get(&ids[0]),
+        batch.get(&ids[1]),
+        "the SameArtifact pair must collapse to one representative in the batch"
+    );
+    assert_eq!(
+        batch.get(&ids[2]),
+        Some(&ids[2]),
+        "the lone image with no SameArtifact class must map to itself"
+    );
+    Ok(())
+}
+
 // --- index-reference error paths ---
 
 #[derive(Debug, Clone, Copy)]

@@ -281,6 +281,35 @@ pub(super) async fn representative<S: SubjectColumn>(
     Ok(S::from_raw(rep))
 }
 
+/// The class representatives of a batch of members at the snapshot, resolved
+/// in one query: each member's last log row below the bound, or the member
+/// itself where it has none — the set-based analogue of [`representative`],
+/// applying the same shared rule per member. Every input member appears in
+/// the returned map.
+pub(super) async fn representatives<S: SubjectColumn + std::hash::Hash>(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    members: &[S],
+) -> Result<std::collections::HashMap<S, S>, SqliteFactStoreError> {
+    if members.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let raw_ids: Vec<i64> = members.iter().map(|m| m.raw()).collect();
+    let members_json =
+        serde_json::to_string(&raw_ids).map_err(json("encoding representative member list"))?;
+    let rows: Vec<(i64, i64)> = sqlx::query_as(queries::RESOLVE_REPS.sql)
+        .bind(kind_tag(S::KIND))
+        .bind(&members_json)
+        .bind(bound.bind())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("resolving subject representatives"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(member, rep)| (S::from_raw(member), S::from_raw(rep)))
+        .collect())
+}
+
 /// The equivalence class of `member` at the snapshot, read off the
 /// representative log: one seek to the representative, then the reverse
 /// gather, plus the representative itself.

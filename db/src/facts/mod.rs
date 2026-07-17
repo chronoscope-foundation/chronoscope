@@ -482,11 +482,12 @@ impl<C: AsConn> EventView<SqliteFactStore> for SqliteHandle<C> {
 }
 
 impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
-    async fn image_representative(
+    /// One `RESOLVE_REPS` query resolves the whole batch in a single round trip.
+    async fn image_representatives(
         &mut self,
-        member: &SqliteImageId,
-    ) -> Result<SqliteImageId, Error> {
-        read::representative(self.conn.conn(), self.bound, *member).await
+        members: &[SqliteImageId],
+    ) -> Result<std::collections::HashMap<SqliteImageId, SqliteImageId>, Error> {
+        read::representatives(self.conn.conn(), self.bound, members).await
     }
 
     async fn image_class(

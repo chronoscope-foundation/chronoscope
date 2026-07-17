@@ -623,12 +623,33 @@ pub trait EventView<S: FactStore>: FactView<S> {
 /// Image-parametric reads over a snapshot view. Images have one canonical
 /// equivalence (`SameArtifact`), implicit; no edge relations today.
 pub trait ImageView<S: FactStore>: FactView<S> {
+    /// The `SameArtifact` representative of each `member` at this snapshot, in
+    /// one resolution. A member with no `SameArtifact` class maps to itself.
+    /// This is the image view's representative primitive;
+    /// [`image_representative`](Self::image_representative) derives the
+    /// singleton case from it.
+    fn image_representatives(
+        &mut self,
+        members: &[ImageIdOf<S>],
+    ) -> impl Future<
+        Output = Result<std::collections::HashMap<ImageIdOf<S>, ImageIdOf<S>>, S::Error>,
+    > + Send;
+
     /// The class representative of `member` under `SameArtifact` at this
-    /// snapshot.
+    /// snapshot — the singleton case of
+    /// [`image_representatives`](Self::image_representatives). A member with no
+    /// `SameArtifact` class is its own representative.
     fn image_representative(
         &mut self,
         member: &ImageIdOf<S>,
-    ) -> impl Future<Output = Result<ImageIdOf<S>, S::Error>> + Send;
+    ) -> impl Future<Output = Result<ImageIdOf<S>, S::Error>> + Send {
+        async move {
+            let reps = self
+                .image_representatives(std::slice::from_ref(member))
+                .await?;
+            Ok(reps.get(member).cloned().unwrap_or_else(|| member.clone()))
+        }
+    }
 
     /// The full `SameArtifact` equivalence class of `member` at this
     /// snapshot.
