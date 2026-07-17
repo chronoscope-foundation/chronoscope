@@ -26,11 +26,11 @@
 //! All are anchored to the image's own pixel / proportional frame; a geographic
 //! reading is a property of the image's projection, derived downstream.
 
-use std::cmp::Ordering;
-
 use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::finite::Finite;
 
 /// Run-length-encoded binary mask in the COCO compressed-string format.
 ///
@@ -48,85 +48,60 @@ pub struct RleMask {
 /// One coordinate component in `0.0..=1.0` proportional image space — the
 /// shared building block of [`ProportionalRect`] and [`ProportionalPoint`].
 ///
-/// The smart constructor [`ProportionalCoord::new`] rejects non-finite values
-/// and anything outside `0.0..=1.0`, and normalizes `-0.0` to `+0.0`. That
-/// normalization plus the NaN/Inf rejection is what lets the manual `Hash`
-/// (via `f32::to_bits`) and `Ord` (via `f32::total_cmp`) stay consistent with
-/// the derived `PartialEq` (under which `-0.0 == +0.0`), so every type built
-/// from coordinates can derive its own `Eq`/`Hash`/`Ord` through this one.
+/// The inner value is a [`Finite`], which rejects `NaN`/`±∞` and normalizes
+/// `-0.0` to `+0.0`. That is what lets `Eq`, `Hash`, and `Ord` derive and stay
+/// consistent with `PartialEq` (under which `-0.0 == +0.0`), so every type built
+/// from coordinates derives its own `Eq`/`Hash`/`Ord` through this one. The
+/// smart constructor [`ProportionalCoord::new`] adds the `0.0..=1.0` range check.
 ///
 /// `#[serde(transparent)]` keeps the wire form a bare number: a coordinate is
-/// indistinguishable from the `f32` it wraps. Deserialization routes that number
+/// indistinguishable from the `f64` it wraps. Deserialization routes that number
 /// through [`ProportionalCoord::new`], so a non-finite or out-of-range
 /// coordinate fails at the wire boundary, and every type built from coordinates
 /// inherits that guard by deserializing its fields as `ProportionalCoord`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]
-pub struct ProportionalCoord(f32);
+pub struct ProportionalCoord(Finite);
 
 impl<'de> Deserialize<'de> for ProportionalCoord {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let value = f32::deserialize(deserializer)?;
+        let value = f64::deserialize(deserializer)?;
         Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-impl Eq for ProportionalCoord {}
-
-impl std::hash::Hash for ProportionalCoord {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.to_bits().hash(state);
-    }
-}
-
-impl PartialOrd for ProportionalCoord {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for ProportionalCoord {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
     }
 }
 
 impl ProportionalCoord {
     /// Construct a proportional coordinate. The value must be finite and in
     /// `0.0..=1.0`; `-0.0` is normalized to `+0.0`.
-    pub fn new(value: f32) -> Result<Self, ProportionalCoordError> {
-        if !value.is_finite() {
-            return Err(ProportionalCoordError::NotFinite { value });
-        }
+    pub fn new(value: f64) -> Result<Self, ProportionalCoordError> {
+        let finite = Finite::new(value).ok_or(ProportionalCoordError::NotFinite { value })?;
         if !(0.0..=1.0).contains(&value) {
             return Err(ProportionalCoordError::OutOfBounds { value });
         }
-        // `-0.0 + 0.0 == +0.0`, and adding `0.0` is a no-op for every other
-        // finite value, so this normalizes the one bit pattern that would
-        // otherwise split an equal value across `Hash`/`Ord`.
-        Ok(Self(value + 0.0))
+        Ok(Self(finite))
     }
 
     /// The coordinate value, in `0.0..=1.0`.
-    pub fn get(self) -> f32 {
-        self.0
+    pub fn get(self) -> f64 {
+        self.0.get()
     }
 }
 
 /// Errors from [`ProportionalCoord::new`].
 ///
-/// `PartialEq` only — the variants carry the pre-validation `f32`, which may be
+/// `PartialEq` only — the variants carry the pre-validation `f64`, which may be
 /// `NaN`, so a total ordering would be dishonest, and errors aren't part of the
 /// content-addressed fact graph.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProportionalCoordError {
     /// The coordinate was not finite (`NaN` or infinite).
-    NotFinite { value: f32 },
+    NotFinite { value: f64 },
     /// The coordinate lay outside the `0.0..=1.0` unit range.
-    OutOfBounds { value: f32 },
+    OutOfBounds { value: f64 },
 }
 
 impl std::fmt::Display for ProportionalCoordError {
@@ -189,7 +164,7 @@ impl ProportionalRect {
     /// Each coordinate routes through [`ProportionalCoord::new`] for the
     /// finite + range check and the `-0.0` normalization, so an invalid
     /// coordinate is the only failure mode; corner assembly cannot fail.
-    pub fn new(ax: f32, ay: f32, bx: f32, by: f32) -> Result<Self, ProportionalCoordError> {
+    pub fn new(ax: f64, ay: f64, bx: f64, by: f64) -> Result<Self, ProportionalCoordError> {
         let a = ProportionalPoint::new(ax, ay)?;
         let b = ProportionalPoint::new(bx, by)?;
         Ok(Self::from_corners(a, b))
@@ -206,22 +181,22 @@ impl ProportionalRect {
     }
 
     /// The smaller x coordinate, in `0.0..=1.0`.
-    pub fn x(&self) -> f32 {
+    pub fn x(&self) -> f64 {
         self.min.x()
     }
 
     /// The smaller y coordinate, in `0.0..=1.0`.
-    pub fn y(&self) -> f32 {
+    pub fn y(&self) -> f64 {
         self.min.y()
     }
 
     /// Width in proportional units; zero for a degenerate rect.
-    pub fn width(&self) -> f32 {
+    pub fn width(&self) -> f64 {
         self.max.x() - self.min.x()
     }
 
     /// Height in proportional units; zero for a degenerate rect.
-    pub fn height(&self) -> f32 {
+    pub fn height(&self) -> f64 {
         self.max.y() - self.min.y()
     }
 }
@@ -262,7 +237,7 @@ pub struct ProportionalPoint {
 impl ProportionalPoint {
     /// Construct a proportional point. Both components must be finite and in
     /// `0.0..=1.0`; `-0.0` is normalized to `+0.0`.
-    pub fn new(x: f32, y: f32) -> Result<Self, ProportionalCoordError> {
+    pub fn new(x: f64, y: f64) -> Result<Self, ProportionalCoordError> {
         Ok(Self {
             x: ProportionalCoord::new(x)?,
             y: ProportionalCoord::new(y)?,
@@ -270,12 +245,12 @@ impl ProportionalPoint {
     }
 
     /// Horizontal coordinate in `0.0..=1.0`.
-    pub fn x(&self) -> f32 {
+    pub fn x(&self) -> f64 {
         self.x.get()
     }
 
     /// Vertical coordinate in `0.0..=1.0`.
-    pub fn y(&self) -> f32 {
+    pub fn y(&self) -> f64 {
         self.y.get()
     }
 }
@@ -307,7 +282,7 @@ impl ProportionalPolyline {
     /// Construct a proportional polyline from raw `(x, y)` pairs. Requires
     /// between two and [`MAX_POLYLINE_POINTS`] points, each finite and in
     /// `0.0..=1.0`.
-    pub fn new(points: Vec<(f32, f32)>) -> Result<Self, ProportionalPolylineError> {
+    pub fn new(points: Vec<(f64, f64)>) -> Result<Self, ProportionalPolylineError> {
         if points.len() < 2 {
             return Err(ProportionalPolylineError::TooFewPoints {
                 count: points.len(),
@@ -367,7 +342,7 @@ impl<'de> Deserialize<'de> for ProportionalPolyline {
 /// Errors from [`ProportionalPolyline::new`].
 ///
 /// `PartialEq` only — a wrapped [`ProportionalCoordError`] carries a
-/// pre-validation `f32` that may be `NaN`, so a total ordering would be
+/// pre-validation `f64` that may be `NaN`, so a total ordering would be
 /// dishonest, and errors aren't part of the content-addressed fact graph.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProportionalPolylineError {
@@ -442,7 +417,7 @@ impl ImageGeometry {
     /// Construct an axis-aligned proportional bbox from two corners given as
     /// raw floats, in any order. See [`ProportionalRect::new`] for the
     /// coordinate validation.
-    pub fn bbox(ax: f32, ay: f32, bx: f32, by: f32) -> Result<Self, ProportionalCoordError> {
+    pub fn bbox(ax: f64, ay: f64, bx: f64, by: f64) -> Result<Self, ProportionalCoordError> {
         Ok(Self::BBox {
             rect: ProportionalRect::new(ax, ay, bx, by)?,
         })
@@ -451,6 +426,8 @@ impl ImageGeometry {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use super::*;
     use proptest::prelude::*;
 
@@ -461,11 +438,11 @@ mod tests {
     // against (negative-zero inconsistency between `PartialEq` and `Hash`/`Ord`)
     // would slip past. Mixing the two zero forms in explicitly forces the laws
     // to exercise them.
-    fn arb_coord() -> impl Strategy<Value = f32> {
+    fn arb_coord() -> impl Strategy<Value = f64> {
         prop_oneof![
-            4 => 0.0f32..0.5,
-            1 => Just(-0.0f32),
-            1 => Just(0.0f32),
+            4 => 0.0f64..0.5,
+            1 => Just(-0.0f64),
+            1 => Just(0.0f64),
         ]
     }
 
@@ -565,7 +542,7 @@ mod tests {
     #[test]
     fn image_geometry_bbox_rejects_nan() {
         assert!(matches!(
-            ImageGeometry::bbox(f32::NAN, 0.0, 0.5, 0.5),
+            ImageGeometry::bbox(f64::NAN, 0.0, 0.5, 0.5),
             Err(ProportionalCoordError::NotFinite { .. })
         ));
     }
@@ -597,7 +574,7 @@ mod tests {
     #[test]
     fn proportional_point_rejects_nan() {
         assert!(matches!(
-            ProportionalPoint::new(f32::NAN, 0.5),
+            ProportionalPoint::new(f64::NAN, 0.5),
             Err(ProportionalCoordError::NotFinite { .. })
         ));
     }
@@ -612,7 +589,7 @@ mod tests {
 
     #[test]
     fn proportional_polyline_rejects_too_many_points() {
-        let points = vec![(0.5f32, 0.5f32); MAX_POLYLINE_POINTS + 1];
+        let points = vec![(0.5f64, 0.5f64); MAX_POLYLINE_POINTS + 1];
         assert!(matches!(
             ProportionalPolyline::new(points),
             Err(ProportionalPolylineError::TooManyPoints { count, limit })
@@ -623,7 +600,7 @@ mod tests {
     #[test]
     fn proportional_polyline_rejects_non_finite_vertex() {
         assert!(matches!(
-            ProportionalPolyline::new(vec![(0.1, 0.1), (f32::INFINITY, 0.2)]),
+            ProportionalPolyline::new(vec![(0.1, 0.1), (f64::INFINITY, 0.2)]),
             Err(ProportionalPolylineError::Coord(
                 ProportionalCoordError::NotFinite { .. }
             ))

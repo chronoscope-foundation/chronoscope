@@ -116,7 +116,7 @@ pub enum SubimageRegion {
 impl SubimageRegion {
     /// Construct a rectangular subimage region. See
     /// [`ProportionalRect::new`] for the validation rules.
-    pub fn rect(ax: f32, ay: f32, bx: f32, by: f32) -> Result<Self, ProportionalCoordError> {
+    pub fn rect(ax: f64, ay: f64, bx: f64, by: f64) -> Result<Self, ProportionalCoordError> {
         Ok(Self::Rect {
             rect: ProportionalRect::new(ax, ay, bx, by)?,
         })

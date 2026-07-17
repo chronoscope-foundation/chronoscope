@@ -321,7 +321,7 @@ fn golden_depiction_fact_localized() -> Result<()> {
     };
     assert_golden_roundtrip(
         &f,
-        r#"{"entity":"1","image":"1","localization":{"rect":{"max":{"x":0.30000001192092896,"y":0.4000000059604645},"min":{"x":0.10000000149011612,"y":0.20000000298023224}},"type":"bbox"},"perspective":"interior"}"#,
+        r#"{"entity":"1","image":"1","localization":{"rect":{"max":{"x":0.3,"y":0.4},"min":{"x":0.1,"y":0.2}},"type":"bbox"},"perspective":"interior"}"#,
     )
 }
 
@@ -503,7 +503,7 @@ fn golden_image_geometry_bbox_locks_tagged_rect() -> Result<()> {
     let geometry = ImageGeometry::bbox(0.1, 0.2, 0.3, 0.4)?;
     assert_golden_roundtrip(
         &geometry,
-        r#"{"rect":{"max":{"x":0.30000001192092896,"y":0.4000000059604645},"min":{"x":0.10000000149011612,"y":0.20000000298023224}},"type":"bbox"}"#,
+        r#"{"rect":{"max":{"x":0.3,"y":0.4},"min":{"x":0.1,"y":0.2}},"type":"bbox"}"#,
     )
 }
 
@@ -517,7 +517,7 @@ fn golden_image_geometry_polyline_locks_proportional_trace() -> Result<()> {
     };
     assert_golden_roundtrip(
         &geometry,
-        r#"{"polyline":{"points":[{"x":0.10000000149011612,"y":0.20000000298023224},{"x":0.30000001192092896,"y":0.4000000059604645}]},"type":"polyline"}"#,
+        r#"{"polyline":{"points":[{"x":0.1,"y":0.2},{"x":0.3,"y":0.4}]},"type":"polyline"}"#,
     )
 }
 
