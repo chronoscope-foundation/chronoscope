@@ -147,12 +147,6 @@ pub enum IdMapError<E, V, I> {
     },
 }
 
-/// The id-traversal error over a scheme `R` — [`IdMapError`] projected onto
-/// `R`'s three id kinds. Keeps the `Fact::try_map_ids` signature readable, the
-/// same alias the assertion layer uses.
-type IdMapErrorOf<R> =
-    IdMapError<<R as IdScheme>::Entity, <R as IdScheme>::Event, <R as IdScheme>::Image>;
-
 /// Reject `a == b`, return the pair otherwise. Shared between
 /// [`OrderedDistinctPair`] and [`DistinctPair`].
 fn check_distinct<Id: PartialEq>(a: Id, b: Id) -> Result<(Id, Id), SelfPairError<Id>> {
@@ -378,12 +372,11 @@ impl<Id> DistinctPair<Id> {
 /// out-of-order pair.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum Fact<R: IdScheme> {
     /// Two entity references describe the same entity.
     SameEntity {
         /// The two distinct entity references, in canonical order.
+        #[self_loop = "IdentityEntity"]
         pair: OrderedDistinctPair<R::Entity>,
     },
     /// Two images represent the same physical artifact — different scans,
@@ -392,11 +385,13 @@ pub enum Fact<R: IdScheme> {
     /// across the class.
     SameArtifact {
         /// The two distinct image references, in canonical order.
+        #[self_loop = "IdentityArtifact"]
         pair: OrderedDistinctPair<R::Image>,
     },
     /// Two lifetime-event references describe the same event.
     SameEvent {
         /// The two distinct event references, in canonical order.
+        #[self_loop = "IdentityEvent"]
         pair: OrderedDistinctPair<R::Event>,
     },
 }
@@ -421,61 +416,6 @@ impl<R: IdScheme> Fact<R> {
         Ok(Self::SameEvent {
             pair: OrderedDistinctPair::new(a, b)?,
         })
-    }
-
-    /// Visit every id this fact mentions, dispatching to the closure for the
-    /// id's kind.
-    ///
-    /// Three closures even though each variant touches one kind: the uniform
-    /// `(fe, fv, fi)` shape lets one caller drive every cluster's traversal.
-    pub fn for_each_id(
-        &self,
-        fe: &mut impl FnMut(&R::Entity),
-        fv: &mut impl FnMut(&R::Event),
-        fi: &mut impl FnMut(&R::Image),
-    ) {
-        match self {
-            Self::SameEntity { pair } => pair.for_each_id(fe),
-            Self::SameEvent { pair } => pair.for_each_id(fv),
-            Self::SameArtifact { pair } => pair.for_each_id(fi),
-        }
-    }
-}
-
-impl<R: IdScheme> Fact<R> {
-    /// Relabel every id through the kind-matching fallible closure, rebuilding
-    /// through the same constructors the wire boundary uses. Produces a
-    /// `Fact<R2>`.
-    ///
-    /// Error is fixed to [`IdMapError`] over `R2`'s three id kinds; each arm
-    /// builds its own [`SelfLoop`] wrapper — `SameEntity` →
-    /// [`SelfLoop::IdentityEntity`], `SameEvent` → [`SelfLoop::IdentityEvent`],
-    /// `SameArtifact` → [`SelfLoop::IdentityArtifact`] — carrying the typed
-    /// output id. The submit layer maps that variant to its own `SubmitError`.
-    ///
-    /// Three closures, like [`Self::for_each_id`]. All three output kinds
-    /// build the carried ids, so none is phantom.
-    pub fn try_map_ids<R2: IdScheme>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, IdMapErrorOf<R2>>,
-        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, IdMapErrorOf<R2>>,
-        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, IdMapErrorOf<R2>>,
-    ) -> Result<Fact<R2>, IdMapErrorOf<R2>> {
-        match self {
-            Self::SameEntity { pair } => Ok(Fact::SameEntity {
-                pair: pair
-                    .try_map_ids(fe, |id| IdMapError::SelfLoop(SelfLoop::IdentityEntity(id)))?,
-            }),
-            Self::SameEvent { pair } => Ok(Fact::SameEvent {
-                pair: pair
-                    .try_map_ids(fv, |id| IdMapError::SelfLoop(SelfLoop::IdentityEvent(id)))?,
-            }),
-            Self::SameArtifact { pair } => Ok(Fact::SameArtifact {
-                pair: pair.try_map_ids(fi, |id| {
-                    IdMapError::SelfLoop(SelfLoop::IdentityArtifact(id))
-                })?,
-            }),
-        }
     }
 }
 

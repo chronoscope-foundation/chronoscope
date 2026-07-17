@@ -208,9 +208,13 @@ Variants and structs must use named fields — a tuple/newtype variant is a
 compile error, since internal tagging flattens an unnamed payload beside
 the tag and collides. Add the comparison/`Debug`/`Clone` derives yourself
 in a `#[derive(..)]` alongside (float-bearing types carry hand-written
-`Eq`/`Hash`/`Ord`). Exemptions: `Location`/`UnresolvedLocation` keep
-hand-written `Deserialize`; the transparent leaf newtypes (ids, validated
-strings) use the `*_newtype!` macros.
+`Eq`/`Hash`/`Ord`). A type generic over `R: IdScheme` additionally gets the
+`IdWalk` derive and the uniform `R: IdScheme` serde/schemars bounds emitted
+for free — don't repeat them; validated products that can't be
+`#[grammar_type]` (e.g. `GapBounds`) spell `#[derive(IdWalk)]` themselves.
+Exemptions: `Location`/`UnresolvedLocation` keep hand-written `Deserialize`;
+the transparent leaf newtypes (ids, validated strings) use the `*_newtype!`
+macros.
 
 ## Architecture Overview
 

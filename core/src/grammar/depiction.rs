@@ -71,8 +71,6 @@ pub enum Perspective {
 /// Generic over one id scheme `R: IdScheme`, reading `R::Entity` and `R::Image`.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub struct Fact<R: IdScheme> {
     /// The depicted entity.
     pub entity: R::Entity,
@@ -82,28 +80,4 @@ pub struct Fact<R: IdScheme> {
     pub localization: Option<ImageGeometry>,
     /// The view classification, when a source supplies one.
     pub perspective: Option<Perspective>,
-}
-
-impl<R: IdScheme> Fact<R> {
-    /// Visit every id this fact mentions, dispatching to the closure for
-    /// the id's kind. Entity before image, matching the field order.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity), fi: &mut impl FnMut(&R::Image)) {
-        fe(&self.entity);
-        fi(&self.image);
-    }
-
-    /// Relabel every id through the kind-matching fallible closure,
-    /// producing a `Fact<R2>`.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, Err>,
-    ) -> Result<Fact<R2>, Err> {
-        Ok(Fact {
-            entity: fe(&self.entity)?,
-            image: fi(&self.image)?,
-            localization: self.localization.clone(),
-            perspective: self.perspective,
-        })
-    }
 }

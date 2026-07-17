@@ -74,8 +74,6 @@ use crate::location::UnresolvedLocation;
 /// [`FactualAssertion::Construction`](crate::grammar::assertions::FactualAssertion::Construction).
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum ConstructionFact<R: IdScheme> {
     /// When construction started, as an uncertain interval.
     Started {
@@ -106,42 +104,6 @@ impl<R: IdScheme> ConstructionFact<R> {
             | Self::Location { entity, .. } => entity,
         }
     }
-
-    /// Visit the single entity id this fact mentions.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
-        match self {
-            Self::Started { entity, .. }
-            | Self::Completed { entity, .. }
-            | Self::Location { entity, .. } => fe(entity),
-        }
-    }
-
-    /// Relabel the single entity id through the fallible closure, producing a
-    /// `ConstructionFact<R2>`.
-    ///
-    /// No distinct-pair payload, so no `on_self_loop` collapse closure: the only
-    /// failure is the leaf closure rejecting a reference. Generic over the error
-    /// type `Err` so the cluster never names the concrete error the assertion
-    /// layer chooses.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-    ) -> Result<ConstructionFact<R2>, Err> {
-        match self {
-            Self::Started { entity, bound } => Ok(ConstructionFact::Started {
-                entity: fe(entity)?,
-                bound: bound.clone(),
-            }),
-            Self::Completed { entity, bound } => Ok(ConstructionFact::Completed {
-                entity: fe(entity)?,
-                bound: bound.clone(),
-            }),
-            Self::Location { entity, location } => Ok(ConstructionFact::Location {
-                entity: fe(entity)?,
-                location: location.clone(),
-            }),
-        }
-    }
 }
 
 /// Demolition bookend fact — start date or completion date.
@@ -152,8 +114,6 @@ impl<R: IdScheme> ConstructionFact<R> {
 /// has no location slot.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum DemolitionFact<R: IdScheme> {
     /// When demolition started, as an uncertain interval.
     Started {
@@ -174,31 +134,6 @@ impl<R: IdScheme> DemolitionFact<R> {
     pub fn subject(&self) -> &R::Entity {
         match self {
             Self::Started { entity, .. } | Self::Completed { entity, .. } => entity,
-        }
-    }
-
-    /// Visit the single entity id this fact mentions.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
-        match self {
-            Self::Started { entity, .. } | Self::Completed { entity, .. } => fe(entity),
-        }
-    }
-
-    /// Relabel the single entity id through the fallible closure, producing a
-    /// `DemolitionFact<R2>`. See [`ConstructionFact::try_map_ids`].
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-    ) -> Result<DemolitionFact<R2>, Err> {
-        match self {
-            Self::Started { entity, bound } => Ok(DemolitionFact::Started {
-                entity: fe(entity)?,
-                bound: bound.clone(),
-            }),
-            Self::Completed { entity, bound } => Ok(DemolitionFact::Completed {
-                entity: fe(entity)?,
-                bound: bound.clone(),
-            }),
         }
     }
 }

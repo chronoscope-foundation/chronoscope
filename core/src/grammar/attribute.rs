@@ -155,8 +155,6 @@ impl std::error::Error for NameTextError {}
 /// the rule that surfaces this rejection in [`crate::submit::SubmitError`].
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum Fact<R: IdScheme> {
     /// A name applied to the entity, with temporal validity bounds.
     Name {
@@ -185,6 +183,7 @@ pub enum Fact<R: IdScheme> {
     /// self-loops fail at construction; see the cluster docs.
     Relationship {
         /// Source and target entity, structurally distinct.
+        #[self_loop = "Relationship"]
         pair: crate::grammar::identity::DistinctPair<R::Entity>,
         relation: EntityRelationType,
     },
@@ -210,63 +209,6 @@ impl<R: IdScheme> Fact<R> {
         match self {
             Self::Name { entity, .. } | Self::ExternalReference { entity, .. } => entity,
             Self::Relationship { pair, .. } => pair.from(),
-        }
-    }
-
-    /// Visit every entity id this fact mentions.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
-        match self {
-            Self::Name { entity, .. } | Self::ExternalReference { entity, .. } => fe(entity),
-            Self::Relationship { pair, .. } => pair.for_each_id(fe),
-        }
-    }
-
-    /// Relabel every entity id through the fallible closure, producing a
-    /// `Fact<E2>`.
-    ///
-    /// The `Relationship` arm rebuilds its `from`/`to` pair through the same
-    /// `DistinctPair::new` the wire boundary uses; a post-map collision (two
-    /// distinct input ids mapping to one output) goes to `on_self_loop`, which
-    /// the caller supplies so the error carries the right
-    /// [`crate::grammar::identity::SelfLoop`] variant (the
-    /// [`FactualAssertion`](crate::grammar::assertions::FactualAssertion) dispatch
-    /// wraps it as [`crate::grammar::identity::SelfLoop::Relationship`]).
-    ///
-    /// Generic over the error type `Err`: both the leaf closure `fe` and the
-    /// `on_self_loop` collapse closure produce `Err`, so the cluster never names
-    /// the concrete error the assertion layer chooses.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-        on_self_loop: impl FnOnce(R2::Entity) -> Err,
-    ) -> Result<Fact<R2>, Err> {
-        match self {
-            Self::Name {
-                entity,
-                name,
-                language,
-                name_type,
-                valid_from,
-                valid_to,
-            } => Ok(Fact::Name {
-                entity: fe(entity)?,
-                name: name.clone(),
-                language: language.clone(),
-                name_type: *name_type,
-                valid_from: valid_from.clone(),
-                valid_to: valid_to.clone(),
-            }),
-            Self::ExternalReference { entity, reference } => Ok(Fact::ExternalReference {
-                entity: fe(entity)?,
-                reference: reference.clone(),
-            }),
-            Self::Relationship { pair, relation } => {
-                let pair = pair.try_map_ids(fe, on_self_loop)?;
-                Ok(Fact::Relationship {
-                    pair,
-                    relation: *relation,
-                })
-            }
         }
     }
 }

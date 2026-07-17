@@ -34,8 +34,6 @@ use crate::grammar::ids::IdScheme;
 /// reference.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum TopologicalRel<R: IdScheme> {
     /// The two entities share a boundary, or sit boundary-to-boundary,
     /// in real space — "next to each other".
@@ -65,39 +63,4 @@ pub enum TopologicalRel<R: IdScheme> {
     /// (`b` on the wrapper) on multiple sides — containment-flavored,
     /// without making a strict mereological claim.
     Surrounds,
-}
-
-impl<R: IdScheme> TopologicalRel<R> {
-    /// Visit the separator / axis entity id this relation carries, if any.
-    ///
-    /// `AcrossFrom` / `SameSide` carry a `separator`, `LinedAlong` an `axis`;
-    /// `Adjacent` / `PartOf` / `Surrounds` carry none. Takes only the entity
-    /// closure — the relation carries no other id kind.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
-        match self {
-            Self::Adjacent | Self::PartOf | Self::Surrounds => {}
-            Self::AcrossFrom { separator } | Self::SameSide { separator } => fe(separator),
-            Self::LinedAlong { axis } => fe(axis),
-        }
-    }
-
-    /// Relabel the separator / axis entity id (if any) through the fallible
-    /// closure, producing a `TopologicalRel<R2>`.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-    ) -> Result<TopologicalRel<R2>, Err> {
-        match self {
-            Self::Adjacent => Ok(TopologicalRel::Adjacent),
-            Self::PartOf => Ok(TopologicalRel::PartOf),
-            Self::Surrounds => Ok(TopologicalRel::Surrounds),
-            Self::AcrossFrom { separator } => Ok(TopologicalRel::AcrossFrom {
-                separator: fe(separator)?,
-            }),
-            Self::SameSide { separator } => Ok(TopologicalRel::SameSide {
-                separator: fe(separator)?,
-            }),
-            Self::LinedAlong { axis } => Ok(TopologicalRel::LinedAlong { axis: fe(axis)? }),
-        }
-    }
 }

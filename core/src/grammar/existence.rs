@@ -25,8 +25,6 @@ use crate::grammar::ids::IdScheme;
 /// inner fact needs no tag of its own.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub struct Fact<R: IdScheme> {
     /// The entity the witness is about.
     pub entity: R::Entity,
@@ -38,22 +36,5 @@ impl<R: IdScheme> Fact<R> {
     /// The entity this witness is a claim about.
     pub fn subject(&self) -> &R::Entity {
         &self.entity
-    }
-
-    /// Visit the single entity id this fact mentions.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
-        fe(&self.entity);
-    }
-
-    /// Relabel the single entity id through the fallible closure, producing a
-    /// `Fact<R2>`. The only failure is the leaf closure rejecting a reference.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-    ) -> Result<Fact<R2>, Err> {
-        Ok(Fact {
-            entity: fe(&self.entity)?,
-            at: self.at.clone(),
-        })
     }
 }

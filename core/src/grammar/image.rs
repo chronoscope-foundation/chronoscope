@@ -80,8 +80,6 @@ pub enum ImageMedium {
 /// relevant entities, not embedded in the location reference.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum Fact<R: IdScheme> {
     /// URL the image was sourced from. A re-scan or alternate-resolution
     /// copy has a different image id and its own `Source` fact.
@@ -148,57 +146,4 @@ pub enum Fact<R: IdScheme> {
         /// The descriptive medium.
         medium: ImageMedium,
     },
-}
-
-impl<R: IdScheme> Fact<R> {
-    /// Visit the single image id this fact mentions.
-    pub fn for_each_id(&self, fi: &mut impl FnMut(&R::Image)) {
-        match self {
-            Self::Source { image, .. }
-            | Self::Author { image, .. }
-            | Self::CreatedDate { image, .. }
-            | Self::CapturedDate { image, .. }
-            | Self::CapturedLocation { image, .. }
-            | Self::Medium { image, .. } => fi(image),
-        }
-    }
-
-    /// Relabel the single image id through the fallible closure, producing
-    /// a `Fact<R2>`.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, Err>,
-    ) -> Result<Fact<R2>, Err> {
-        match self {
-            Self::Source { image, url } => Ok(Fact::Source {
-                image: fi(image)?,
-                url: url.clone(),
-            }),
-            Self::Author {
-                image,
-                name,
-                language,
-            } => Ok(Fact::Author {
-                image: fi(image)?,
-                name: name.clone(),
-                language: language.clone(),
-            }),
-            Self::CreatedDate { image, bound } => Ok(Fact::CreatedDate {
-                image: fi(image)?,
-                bound: bound.clone(),
-            }),
-            Self::CapturedDate { image, bound } => Ok(Fact::CapturedDate {
-                image: fi(image)?,
-                bound: bound.clone(),
-            }),
-            Self::CapturedLocation { image, location } => Ok(Fact::CapturedLocation {
-                image: fi(image)?,
-                location: location.clone(),
-            }),
-            Self::Medium { image, medium } => Ok(Fact::Medium {
-                image: fi(image)?,
-                medium: *medium,
-            }),
-        }
-    }
 }

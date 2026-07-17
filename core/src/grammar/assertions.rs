@@ -42,11 +42,6 @@ use crate::grammar::{
     attribute, bookend, composites, depiction, event, existence, identity, image, observation,
 };
 
-/// The id-traversal error over a scheme `R` — [`identity::IdMapError`] projected
-/// onto `R`'s three id kinds. Keeps the `try_map_ids` signatures readable.
-type IdMapErrorOf<R> =
-    identity::IdMapError<<R as IdScheme>::Entity, <R as IdScheme>::Event, <R as IdScheme>::Image>;
-
 /// Factual assertion — a claim about the external world.
 ///
 /// Construction and demolition are flat per-entity bookend facts, not
@@ -55,8 +50,6 @@ type IdMapErrorOf<R> =
 /// information attaches to a lifetime-event id via the event cluster.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum FactualAssertion<R: IdScheme> {
     /// Entity-level attribute claims (names, external refs, relationships).
     Attribute { fact: attribute::Fact<R> },
@@ -80,73 +73,6 @@ pub enum FactualAssertion<R: IdScheme> {
     Image { fact: image::Fact<R> },
 }
 
-impl<R: IdScheme> FactualAssertion<R> {
-    /// Visit every id this assertion mentions, dispatching each to its kind's
-    /// closure. The collector half of the id-traversal.
-    ///
-    /// Holds all three closures and hands each cluster the subset it needs
-    /// (attribute / bookend get entity, event and gap get entity + event,
-    /// image gets image).
-    pub fn for_each_id(
-        &self,
-        fe: &mut impl FnMut(&R::Entity),
-        fv: &mut impl FnMut(&R::Event),
-        fi: &mut impl FnMut(&R::Image),
-    ) {
-        match self {
-            Self::Attribute { fact } => fact.for_each_id(fe),
-            Self::Construction { fact } => fact.for_each_id(fe),
-            Self::Demolition { fact } => fact.for_each_id(fe),
-            Self::Existence { fact } => fact.for_each_id(fe),
-            Self::Event { fact } => fact.for_each_id(fe, fv),
-            Self::Gap { bounds } => bounds.for_each_id(fe, fv),
-            Self::Image { fact } => fact.for_each_id(fi),
-        }
-    }
-
-    /// Relabel every id through the kind-matching fallible closure,
-    /// producing a `FactualAssertion<R2>`.
-    ///
-    /// Threads the three closures into each cluster's `try_map_ids`, names
-    /// the concrete error (`IdMapErrorOf<R2>`), and supplies the attribute
-    /// `Relationship` arm's `on_self_loop`, which
-    /// wraps a pair collapse as
-    /// [`crate::grammar::identity::SelfLoop::Relationship`]. A leaf-lookup
-    /// rejection or that collapse propagates as the `IdMapError`.
-    pub fn try_map_ids<R2: IdScheme>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, IdMapErrorOf<R2>>,
-        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, IdMapErrorOf<R2>>,
-        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, IdMapErrorOf<R2>>,
-    ) -> Result<FactualAssertion<R2>, IdMapErrorOf<R2>> {
-        use crate::grammar::identity::{IdMapError, SelfLoop};
-        match self {
-            Self::Attribute { fact } => Ok(FactualAssertion::Attribute {
-                fact: fact
-                    .try_map_ids(fe, |id| IdMapError::SelfLoop(SelfLoop::Relationship(id)))?,
-            }),
-            Self::Construction { fact } => Ok(FactualAssertion::Construction {
-                fact: fact.try_map_ids(fe)?,
-            }),
-            Self::Demolition { fact } => Ok(FactualAssertion::Demolition {
-                fact: fact.try_map_ids(fe)?,
-            }),
-            Self::Existence { fact } => Ok(FactualAssertion::Existence {
-                fact: fact.try_map_ids(fe)?,
-            }),
-            Self::Event { fact } => Ok(FactualAssertion::Event {
-                fact: fact.try_map_ids(fe, fv)?,
-            }),
-            Self::Gap { bounds } => Ok(FactualAssertion::Gap {
-                bounds: bounds.try_map_ids(fe, fv)?,
-            }),
-            Self::Image { fact } => Ok(FactualAssertion::Image {
-                fact: fact.try_map_ids(fi)?,
-            }),
-        }
-    }
-}
-
 /// Judgment assertion — an interpretive conclusion about entities or media.
 ///
 /// Depiction claims live here, not on the factual side: "entity X appears in
@@ -154,8 +80,6 @@ impl<R: IdScheme> FactualAssertion<R> {
 /// reads the content rather than recording a directly-observed fact.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum JudgmentAssertion<R: IdScheme> {
     /// Same-entity / same-artifact / same-event equivalence judgments.
     Identity { fact: identity::Fact<R> },
@@ -166,62 +90,6 @@ pub enum JudgmentAssertion<R: IdScheme> {
     Observation { fact: observation::Fact<R> },
     /// Composite-image sub-region structural facts.
     Composite { fact: composites::Fact<R> },
-}
-
-impl<R: IdScheme> JudgmentAssertion<R> {
-    /// Visit every id this assertion mentions, dispatching each to its
-    /// kind's closure. The collector half of the id-traversal.
-    ///
-    /// Hands each cluster the subset it needs — identity gets all three
-    /// (each variant uses one), depiction gets entity + image, observation
-    /// gets entity, composite gets image.
-    pub fn for_each_id(
-        &self,
-        fe: &mut impl FnMut(&R::Entity),
-        fv: &mut impl FnMut(&R::Event),
-        fi: &mut impl FnMut(&R::Image),
-    ) {
-        match self {
-            Self::Identity { fact } => fact.for_each_id(fe, fv, fi),
-            Self::Depiction { fact } => fact.for_each_id(fe, fi),
-            Self::Observation { fact } => fact.for_each_id(fe),
-            Self::Composite { fact } => fact.for_each_id(fi),
-        }
-    }
-
-    /// Relabel every id through the kind-matching fallible closure,
-    /// producing a `JudgmentAssertion<R2>`.
-    ///
-    /// Threads the three closures into each cluster's `try_map_ids` and
-    /// names the same `IdMapErrorOf<R2>` the
-    /// factual dispatch does. Identity builds its own
-    /// [`crate::grammar::identity::SelfLoop`] wrappers, so only the
-    /// observation `Spatial` arm supplies an `on_self_loop` here (wrapping a
-    /// collapse as [`crate::grammar::identity::SelfLoop::Spatial`]). A
-    /// leaf-lookup rejection or any pair collapse propagates as the
-    /// `IdMapError`.
-    pub fn try_map_ids<R2: IdScheme>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, IdMapErrorOf<R2>>,
-        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, IdMapErrorOf<R2>>,
-        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, IdMapErrorOf<R2>>,
-    ) -> Result<JudgmentAssertion<R2>, IdMapErrorOf<R2>> {
-        use crate::grammar::identity::{IdMapError, SelfLoop};
-        match self {
-            Self::Identity { fact } => Ok(JudgmentAssertion::Identity {
-                fact: fact.try_map_ids(fe, fv, fi)?,
-            }),
-            Self::Depiction { fact } => Ok(JudgmentAssertion::Depiction {
-                fact: fact.try_map_ids(fe, fi)?,
-            }),
-            Self::Observation { fact } => Ok(JudgmentAssertion::Observation {
-                fact: fact.try_map_ids(fe, |id| IdMapError::SelfLoop(SelfLoop::Spatial(id)))?,
-            }),
-            Self::Composite { fact } => Ok(JudgmentAssertion::Composite {
-                fact: fact.try_map_ids(fi)?,
-            }),
-        }
-    }
 }
 
 /// Meta-assertion — a fact about other facts.
@@ -281,14 +149,14 @@ mod traversal_props {
     //! Whole-grammar property tests for the id-traversal
     //! (`try_map_ids` / `for_each_id`).
     //!
-    //! The traversal is hand-written per cluster and dispatched here at the
-    //! `FactualAssertion` / `JudgmentAssertion` level. The `event` and
-    //! `identity` unit tests cover the trickiest shapes (nested `Gap`
-    //! recursion; kinded self-loop); the other clusters' arms are covered only
-    //! incidentally through the submit pipeline. These props generate every
-    //! variant of every cluster and assert two laws that fail on a dropped or
-    //! reordered field, a same-kind position-swap, or drift between the two
-    //! methods.
+    //! Both methods are generated by `#[derive(IdWalk)]` from one field spec.
+    //! These props generate every variant of every cluster and assert three
+    //! laws — the identity remap, coverage agreement between `for_each_id` and
+    //! `try_map_ids`, and the serde round-trip — each failing on a dropped or
+    //! reordered field or a same-kind position-swap in any arm. Coverage
+    //! agreement is the only whole-grammar exercise of `for_each_id`, which
+    //! feeds a persistent index. The `event` and `identity` unit tests cover the
+    //! trickiest shapes (nested `Gap` recursion; kinded self-loop).
     //!
     //! `try_map_ids` carries every non-id field verbatim and touches only ids,
     //! so the generators vary two things: which variant and the id values.
@@ -298,14 +166,11 @@ mod traversal_props {
     //! Ids are distinct `Memory*Id` values (via [`distinct_u64_pair`] for
     //! same-kind pairs). The three id kinds are distinct Rust types, so a
     //! closure-dispatch swap can't typecheck; distinct values catch the rest:
-    //!
-    //! - The identity law catches a same-kind position-swap (e.g.
-    //!   `IsSubimageOf { subimage, parent }` reconstructed swapped), since the
-    //!   output no longer equals the distinct-valued input. The pair types
-    //!   canonicalize, but the input's constructors already ran, so an identity
-    //!   remap reproduces the same canonical form.
-    //! - The coverage-agreement law catches `for_each_id` visiting a different
-    //!   id, count, or order than `try_map_ids`.
+    //! the identity law catches a same-kind position-swap (e.g.
+    //! `IsSubimageOf { subimage, parent }` reconstructed swapped), since the
+    //! output no longer equals the distinct-valued input. The pair types
+    //! canonicalize, but the input's constructors already ran, so an identity
+    //! remap reproduces the same canonical form.
 
     use proptest::prelude::*;
 

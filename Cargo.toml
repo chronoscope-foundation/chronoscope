@@ -60,6 +60,7 @@ tracing = "0.1"
 # Proc-macro authoring (chronoscope-macros)
 syn = "2"
 quote = "1"
+proc-macro2 = "1"
 
 # WASM size optimizations — applied to all release builds but the savings
 # primarily matter for the wasm32 target. LTO and codegen-units=1 let LLVM

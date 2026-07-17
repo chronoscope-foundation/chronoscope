@@ -121,7 +121,7 @@
 
 use std::collections::BTreeSet;
 
-use chronoscope_macros::grammar_type;
+use chronoscope_macros::{IdWalk, grammar_type};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -139,8 +139,6 @@ use crate::location::UnresolvedLocation;
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum Fact<R: IdScheme> {
     /// Ties an interior event to its subject entity and declares its kind.
     /// Each minted event carries exactly one; a `SameEvent` class may carry
@@ -208,88 +206,6 @@ pub enum Fact<R: IdScheme> {
 }
 
 impl<R: IdScheme> Fact<R> {
-    /// Visit every id this fact mentions, dispatching to the closure for
-    /// the id's kind.
-    ///
-    /// Two closures, not three: the event cluster spans only lifetime-event
-    /// ids (every variant) and an entity id (only [`Fact::HasEvent`]'s
-    /// subject). Each cluster takes only the closures its id kinds require.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity), fv: &mut impl FnMut(&R::Event)) {
-        match self {
-            // The one variant carrying an entity ref: visit both ids.
-            Self::HasEvent { entity, event, .. } => {
-                fe(entity);
-                fv(event);
-            }
-            Self::DurationalDate { event, .. }
-            | Self::PointDate { event, .. }
-            | Self::MovedToLocation { event, .. }
-            | Self::DamageCause { event, .. }
-            | Self::MoveMethod { event, .. }
-            | Self::UsageChange { event, .. }
-            | Self::Designation { event, .. }
-            | Self::Description { event, .. } => fv(event),
-        }
-    }
-
-    /// Relabel every id through the kind-matching fallible closure,
-    /// producing a `Fact<R2>`.
-    ///
-    /// No distinct-pair payloads, so no `on_self_loop` wiring: the only
-    /// failure is a leaf closure rejecting a reference. Generic over the
-    /// error type `Err` so the cluster never names the concrete error the
-    /// assertion layer chooses.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, Err>,
-    ) -> Result<Fact<R2>, Err> {
-        match self {
-            Self::HasEvent {
-                entity,
-                event,
-                kind,
-            } => Ok(Fact::HasEvent {
-                entity: fe(entity)?,
-                event: fv(event)?,
-                kind: *kind,
-            }),
-            Self::DurationalDate { event, role, bound } => Ok(Fact::DurationalDate {
-                event: fv(event)?,
-                role: *role,
-                bound: bound.clone(),
-            }),
-            Self::PointDate { event, bound } => Ok(Fact::PointDate {
-                event: fv(event)?,
-                bound: bound.clone(),
-            }),
-            Self::MovedToLocation { event, location } => Ok(Fact::MovedToLocation {
-                event: fv(event)?,
-                location: location.clone(),
-            }),
-            Self::DamageCause { event, cause } => Ok(Fact::DamageCause {
-                event: fv(event)?,
-                cause: cause.clone(),
-            }),
-            Self::MoveMethod { event, method } => Ok(Fact::MoveMethod {
-                event: fv(event)?,
-                method: *method,
-            }),
-            Self::UsageChange { event, new_usages } => Ok(Fact::UsageChange {
-                event: fv(event)?,
-                new_usages: new_usages.clone(),
-            }),
-            Self::Designation { event, designation } => Ok(Fact::Designation {
-                event: fv(event)?,
-                designation: designation.clone(),
-            }),
-            Self::Description { event, text } => Ok(Fact::Description {
-                event: fv(event)?,
-                text: text.clone(),
-            }),
-        }
-    }
-
     /// The single lifetime-event id this fact mentions as its subject.
     pub fn subject(&self) -> &R::Event {
         match self {
@@ -444,8 +360,6 @@ impl std::ops::Sub for Days {
 /// demolition (the last moment it existed).
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum OrderableEvent<R: IdScheme> {
     /// A lifetime event inside the entity's lifetime, by id.
     Event { event: R::Event },
@@ -460,37 +374,6 @@ pub enum OrderableEvent<R: IdScheme> {
         /// The entity whose demolition started.
         entity: R::Entity,
     },
-}
-
-impl<R: IdScheme> OrderableEvent<R> {
-    /// Visit the single id this endpoint carries, dispatching to the
-    /// closure for its kind.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity), fv: &mut impl FnMut(&R::Event)) {
-        match self {
-            Self::Event { event } => fv(event),
-            Self::ConstructionCompletion { entity } | Self::DemolitionStart { entity } => {
-                fe(entity);
-            }
-        }
-    }
-
-    /// Relabel this endpoint's single id through the kind-matching
-    /// fallible closure.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, Err>,
-    ) -> Result<OrderableEvent<R2>, Err> {
-        match self {
-            Self::Event { event } => Ok(OrderableEvent::Event { event: fv(event)? }),
-            Self::ConstructionCompletion { entity } => Ok(OrderableEvent::ConstructionCompletion {
-                entity: fe(entity)?,
-            }),
-            Self::DemolitionStart { entity } => Ok(OrderableEvent::DemolitionStart {
-                entity: fe(entity)?,
-            }),
-        }
-    }
 }
 
 // ============================================================================
@@ -516,7 +399,7 @@ impl<R: IdScheme> OrderableEvent<R> {
 /// unconstrained gap. The mirror copies the derived serialize shape, so the two
 /// directions can't drift.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema, IdWalk,
 )]
 #[serde(bound(serialize = "R: IdScheme"))]
 #[serde(bound(deserialize = "R: IdScheme"), try_from = "RawGapBounds<R>")]
@@ -598,32 +481,6 @@ impl<R: IdScheme> GapBounds<R> {
     /// Maximum gap in days; `None` leaves the upper side open.
     pub fn max_days(&self) -> Option<Days> {
         self.max_days
-    }
-}
-
-impl<R: IdScheme> GapBounds<R> {
-    /// Visit both endpoints' ids in `from`-then-`to` order.
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity), fv: &mut impl FnMut(&R::Event)) {
-        self.from.for_each_id(fe, fv);
-        self.to.for_each_id(fe, fv);
-    }
-
-    /// Relabel both endpoints through the kind-matching fallible closures.
-    ///
-    /// The day bounds (`min_days` / `max_days`) are id-independent and
-    /// already satisfy the [`GapBounds::new`] invariants, so they are copied
-    /// verbatim rather than re-validated. Only the two endpoints carry ids.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-        fv: &mut impl FnMut(&R::Event) -> Result<R2::Event, Err>,
-    ) -> Result<GapBounds<R2>, Err> {
-        Ok(GapBounds {
-            from: self.from.try_map_ids(fe, fv)?,
-            to: self.to.try_map_ids(fe, fv)?,
-            min_days: self.min_days,
-            max_days: self.max_days,
-        })
     }
 }
 
@@ -747,7 +604,7 @@ mod tests {
     // endpoints route through both closures (one is an entity, the other an
     // event), so a closure-dispatch swap would fail the assertion.
 
-    use crate::submit::{BundleLocal, EntityIdx, EventIdx};
+    use crate::submit::{BundleLocal, EntityIdx, EventIdx, ImageIdx};
 
     /// A gap whose `from` endpoint carries an entity ref and whose `to`
     /// endpoint carries an event ref — so the relabel touches both id
@@ -776,6 +633,7 @@ mod tests {
                 Ok::<_, IdMapError<String, String, String>>(format!("entity-{}", e.0))
             },
             &mut |v: &EventIdx| Ok(format!("event-{}", v.0)),
+            &mut |i: &ImageIdx| Ok(format!("image-{}", i.0)),
         )?;
         let expected = GapBounds::new(
             OrderableEvent::ConstructionCompletion {
@@ -799,6 +657,7 @@ mod tests {
         bounds.for_each_id(
             &mut |e: &EntityIdx| entities.push(*e),
             &mut |v: &EventIdx| events.push(*v),
+            &mut |_i: &ImageIdx| {},
         );
         // `from` (entity) is visited before `to` (event); the entity
         // endpoint lands in `entities`, the event endpoint in `events`.
@@ -828,6 +687,7 @@ mod tests {
                     })
                 },
                 &mut |v: &EventIdx| Ok(format!("event-{}", v.0)),
+                &mut |i: &ImageIdx| Ok(format!("image-{}", i.0)),
             );
         assert!(matches!(
             result,

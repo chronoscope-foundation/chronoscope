@@ -1095,9 +1095,13 @@ fn rule_observation_depiction<S>(
             continue;
         };
         let mut entities: BTreeSet<EntityIdOf<S>> = BTreeSet::new();
-        obs.for_each_id(&mut |e: &EntityIdOf<S>| {
-            entities.insert(e.clone());
-        });
+        obs.for_each_id(
+            &mut |e: &EntityIdOf<S>| {
+                entities.insert(e.clone());
+            },
+            &mut |_v| {},
+            &mut |_i| {},
+        );
         let gathered = image_facts.get(image).map(Vec::as_slice).unwrap_or(&[]);
         for entity in entities {
             if !gathered

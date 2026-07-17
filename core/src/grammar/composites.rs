@@ -40,8 +40,6 @@ use crate::grammar::ids::IdScheme;
 /// Generic over one id scheme `R: IdScheme`, reading `R::Image`.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum Fact<R: IdScheme> {
     /// One image is a sub-region of another (a composite's panel,
     /// inset, or grid cell). See the module docs for the submit-time
@@ -54,43 +52,6 @@ pub enum Fact<R: IdScheme> {
         /// The region of the parent occupied by the subimage.
         region: SubimageRegion,
     },
-}
-
-impl<R: IdScheme> Fact<R> {
-    /// Visit every image id this fact mentions.
-    ///
-    /// `IsSubimageOf` carries two image ids (`subimage` then `parent`); both
-    /// go to the same closure, in field order. The no-self-parent invariant
-    /// is a submit-layer rule, not a structural pair constraint.
-    pub fn for_each_id(&self, fi: &mut impl FnMut(&R::Image)) {
-        match self {
-            Self::IsSubimageOf {
-                subimage, parent, ..
-            } => {
-                fi(subimage);
-                fi(parent);
-            }
-        }
-    }
-
-    /// Relabel every image id through the fallible closure, producing a
-    /// `Fact<R2>`.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fi: &mut impl FnMut(&R::Image) -> Result<R2::Image, Err>,
-    ) -> Result<Fact<R2>, Err> {
-        match self {
-            Self::IsSubimageOf {
-                subimage,
-                parent,
-                region,
-            } => Ok(Fact::IsSubimageOf {
-                subimage: fi(subimage)?,
-                parent: fi(parent)?,
-                region: *region,
-            }),
-        }
-    }
 }
 
 /// The region of a parent image occupied by a subimage.

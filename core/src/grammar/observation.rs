@@ -50,8 +50,6 @@ use crate::grammar::spatial::TopologicalRel;
 /// [`crate::grammar::identity::OrderedDistinctPair`].
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(serialize = "R: IdScheme", deserialize = "R: IdScheme"))]
-#[schemars(bound = "R: IdScheme + ::schemars::JsonSchema")]
 pub enum Fact<R: IdScheme> {
     /// A claim that an entity has a particular feature. The evidence —
     /// which image grounded the observation, which region of that image,
@@ -63,6 +61,7 @@ pub enum Fact<R: IdScheme> {
     Spatial {
         /// The two entities, structurally distinct, in subject-object
         /// order for directional relations.
+        #[self_loop = "Spatial"]
         pair: crate::grammar::identity::DistinctPair<R::Entity>,
         relation: TopologicalRel<R>,
     },
@@ -77,52 +76,5 @@ impl<R: IdScheme> Fact<R> {
     ) -> Result<Self, crate::grammar::identity::SelfPairError<R::Entity>> {
         let pair = crate::grammar::identity::DistinctPair::new(a, b)?;
         Ok(Self::Spatial { pair, relation })
-    }
-}
-
-impl<R: IdScheme> Fact<R> {
-    /// Visit every entity id this fact mentions.
-    ///
-    /// The `Spatial` arm threads the closure into both the `from`/`to` pair
-    /// (visited first) and the relation's separator / axis (visited second).
-    pub fn for_each_id(&self, fe: &mut impl FnMut(&R::Entity)) {
-        match self {
-            Self::Feature { entity, .. } => fe(entity),
-            Self::Spatial { pair, relation } => {
-                pair.for_each_id(fe);
-                relation.for_each_id(fe);
-            }
-        }
-    }
-
-    /// Relabel every entity id through the fallible closure, producing a
-    /// `Fact<E2>`.
-    ///
-    /// The `Spatial` arm maps the pair (before the relation) and a post-map
-    /// collision is handed to `on_self_loop`, which the caller supplies so
-    /// the resulting error carries the right
-    /// [`crate::grammar::identity::SelfLoop`] variant (the
-    /// [`JudgmentAssertion`](crate::grammar::assertions::JudgmentAssertion)
-    /// dispatch wraps it as [`crate::grammar::identity::SelfLoop::Spatial`]).
-    ///
-    /// Generic over the error type `Err`: both the leaf closure `fe` and
-    /// the `on_self_loop` collapse closure produce `Err`, so the cluster
-    /// never names the concrete error the assertion layer chooses.
-    pub fn try_map_ids<R2: IdScheme, Err>(
-        &self,
-        fe: &mut impl FnMut(&R::Entity) -> Result<R2::Entity, Err>,
-        on_self_loop: impl FnOnce(R2::Entity) -> Err,
-    ) -> Result<Fact<R2>, Err> {
-        match self {
-            Self::Feature { entity, feature } => Ok(Fact::Feature {
-                entity: fe(entity)?,
-                feature: feature.clone(),
-            }),
-            Self::Spatial { pair, relation } => {
-                let pair = pair.try_map_ids(fe, on_self_loop)?;
-                let relation = relation.try_map_ids(fe)?;
-                Ok(Fact::Spatial { pair, relation })
-            }
-        }
     }
 }
