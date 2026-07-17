@@ -44,6 +44,18 @@ pub struct Attributed<V, ImgId> {
     pub sources: Vec<Citation<ImgId>>,
 }
 
+/// Why a value is present when no source directly asserted it. `None` = asserted;
+/// `Some(kind)` = derived by that rule. One variant per derivation rule; the
+/// witnesses ride in the slot's own `sources`/`facts`/value, so variants stay
+/// lean and don't duplicate them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Derivation {
+    /// `construction ≤ W`, because the entity was witnessed existing at `W` — a
+    /// "built by" bound the solver injected from existence witnesses.
+    ExistenceWitness,
+}
+
 /// The `T`-flattened mirror of the projection's [`Bracket`], for any lattice
 /// `V`: the extent (`possible`), the citations behind it, and the consensus read
 /// off the bracket's conflict tri-state.
@@ -64,6 +76,11 @@ pub struct Bounded<V, ImgId> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<FactId>,
     pub consensus: Consensus<V, ImgId>,
+    /// Set when the value was derived rather than asserted, naming the rule that
+    /// derived it. The value, citations, and facts above are the derivation's
+    /// witnesses; a reader shows the bound inline and tags it inferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derivation: Option<Derivation>,
 }
 
 impl<X: Ord, ImgId> Bounded<Claimed<X>, ImgId> {
@@ -206,6 +223,14 @@ pub trait SupportAtom {
     fn date_premise(&self) -> Option<(FactId, UncertainDate)> {
         None
     }
+
+    /// Whether this atom directly asserts a construction start. A present
+    /// construction-start slot whose support holds no such atom carries a derived
+    /// "built by" bound; this is how the flatten reads asserted-vs-derived off
+    /// the support. `false` for atoms that back no construction-start fact.
+    fn asserts_construction_start(&self) -> bool {
+        false
+    }
 }
 
 impl<EntId, ImgId: Clone> SupportAtom for (EntId, Citation<ImgId>) {
@@ -225,6 +250,9 @@ impl<R: IdScheme> SupportAtom for FactAtom<R> {
     }
     fn date_premise(&self) -> Option<(FactId, UncertainDate)> {
         Some((self.id, fact_date(&self.fact)?))
+    }
+    fn asserts_construction_start(&self) -> bool {
+        crate::conflicts::is_construction_start(&self.fact)
     }
 }
 
@@ -276,6 +304,7 @@ where
             sources: Vec::new(),
             facts: Vec::new(),
             consensus: Consensus::Absent,
+            derivation: None,
         };
     }
 
@@ -311,6 +340,7 @@ where
         sources: srcs,
         facts: fact_ids(&b.extent.support),
         consensus,
+        derivation: None,
     }
 }
 
@@ -654,6 +684,7 @@ mod tests {
                 sources: Vec::new(),
                 facts: Vec::new(),
                 consensus,
+                derivation: None,
             }
         }
 

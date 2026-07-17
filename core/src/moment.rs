@@ -408,6 +408,7 @@ mod tests {
             sources: Vec::new(),
             facts: Vec::new(),
             consensus: Consensus::Reached { value },
+            derivation: None,
         })
     }
 
@@ -418,6 +419,7 @@ mod tests {
             sources: Vec::new(),
             facts: Vec::new(),
             consensus: Consensus::Absent,
+            derivation: None,
         }
     }
 

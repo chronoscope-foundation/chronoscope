@@ -18,14 +18,15 @@ use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::algebra::semiring::{Label, Support};
-use crate::conflicts::{FactAtom, fact_date};
-use crate::date::UncertainDate;
+use crate::algebra::monoid::CommutativeMonoid;
+use crate::algebra::semiring::{Label, Semiring, Support};
+use crate::conflicts::{FactAtom, fact_date, is_construction_start};
+use crate::date::{DateBound, UncertainDate};
 use crate::grammar::assertions::FactualAssertion;
-use crate::grammar::bookend::{ConstructionFact, DemolitionFact};
+use crate::grammar::bookend::DemolitionFact;
 use crate::grammar::ids::{FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
-use crate::projection;
+use crate::projection::{self, Bracket};
 use crate::submit::StoredFact;
 
 /// An entity-level temporal contradiction: facts that can't jointly hold.
@@ -74,7 +75,7 @@ type CitedEntity<R> = projection::Entity<
 /// The entity-level temporal contradictions in one entity's projection.
 ///
 /// Bounds existence witnesses by the entity's lifetime window: the construction
-/// floor ([`ConstructionFact::Started`], read earliest) and the demolition
+/// floor ([`ConstructionFact::Started`](crate::grammar::bookend::ConstructionFact::Started), read earliest) and the demolition
 /// ceiling ([`DemolitionFact::Completed`], read latest). A witness whose latest
 /// instant falls below the floor, or whose earliest instant rises above the
 /// ceiling, can't hold with that bookend, and the [`TemporalConflict`] names the
@@ -135,10 +136,101 @@ pub fn temporal_conflicts<R: IdScheme>(entity: &CitedEntity<R>) -> Vec<TemporalC
     conflicts
 }
 
-/// One end of the entity's lifetime window: the bounding instant and the
-/// bookend fact(s) that pin it, so a conflict can name them.
+/// Inject a derived "built by" bound into an empty construction start. Reads the
+/// same witnesses [`temporal_conflicts`] does — existence facts and interior-event
+/// dates — derives `construction ≤ earliest-witness` preserving that witness's
+/// precision, and folds it into the empty slot with support a premise on the
+/// binding witness fact(s).
+///
+/// Only an empty construction start is touched. An asserted start a witness
+/// predates is the detector's alarm, not the producer's; one a witness agrees
+/// with makes the derived bound redundant. So no asserted value ever absorbs a
+/// witness into its provenance, and the detector is never blinded — the inference
+/// only fills a gap, it never rewrites an asserted bookend.
+pub fn inject_derived_bounds<R: IdScheme>(entity: &mut CitedEntity<R>) {
+    if !entity.construction.started_at.extent.support.is_zero() {
+        return;
+    }
+
+    let injection: Option<(UncertainDate, Label<FactAtom<R>>)> = {
+        // Every witness with a definite upper bound, paired with the precision-
+        // keeping bound and the fact it rests on. An open-above witness ("after
+        // 1800") floors the start at +∞ — no information — so it contributes none.
+        let mut witnesses: Vec<(NaiveDate, DateBound, &FactAtom<R>)> = Vec::new();
+        for (date, entry) in &entity.existence {
+            if let (Some(latest), Some(bound)) = (date.latest(), date.latest_bound().copied()) {
+                for atom in entry.support.atoms() {
+                    witnesses.push((latest, bound, atom));
+                }
+            }
+        }
+        for entry in entity.events.values() {
+            let event = &entry.value;
+            for slot in [&event.occurred_at, &event.started_at, &event.completed_at] {
+                for atom in slot.extent.support.atoms() {
+                    if let Some(date) = fact_date(&atom.fact)
+                        && let (Some(latest), Some(bound)) =
+                            (date.latest(), date.latest_bound().copied())
+                    {
+                        witnesses.push((latest, bound, atom));
+                    }
+                }
+            }
+        }
+
+        // The earliest witness sets the "built by" bound; every witness tied at it
+        // binds the bound jointly, so the support names each one.
+        match witnesses.iter().map(|(latest, _, _)| *latest).min() {
+            None => None,
+            Some(earliest) => {
+                let mut derived_bound: Option<DateBound> = None;
+                let mut support = Label::empty();
+                for (latest, bound, atom) in &witnesses {
+                    if *latest == earliest {
+                        // Ties share the instant — keep the finest precision.
+                        derived_bound = Some(match derived_bound {
+                            Some(current) if current.precision() <= bound.precision() => current,
+                            _ => *bound,
+                        });
+                        support = support.plus(Label::premise((*atom).clone()));
+                    }
+                }
+                derived_bound
+                    .and_then(|bound| UncertainDate::bounded(None, Some(bound)).ok())
+                    .map(|derived| (derived, support))
+            }
+        }
+    };
+
+    if let Some((derived, support)) = injection {
+        entity.construction.started_at = entity
+            .construction
+            .started_at
+            .clone()
+            .combine(Bracket::from((derived, support)));
+    }
+}
+
+/// ∃-satisfiability of a derived date constraint against a slot's asserted
+/// envelope: `derived ⊓ envelope ≠ ⊥`. Some hypothesis of the envelope can still
+/// hold under `derived`. Its unsatisfiable face (`!envelope_satisfies`) is a
+/// relational conflict — a witness that no bookend hypothesis admits; its
+/// satisfiable face is what an inference producer injects.
+fn envelope_satisfies(derived: &UncertainDate, envelope: &UncertainDate) -> bool {
+    derived.overlaps(envelope)
+}
+
+/// One end of the entity's lifetime window: the bounding instant, the asserted
+/// envelope a witness is checked against, and the bookend fact(s) that pin it,
+/// so a conflict can name them.
 struct LifetimeBound {
+    /// The extremum instant — the earliest a construction could have started, or
+    /// the latest a demolition could have reached — carried into the conflict kind.
     instant: NaiveDate,
+    /// The bookend slot's extent (join): every hypothesis the asserted dates
+    /// admit. A witness's derived one-sided bound is checked against it.
+    envelope: UncertainDate,
+    /// The bookend fact(s) setting the extremum.
     facts: Vec<FactId>,
 }
 
@@ -159,7 +251,11 @@ fn construction_floor<R: IdScheme>(entity: &CitedEntity<R>) -> Option<LifetimeBo
         .filter(|atom| is_construction_start(&atom.fact))
         .map(|atom| atom.id)
         .collect();
-    (!facts.is_empty()).then_some(LifetimeBound { instant, facts })
+    (!facts.is_empty()).then(|| LifetimeBound {
+        instant,
+        envelope: started.extent.value.clone(),
+        facts,
+    })
 }
 
 /// The demolition ceiling: the latest the entity could have persisted to under
@@ -179,7 +275,11 @@ fn demolition_ceiling<R: IdScheme>(entity: &CitedEntity<R>) -> Option<LifetimeBo
         .filter(|atom| is_demolition_completed(&atom.fact))
         .map(|atom| atom.id)
         .collect();
-    (!facts.is_empty()).then_some(LifetimeBound { instant, facts })
+    (!facts.is_empty()).then(|| LifetimeBound {
+        instant,
+        envelope: completed.extent.value.clone(),
+        facts,
+    })
 }
 
 /// Bundle a witness's out-of-window dates into one conflict per violated bound.
@@ -201,9 +301,13 @@ fn bundle_conflicts(
         let mut witness: Option<&UncertainDate> = None;
         let mut witness_latest: Option<NaiveDate> = None;
         for (id, date) in dates {
-            if let Some(latest) = date.latest()
-                && latest < floor.instant
-            {
+            // "construction ≤ this witness" — the bound the witness derives on the
+            // start. Unsatisfiable against the asserted envelope exactly when the
+            // witness predates every construction hypothesis, i.e. below the floor.
+            let derived = UncertainDate::bounded(None, date.latest_bound().copied());
+            let below_floor =
+                derived.is_ok_and(|derived| !envelope_satisfies(&derived, &floor.envelope));
+            if below_floor && let Some(latest) = date.latest() {
                 ids.push(*id);
                 if witness_latest.is_none_or(|cur| latest > cur) {
                     witness_latest = Some(latest);
@@ -229,9 +333,13 @@ fn bundle_conflicts(
         let mut witness: Option<&UncertainDate> = None;
         let mut witness_earliest: Option<NaiveDate> = None;
         for (id, date) in dates {
-            if let Some(earliest) = date.earliest()
-                && earliest > ceiling.instant
-            {
+            // "demolition ≥ this witness" — unsatisfiable against the asserted
+            // envelope exactly when the witness outlasts every demolition
+            // hypothesis, i.e. above the ceiling.
+            let derived = UncertainDate::bounded(date.earliest_bound().copied(), None);
+            let above_ceiling =
+                derived.is_ok_and(|derived| !envelope_satisfies(&derived, &ceiling.envelope));
+            if above_ceiling && let Some(earliest) = date.earliest() {
                 ids.push(*id);
                 if witness_earliest.is_none_or(|cur| earliest < cur) {
                     witness_earliest = Some(earliest);
@@ -281,21 +389,6 @@ fn push_conflict(
     }
 }
 
-/// Whether a stored fact is a [`ConstructionFact::Started`] claim — the fact a
-/// temporal conflict names as the floor a witness fell below.
-fn is_construction_start<R: IdScheme>(fact: &StoredFact<R>) -> bool {
-    matches!(
-        fact,
-        StoredFact::Factual(f)
-            if matches!(
-                &f.assertion,
-                FactualAssertion::Construction {
-                    fact: ConstructionFact::Started { .. },
-                }
-            )
-    )
-}
-
 /// Whether a stored fact is a [`DemolitionFact::Completed`] claim — the fact a
 /// temporal conflict names as the ceiling a witness rose above.
 fn is_demolition_completed<R: IdScheme>(fact: &StoredFact<R>) -> bool {
@@ -321,6 +414,7 @@ mod tests {
 
     use crate::conflicts::fact_lineage;
     use crate::date::{DatePrecision, UncertainDate};
+    use crate::grammar::bookend::ConstructionFact;
     use crate::grammar::citations::{Excerpt, ExternalSource, FactualCitation};
     use crate::grammar::event::Fact as EventFact;
     use crate::grammar::existence;
@@ -332,6 +426,7 @@ mod tests {
     use crate::submit::{
         Commit, CommitAuthor, Decl, EntityIdx, EventIdx, SubmitFact, commit_facts,
     };
+    use crate::typed;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -849,6 +944,319 @@ mod tests {
         assert_eq!(
             named, expected,
             "the conflict names the witness and both disputed construction starts"
+        );
+        Ok(())
+    }
+
+    // ---- derived-bound producer ----
+
+    /// A `UsageChanged` point event on entity 0 / event 0, dated `y` — an
+    /// interior event whose date is an existence witness (the Colosseum opening).
+    fn point_event_at(y: i32) -> Result<Vec<SubmitFact>, Box<dyn std::error::Error>> {
+        Ok(vec![
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Event {
+                    fact: EventFact::HasEvent {
+                        entity: EntityIdx(0),
+                        event: EventIdx(0),
+                        kind: LifetimeEventKind::Point {
+                            kind: PointKind::UsageChanged,
+                        },
+                    },
+                },
+                citation: citation("https://example.com/opening")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Event {
+                    fact: EventFact::PointDate {
+                        event: EventIdx(0),
+                        bound: year(y)?,
+                    },
+                },
+                citation: citation("https://example.com/opening-date")?,
+            },
+        ])
+    }
+
+    /// The one-sided "before `y`" bound the producer derives from a year-`y`
+    /// witness — construction ≤ end of `y`, preserving the witness's precision.
+    fn before(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+        Ok(UncertainDate::bounded(
+            None,
+            year(y)?.latest_bound().copied(),
+        )?)
+    }
+
+    /// The Colosseum shape: an existence witness at 81 and no construction start.
+    /// The producer fills the empty construction slot with the derived "before 81"
+    /// bound resting on the witness, and the flatten marks the row inferred.
+    #[tokio::test]
+    async fn empty_construction_gains_inferred_built_by_from_existence_witness() -> TestResult {
+        let store = MemoryFactStore::new();
+        let commit = Commit::<MemoryIds> {
+            author: CommitAuthor::User(UserId::new("test")),
+            recorded_at: fixed_time()?,
+            entities: vec![Decl::Local],
+            events: Vec::new(),
+            images: Vec::new(),
+            facts: [existence_at(81)?].into_iter().collect(),
+        };
+        let result = commit_facts(&store, commit)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let id = result.entities.get(&EntityIdx(0)).ok_or("entity 0")?.id;
+        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let (class, mut entity) =
+            project_entity::<MemoryFactStore, _, _>(&mut view, id, fact_lineage)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .ok_or("known id should project")?;
+
+        let witness = witness_id(&entity).ok_or("existence witness fact")?;
+        assert!(
+            entity.construction.started_at.extent.support.is_zero(),
+            "the construction start is empty before inference"
+        );
+
+        inject_derived_bounds::<MemoryIds>(&mut entity);
+
+        let started = &entity.construction.started_at;
+        assert_eq!(
+            started.extent.value,
+            before(81)?,
+            "the empty slot gains construction ≤ 81"
+        );
+        let atoms: BTreeSet<FactId> = started.extent.support.atoms().map(|atom| atom.id).collect();
+        assert_eq!(
+            atoms,
+            BTreeSet::from([witness]),
+            "the derived bound rests on the witness fact alone"
+        );
+
+        // The flatten surfaces the bound inline on the construction row, marked
+        // inferred and sourced to the witness.
+        let typed = typed::Entity::parse(&entity, &class);
+        let period = typed
+            .timeline
+            .events()
+            .iter()
+            .find_map(|event| match &event.detail {
+                typed::EventDetail::Constructed { period, .. } => Some(period),
+                _ => None,
+            })
+            .ok_or("a constructed row")?;
+        assert_eq!(
+            period.started.derivation,
+            Some(typed::Derivation::ExistenceWitness),
+            "the inferred start is marked derived by the existence-witness rule"
+        );
+        assert_eq!(
+            period.started.possible,
+            before(81)?,
+            "the inferred row carries the before-81 bound"
+        );
+        assert_eq!(
+            period.started.facts,
+            vec![witness],
+            "the inferred row names the witness fact"
+        );
+        assert_eq!(
+            period.started.sources.len(),
+            1,
+            "the inferred row cites the witness source"
+        );
+        Ok(())
+    }
+
+    /// An interior event's date is a witness too: a point event dated 81 with no
+    /// construction start infers the same "before 81" bound on its own.
+    #[tokio::test]
+    async fn interior_event_date_infers_built_by_bound() -> TestResult {
+        let store = MemoryFactStore::new();
+        let commit = Commit::<MemoryIds> {
+            author: CommitAuthor::User(UserId::new("test")),
+            recorded_at: fixed_time()?,
+            entities: vec![Decl::Local],
+            events: vec![Decl::Local],
+            images: Vec::new(),
+            facts: point_event_at(81)?.into_iter().collect(),
+        };
+        let mut entity = project(&store, commit).await?;
+
+        let event_date = entity
+            .events
+            .values()
+            .next()
+            .ok_or("one event")?
+            .value
+            .occurred_at
+            .extent
+            .support
+            .atoms()
+            .next()
+            .ok_or("event date fact")?
+            .id;
+
+        inject_derived_bounds::<MemoryIds>(&mut entity);
+
+        let started = &entity.construction.started_at;
+        assert_eq!(
+            started.extent.value,
+            before(81)?,
+            "the event date floors the built-by bound"
+        );
+        let atoms: BTreeSet<FactId> = started.extent.support.atoms().map(|atom| atom.id).collect();
+        assert_eq!(
+            atoms,
+            BTreeSet::from([event_date]),
+            "the bound rests on the event's date fact"
+        );
+        Ok(())
+    }
+
+    /// An asserted construction start is the producer's boundary: a witness
+    /// consistent with it makes the derived bound redundant, so the asserted slot
+    /// stays byte-for-byte untouched and its flattened row carries no derivation.
+    #[tokio::test]
+    async fn asserted_construction_start_blocks_inference() -> TestResult {
+        let store = MemoryFactStore::new();
+        let commit = Commit::<MemoryIds> {
+            author: CommitAuthor::User(UserId::new("test")),
+            recorded_at: fixed_time()?,
+            entities: vec![Decl::Local],
+            events: Vec::new(),
+            images: Vec::new(),
+            facts: [existence_at(81)?, construction_started(70)?]
+                .into_iter()
+                .collect(),
+        };
+        let result = commit_facts(&store, commit)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        let id = result.entities.get(&EntityIdx(0)).ok_or("entity 0")?.id;
+        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let (class, mut entity) =
+            project_entity::<MemoryFactStore, _, _>(&mut view, id, fact_lineage)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .ok_or("known id should project")?;
+
+        let before_inject = entity.construction.started_at.clone();
+        inject_derived_bounds::<MemoryIds>(&mut entity);
+        assert_eq!(
+            entity.construction.started_at, before_inject,
+            "an asserted construction start is untouched by inference"
+        );
+
+        let typed = typed::Entity::parse(&entity, &class);
+        let period = typed
+            .timeline
+            .events()
+            .iter()
+            .find_map(|event| match &event.detail {
+                typed::EventDetail::Constructed { period, .. } => Some(period),
+                _ => None,
+            })
+            .ok_or("a constructed row")?;
+        assert_eq!(
+            period.started.derivation, None,
+            "an asserted start is not marked derived"
+        );
+        Ok(())
+    }
+
+    /// Witnesses tied at the earliest date all bind the inferred bound: an
+    /// existence fact and an interior event both dated 81 leave the derived bound
+    /// resting on both facts, so every binder surfaces as provenance.
+    #[tokio::test]
+    async fn witnesses_tied_at_earliest_all_bind_the_inferred_bound() -> TestResult {
+        let store = MemoryFactStore::new();
+        let mut facts: BTreeSet<SubmitFact> = BTreeSet::new();
+        facts.insert(existence_at(81)?);
+        facts.extend(point_event_at(81)?);
+        let commit = Commit::<MemoryIds> {
+            author: CommitAuthor::User(UserId::new("test")),
+            recorded_at: fixed_time()?,
+            entities: vec![Decl::Local],
+            events: vec![Decl::Local],
+            images: Vec::new(),
+            facts,
+        };
+        let mut entity = project(&store, commit).await?;
+
+        let witness = witness_id(&entity).ok_or("existence witness fact")?;
+        let event_date = entity
+            .events
+            .values()
+            .next()
+            .ok_or("one event")?
+            .value
+            .occurred_at
+            .extent
+            .support
+            .atoms()
+            .next()
+            .ok_or("event date fact")?
+            .id;
+
+        inject_derived_bounds::<MemoryIds>(&mut entity);
+
+        let atoms: BTreeSet<FactId> = entity
+            .construction
+            .started_at
+            .extent
+            .support
+            .atoms()
+            .map(|atom| atom.id)
+            .collect();
+        assert_eq!(
+            atoms,
+            BTreeSet::from([witness, event_date]),
+            "both witnesses tied at 81 bind the inferred bound"
+        );
+        Ok(())
+    }
+
+    /// Witnesses tied at one instant but differing precision: the derived bound
+    /// keeps the finest, so "built by 81-12-31" wins over "built by 81".
+    #[tokio::test]
+    async fn tie_break_keeps_the_finest_witness_precision() -> TestResult {
+        let store = MemoryFactStore::new();
+        let precise_day = SubmitFact::Factual {
+            assertion: FactualAssertion::Existence {
+                fact: existence::Fact {
+                    entity: EntityIdx(0),
+                    at: UncertainDate::with_precision(
+                        chrono::NaiveDate::from_ymd_opt(81, 12, 31).ok_or("valid day")?,
+                        DatePrecision::Day,
+                    )?,
+                },
+            },
+            citation: citation("https://example.com/precise-witness")?,
+        };
+        let commit = Commit::<MemoryIds> {
+            author: CommitAuthor::User(UserId::new("test")),
+            recorded_at: fixed_time()?,
+            entities: vec![Decl::Local],
+            events: Vec::new(),
+            images: Vec::new(),
+            // A year-81 witness ends Dec 31, tying the day-81-12-31 witness.
+            facts: [existence_at(81)?, precise_day].into_iter().collect(),
+        };
+        let mut entity = project(&store, commit).await?;
+        inject_derived_bounds::<MemoryIds>(&mut entity);
+
+        let bound = entity
+            .construction
+            .started_at
+            .extent
+            .value
+            .latest_bound()
+            .ok_or("the derived bound has an upper edge")?;
+        assert_eq!(
+            bound.precision(),
+            DatePrecision::Day,
+            "the finest-precision tied witness sets the bound's precision"
         );
         Ok(())
     }

@@ -24,6 +24,7 @@ use chronoscope_core::grammar::citations::{
 };
 use chronoscope_core::grammar::depiction::{self, Perspective};
 use chronoscope_core::grammar::event;
+use chronoscope_core::grammar::existence;
 use chronoscope_core::grammar::ids::UserId;
 use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::grammar::lifecycle::{LifetimeEventKind, PointKind};
@@ -32,7 +33,7 @@ use chronoscope_core::solvers::TemporalConflictKind;
 use chronoscope_core::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact, commit_facts,
 };
-use chronoscope_core::typed::{Consensus, EventDetail, InteriorEvent, distinct_rivals};
+use chronoscope_core::typed::{Consensus, Derivation, EventDetail, InteriorEvent, distinct_rivals};
 
 use super::TestContext;
 use crate::cdn::tests::TEST_CDN_BASE_URL;
@@ -381,6 +382,51 @@ async fn commit_entity_with_event_before_construction(
     commit_single_entity(facts, commit).await
 }
 
+/// Commit a named entity attested to exist at `witness` — a P571 existence
+/// witness — with no construction start. The Colosseum shape the derived-bound
+/// producer fills: the read infers `construction ≤ witness`.
+async fn commit_entity_with_existence_witness(
+    facts: &ServerFactStore,
+    name: &str,
+    witness: i32,
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name {
+                        entity: EntityIdx(0),
+                        name: NameText::new(name),
+                        language: Language::new("en")?,
+                        name_type: NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                },
+                citation: citation("https://example.com/name")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Existence {
+                    fact: existence::Fact {
+                        entity: EntityIdx(0),
+                        at: year(witness)?,
+                    },
+                },
+                citation: citation("https://example.com/witness")?,
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    commit_single_entity(facts, commit).await
+}
+
 /// Commit a named, placeable entity depicted by one image: an exterior-picture
 /// depiction whose image carries a Commons `Source` URL and a `Picture` medium.
 /// Exercises the image read path (`get_entity` grid, `/markers` thumbnail).
@@ -633,6 +679,58 @@ async fn get_entity_surfaces_a_temporal_conflict_for_an_event_before_constructio
         ),
         other => return Err(format!("expected a before-construction kind, got {other:?}").into()),
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_entity_infers_a_built_by_bound_from_an_existence_witness() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // The Colosseum shape: attested existing in 81, no construction date. The read
+    // fills the empty construction row with an inferred "before 81" bound, marked
+    // derived and sourced to the witness — not a conflict.
+    let id = commit_entity_with_existence_witness(&ctx.app_state.facts, "Colosseum", 81).await?;
+
+    let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
+
+    let construction = detail
+        .entity
+        .timeline
+        .events()
+        .iter()
+        .find_map(|event| match &event.detail {
+            EventDetail::Constructed { period, .. } => Some(period),
+            _ => None,
+        })
+        .ok_or("expected an inferred construction entry in the timeline")?;
+
+    assert_eq!(
+        construction.started.derivation,
+        Some(Derivation::ExistenceWitness),
+        "the inferred start is marked derived, got {:?}",
+        construction.started.derivation
+    );
+    // "before 81": open below, topping out at the end of the witnessed year, so
+    // the one-sided bound round-trips through the client.
+    assert_eq!(
+        construction.started.possible.earliest(),
+        None,
+        "the built-by bound is open below"
+    );
+    assert_eq!(
+        construction.started.possible.latest(),
+        NaiveDate::from_ymd_opt(81, 12, 31),
+        "the built-by bound tops out at the end of the witnessed year"
+    );
+    assert_eq!(
+        construction.started.facts.len(),
+        1,
+        "the inferred row names the witness fact"
+    );
+    assert!(
+        detail.temporal_conflicts.is_empty(),
+        "a witness with no bookend infers a bound, not a conflict, got {:?}",
+        detail.temporal_conflicts
+    );
     Ok(())
 }
 

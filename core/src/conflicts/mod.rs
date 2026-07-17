@@ -9,4 +9,4 @@ mod detect;
 pub mod minimize;
 
 pub use detect::{FactAtom, fact_lineage};
-pub(crate) use detect::{fact_date, minimal_fighting_sets};
+pub(crate) use detect::{fact_date, is_construction_start, minimal_fighting_sets};

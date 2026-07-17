@@ -103,6 +103,23 @@ pub(crate) fn fact_date<R: IdScheme>(fact: &StoredFact<R>) -> Option<UncertainDa
     Some(bound.clone())
 }
 
+/// Whether a stored fact is a [`ConstructionFact::Started`](bookend::ConstructionFact::Started)
+/// claim — the fact a temporal conflict names as the floor a witness fell below,
+/// and the direct assertion that tells an asserted construction start apart from
+/// a derived "built by" bound.
+pub(crate) fn is_construction_start<R: IdScheme>(fact: &StoredFact<R>) -> bool {
+    matches!(
+        fact,
+        StoredFact::Factual(f)
+            if matches!(
+                &f.assertion,
+                FactualAssertion::Construction {
+                    fact: bookend::ConstructionFact::Started { .. },
+                }
+            )
+    )
+}
+
 /// The minimal fighting sets among a slot's date premises, whose joint meet is
 /// already ⊥.
 ///

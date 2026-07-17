@@ -399,7 +399,7 @@ pub async fn get_entity(
     let mut view = open_read_view(&state.facts, params.snapshot, None).await?;
     // An id no committed fact ever named projects as `None` — the fact store's
     // "not found", since a real entity carries at least the fact that minted it.
-    let Some((class, projected)) =
+    let Some((class, mut projected)) =
         project_entity::<ServerFactStore, _, _>(&mut view, id, fact_lineage)
             .await
             .map_err(fact_store_err)?
@@ -410,10 +410,14 @@ pub async fn get_entity(
         ));
     };
     // The `fact_lineage` projection carries the whole facts behind each slot, so
-    // one read serves both surfaces: `Entity::parse` flattens the typed view
-    // (over-determined date slots ride inline as a disputed consensus), and
-    // `temporal_conflicts` reads the same support for cross-field contradictions.
+    // one read serves both surfaces: `temporal_conflicts` reads the support for
+    // cross-field contradictions, then `inject_derived_bounds` folds any inferred
+    // "built by" bound into the empty construction slot, and `Entity::parse`
+    // flattens the typed view (the inferred bound rides inline, marked derived).
+    // The detector runs first, on the asserted slots, so an injected bound never
+    // feeds back into it.
     let temporal_conflicts = solvers::temporal_conflicts::<ServerIds>(&projected);
+    solvers::inject_derived_bounds::<ServerIds>(&mut projected);
     let entity = typed::Entity::parse(&projected, &class);
 
     let snapshot = view.snapshot().await.map_err(fact_store_err)?;

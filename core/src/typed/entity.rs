@@ -549,6 +549,7 @@ where
         sources: sources(&entry.support),
         facts: fact_ids(&entry.support),
         consensus: Consensus::Reached { value: at.clone() },
+        derivation: None,
     }
 }
 
@@ -572,9 +573,25 @@ where
     let mut events: Vec<TimelineEvent<EvtId, X::Img>> = Vec::new();
 
     if bookend_present(&projected.construction) {
+        let mut period = bookend_period(&projected.construction);
+        // A present construction start with no asserting construction-start fact
+        // in its support is the solver's injected "built by" bound. Only the
+        // construction start receives an injection, so the read is construction-
+        // local; demolition's own start never carries a derivation.
+        if has_date(&period.started)
+            && !projected
+                .construction
+                .started_at
+                .extent
+                .support
+                .atoms()
+                .any(SupportAtom::asserts_construction_start)
+        {
+            period.started.derivation = Some(Derivation::ExistenceWitness);
+        }
         events.push(TimelineEvent {
             detail: EventDetail::Constructed {
-                period: bookend_period(&projected.construction),
+                period,
                 location: bracket(&projected.construction.location),
             },
             sources: bookend_sources(&projected.construction),
