@@ -34,7 +34,7 @@ serde_jcs.workspace = true
 tracing.workspace = true
 urlencoding = "2.1"
 thiserror.workspace = true
-chronoscope-macros = { path = "../chronoscope-macros" }
+chronoscope-macros = { path = "../macros" }
 sqlx = { version = "0.8", default-features = false, features = ["derive"], optional = true }
 
 [dev-dependencies]
