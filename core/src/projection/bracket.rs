@@ -95,23 +95,26 @@ pub trait ConsensusConflict {
     fn conflict(&self) -> ConflictStatus;
 }
 
+/// The structural conflict rule shared by the value-mode consensus types
+/// (dates, `Claimed` payloads): the consensus is ⊥ exactly when it admits
+/// nothing, which reads as a conflict.
+fn structural_conflict(value: &impl JoinSemilattice) -> ConflictStatus {
+    if value.is_bottom() {
+        ConflictStatus::Conflict
+    } else {
+        ConflictStatus::Consistent
+    }
+}
+
 impl ConsensusConflict for UncertainDate {
     fn conflict(&self) -> ConflictStatus {
-        if self.is_bottom() {
-            ConflictStatus::Conflict
-        } else {
-            ConflictStatus::Consistent
-        }
+        structural_conflict(self)
     }
 }
 
 impl<A: Ord> ConsensusConflict for Claimed<A> {
     fn conflict(&self) -> ConflictStatus {
-        if self.is_bottom() {
-            ConflictStatus::Conflict
-        } else {
-            ConflictStatus::Consistent
-        }
+        structural_conflict(self)
     }
 }
 
