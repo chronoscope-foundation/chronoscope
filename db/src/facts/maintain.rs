@@ -33,6 +33,7 @@ use super::convert::seed_ids;
 use super::error::{SqliteFactStoreError, sql};
 use super::queries;
 use super::read::{ReadBound, class_members_raw, resolve_rep_raw, retraction_edges};
+use super::storage::{WitnessRow, witness_date_columns, witness_date_json};
 
 async fn insert_rep(
     conn: &mut SqliteConnection,
@@ -49,6 +50,73 @@ async fn insert_rep(
         .execute(&mut *conn)
         .await
         .map_err(sql("inserting representative log row"))?;
+    Ok(())
+}
+
+/// Append the temporal-index row a staged fact seeds. `fact_id` is the staged
+/// fact's id. Each variant is one INSERT under the fact's immutable subject; a
+/// rejected submit's savepoint unwinds it with the staging.
+pub(super) async fn record_witness(
+    conn: &mut SqliteConnection,
+    fact_id: i64,
+    row: WitnessRow,
+) -> Result<(), SqliteFactStoreError> {
+    match row {
+        WitnessRow::Existence { member, date } => {
+            let (earliest, latest, json) = witness_date_columns(&date)?;
+            sqlx::query(queries::INSERT_EXISTENCE_WITNESS.sql)
+                .bind(member)
+                .bind(earliest)
+                .bind(latest)
+                .bind(&json)
+                .bind(fact_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql("inserting existence witness"))?;
+        }
+        WitnessRow::EventDate { event, date, role } => {
+            let (earliest, latest, json) = witness_date_columns(&date)?;
+            sqlx::query(queries::INSERT_EVENT_WITNESS.sql)
+                .bind(event)
+                .bind(earliest)
+                .bind(latest)
+                .bind(&json)
+                .bind(fact_id)
+                .bind(role)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql("inserting event witness"))?;
+        }
+        WitnessRow::HasEvent { member, event } => {
+            sqlx::query(queries::INSERT_HAS_EVENT.sql)
+                .bind(member)
+                .bind(event)
+                .bind(fact_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql("inserting has-event edge"))?;
+        }
+        WitnessRow::ConstructionStart { member, date } => {
+            let json = witness_date_json(&date)?;
+            sqlx::query(queries::INSERT_CONSTRUCTION_START.sql)
+                .bind(member)
+                .bind(&json)
+                .bind(fact_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql("inserting construction-start bookend"))?;
+        }
+        WitnessRow::DemolitionCompleted { member, date } => {
+            let json = witness_date_json(&date)?;
+            sqlx::query(queries::INSERT_DEMOLITION_COMPLETED.sql)
+                .bind(member)
+                .bind(&json)
+                .bind(fact_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql("inserting demolition-completion bookend"))?;
+        }
+    }
     Ok(())
 }
 

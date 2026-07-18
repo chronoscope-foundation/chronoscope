@@ -57,6 +57,9 @@ pub mod ids;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod witness_tests;
+
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -81,7 +84,7 @@ use self::error::sql;
 use self::read::{FacetKey, ReadBound};
 use self::storage::{
     commit_to_json, external_ref_key, facet_columns, fact_to_json, kind_tag, named_entity,
-    referenced_entity, result_to_json, sourced_image, subject_rows,
+    referenced_entity, result_to_json, sourced_image, subject_rows, witness_row,
 };
 
 use self::convert::{i64_to_u64, u64_to_i64};
@@ -533,6 +536,31 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
 }
 
 // ============================================================================
+// Temporal-conflict read — the witness-index read path
+// ============================================================================
+
+impl<C: AsConn> SqliteHandle<C> {
+    /// The entity-level temporal contradictions of `entity`'s class at this
+    /// view's snapshot, read via the per-subject witness indexes rather than a
+    /// whole-entity projection: the composed read
+    /// (`read::temporal_conflict_scan`) followed by
+    /// [`conflicts_via_index`](chronoscope_core::solvers::conflicts_via_index).
+    /// Equal (as a set) to
+    /// [`temporal_conflicts`](chronoscope_core::solvers::temporal_conflicts) over
+    /// the projected entity at the same snapshot.
+    ///
+    /// # Errors
+    /// Returns [`SqliteFactStoreError`] on a backend failure.
+    pub async fn temporal_conflicts_indexed(
+        &mut self,
+        entity: SqliteEntityId,
+    ) -> Result<Vec<chronoscope_core::solvers::TemporalConflict>, Error> {
+        let scan = read::temporal_conflict_scan(self.conn.conn(), self.bound, entity).await?;
+        Ok(chronoscope_core::solvers::conflicts_via_index(&scan))
+    }
+}
+
+// ============================================================================
 // FactWrite impl — the write connection forms only
 // ============================================================================
 
@@ -620,6 +648,7 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         let spatial = fact
             .located_subject()
             .map(|(location, subject)| (location.bounding_rects(), kind_tag(subject.kind())));
+        let witness = witness_row(&fact);
         let fact_json = fact_to_json(fact)?;
         // A RetractCommit facet stores the target's surrogate seq; an
         // unrecorded target resolves NULL, and the validator rejects the
@@ -674,6 +703,11 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
                     .await
                     .map_err(sql("inserting spatial envelope row"))?;
             }
+        }
+        // Witness-index maintenance runs on the same connection as the
+        // staging, so a rejected submit's savepoint unwinds these rows too.
+        if let Some(witness) = witness {
+            maintain::record_witness(&mut *conn, fid_raw, witness).await?;
         }
         // Representative-log maintenance runs on the same connection as the
         // staging, so a rejected submit's savepoint unwinds its rep rows

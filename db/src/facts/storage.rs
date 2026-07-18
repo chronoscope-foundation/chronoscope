@@ -13,13 +13,16 @@
 
 use std::borrow::Cow;
 
+use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
+use chronoscope_core::date::UncertainDate;
 use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use chronoscope_core::grammar::citations::{
     ExternalReference, FactualCitation, JudgmentSource, MetaSource,
 };
 use chronoscope_core::grammar::ids::{CommitId, FactId, SubjectKind};
+use chronoscope_core::grammar::lifecycle::DurationalRole;
 use chronoscope_core::grammar::{attribute, bookend, depiction, event, identity, image};
 use chronoscope_core::location::{Location, UnresolvedLocation};
 use chronoscope_core::nonempty::NonEmptyVec;
@@ -637,6 +640,114 @@ pub(super) fn depiction_subjects(
         }) => Some((*entity, *image)),
         _ => None,
     }
+}
+
+// ============================================================================
+// Temporal-conflict witness rows
+// ============================================================================
+
+/// The slot-order key a durational endpoint / point date files under in
+/// `event_witness`, mirroring the projection's `[occurred, started, completed]`
+/// slot order so a bundled conflict picks the same tie-breaking witness the
+/// whole-entity oracle does.
+const ROLE_OCCURRED: i64 = 0;
+const ROLE_STARTED: i64 = 1;
+const ROLE_COMPLETED: i64 = 2;
+
+/// The witness / bookend index row a staged fact contributes, keyed by the
+/// fact's *immutable* subject. `None` for facts that seed no temporal index.
+pub(super) enum WitnessRow {
+    /// An `Existence` witness, under its entity.
+    Existence { member: i64, date: UncertainDate },
+    /// An interior-event date witness, under its event; `role` is the
+    /// projection slot-order key.
+    EventDate {
+        event: i64,
+        date: UncertainDate,
+        role: i64,
+    },
+    /// A `HasEvent` ownership edge, under its entity.
+    HasEvent { member: i64, event: i64 },
+    /// A `ConstructionFact::Started` bookend, under its entity.
+    ConstructionStart { member: i64, date: UncertainDate },
+    /// A `DemolitionFact::Completed` bookend, under its entity.
+    DemolitionCompleted { member: i64, date: UncertainDate },
+}
+
+/// The temporal-index row a staged fact seeds, if any — the write-side half of
+/// the composed read in [`super::read`]. Only the five fact shapes the
+/// temporal-conflict read consumes appear here; everything else seeds nothing.
+pub(super) fn witness_row(fact: &StoredFact<SqliteIds>) -> Option<WitnessRow> {
+    let StoredFact::Factual(StoredFactualFact { assertion, .. }) = fact else {
+        return None;
+    };
+    match assertion {
+        FactualAssertion::Existence { fact } => Some(WitnessRow::Existence {
+            member: fact.entity.0,
+            date: fact.at.clone(),
+        }),
+        FactualAssertion::Construction {
+            fact: bookend::ConstructionFact::Started { entity, bound },
+        } => Some(WitnessRow::ConstructionStart {
+            member: entity.0,
+            date: bound.clone(),
+        }),
+        FactualAssertion::Demolition {
+            fact: bookend::DemolitionFact::Completed { entity, bound },
+        } => Some(WitnessRow::DemolitionCompleted {
+            member: entity.0,
+            date: bound.clone(),
+        }),
+        FactualAssertion::Event { fact } => match fact {
+            event::Fact::HasEvent { entity, event, .. } => Some(WitnessRow::HasEvent {
+                member: entity.0,
+                event: event.0,
+            }),
+            event::Fact::PointDate { event, bound } => Some(WitnessRow::EventDate {
+                event: event.0,
+                date: bound.clone(),
+                role: ROLE_OCCURRED,
+            }),
+            event::Fact::DurationalDate { event, role, bound } => Some(WitnessRow::EventDate {
+                event: event.0,
+                date: bound.clone(),
+                role: match role {
+                    DurationalRole::Started => ROLE_STARTED,
+                    DurationalRole::Completed => ROLE_COMPLETED,
+                },
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The `num_days_from_ce` day number of a date — the sortable integer the
+/// witness endpoints store and the read-side scan thresholds bind. A monotonic
+/// bijection, so `<` / `>` on it is date order for BCE years and years past
+/// 9999 alike, where a date string would not sort. One definition both the
+/// stored endpoint and the scan threshold share, so the two can never drift.
+pub(super) fn day_number(date: NaiveDate) -> i64 {
+    i64::from(date.num_days_from_ce())
+}
+
+/// The full `UncertainDate` JSON a witness index row stores. Bookend rows, read
+/// whole rather than value-scanned, store only this.
+pub(super) fn witness_date_json(date: &UncertainDate) -> Result<String, SqliteFactStoreError> {
+    serde_json::to_string(date).map_err(super::error::json("encoding witness date"))
+}
+
+/// The sortable endpoint days and JSON a value-scanned witness index row stores
+/// for a date: `(earliest, latest)` as [`day_number`]s, each `None` for an open
+/// side, plus the full `UncertainDate` JSON.
+pub(super) fn witness_date_columns(
+    date: &UncertainDate,
+) -> Result<(Option<i64>, Option<i64>, String), SqliteFactStoreError> {
+    Ok((
+        date.earliest().map(day_number),
+        date.latest().map(day_number),
+        witness_date_json(date)?,
+    ))
 }
 
 /// The distinct `(kind tag, subject id)` pairs a fact mentions — its

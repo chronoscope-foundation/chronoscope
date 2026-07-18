@@ -823,6 +823,7 @@ dependencies = [
  "chronoscope-api-client",
  "chronoscope-core",
  "chronoscope-integrations",
+ "proptest",
  "schemars 0.8.22",
  "serde",
  "serde_json",

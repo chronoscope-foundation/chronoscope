@@ -16,10 +16,15 @@
 //! ([`super::maintain`]) keeps the log equal to the live-edge components at
 //! every snapshot, so no read walks identity edges.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use sqlx::SqliteConnection;
 
+use chronoscope_core::algebra::lattice::JoinSemilattice;
+use chronoscope_core::date::UncertainDate;
 use chronoscope_core::geo::Viewport;
 use chronoscope_core::grammar::ids::FactId;
+use chronoscope_core::solvers::WitnessScan;
 use chronoscope_core::store::FactPlacement;
 use chronoscope_core::store::pagination;
 use chronoscope_core::store::retraction::{RetractionEdges, effective_retractor};
@@ -33,7 +38,7 @@ use super::error::{SqliteFactStoreError, json, sql};
 use super::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
 use super::queries;
 use super::storage::{
-    SubjectColumn, depiction_subjects, fact_from_json, kind_tag, result_from_json,
+    SubjectColumn, day_number, depiction_subjects, fact_from_json, kind_tag, result_from_json,
 };
 
 /// A read's visibility: a pool view's pinned exclusive upper bound, or the
@@ -821,5 +826,237 @@ pub(super) async fn all_class_page<S: SubjectColumn>(
         rows,
         next,
         next_class,
+    })
+}
+
+// ============================================================================
+// Temporal-conflict composed read
+// ============================================================================
+
+/// The extent (join) of a set of dated facts — the bookend hull the floor /
+/// ceiling read an endpoint off. The same `join_all` `witness_floor` /
+/// `witness_ceiling` rebuild core-side, so the scan threshold and the
+/// enumerated bound can never disagree.
+fn witness_join(facts: &[(FactId, UncertainDate)]) -> UncertainDate {
+    UncertainDate::join_all(facts.iter().map(|(_, date)| date.clone()))
+}
+
+/// Which bound a value-range witness scan runs against, carrying the threshold
+/// day the endpoint is compared to.
+#[derive(Clone, Copy)]
+enum Threshold {
+    /// Below the construction floor: `date_latest < day`.
+    Below(i64),
+    /// Above the demolition ceiling: `date_earliest > day`.
+    Above(i64),
+}
+
+/// The events a class owns at the bound: every event some member holds a
+/// live `HasEvent` to. Per-edge liveness (the retraction fixpoint over
+/// `has_event`) — the ownership hop `project_entity`'s `event_reachers` takes,
+/// **not** `event_owners`' latest-owner-wins, so re-owning an event (retract old
+/// edge + add new) leaves ownership per-edge and a snapshot where both edges are
+/// transiently live counts the event for both.
+async fn owned_events(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    members: &BTreeSet<SqliteEntityId>,
+) -> Result<BTreeSet<SqliteEventId>, SqliteFactStoreError> {
+    // Keyed by fact id so the retraction filter runs over deduped edge facts.
+    let mut candidates: BTreeMap<i64, i64> = BTreeMap::new();
+    for member in members {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(queries::HAS_EVENT_EDGES.sql)
+            .bind(member.raw())
+            .bind(bound.bind())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql("fetching has-event edges"))?;
+        for (event, fid) in rows {
+            candidates.insert(fid, event);
+        }
+    }
+    let seeds = seed_ids(candidates.keys(), "has-event edge fact id")?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    let mut owned = BTreeSet::new();
+    for ((_, event), fid) in candidates.iter().zip(&seeds) {
+        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
+            continue;
+        }
+        owned.insert(SqliteEventId::from_raw(*event));
+    }
+    Ok(owned)
+}
+
+/// The class's live bookend facts under one query (construction starts or
+/// demolition completions), fetched whole per member and retraction-filtered.
+/// Ascending by fact id.
+async fn bookend_facts(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    members: &BTreeSet<SqliteEntityId>,
+    query: &'static str,
+) -> Result<Vec<(FactId, UncertainDate)>, SqliteFactStoreError> {
+    let mut candidates: BTreeMap<i64, UncertainDate> = BTreeMap::new();
+    for member in members {
+        let rows: Vec<(sqlx::types::Json<UncertainDate>, i64)> = sqlx::query_as(query)
+            .bind(member.raw())
+            .bind(bound.bind())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql("fetching bookend facts"))?;
+        for (date, fid) in rows {
+            candidates.insert(fid, date.0);
+        }
+    }
+    let seeds = seed_ids(candidates.keys(), "bookend fact id")?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    let mut facts = Vec::new();
+    for ((_, date), fid) in candidates.iter().zip(&seeds) {
+        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
+            continue;
+        }
+        facts.push((*fid, date.clone()));
+    }
+    Ok(facts)
+}
+
+/// The value-range witness violators against one bound, grouped as the
+/// enumeration bundles them: existence facts by their exact date, an event's
+/// date facts by event in projection slot order (`(role, fact_id)`). Existence
+/// witnesses scan per member, event witnesses per owned event; one retraction
+/// closure gates the batch.
+async fn witness_groups(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    members: &BTreeSet<SqliteEntityId>,
+    owned: &BTreeSet<SqliteEventId>,
+    threshold: Threshold,
+) -> Result<Vec<Vec<(FactId, UncertainDate)>>, SqliteFactStoreError> {
+    let (existence_sql, event_sql, day) = match threshold {
+        Threshold::Below(day) => (
+            queries::EXISTENCE_WITNESS_BELOW.sql,
+            queries::EVENT_WITNESS_BELOW.sql,
+            day,
+        ),
+        Threshold::Above(day) => (
+            queries::EXISTENCE_WITNESS_ABOVE.sql,
+            queries::EVENT_WITNESS_ABOVE.sql,
+            day,
+        ),
+    };
+
+    // Existence candidates: fact id → stored date.
+    let mut existence: BTreeMap<i64, UncertainDate> = BTreeMap::new();
+    for member in members {
+        let rows: Vec<(sqlx::types::Json<UncertainDate>, i64)> = sqlx::query_as(existence_sql)
+            .bind(member.raw())
+            .bind(day)
+            .bind(bound.bind())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql("fetching existence witnesses"))?;
+        for (date, fid) in rows {
+            existence.insert(fid, date.0);
+        }
+    }
+    // Event candidates: fact id → (event, slot-order role, stored date).
+    let mut events: BTreeMap<i64, (i64, i64, UncertainDate)> = BTreeMap::new();
+    for event in owned {
+        let rows: Vec<(sqlx::types::Json<UncertainDate>, i64, i64)> = sqlx::query_as(event_sql)
+            .bind(event.raw())
+            .bind(day)
+            .bind(bound.bind())
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql("fetching event witnesses"))?;
+        for (date, fid, role) in rows {
+            events.insert(fid, (event.raw(), role, date.0));
+        }
+    }
+
+    // One retraction closure over every candidate fact id.
+    let mut seed_ints: Vec<i64> = existence.keys().copied().collect();
+    seed_ints.extend(events.keys().copied());
+    let seeds = seed_ids(seed_ints.iter(), "witness fact id")?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    let live = |fid: FactId| effective_retractor(fid, bound.fact_id(), &retraction).is_none();
+
+    // Existence groups: bundle by exact date, matching the projection's
+    // FactMap<UncertainDate> keying.
+    let mut existence_groups: BTreeMap<UncertainDate, Vec<FactId>> = BTreeMap::new();
+    for (fid_raw, date) in &existence {
+        let fid = FactId::new(i64_to_u64(*fid_raw, "existence witness fact id")?);
+        if !live(fid) {
+            continue;
+        }
+        existence_groups.entry(date.clone()).or_default().push(fid);
+    }
+    // Event groups: bundle by event, ordered into the projection's slot order so
+    // a tie at the bound picks the same witness the whole-entity oracle does.
+    let mut event_groups: BTreeMap<i64, Vec<(i64, FactId, UncertainDate)>> = BTreeMap::new();
+    for (fid_raw, (event, role, date)) in &events {
+        let fid = FactId::new(i64_to_u64(*fid_raw, "event witness fact id")?);
+        if !live(fid) {
+            continue;
+        }
+        event_groups
+            .entry(*event)
+            .or_default()
+            .push((*role, fid, date.clone()));
+    }
+
+    let mut groups: Vec<Vec<(FactId, UncertainDate)>> = Vec::new();
+    for (date, fids) in existence_groups {
+        groups.push(fids.into_iter().map(|fid| (fid, date.clone())).collect());
+    }
+    for (_event, mut rows) in event_groups {
+        rows.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        groups.push(rows.into_iter().map(|(_, fid, date)| (fid, date)).collect());
+    }
+    Ok(groups)
+}
+
+/// The temporal-conflict composed read at the bound — the witness-index
+/// counterpart of projecting the whole entity. Mirrors `project_entity`'s hops:
+/// class members via `subject_reps`, owned events via the per-edge `HasEvent`
+/// liveness hop. Reads the class's live bookend facts (joined core-side into the
+/// floor / ceiling), then the two value-range scans for the witnesses that cross
+/// them — so an in-bounds entity seeks to nothing and yields no conflict without
+/// a projection. The result feeds
+/// [`conflicts_via_index`](chronoscope_core::solvers::conflicts_via_index).
+pub(super) async fn temporal_conflict_scan(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    entity: SqliteEntityId,
+) -> Result<WitnessScan, SqliteFactStoreError> {
+    let members = equiv_class(conn, bound, entity).await?.members;
+    let owned = owned_events(conn, bound, &members).await?;
+
+    let construction_starts =
+        bookend_facts(conn, bound, &members, queries::CONSTRUCTION_STARTS.sql).await?;
+    let demolition_completions =
+        bookend_facts(conn, bound, &members, queries::DEMOLITION_COMPLETIONS.sql).await?;
+
+    let floor_day = witness_join(&construction_starts)
+        .earliest()
+        .map(day_number);
+    let ceiling_day = witness_join(&demolition_completions)
+        .latest()
+        .map(day_number);
+
+    let below_floor = match floor_day {
+        Some(day) => witness_groups(conn, bound, &members, &owned, Threshold::Below(day)).await?,
+        None => Vec::new(),
+    };
+    let above_ceiling = match ceiling_day {
+        Some(day) => witness_groups(conn, bound, &members, &owned, Threshold::Above(day)).await?,
+        None => Vec::new(),
+    };
+
+    Ok(WitnessScan {
+        construction_starts,
+        demolition_completions,
+        below_floor,
+        above_ceiling,
     })
 }

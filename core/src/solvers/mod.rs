@@ -18,6 +18,7 @@ use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::algebra::lattice::JoinSemilattice;
 use crate::algebra::monoid::CommutativeMonoid;
 use crate::algebra::semiring::{Label, Semiring, Support};
 use crate::conflicts::{FactAtom, fact_date, is_construction_start};
@@ -134,6 +135,93 @@ pub fn temporal_conflicts<R: IdScheme>(entity: &CitedEntity<R>) -> Vec<TemporalC
     }
 
     conflicts
+}
+
+/// The live temporal witnesses and bookends of an entity's class at one
+/// snapshot, grouped for [`conflicts_via_index`].
+///
+/// The composed-read output the fact store produces by scanning the per-subject
+/// witness indexes — keyed by each witness's immutable subject — instead of
+/// projecting the whole entity. `construction_starts` / `demolition_completions`
+/// are the live bookend facts the floor / ceiling join over; `below_floor` /
+/// `above_ceiling` are the value-range violators, each inner group the witnesses
+/// the enumeration bundles into one conflict (existence facts grouped by exact
+/// date, an event's date facts grouped by event in projection slot order).
+#[derive(Debug, Clone, Default)]
+pub struct WitnessScan {
+    /// The live `ConstructionFact::Started` facts and their dates.
+    pub construction_starts: Vec<(FactId, UncertainDate)>,
+    /// The live `DemolitionFact::Completed` facts and their dates.
+    pub demolition_completions: Vec<(FactId, UncertainDate)>,
+    /// Witness groups whose latest instant falls below the construction floor.
+    pub below_floor: Vec<Vec<(FactId, UncertainDate)>>,
+    /// Witness groups whose earliest instant rises above the demolition ceiling.
+    pub above_ceiling: Vec<Vec<(FactId, UncertainDate)>>,
+}
+
+/// The entity-level temporal contradictions read straight off the witness
+/// indexes — the detect-then-enumerate counterpart of
+/// [`temporal_conflicts`] over [`project_entity`](crate::projection::project_entity).
+///
+/// **Detect:** the floor and ceiling come from the class's bookend facts; a
+/// [`WitnessScan`] whose value-range scans found no violator carries no
+/// `below_floor` / `above_ceiling` group, so an in-bounds entity yields no
+/// conflict without the whole-entity projection. **Enumerate:** each violator
+/// group runs today's `bundle_conflicts` against the bound it crossed, sharing
+/// one dedup set — so event endpoints unite, disputed bookends are all named, and
+/// repeated fact sets collapse exactly as the oracle does. The homomorphism
+/// `conflicts_via_index(E, T) == temporal_conflicts(project_entity_at(E, T))` as
+/// sets, at every snapshot, is the proptest that guards the two paths from drift.
+pub fn conflicts_via_index(scan: &WitnessScan) -> Vec<TemporalConflict> {
+    let floor = witness_floor(&scan.construction_starts);
+    let ceiling = witness_ceiling(&scan.demolition_completions);
+    let mut conflicts: Vec<TemporalConflict> = Vec::new();
+    let mut seen: BTreeSet<BTreeSet<FactId>> = BTreeSet::new();
+    if let Some(floor) = floor.as_ref() {
+        for group in &scan.below_floor {
+            bundle_conflicts(&mut conflicts, &mut seen, group, Some(floor), None);
+        }
+    }
+    if let Some(ceiling) = ceiling.as_ref() {
+        for group in &scan.above_ceiling {
+            bundle_conflicts(&mut conflicts, &mut seen, group, None, Some(ceiling));
+        }
+    }
+    conflicts
+}
+
+/// The construction floor from the class's live construction-start facts —
+/// [`construction_floor`]'s reading over the raw facts: the extent's earliest
+/// instant (the join over every hypothesis) and every start fact that could set
+/// it. Absent when no start dates it, or when a start is open below (the join is
+/// then unbounded below, exactly as the projected floor bails).
+fn witness_floor(starts: &[(FactId, UncertainDate)]) -> Option<LifetimeBound> {
+    if starts.is_empty() {
+        return None;
+    }
+    let envelope = UncertainDate::join_all(starts.iter().map(|(_, date)| date.clone()));
+    let instant = envelope.earliest()?;
+    Some(LifetimeBound {
+        instant,
+        envelope,
+        facts: starts.iter().map(|(id, _)| *id).collect(),
+    })
+}
+
+/// The demolition ceiling from the class's live demolition-completion facts —
+/// [`demolition_ceiling`]'s reading over the raw facts: the extent's latest
+/// instant and every completion fact behind it.
+fn witness_ceiling(completions: &[(FactId, UncertainDate)]) -> Option<LifetimeBound> {
+    if completions.is_empty() {
+        return None;
+    }
+    let envelope = UncertainDate::join_all(completions.iter().map(|(_, date)| date.clone()));
+    let instant = envelope.latest()?;
+    Some(LifetimeBound {
+        instant,
+        envelope,
+        facts: completions.iter().map(|(id, _)| *id).collect(),
+    })
 }
 
 /// Inject a derived "built by" bound into an empty construction start. Reads the

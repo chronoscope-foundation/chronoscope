@@ -299,3 +299,81 @@ CREATE TABLE facts_spatial (
 );
 SELECT AddGeometryColumn('facts_spatial', 'region', 4326, 'GEOMETRY', 'XY');
 SELECT CreateSpatialIndex('facts_spatial', 'region');
+
+-- Temporal-conflict witness indexes: five per-subject logs, each keyed by a
+-- witness's *immutable* subject, that let the temporal-conflict read compose
+-- with subject_reps and a per-edge HasEvent ownership hop instead of projecting
+-- the whole entity. Every dated row carries the full UncertainDate (as JSON) so
+-- a reconstructed conflict keeps the witness's precision, plus the two endpoint
+-- days (num_days_from_ce of the interval's earliest period-start and latest
+-- period-end) as sortable integers for the value-range scans; a NULL endpoint is
+-- open on that side. INSERT-only, written inside the staging fact's submit
+-- savepoint (the maintain module), so a rejected submit unwinds these rows with
+-- its staging. No merge/split maintenance: identity churn (SameEntity) resolves
+-- at read via subject_reps, event ownership (HasEvent) at read via the
+-- retraction fixpoint over has_event.
+
+-- Existence witnesses, entity-member-keyed: one row per Existence fact under the
+-- entity it names. The value orderings serve the two per-bound range scans —
+-- below the construction floor by latest endpoint, above the demolition ceiling
+-- by earliest.
+CREATE TABLE existence_witness (
+    member        INTEGER NOT NULL,
+    date_earliest INTEGER,
+    date_latest   INTEGER,
+    date_json     TEXT    NOT NULL,
+    fact_id       INTEGER NOT NULL,
+    PRIMARY KEY (member, fact_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_existence_witness_latest   ON existence_witness(member, date_latest);
+CREATE INDEX idx_existence_witness_earliest ON existence_witness(member, date_earliest);
+
+-- Interior-event date witnesses, event-keyed: one row per PointDate /
+-- DurationalDate fact under the event it names (never the entity — the
+-- event→entity binding is the read-time HasEvent hop). `role` orders an event's
+-- witnesses into the projection's slot order (0 = point/occurred, 1 = durational
+-- started, 2 = durational completed) so a bundled conflict selects the same
+-- witness the whole-entity oracle does on a tie.
+CREATE TABLE event_witness (
+    event         INTEGER NOT NULL,
+    date_earliest INTEGER,
+    date_latest   INTEGER,
+    date_json     TEXT    NOT NULL,
+    fact_id       INTEGER NOT NULL,
+    role          INTEGER NOT NULL,
+    PRIMARY KEY (event, fact_id)
+) WITHOUT ROWID;
+CREATE INDEX idx_event_witness_latest   ON event_witness(event, date_latest);
+CREATE INDEX idx_event_witness_earliest ON event_witness(event, date_earliest);
+
+-- HasEvent edges, entity-member-keyed: one row per HasEvent fact under the
+-- entity it names. The read scans these per class member and gates each edge on
+-- its own liveness (the retraction fixpoint), so re-owning an event moves
+-- ownership with no change to the date facts — per-edge liveness matching
+-- project_entity's event_reachers.
+CREATE TABLE has_event (
+    member  INTEGER NOT NULL,
+    event   INTEGER NOT NULL,
+    fact_id INTEGER NOT NULL,
+    PRIMARY KEY (member, event, fact_id)
+) WITHOUT ROWID;
+
+-- Construction-start bookends, entity-member-keyed: one row per
+-- ConstructionFact::Started fact; the read joins their dates into the
+-- construction floor.
+CREATE TABLE construction_start (
+    member    INTEGER NOT NULL,
+    date_json TEXT    NOT NULL,
+    fact_id   INTEGER NOT NULL,
+    PRIMARY KEY (member, fact_id)
+) WITHOUT ROWID;
+
+-- Demolition-completion bookends, entity-member-keyed: one row per
+-- DemolitionFact::Completed fact; the read joins their dates into the demolition
+-- ceiling.
+CREATE TABLE demolition_completed (
+    member    INTEGER NOT NULL,
+    date_json TEXT    NOT NULL,
+    fact_id   INTEGER NOT NULL,
+    PRIMARY KEY (member, fact_id)
+) WITHOUT ROWID;

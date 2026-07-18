@@ -47,8 +47,9 @@ async fn fresh_pool(database_url: &str) -> Result<SqlitePool, DbError> {
 /// A fresh file-backed store per case, plus the tempdir holding its
 /// database. Views hold read transactions for their lifetime, and only a
 /// file-backed database gives WAL's reader/writer independence — a
-/// shared-cache in-memory database serializes them at table locks.
-async fn fresh_store() -> Result<(SqliteFactStore, tempfile::TempDir), TestError> {
+/// shared-cache in-memory database serializes them at table locks. The
+/// witness homomorphism suite reuses it for the same reader/writer reason.
+pub(super) async fn fresh_store() -> Result<(SqliteFactStore, tempfile::TempDir), TestError> {
     let dir = tempfile::tempdir()?;
     let url = format!("sqlite:{}", dir.path().join("facts.sqlite3").display());
     let pool = fresh_pool(&url).await?;

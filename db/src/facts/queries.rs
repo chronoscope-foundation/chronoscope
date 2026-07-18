@@ -367,6 +367,44 @@ define_fact_queries! {
         LIMIT ?5
     "
     ),
+
+    // ---- Temporal-conflict witness indexes ----
+    //
+    // Append hooks: one row per relevant staged fact, under its immutable
+    // subject. Written in the staging fact's submit savepoint (see
+    // super::maintain), so a rejected submit unwinds them.
+    INSERT_EXISTENCE_WITNESS: "INSERT INTO existence_witness (member, date_earliest, date_latest, date_json, fact_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+    INSERT_EVENT_WITNESS: "INSERT INTO event_witness (event, date_earliest, date_latest, date_json, fact_id, role) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+    INSERT_HAS_EVENT: "INSERT INTO has_event (member, event, fact_id) VALUES (?1, ?2, ?3)",
+    INSERT_CONSTRUCTION_START: "INSERT INTO construction_start (member, date_json, fact_id) VALUES (?1, ?2, ?3)",
+    INSERT_DEMOLITION_COMPLETED: "INSERT INTO demolition_completed (member, date_json, fact_id) VALUES (?1, ?2, ?3)",
+
+    // The composed read. Each scans one subject below the exclusive snapshot
+    // bound; retraction filtering runs in Rust over the batched closure, as
+    // everywhere else. The bookend scans (few rows per entity) fetch whole; the
+    // existence / event witness scans take the value-range predicate the
+    // enumeration needs, riding the endpoint index.
+
+    // A member's `HasEvent` edge candidates: (event, fact_id). Retraction gates
+    // each edge, so ownership is per-edge (matching project_entity's
+    // event_reachers), not latest-owner-wins.
+    HAS_EVENT_EDGES: "SELECT event, fact_id FROM has_event WHERE member = ?1 AND fact_id < ?2",
+
+    // A member's construction-start / demolition-completion bookend facts,
+    // whole. The read joins their dates into the floor / ceiling.
+    CONSTRUCTION_STARTS: "SELECT date_json, fact_id FROM construction_start WHERE member = ?1 AND fact_id < ?2",
+    DEMOLITION_COMPLETIONS: "SELECT date_json, fact_id FROM demolition_completed WHERE member = ?1 AND fact_id < ?2",
+
+    // The two per-bound value-range scans. Below the floor: witnesses whose
+    // latest instant strictly precedes it (`date_latest < floor_days`) — a
+    // NULL latest (open above) never matches, correctly excluded. Above the
+    // ceiling: witnesses whose earliest instant strictly follows it. Each rides
+    // the matching endpoint index (idx_*_latest / idx_*_earliest), so an entity
+    // with no violator seeks to nothing.
+    EXISTENCE_WITNESS_BELOW: "SELECT date_json, fact_id FROM existence_witness WHERE member = ?1 AND date_latest < ?2 AND fact_id < ?3",
+    EXISTENCE_WITNESS_ABOVE: "SELECT date_json, fact_id FROM existence_witness WHERE member = ?1 AND date_earliest > ?2 AND fact_id < ?3",
+    EVENT_WITNESS_BELOW: "SELECT date_json, fact_id, role FROM event_witness WHERE event = ?1 AND date_latest < ?2 AND fact_id < ?3",
+    EVENT_WITNESS_ABOVE: "SELECT date_json, fact_id, role FROM event_witness WHERE event = ?1 AND date_earliest > ?2 AND fact_id < ?3",
 }
 
 /// Verify every fact-store query's plan — no full table scans.
