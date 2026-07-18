@@ -9,6 +9,7 @@
   --color-sepia: #6b5840;
   --color-copper: #9a5f28;
   --color-sage: #7a8b6f;
+  --color-sage-deep: #5f6e54;
   --color-amber: #b8651e;
   --color-amber-deep: #8c4a13;
 
@@ -26,7 +27,7 @@
  *   text-body         primary readable text
  *   text-secondary    supporting/muted text, prose paragraphs
  *   text-accent       headings, links, interactive highlights
- *   text-verified     confidence/verification indicators (future)
+ *   text-verified     inferred/derived-value indicators (a solver-built bound)
  *   text-disputed     conflicting-claim indicators (a contested date/field)
  */
 @theme {
@@ -35,6 +36,7 @@
   --color-secondary: var(--color-sepia);
   --color-accent: var(--color-copper);
   --color-verified: var(--color-sage);
+  --color-verified-deep: var(--color-sage-deep);
   --color-disputed: var(--color-amber);
   --color-disputed-deep: var(--color-amber-deep);
 }

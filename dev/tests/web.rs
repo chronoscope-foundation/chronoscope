@@ -334,6 +334,56 @@ async fn test_entity_click_opens_detail() -> TestResult {
     .await
 }
 
+/// Hagia Sophia carries a P571 inception (537) and no asserted construction, so
+/// the read-time solver fills the empty construction slot with an inferred "built
+/// by 537" bound. The panel renders that row with the sage inferred marker,
+/// distinct from a citation bullet and a conflict marker; opening it names the
+/// derivation, the witness reason, and the underlying Wikidata source.
+#[tokio::test]
+async fn test_inferred_construction_bound_renders_marker_and_names_witness() -> TestResult {
+    web_test(async |t| {
+        t.goto_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1, 14.0).await?;
+        t.click_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1).await?;
+        t.wait_for_selector("[role='complementary']").await?;
+        t.wait_for_body_text("Known to exist").await?;
+
+        // The inferred marker's aria-label names the derived bound, distinct from a
+        // citation bullet's "N sources" and a conflict marker's "date conflict".
+        let marker = "[role='complementary'] button[aria-label*='inferred']";
+        t.wait_for_selector(marker).await?;
+        let label = t.attr(marker, "aria-label").await?.unwrap_or_default();
+        check(
+            label.contains("537"),
+            format!("the inferred marker names the 537 built-by bound, got: {label}"),
+        )?;
+
+        t.screenshot("test_inferred_construction_bound_marker")
+            .await?;
+
+        // Opening the marker reveals the derivation: the "built by W" heading, the
+        // witness reason, and the underlying witness citation linked to its real
+        // Wikidata source (not a generic "Derivation" label).
+        t.click(marker).await?;
+        t.wait_for_selector("[role='group']").await?;
+        let popover = t.text("[role='group']").await?.to_lowercase();
+        for token in [
+            "inferred",
+            "built by",
+            "537",
+            "recorded existing",
+            "wikidata",
+        ] {
+            check(
+                popover.contains(token),
+                format!("the inferred popover must name '{token}', got: {popover}"),
+            )?;
+        }
+
+        Ok(())
+    })
+    .await
+}
+
 /// Chioggia's 1633 refounding witnesses existence *after* its 1623 demolition —
 /// the demolition-ceiling side of the temporal solver, complementing Notre-Dame's
 /// construction-floor conflict. The item projects as one entity (the demolition

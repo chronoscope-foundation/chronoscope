@@ -606,17 +606,27 @@ enum DateCell {
     Disputed { value: UncertainDate },
     /// A value this layer left open.
     Pending(UncertainDate),
+    /// A bound no source asserted — the solver derived it from an existence
+    /// witness ("built by W"). The value reads inline in the muted sage tone; the
+    /// derivation and its witnesses ride alongside for the marker's popover.
+    Inferred {
+        value: UncertainDate,
+        derivation: Derivation,
+        witnesses: Vec<CiteEntry>,
+    },
 }
 
 impl DateCell {
-    /// The representative instant this row sits at — its earliest possible date —
-    /// or `None` for an undated row.
+    /// The representative instant this row sits at: its earliest possible date, or
+    /// `None` when it has none — an undated row, or a lower-open bound, which spans
+    /// a range rather than sitting at one instant.
     fn instant(&self) -> Option<NaiveDate> {
-        match self {
-            DateCell::Unknown => None,
-            DateCell::Settled(d) | DateCell::Pending(d) => d.earliest(),
-            DateCell::Disputed { value } => value.earliest(),
-        }
+        let date = match self {
+            DateCell::Unknown => return None,
+            DateCell::Settled(d) | DateCell::Pending(d) => d,
+            DateCell::Disputed { value } | DateCell::Inferred { value, .. } => value,
+        };
+        date.earliest()
     }
 }
 
@@ -713,7 +723,8 @@ use chronoscope_core::moment::TransitionRole;
 use chronoscope_core::projection::Citation;
 use chronoscope_core::solvers::TemporalConflictKind;
 use chronoscope_core::typed::{
-    Attributed, Bounded, Consensus, EventDetail, InteriorEvent, MomentView, distinct_rivals,
+    Attributed, Bounded, Consensus, Derivation, EventDetail, InteriorEvent, MomentView,
+    distinct_rivals,
 };
 
 use chronoscope_api_client::{
@@ -840,6 +851,26 @@ fn date_display(
     let Some(b) = bounded else {
         return (DateCell::Unknown, None);
     };
+    // A derived bound rides in an empty slot the solver filled from a witness, so
+    // it outranks the consensus read: the value is inferred, and the inferred
+    // marker owns its witnesses — the row shows no separate citation bullet.
+    if let Some(derivation) = &b.derivation {
+        // The witness lines cite the attested year `W` the source states; the
+        // bound itself rides on the cell's value, formatted at render.
+        let witnessed = b
+            .possible
+            .latest_bound()
+            .map(format_date_bound)
+            .unwrap_or_else(|| format_uncertain_date(&b.possible));
+        return (
+            DateCell::Inferred {
+                value: b.possible.clone(),
+                derivation: derivation.clone(),
+                witnesses: cite_entries(&witnessed, &b.sources),
+            },
+            None,
+        );
+    }
     match &b.consensus {
         Consensus::Absent => (DateCell::Unknown, None),
         Consensus::Reached { .. } => {
@@ -878,19 +909,25 @@ fn date_display(
 /// settled/pending date. Each source becomes one popover line attesting the
 /// field's own display `value`. `None` when nothing cites the field.
 fn cited_field(value: &str, sources: &[Citation<ImageId>]) -> Option<Citations> {
-    let entries = sources
+    let entries = cite_entries(value, sources);
+    (!entries.is_empty()).then_some(Citations {
+        count: entries.len(),
+        disputed: false,
+        entries,
+    })
+}
+
+/// One popover line per source, each attesting the given display `value`. The
+/// shared body of [`cited_field`] and the inferred marker's witness list.
+fn cite_entries(value: &str, sources: &[Citation<ImageId>]) -> Vec<CiteEntry> {
+    sources
         .iter()
         .map(|source| CiteEntry {
             value: value.to_string(),
             source: citation_label(source),
             url: citation_url(source),
         })
-        .collect::<Vec<_>>();
-    (!entries.is_empty()).then_some(Citations {
-        count: entries.len(),
-        disputed: false,
-        entries,
-    })
+        .collect()
 }
 
 /// A short source label for one rival's citations: each citation's source name,
@@ -1178,12 +1215,24 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
     let label = row.label.clone();
     let description = row.description.clone();
     // Existence witnesses are evidence, not a lifecycle phase — muted, not bold,
-    // with a fainter rule.
+    // with a fainter rule. An inferred bound is derived rather than asserted, so
+    // it wears its own muted sage treatment.
     let existence = row.role == TransitionRole::KnownToExist;
+    let inferred = matches!(&row.date, DateCell::Inferred { .. });
     let bullet = row
         .citations
         .clone()
         .map(|citations| view! { <CitationBullet citations=citations/> });
+    let inferred_marker = match &row.date {
+        DateCell::Inferred {
+            value,
+            derivation,
+            witnesses,
+        } => Some(view! {
+            <InferredMarker value=value.clone() derivation=derivation.clone() witnesses=witnesses.clone()/>
+        }),
+        _ => None,
+    };
     let marker = (!conflicts.is_empty()).then(|| view! { <ConflictMarker conflicts=conflicts/> });
     let date_view = match &row.date {
         DateCell::Unknown => {
@@ -1204,13 +1253,23 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
             <span class="text-body">{format!(" \u{2014} {}", format_uncertain_date(value))}</span>
         }
         .into_any(),
+        DateCell::Inferred { value, .. } => view! {
+            <span class="text-verified italic">
+                {format!(" \u{2014} {}", format_inferred_bound(value))}
+            </span>
+        }
+        .into_any(),
     };
-    let li_class = if existence {
+    let li_class = if inferred {
+        "pl-2 border-l-2 border-verified/30"
+    } else if existence {
         "pl-2 border-l-2 border-sepia/20"
     } else {
         "pl-2 border-l-2 border-copper/30"
     };
-    let label_class = if existence {
+    let label_class = if inferred {
+        "text-verified italic"
+    } else if existence {
         "text-sepia/70 italic"
     } else {
         "font-semibold"
@@ -1218,7 +1277,7 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
     view! {
         <li class=li_class>
             <div>
-                <span class=label_class>{label}</span>{date_view}{bullet}{marker}
+                <span class=label_class>{label}</span>{date_view}{bullet}{inferred_marker}{marker}
             </div>
             {description.map(|desc| view! {
                 <p class="text-xs text-sepia/70 mt-0.5">{desc}</p>
@@ -1392,6 +1451,11 @@ fn CitationBullet(citations: Citations) -> impl IntoView {
     } else {
         "Sources".to_string()
     };
+    let tone = if disputed {
+        PopoverTone::Disputed
+    } else {
+        PopoverTone::Neutral
+    };
 
     let toggle = move |_: leptos::ev::MouseEvent| {
         let opening = !open.get_untracked();
@@ -1430,11 +1494,11 @@ fn CitationBullet(citations: Citations) -> impl IntoView {
                         <div
                             node_ref=popover_ref
                             role="group"
-                            class=popover_class(disputed)
+                            class=popover_class(tone)
                             style=move || popover_style(anchor.get())
                         >
-                            <div class=top_accent_class(disputed)></div>
-                            <div class=header_class(disputed)>
+                            <div class=top_accent_class(tone)></div>
+                            <div class=header_class(tone)>
                                 <span>{heading.clone()}</span>
                             </div>
                             <ul class="py-1 max-h-64 overflow-y-auto">
@@ -1516,17 +1580,27 @@ fn bullet_class(disputed: bool, open: bool) -> String {
 /// [`popover_style`].
 const POPOVER_WIDTH_PX: f64 = 240.0;
 
+/// The hue a citation/marker popover carries: neutral for a plain source list,
+/// disputed (amber) for a contested field or a temporal conflict, inferred (sage)
+/// for a derived "built by" bound. Drives the border, accent, and header color.
+#[derive(Clone, Copy)]
+enum PopoverTone {
+    Neutral,
+    Disputed,
+    Inferred,
+}
+
 /// The popover panel classes. `position: fixed` (placed by [`popover_style`])
-/// lets it escape the panel's `overflow-y-auto` clipping. The contested panel
-/// carries an amber border. Mounted only while open (via `<Show>`), so it owns
-/// no visibility toggle.
-fn popover_class(disputed: bool) -> String {
+/// lets it escape the panel's `overflow-y-auto` clipping. The border picks up the
+/// tone's hue. Mounted only while open (via `<Show>`), so it owns no visibility
+/// toggle.
+fn popover_class(tone: PopoverTone) -> String {
     let base = "fixed z-20 text-left rounded-md bg-parchment shadow-lg \
                 overflow-hidden font-sans border";
-    let border = if disputed {
-        "border-disputed/40"
-    } else {
-        "border-sepia/20"
+    let border = match tone {
+        PopoverTone::Neutral => "border-sepia/20",
+        PopoverTone::Disputed => "border-disputed/40",
+        PopoverTone::Inferred => "border-verified/40",
     };
     format!("{base} {border}")
 }
@@ -1544,23 +1618,24 @@ fn popover_style(anchor: Option<(f64, f64)>) -> String {
     format!("top: {top}px; left: {left}px; width: {POPOVER_WIDTH_PX}px;")
 }
 
-/// The 2px top accent: amber for a contested field, muted otherwise.
-fn top_accent_class(disputed: bool) -> &'static str {
-    if disputed {
-        "h-0.5 bg-disputed"
-    } else {
-        "h-0.5 bg-sepia/50"
+/// The 2px top accent, in the popover's tone: amber for a contested field, sage
+/// for an inferred bound, muted otherwise.
+fn top_accent_class(tone: PopoverTone) -> &'static str {
+    match tone {
+        PopoverTone::Neutral => "h-0.5 bg-sepia/50",
+        PopoverTone::Disputed => "h-0.5 bg-disputed",
+        PopoverTone::Inferred => "h-0.5 bg-verified",
     }
 }
 
-/// The popover header row classes.
-fn header_class(disputed: bool) -> String {
+/// The popover header row classes, tinted to the popover's tone.
+fn header_class(tone: PopoverTone) -> String {
     let base = "flex justify-between items-baseline px-3 py-2 border-b border-sepia/15 \
                 text-[0.6rem] font-bold uppercase tracking-wider";
-    let color = if disputed {
-        "text-disputed-deep"
-    } else {
-        "text-secondary"
+    let color = match tone {
+        PopoverTone::Neutral => "text-secondary",
+        PopoverTone::Disputed => "text-disputed-deep",
+        PopoverTone::Inferred => "text-verified-deep",
     };
     format!("{base} {color}")
 }
@@ -1662,11 +1737,11 @@ fn ConflictMarker(conflicts: Vec<ResolvedConflict>) -> impl IntoView {
                         <div
                             node_ref=popover_ref
                             role="group"
-                            class=popover_class(true)
+                            class=popover_class(PopoverTone::Disputed)
                             style=move || popover_style(anchor.get())
                         >
-                            <div class=top_accent_class(true)></div>
-                            <div class=header_class(true)>
+                            <div class=top_accent_class(PopoverTone::Disputed)></div>
+                            <div class=header_class(PopoverTone::Disputed)>
                                 <span>{heading.clone()}</span>
                             </div>
                             <div class="p-3 space-y-4 max-h-80 overflow-y-auto">
@@ -1807,21 +1882,177 @@ fn build_conflict_svg(conflict: &ResolvedConflict) -> Option<String> {
     ))
 }
 
-/// The conflict marker classes: a solid amber disc the size of a citation
-/// bullet, its parchment `!` reading as a cut-out, deepening while its popover
-/// is open. Mirrors [`bullet_class`]'s dimensions so it rides the row as the
-/// same-sized superscript — solid alert against the bullet's neutral outline.
+/// The disc geometry shared by the conflict and inferred markers: a
+/// superscript-sized solid disc holding a parchment cut-out glyph, matching the
+/// citation bullet's dimensions so all three ride the row alike. Only the
+/// background tone differs between them.
+fn disc_base() -> &'static str {
+    "inline-flex items-center justify-center align-[0.5em] \
+     min-w-[1.3em] h-[1.3em] px-[0.25em] ml-[0.15em] \
+     rounded-full text-parchment text-[0.6em] font-sans font-bold leading-none \
+     cursor-pointer transition-colors"
+}
+
+/// The conflict marker's tone over [`disc_base`]: a solid amber disc, its
+/// parchment `!` a cut-out, deepening while its popover is open — solid alert
+/// against the citation bullet's neutral outline.
 fn conflict_glyph_class(open: bool) -> String {
-    let base = "inline-flex items-center justify-center align-[0.5em] \
-                min-w-[1.3em] h-[1.3em] px-[0.25em] ml-[0.15em] \
-                rounded-full text-parchment text-[0.6em] font-sans font-bold leading-none \
-                cursor-pointer transition-colors";
     let tone = if open {
         "bg-disputed-deep"
     } else {
         "bg-disputed hover:bg-disputed-deep"
     };
-    format!("{base} {tone}")
+    format!("{} {tone}", disc_base())
+}
+
+// ==================== Inferred marker ====================
+
+/// An inferred marker: a solid sage disc beside the citation bullet on a
+/// construction row whose date the solver derived from an existence witness
+/// rather than any source asserting it. Tapping it opens a sage-toned popover
+/// naming the derivation ("built by W"), the witness reason, and the underlying
+/// witness citations. Mirrors [`ConflictMarker`]'s disposal-safe popover:
+/// portaled to `document.body`, closed on an outside click or Escape, with
+/// guarded signal access so a teardown mid-handler can't panic.
+#[component]
+fn InferredMarker(
+    value: UncertainDate,
+    derivation: Derivation,
+    witnesses: Vec<CiteEntry>,
+) -> impl IntoView {
+    let (open, set_open) = signal(false);
+    let (anchor, set_anchor) = signal(None::<(f64, f64)>);
+    let root_ref = NodeRef::<leptos::html::Span>::new();
+    let popover_ref = NodeRef::<leptos::html::Div>::new();
+
+    let click_handle =
+        window_event_listener(leptos::ev::click, move |ev: leptos::ev::MouseEvent| {
+            if !open.try_get_untracked().unwrap_or(false) {
+                return;
+            }
+            let Some(node) = ev
+                .target()
+                .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+            else {
+                return;
+            };
+            let inside = root_ref
+                .get_untracked()
+                .is_some_and(|root| root.contains(Some(&node)))
+                || popover_ref
+                    .get_untracked()
+                    .is_some_and(|popover| popover.contains(Some(&node)));
+            if !inside {
+                let _ = set_open.try_set(false);
+            }
+        });
+    let key_handle =
+        window_event_listener(leptos::ev::keydown, move |ev: leptos::ev::KeyboardEvent| {
+            if ev.key() == "Escape" && open.try_get_untracked() == Some(true) {
+                let _ = set_open.try_set(false);
+            }
+        });
+    on_cleanup(move || {
+        click_handle.remove();
+        key_handle.remove();
+    });
+
+    let (claim, reason) = inferred_text(&derivation, &value);
+    let aria_label = format!("inferred date, {claim}");
+    let heading = format!("Inferred \u{00b7} {claim}");
+
+    let toggle = move |_: leptos::ev::MouseEvent| {
+        let opening = !open.get_untracked();
+        if opening && let Some(el) = root_ref.get_untracked() {
+            let rect = el.get_bounding_client_rect();
+            set_anchor.set(Some((rect.bottom(), rect.right())));
+        }
+        set_open.set(opening);
+    };
+
+    view! {
+        <span node_ref=root_ref>
+            <button
+                type="button"
+                class=move || inferred_glyph_class(open.get())
+                aria-expanded=move || if open.get() { "true" } else { "false" }
+                aria-label=aria_label
+                on:click=toggle
+            >
+                <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]" aria-hidden="true">
+                    "i"
+                </span>
+            </button>
+        </span>
+        <Show when=move || open.get()>
+            {
+                // Clone into block locals so the `Show` closure borrows the
+                // originals; clone again at each use so the `Portal` closure does
+                // too — the discipline `CitationBullet` and `ConflictMarker` follow.
+                let heading = heading.clone();
+                let reason = reason.clone();
+                let witnesses = witnesses.clone();
+                view! {
+                    <Portal>
+                        <div
+                            node_ref=popover_ref
+                            role="group"
+                            class=popover_class(PopoverTone::Inferred)
+                            style=move || popover_style(anchor.get())
+                        >
+                            <div class=top_accent_class(PopoverTone::Inferred)></div>
+                            <div class=header_class(PopoverTone::Inferred)>
+                                <span>{heading.clone()}</span>
+                            </div>
+                            <p class="px-3 py-2 font-serif text-sm text-body border-b border-sepia/15">
+                                {reason.clone()}
+                            </p>
+                            <ul class="py-1 max-h-64 overflow-y-auto">
+                                {citation_entry_views(witnesses.clone())}
+                            </ul>
+                        </div>
+                    </Portal>
+                }
+            }
+        </Show>
+    }
+}
+
+/// The claim a derived bound asserts and the evidence behind it, both phrased
+/// from the structured [`Derivation`] and the bound's own value — a future locale
+/// layer swaps only these templates, and a new rule brings its own words.
+fn inferred_text(derivation: &Derivation, value: &UncertainDate) -> (String, String) {
+    match derivation {
+        Derivation::ExistenceWitness => {
+            let w = value
+                .latest_bound()
+                .map(format_date_bound)
+                .unwrap_or_else(|| format_uncertain_date(value));
+            (format!("built by {w}"), format!("Recorded existing in {w}"))
+        }
+    }
+}
+
+/// A one-sided derived bound as a compact inline value — "≤ W" when open below,
+/// "≥ W" when open above — so the reader sees the boundary and its direction.
+fn format_inferred_bound(value: &UncertainDate) -> String {
+    match (value.earliest_bound(), value.latest_bound()) {
+        (None, Some(hi)) => format!("\u{2264} {}", format_date_bound(hi)),
+        (Some(lo), None) => format!("\u{2265} {}", format_date_bound(lo)),
+        _ => format_uncertain_date(value),
+    }
+}
+
+/// The inferred marker's tone over [`disc_base`]: a solid sage disc, its
+/// parchment `i` a cut-out, deepening while its popover is open — a derived-value
+/// tag in the sage tone.
+fn inferred_glyph_class(open: bool) -> String {
+    let tone = if open {
+        "bg-verified-deep"
+    } else {
+        "bg-verified hover:bg-verified-deep"
+    };
+    format!("{} {tone}", disc_base())
 }
 
 /// Neutralize the ampersand and angle brackets before splicing generated text
