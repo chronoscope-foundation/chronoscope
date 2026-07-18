@@ -857,23 +857,32 @@ enum Threshold {
 /// **not** `event_owners`' latest-owner-wins, so re-owning an event (retract old
 /// edge + add new) leaves ownership per-edge and a snapshot where both edges are
 /// transiently live counts the event for both.
+/// The JSON array of raw subject ids a batched witness scan binds to its
+/// `json_each` driver — one indexed probe per id, the `event_owners` shape.
+fn subject_id_json<S: SubjectColumn>(
+    ids: &BTreeSet<S>,
+    context: &'static str,
+) -> Result<String, SqliteFactStoreError> {
+    let raw: Vec<i64> = ids.iter().map(|&id| id.raw()).collect();
+    serde_json::to_string(&raw).map_err(json(context))
+}
+
 async fn owned_events(
     conn: &mut SqliteConnection,
     bound: ReadBound,
     members: &BTreeSet<SqliteEntityId>,
 ) -> Result<BTreeSet<SqliteEventId>, SqliteFactStoreError> {
+    let members_json = subject_id_json(members, "encoding has-event member id list")?;
     // Keyed by fact id so the retraction filter runs over deduped edge facts.
     let mut candidates: BTreeMap<i64, i64> = BTreeMap::new();
-    for member in members {
-        let rows: Vec<(i64, i64)> = sqlx::query_as(queries::HAS_EVENT_EDGES.sql)
-            .bind(member.raw())
-            .bind(bound.bind())
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sql("fetching has-event edges"))?;
-        for (event, fid) in rows {
-            candidates.insert(fid, event);
-        }
+    let rows: Vec<(i64, i64)> = sqlx::query_as(queries::HAS_EVENT_EDGES.sql)
+        .bind(&members_json)
+        .bind(bound.bind())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("fetching has-event edges"))?;
+    for (event, fid) in rows {
+        candidates.insert(fid, event);
     }
     let seeds = seed_ids(candidates.keys(), "has-event edge fact id")?;
     let retraction = retraction_edges(conn, bound, &seeds).await?;
@@ -888,25 +897,24 @@ async fn owned_events(
 }
 
 /// The class's live bookend facts under one query (construction starts or
-/// demolition completions), fetched whole per member and retraction-filtered.
-/// Ascending by fact id.
+/// demolition completions), fetched whole over the member set and
+/// retraction-filtered. Ascending by fact id.
 async fn bookend_facts(
     conn: &mut SqliteConnection,
     bound: ReadBound,
     members: &BTreeSet<SqliteEntityId>,
     query: &'static str,
 ) -> Result<Vec<(FactId, UncertainDate)>, SqliteFactStoreError> {
+    let members_json = subject_id_json(members, "encoding bookend member id list")?;
     let mut candidates: BTreeMap<i64, UncertainDate> = BTreeMap::new();
-    for member in members {
-        let rows: Vec<(sqlx::types::Json<UncertainDate>, i64)> = sqlx::query_as(query)
-            .bind(member.raw())
-            .bind(bound.bind())
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(sql("fetching bookend facts"))?;
-        for (date, fid) in rows {
-            candidates.insert(fid, date.0);
-        }
+    let rows: Vec<(sqlx::types::Json<UncertainDate>, i64)> = sqlx::query_as(query)
+        .bind(&members_json)
+        .bind(bound.bind())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("fetching bookend facts"))?;
+    for (date, fid) in rows {
+        candidates.insert(fid, date.0);
     }
     let seeds = seed_ids(candidates.keys(), "bookend fact id")?;
     let retraction = retraction_edges(conn, bound, &seeds).await?;
@@ -922,9 +930,9 @@ async fn bookend_facts(
 
 /// The value-range witness violators against one bound, grouped as the
 /// enumeration bundles them: existence facts by their exact date, an event's
-/// date facts by event in projection slot order (`(role, fact_id)`). Existence
-/// witnesses scan per member, event witnesses per owned event; one retraction
-/// closure gates the batch.
+/// date facts by event in projection slot order (`(role, fact_id)`). One scan
+/// over the whole member set gathers the existence witnesses and one over the
+/// owned-event set the event witnesses; one retraction closure gates the batch.
 async fn witness_groups(
     conn: &mut SqliteConnection,
     bound: ReadBound,
@@ -946,32 +954,33 @@ async fn witness_groups(
     };
 
     // Existence candidates: fact id → stored date.
+    let members_json = subject_id_json(members, "encoding existence witness member id list")?;
     let mut existence: BTreeMap<i64, UncertainDate> = BTreeMap::new();
-    for member in members {
-        let rows: Vec<(sqlx::types::Json<UncertainDate>, i64)> = sqlx::query_as(existence_sql)
-            .bind(member.raw())
+    let existence_rows: Vec<(sqlx::types::Json<UncertainDate>, i64)> =
+        sqlx::query_as(existence_sql)
+            .bind(&members_json)
             .bind(day)
             .bind(bound.bind())
             .fetch_all(&mut *conn)
             .await
             .map_err(sql("fetching existence witnesses"))?;
-        for (date, fid) in rows {
-            existence.insert(fid, date.0);
-        }
+    for (date, fid) in existence_rows {
+        existence.insert(fid, date.0);
     }
-    // Event candidates: fact id → (event, slot-order role, stored date).
+    // Event candidates: fact id → (event, slot-order role, stored date). The
+    // scan carries `event` back so the batched rows regroup by event.
+    let owned_json = subject_id_json(owned, "encoding event witness event id list")?;
     let mut events: BTreeMap<i64, (i64, i64, UncertainDate)> = BTreeMap::new();
-    for event in owned {
-        let rows: Vec<(sqlx::types::Json<UncertainDate>, i64, i64)> = sqlx::query_as(event_sql)
-            .bind(event.raw())
+    let event_rows: Vec<(sqlx::types::Json<UncertainDate>, i64, i64, i64)> =
+        sqlx::query_as(event_sql)
+            .bind(&owned_json)
             .bind(day)
             .bind(bound.bind())
             .fetch_all(&mut *conn)
             .await
             .map_err(sql("fetching event witnesses"))?;
-        for (date, fid, role) in rows {
-            events.insert(fid, (event.raw(), role, date.0));
-        }
+    for (date, fid, role, event) in event_rows {
+        events.insert(fid, (event, role, date.0));
     }
 
     // One retraction closure over every candidate fact id.

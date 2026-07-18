@@ -379,32 +379,78 @@ define_fact_queries! {
     INSERT_CONSTRUCTION_START: "INSERT INTO construction_start (member, date_json, fact_id) VALUES (?1, ?2, ?3)",
     INSERT_DEMOLITION_COMPLETED: "INSERT INTO demolition_completed (member, date_json, fact_id) VALUES (?1, ?2, ?3)",
 
-    // The composed read. Each scans one subject below the exclusive snapshot
-    // bound; retraction filtering runs in Rust over the batched closure, as
-    // everywhere else. The bookend scans (few rows per entity) fetch whole; the
-    // existence / event witness scans take the value-range predicate the
-    // enumeration needs, riding the endpoint index.
+    // The composed read. Each drives its per-subject index probe from a
+    // json_each id set — the batched `EVENT_OWNERS` shape — so a class's whole
+    // member set (or owned-event set) reads in one round trip. Retraction
+    // filtering runs in Rust over the batched closure, as everywhere else. The
+    // bookend scans fetch whole; the existence / event witness scans carry the
+    // value-range predicate the enumeration needs, riding the endpoint index.
+    //
+    // The `json_each(?1) CROSS JOIN <table> ON <table>.<key> = json_each.value`
+    // form makes json_each the driver, so each id is one indexed probe of the
+    // witness table; the CROSS JOIN pins that order against the stats-free
+    // planner, which otherwise puts the witness table outermost and scans it.
 
-    // A member's `HasEvent` edge candidates: (event, fact_id). Retraction gates
-    // each edge, so ownership is per-edge (matching project_entity's
-    // event_reachers), not latest-owner-wins.
-    HAS_EVENT_EDGES: "SELECT event, fact_id FROM has_event WHERE member = ?1 AND fact_id < ?2",
+    // The `HasEvent` edge candidates of a member set (?1 json array of member
+    // ids, ?2 bound): (event, fact_id) per member. Retraction gates each edge, so
+    // ownership is per-edge (matching project_entity's event_reachers), not
+    // latest-owner-wins.
+    HAS_EVENT_EDGES: "
+        SELECT has_event.event, has_event.fact_id
+        FROM json_each(?1)
+        CROSS JOIN has_event ON has_event.member = json_each.value
+        WHERE has_event.fact_id < ?2
+    ",
 
-    // A member's construction-start / demolition-completion bookend facts,
-    // whole. The read joins their dates into the floor / ceiling.
-    CONSTRUCTION_STARTS: "SELECT date_json, fact_id FROM construction_start WHERE member = ?1 AND fact_id < ?2",
-    DEMOLITION_COMPLETIONS: "SELECT date_json, fact_id FROM demolition_completed WHERE member = ?1 AND fact_id < ?2",
+    // The construction-start / demolition-completion bookend facts of a member
+    // set (?1 json array of member ids, ?2 bound), whole. The read joins their
+    // dates into the floor / ceiling.
+    CONSTRUCTION_STARTS: "
+        SELECT construction_start.date_json, construction_start.fact_id
+        FROM json_each(?1)
+        CROSS JOIN construction_start ON construction_start.member = json_each.value
+        WHERE construction_start.fact_id < ?2
+    ",
+    DEMOLITION_COMPLETIONS: "
+        SELECT demolition_completed.date_json, demolition_completed.fact_id
+        FROM json_each(?1)
+        CROSS JOIN demolition_completed ON demolition_completed.member = json_each.value
+        WHERE demolition_completed.fact_id < ?2
+    ",
 
-    // The two per-bound value-range scans. Below the floor: witnesses whose
-    // latest instant strictly precedes it (`date_latest < floor_days`) — a
-    // NULL latest (open above) never matches, correctly excluded. Above the
-    // ceiling: witnesses whose earliest instant strictly follows it. Each rides
-    // the matching endpoint index (idx_*_latest / idx_*_earliest), so an entity
-    // with no violator seeks to nothing.
-    EXISTENCE_WITNESS_BELOW: "SELECT date_json, fact_id FROM existence_witness WHERE member = ?1 AND date_latest < ?2 AND fact_id < ?3",
-    EXISTENCE_WITNESS_ABOVE: "SELECT date_json, fact_id FROM existence_witness WHERE member = ?1 AND date_earliest > ?2 AND fact_id < ?3",
-    EVENT_WITNESS_BELOW: "SELECT date_json, fact_id, role FROM event_witness WHERE event = ?1 AND date_latest < ?2 AND fact_id < ?3",
-    EVENT_WITNESS_ABOVE: "SELECT date_json, fact_id, role FROM event_witness WHERE event = ?1 AND date_earliest > ?2 AND fact_id < ?3",
+    // The two per-bound value-range scans over an id set (?1 json array of ids,
+    // ?2 threshold day, ?3 bound). Below the floor: witnesses whose latest
+    // instant strictly precedes it (`date_latest < ?2`) — a NULL latest (open
+    // above) never matches, correctly excluded. Above the ceiling: witnesses
+    // whose earliest instant strictly follows it. Each id is one indexed PK
+    // seek (member/event equality, fact_id bounded), the date threshold
+    // filtering that id's rows; the endpoint indexes (idx_*_latest /
+    // idx_*_earliest) stay available for a stats-driven planner. The event
+    // scans carry `event` back so the batched rows regroup by event.
+    EXISTENCE_WITNESS_BELOW: "
+        SELECT existence_witness.date_json, existence_witness.fact_id
+        FROM json_each(?1)
+        CROSS JOIN existence_witness ON existence_witness.member = json_each.value
+        WHERE existence_witness.date_latest < ?2 AND existence_witness.fact_id < ?3
+    ",
+    EXISTENCE_WITNESS_ABOVE: "
+        SELECT existence_witness.date_json, existence_witness.fact_id
+        FROM json_each(?1)
+        CROSS JOIN existence_witness ON existence_witness.member = json_each.value
+        WHERE existence_witness.date_earliest > ?2 AND existence_witness.fact_id < ?3
+    ",
+    EVENT_WITNESS_BELOW: "
+        SELECT event_witness.date_json, event_witness.fact_id, event_witness.role, event_witness.event
+        FROM json_each(?1)
+        CROSS JOIN event_witness ON event_witness.event = json_each.value
+        WHERE event_witness.date_latest < ?2 AND event_witness.fact_id < ?3
+    ",
+    EVENT_WITNESS_ABOVE: "
+        SELECT event_witness.date_json, event_witness.fact_id, event_witness.role, event_witness.event
+        FROM json_each(?1)
+        CROSS JOIN event_witness ON event_witness.event = json_each.value
+        WHERE event_witness.date_earliest > ?2 AND event_witness.fact_id < ?3
+    ",
 }
 
 /// Verify every fact-store query's plan — no full table scans.
