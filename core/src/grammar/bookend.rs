@@ -93,6 +93,7 @@ pub enum ConstructionFact<R: IdScheme> {
     /// `Moved` event overrides it.
     Location {
         entity: R::Entity,
+        #[location_role = "BookendLocation"]
         location: UnresolvedLocation,
     },
 }

@@ -44,7 +44,7 @@
 
 // `Same*` names mark equivalence claims, not plain id references.
 
-use chronoscope_macros::{DateWalk, grammar_type};
+use chronoscope_macros::{DateWalk, LocationWalk, grammar_type};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -174,7 +174,18 @@ fn check_distinct<Id: PartialEq>(a: Id, b: Id) -> Result<(Id, Id), SelfPairError
 /// self-equivalence is rejected at parse time. The mirror copies the derived
 /// `{a, b}` serialize shape, so the two directions can't drift.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema, DateWalk,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    DateWalk,
+    LocationWalk,
 )]
 #[serde(bound(serialize = "Id: Serialize"))]
 #[serde(
@@ -280,7 +291,18 @@ impl<Id: Ord> OrderedDistinctPair<Id> {
 /// The mirror copies the derived `{from, to}` shape, so the two directions
 /// can't drift.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema, DateWalk,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    DateWalk,
+    LocationWalk,
 )]
 #[serde(bound(serialize = "Id: Serialize"))]
 #[serde(

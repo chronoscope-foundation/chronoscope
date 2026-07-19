@@ -14,8 +14,9 @@
 //!
 //! [`macro@IdWalk`] derives the grammar's id-relabel + id-collect walks
 //! (`for_each_id` / `try_map_ids`) from a scheme-world type's field tokens;
-//! [`macro@DateWalk`] derives an inherent `visit_dates` method — the structural
-//! `UncertainDate` role-tagging walk.
+//! [`macro@DateWalk`] and [`macro@LocationWalk`] derive the inherent
+//! `visit_dates` / `visit_locations` methods — the structural `UncertainDate`
+//! and `UnresolvedLocation` role-tagging walks.
 
 mod walk;
 
@@ -61,14 +62,33 @@ pub fn derive_date_walk(item: TokenStream) -> TokenStream {
     walk::derive_date_walk(item)
 }
 
+/// Derive an inherent `visit_locations` method — the structural
+/// `UnresolvedLocation` role-tagging walk — over a grammar type's fields.
+///
+/// The `UnresolvedLocation` sibling of [`macro@DateWalk`]: a field typed
+/// `UnresolvedLocation` (or `Option<UnresolvedLocation>`) tags its location with
+/// the `LocationRole` its `#[location_role = "Role"]` names — a
+/// `location_role`-less location field is a compile error. Recursion follows the
+/// same rule as `DateWalk` (a field mentioning the scheme param `R`, id leaves
+/// excepted, or one flagged `#[traverse]`); the `#[traverse]` escape hatch is
+/// shared with `DateWalk`, so a `#[traverse]` field is recursed by both walks.
+///
+/// The expansion names `crate::submit::error::LocationRole` and
+/// `crate::location::UnresolvedLocation`, which resolve in `chronoscope-core`.
+#[proc_macro_derive(LocationWalk, attributes(location_role, traverse))]
+pub fn derive_location_walk(item: TokenStream) -> TokenStream {
+    walk::derive_location_walk(item)
+}
+
 /// Declare a grammar sum or product with the standard serde bundle.
 ///
-/// Derives `Serialize`, `Deserialize`, `JsonSchema`, and [`macro@DateWalk`]
-/// (the structural `UncertainDate` role-tagging walk, always — a dateless type
-/// gets an empty walk, so a recursion always lands on a type carrying the
-/// inherent `visit_dates` method), and applies `deny_unknown_fields`. Enums also
-/// get internal tagging on
-/// `"type"` with `snake_case` variant names.
+/// Derives `Serialize`, `Deserialize`, `JsonSchema`, [`macro@DateWalk`], and
+/// [`macro@LocationWalk`] (the structural `UncertainDate` and
+/// `UnresolvedLocation` role-tagging walks, always — a type with no dates or no
+/// locations gets an empty walk, so a recursion always lands on a type carrying
+/// the inherent `visit_dates` / `visit_locations` method), and applies
+/// `deny_unknown_fields`. Enums also get internal tagging on `"type"` with
+/// `snake_case` variant names.
 ///
 /// Every variant must be a struct or unit variant; every struct must use
 /// named fields. Tuple/newtype shapes are a compile error: under internal
@@ -135,7 +155,7 @@ pub fn grammar_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
-        #[derive(::serde::Serialize, ::serde::Deserialize, ::schemars::JsonSchema, ::chronoscope_macros::DateWalk #id_walk_derive)]
+        #[derive(::serde::Serialize, ::serde::Deserialize, ::schemars::JsonSchema, ::chronoscope_macros::DateWalk, ::chronoscope_macros::LocationWalk #id_walk_derive)]
         #serde_attrs
         #scheme_bounds
         #input

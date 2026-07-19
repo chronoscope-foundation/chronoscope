@@ -137,6 +137,7 @@ pub enum Fact<R: IdScheme> {
         /// Which image the location applies to.
         image: R::Image,
         /// The capture location.
+        #[location_role = "ImageCaptured"]
         location: UnresolvedLocation,
     },
     /// What kind of image this is. Descriptive, never gating — it serves as a

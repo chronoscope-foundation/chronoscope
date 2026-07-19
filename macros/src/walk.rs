@@ -1,5 +1,6 @@
-//! The grammar's field walks: `IdWalk` (id relabel + collect) and `DateWalk`
-//! (the `UncertainDate` role-tagging walk).
+//! The grammar's field walks: `IdWalk` (id relabel + collect) and the
+//! structural role-tagging walks `DateWalk` (`UncertainDate` → `DateRole`) and
+//! `LocationWalk` (`UnresolvedLocation` → `LocationRole`).
 //!
 //! Every scheme-world grammar type (`<R: IdScheme>`) needs a `for_each_id`
 //! (collect) and `try_map_ids` (fallible relabel) over its `R::Entity` /
@@ -26,6 +27,11 @@
 //! the rare interior node that isn't `R`-parametrized. Non-`R` types are leaves
 //! where date-recursion stops. A `#[date_role]` field marks the date leaves; an
 //! `UncertainDate` field with no `#[date_role]` fails to compile.
+//!
+//! `LocationWalk` mirrors `DateWalk` over `UnresolvedLocation` / `LocationRole`
+//! via `#[location_role]`, sharing the same recursion skeleton (and the
+//! `#[traverse]` escape hatch) through [`WalkSpec`]. A type with no locations
+//! just visits nothing.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -160,7 +166,8 @@ fn mentions(ty: &Type, scheme: &Ident) -> bool {
 
 /// Read a `#[name = "Ident"]` string attribute off a field, turning its string
 /// literal into an [`Ident`]. `None` when absent; an `Err` on a duplicate or a
-/// non-string-literal value. Shared by `#[self_loop]` and `#[date_role]`.
+/// non-string-literal value. Shared by `#[self_loop]`, `#[date_role]`, and
+/// `#[location_role]`.
 fn string_ident_attr(field: &syn::Field, attr_name: &str) -> Result<Option<Ident>, syn::Error> {
     let mut found = None;
     for attr in &field.attrs {
@@ -480,7 +487,7 @@ pub fn derive_id_walk(item: TokenStream) -> TokenStream {
 }
 
 // ============================================================================
-// DateWalk
+// Structural role-tagging walks (DateWalk, LocationWalk)
 // ============================================================================
 
 /// If a type is `Option<Inner>`, return `Inner`.
@@ -496,15 +503,42 @@ fn option_inner(ty: &Type) -> Option<&Type> {
     None
 }
 
-/// Whether a type's tokens mention `UncertainDate` anywhere — the "field carries
-/// a date" test.
-fn mentions_date(ty: &Type) -> bool {
-    mentions(ty, &format_ident!("UncertainDate"))
+/// The leaf-specific tokens that distinguish one structural role-tagging walk
+/// from another. `DateWalk` tags every `UncertainDate` with a `DateRole`;
+/// `LocationWalk` tags every `UnresolvedLocation` with a `LocationRole`. The
+/// traversal skeleton is shared — tag each role leaf, recurse into every
+/// interior node (a field mentioning the scheme param `R`, or a `#[traverse]`
+/// one), stop at every other leaf — so a spec supplies only the leaf type, its
+/// role attribute and enum, and the inherent method the walk emits.
+struct WalkSpec {
+    /// Derive name, for the shape-error messages (`"DateWalk"`).
+    derive_name: &'static str,
+    /// The inherent method the walk emits (`"visit_dates"`).
+    method: &'static str,
+    /// The per-field role attribute (`"date_role"`).
+    role_attr: &'static str,
+    /// The leaf value type's ident, for the "field carries the leaf" test and
+    /// the annotation-error messages (`"UncertainDate"`).
+    leaf_ident: &'static str,
+    /// The role enum's short name, for the generated method's doc
+    /// (`"DateRole"`).
+    role_name: &'static str,
+    /// The role enum the leaf is tagged with (`crate::submit::error::DateRole`).
+    role_enum: TokenStream2,
+    /// The leaf value type in the visitor signature
+    /// (`crate::date::UncertainDate`).
+    value_ty: TokenStream2,
+}
+
+/// Whether a type's tokens mention the spec's leaf type anywhere — the "field
+/// carries the walk's leaf" test.
+fn mentions_leaf(ty: &Type, spec: &WalkSpec) -> bool {
+    mentions(ty, &format_ident!("{}", spec.leaf_ident))
 }
 
 /// Whether `ty` is exactly one of the deriving type's generic parameters (a
 /// bare `T` field, no path or arguments) — a scheme's id type in this grammar,
-/// so it hosts no dates and the walk skips it.
+/// so it hosts no role leaves and the walk skips it.
 fn is_bare_type_param(ty: &Type, type_params: &[Ident]) -> bool {
     let Type::Path(p) = ty else { return false };
     p.qself.is_none()
@@ -514,7 +548,8 @@ fn is_bare_type_param(ty: &Type, type_params: &[Ident]) -> bool {
 }
 
 /// Whether a field carries the bare `#[traverse]` marker — the escape hatch
-/// forcing date-recursion into an interior node that isn't `R`-parametrized.
+/// forcing recursion into an interior node that isn't `R`-parametrized. Shared
+/// by both role walks: a `#[traverse]` field is recursed by each.
 fn has_traverse(field: &syn::Field) -> bool {
     field
         .attrs
@@ -522,42 +557,52 @@ fn has_traverse(field: &syn::Field) -> bool {
         .any(|attr| attr.path().is_ident("traverse"))
 }
 
-/// Per-field `visit_dates` code for one named field, given its accessor.
+/// Per-field walk code for one named field, given its accessor and the
+/// [`WalkSpec`] naming the leaf.
 ///
-/// A `#[date_role]` field is an `UncertainDate` (or `Option<UncertainDate>`)
-/// visited with its role. Recursion descends only into interior nodes of the
-/// grammar: a field whose type mentions the scheme param `R` (an id-leaf
-/// projection or a bare id param excepted — those are ids, not sub-facts), or
-/// one flagged `#[traverse]`. Every other field is a non-`R` leaf where the walk
-/// stops; it's elided (`None`) so it falls under the binding's `..` and needs no
-/// `visit_dates` method.
-fn date_field_emit(
+/// A role-attribute field is the walk's leaf type (or an `Option` of it),
+/// visited with the role its attribute names. Recursion descends only into
+/// interior nodes of the grammar: a field whose type mentions the scheme param
+/// `R` (an id-leaf projection or a bare id param excepted — those are ids, not
+/// sub-facts), or one flagged `#[traverse]`. Every other field is a non-`R` leaf
+/// where the walk stops; it's elided (`None`) so it falls under the binding's
+/// `..` and needs no walk method. A leaf-typed field with no role attribute is
+/// the forgotten-annotation bug the derive exists to catch.
+fn role_field_emit(
     field: &syn::Field,
     access: &TokenStream2,
     scheme: Option<&Ident>,
     type_params: &[Ident],
+    spec: &WalkSpec,
 ) -> Result<Option<TokenStream2>, syn::Error> {
     let ty = &field.ty;
 
-    if let Some(role) = string_ident_attr(field, "date_role")? {
-        let role_path = quote! { crate::submit::error::DateRole::#role };
+    if let Some(role) = string_ident_attr(field, spec.role_attr)? {
+        let role_enum = &spec.role_enum;
+        let role_path = quote! { #role_enum::#role };
         if let Some(inner) = option_inner(ty) {
-            if !mentions_date(inner) {
+            if !mentions_leaf(inner, spec) {
                 return Err(syn::Error::new_spanned(
                     field,
-                    "Option-wrapped date field must wrap UncertainDate directly",
+                    format!(
+                        "Option-wrapped #[{}] field must wrap {} directly",
+                        spec.role_attr, spec.leaf_ident
+                    ),
                 ));
             }
             return Ok(Some(quote! {
-                if let ::core::option::Option::Some(d) = #access {
-                    f(#role_path, d);
+                if let ::core::option::Option::Some(v) = #access {
+                    f(#role_path, v);
                 }
             }));
         }
-        if !mentions_date(ty) {
+        if !mentions_leaf(ty, spec) {
             return Err(syn::Error::new_spanned(
                 field,
-                "#[date_role] field must be UncertainDate or Option<UncertainDate>",
+                format!(
+                    "#[{}] field must be {} or Option<{}>",
+                    spec.role_attr, spec.leaf_ident, spec.leaf_ident
+                ),
             ));
         }
         return Ok(Some(quote! { f(#role_path, #access); }));
@@ -565,21 +610,25 @@ fn date_field_emit(
 
     // Recurse into an interior node: a field whose type mentions the scheme
     // param, id leaves excepted (a bare scheme id param or an `R::Assoc`
-    // projection host no dates), or one flagged `#[traverse]`. The call resolves
-    // to the field type's own inherent `visit_dates`.
+    // projection host no leaves), or one flagged `#[traverse]`. The call
+    // resolves to the field type's own inherent walk method.
     let recurse_scheme = scheme.is_some_and(|s| {
         mentions(ty, s) && leaf_kind(ty, s).is_none() && !is_bare_type_param(ty, type_params)
     });
     if has_traverse(field) || recurse_scheme {
-        return Ok(Some(quote! { #access.visit_dates(f); }));
+        let method = format_ident!("{}", spec.method);
+        return Ok(Some(quote! { #access.#method(f); }));
     }
 
-    // A date-typed field with no `#[date_role]` is the forgotten-annotation bug
+    // A leaf-typed field with no role attribute is the forgotten-annotation bug
     // the derive exists to catch.
-    if mentions_date(ty) {
+    if mentions_leaf(ty, spec) {
         return Err(syn::Error::new_spanned(
             field,
-            "UncertainDate field needs #[date_role = \"...\"]",
+            format!(
+                "{} field needs #[{} = \"...\"]",
+                spec.leaf_ident, spec.role_attr
+            ),
         ));
     }
 
@@ -587,10 +636,12 @@ fn date_field_emit(
     Ok(None)
 }
 
-/// Derive `DateWalk` from a type's field tokens: visit each `#[date_role]`
-/// `UncertainDate`, recurse into every interior node (an `R`-mentioning field
-/// or a `#[traverse]` one), and stop at every non-`R` leaf.
-pub fn derive_date_walk(item: TokenStream) -> TokenStream {
+/// Derive a structural role-tagging walk from a type's field tokens: visit each
+/// role-attribute leaf, recurse into every interior node (an `R`-mentioning
+/// field or a `#[traverse]` one), and stop at every non-`R` leaf. The shared
+/// engine behind [`derive_date_walk`] and [`derive_location_walk`]; `spec` names
+/// the leaf.
+fn derive_role_walk(item: TokenStream, spec: &WalkSpec) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     let name = &input.ident;
     let scheme = scheme_param(&input);
@@ -613,7 +664,13 @@ pub fn derive_date_walk(item: TokenStream) -> TokenStream {
                         for field in &fields.named {
                             let Some(fname) = &field.ident else { continue };
                             let access = quote! { #fname };
-                            match date_field_emit(field, &access, scheme.as_ref(), &type_params) {
+                            match role_field_emit(
+                                field,
+                                &access,
+                                scheme.as_ref(),
+                                &type_params,
+                                spec,
+                            ) {
                                 // Bind only the fields that emit; the rest fall
                                 // under `..` so an id-leaf field isn't unused.
                                 Ok(Some(e)) => {
@@ -641,7 +698,10 @@ pub fn derive_date_walk(item: TokenStream) -> TokenStream {
                     }
                     Fields::Unit => arms.push(quote! { Self::#vname => {} }),
                     Fields::Unnamed(_) => {
-                        return fail(variant, "DateWalk requires named-field variants");
+                        return fail(
+                            variant,
+                            &format!("{} requires named-field variants", spec.derive_name),
+                        );
                     }
                 }
             }
@@ -652,12 +712,12 @@ pub fn derive_date_walk(item: TokenStream) -> TokenStream {
                 let mut emits = Vec::new();
                 for field in &fields.named {
                     let Some(fname) = &field.ident else { continue };
-                    // Borrow the field so a bare-`UncertainDate` field passes `&`
-                    // to the visitor, matching the reference an enum binding
-                    // yields. Parens keep the `&` on the field, not a trailing
-                    // method call.
+                    // Borrow the field so a bare leaf field passes `&` to the
+                    // visitor, matching the reference an enum binding yields.
+                    // Parens keep the `&` on the field, not a trailing method
+                    // call.
                     let access = quote! { (&self.#fname) };
-                    match date_field_emit(field, &access, scheme.as_ref(), &type_params) {
+                    match role_field_emit(field, &access, scheme.as_ref(), &type_params, spec) {
                         Ok(Some(e)) => emits.push(e),
                         Ok(None) => {}
                         Err(e) => return e.to_compile_error().into(),
@@ -665,32 +725,74 @@ pub fn derive_date_walk(item: TokenStream) -> TokenStream {
                 }
                 quote! { #(#emits)* }
             }
-            // A unit struct reaches no dates — `grammar_type` accepts it, so
-            // `DateWalk` must too (an empty walk).
+            // A unit struct reaches no leaves — `grammar_type` accepts it, so
+            // the walk must too (an empty walk).
             Fields::Unit => quote! {},
             Fields::Unnamed(_) => {
-                return fail(&data.fields, "DateWalk requires named struct fields");
+                return fail(
+                    &data.fields,
+                    &format!("{} requires named struct fields", spec.derive_name),
+                );
             }
         },
-        Data::Union(_) => return fail(&input, "DateWalk cannot derive on a union"),
+        Data::Union(_) => {
+            return fail(
+                &input,
+                &format!("{} cannot derive on a union", spec.derive_name),
+            );
+        }
     };
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    let method = format_ident!("{}", spec.method);
+    let role_enum = &spec.role_enum;
+    let value_ty = &spec.value_ty;
+    let doc = format!(
+        " Visit every `{}` this value reaches, tagging each with its `{}`. Generated by `#[derive({})]`.",
+        spec.leaf_ident, spec.role_name, spec.derive_name
+    );
 
     quote! {
         impl #impl_generics #name #ty_generics #where_clause {
-            /// Visit every `UncertainDate` this value reaches, tagging each with
-            /// its `DateRole`. Generated by `#[derive(DateWalk)]`.
-            pub fn visit_dates(
+            #[doc = #doc]
+            pub fn #method(
                 &self,
-                f: &mut dyn ::core::ops::FnMut(
-                    crate::submit::error::DateRole,
-                    &crate::date::UncertainDate,
-                ),
+                f: &mut dyn ::core::ops::FnMut(#role_enum, &#value_ty),
             ) {
                 #body
             }
         }
     }
     .into()
+}
+
+/// Derive `DateWalk`: an inherent `visit_dates` tagging each `UncertainDate`
+/// with its [`DateRole`](crate::submit::error::DateRole).
+pub fn derive_date_walk(item: TokenStream) -> TokenStream {
+    let spec = WalkSpec {
+        derive_name: "DateWalk",
+        method: "visit_dates",
+        role_attr: "date_role",
+        leaf_ident: "UncertainDate",
+        role_name: "DateRole",
+        role_enum: quote! { crate::submit::error::DateRole },
+        value_ty: quote! { crate::date::UncertainDate },
+    };
+    derive_role_walk(item, &spec)
+}
+
+/// Derive `LocationWalk`: an inherent `visit_locations` tagging each
+/// `UnresolvedLocation` with its
+/// [`LocationRole`](crate::submit::error::LocationRole).
+pub fn derive_location_walk(item: TokenStream) -> TokenStream {
+    let spec = WalkSpec {
+        derive_name: "LocationWalk",
+        method: "visit_locations",
+        role_attr: "location_role",
+        leaf_ident: "UnresolvedLocation",
+        role_name: "LocationRole",
+        role_enum: quote! { crate::submit::error::LocationRole },
+        value_ty: quote! { crate::location::UnresolvedLocation },
+    };
+    derive_role_walk(item, &spec)
 }

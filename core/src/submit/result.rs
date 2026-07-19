@@ -262,20 +262,59 @@ impl<R: IdScheme> StoredFact<R> {
     pub fn located_subject(
         &self,
     ) -> Option<(&crate::location::UnresolvedLocation, LocatedSubject<'_, R>)> {
+        use crate::grammar::{attribute, bookend, event, image};
         let Self::Factual(StoredFactualFact { assertion, .. }) = self else {
             return None;
         };
+        // Exhaustive at the `FactualAssertion` level and within every enum cluster
+        // (bookend, event, image, attribute): a new location-bearing variant is a
+        // compile error here until mapped to its subject, keeping this in lockstep
+        // with `for_each_stored_location`'s derived walk. Attribute's variants are
+        // enumerated to `None`; existence and gap are struct clusters — no variants
+        // to host a location — so they stay `None`.
         match assertion {
-            FactualAssertion::Construction {
-                fact: crate::grammar::bookend::ConstructionFact::Location { entity, location },
-            } => Some((location, LocatedSubject::Entity(entity))),
-            FactualAssertion::Event {
-                fact: crate::grammar::event::Fact::MovedToLocation { event, location },
-            } => Some((location, LocatedSubject::Event(event))),
-            FactualAssertion::Image {
-                fact: crate::grammar::image::Fact::CapturedLocation { image, location },
-            } => Some((location, LocatedSubject::Image(image))),
-            _ => None,
+            FactualAssertion::Construction { fact } => match fact {
+                bookend::ConstructionFact::Location { entity, location } => {
+                    Some((location, LocatedSubject::Entity(entity)))
+                }
+                bookend::ConstructionFact::Started { .. }
+                | bookend::ConstructionFact::Completed { .. } => None,
+            },
+            FactualAssertion::Demolition { fact } => match fact {
+                bookend::DemolitionFact::Started { .. }
+                | bookend::DemolitionFact::Completed { .. } => None,
+            },
+            FactualAssertion::Event { fact } => match fact {
+                event::Fact::MovedToLocation { event, location } => {
+                    Some((location, LocatedSubject::Event(event)))
+                }
+                event::Fact::HasEvent { .. }
+                | event::Fact::DurationalDate { .. }
+                | event::Fact::PointDate { .. }
+                | event::Fact::DamageCause { .. }
+                | event::Fact::MoveMethod { .. }
+                | event::Fact::UsageChange { .. }
+                | event::Fact::Designation { .. }
+                | event::Fact::Description { .. } => None,
+            },
+            FactualAssertion::Image { fact } => match fact {
+                image::Fact::CapturedLocation { image, location } => {
+                    Some((location, LocatedSubject::Image(image)))
+                }
+                image::Fact::Source { .. }
+                | image::Fact::Author { .. }
+                | image::Fact::CreatedDate { .. }
+                | image::Fact::CapturedDate { .. }
+                | image::Fact::Medium { .. } => None,
+            },
+            FactualAssertion::Attribute { fact } => match fact {
+                attribute::Fact::Name { .. }
+                | attribute::Fact::ExternalReference { .. }
+                | attribute::Fact::Relationship { .. } => None,
+            },
+            // Struct clusters (no variants): a location could only enter as a field,
+            // an absurd shape for a bare existence witness or a cross-event gap.
+            FactualAssertion::Existence { .. } | FactualAssertion::Gap { .. } => None,
         }
     }
 }

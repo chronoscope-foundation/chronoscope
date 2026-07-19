@@ -42,7 +42,7 @@ use crate::grammar::citations::JudgmentSource;
 use crate::grammar::identity::{self, IdMapError, SelfLoop};
 use crate::grammar::ids::{FactId, IdScheme, SubjectKind};
 use crate::grammar::lifecycle::LifetimeEventKind;
-use crate::grammar::{attribute, bookend, composites, event, image};
+use crate::grammar::{attribute, composites, event};
 use crate::location::{ConflictStatus, UnresolvedLocation};
 use crate::store::pagination::{PAGE_SIZE, paginate};
 use crate::store::{
@@ -957,40 +957,22 @@ fn rule_location_validity<S: FactStore>(
 }
 
 /// Visit every [`UnresolvedLocation`] a stored fact carries, tagging each with
-/// its [`LocationRole`]. Only factual facts carry a location: a construction
-/// bookend, a `Moved` event's destination, an image's capture place. Until this
-/// is macro-derived, a new location-bearing grammar variant must be added here by
-/// hand.
+/// its [`LocationRole`]. Only factual facts carry a location — a construction
+/// bookend, a `Moved` event's destination, an image's capture place — so this
+/// dispatches the factual assertion through its derived `visit_locations`;
+/// judgment and meta facts reach no location. The location parallel of
+/// [`for_each_stored_date`].
+///
+/// The walk reaches every direct `UnresolvedLocation` field — the derive requires
+/// a `#[location_role]` on each, so they are compile-checked — and recurses into
+/// `R`-composites automatically; `#[traverse]` extends it to a non-`R` location
+/// host, of which there are none today.
 fn for_each_stored_location<R: IdScheme>(
     fact: &StoredFact<R>,
     visit: &mut impl FnMut(LocationRole, &UnresolvedLocation),
 ) {
-    let StoredFact::Factual(StoredFactualFact { assertion, .. }) = fact else {
-        return;
-    };
-    match assertion {
-        FactualAssertion::Construction {
-            fact: bookend::ConstructionFact::Location { location, .. },
-        } => visit(LocationRole::BookendLocation, location),
-        FactualAssertion::Event {
-            fact: event::Fact::MovedToLocation { location, .. },
-        } => visit(LocationRole::MovedToLocation, location),
-        FactualAssertion::Image { fact } => match fact {
-            image::Fact::CapturedLocation { location, .. } => {
-                visit(LocationRole::ImageCaptured, location)
-            }
-            image::Fact::Source { .. }
-            | image::Fact::Author { .. }
-            | image::Fact::CreatedDate { .. }
-            | image::Fact::CapturedDate { .. }
-            | image::Fact::Medium { .. } => {}
-        },
-        FactualAssertion::Attribute { .. }
-        | FactualAssertion::Construction { .. }
-        | FactualAssertion::Demolition { .. }
-        | FactualAssertion::Existence { .. }
-        | FactualAssertion::Event { .. }
-        | FactualAssertion::Gap { .. } => {}
+    if let StoredFact::Factual(StoredFactualFact { assertion, .. }) = fact {
+        assertion.visit_locations(visit);
     }
 }
 

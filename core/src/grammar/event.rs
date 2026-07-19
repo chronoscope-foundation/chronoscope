@@ -121,7 +121,7 @@
 
 use std::collections::BTreeSet;
 
-use chronoscope_macros::{DateWalk, IdWalk, grammar_type};
+use chronoscope_macros::{DateWalk, IdWalk, LocationWalk, grammar_type};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -176,6 +176,7 @@ pub enum Fact<R: IdScheme> {
     MovedToLocation {
         event: R::Event,
         /// The destination location of the move.
+        #[location_role = "MovedToLocation"]
         location: UnresolvedLocation,
     },
     /// What caused a [`crate::grammar::lifecycle::DurationalKind::Damaged`]
@@ -413,6 +414,7 @@ pub enum OrderableEvent<R: IdScheme> {
     JsonSchema,
     IdWalk,
     DateWalk,
+    LocationWalk,
 )]
 #[serde(bound(serialize = "R: IdScheme"))]
 #[serde(bound(deserialize = "R: IdScheme"), try_from = "RawGapBounds<R>")]
