@@ -691,7 +691,8 @@ impl JsonSchema for UncertainDate {
 
 /// For the earliest bound: the effective boundary is `period_start()`.
 /// For the latest bound: the effective boundary is `period_end()`.
-/// When boundaries are equal, precision tiebreaks for a total order.
+/// On an equal boundary day the finest `DatePrecision` wins, giving bound
+/// selection one total order shared by all four helpers below.
 impl DateBound {
     /// Ordering key for earliest-bound comparisons (lower bound of the interval).
     fn earliest_key(&self) -> (NaiveDate, DatePrecision) {
@@ -704,10 +705,22 @@ impl DateBound {
     }
 }
 
+/// Re-orient a bound key so the finest precision sorts highest, letting a
+/// `max_by_key` selection keep the finest tag on an equal boundary day — the
+/// same finest-wins tie-break the `min_by_key` selections get for free from
+/// `DatePrecision::Day` being the smallest precision.
+fn finest_high(
+    (day, precision): (NaiveDate, DatePrecision),
+) -> (NaiveDate, std::cmp::Reverse<DatePrecision>) {
+    (day, std::cmp::Reverse(precision))
+}
+
 /// Tighten (for meet): `Some` wins over `None`. Picks the more restrictive bound.
 fn tighten_earliest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBound> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(*std::cmp::max_by_key(a, b, |x| x.earliest_key())),
+        (Some(a), Some(b)) => Some(*std::cmp::max_by_key(a, b, |x| {
+            finest_high(x.earliest_key())
+        })),
         (Some(x), None) | (None, Some(x)) => Some(*x),
         (None, None) => None,
     }
@@ -731,7 +744,7 @@ fn widen_earliest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBo
 
 fn widen_latest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBound> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(*std::cmp::max_by_key(a, b, |x| x.latest_key())),
+        (Some(a), Some(b)) => Some(*std::cmp::max_by_key(a, b, |x| finest_high(x.latest_key()))),
         _ => None,
     }
 }
@@ -1541,14 +1554,16 @@ mod tests {
     /// cover the same days. Canonicalization sorts and coalesces by denoted day
     /// ([`TimeRange::cmp_by_span`] / [`TimeRange::adjacent_or_overlapping`] both
     /// key on `period_start`/`period_end`), so the `(period_start, period_end)`
-    /// day-range sequences are aligned and compare directly. `DatePrecision` is
-    /// dropped: the lattice is distributive over denoted days, not over the
-    /// precision-bearing structural form, since `meet`/`join` select bounds by
-    /// `(boundary_day, precision)` and two bounds can denote the same boundary
-    /// day at different precisions.
+    /// day-range sequences align and compare directly, dropping `DatePrecision`.
     ///
-    /// The precision-clobbering this papers over is not the desired behavior;
-    /// it will be resolved in an upcoming commit.
+    /// The single-operation laws are exact under structural `==`: the
+    /// finest-wins tie-break gives bound selection one total order, so each
+    /// operation lands on the same precision-tagged bound however its inputs
+    /// associate. Absorption and distributivity hold up to denotation instead —
+    /// a lower-bound precision is display metadata over a fixed boundary day,
+    /// and a symmetric bound tie-break tags that one day with different
+    /// precisions across different associations, so the two forms denote one
+    /// instant-set while differing structurally.
     fn date_denotes_same(a: &UncertainDate, b: &UncertainDate) -> bool {
         fn day_ranges(d: &UncertainDate) -> Vec<(Option<NaiveDate>, Option<NaiveDate>)> {
             d.intervals()
@@ -1566,8 +1581,8 @@ mod tests {
 
     #[test]
     fn date_denotes_same_discriminates() -> TestResult {
-        // Genuinely different instant-sets must compare unequal, else the laws
-        // pass vacuously.
+        // Genuinely different instant-sets must compare unequal, else the
+        // denotational laws pass vacuously.
         assert!(!date_denotes_same(&year(1000)?, &year(1001)?));
 
         // Equi-denotational, structurally different: "1927" at year precision
@@ -1584,13 +1599,40 @@ mod tests {
         Ok(())
     }
 
-    // Core laws run structurally (`==`), guarding canonical-form confluence that
-    // `CommitId` and `BTreeSet<SubmitFact>` dedup depend on. The order/lattice
-    // laws run denotationally: `meet`/`join` select bounds by `(day, precision)`,
-    // so distributivity rearranges which precision-tagged bound survives while
-    // denoting the same days — `date_denotes_same` ignores that tag.
-    crate::lattice_laws!(
-        lattice_laws,
+    // Single-operation laws are exact: the finest-wins tie-break makes bound
+    // selection one total order, so join and meet are structurally
+    // associative/commutative/idempotent with their unit — guarding the
+    // canonical-form confluence that `CommitId` and `BTreeSet<SubmitFact>` dedup
+    // depend on.
+    crate::join_semilattice_laws!(
+        join_laws,
+        UncertainDate,
+        arb_uncertain_date(),
+        |a: &UncertainDate, b: &UncertainDate| a == b
+    );
+    crate::meet_semilattice_laws!(
+        meet_laws,
+        UncertainDate,
+        arb_uncertain_date(),
+        |a: &UncertainDate, b: &UncertainDate| a == b
+    );
+
+    // The bounded-lattice laws that need both bounds and stay exact: ⊥/⊤
+    // annihilation and the meet-below-join ordering never rebalance a precision
+    // tag, so they hold under structural `==`.
+    crate::bounded_lattice_laws!(
+        bounded_lattice_laws,
+        UncertainDate,
+        arb_uncertain_date(),
+        |a: &UncertainDate, b: &UncertainDate| a == b
+    );
+
+    // Splitting the carrier into a denotation (a clean distributive lattice)
+    // plus display-precision metadata would make distributivity structural;
+    // fused on one value as they are here, the cross-operation laws hold only up
+    // to denotation.
+    crate::distributive_lattice_laws!(
+        distributive_lattice_laws,
         UncertainDate,
         arb_uncertain_date(),
         date_denotes_same
