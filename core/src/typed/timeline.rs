@@ -27,12 +27,11 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::date::UncertainDate;
-use crate::moment::{TransitionRole, decompose, topological_order};
-
-use super::{
-    Bounded, EventDetail, InteriorEvent, Period, TimelineEvent, dated_bound, has_date,
-    interior_event_bounds,
+use crate::moment::{
+    EventTemporalShape, TransitionRole, decompose, event_temporal_shape, topological_order,
 };
+
+use super::{Bounded, EventDetail, TimelineEvent, dated_bound, has_date};
 
 /// One position in a timeline's ordered moment sequence: which event it projects
 /// (`event_index` into [`Timeline::events`]), the transition role, whether a
@@ -111,38 +110,30 @@ impl<EvtId, ImgId> Timeline<EvtId, ImgId> {
     }
 }
 
-/// The date a moment displays, looked up from its event's `Period` by role: a
-/// durational start role reads `started`, an end role reads `completed`, a point
-/// event reads its instant, and an ambiguous event takes the first dated of its
-/// [`interior_event_bounds`]. Mirrors how [`decompose`] dated each endpoint.
-fn resolve_moment_date<'a, EvtId, ImgId>(
+/// The date a moment displays, recovered from its event's
+/// [`EventTemporalShape`] by role: a durational start role reads `started`, an
+/// end role reads `completed`, a point event reads its instant, and an ambiguous
+/// event takes the first dated of its `[started, completed, occurred]`. Mirrors
+/// how [`decompose`] dated each endpoint.
+fn resolve_moment_date<EvtId, ImgId>(
     role: TransitionRole,
-    detail: &'a EventDetail<EvtId, ImgId>,
-) -> Option<&'a Bounded<UncertainDate, ImgId>> {
-    let endpoint = |period: &'a Period<ImgId>| {
-        if role.durational_end().is_some() {
-            dated_bound(&period.started)
-        } else {
-            dated_bound(&period.completed)
-        }
-    };
-    match detail {
-        EventDetail::Constructed { period, .. } | EventDetail::Demolished { period } => {
-            endpoint(period)
-        }
-        EventDetail::Existed { at } => dated_bound(at),
-        EventDetail::Interior { kind, .. } => match kind {
-            InteriorEvent::Modified { period }
-            | InteriorEvent::Repaired { period }
-            | InteriorEvent::Damaged { period, .. }
-            | InteriorEvent::Moved { period, .. } => endpoint(period),
-            InteriorEvent::UsageChanged { at, .. } | InteriorEvent::Designated { at, .. } => {
-                dated_bound(at)
+    detail: &EventDetail<EvtId, ImgId>,
+) -> Option<&Bounded<UncertainDate, ImgId>> {
+    match event_temporal_shape(detail) {
+        EventTemporalShape::Durational {
+            start_role,
+            started,
+            completed,
+            ..
+        } => {
+            if role == start_role {
+                dated_bound(started)
+            } else {
+                dated_bound(completed)
             }
-            InteriorEvent::Ambiguous { .. } => interior_event_bounds(kind)
-                .into_iter()
-                .find(|b| has_date(b)),
-        },
+        }
+        EventTemporalShape::Point { at, .. } => dated_bound(at),
+        EventTemporalShape::Ambiguous { bounds } => bounds.into_iter().find(|b| has_date(b)),
     }
 }
 
@@ -257,7 +248,7 @@ mod tests {
     use super::*;
     use crate::algebra::lattice::JoinSemilattice;
     use crate::date::DatePrecision;
-    use crate::typed::Consensus;
+    use crate::typed::{Consensus, InteriorEvent, Period};
     use chrono::{Datelike, NaiveDate};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;

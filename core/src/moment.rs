@@ -18,10 +18,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::date::UncertainDate;
-use crate::typed::{
-    Bounded, EventDetail, InteriorEvent, TimelineEvent, dated_bound, has_date,
-    interior_event_bounds,
-};
+use crate::typed::{Bounded, EventDetail, InteriorEvent, TimelineEvent, dated_bound, has_date};
 
 /// The role of a `Moment` within an entity's lifecycle.
 ///
@@ -89,6 +86,106 @@ impl TransitionRole {
             Self::DemolitionStart => Some(Self::DemolitionEnd),
             _ => None,
         }
+    }
+}
+
+/// How one lifecycle event anchors in time, over its raw (possibly undated)
+/// bounds. The single mapping from event variant to temporal anchor: every
+/// consumer — [`decompose`], `resolve_moment_date`, `entry_date_bounds` — reads
+/// it, so a new event variant is classified in exactly one place.
+///
+/// Bounds are exposed raw, not pre-filtered to dated ones: the span folds need
+/// every bound including undated ones, while the single-date consumers apply
+/// their own first-dated pick.
+pub(crate) enum EventTemporalShape<'a, ImgId> {
+    /// A span with two independently-bounded endpoints and their transition
+    /// roles.
+    Durational {
+        start_role: TransitionRole,
+        end_role: TransitionRole,
+        started: &'a Bounded<UncertainDate, ImgId>,
+        completed: &'a Bounded<UncertainDate, ImgId>,
+    },
+    /// A single instant under one role.
+    Point {
+        role: TransitionRole,
+        at: &'a Bounded<UncertainDate, ImgId>,
+    },
+    /// An unsettled interior event, whose date is the first dated of
+    /// `[started, completed, occurred]` in that order.
+    Ambiguous {
+        bounds: [&'a Bounded<UncertainDate, ImgId>; 3],
+    },
+}
+
+/// The temporal shape of one lifecycle event. The `Interior` arm delegates to
+/// [`interior_event_temporal_shape`].
+pub(crate) fn event_temporal_shape<EvtId, ImgId>(
+    detail: &EventDetail<EvtId, ImgId>,
+) -> EventTemporalShape<'_, ImgId> {
+    match detail {
+        EventDetail::Constructed { period, .. } => EventTemporalShape::Durational {
+            start_role: TransitionRole::ConstructionStart,
+            end_role: TransitionRole::ConstructionEnd,
+            started: &period.started,
+            completed: &period.completed,
+        },
+        EventDetail::Demolished { period } => EventTemporalShape::Durational {
+            start_role: TransitionRole::DemolitionStart,
+            end_role: TransitionRole::DemolitionEnd,
+            started: &period.started,
+            completed: &period.completed,
+        },
+        EventDetail::Existed { at } => EventTemporalShape::Point {
+            role: TransitionRole::KnownToExist,
+            at,
+        },
+        EventDetail::Interior { kind, .. } => interior_event_temporal_shape(kind),
+    }
+}
+
+/// The temporal shape of one interior event — the `InteriorEvent`-level
+/// classification that [`event_temporal_shape`] delegates its `Interior` arm
+/// to.
+pub(crate) fn interior_event_temporal_shape<ImgId>(
+    kind: &InteriorEvent<ImgId>,
+) -> EventTemporalShape<'_, ImgId> {
+    match kind {
+        InteriorEvent::Modified { period } => EventTemporalShape::Durational {
+            start_role: TransitionRole::ModificationStart,
+            end_role: TransitionRole::ModificationEnd,
+            started: &period.started,
+            completed: &period.completed,
+        },
+        InteriorEvent::Repaired { period } => EventTemporalShape::Durational {
+            start_role: TransitionRole::RepairStart,
+            end_role: TransitionRole::RepairEnd,
+            started: &period.started,
+            completed: &period.completed,
+        },
+        InteriorEvent::Damaged { period, .. } => EventTemporalShape::Durational {
+            start_role: TransitionRole::DamagedStart,
+            end_role: TransitionRole::DamagedEnd,
+            started: &period.started,
+            completed: &period.completed,
+        },
+        InteriorEvent::Moved { period, .. } => EventTemporalShape::Durational {
+            start_role: TransitionRole::MovedStart,
+            end_role: TransitionRole::MovedEnd,
+            started: &period.started,
+            completed: &period.completed,
+        },
+        InteriorEvent::UsageChanged { at, .. } => EventTemporalShape::Point {
+            role: TransitionRole::UsageModified,
+            at,
+        },
+        InteriorEvent::Designated { at, .. } => EventTemporalShape::Point {
+            role: TransitionRole::Designated,
+            at,
+        },
+        InteriorEvent::Ambiguous { facts, .. } => EventTemporalShape::Ambiguous {
+            bounds: [&facts.started, &facts.completed, &facts.occurred],
+        },
     }
 }
 
@@ -194,74 +291,20 @@ pub(crate) fn decompose<EvtId, ImgId>(
 ) -> Vec<Moment<'_, ImgId>> {
     let mut out: Vec<Moment<'_, ImgId>> = Vec::with_capacity(timeline.len() * 2);
     for (i, event) in timeline.iter().enumerate() {
-        match &event.detail {
-            EventDetail::Constructed { period, .. } => push_durational(
-                &mut out,
-                i,
-                TransitionRole::ConstructionStart,
-                TransitionRole::ConstructionEnd,
-                &period.started,
-                &period.completed,
-            ),
-            EventDetail::Demolished { period } => push_durational(
-                &mut out,
-                i,
-                TransitionRole::DemolitionStart,
-                TransitionRole::DemolitionEnd,
-                &period.started,
-                &period.completed,
-            ),
-            EventDetail::Existed { at } => {
-                push_point(&mut out, i, TransitionRole::KnownToExist, dated_bound(at));
+        match event_temporal_shape(&event.detail) {
+            EventTemporalShape::Durational {
+                start_role,
+                end_role,
+                started,
+                completed,
+            } => push_durational(&mut out, i, start_role, end_role, started, completed),
+            EventTemporalShape::Point { role, at } => {
+                push_point(&mut out, i, role, dated_bound(at));
             }
-            EventDetail::Interior { kind, .. } => match kind {
-                InteriorEvent::Modified { period } => push_durational(
-                    &mut out,
-                    i,
-                    TransitionRole::ModificationStart,
-                    TransitionRole::ModificationEnd,
-                    &period.started,
-                    &period.completed,
-                ),
-                InteriorEvent::Repaired { period } => push_durational(
-                    &mut out,
-                    i,
-                    TransitionRole::RepairStart,
-                    TransitionRole::RepairEnd,
-                    &period.started,
-                    &period.completed,
-                ),
-                InteriorEvent::Damaged { period, .. } => push_durational(
-                    &mut out,
-                    i,
-                    TransitionRole::DamagedStart,
-                    TransitionRole::DamagedEnd,
-                    &period.started,
-                    &period.completed,
-                ),
-                InteriorEvent::Moved { period, .. } => push_durational(
-                    &mut out,
-                    i,
-                    TransitionRole::MovedStart,
-                    TransitionRole::MovedEnd,
-                    &period.started,
-                    &period.completed,
-                ),
-                InteriorEvent::UsageChanged { at, .. } => {
-                    push_point(&mut out, i, TransitionRole::UsageModified, dated_bound(at));
-                }
-                InteriorEvent::Designated { at, .. } => {
-                    push_point(&mut out, i, TransitionRole::Designated, dated_bound(at));
-                }
-                InteriorEvent::Ambiguous { .. } => {
-                    // Reuse the interior event's date-priority bounds rather than
-                    // re-listing started/completed/occurred here.
-                    let date = interior_event_bounds(kind)
-                        .into_iter()
-                        .find(|b| has_date(b));
-                    push_point(&mut out, i, TransitionRole::Ambiguous, date);
-                }
-            },
+            EventTemporalShape::Ambiguous { bounds } => {
+                let date = bounds.into_iter().find(|b| has_date(b));
+                push_point(&mut out, i, TransitionRole::Ambiguous, date);
+            }
         }
     }
     out

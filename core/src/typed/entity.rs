@@ -11,6 +11,7 @@ use crate::grammar::lifecycle::{
     DamageCause, DurationalKind, LifetimeEventKind, MoveMethod, PointKind, Usage,
 };
 use crate::location::UnresolvedLocation;
+use crate::moment::{EventTemporalShape, event_temporal_shape};
 use crate::projection::Claimed;
 use crate::store::schema::EquivClass;
 
@@ -481,36 +482,19 @@ where
         .collect()
 }
 
-/// The date bounds one interior event carries, in representative-first order: a
-/// period's start then completion, a point event's instant, an ambiguous event's
-/// start/completion/occurrence. [`timeline_span`](crate::listing) folds
-/// them all for the entity's date span.
-pub(crate) fn interior_event_bounds<ImgId>(
-    kind: &InteriorEvent<ImgId>,
-) -> Vec<&Bounded<UncertainDate, ImgId>> {
-    match kind {
-        InteriorEvent::Modified { period }
-        | InteriorEvent::Repaired { period }
-        | InteriorEvent::Damaged { period, .. }
-        | InteriorEvent::Moved { period, .. } => vec![&period.started, &period.completed],
-        InteriorEvent::UsageChanged { at, .. } | InteriorEvent::Designated { at, .. } => vec![at],
-        InteriorEvent::Ambiguous { facts, .. } => {
-            vec![&facts.started, &facts.completed, &facts.occurred]
-        }
-    }
-}
-
-/// The date bounds one timeline entry carries: a bookend or durational span's
-/// endpoints, or an interior event's bounds (see [`interior_event_bounds`]).
+/// The date bounds one timeline entry carries, read off its
+/// [`EventTemporalShape`]: a durational span's endpoints, a point event's
+/// instant, or an ambiguous event's `[started, completed, occurred]`.
+/// [`timeline_span`](crate::listing) folds them all for the entity's date span.
 pub(crate) fn entry_date_bounds<EvtId, ImgId>(
     detail: &EventDetail<EvtId, ImgId>,
 ) -> Vec<&Bounded<UncertainDate, ImgId>> {
-    match detail {
-        EventDetail::Constructed { period, .. } | EventDetail::Demolished { period } => {
-            vec![&period.started, &period.completed]
-        }
-        EventDetail::Existed { at } => vec![at],
-        EventDetail::Interior { kind, .. } => interior_event_bounds(kind),
+    match event_temporal_shape(detail) {
+        EventTemporalShape::Durational {
+            started, completed, ..
+        } => vec![started, completed],
+        EventTemporalShape::Point { at, .. } => vec![at],
+        EventTemporalShape::Ambiguous { bounds } => bounds.to_vec(),
     }
 }
 
