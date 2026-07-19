@@ -277,6 +277,28 @@ pub enum SubmitError<EntId, EvtId, ImgId> {
         /// The event with conflicting `HasEvent` claims.
         event: EvtId,
     },
+    /// An interior event's `{entity, kind}` is pinned at its first-ever
+    /// `HasEvent` and stays fixed for the life of that event id, across
+    /// retraction. A `HasEvent` naming a different subject entity or kind than
+    /// the pin — re-homing the event to another entity, re-typing its kind, or
+    /// re-adopting a retracted event id under a new owner — is rejected; an
+    /// identical re-assertion is accepted. Genuine disagreement belongs on a
+    /// separate event id, not by mutating an existing one.
+    #[error(
+        "event {event}: HasEvent ownership is immutable — pinned to entity {pinned_entity} ({pinned_kind}) at its first-ever HasEvent, but this commit names entity {attempted_entity} ({attempted_kind})"
+    )]
+    EventOwnershipImmutable {
+        /// The event whose ownership pin this commit tried to change.
+        event: EvtId,
+        /// The subject entity pinned at the event's earliest-ever `HasEvent`.
+        pinned_entity: EntId,
+        /// The kind pinned at the event's earliest-ever `HasEvent`.
+        pinned_kind: LifetimeEventKind,
+        /// The differing subject entity the event's active `HasEvent` carries.
+        attempted_entity: EntId,
+        /// The differing kind the event's active `HasEvent` carries.
+        attempted_kind: LifetimeEventKind,
+    },
     /// A payload or date fact on an event doesn't suit the kind the same
     /// commit's `HasEvent` declares — a damage cause on a non-`Damaged` event, a
     /// `DurationalDate` on a point event. The availability matrix

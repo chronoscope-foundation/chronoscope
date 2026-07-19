@@ -29,7 +29,7 @@
 //! services those reads from memory, where a SQL backend awaits the equivalent
 //! reads against its transaction.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use futures_util::TryStreamExt;
 
@@ -175,10 +175,37 @@ pub async fn validate_submit<S: FactStore, V: FactView<S> + EventView<S> + Image
             }
         }
     }
-    let (event_facts, image_facts) = gather_subject_neighborhood::<S, V>(candidates, view).await?;
-    run_cluster_rules::<S>(candidates, &event_facts, &image_facts, &mut errors);
+    let (event_facts, event_has_events, image_facts) =
+        gather_subject_neighborhood::<S, V>(candidates, view).await?;
+    run_cluster_rules::<S>(
+        candidates,
+        &event_facts,
+        &event_has_events,
+        &image_facts,
+        &mut errors,
+    );
     Ok(errors)
 }
+
+/// A retraction-inclusive `HasEvent`-history entry: a stored `HasEvent` fact
+/// paired with its persistent id. The ownership rule pins an event's
+/// `{entity, kind}` at the earliest-ever claim by fact id, so it needs the id
+/// alongside the fact even for a retracted original.
+struct HasEventHistoryEntry<S: FactStore> {
+    pub fact_id: FactId,
+    pub fact: StoredFactOf<S>,
+}
+
+/// The precomputed cluster-rule neighbourhood: per touched event its cumulative
+/// active facts, per event this commit types a retraction-inclusive `HasEvent`
+/// history (for the ownership pin), and per touched image its cumulative active
+/// facts. Aliased so the gather signature stays under clippy's `type_complexity`
+/// bar.
+type SubjectNeighborhood<S> = (
+    BTreeMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
+    BTreeMap<EventIdOf<S>, Vec<HasEventHistoryEntry<S>>>,
+    BTreeMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
+);
 
 /// Drain each event and image this commit's `candidates` touch exactly once,
 /// producing the subject-keyed neighbourhood the cluster rules read.
@@ -187,19 +214,12 @@ pub async fn validate_submit<S: FactStore, V: FactView<S> + EventView<S> + Image
 /// closure is a no-op — no cluster rule keys off the entity neighbourhood, and
 /// the judgment citation's observed image already reaches `fi`). Every touched
 /// event / image is drained once through the union view, so a subject several
-/// candidates mention is read a single time. The maps are looked up by id,
-/// never iterated for output, so the `HashMap` choice doesn't affect rule
-/// determinism.
+/// candidates mention is read a single time. The maps are keyed and looked up
+/// by id; `BTreeMap` keeps their iteration order deterministic.
 async fn gather_subject_neighborhood<S, V>(
     candidates: &[StoredFactOf<S>],
     view: &mut V,
-) -> Result<
-    (
-        HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
-        HashMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
-    ),
-    S::Error,
->
+) -> Result<SubjectNeighborhood<S>, S::Error>
 where
     S: FactStore,
     V: EventView<S> + ImageView<S>,
@@ -217,7 +237,7 @@ where
             },
         );
     }
-    let mut event_facts: HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>> = HashMap::new();
+    let mut event_facts: BTreeMap<EventIdOf<S>, Vec<StoredFactOf<S>>> = BTreeMap::new();
     for e in events {
         let event = &e;
         let facts = paginate(&mut *view, |v, cursor| async move {
@@ -230,7 +250,29 @@ where
         .await?;
         event_facts.insert(e, facts);
     }
-    let mut image_facts: HashMap<ImageIdOf<S>, Vec<StoredFactOf<S>>> = HashMap::new();
+    // Per event this commit types a `HasEvent` on: its retraction-inclusive
+    // `HasEvent` history (fact id + fact), so the ownership rule can pin the
+    // earliest-ever claim even across a retract-and-re-add re-home.
+    let mut event_has_events: BTreeMap<EventIdOf<S>, Vec<HasEventHistoryEntry<S>>> =
+        BTreeMap::new();
+    for e in commit_has_event_subjects::<S>(candidates) {
+        let event = &e;
+        let facts = paginate(&mut *view, |v, cursor| async move {
+            let page = v
+                .all_has_events_about_event(event, cursor, PAGE_SIZE)
+                .await?;
+            let (rows, next) = page.into_parts();
+            Ok::<_, S::Error>((rows, next, v))
+        })
+        .map_ok(|item| HasEventHistoryEntry {
+            fact_id: item.fact_id,
+            fact: item.fact,
+        })
+        .try_collect()
+        .await?;
+        event_has_events.insert(e, facts);
+    }
+    let mut image_facts: BTreeMap<ImageIdOf<S>, Vec<StoredFactOf<S>>> = BTreeMap::new();
     for i in images {
         let image = &i;
         let facts = paginate(&mut *view, |v, cursor| async move {
@@ -243,7 +285,7 @@ where
         .await?;
         image_facts.insert(i, facts);
     }
-    Ok((event_facts, image_facts))
+    Ok((event_facts, event_has_events, image_facts))
 }
 
 /// Resolve a retract/supersede fact-target by its [`FactPlacement`].
@@ -518,14 +560,16 @@ fn substitute_meta(meta: &MetaAssertion) -> MetaAssertion {
 /// phase already did every drain.
 fn run_cluster_rules<S>(
     candidates: &[StoredFactOf<S>],
-    event_facts: &HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
-    image_facts: &HashMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
+    event_facts: &BTreeMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
+    event_has_events: &BTreeMap<EventIdOf<S>, Vec<HasEventHistoryEntry<S>>>,
+    image_facts: &BTreeMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
     errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
 ) where
     S: FactStore,
 {
     rule_event_has_one_kind::<S>(candidates, event_facts, errors);
     rule_event_fact_kind_consistency::<S>(candidates, event_facts, errors);
+    rule_event_ownership_immutable::<S>(candidates, event_facts, event_has_events, errors);
     rule_same_event_unresolvable::<S>(candidates, errors);
     rule_name_window::<S>(candidates, errors);
     rule_single_interval_date::<S>(candidates, errors);
@@ -577,7 +621,7 @@ where
 /// event ids, not on one id.
 fn rule_event_has_one_kind<S>(
     candidates: &[StoredFactOf<S>],
-    event_facts: &HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
+    event_facts: &BTreeMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
     errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
 ) where
     S: FactStore,
@@ -589,6 +633,89 @@ fn rule_event_has_one_kind<S>(
             1 => {}
             _ => errors.push(SubmitError::EventMultipleHasEvent { event: e }),
         }
+    }
+}
+
+/// An event's `{entity, kind}` is pinned at its first-ever `HasEvent` and stays
+/// fixed for the life of the event id, across retraction. For each event this
+/// commit types a `HasEvent` on, the pin is the `{entity, kind}` of the
+/// earliest-ever `HasEvent` — retraction-inclusive, by fact id, so a retracted
+/// original still pins. A single surviving active claim that differs from the
+/// pin — a re-home to another entity, a re-type, or the re-adoption of a
+/// retracted event id under a new owner — is rejected as
+/// [`SubmitError::EventOwnershipImmutable`]; an identical re-assertion matches
+/// the pin and passes.
+///
+/// The rule fires only when the event carries exactly one distinct active
+/// `HasEvent` claim: zero (missing) and two-or-more (conflicting) are
+/// [`rule_event_has_one_kind`]'s to report, and an event whose only `HasEvent`
+/// is minted in this commit sets its own pin, so its lone active claim equals
+/// it. The retraction-inclusive `HasEvent` history is what the active-only
+/// neighbourhood can't supply — the retracted original a re-home tries to erase.
+fn rule_event_ownership_immutable<S>(
+    candidates: &[StoredFactOf<S>],
+    event_facts: &BTreeMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
+    event_has_events: &BTreeMap<EventIdOf<S>, Vec<HasEventHistoryEntry<S>>>,
+    errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
+) where
+    S: FactStore,
+{
+    for e in commit_has_event_subjects::<S>(candidates) {
+        // Compare only against a single surviving active claim: 0 / >=2 are
+        // rule_event_has_one_kind's, and a fresh in-commit-only pin equals its
+        // own lone active claim.
+        let active = event_facts.get(&e).map(Vec::as_slice).unwrap_or(&[]);
+        let mut claims = has_event_claims::<S>(&e, active).into_iter();
+        let (Some((active_entity, active_kind)), None) = (claims.next(), claims.next()) else {
+            continue;
+        };
+        // Pin = the earliest-ever HasEvent's {entity, kind}, retraction-inclusive.
+        let ever = event_has_events.get(&e).map(Vec::as_slice).unwrap_or(&[]);
+        let Some((pin_entity, pin_kind)) = ever
+            .iter()
+            .filter_map(|entry| has_event_pin::<S>(&entry.fact).map(|pin| (entry.fact_id, pin)))
+            .min_by_key(|(fid, _)| *fid)
+            .map(|(_, pin)| pin)
+        else {
+            continue;
+        };
+        if active_entity != pin_entity || active_kind != pin_kind {
+            errors.push(SubmitError::EventOwnershipImmutable {
+                event: e,
+                pinned_entity: pin_entity,
+                pinned_kind: pin_kind,
+                attempted_entity: active_entity,
+                attempted_kind: active_kind,
+            });
+        }
+    }
+}
+
+/// The distinct event ids this commit types a `HasEvent` on — the subjects the
+/// ownership rule keys off, and the events its retraction-inclusive history is
+/// gathered for. `BTreeSet` for a deterministic pass order.
+fn commit_has_event_subjects<S>(candidates: &[StoredFactOf<S>]) -> BTreeSet<EventIdOf<S>>
+where
+    S: FactStore,
+{
+    let mut events = BTreeSet::new();
+    for fact in candidates {
+        if let Some(event::Fact::HasEvent { event, .. }) = fact.event_fact() {
+            events.insert(event.clone());
+        }
+    }
+    events
+}
+
+/// The `{entity, kind}` a `HasEvent` fact pins, or `None` for any other fact.
+fn has_event_pin<S>(fact: &StoredFactOf<S>) -> Option<(EntityIdOf<S>, LifetimeEventKind)>
+where
+    S: FactStore,
+{
+    if let Some(event::Fact::HasEvent { entity, kind, .. }) = fact.event_fact() {
+        Some((entity.clone(), *kind))
+    } else {
+        None
     }
 }
 
@@ -607,7 +734,7 @@ fn rule_event_has_one_kind<S>(
 /// kind disagreement lives on separate event ids, each internally consistent.
 fn rule_event_fact_kind_consistency<S>(
     candidates: &[StoredFactOf<S>],
-    event_facts: &HashMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
+    event_facts: &BTreeMap<EventIdOf<S>, Vec<StoredFactOf<S>>>,
     errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
 ) where
     S: FactStore,
@@ -953,7 +1080,7 @@ fn for_each_stored_location<R: IdScheme>(
 /// dedup by `(entity, image)`.
 fn rule_observation_depiction<S>(
     candidates: &[StoredFactOf<S>],
-    image_facts: &HashMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
+    image_facts: &BTreeMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
     errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
 ) where
     S: FactStore,
@@ -1034,7 +1161,7 @@ fn rule_composite_self_parent<S: FactStore>(
 /// subimage under different parents (in-commit ∪ pre-commit) conflict.
 fn rule_composite_multiple_parents<S>(
     candidates: &[StoredFactOf<S>],
-    image_facts: &HashMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
+    image_facts: &BTreeMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
     errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
 ) where
     S: FactStore,
@@ -1075,7 +1202,7 @@ fn rule_composite_multiple_parents<S>(
 /// and filtered from the gathered edges. Pushes dedup by image id.
 fn rule_composite_chain<S>(
     candidates: &[StoredFactOf<S>],
-    image_facts: &HashMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
+    image_facts: &BTreeMap<ImageIdOf<S>, Vec<StoredFactOf<S>>>,
     errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
 ) where
     S: FactStore,

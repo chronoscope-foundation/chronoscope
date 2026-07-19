@@ -62,6 +62,7 @@ use async_lock::{Mutex, MutexGuard};
 use schemars::JsonSchema;
 
 use crate::grammar::assertions::MetaAssertion;
+use crate::grammar::event;
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
 use crate::store::retraction::RetractionEdges;
 use crate::store::schema::{
@@ -280,6 +281,36 @@ enum Partition {
     Beyond,
 }
 
+/// How a backlink walk filters candidates: whether to keep retracted facts, and
+/// a content predicate. The active `all_facts_about_*` walks drop retracted
+/// facts and keep every kind ([`BacklinkFilter::active`]); the ownership walk
+/// keeps retracted facts and only `HasEvent`
+/// ([`BacklinkFilter::retraction_inclusive_has_events`]). Bundled so
+/// [`ReadCore::facts_about`] carries both concerns in one argument.
+struct BacklinkFilter<F> {
+    retraction_inclusive: bool,
+    keep: F,
+}
+
+impl BacklinkFilter<fn(&MemStoredFact) -> bool> {
+    /// Active facts of every kind — the general backlink walk.
+    fn active() -> Self {
+        Self {
+            retraction_inclusive: false,
+            keep: |_| true,
+        }
+    }
+
+    /// `HasEvent` facts, active or retracted — the ownership walk, which needs
+    /// the retracted original a re-home tries to erase.
+    fn retraction_inclusive_has_events() -> Self {
+        Self {
+            retraction_inclusive: true,
+            keep: |fact| matches!(fact.event_fact(), Some(event::Fact::HasEvent { .. })),
+        }
+    }
+}
+
 impl<'a> ReadCore<'a> {
     /// Look up a fact across the committed + pending halves.
     ///
@@ -435,8 +466,8 @@ impl<'a> ReadCore<'a> {
     /// `next_cursor` is `Some(last-emitted id)` when the page fills before the
     /// range runs out, so the next walk resumes strictly past it; `None` once
     /// the backlink range is exhausted or the snapshot bound ends the scan. A
-    /// retracted fact is skipped without consuming a slot, so a page can come
-    /// back short or empty yet still carry a resume cursor.
+    /// skipped fact (retracted, or rejected by `filter.keep`) consumes no slot,
+    /// so a page can come back short or empty yet still carry a resume cursor.
     fn facts_about<S>(
         &self,
         backlinks: &HashMap<S, BTreeSet<FactId>>,
@@ -444,6 +475,7 @@ impl<'a> ReadCore<'a> {
         subject: &S,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
+        filter: BacklinkFilter<impl Fn(&MemStoredFact) -> bool>,
     ) -> FactPage<MemStoredFact, S, FactId>
     where
         S: Copy + Ord + std::hash::Hash,
@@ -468,12 +500,15 @@ impl<'a> ReadCore<'a> {
                 next_cursor = last_emitted;
                 break;
             }
-            if self.retracted_by(fid).is_some() {
+            if !filter.retraction_inclusive && self.retracted_by(fid).is_some() {
                 continue;
             }
             let Some(fact) = self.fact_slot(fid) else {
                 continue;
             };
+            if !(filter.keep)(fact) {
+                continue;
+            }
             items.push(PageItem {
                 fact_id: fid,
                 fact: fact.clone(),
@@ -995,6 +1030,7 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
                     entity,
                     after,
                     limit,
+                    BacklinkFilter::active(),
                 )
             })
             .await)
@@ -1050,6 +1086,27 @@ impl<Src: CoreSource + Send + Sync> EventView<MemoryFactStore> for Src {
                     event,
                     after,
                     limit,
+                    BacklinkFilter::active(),
+                )
+            })
+            .await)
+    }
+
+    async fn all_has_events_about_event(
+        &mut self,
+        event: &MemoryEventId,
+        after: Option<FactId>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<FactPage<StoredFactOf<MemoryFactStore>, MemoryEventId, FactId>, MemoryError> {
+        Ok(self
+            .with_core(|c| {
+                c.facts_about(
+                    c.event_backlinks,
+                    c.pending_event_backlinks,
+                    event,
+                    after,
+                    limit,
+                    BacklinkFilter::retraction_inclusive_has_events(),
                 )
             })
             .await)
@@ -1138,6 +1195,7 @@ impl<Src: CoreSource + Send + Sync> ImageView<MemoryFactStore> for Src {
                     image,
                     after,
                     limit,
+                    BacklinkFilter::active(),
                 )
             })
             .await)

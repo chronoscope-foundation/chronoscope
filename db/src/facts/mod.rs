@@ -482,6 +482,15 @@ impl<C: AsConn> EventView<SqliteFactStore> for SqliteHandle<C> {
     ) -> Result<WalkPage<SqliteFactStore, SqliteEventId>, Error> {
         read::backlink_page(self.conn.conn(), self.bound, *event, after, limit).await
     }
+
+    async fn all_has_events_about_event(
+        &mut self,
+        event: &SqliteEventId,
+        after: Option<FactId>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WalkPage<SqliteFactStore, SqliteEventId>, Error> {
+        read::has_event_backlink_page(self.conn.conn(), self.bound, *event, after, limit).await
+    }
 }
 
 impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {

@@ -23,6 +23,7 @@ use sqlx::SqliteConnection;
 use chronoscope_core::algebra::lattice::JoinSemilattice;
 use chronoscope_core::date::UncertainDate;
 use chronoscope_core::geo::Viewport;
+use chronoscope_core::grammar::event;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::solvers::WitnessScan;
 use chronoscope_core::store::FactPlacement;
@@ -384,6 +385,60 @@ pub(super) async fn backlink_page<S: SubjectColumn>(
             fact: fact_from_json(fact_json)?,
             representative: subject,
         });
+    }
+    let next_cursor = if more { seeds.last().copied() } else { None };
+    Ok(FactPage { items, next_cursor })
+}
+
+/// One page of `event`'s `HasEvent` facts, active *or retracted*, resuming
+/// strictly past `after`. The retraction-inclusive twin of [`backlink_page`]
+/// for the ownership rule: it drops the retraction filter and keeps only
+/// `HasEvent` facts, decoding each candidate's fact to test its variant. A
+/// non-`HasEvent` candidate is dropped without consuming a slot, so a page can
+/// come short yet still carry a resume cursor (the last candidate consumed,
+/// whatever its variant).
+pub(super) async fn has_event_backlink_page(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    event: SqliteEventId,
+    after: Option<FactId>,
+    limit: std::num::NonZeroUsize,
+) -> Result<FactPage<StoredFact<SqliteIds>, SqliteEventId, FactId>, SqliteFactStoreError> {
+    // -1 sits below every stored id, so it opens the strictly-past scan.
+    let cursor_bind = match after {
+        None => -1,
+        Some(cursor) => u64_to_i64(cursor.get(), "has-event backlink resume cursor")?,
+    };
+    // Fetch one past the page to learn whether candidates remain.
+    let fetch = i64::try_from(limit.get())
+        .unwrap_or(i64::MAX)
+        .saturating_add(1);
+    let mut rows: Vec<(i64, String)> = sqlx::query_as(queries::BACKLINK_PAGE.sql)
+        .bind(kind_tag(SqliteEventId::KIND))
+        .bind(event.raw())
+        .bind(cursor_bind)
+        .bind(bound.bind())
+        .bind(fetch)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("fetching has-event backlink page"))?;
+    let more = rows.len() > limit.get();
+    rows.truncate(limit.get());
+
+    let seeds = seed_ids(
+        rows.iter().map(|(fid, _)| fid),
+        "has-event backlink fact id",
+    )?;
+    let mut items = Vec::with_capacity(rows.len());
+    for ((_, fact_json), fid) in rows.iter().zip(&seeds) {
+        let fact = fact_from_json(fact_json)?;
+        if matches!(fact.event_fact(), Some(event::Fact::HasEvent { .. })) {
+            items.push(PageItem {
+                fact_id: *fid,
+                fact,
+                representative: event,
+            });
+        }
     }
     let next_cursor = if more { seeds.last().copied() } else { None };
     Ok(FactPage { items, next_cursor })

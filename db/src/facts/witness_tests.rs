@@ -11,10 +11,11 @@
 //!
 //! as sets. The proptest drives random submit sequences — existence witnesses,
 //! bookends, point / durational events, identity merges, retractions — and
-//! checks the law at every fact-id snapshot for every entity. The two findings
-//! the read design turns on ride as explicit regression fixtures: re-owning an
-//! event (retract the old `HasEvent`, add a new one) and retracting only the
-//! `HasEvent` while its date fact stays live.
+//! checks the law at every fact-id snapshot for every entity. Two edge-churn
+//! fixtures ride alongside: retracting only the `HasEvent` while its date fact
+//! stays live (an orphaned date), and attempting to re-home an event to a
+//! different entity — now refused by ownership immutability, so the fixture pins
+//! the rejection and that X keeps the event.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
@@ -507,14 +508,14 @@ proptest! {
 // Regression fixtures — the two interleavings the read design turns on
 // ============================================================================
 
-/// Finding A: re-owning an event. An event dated before the construction floor
-/// is owned by X, then re-owned to Y by retracting the old `HasEvent` and adding
-/// a new one in one commit. At the interior snapshot where both edges are live
-/// the event is a witness for *both* X and Y (per-edge ownership), which
-/// latest-owner-wins would get wrong — the homomorphism must hold at every
-/// snapshot.
+/// Re-owning an event to a different entity is refused by ownership
+/// immutability. An event dated before X's construction floor is owned by X;
+/// re-homing it to Y — retracting the old `HasEvent` and adding one for Y in a
+/// single commit — is rejected, because an event's `{entity, kind}` is pinned at
+/// its first-ever `HasEvent`. The commit does not land, so X keeps the event and
+/// the witness read still agrees with the projection at every snapshot.
 #[tokio::test]
-async fn reowned_event_matches_projection_at_every_snapshot() -> Result<(), TestError> {
+async fn reowning_an_event_to_a_different_entity_is_rejected() -> Result<(), TestError> {
     let (store, _dir) = fresh_store().await?;
 
     // X = entity 0, Y = entity 1, both built in 1600.
@@ -541,16 +542,23 @@ async fn reowned_event_matches_projection_at_every_snapshot() -> Result<(), Test
     let event = event_id(&owned, 0)?;
     let old_edge = has_event_fact_id(&store, event).await?;
 
-    // Re-own to Y in one commit: retract the old edge, add a new one.
-    commit_one(
+    // Attempt to re-home to Y in one commit (retract the old edge, add Y's).
+    // The only otherwise-valid rejection reason is ownership immutability, so a
+    // refused commit pins that the pin (X) survives the retraction.
+    let reowned = try_commit(
         &store,
-        2,
         vec![Decl::Existing { id: y }],
         vec![Decl::Existing { id: event }],
+        2,
         vec![retract_fact(old_edge)?, has_event_point_fact(0, 0)?],
     )
-    .await?;
+    .await;
+    assert!(
+        reowned.is_none(),
+        "re-homing an event to a different entity must be rejected by ownership immutability"
+    );
 
+    // The event still belongs to X; the witness read agrees with the projection.
     assert_homomorphism(&store, &[x, y]).await?;
     store.close().await;
     Ok(())

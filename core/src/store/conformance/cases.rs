@@ -3507,13 +3507,15 @@ pub async fn same_event_identity_fact_rejected<S: FactStore>(store: S) -> TestRe
     Ok(())
 }
 
-/// A same-commit retraction is visible to the exactly-one rule's read: C1 puts a
-/// `HasEvent { Moved }` on event E; C2 retracts it and adds a
-/// `HasEvent { Damaged }`. The retraction is visible, so the surviving claim
-/// count is one and the commit is accepted — without the pending-retractor
-/// overlay the stale `Moved` claim would read active alongside the new one,
-/// tripping `EventMultipleHasEvent`.
-pub async fn event_kind_rule_sees_same_commit_retraction<S: FactStore>(store: S) -> TestResult {
+/// Re-typing an event across a same-commit retraction is rejected by ownership
+/// immutability. C1 types event E `Moved`; C2 retracts that `HasEvent` and adds
+/// `HasEvent { Damaged }`. The same-commit retraction is visible, so the stale
+/// `Moved` claim is *not* double-counted — no `EventMultipleHasEvent` — but the
+/// event's `{entity, kind}` is pinned at its first-ever `HasEvent`, so the
+/// re-type to `Damaged` trips `EventOwnershipImmutable` instead.
+pub async fn event_retype_across_same_commit_retraction_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
     let c1 = commit_facts(
         &store,
         local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, moved_kind())?])?,
@@ -3547,7 +3549,200 @@ pub async fn event_kind_rule_sees_same_commit_retraction<S: FactStore>(store: S)
         .into_iter()
         .collect(),
     };
-    commit_ok(&store, c2).await
+    let errs = commit_err(&store, c2).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventOwnershipImmutable { .. })),
+        "the re-type must trip ownership immutability: {errs:?}"
+    );
+    assert!(
+        !errs
+            .iter()
+            .any(|e| matches!(e, SubmitError::EventMultipleHasEvent { .. })),
+        "the same-commit retraction is visible, so the stale claim is not double-counted: {errs:?}"
+    );
+    Ok(())
+}
+
+/// Re-homing an event to a different entity across retraction is rejected. C1
+/// types event V `Moved` on entity X; C2 retracts that `HasEvent`; C3 declares V
+/// `Existing` and adds `HasEvent { Moved }` on a fresh entity Y. V's only active
+/// claim is now Y, so the active-only rules pass — but the pin from V's
+/// retracted first-ever `HasEvent` still names X, so ownership rejects.
+pub async fn event_rehome_across_retraction_rejected<S: FactStore>(store: S) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, moved_kind())?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let event = c1
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing event")?
+        .id
+        .clone();
+    let has_event_x = *c1.fact_ids.first().ok_or("no has-event fact id")?;
+
+    commit_retract(&store, has_event_x, 10).await?;
+
+    // C3: mint a fresh entity Y, re-declare V as Existing, re-home to Y.
+    let c3: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: vec![Decl::Local],
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [has_event_fact(0, 0, moved_kind())?].into_iter().collect(),
+    };
+    let errs = commit_err(&store, c3).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventOwnershipImmutable { .. })),
+        "re-homing V to a new entity must trip ownership immutability: {errs:?}"
+    );
+    Ok(())
+}
+
+/// Re-typing an event across retraction, split over commits, is rejected. Like
+/// [`event_rehome_across_retraction_rejected`] but C3 keeps the same entity X
+/// and changes only the kind (`Moved` → `Damaged`). The pin's kind is immutable.
+pub async fn event_retype_across_retraction_rejected<S: FactStore>(store: S) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, moved_kind())?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id
+        .clone();
+    let event = c1
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing event")?
+        .id
+        .clone();
+    let has_event_moved = *c1.fact_ids.first().ok_or("no has-event fact id")?;
+
+    commit_retract(&store, has_event_moved, 10).await?;
+
+    let c3: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: vec![Decl::Existing { id: entity }],
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [has_event_fact(0, 0, damaged_kind())?]
+            .into_iter()
+            .collect(),
+    };
+    let errs = commit_err(&store, c3).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventOwnershipImmutable { .. })),
+        "re-typing V's kind must trip ownership immutability: {errs:?}"
+    );
+    Ok(())
+}
+
+/// Re-asserting the identical `{entity, kind}` after a retraction is accepted —
+/// the pin is unchanged. C1 types event V `Moved` on X; C2 retracts it; C3
+/// re-declares V `Existing` and re-asserts `HasEvent { Moved }` on X (a revive
+/// with a fresh commit). The active claim equals the pin, so ownership passes.
+pub async fn event_reassert_identical_has_event_after_retraction_accepted<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, moved_kind())?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let entity = c1
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing entity")?
+        .id
+        .clone();
+    let event = c1
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing event")?
+        .id
+        .clone();
+    let has_event_moved = *c1.fact_ids.first().ok_or("no has-event fact id")?;
+
+    commit_retract(&store, has_event_moved, 10).await?;
+
+    let c3: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: vec![Decl::Existing { id: entity }],
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [has_event_fact(0, 0, moved_kind())?].into_iter().collect(),
+    };
+    commit_ok(&store, c3).await
+}
+
+/// A brand-new event id sets its own pin: minting event V with `HasEvent` on X
+/// is accepted, whatever the `{entity, kind}` — there is no prior ever-asserted
+/// claim to conflict with, so ownership never fires on a first-ever `HasEvent`.
+pub async fn event_fresh_id_sets_its_own_pin<S: FactStore>(store: S) -> TestResult {
+    commit_ok(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, moved_kind())?])?,
+    )
+    .await
+}
+
+/// Re-adopting a retracted event id under a different `{entity, kind}` is
+/// rejected — the case the retraction-inclusive read is for. C1 types event V
+/// `Moved` on X; C2 retracts the `HasEvent`, orphaning V; C3 declares V
+/// `Existing` and adopts it under a fresh entity Y with kind `Damaged`. V has no
+/// active `HasEvent` between C2 and C3, so the active-only rules see only C3's
+/// lone claim and would accept it — but the pin from V's retracted first-ever
+/// `HasEvent` names X/`Moved`, so ownership rejects the re-adoption.
+pub async fn event_readopt_retracted_id_under_new_owner_rejected<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let c1 = commit_facts(
+        &store,
+        local_bundle(1, 1, 0, 0, vec![has_event_fact(0, 0, moved_kind())?])?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let event = c1
+        .events
+        .get(&EventIdx(0))
+        .ok_or("missing event")?
+        .id
+        .clone();
+    let has_event_x = *c1.fact_ids.first().ok_or("no has-event fact id")?;
+
+    commit_retract(&store, has_event_x, 10).await?;
+
+    let c3: SubmitCommitInput<S> = SubmitBundle {
+        author: user_author()?,
+        recorded_at: fixed_time() + chrono::Duration::seconds(20),
+        entities: vec![Decl::Local],
+        events: vec![Decl::Existing { id: event }],
+        images: Vec::new(),
+        facts: [has_event_fact(0, 0, damaged_kind())?]
+            .into_iter()
+            .collect(),
+    };
+    let errs = commit_err(&store, c3).await?;
+    assert!(
+        errs.iter()
+            .any(|e| matches!(e, SubmitError::EventOwnershipImmutable { .. })),
+        "re-adopting a retracted event id under a new owner must trip ownership immutability: {errs:?}"
+    );
+    Ok(())
 }
 
 /// Re-typing an event must atomically retract the payloads the new kind doesn't

@@ -614,6 +614,24 @@ pub trait EventView<S: FactStore>: FactView<S> {
         after: Option<S::Cursor>,
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<WalkPage<S, EventIdOf<S>>, S::Error>> + Send;
+
+    /// Every `HasEvent` ever asserted on `event`, active *or retracted*,
+    /// ascending by fact id. Unlike [`Self::all_facts_about_event`] this keeps
+    /// retracted facts and returns only `HasEvent` facts.
+    ///
+    /// The submit-time ownership rule reads this to pin an event's
+    /// `{entity, kind}` at its earliest-ever `HasEvent`: seeing the retracted
+    /// original is what lets it reject a re-home or re-type staged as a
+    /// retract-plus-re-add, which the active-only neighbourhood can't see. Page
+    /// semantics match the other backlink walks — a page may come back short (a
+    /// non-`HasEvent` candidate is skipped without consuming a slot) yet still
+    /// carry a resume cursor.
+    fn all_has_events_about_event(
+        &mut self,
+        event: &EventIdOf<S>,
+        after: Option<S::Cursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> impl Future<Output = Result<WalkPage<S, EventIdOf<S>>, S::Error>> + Send;
 }
 
 // ============================================================================
