@@ -244,7 +244,7 @@ fn EntityDetailContent(
                                         Some(name) => {
                                             let text = name.text.clone();
                                             let bullet = name.citations.clone().map(|lines| {
-                                                view! { <CitationBullet lines=lines/> }
+                                                view! { <CitationMarker lines=lines/> }
                                             });
                                             view! { <span>{text}</span>{bullet} }.into_any()
                                         }
@@ -512,7 +512,7 @@ fn EntityLinks(links: Vec<LinkInfo>) -> impl IntoView {
                 <ul class="text-sm space-y-1">
                     {links.iter().map(|link| {
                         let bullet = link.citations.clone().map(|lines| {
-                            view! { <CitationBullet lines=lines/> }
+                            view! { <CitationMarker lines=lines/> }
                         });
                         view! {
                         <li>
@@ -1230,12 +1230,12 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
         DateCell::Settled { sources, .. } | DateCell::Pending { sources, .. } => {
             (!sources.is_empty()).then(|| {
                 let lines = CitationLines::Sources(sources.clone());
-                view! { <CitationBullet lines=lines/> }
+                view! { <CitationMarker lines=lines/> }
             })
         }
         DateCell::Disputed { rivals, .. } => {
             let lines = CitationLines::Rivals(rivals.clone());
-            Some(view! { <CitationBullet lines=lines/> })
+            Some(view! { <CitationMarker lines=lines/> })
         }
         DateCell::Inferred { .. } | DateCell::Unknown => None,
     };
@@ -1396,16 +1396,23 @@ fn resolve_points(
     out
 }
 
-// ==================== Citation bullet ====================
+// ==================== Popover shell ====================
 
-/// A citation bullet: a small superscript mark showing a field's source count,
-/// neutral normally and amber when the field is contested. Tapping it toggles a
-/// popover listing the sources — each linked to its source when it has one — or,
-/// for a contested field, the rival claims. An outside click or Escape closes it.
+/// The disposal-safe popover shared by the citation, conflict, and inferred
+/// markers: a trigger glyph that toggles a toned body portaled to
+/// `document.body`, closed on an outside click or Escape. The portal escapes the
+/// panel's slide transform and `overflow-y-auto` clip; guarded signal access
+/// keeps a teardown mid-handler safe.
 #[component]
-fn CitationBullet(lines: CitationLines) -> impl IntoView {
+fn Popover(
+    tone: PopoverTone,
+    trigger_class: impl Fn(bool) -> String + Send + Sync + 'static,
+    aria_label: String,
+    #[prop(into)] glyph: ViewFn,
+    #[prop(into)] body: ViewFn,
+) -> impl IntoView {
     let (open, set_open) = signal(false);
-    // The bullet's on-screen rect at the moment it was opened. The popover is
+    // The glyph's on-screen rect at the moment it was opened. The popover is
     // portaled to `document.body` to escape the panel's slide transform (which
     // would otherwise anchor its `position: fixed` to the panel) and the panel's
     // `overflow-y-auto` clip, so the rect gives it its viewport placement.
@@ -1413,7 +1420,7 @@ fn CitationBullet(lines: CitationLines) -> impl IntoView {
     let root_ref = NodeRef::<leptos::html::Span>::new();
     let popover_ref = NodeRef::<leptos::html::Div>::new();
 
-    // Close when a click lands outside both the bullet and its portaled popover.
+    // Close when a click lands outside both the glyph and its portaled popover.
     // Leptos delegates the button's toggle below the window, so the toggle runs
     // first and the fresh open survives this handler.
     let click_handle =
@@ -1448,6 +1455,60 @@ fn CitationBullet(lines: CitationLines) -> impl IntoView {
         key_handle.remove();
     });
 
+    let toggle = move |_: leptos::ev::MouseEvent| {
+        let opening = !open.get_untracked();
+        if opening && let Some(el) = root_ref.get_untracked() {
+            let rect = el.get_bounding_client_rect();
+            set_anchor.set(Some((rect.bottom(), rect.right())));
+        }
+        set_open.set(opening);
+    };
+
+    view! {
+        <span node_ref=root_ref>
+            <button
+                type="button"
+                class=move || trigger_class(open.get())
+                aria-expanded=move || if open.get() { "true" } else { "false" }
+                aria-label=aria_label
+                on:click=toggle
+            >
+                {glyph.run()}
+            </button>
+        </span>
+        <Show when=move || open.get()>
+            {
+                // `Show` and `Portal` both take a reactive `Fn` children, so
+                // neither closure may move a captured value out. Clone the body
+                // handle into this block local for the `Show` closure; `run`
+                // borrows it inside the `Portal`.
+                let body = body.clone();
+                view! {
+                    <Portal>
+                        <div
+                            node_ref=popover_ref
+                            role="group"
+                            class=popover_class(tone)
+                            style=move || popover_style(anchor.get())
+                        >
+                            <div class=top_accent_class(tone)></div>
+                            {body.run()}
+                        </div>
+                    </Portal>
+                }
+            }
+        </Show>
+    }
+}
+
+// ==================== Citation marker ====================
+
+/// A citation marker: a small superscript mark showing a field's source count,
+/// neutral normally and amber when the field is contested. Tapping it toggles a
+/// popover listing the sources — each linked to its source when it has one — or,
+/// for a contested field, the rival claims. An outside click or Escape closes it.
+#[component]
+fn CitationMarker(lines: CitationLines) -> impl IntoView {
     // The variant is the bullet's meaning: rival claims read as the disputed
     // badge, agreeing sources as the neutral one.
     let (disputed, entries) = match lines {
@@ -1476,58 +1537,33 @@ fn CitationBullet(lines: CitationLines) -> impl IntoView {
         PopoverTone::Neutral
     };
 
-    let toggle = move |_: leptos::ev::MouseEvent| {
-        let opening = !open.get_untracked();
-        if opening && let Some(el) = root_ref.get_untracked() {
-            let rect = el.get_bounding_client_rect();
-            set_anchor.set(Some((rect.bottom(), rect.right())));
-        }
-        set_open.set(opening);
-    };
-
     view! {
-        <span node_ref=root_ref>
-            <button
-                type="button"
-                class=move || bullet_class(disputed, open.get())
-                aria-expanded=move || if open.get() { "true" } else { "false" }
-                aria-label=aria_label
-                on:click=toggle
-            >
-                <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]">
-                    {count.to_string()}
-                </span>
-            </button>
-        </span>
-        <Show when=move || open.get()>
-            {
-                // `Show` and `Portal` both take a reactive `Fn` children, so
-                // neither closure may move a captured value out. Clone into these
-                // block locals so the `Show` closure only borrows the originals,
-                // then clone again at each use site so the `Portal` closure only
-                // borrows the locals.
+        <Popover
+            tone=tone
+            trigger_class=move |open| bullet_class(disputed, open)
+            aria_label=aria_label
+            glyph=move || {
+                view! {
+                    <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]">
+                        {count.to_string()}
+                    </span>
+                }
+            }
+            body=move || {
+                // Clone the popover data into this reactive `Fn` body so it only
+                // borrows the captured values, rebuilding on each portal mount.
                 let heading = heading.clone();
                 let entries = entries.clone();
                 view! {
-                    <Portal>
-                        <div
-                            node_ref=popover_ref
-                            role="group"
-                            class=popover_class(tone)
-                            style=move || popover_style(anchor.get())
-                        >
-                            <div class=top_accent_class(tone)></div>
-                            <div class=header_class(tone)>
-                                <span>{heading.clone()}</span>
-                            </div>
-                            <ul class="py-1 max-h-64 overflow-y-auto">
-                                {citation_entry_views(entries.clone())}
-                            </ul>
-                        </div>
-                    </Portal>
+                    <div class=header_class(tone)>
+                        <span>{heading}</span>
+                    </div>
+                    <ul class="py-1 max-h-64 overflow-y-auto">
+                        {citation_entry_views(entries)}
+                    </ul>
                 }
             }
-        </Show>
+        />
     }
 }
 
@@ -1663,52 +1699,10 @@ fn header_class(tone: PopoverTone) -> String {
 
 /// A conflict marker: a small amber alert disc beside the citation bullet on a
 /// timeline row whose date takes part in an entity-level temporal conflict.
-/// Tapping it opens a popover naming each clash in plain language and plotting
-/// its participating facts on a small inline time-axis. Mirrors
-/// [`CitationBullet`]'s disposal-safe popover: portaled to `document.body`,
-/// closed on an outside click or Escape, with guarded signal access so a teardown
-/// mid-handler can't panic.
+/// Tapping it opens a [`Popover`] naming each clash in plain language and
+/// plotting its participating facts on a small inline time-axis.
 #[component]
 fn ConflictMarker(conflicts: Vec<ResolvedConflict>) -> impl IntoView {
-    let (open, set_open) = signal(false);
-    // The glyph's on-screen rect at open, so the portaled popover can place
-    // itself outside the panel's slide transform and overflow clip.
-    let (anchor, set_anchor) = signal(None::<(f64, f64)>);
-    let root_ref = NodeRef::<leptos::html::Span>::new();
-    let popover_ref = NodeRef::<leptos::html::Div>::new();
-
-    let click_handle =
-        window_event_listener(leptos::ev::click, move |ev: leptos::ev::MouseEvent| {
-            if !open.try_get_untracked().unwrap_or(false) {
-                return;
-            }
-            let Some(node) = ev
-                .target()
-                .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
-            else {
-                return;
-            };
-            let inside = root_ref
-                .get_untracked()
-                .is_some_and(|root| root.contains(Some(&node)))
-                || popover_ref
-                    .get_untracked()
-                    .is_some_and(|popover| popover.contains(Some(&node)));
-            if !inside {
-                let _ = set_open.try_set(false);
-            }
-        });
-    let key_handle =
-        window_event_listener(leptos::ev::keydown, move |ev: leptos::ev::KeyboardEvent| {
-            if ev.key() == "Escape" && open.try_get_untracked() == Some(true) {
-                let _ = set_open.try_set(false);
-            }
-        });
-    on_cleanup(move || {
-        click_handle.remove();
-        key_handle.remove();
-    });
-
     let count = conflicts.len();
     let aria_label = if count == 1 {
         "1 date conflict".to_string()
@@ -1721,56 +1715,33 @@ fn ConflictMarker(conflicts: Vec<ResolvedConflict>) -> impl IntoView {
         format!("{count} date conflicts")
     };
 
-    let toggle = move |_: leptos::ev::MouseEvent| {
-        let opening = !open.get_untracked();
-        if opening && let Some(el) = root_ref.get_untracked() {
-            let rect = el.get_bounding_client_rect();
-            set_anchor.set(Some((rect.bottom(), rect.right())));
-        }
-        set_open.set(opening);
-    };
-
     view! {
-        <span node_ref=root_ref>
-            <button
-                type="button"
-                class=move || conflict_glyph_class(open.get())
-                aria-expanded=move || if open.get() { "true" } else { "false" }
-                aria-label=aria_label
-                on:click=toggle
-            >
-                <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]" aria-hidden="true">
-                    "!"
-                </span>
-            </button>
-        </span>
-        <Show when=move || open.get()>
-            {
-                // Clone into block locals so the `Show` closure borrows the
-                // originals; clone again at each use so the `Portal` closure does
-                // too — the same discipline `CitationBullet` follows.
+        <Popover
+            tone=PopoverTone::Disputed
+            trigger_class=conflict_glyph_class
+            aria_label=aria_label
+            glyph=move || {
+                view! {
+                    <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]" aria-hidden="true">
+                        "!"
+                    </span>
+                }
+            }
+            body=move || {
+                // Clone the popover data into this reactive `Fn` body so it only
+                // borrows the captured values, rebuilding on each portal mount.
                 let heading = heading.clone();
                 let conflicts = conflicts.clone();
                 view! {
-                    <Portal>
-                        <div
-                            node_ref=popover_ref
-                            role="group"
-                            class=popover_class(PopoverTone::Disputed)
-                            style=move || popover_style(anchor.get())
-                        >
-                            <div class=top_accent_class(PopoverTone::Disputed)></div>
-                            <div class=header_class(PopoverTone::Disputed)>
-                                <span>{heading.clone()}</span>
-                            </div>
-                            <div class="p-3 space-y-4 max-h-80 overflow-y-auto">
-                                {conflict_detail_views(conflicts.clone())}
-                            </div>
-                        </div>
-                    </Portal>
+                    <div class=header_class(PopoverTone::Disputed)>
+                        <span>{heading}</span>
+                    </div>
+                    <div class="p-3 space-y-4 max-h-80 overflow-y-auto">
+                        {conflict_detail_views(conflicts)}
+                    </div>
                 }
             }
-        </Show>
+        />
     }
 }
 
@@ -1972,112 +1943,50 @@ fn conflict_glyph_class(open: bool) -> String {
 
 /// An inferred marker: a solid sage disc beside the citation bullet on a
 /// construction row whose date the solver derived from an existence witness
-/// rather than any source asserting it. Tapping it opens a sage-toned popover
+/// rather than any source asserting it. Tapping it opens a sage-toned [`Popover`]
 /// naming the derivation ("built by W"), the witness reason, and the underlying
-/// witness citations. Mirrors [`ConflictMarker`]'s disposal-safe popover:
-/// portaled to `document.body`, closed on an outside click or Escape, with
-/// guarded signal access so a teardown mid-handler can't panic.
+/// witness citations.
 #[component]
 fn InferredMarker(
     value: UncertainDate,
     derivation: Derivation,
     witnesses: Vec<CiteEntry>,
 ) -> impl IntoView {
-    let (open, set_open) = signal(false);
-    let (anchor, set_anchor) = signal(None::<(f64, f64)>);
-    let root_ref = NodeRef::<leptos::html::Span>::new();
-    let popover_ref = NodeRef::<leptos::html::Div>::new();
-
-    let click_handle =
-        window_event_listener(leptos::ev::click, move |ev: leptos::ev::MouseEvent| {
-            if !open.try_get_untracked().unwrap_or(false) {
-                return;
-            }
-            let Some(node) = ev
-                .target()
-                .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
-            else {
-                return;
-            };
-            let inside = root_ref
-                .get_untracked()
-                .is_some_and(|root| root.contains(Some(&node)))
-                || popover_ref
-                    .get_untracked()
-                    .is_some_and(|popover| popover.contains(Some(&node)));
-            if !inside {
-                let _ = set_open.try_set(false);
-            }
-        });
-    let key_handle =
-        window_event_listener(leptos::ev::keydown, move |ev: leptos::ev::KeyboardEvent| {
-            if ev.key() == "Escape" && open.try_get_untracked() == Some(true) {
-                let _ = set_open.try_set(false);
-            }
-        });
-    on_cleanup(move || {
-        click_handle.remove();
-        key_handle.remove();
-    });
-
     let (claim, reason) = inferred_text(&derivation, &value);
     let aria_label = format!("inferred date, {claim}");
     let heading = format!("Inferred \u{00b7} {claim}");
 
-    let toggle = move |_: leptos::ev::MouseEvent| {
-        let opening = !open.get_untracked();
-        if opening && let Some(el) = root_ref.get_untracked() {
-            let rect = el.get_bounding_client_rect();
-            set_anchor.set(Some((rect.bottom(), rect.right())));
-        }
-        set_open.set(opening);
-    };
-
     view! {
-        <span node_ref=root_ref>
-            <button
-                type="button"
-                class=move || inferred_glyph_class(open.get())
-                aria-expanded=move || if open.get() { "true" } else { "false" }
-                aria-label=aria_label
-                on:click=toggle
-            >
-                <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]" aria-hidden="true">
-                    "i"
-                </span>
-            </button>
-        </span>
-        <Show when=move || open.get()>
-            {
-                // Clone into block locals so the `Show` closure borrows the
-                // originals; clone again at each use so the `Portal` closure does
-                // too — the discipline `CitationBullet` and `ConflictMarker` follow.
+        <Popover
+            tone=PopoverTone::Inferred
+            trigger_class=inferred_glyph_class
+            aria_label=aria_label
+            glyph=move || {
+                view! {
+                    <span class="[text-box-trim:trim-both] [text-box-edge:cap_alphabetic]" aria-hidden="true">
+                        "i"
+                    </span>
+                }
+            }
+            body=move || {
+                // Clone the popover data into this reactive `Fn` body so it only
+                // borrows the captured values, rebuilding on each portal mount.
                 let heading = heading.clone();
                 let reason = reason.clone();
                 let witnesses = witnesses.clone();
                 view! {
-                    <Portal>
-                        <div
-                            node_ref=popover_ref
-                            role="group"
-                            class=popover_class(PopoverTone::Inferred)
-                            style=move || popover_style(anchor.get())
-                        >
-                            <div class=top_accent_class(PopoverTone::Inferred)></div>
-                            <div class=header_class(PopoverTone::Inferred)>
-                                <span>{heading.clone()}</span>
-                            </div>
-                            <p class="px-3 py-2 font-serif text-sm text-body border-b border-sepia/15">
-                                {reason.clone()}
-                            </p>
-                            <ul class="py-1 max-h-64 overflow-y-auto">
-                                {citation_entry_views(witnesses.clone())}
-                            </ul>
-                        </div>
-                    </Portal>
+                    <div class=header_class(PopoverTone::Inferred)>
+                        <span>{heading}</span>
+                    </div>
+                    <p class="px-3 py-2 font-serif text-sm text-body border-b border-sepia/15">
+                        {reason}
+                    </p>
+                    <ul class="py-1 max-h-64 overflow-y-auto">
+                        {citation_entry_views(witnesses)}
+                    </ul>
                 }
             }
-        </Show>
+        />
     }
 }
 
