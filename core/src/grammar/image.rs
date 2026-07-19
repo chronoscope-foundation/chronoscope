@@ -118,6 +118,7 @@ pub enum Fact<R: IdScheme> {
     CreatedDate {
         image: R::Image,
         /// The source-claimed interval for the creation.
+        #[date_role = "ImageCreated"]
         bound: UncertainDate,
     },
     /// When this image was captured — the survey or record date of the
@@ -128,6 +129,7 @@ pub enum Fact<R: IdScheme> {
         /// Which image the bound applies to.
         image: R::Image,
         /// The source-claimed interval for the capture.
+        #[date_role = "ImageCaptured"]
         bound: UncertainDate,
     },
     /// Where this image was captured — the viewpoint location.

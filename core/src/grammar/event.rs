@@ -121,7 +121,7 @@
 
 use std::collections::BTreeSet;
 
-use chronoscope_macros::{IdWalk, grammar_type};
+use chronoscope_macros::{DateWalk, IdWalk, grammar_type};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +161,7 @@ pub enum Fact<R: IdScheme> {
         /// event's duration.
         role: DurationalRole,
         /// The source-claimed interval for that endpoint.
+        #[date_role = "EventDate"]
         bound: UncertainDate,
     },
     /// An uncertain interval for a point lifetime event
@@ -168,6 +169,7 @@ pub enum Fact<R: IdScheme> {
     PointDate {
         event: R::Event,
         /// The source-claimed interval for the event.
+        #[date_role = "EventDate"]
         bound: UncertainDate,
     },
     /// Where a `Moved` event landed the structure.
@@ -399,7 +401,18 @@ pub enum OrderableEvent<R: IdScheme> {
 /// unconstrained gap. The mirror copies the derived serialize shape, so the two
 /// directions can't drift.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema, IdWalk,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    IdWalk,
+    DateWalk,
 )]
 #[serde(bound(serialize = "R: IdScheme"))]
 #[serde(bound(deserialize = "R: IdScheme"), try_from = "RawGapBounds<R>")]

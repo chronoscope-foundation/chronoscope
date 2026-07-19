@@ -2,9 +2,10 @@
 //!
 //! This is `chronoscope-core`'s dedicated companion crate: Rust keeps a
 //! proc-macro (`proc-macro = true`) crate separate from the one exporting a
-//! normal API, so core's grammar derives live here. [`macro@IdWalk`] expands to
-//! `crate::grammar::{identity, ids}` paths that resolve in the deriving crate,
-//! making it derivable within `chronoscope-core`.
+//! normal API, so core's grammar derives live here. [`macro@IdWalk`] and
+//! [`macro@DateWalk`] expand to `crate::grammar::{identity, ids}`,
+//! `crate::submit::error`, and `crate::date` paths that resolve in the deriving
+//! crate, making them derivable within `chronoscope-core`.
 //!
 //! [`grammar_type`] declares a serializable grammar sum (enum) or product
 //! (struct). It bundles the project's serde conventions and forbids
@@ -12,7 +13,9 @@
 //! the tag and collide.
 //!
 //! [`macro@IdWalk`] derives the grammar's id-relabel + id-collect walks
-//! (`for_each_id` / `try_map_ids`) from a scheme-world type's field tokens.
+//! (`for_each_id` / `try_map_ids`) from a scheme-world type's field tokens;
+//! [`macro@DateWalk`] derives an inherent `visit_dates` method — the structural
+//! `UncertainDate` role-tagging walk.
 
 mod walk;
 
@@ -40,11 +43,32 @@ pub fn derive_id_walk(item: TokenStream) -> TokenStream {
     walk::derive_id_walk(item)
 }
 
+/// Derive an inherent `visit_dates` method — the structural `UncertainDate`
+/// role-tagging walk — over a grammar type's fields.
+///
+/// A field typed `UncertainDate` (or `Option<UncertainDate>`) tags its date with
+/// the `DateRole` its `#[date_role = "Role"]` names — a `date_role`-less date
+/// field is a compile error. Recursion descends only into interior nodes: a
+/// field whose type mentions the scheme param `R` (an id-leaf projection
+/// `R::Entity` / `Event` / `Image` or a bare id param excepted), or one flagged
+/// `#[traverse]` (the escape hatch for the rare interior node that isn't
+/// `R`-parametrized). Every other field is a leaf where the walk stops.
+///
+/// The expansion names `crate::submit::error::DateRole` and
+/// `crate::date::UncertainDate`, which resolve in `chronoscope-core`.
+#[proc_macro_derive(DateWalk, attributes(date_role, traverse))]
+pub fn derive_date_walk(item: TokenStream) -> TokenStream {
+    walk::derive_date_walk(item)
+}
+
 /// Declare a grammar sum or product with the standard serde bundle.
 ///
-/// Derives `Serialize`, `Deserialize`, `JsonSchema`, and applies
-/// `deny_unknown_fields`. Enums also get internal tagging on `"type"` with
-/// `snake_case` variant names.
+/// Derives `Serialize`, `Deserialize`, `JsonSchema`, and [`macro@DateWalk`]
+/// (the structural `UncertainDate` role-tagging walk, always — a dateless type
+/// gets an empty walk, so a recursion always lands on a type carrying the
+/// inherent `visit_dates` method), and applies `deny_unknown_fields`. Enums also
+/// get internal tagging on
+/// `"type"` with `snake_case` variant names.
 ///
 /// Every variant must be a struct or unit variant; every struct must use
 /// named fields. Tuple/newtype shapes are a compile error: under internal
@@ -111,7 +135,7 @@ pub fn grammar_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     quote! {
-        #[derive(::serde::Serialize, ::serde::Deserialize, ::schemars::JsonSchema #id_walk_derive)]
+        #[derive(::serde::Serialize, ::serde::Deserialize, ::schemars::JsonSchema, ::chronoscope_macros::DateWalk #id_walk_derive)]
         #serde_attrs
         #scheme_bounds
         #input

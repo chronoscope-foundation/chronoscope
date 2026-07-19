@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use chronoscope_macros::grammar_type;
+use chronoscope_macros::{DateWalk, grammar_type};
 use oxilangtag::LanguageTag;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -373,8 +373,9 @@ crate::validated_string_newtype! {
 ///
 /// Judgment and meta citations carry the source enum directly; their warrant
 /// isn't always a quoted passage. See [`JudgmentSource`] and [`MetaSource`].
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema, DateWalk)]
 pub struct FactualCitation {
+    #[traverse]
     pub source: ExternalSource,
     pub excerpts: NonEmptyVec<Excerpt>,
 }
@@ -478,6 +479,7 @@ pub enum ExternalSource {
         /// (a `published_time` meta tag, a dateline). Not the retrieval date,
         /// not inferred from content. `None` when the page carries no honest
         /// signal.
+        #[date_role = "CitationDate"]
         published: Option<UncertainDate>,
     },
     /// A Wikidata claim pinned to a revision id, re-fetchable for
@@ -521,6 +523,7 @@ pub enum ExternalSource {
         /// known — the edition's date, not the underlying work's. A 1995
         /// reprint of an 1820 memoir is `published: 1995`, with 1820 in the
         /// excerpts.
+        #[date_role = "CitationDate"]
         published: Option<UncertainDate>,
     },
     /// An archival or museum-collection item. The citation must carry
@@ -531,6 +534,7 @@ pub enum ExternalSource {
         catalog_id: Option<String>,
         /// When the artifact was created — the photograph taken, the letter
         /// written. Not when the archive accessioned or digitized it.
+        #[date_role = "CitationDate"]
         created: Option<UncertainDate>,
     },
 }
@@ -561,7 +565,10 @@ pub enum ExternalSource {
 pub enum JudgmentSource<ImgId> {
     /// External evidence wrapping any [`ExternalSource`]. Preferred when
     /// available.
-    External { source: ExternalSource },
+    External {
+        #[traverse]
+        source: ExternalSource,
+    },
     /// Researcher's analytical judgment, with required free-text
     /// justification.
     PersonalKnowledge {
@@ -712,7 +719,10 @@ pub enum Observer {
 pub enum MetaSource {
     /// External evidence that the underlying fact is wrong, fabricated,
     /// or otherwise warrants the meta-action.
-    External { source: ExternalSource },
+    External {
+        #[traverse]
+        source: ExternalSource,
+    },
     /// Moderator or researcher judgment, with required justification.
     PersonalKnowledge {
         /// The author of the meta-action.

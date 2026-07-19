@@ -29,6 +29,7 @@ pub struct Fact<R: IdScheme> {
     /// The entity the witness is about.
     pub entity: R::Entity,
     /// A date the entity is attested to have existed at, as an uncertain interval.
+    #[date_role = "ExistenceWitness"]
     pub at: UncertainDate,
 }
 

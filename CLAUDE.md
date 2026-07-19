@@ -204,6 +204,13 @@ Declare every grammar sum/product with `#[grammar_type]` (from the
 `chronoscope-macros` crate). It is the one source of the grammar's serde
 conventions: a single `"type"` internal tag, `snake_case` variant names,
 `deny_unknown_fields`, and derived `Serialize`/`Deserialize`/`JsonSchema`.
+It also always derives `DateWalk` (the `UncertainDate` role-tagging
+`visit_dates` walk): `#[date_role = "..."]` tags each direct `UncertainDate`
+field (an untagged one fails to compile), recursion into an
+`R: IdScheme`-parametrized composite is automatic, and `#[traverse]` is the
+escape hatch that recurses into the few non-`R` date hosts (the citation
+sources). A dateless type gets an empty `visit_dates`, so a `#[traverse]`
+always lands on a type that has the method.
 Variants and structs must use named fields — a tuple/newtype variant is a
 compile error, since internal tagging flattens an unnamed payload beside
 the tag and collides. Add the comparison/`Debug`/`Clone` derives yourself
@@ -211,7 +218,8 @@ in a `#[derive(..)]` alongside (float-bearing types carry hand-written
 `Eq`/`Hash`/`Ord`). A type generic over `R: IdScheme` additionally gets the
 `IdWalk` derive and the uniform `R: IdScheme` serde/schemars bounds emitted
 for free — don't repeat them; validated products that can't be
-`#[grammar_type]` (e.g. `GapBounds`) spell `#[derive(IdWalk)]` themselves.
+`#[grammar_type]` (e.g. `GapBounds`) spell `#[derive(IdWalk)]` (and
+`#[derive(DateWalk)]` when the date walk must reach them) themselves.
 Exemptions: `Location`/`UnresolvedLocation` keep hand-written `Deserialize`;
 the transparent leaf newtypes (ids, validated strings) use the `*_newtype!`
 macros.

@@ -10,10 +10,10 @@
 use crate::algebra::semiring::Label;
 use crate::date::UncertainDate;
 use crate::grammar::assertions::FactualAssertion;
+use crate::grammar::bookend;
 use crate::grammar::ids::{FactId, IdScheme};
-use crate::grammar::{bookend, event};
 use crate::nonempty::NonEmptyVec;
-use crate::submit::StoredFact;
+use crate::submit::{DateRole, StoredFact};
 
 use super::minimize::minimize;
 
@@ -84,23 +84,17 @@ pub(crate) fn fact_date<R: IdScheme>(fact: &StoredFact<R>) -> Option<UncertainDa
     let StoredFact::Factual(f) = fact else {
         return None;
     };
-    let bound = match &f.assertion {
-        FactualAssertion::Construction {
-            fact:
-                bookend::ConstructionFact::Started { bound, .. }
-                | bookend::ConstructionFact::Completed { bound, .. },
+    // A bookend or event-date fact carries exactly one such bound; the other
+    // fact-payload dates (name windows, existence, image) route to other slots
+    // and aren't this pass's endpoint intervals. Reuse the derived walk so the
+    // set of endpoint positions can't drift from the single-interval rule's.
+    let mut bound = None;
+    f.assertion.visit_dates(&mut |role, date| {
+        if matches!(role, DateRole::BookendBound | DateRole::EventDate) {
+            bound = Some(date.clone());
         }
-        | FactualAssertion::Demolition {
-            fact:
-                bookend::DemolitionFact::Started { bound, .. }
-                | bookend::DemolitionFact::Completed { bound, .. },
-        }
-        | FactualAssertion::Event {
-            fact: event::Fact::DurationalDate { bound, .. } | event::Fact::PointDate { bound, .. },
-        } => bound,
-        _ => return None,
-    };
-    Some(bound.clone())
+    });
+    bound
 }
 
 /// Whether a stored fact is a [`ConstructionFact::Started`](bookend::ConstructionFact::Started)

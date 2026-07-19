@@ -79,12 +79,14 @@ pub enum ConstructionFact<R: IdScheme> {
     Started {
         entity: R::Entity,
         /// The source-claimed interval for the start.
+        #[date_role = "BookendBound"]
         bound: UncertainDate,
     },
     /// When construction completed, as an uncertain interval.
     Completed {
         entity: R::Entity,
         /// The source-claimed interval for the completion.
+        #[date_role = "BookendBound"]
         bound: UncertainDate,
     },
     /// Where the entity was built — its default location until a subsequent
@@ -119,12 +121,14 @@ pub enum DemolitionFact<R: IdScheme> {
     Started {
         entity: R::Entity,
         /// The source-claimed interval for the start.
+        #[date_role = "BookendBound"]
         bound: UncertainDate,
     },
     /// When demolition completed, as an uncertain interval.
     Completed {
         entity: R::Entity,
         /// The source-claimed interval for the completion.
+        #[date_role = "BookendBound"]
         bound: UncertainDate,
     },
 }

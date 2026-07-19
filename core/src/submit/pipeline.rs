@@ -38,7 +38,7 @@ use super::result::{StoredFact, StoredFactualFact, StoredJudgmentFact, StoredMet
 use super::{EntityIdx, EventIdx, ImageIdx, SubmitFact};
 use crate::date::UncertainDate;
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
-use crate::grammar::citations::{ExternalSource, FactualCitation, JudgmentSource, MetaSource};
+use crate::grammar::citations::JudgmentSource;
 use crate::grammar::identity::{self, IdMapError, SelfLoop};
 use crate::grammar::ids::{FactId, IdScheme, SubjectKind};
 use crate::grammar::lifecycle::LifetimeEventKind;
@@ -872,10 +872,11 @@ fn rule_name_window<S: FactStore>(
 /// Every stored `UncertainDate` must be a single non-empty interval. We model
 /// no use for a disjunction or ⊥ in a submission today, so we reject them to
 /// keep the model simple and junk out of the store. This is a deliberately
-/// strict guard: a real use case can relax it later with nothing breaking. The
-/// traversal in [`for_each_stored_date`] currently covers every date position;
-/// until it is macro-derived, a new date-bearing grammar variant must be added
-/// there by hand.
+/// strict guard: a real use case can relax it later with nothing breaking.
+/// [`for_each_stored_date`] walks the whole date surface through the derived
+/// `visit_dates`: direct grammar date fields are compile-checked (the derive
+/// requires a `#[date_role]`), and the citation `ExternalSource` dates ride the
+/// same walk via `#[traverse]` on the source fields — no hand-maintained list.
 fn rule_single_interval_date<S: FactStore>(
     candidates: &[StoredFactOf<S>],
     errors: &mut Vec<SubmitError<EntityIdOf<S>, EventIdOf<S>, ImageIdOf<S>>>,
@@ -892,9 +893,12 @@ fn rule_single_interval_date<S: FactStore>(
 /// Visit every [`UncertainDate`] a stored fact reaches — fact-payload date
 /// fields and every `ExternalSource` date across the three citation hosts —
 /// tagging each with its [`DateRole`]. The one closed traversal the
-/// single-interval rule walks; routing all `ExternalSource` hosts through
-/// [`for_each_external_source_date`] keeps a future fourth host from
-/// reintroducing the citation-date hole.
+/// single-interval rule walks.
+///
+/// [`StoredFact`]'s tuple variants can't derive [`DateWalk`](chronoscope_macros::DateWalk),
+/// so this dispatches each arm into the payload's and citation's derived
+/// `visit_dates`; the citation `ExternalSource` dates ride that walk through
+/// `#[traverse]` on the source fields.
 fn for_each_stored_date<R: IdScheme>(
     fact: &StoredFact<R>,
     visit: &mut impl FnMut(DateRole, &UncertainDate),
@@ -904,95 +908,11 @@ fn for_each_stored_date<R: IdScheme>(
             assertion,
             citation,
         }) => {
-            for_each_assertion_date(assertion, visit);
-            let FactualCitation { source, .. } = citation;
-            for_each_external_source_date(source, visit);
+            assertion.visit_dates(visit);
+            citation.visit_dates(visit);
         }
-        StoredFact::Judgment(StoredJudgmentFact { source, .. }) => {
-            if let JudgmentSource::External { source } = source {
-                for_each_external_source_date(source, visit);
-            }
-        }
-        StoredFact::Meta(StoredMetaFact { source, .. }) => {
-            if let MetaSource::External { source } = source {
-                for_each_external_source_date(source, visit);
-            }
-        }
-    }
-}
-
-/// Visit the date fields a factual assertion's payload carries. The event and
-/// gap clusters carry no calendar dates except the dated event facts, so the
-/// event arm reaches only those.
-fn for_each_assertion_date<R: IdScheme>(
-    assertion: &FactualAssertion<R>,
-    visit: &mut impl FnMut(DateRole, &UncertainDate),
-) {
-    match assertion {
-        FactualAssertion::Attribute {
-            fact:
-                attribute::Fact::Name {
-                    valid_from,
-                    valid_to,
-                    ..
-                },
-        } => {
-            if let Some(date) = valid_from {
-                visit(DateRole::NameValidFrom, date);
-            }
-            if let Some(date) = valid_to {
-                visit(DateRole::NameValidTo, date);
-            }
-        }
-        FactualAssertion::Construction { fact } => match fact {
-            bookend::ConstructionFact::Started { bound, .. }
-            | bookend::ConstructionFact::Completed { bound, .. } => {
-                visit(DateRole::BookendBound, bound);
-            }
-            bookend::ConstructionFact::Location { .. } => {}
-        },
-        FactualAssertion::Demolition { fact } => {
-            let (bookend::DemolitionFact::Started { bound, .. }
-            | bookend::DemolitionFact::Completed { bound, .. }) = fact;
-            visit(DateRole::BookendBound, bound);
-        }
-        FactualAssertion::Existence { fact } => {
-            visit(DateRole::ExistenceWitness, &fact.at);
-        }
-        FactualAssertion::Event { fact } => {
-            if let event::Fact::PointDate { bound, .. }
-            | event::Fact::DurationalDate { bound, .. } = fact
-            {
-                visit(DateRole::EventDate, bound);
-            }
-        }
-        FactualAssertion::Image { fact } => match fact {
-            image::Fact::CreatedDate { bound, .. } => visit(DateRole::ImageCreated, bound),
-            image::Fact::CapturedDate { bound, .. } => visit(DateRole::ImageCaptured, bound),
-            image::Fact::Source { .. }
-            | image::Fact::Author { .. }
-            | image::Fact::CapturedLocation { .. }
-            | image::Fact::Medium { .. } => {}
-        },
-        FactualAssertion::Attribute { .. } | FactualAssertion::Gap { .. } => {}
-    }
-}
-
-/// Visit the publication/creation date an `ExternalSource` carries, when one is
-/// present. The structured variants pin their version instead of a date.
-fn for_each_external_source_date(
-    source: &ExternalSource,
-    visit: &mut impl FnMut(DateRole, &UncertainDate),
-) {
-    let date = match source {
-        ExternalSource::Url { published, .. } | ExternalSource::Book { published, .. } => {
-            published.as_ref()
-        }
-        ExternalSource::Archive { created, .. } => created.as_ref(),
-        ExternalSource::Wikidata { .. } | ExternalSource::Dbpedia { .. } => None,
-    };
-    if let Some(date) = date {
-        visit(DateRole::CitationDate, date);
+        StoredFact::Judgment(StoredJudgmentFact { source, .. }) => source.visit_dates(visit),
+        StoredFact::Meta(StoredMetaFact { source, .. }) => source.visit_dates(visit),
     }
 }
 

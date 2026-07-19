@@ -166,8 +166,10 @@ pub enum Fact<R: IdScheme> {
         name_type: NameType,
         /// When this name first applied, when known. The single bound
         /// expresses imprecision.
+        #[date_role = "NameValidFrom"]
         valid_from: Option<UncertainDate>,
         /// When this name stopped applying, when known.
+        #[date_role = "NameValidTo"]
         valid_to: Option<UncertainDate>,
     },
     /// The entity has an identifier in an external reference system
