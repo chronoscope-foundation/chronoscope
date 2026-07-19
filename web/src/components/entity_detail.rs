@@ -243,8 +243,8 @@ fn EntityDetailContent(
                                     {match &entity.name {
                                         Some(name) => {
                                             let text = name.text.clone();
-                                            let bullet = name.citations.clone().map(|citations| {
-                                                view! { <CitationBullet citations=citations/> }
+                                            let bullet = name.citations.clone().map(|lines| {
+                                                view! { <CitationBullet lines=lines/> }
                                             });
                                             view! { <span>{text}</span>{bullet} }.into_any()
                                         }
@@ -511,8 +511,8 @@ fn EntityLinks(links: Vec<LinkInfo>) -> impl IntoView {
                 </p>
                 <ul class="text-sm space-y-1">
                     {links.iter().map(|link| {
-                        let bullet = link.citations.clone().map(|citations| {
-                            view! { <CitationBullet citations=citations/> }
+                        let bullet = link.citations.clone().map(|lines| {
+                            view! { <CitationBullet lines=lines/> }
                         });
                         view! {
                         <li>
@@ -550,20 +550,20 @@ struct CiteEntry {
     url: Option<String>,
 }
 
-/// The citation badge for one field: how many sources back it, whether it is
-/// contested, and the per-source (or, when contested, per-rival) popover lines.
+/// The lines a citation bullet lists — the variant is the bullet's meaning: the
+/// sources agreeing on a field's value, or the rival claims contesting it. The
+/// count is the inner list's length; `Rivals` reads as the disputed badge.
 #[derive(Debug, Clone)]
-struct Citations {
-    count: usize,
-    disputed: bool,
-    entries: Vec<CiteEntry>,
+enum CitationLines {
+    Sources(Vec<CiteEntry>),
+    Rivals(Vec<CiteEntry>),
 }
 
 /// The entity's display name and the badge for the sources behind it.
 #[derive(Debug, Clone)]
 struct NameInfo {
     text: String,
-    citations: Option<Citations>,
+    citations: Option<CitationLines>,
 }
 
 /// One row in the rendered entity timeline.
@@ -583,29 +583,38 @@ struct TimelineRow {
     /// [`Bounded::facts`]. A row participates in a conflict when one of these
     /// rides the conflict's own `facts`.
     facts: Vec<FactId>,
-    /// The badge for this row's date, `None` when the row carries no dated
-    /// claim.
-    citations: Option<Citations>,
     /// Optional secondary text shown beneath the row (free-text
     /// descriptions authored on the underlying event, plus — for
     /// `Designated` — the settled designation text).
     description: Option<String>,
 }
 
-/// The date side of a timeline row: the value rendered inline. A contested date
-/// shows its honest joined value here; the rival claims live in [`Citations`].
+/// The date side of a timeline row: the value rendered inline, folded together
+/// with the provenance behind it. Each variant carries its own citation lines —
+/// agreeing sources, contested rivals, or a derivation's witnesses — so the
+/// bullet the row shows follows from the variant.
 #[derive(Debug, Clone)]
 enum DateCell {
     /// No claim dated this row.
     Unknown,
-    /// One value the sources agree on.
-    Settled(UncertainDate),
+    /// One value the sources agree on, each an agreeing line.
+    Settled {
+        value: UncertainDate,
+        sources: Vec<CiteEntry>,
+    },
+    /// A value this layer left open, with the sources behind it.
+    Pending {
+        value: UncertainDate,
+        sources: Vec<CiteEntry>,
+    },
     /// Irreconcilable rival claims, rendered as their joined extent — the honest
     /// span of possible instants: disjoint like "1160 / 1163" when the rivals
-    /// leave a gap, contiguous when they abut.
-    Disputed { value: UncertainDate },
-    /// A value this layer left open.
-    Pending(UncertainDate),
+    /// leave a gap, contiguous when they abut. Each rival's own claim rides in
+    /// `rivals`.
+    Disputed {
+        value: UncertainDate,
+        rivals: Vec<CiteEntry>,
+    },
     /// A bound no source asserted — the solver derived it from an existence
     /// witness ("built by W"). The value reads inline in the muted sage tone; the
     /// derivation and its witnesses ride alongside for the marker's popover.
@@ -623,8 +632,10 @@ impl DateCell {
     fn instant(&self) -> Option<NaiveDate> {
         let date = match self {
             DateCell::Unknown => return None,
-            DateCell::Settled(d) | DateCell::Pending(d) => d,
-            DateCell::Disputed { value } | DateCell::Inferred { value, .. } => value,
+            DateCell::Settled { value, .. }
+            | DateCell::Pending { value, .. }
+            | DateCell::Disputed { value, .. }
+            | DateCell::Inferred { value, .. } => value,
         };
         date.earliest()
     }
@@ -680,7 +691,7 @@ struct ResolvedConflict {
 struct LinkInfo {
     label: String,
     url: String,
-    citations: Option<Citations>,
+    citations: Option<CitationLines>,
 }
 
 /// One image in the detail grid: the URL the grid/lightbox load
@@ -827,14 +838,13 @@ async fn fetch_entity_images_page(
 /// a durational pair collapsed to a single undated moment), the endpoint's date,
 /// and — when this moment carries it — the event's secondary text.
 fn moment_row(moment: MomentView<'_, EventId, ImageId>) -> TimelineRow {
-    let (date, citations) = date_display(moment.date);
+    let date = date_display(moment.date);
     let facts = moment.date.map(|b| b.facts.clone()).unwrap_or_default();
     TimelineRow {
         role: moment.role,
         label: moment_label(moment.role, moment.collapsed).to_string(),
         date,
         facts,
-        citations,
         description: moment
             .carries_description
             .then(|| entry_description(&moment.event.detail))
@@ -842,14 +852,12 @@ fn moment_row(moment: MomentView<'_, EventId, ImageId>) -> TimelineRow {
     }
 }
 
-/// Read a moment's date slot into its inline cell and citation badge. A settled
-/// or pending slot cites each source against its one value; a conflict lists
-/// each rival's own date and source and marks the badge disputed.
-fn date_display(
-    bounded: Option<&Bounded<UncertainDate, ImageId>>,
-) -> (DateCell, Option<Citations>) {
+/// Read a moment's date slot into its inline cell, folding each slot's provenance
+/// into the variant. A settled or pending slot cites each source against its one
+/// value; a conflict carries each rival's own date and source.
+fn date_display(bounded: Option<&Bounded<UncertainDate, ImageId>>) -> DateCell {
     let Some(b) = bounded else {
-        return (DateCell::Unknown, None);
+        return DateCell::Unknown;
     };
     // A derived bound rides in an empty slot the solver filled from a witness, so
     // it outranks the consensus read: the value is inferred, and the inferred
@@ -862,27 +870,24 @@ fn date_display(
             .latest_bound()
             .map(format_date_bound)
             .unwrap_or_else(|| format_uncertain_date(&b.possible));
-        return (
-            DateCell::Inferred {
-                value: b.possible.clone(),
-                derivation: derivation.clone(),
-                witnesses: cite_entries(&witnessed, &b.sources),
-            },
-            None,
-        );
+        return DateCell::Inferred {
+            value: b.possible.clone(),
+            derivation: derivation.clone(),
+            witnesses: cite_entries(&witnessed, &b.sources),
+        };
     }
     match &b.consensus {
-        Consensus::Absent => (DateCell::Unknown, None),
-        Consensus::Reached { .. } => {
-            let citations = cited_field(&format_uncertain_date(&b.possible), &b.sources);
-            (DateCell::Settled(b.possible.clone()), citations)
-        }
-        Consensus::Pending { .. } => {
-            let citations = cited_field(&format_uncertain_date(&b.possible), &b.sources);
-            (DateCell::Pending(b.possible.clone()), citations)
-        }
+        Consensus::Absent => DateCell::Unknown,
+        Consensus::Reached { .. } => DateCell::Settled {
+            value: b.possible.clone(),
+            sources: cite_entries(&format_uncertain_date(&b.possible), &b.sources),
+        },
+        Consensus::Pending { .. } => DateCell::Pending {
+            value: b.possible.clone(),
+            sources: cite_entries(&format_uncertain_date(&b.possible), &b.sources),
+        },
         Consensus::Conflict { fighting } => {
-            let entries = distinct_rivals(fighting)
+            let rivals = distinct_rivals(fighting)
                 .into_iter()
                 .map(|rival| CiteEntry {
                     value: format_uncertain_date(&rival.value),
@@ -890,31 +895,20 @@ fn date_display(
                     url: rival.sources.first().and_then(citation_url),
                 })
                 .collect::<Vec<_>>();
-            let citations = Citations {
-                count: entries.len(),
-                disputed: true,
-                entries,
-            };
-            (
-                DateCell::Disputed {
-                    value: b.possible.clone(),
-                },
-                Some(citations),
-            )
+            DateCell::Disputed {
+                value: b.possible.clone(),
+                rivals,
+            }
         }
     }
 }
 
-/// The badge for a single-valued cited field — a name, a link, or a
-/// settled/pending date. Each source becomes one popover line attesting the
-/// field's own display `value`. `None` when nothing cites the field.
-fn cited_field(value: &str, sources: &[Citation<ImageId>]) -> Option<Citations> {
+/// The badge for a single-valued cited field — a name or a link. Each source
+/// becomes one agreeing popover line attesting the field's own display `value`.
+/// `None` when nothing cites the field.
+fn cited_field(value: &str, sources: &[Citation<ImageId>]) -> Option<CitationLines> {
     let entries = cite_entries(value, sources);
-    (!entries.is_empty()).then_some(Citations {
-        count: entries.len(),
-        disputed: false,
-        entries,
-    })
+    (!entries.is_empty()).then_some(CitationLines::Sources(entries))
 }
 
 /// One popover line per source, each attesting the given display `value`. The
@@ -1219,10 +1213,22 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
     // it wears its own muted sage treatment.
     let existence = row.role == TransitionRole::KnownToExist;
     let inferred = matches!(&row.date, DateCell::Inferred { .. });
-    let bullet = row
-        .citations
-        .clone()
-        .map(|citations| view! { <CitationBullet citations=citations/> });
+    // The bullet's meaning is the variant: agreeing sources (when any) read
+    // neutral, contested rivals read disputed; an inferred bound wears the marker
+    // instead, an unknown date carries nothing.
+    let bullet = match &row.date {
+        DateCell::Settled { sources, .. } | DateCell::Pending { sources, .. } => {
+            (!sources.is_empty()).then(|| {
+                let lines = CitationLines::Sources(sources.clone());
+                view! { <CitationBullet lines=lines/> }
+            })
+        }
+        DateCell::Disputed { rivals, .. } => {
+            let lines = CitationLines::Rivals(rivals.clone());
+            Some(view! { <CitationBullet lines=lines/> })
+        }
+        DateCell::Inferred { .. } | DateCell::Unknown => None,
+    };
     let inferred_marker = match &row.date {
         DateCell::Inferred {
             value,
@@ -1238,18 +1244,18 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
         DateCell::Unknown => {
             view! { <span class="text-sepia/40 italic">" \u{2014} date unknown"</span> }.into_any()
         }
-        DateCell::Settled(date) => view! {
+        DateCell::Settled { value: date, .. } => view! {
             <span class="text-sepia/70">{format!(" \u{2014} {}", format_uncertain_date(date))}</span>
         }
         .into_any(),
-        DateCell::Pending(date) => view! {
+        DateCell::Pending { value: date, .. } => view! {
             <span class="text-sepia/70">
                 {format!(" \u{2014} {}", format_uncertain_date(date))}
                 <span class="text-sepia/40 italic text-xs">" (pending)"</span>
             </span>
         }
         .into_any(),
-        DateCell::Disputed { value } => view! {
+        DateCell::Disputed { value, .. } => view! {
             <span class="text-body">{format!(" \u{2014} {}", format_uncertain_date(value))}</span>
         }
         .into_any(),
@@ -1386,7 +1392,7 @@ fn resolve_points(
 /// popover listing the sources — each linked to its source when it has one — or,
 /// for a contested field, the rival claims. An outside click or Escape closes it.
 #[component]
-fn CitationBullet(citations: Citations) -> impl IntoView {
+fn CitationBullet(lines: CitationLines) -> impl IntoView {
     let (open, set_open) = signal(false);
     // The bullet's on-screen rect at the moment it was opened. The popover is
     // portaled to `document.body` to escape the panel's slide transform (which
@@ -1431,11 +1437,13 @@ fn CitationBullet(citations: Citations) -> impl IntoView {
         key_handle.remove();
     });
 
-    let Citations {
-        count,
-        disputed,
-        entries,
-    } = citations;
+    // The variant is the bullet's meaning: rival claims read as the disputed
+    // badge, agreeing sources as the neutral one.
+    let (disputed, entries) = match lines {
+        CitationLines::Sources(entries) => (false, entries),
+        CitationLines::Rivals(entries) => (true, entries),
+    };
+    let count = entries.len();
 
     let aria_label = if disputed {
         format!("{count} conflicting sources")
