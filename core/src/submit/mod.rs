@@ -109,11 +109,6 @@ impl IdScheme for BundleLocal {
 /// one retraction undoes a bad match.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[serde(bound(
-    serialize = "Id: ::serde::Serialize",
-    deserialize = "Id: ::serde::de::DeserializeOwned"
-))]
-#[schemars(bound = "Id: ::schemars::JsonSchema")]
 pub enum Decl<Id> {
     /// Adopt a previously-minted id.
     Existing {

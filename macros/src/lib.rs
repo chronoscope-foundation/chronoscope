@@ -110,6 +110,10 @@ pub fn derive_location_walk(item: TokenStream) -> TokenStream {
 /// bounds, so the grammar types stop repeating them. Validated products that
 /// can't be `grammar_type` spell `#[derive(IdWalk)]` themselves.
 ///
+/// A type generic over a bare id param instead (`<ImgId>`, `<Id>` — no
+/// `IdScheme` bound) emits the `DeserializeOwned` + `JsonSchema` bounds that
+/// param needs, since grammar values are always owned-deserialized.
+///
 /// ```compile_fail
 /// use chronoscope_macros::grammar_type;
 /// #[grammar_type]
@@ -151,7 +155,39 @@ pub fn grammar_type(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 },
             )
         }
-        None => (quote! {}, quote! {}),
+        // No IdScheme param: any bare generic type param is a persistent/id
+        // type deserialized owned, so serde's default `Deserialize<'de>` bound
+        // is too weak — emit the `DeserializeOwned` + matching `JsonSchema`
+        // bound it needs. The serialize bound stays inferred: a bare param
+        // serializes directly, so serde's default `Serialize` bound is right.
+        None => {
+            let params: Vec<String> = input
+                .generics
+                .type_params()
+                .map(|tp| tp.ident.to_string())
+                .collect();
+            if params.is_empty() {
+                (quote! {}, quote! {})
+            } else {
+                let de_bound = params
+                    .iter()
+                    .map(|p| format!("{p}: ::serde::de::DeserializeOwned"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let schemars_bound = params
+                    .iter()
+                    .map(|p| format!("{p}: ::schemars::JsonSchema"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    quote! {},
+                    quote! {
+                        #[serde(bound(deserialize = #de_bound))]
+                        #[schemars(bound = #schemars_bound)]
+                    },
+                )
+            }
+        }
     };
 
     quote! {

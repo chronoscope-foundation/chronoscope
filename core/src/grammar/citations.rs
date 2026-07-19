@@ -507,11 +507,6 @@ pub enum ExternalSource {
 /// others are id-free.
 #[grammar_type]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(bound(
-    serialize = "ImgId: ::serde::Serialize",
-    deserialize = "ImgId: ::serde::de::DeserializeOwned"
-))]
-#[schemars(bound = "ImgId: ::schemars::JsonSchema")]
 pub enum JudgmentSource<ImgId> {
     /// External evidence wrapping any [`ExternalSource`]. Preferred when
     /// available.
