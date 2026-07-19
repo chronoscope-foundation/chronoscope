@@ -49,36 +49,20 @@
 //!   says "an indicator of significant parts, not directly specifying an interval" — but
 //!   consumers treat it as one. See <https://www.wikidata.org/wiki/Help:Dates>.
 
-use std::fmt;
-
 use chrono::{Datelike, NaiveDate};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Errors from date construction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DateError {
     /// Year 0 does not exist in historical convention (use -1 for 1 BCE).
+    #[error("year 0 does not exist in historical convention (use -1 for 1 BCE)")]
     Year0,
     /// Range endpoints are inverted (earliest > latest).
+    #[error("range: earliest must be <= latest")]
     InvertedRange,
 }
-
-impl fmt::Display for DateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Year0 => {
-                write!(
-                    f,
-                    "year 0 does not exist in historical convention (use -1 for 1 BCE)"
-                )
-            }
-            Self::InvertedRange => write!(f, "range: earliest must be <= latest"),
-        }
-    }
-}
-
-impl std::error::Error for DateError {}
 
 /// Precision level for date bounds.
 ///
@@ -192,10 +176,11 @@ impl<'de> Deserialize<'de> for TimeRange {
 }
 
 /// Errors from [`TimeRange::new`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TimeRangeError {
     /// `earliest`'s period start is after `latest`'s period end — endpoints
     /// crossed.
+    #[error("time range earliest ({earliest:?}) must be <= latest ({latest:?})")]
     EndpointsInverted {
         /// The earliest endpoint, as supplied.
         earliest: DateBound,
@@ -203,19 +188,6 @@ pub enum TimeRangeError {
         latest: DateBound,
     },
 }
-
-impl fmt::Display for TimeRangeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EndpointsInverted { earliest, latest } => write!(
-                f,
-                "time range earliest ({earliest:?}) must be <= latest ({latest:?})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TimeRangeError {}
 
 // TimeRange::new and UncertainDate::bounded enforce the same "earliest <=
 // latest" predicate; this conversion collapses the TimeRange error onto

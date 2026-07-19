@@ -129,23 +129,12 @@ impl AsRef<str> for NameText {
 
 /// Error from [`NameText`] deserialization: the wire input was not NFC. The
 /// wire form feeds the commit hash, so the boundary rejects it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("name text {input:?} is not NFC (canonical form is {canonical:?})")]
 pub struct NameTextError {
     pub input: String,
     pub canonical: String,
 }
-
-impl std::fmt::Display for NameTextError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "name text {:?} is not NFC (canonical form is {:?})",
-            self.input, self.canonical
-        )
-    }
-}
-
-impl std::error::Error for NameTextError {}
 
 /// Attribute-cluster fact.
 ///

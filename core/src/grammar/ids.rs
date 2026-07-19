@@ -235,9 +235,10 @@ macro_rules! subject_id_newtype {
 /// Single shared error type so the macro doesn't have to mint a fresh
 /// `<Name>Error` per invocation. Variants cover the length-bound checks
 /// the macro can configure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ValidatedStringError {
     /// Trimmed length was below the configured minimum.
+    #[error("{type_name} too short: {len} chars (min {min})")]
     TooShort {
         /// The label of the type (the macro invocation's identifier).
         type_name: &'static str,
@@ -247,6 +248,7 @@ pub enum ValidatedStringError {
         min: usize,
     },
     /// Length was above the configured maximum.
+    #[error("{type_name} too long: {len} chars (max {max})")]
     TooLong {
         /// The label of the type (the macro invocation's identifier).
         type_name: &'static str,
@@ -256,29 +258,6 @@ pub enum ValidatedStringError {
         max: usize,
     },
 }
-
-impl std::fmt::Display for ValidatedStringError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TooShort {
-                type_name,
-                len,
-                min,
-            } => {
-                write!(f, "{type_name} too short: {len} chars (min {min})")
-            }
-            Self::TooLong {
-                type_name,
-                len,
-                max,
-            } => {
-                write!(f, "{type_name} too long: {len} chars (max {max})")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ValidatedStringError {}
 
 /// Emit a `#[serde(transparent)]` string newtype with length-bound
 /// validation, smart constructor, `Display`, `AsRef<str>`, and manual
@@ -650,29 +629,15 @@ impl AsRef<str> for CommitId {
 pub const COMMIT_ID_HEX_LEN: usize = 64;
 
 /// Errors from [`CommitId::parse`] / `TryFrom<String>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommitIdError {
     /// The supplied string did not have the expected hex-digest length.
+    #[error("commit id has wrong length: {len} chars (expected {expected})")]
     WrongLength { len: usize, expected: usize },
     /// The supplied string contained non-hex or uppercase-hex bytes.
+    #[error("commit id must be lowercase hex (a-f, 0-9)")]
     NotLowercaseHex,
 }
-
-impl std::fmt::Display for CommitIdError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WrongLength { len, expected } => write!(
-                f,
-                "commit id has wrong length: {len} chars (expected {expected})"
-            ),
-            Self::NotLowercaseHex => {
-                write!(f, "commit id must be lowercase hex (a-f, 0-9)")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CommitIdError {}
 
 #[cfg(test)]
 mod tests {

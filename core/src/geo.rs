@@ -126,36 +126,18 @@ impl<'de> Deserialize<'de> for GeoPoint {
 /// values that may be `NaN` or infinite, so total ordering would be
 /// dishonest. Errors aren't part of the content-addressed-fact graph,
 /// so missing `Ord` here doesn't constrain anything downstream.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum GeoPointError {
     /// One or more coordinates were not finite.
+    #[error("geo-point coordinates must be finite, got lat={lat}, lon={lon}")]
     NotFinite { lat: f64, lon: f64 },
     /// `lat` was outside `[-90, 90]`.
+    #[error("latitude must be in [-90, 90], got {lat}")]
     LatitudeOutOfRange { lat: f64 },
     /// `lon` was outside `[-180, 180]`.
+    #[error("longitude must be in [-180, 180], got {lon}")]
     LongitudeOutOfRange { lon: f64 },
 }
-
-impl std::fmt::Display for GeoPointError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFinite { lat, lon } => {
-                write!(
-                    f,
-                    "geo-point coordinates must be finite, got lat={lat}, lon={lon}"
-                )
-            }
-            Self::LatitudeOutOfRange { lat } => {
-                write!(f, "latitude must be in [-90, 90], got {lat}")
-            }
-            Self::LongitudeOutOfRange { lon } => {
-                write!(f, "longitude must be in [-180, 180], got {lon}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for GeoPointError {}
 
 // ============================================================================
 // Viewport
@@ -194,11 +176,16 @@ pub struct Viewport {
 /// turn a transposition into a bogus wrap box, silently corrupting the lon axis.
 /// The lat guard is the one transposition symptom we can prove, so we reject it
 /// rather than construct a wrong box.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ViewportError {
     /// `sw`'s latitude exceeds `ne`'s — the box is inverted north-to-south.
     /// Longitude ordering is free: `sw.lon() > ne.lon()` denotes an
     /// antimeridian-wrapping box (see [`Viewport`]).
+    #[error(
+        "viewport sw latitude ({}) must be at or below ne latitude ({})",
+        .sw.lat(),
+        .ne.lat(),
+    )]
     LatitudeInverted {
         /// The southwest corner as supplied.
         sw: GeoPoint,
@@ -207,50 +194,20 @@ pub enum ViewportError {
     },
 }
 
-impl std::fmt::Display for ViewportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::LatitudeInverted { sw, ne } => write!(
-                f,
-                "viewport sw latitude ({}) must be at or below ne latitude ({})",
-                sw.lat(),
-                ne.lat(),
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ViewportError {}
-
 /// Errors from [`Viewport::from_coords`]: a corner coordinate out of range or
 /// non-finite (from [`GeoPoint::new`]), or a latitude-inverted corner pair
 /// (from [`Viewport::new`]).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ViewportCoordsError {
     /// The southwest corner's latitude or longitude failed [`GeoPoint::new`].
-    Southwest(GeoPointError),
+    #[error("southwest viewport corner: {0}")]
+    Southwest(#[source] GeoPointError),
     /// The northeast corner's latitude or longitude failed [`GeoPoint::new`].
-    Northeast(GeoPointError),
+    #[error("northeast viewport corner: {0}")]
+    Northeast(#[source] GeoPointError),
     /// The corner pair was latitude-inverted (see [`ViewportError`]).
-    Viewport(ViewportError),
-}
-
-impl std::fmt::Display for ViewportCoordsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Southwest(e) => write!(f, "southwest viewport corner: {e}"),
-            Self::Northeast(e) => write!(f, "northeast viewport corner: {e}"),
-            Self::Viewport(e) => e.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for ViewportCoordsError {}
-
-impl From<ViewportError> for ViewportCoordsError {
-    fn from(e: ViewportError) -> Self {
-        Self::Viewport(e)
-    }
+    #[error(transparent)]
+    Viewport(#[from] ViewportError),
 }
 
 impl Viewport {
@@ -622,21 +579,12 @@ impl Meters {
 }
 
 /// Errors from [`Meters::try_new`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum MetersError {
     /// The value was not finite.
+    #[error("meter value must be finite, got {value}")]
     NonFinite { value: f64 },
 }
-
-impl std::fmt::Display for MetersError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NonFinite { value } => write!(f, "meter value must be finite, got {value}"),
-        }
-    }
-}
-
-impl std::error::Error for MetersError {}
 
 // ============================================================================
 // Circle

@@ -96,31 +96,15 @@ impl ProportionalCoord {
 /// `PartialEq` only — the variants carry the pre-validation `f64`, which may be
 /// `NaN`, so a total ordering would be dishonest, and errors aren't part of the
 /// content-addressed fact graph.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ProportionalCoordError {
     /// The coordinate was not finite (`NaN` or infinite).
+    #[error("proportional coordinate must be finite, got {value}")]
     NotFinite { value: f64 },
     /// The coordinate lay outside the `0.0..=1.0` unit range.
+    #[error("proportional coordinate must lie in 0.0..=1.0, got {value}")]
     OutOfBounds { value: f64 },
 }
-
-impl std::fmt::Display for ProportionalCoordError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFinite { value } => {
-                write!(f, "proportional coordinate must be finite, got {value}")
-            }
-            Self::OutOfBounds { value } => {
-                write!(
-                    f,
-                    "proportional coordinate must lie in 0.0..=1.0, got {value}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ProportionalCoordError {}
 
 /// An axis-aligned proportional rectangle in `0.0..=1.0` coordinates, given by
 /// two corner points in canonical order (`min.x <= max.x`, `min.y <= max.y`).
@@ -344,39 +328,17 @@ impl<'de> Deserialize<'de> for ProportionalPolyline {
 /// `PartialEq` only — a wrapped [`ProportionalCoordError`] carries a
 /// pre-validation `f64` that may be `NaN`, so a total ordering would be
 /// dishonest, and errors aren't part of the content-addressed fact graph.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ProportionalPolylineError {
     /// A vertex coordinate was invalid (non-finite or out of range).
-    Coord(ProportionalCoordError),
+    #[error("proportional polyline vertex invalid: {0}")]
+    Coord(#[source] ProportionalCoordError),
     /// The trace named fewer than two points.
+    #[error("proportional polyline needs at least two points, got {count}")]
     TooFewPoints { count: usize },
     /// The trace named more than [`MAX_POLYLINE_POINTS`] points.
+    #[error("proportional polyline exceeds the {limit}-point limit, got {count}")]
     TooManyPoints { count: usize, limit: usize },
-}
-
-impl std::fmt::Display for ProportionalPolylineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Coord(e) => write!(f, "proportional polyline vertex invalid: {e}"),
-            Self::TooFewPoints { count } => write!(
-                f,
-                "proportional polyline needs at least two points, got {count}"
-            ),
-            Self::TooManyPoints { count, limit } => write!(
-                f,
-                "proportional polyline exceeds the {limit}-point limit, got {count}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ProportionalPolylineError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Coord(e) => Some(e),
-            Self::TooFewPoints { .. } | Self::TooManyPoints { .. } => None,
-        }
-    }
 }
 
 /// Image-space localization geometry for a depiction — where in the image's own

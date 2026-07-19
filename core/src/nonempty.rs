@@ -11,21 +11,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Errors from constructing a [`NonEmptyVec`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NonEmptyVecError {
     /// The supplied `Vec` was empty.
+    #[error("non-empty vec must contain at least one element")]
     Empty,
 }
-
-impl std::fmt::Display for NonEmptyVecError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "non-empty vec must contain at least one element"),
-        }
-    }
-}
-
-impl std::error::Error for NonEmptyVecError {}
 
 /// A `Vec<T>` whose length is at least one.
 ///

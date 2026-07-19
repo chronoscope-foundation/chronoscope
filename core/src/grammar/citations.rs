@@ -94,26 +94,15 @@ impl AsRef<str> for Excerpt {
 }
 
 /// Errors from [`Excerpt::new`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExcerptError {
     /// The supplied text was empty.
+    #[error("excerpt must not be empty")]
     Empty,
     /// The supplied text exceeded [`EXCERPT_MAX_LEN`] characters.
+    #[error("excerpt too long: {len} chars (max {max})")]
     TooLong { len: usize, max: usize },
 }
-
-impl std::fmt::Display for ExcerptError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "excerpt must not be empty"),
-            Self::TooLong { len, max } => {
-                write!(f, "excerpt too long: {len} chars (max {max})")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ExcerptError {}
 
 // ============================================================================
 // Language — canonical BCP-47 tag
@@ -171,32 +160,16 @@ impl<'de> Deserialize<'de> for Language {
 }
 
 /// Errors from [`Language`] construction and deserialization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LanguageError {
     /// The input failed BCP-47 parsing.
+    #[error("language tag {input:?} failed BCP-47 parsing: {message}")]
     Unparseable { input: String, message: String },
     /// Wire input parsed but was not in canonical form. The wire form feeds
     /// the commit hash, so the boundary rejects it.
+    #[error("language tag {input:?} is not canonical (canonical form is {canonical:?})")]
     NotCanonical { input: String, canonical: String },
 }
-
-impl std::fmt::Display for LanguageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unparseable { input, message } => {
-                write!(f, "language tag {input:?} failed BCP-47 parsing: {message}")
-            }
-            Self::NotCanonical { input, canonical } => {
-                write!(
-                    f,
-                    "language tag {input:?} is not canonical (canonical form is {canonical:?})"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for LanguageError {}
 
 // ============================================================================
 // WikimediaCategoryName
@@ -309,36 +282,22 @@ impl<'de> Deserialize<'de> for Isbn {
 }
 
 /// Errors from [`Isbn::parse`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IsbnError {
     /// Length after stripping separators isn't 10 or 13.
+    #[error("ISBN must be 10 or 13 digits, got {len}")]
     WrongLength {
         /// Observed length in characters after separator stripping.
         len: usize,
     },
     /// A non-digit character was present (other than a final `X` on an
     /// ISBN-10).
+    #[error("ISBN must be all digits (with optional final X on ISBN-10)")]
     NonDigit,
     /// Check digit did not match.
+    #[error("ISBN check digit does not match")]
     BadCheckDigit,
 }
-
-impl std::fmt::Display for IsbnError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WrongLength { len } => {
-                write!(f, "ISBN must be 10 or 13 digits, got {len}")
-            }
-            Self::NonDigit => write!(
-                f,
-                "ISBN must be all digits (with optional final X on ISBN-10)"
-            ),
-            Self::BadCheckDigit => write!(f, "ISBN check digit does not match"),
-        }
-    }
-}
-
-impl std::error::Error for IsbnError {}
 
 // ============================================================================
 // Justification
@@ -406,22 +365,13 @@ impl<'de> Deserialize<'de> for FactualCitation {
 }
 
 /// Errors from [`FactualCitation::new`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CitationError {
     /// No excerpts were supplied. A factual citation requires at least
     /// one verbatim passage from the source.
+    #[error("factual citation requires at least one excerpt")]
     ExcerptRequired,
 }
-
-impl std::fmt::Display for CitationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ExcerptRequired => write!(f, "factual citation requires at least one excerpt"),
-        }
-    }
-}
-
-impl std::error::Error for CitationError {}
 
 // ============================================================================
 // WikidataField

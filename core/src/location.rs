@@ -35,7 +35,6 @@
 //! projection layers both follow.
 
 use std::cmp::Ordering;
-use std::fmt;
 
 use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
@@ -65,50 +64,20 @@ pub const MAX_UNCERTAINTY_RADIUS: Meters = Meters::new_unchecked(5_000_000.0);
 /// `PartialEq` only — the radius variants carry a bare `f64`, which has no total
 /// `Eq`/`Ord`. Errors aren't part of the content-addressed-fact graph, so that
 /// doesn't ripple.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum LocationError {
     /// `OneOf` / `AllOf` requires at least 2 entries.
+    #[error("OneOf/AllOf requires at least 2 entries, got {count}")]
     TooFewEntries { count: usize },
     /// The circle's center coordinate failed [`GeoPoint`] validation.
-    Center(GeoPointError),
+    #[error("circle center: {0}")]
+    Center(#[from] GeoPointError),
     /// Radius was negative.
+    #[error("radius must be non-negative, got {radius}")]
     NegativeRadius { radius: f64 },
     /// Radius exceeded [`MAX_UNCERTAINTY_RADIUS`].
+    #[error("radius {radius} exceeds the {} m sanity bound", MAX_UNCERTAINTY_RADIUS.get())]
     RadiusTooLarge { radius: f64 },
-}
-
-impl fmt::Display for LocationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooFewEntries { count } => {
-                write!(f, "OneOf/AllOf requires at least 2 entries, got {count}")
-            }
-            Self::Center(e) => write!(f, "circle center: {e}"),
-            Self::NegativeRadius { radius } => {
-                write!(f, "radius must be non-negative, got {radius}")
-            }
-            Self::RadiusTooLarge { radius } => write!(
-                f,
-                "radius {radius} exceeds the {} m sanity bound",
-                MAX_UNCERTAINTY_RADIUS.get()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for LocationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Center(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<GeoPointError> for LocationError {
-    fn from(e: GeoPointError) -> Self {
-        Self::Center(e)
-    }
 }
 
 /// Both [`Location`] and [`UnresolvedLocation`] carry the same two combinators —

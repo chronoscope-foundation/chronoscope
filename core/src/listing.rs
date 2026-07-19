@@ -128,9 +128,10 @@ pub struct EntityListPage<EntId, ImgId, Cur> {
 }
 
 /// A listing failure: a backend error from the walk or projection.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum ListError<E> {
-    Backend(E),
+    #[error(transparent)]
+    Backend(#[from] E),
 }
 
 /// List the entities whose current marker falls in `viewport`, at the view's

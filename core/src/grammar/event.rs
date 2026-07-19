@@ -500,31 +500,16 @@ impl<R: IdScheme> GapBounds<R> {
 }
 
 /// Errors from [`GapBounds::new`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GapBoundsError {
     /// Both `min_days` and `max_days` were `None`; the gap is meaningless
     /// without at least one bound.
+    #[error("event gap must constrain at least one of min_days / max_days")]
     Unconstrained,
     /// `min_days > max_days` when both are present.
+    #[error("min_days ({min_days}) must not exceed max_days ({max_days})")]
     MinExceedsMax { min_days: u64, max_days: u64 },
 }
-
-impl std::fmt::Display for GapBoundsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unconstrained => write!(
-                f,
-                "event gap must constrain at least one of min_days / max_days"
-            ),
-            Self::MinExceedsMax { min_days, max_days } => write!(
-                f,
-                "min_days ({min_days}) must not exceed max_days ({max_days})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for GapBoundsError {}
 
 #[cfg(test)]
 mod tests {

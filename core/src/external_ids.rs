@@ -27,21 +27,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// `NrhpReferenceNumber::new` is infallible — the non-empty invariant
 /// is enforced only at the wire boundary, where untrusted input enters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExternalStringIdError {
     /// The supplied string was empty.
+    #[error("external id must not be empty")]
     Empty,
 }
-
-impl std::fmt::Display for ExternalStringIdError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "external id must not be empty"),
-        }
-    }
-}
-
-impl std::error::Error for ExternalStringIdError {}
 
 /// Error returned when parsing a Wikidata ID from its string form
 /// (`<prefix><digits>`, e.g. `"Q12345"` / `"P1448"`).
@@ -50,44 +41,25 @@ impl std::error::Error for ExternalStringIdError {}
 /// offending input and which prefix was expected. Surfaced by
 /// [`WikidataEntityId`]'s and [`WikidataPropertyId`]'s `FromStr` /
 /// `Deserialize` impls.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WikidataIdParseError {
     /// The input was empty.
+    #[error("wikidata id must not be empty")]
     Empty,
     /// The first byte was not the expected prefix (`'Q'` for entities,
     /// `'P'` for properties). Holds the expected prefix and the input.
+    #[error("wikidata id {found:?} must start with {expected:?}")]
     WrongPrefix { expected: char, found: String },
     /// The prefix was present but no digits followed it.
+    #[error("wikidata id {found:?} must have digits after the {expected:?} prefix")]
     MissingDigits { expected: char, found: String },
     /// A byte after the prefix was not an ASCII digit.
+    #[error("wikidata id {found:?} must be {expected:?} followed only by ASCII digits")]
     NonDigitTail { expected: char, found: String },
     /// The digits parsed but overflowed `u64`.
+    #[error("wikidata id {found:?} numeric part overflows u64")]
     Overflow { found: String },
 }
-
-impl std::fmt::Display for WikidataIdParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Empty => write!(f, "wikidata id must not be empty"),
-            Self::WrongPrefix { expected, found } => {
-                write!(f, "wikidata id {found:?} must start with {expected:?}")
-            }
-            Self::MissingDigits { expected, found } => write!(
-                f,
-                "wikidata id {found:?} must have digits after the {expected:?} prefix"
-            ),
-            Self::NonDigitTail { expected, found } => write!(
-                f,
-                "wikidata id {found:?} must be {expected:?} followed only by ASCII digits"
-            ),
-            Self::Overflow { found } => {
-                write!(f, "wikidata id {found:?} numeric part overflows u64")
-            }
-        }
-    }
-}
-
-impl std::error::Error for WikidataIdParseError {}
 
 // ============================================================================
 // Numeric-ID macro
