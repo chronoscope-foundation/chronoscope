@@ -20,7 +20,9 @@ use chronoscope_api::state::permissive_dns_resolver;
 use chronoscope_api_client::Client;
 use chronoscope_api_client::client::AuthClient;
 use chronoscope_db::{MediaType, ResearchUrlStatus};
-use chronoscope_dev::{DevServerConfig, ImageResolveMode, RunningDevServer, start_dev_server};
+use chronoscope_dev::{
+    DevServerConfig, FactsDbSource, ImageResolveMode, RunningDevServer, start_dev_server,
+};
 use chronoscope_workers::RetryConfig;
 use chronoscope_workers::{ApifyConfig, CacheMode, CachingClient, HttpClient};
 use dropshot::ConfigLogging;
@@ -120,14 +122,18 @@ impl TestServer {
         let port = chronoscope_dev::find_available_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
 
-        // Fresh file-backed SQLite DB per harness — the fact store's views
-        // hold read transactions, which a shared-cache in-memory database
-        // would serialize at table locks.
+        // Fresh file-backed app + facts DBs per harness — the fact store's
+        // views hold read transactions on the (empty) facts overlay, which an
+        // in-memory overlay would serialize at table locks. These tests
+        // exercise the URL-fetch pipeline, not fact data, so the facts overlay
+        // is a fresh writable scratch file, created+migrated and left empty.
         let db_dir = tempfile::tempdir()?;
         let database_url = format!("sqlite:{}", db_dir.path().join("test.db").display());
+        let facts_database = format!("sqlite:{}", db_dir.path().join("facts.db").display());
 
         let server = start_dev_server(DevServerConfig {
             database_url: Some(database_url),
+            facts: FactsDbSource::Writable(facts_database),
             http_client,
             worker_idle_backoff: Duration::from_millis(50),
             retry_config: RetryConfig {

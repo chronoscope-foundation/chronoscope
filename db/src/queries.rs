@@ -368,18 +368,21 @@ mod tests {
     }
 
     /// A covering-index scan reads every index row — a table scan in index
-    /// clothing — so the verifier refuses it end-to-end.
+    /// clothing — so the verifier refuses it end-to-end. The example is an
+    /// app table (`research_urls`'s non-partial `idx_urls_created`), since
+    /// the fact tables live in a separate overlay this app pool doesn't
+    /// attach.
     #[tokio::test]
     async fn covering_index_scan_of_a_full_index_is_refused()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = Database::new_without_plan_verification("sqlite::memory:").await?;
-        let sql = "SELECT kind, rep, as_of FROM subject_reps ORDER BY kind, rep";
+        let sql = "SELECT created_at, id FROM research_urls ORDER BY created_at DESC, id DESC";
         let outcome = verify_query_plan_sql(db.pool(), "covering_scan", sql).await;
         let Err(QueryPlanError::FullTableScan { detail, .. }) = outcome else {
             return Err(format!("expected a full-scan refusal, got {outcome:?}").into());
         };
         assert!(
-            detail.starts_with("SCAN subject_reps USING COVERING INDEX"),
+            detail.starts_with("SCAN research_urls USING COVERING INDEX"),
             "refusal must name the covering scan, got {detail}"
         );
         Ok(())

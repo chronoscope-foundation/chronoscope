@@ -48,15 +48,17 @@ use crate::state::{
     ServerImageId,
 };
 
-/// A fresh file-backed fact store per test, plus the tempdir holding it.
-/// Views hold read transactions for their lifetime, and only a file-backed
-/// database gives WAL's reader/writer independence — a shared-cache in-memory
-/// database serializes them at table locks.
+/// A fresh fact store per test, plus the tempdir holding its overlay facts
+/// file. Views hold read transactions on the overlay (WAL) for their
+/// lifetime, and only a file-backed overlay gives WAL's reader/writer
+/// independence — an in-memory overlay would serialize them at table locks.
 async fn fresh_fact_store()
 -> Result<(ServerFactStore, tempfile::TempDir), Box<dyn std::error::Error + Send + Sync>> {
     let dir = tempfile::tempdir()?;
-    let url = format!("sqlite:{}", dir.path().join("facts.sqlite3").display());
-    let store = ServerFactStore::open(&url).await?;
+    let store = ServerFactStore::open(chronoscope_db::FactStoreLocations::standalone_at(
+        &dir.path().join("facts.sqlite3"),
+    )?)
+    .await?;
     Ok((store, dir))
 }
 
@@ -246,6 +248,9 @@ impl TestContext {
 
         let config = Config {
             database_url: "sqlite::memory:".to_string(),
+            // The fact store under test is the standalone `facts` built above
+            // (its own overlay), so this app-side facts path goes unused.
+            facts_database: "sqlite::memory:".to_string(),
             rp_id: "localhost".to_string(),
             rp_origin: format!("http://localhost:{}", addr.port()),
             bind_addr: addr,

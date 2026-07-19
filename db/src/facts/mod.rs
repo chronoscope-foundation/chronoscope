@@ -1,8 +1,19 @@
 //! SQLite [`FactStore`] backend.
 //!
-//! Rides the crate's shared pool (SpatiaLite loaded, WAL):
-//! [`SqliteFactStore::new`] wraps a pool the caller built, so the fact-store
-//! tables live beside the rest of the schema in one database.
+//! Two-layer layout: the fact tables live in a writable `ovl` overlay and,
+//! optionally, a frozen read-only `base` beneath it, both attached on a pool
+//! whose `main` holds no fact tables (SpatiaLite loaded, WAL). Writes and
+//! overlay-only state qualify `ovl.`; data reads stay unqualified and, when a
+//! base is mounted, resolve through per-table temp union views spanning
+//! base ∪ overlay (see the `queries` module and `UNION_VIEW_TABLES`). Mounting
+//! is sound because the fact schema is append-only — merges and retractions of
+//! base subjects append overlay rows, base rows are never touched — so a frozen
+//! base under an overlay reads correctly, and the overlay mints ids past the
+//! base's max so the id spaces stay disjoint across the union. The store owns
+//! that pool — [`SqliteFactStore::open`] ensures the overlay's schema, mounts
+//! any base read-only, seeds the overlay's id continuations past the base, and
+//! verifies the query plans; [`new`](SqliteFactStore::new) wraps an
+//! overlay-only pool a caller already attached.
 //!
 //! ## Transactions
 //!
@@ -63,6 +74,7 @@ mod witness_tests;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use sqlx::sqlite::SqlitePool;
 use sqlx::{Acquire, Sqlite, SqliteConnection, Transaction};
@@ -81,6 +93,7 @@ pub use self::error::SqliteFactStoreError;
 pub use self::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
 
 use self::error::sql;
+use self::queries::FactQueries;
 use self::read::{FacetKey, ReadBound};
 use self::storage::{
     commit_to_json, external_ref_key, facet_columns, fact_to_json, kind_tag, named_entity,
@@ -88,8 +101,6 @@ use self::storage::{
 };
 
 use self::convert::{i64_to_u64, u64_to_i64};
-
-pub(crate) use self::queries::verify_query_plans;
 
 // Aliases to keep the spellings short.
 type SqlStoredFact = StoredFact<SqliteIds>;
@@ -101,56 +112,354 @@ type Error = SqliteFactStoreError;
 // SqliteFactStore
 // ============================================================================
 
+/// The fact tables a mounted base ∪ overlay spans through a per-connection temp
+/// union view, so the unqualified data reads see both layers with no per-query
+/// branching. Excludes the overlay-only counters (seeded, never unioned) and
+/// the spatial shadow tables (the spatial read unions per rtree branch instead,
+/// since an rtree can't drive its index through a view). Built in
+/// [`create_pool_with_overlay`](crate::create_pool_with_overlay)'s
+/// `after_connect`.
+pub(crate) const UNION_VIEW_TABLES: &[&str] = &[
+    "facts",
+    "fact_subjects",
+    "fact_commits",
+    "subject_reps",
+    "existence_witness",
+    "event_witness",
+    "has_event",
+    "construction_start",
+    "demolition_completed",
+];
+
 /// The stored-facts codec version. Bump on ANY change to the stored
 /// `fact_json` / `result_json` shapes or the id encoding conventions —
 /// anything that would make a previously built facts-DB artifact decode
-/// wrongly. Built artifacts carry it in `PRAGMA user_version`
-/// ([`SqliteFactStore::stamp_codec_version`]); the dev mount refuses a
-/// mismatch, so a stale artifact fails loudly instead of decoding garbage.
+/// wrongly. `ingest build-db` stamps it into the facts file's
+/// `PRAGMA user_version` after a successful build, and both
+/// [`validate_facts_file`] and the dev mount refuse a file that doesn't carry
+/// it — a stale codec, or an interrupted build (which never reached the
+/// stamp), fails loudly instead of decoding garbage.
 pub const FACTS_CODEC_VERSION: i32 = 1;
 
-/// SQLite implementation of [`FactStore`] over a shared [`SqlitePool`].
+/// Why a facts database file is not a valid, current build. Both consumers of
+/// a pre-built base pin — [`SqliteFactStore::open`] mounting one, and the dev
+/// server's [`validate_facts_file`] pre-check — validate through it and render
+/// their own remedy around this: `open`'s mount refusal names the build
+/// command, the dev mount the fetch command.
+#[derive(Debug, thiserror::Error)]
+pub enum FactsFileError {
+    /// The file is missing or its bytes can't be read.
+    #[error("facts database {path} is unreadable: {source}")]
+    Unreadable {
+        /// The offending path.
+        path: String,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The file exists but isn't a SQLite database (too short, or the magic
+    /// header is wrong).
+    #[error("facts database {path} is not a SQLite database ({detail})")]
+    NotSqlite {
+        /// The offending path.
+        path: String,
+        /// What was wrong.
+        detail: String,
+    },
+    /// The database carries the wrong codec stamp — a different version, or
+    /// `0` from an unstamped / interrupted build.
+    #[error(
+        "facts database {path} carries facts codec version {found}, but this build expects \
+         {expected} (an unstamped or partial build reads 0)"
+    )]
+    CodecMismatch {
+        /// The offending path.
+        path: String,
+        /// The version read from the file.
+        found: i32,
+        /// The version this build requires.
+        expected: i32,
+    },
+}
+
+/// Validate a pre-built facts database by header inspection alone — no SQLite
+/// connection, so it works on a read-only artifact with no `-shm`/`-wal`
+/// access. Checks the file exists, is non-empty with the SQLite magic header,
+/// and carries [`FACTS_CODEC_VERSION`] in its `user_version` (file-header
+/// bytes 60..64, big-endian; the stamp is `ingest build-db`'s last step, so a
+/// partial build reads `0`). The one definition of "is this a valid, current
+/// facts DB", shared by [`SqliteFactStore::open`] validating a base pin and the
+/// dev server's pre-mount check.
+///
+/// # Errors
+/// Returns [`FactsFileError`] naming the path and the specific failure.
+pub fn validate_facts_file(path: &std::path::Path) -> Result<(), FactsFileError> {
+    use std::io::Read;
+
+    let ps = || path.display().to_string();
+    let unreadable = |source| FactsFileError::Unreadable { path: ps(), source };
+
+    let len = std::fs::metadata(path).map_err(unreadable)?.len();
+    if len < 64 {
+        return Err(FactsFileError::NotSqlite {
+            path: ps(),
+            detail: format!("{len} bytes, shorter than the 64-byte header"),
+        });
+    }
+    let mut header = [0u8; 64];
+    std::fs::File::open(path)
+        .map_err(unreadable)?
+        .read_exact(&mut header)
+        .map_err(unreadable)?;
+    if &header[0..16] != b"SQLite format 3\0" {
+        return Err(FactsFileError::NotSqlite {
+            path: ps(),
+            detail: "magic header mismatch".to_owned(),
+        });
+    }
+    let found = i32::from_be_bytes([header[60], header[61], header[62], header[63]]);
+    if found != FACTS_CODEC_VERSION {
+        return Err(FactsFileError::CodecMismatch {
+            path: ps(),
+            found,
+            expected: FACTS_CODEC_VERSION,
+        });
+    }
+    Ok(())
+}
+
+/// Where a fact store's databases live. `app` is the connection's `main` (a
+/// throwaway `sqlite::memory:` for the standalone store — the fact tables never
+/// live there); `overlay` is the writable facts database, attached as `ovl`,
+/// given as a filesystem path (a leading `sqlite:` is stripped). `base` is an
+/// optional frozen read-only database a union view reads beneath the overlay —
+/// `None` for an overlay-only store (the producer, most tests), `Some(pin)`
+/// when serving a pre-built artifact under a fresh writable overlay.
+#[derive(Debug, Clone)]
+pub struct FactStoreLocations {
+    /// The `sqlite:` URL for the connection's `main` database.
+    app: String,
+    /// The writable facts database — a filesystem path attached as `ovl`.
+    overlay: String,
+    /// A frozen read-only base beneath the overlay in a union view, or `None`
+    /// for overlay-only.
+    base: Option<String>,
+}
+
+/// A tempdir path as the `String` the `ATTACH` binds — the one place a `&Path`
+/// database location becomes the stored string, so every fixture routes its
+/// path conversion through the same UTF-8 guard.
+fn path_string(path: &std::path::Path, role: &str) -> crate::DbResult<String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        crate::DbError::Config(format!(
+            "facts {role} path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })
+}
+
+impl FactStoreLocations {
+    /// A standalone overlay-only store over one writable facts file, with a
+    /// throwaway in-memory `main` — the shape the producer (`ingest build-db`),
+    /// conformance, and the api-test fixtures use.
+    pub fn standalone(overlay: impl Into<String>) -> Self {
+        Self {
+            app: "sqlite::memory:".to_owned(),
+            overlay: overlay.into(),
+            base: None,
+        }
+    }
+
+    /// [`standalone`](Self::standalone) from a filesystem path.
+    ///
+    /// # Errors
+    /// Returns [`DbError`](crate::DbError) if the path is not valid UTF-8.
+    pub fn standalone_at(overlay: &std::path::Path) -> crate::DbResult<Self> {
+        Ok(Self::standalone(path_string(overlay, "overlay")?))
+    }
+
+    /// A mounted store: a frozen `base` artifact read beneath a fresh writable
+    /// `overlay`, with a throwaway in-memory `main`. The serving shape —
+    /// submissions land in the (typically discarded) overlay, reads span
+    /// base ∪ overlay.
+    pub fn mounted(base: impl Into<String>, overlay: impl Into<String>) -> Self {
+        Self {
+            app: "sqlite::memory:".to_owned(),
+            overlay: overlay.into(),
+            base: Some(base.into()),
+        }
+    }
+
+    /// [`mounted`](Self::mounted) from filesystem paths.
+    ///
+    /// # Errors
+    /// Returns [`DbError`](crate::DbError) if either path is not valid UTF-8.
+    pub fn mounted_at(base: &std::path::Path, overlay: &std::path::Path) -> crate::DbResult<Self> {
+        Ok(Self::mounted(
+            path_string(base, "base")?,
+            path_string(overlay, "overlay")?,
+        ))
+    }
+
+    /// The overlay as a bare filesystem path (for the `ATTACH`), stripping a
+    /// `sqlite:` scheme prefix if present.
+    fn overlay_path(&self) -> &str {
+        self.overlay
+            .strip_prefix("sqlite:")
+            .unwrap_or(&self.overlay)
+    }
+
+    /// The base as a bare filesystem path, stripping a `sqlite:` prefix, or
+    /// `None` for an overlay-only store.
+    fn base_path(&self) -> Option<&str> {
+        self.base
+            .as_deref()
+            .map(|base| base.strip_prefix("sqlite:").unwrap_or(base))
+    }
+}
+
+/// Create (if absent) and migrate a fresh facts database at `overlay_path`,
+/// opening the path directly as `main` — sqlx migrations create tables in
+/// `main`, so this is the only way to build the fact schema in the file; the
+/// serving pool then attaches the file as `ovl`. Does NOT stamp the codec
+/// version: the stamp certifies a *completed* build, so only `ingest build-db`
+/// writes it, after the ingest succeeds. Idempotent: an already-migrated file
+/// skips applied migrations.
+///
+/// # Errors
+/// Returns [`DbError`](crate::DbError) if the pool or migrations fail.
+pub async fn create_facts_file(overlay_path: &str) -> crate::DbResult<()> {
+    let pool = crate::create_pool(&format!("sqlite:{overlay_path}")).await?;
+    sqlx::migrate!("./migrations/facts").run(&pool).await?;
+    pool.close().await;
+    Ok(())
+}
+
+/// Seed the overlay's per-kind subject-id counters past the base's, so a fresh
+/// overlay over a populated base never re-mints a base subject id. The fact-id
+/// and commit-seq continuations take a per-branch `MAX` across base and overlay
+/// at insert time, but the typed counters are overlay-only state that can't span
+/// layers — so their high-water marks are copied forward once at mount, taking
+/// the max of each so a reused overlay that already minted past the base keeps
+/// its own frontier. Runs only on a base-mounted pool, where `base.*` resolves.
+async fn seed_overlay_continuations(pool: &SqlitePool) -> crate::DbResult<()> {
+    let (entity, event, image): (i64, i64, i64) = sqlx::query_as(queries::BASE_COUNTERS.sql)
+        .fetch_one(pool)
+        .await?;
+    sqlx::query(queries::SEED_COUNTERS.sql)
+        .bind(entity)
+        .bind(event)
+        .bind(image)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// SQLite implementation of [`FactStore`] over a base ∪ overlay pool: `main`
+/// holds no fact tables, the writable `ovl` overlay holds the store's own, and
+/// (when mounted) a frozen `base` supplies the layer beneath.
 #[derive(Debug, Clone)]
 pub struct SqliteFactStore {
     pool: SqlitePool,
+    /// The base-aware SQL resolved once for this store's fixed layer shape (see
+    /// [`FactQueries`]), so the hot paths bind a cached `&str` rather than
+    /// re-`format!`-ing per fact / member / page. Shared behind an `Arc` so
+    /// cloning the store — the api `AppState`, the tests — stays cheap.
+    queries: Arc<FactQueries>,
 }
 
 impl SqliteFactStore {
-    /// Wrap an already-built pool (migrations run, SpatiaLite loaded).
+    /// Wrap an already-built overlay-only pool (fact tables visible as `ovl.*`,
+    /// no base). The pool's owner set up the attach and the fact migrations.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            queries: Arc::new(FactQueries::resolve(false)),
+        }
     }
 
-    /// Open a fact store at `database_url`: build the pool, run migrations,
-    /// and wrap it. The lighter construction for batch loaders — no server
-    /// queues or worker channel, so `close` alone tears down cleanly.
+    /// Mount the fact store at `locations`. The one construction path, uniform
+    /// across the producer and serving:
+    ///
+    /// - ensure the overlay carries the fact schema ([`create_facts_file`], a
+    ///   no-op on an already-migrated file);
+    /// - validate any base pin ([`validate_facts_file`]: exists, SQLite, current
+    ///   codec stamp), so serving a missing, partial, or stale artifact fails
+    ///   loud rather than fabricating an empty layer;
+    /// - build the pool — the overlay attaches read-write, the base (if any)
+    ///   read-only+immutable, and the union views span both;
+    /// - seed the overlay's id counters past the base's, so a fresh overlay over
+    ///   a populated base never re-mints a base subject id;
+    /// - verify the fact-query plans against the layers this pool actually
+    ///   mounts.
+    ///
+    /// A base-less mount is the producer (`ingest build-db`, a fixture base,
+    /// which stamps afterward) and the fresh test/conformance fixtures. A
+    /// mount with a base serves that finished artifact under a scratch overlay.
     ///
     /// # Errors
-    /// Returns [`DbError`](crate::DbError) if the pool or migrations fail.
-    pub async fn open(database_url: &str) -> crate::DbResult<Self> {
-        let pool = crate::create_pool(database_url).await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self::new(pool))
+    /// Returns [`DbError`](crate::DbError) if the overlay build, base
+    /// validation, pool, seeding, or plan verification fails.
+    pub async fn open(locations: FactStoreLocations) -> crate::DbResult<Self> {
+        create_facts_file(locations.overlay_path()).await?;
+        if let Some(base) = locations.base_path() {
+            validate_facts_file(std::path::Path::new(base)).map_err(|e| {
+                crate::DbError::Config(format!(
+                    "{e}; build one with `ingest build-db` and point CHRONOSCOPE_FACTS_DB at it"
+                ))
+            })?;
+        }
+        let has_base = locations.base_path().is_some();
+        let pool = crate::create_pool_with_overlay(
+            &locations.app,
+            Some(crate::FactMount {
+                overlay: locations.overlay_path(),
+                base: locations.base_path(),
+            }),
+        )
+        .await?;
+        if has_base {
+            seed_overlay_continuations(&pool).await?;
+        }
+        let fact_queries = FactQueries::resolve(has_base);
+        // Verify the exact strings this store will bind, so the plan gate can't
+        // drift from the resolved set.
+        queries::verify_query_plans(&pool, &fact_queries).await?;
+        Ok(Self {
+            pool,
+            queries: Arc::new(fact_queries),
+        })
+    }
+
+    /// Stamp [`FACTS_CODEC_VERSION`] into the overlay's `user_version` — the
+    /// certificate that this facts database is a completed build. `ingest
+    /// build-db` calls it after the ingest succeeds, so an interrupted build
+    /// leaves `0` and is rejected by [`validate_facts_file`] and the dev
+    /// mount. The value is a compile-time constant, not input, and a `PRAGMA`
+    /// takes no binds.
+    ///
+    /// The stamp write lands in the overlay's WAL; a `TRUNCATE` checkpoint
+    /// then folds it into the database-file header, so [`validate_facts_file`]
+    /// — which reads the raw header, not a connection — sees the stamp
+    /// regardless of when the pool later checkpoints on close. Post-ingest
+    /// there are no held readers, so the checkpoint completes.
+    ///
+    /// # Errors
+    /// Returns [`DbError`](crate::DbError) if the write or checkpoint fails.
+    pub async fn stamp_codec_version(&self) -> crate::DbResult<()> {
+        sqlx::query(&format!("PRAGMA ovl.user_version = {FACTS_CODEC_VERSION}"))
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA ovl.wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Close the pool, awaiting connection teardown inside the runtime so
     /// SpatiaLite's `dlclose` finishes before process exit.
     pub async fn close(&self) {
         self.pool.close().await;
-    }
-
-    /// Stamp the database with [`FACTS_CODEC_VERSION`] via `PRAGMA
-    /// user_version` — the artifact builder's final step, so consumers can
-    /// refuse a stale codec before decoding anything. A PRAGMA takes no bind
-    /// parameters; the value is a compile-time constant, not input.
-    ///
-    /// # Errors
-    /// Returns [`DbError`](crate::DbError) if the write fails.
-    pub async fn stamp_codec_version(&self) -> crate::DbResult<()> {
-        sqlx::query(&format!("PRAGMA user_version = {FACTS_CODEC_VERSION}"))
-            .execute(&self.pool)
-            .await?;
-        Ok(())
     }
 }
 
@@ -222,7 +531,11 @@ impl WriteConn for ScopeTx<'_> {}
 /// form, and keeps its fields private so handles come only from the store.
 pub struct SqliteHandle<C> {
     conn: C,
+    /// The read scope — the snapshot bound.
     bound: ReadBound,
+    /// The store's cached base-aware SQL, threaded to the reads so they bind a
+    /// resolved `&str` instead of re-building it per call.
+    queries: Arc<FactQueries>,
 }
 
 /// Snapshot-scoped read view: an owned deferred read transaction plus the
@@ -303,6 +616,7 @@ impl FactStore for SqliteFactStore {
         let mut handle = SqliteHandle {
             conn: FrameConn(&mut tx, PhantomData),
             bound: ReadBound::Union,
+            queries: self.queries.clone(),
         };
         let result = f(self, &mut handle).await;
         if result.is_ok() {
@@ -329,7 +643,9 @@ impl FactStore for SqliteFactStore {
             .acquire()
             .await
             .map_err(sql("acquiring clock connection"))?;
-        Ok(FactId::new(read::next_fact_id(&mut conn).await?))
+        Ok(FactId::new(
+            read::next_fact_id(&mut conn, &self.queries).await?,
+        ))
     }
 
     async fn no_later_than(&self, snapshot: FactId) -> Result<Self::View<'_>, Self::Error> {
@@ -341,6 +657,7 @@ impl FactStore for SqliteFactStore {
         Ok(SqliteHandle {
             conn: ViewTx(tx),
             bound: ReadBound::Pinned(snapshot),
+            queries: self.queries.clone(),
         })
     }
 
@@ -352,10 +669,11 @@ impl FactStore for SqliteFactStore {
             .map_err(sql("opening view read transaction"))?;
         // Reading the watermark on the view's own transaction also latches
         // its WAL read snapshot right here.
-        let snapshot = FactId::new(read::next_fact_id(&mut tx).await?);
+        let snapshot = FactId::new(read::next_fact_id(&mut tx, &self.queries).await?);
         Ok(SqliteHandle {
             conn: ViewTx(tx),
             bound: ReadBound::Pinned(snapshot),
+            queries: self.queries.clone(),
         })
     }
 }
@@ -372,9 +690,12 @@ impl<C: AsConn> FactView<SqliteFactStore> for SqliteHandle<C> {
     /// moves as facts stage — `MAX(fact_id) + 1` over what its connection
     /// sees.
     async fn snapshot(&mut self) -> Result<FactId, Error> {
-        match self.bound {
-            ReadBound::Pinned(snapshot) => Ok(snapshot),
-            ReadBound::Union => Ok(FactId::new(read::next_fact_id(self.conn.conn()).await?)),
+        match self.bound.snapshot() {
+            Some(snapshot) => Ok(snapshot),
+            None => {
+                let fq = &*self.queries;
+                Ok(FactId::new(read::next_fact_id(self.conn.conn(), fq).await?))
+            }
         }
     }
 
@@ -396,14 +717,16 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         &mut self,
         member: &SqliteEntityId,
     ) -> Result<SqliteEntityId, Error> {
-        read::representative(self.conn.conn(), self.bound, *member).await
+        let fq = &*self.queries;
+        read::representative(self.conn.conn(), self.bound, fq, *member).await
     }
 
     async fn entity_class(
         &mut self,
         member: &SqliteEntityId,
     ) -> Result<EquivClass<SqliteEntityId>, Error> {
-        read::equiv_class(self.conn.conn(), self.bound, *member).await
+        let fq = &*self.queries;
+        read::equiv_class(self.conn.conn(), self.bound, fq, *member).await
     }
 
     /// The temporal streams wait on their date index; their empty page is
@@ -417,6 +740,7 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         limit: std::num::NonZeroUsize,
     ) -> Result<ClassWalkPage<SqliteFactStore, SqliteEntityId>, Error> {
         let bound = self.bound;
+        let fq = &*self.queries;
         let conn = self.conn.conn();
         match stream {
             EntityStream::ByName { name, language } => {
@@ -424,15 +748,15 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
                     norm: normalize_name(name),
                     language: language.as_str(),
                 };
-                read::keyed_class_page(conn, bound, key, named_entity, after, limit).await
+                read::keyed_class_page(conn, bound, fq, key, named_entity, after, limit).await
             }
             EntityStream::ByExternalReference { reference } => {
                 let key = FacetKey::ExternalRef(external_ref_key(reference)?);
-                read::keyed_class_page(conn, bound, key, referenced_entity, after, limit).await
+                read::keyed_class_page(conn, bound, fq, key, referenced_entity, after, limit).await
             }
-            EntityStream::All => read::all_class_page(conn, bound, after, limit).await,
+            EntityStream::All => read::all_class_page(conn, bound, fq, after, limit).await,
             EntityStream::InViewport(viewport) => {
-                read::spatial_entity_page(conn, bound, viewport, after, limit).await
+                read::spatial_entity_page(conn, bound, fq, viewport, after, limit).await
             }
             EntityStream::InTimeRange(_) | EntityStream::InViewportAndTimeRange { .. } => {
                 Ok(empty_class_page())
@@ -455,7 +779,8 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         after: Option<(SqliteImageId, FactId)>,
         limit: std::num::NonZeroUsize,
     ) -> Result<DepictionWalkPage<SqliteFactStore>, Error> {
-        read::depiction_page(self.conn.conn(), self.bound, *entity, after, limit).await
+        let fq = &*self.queries;
+        read::depiction_page(self.conn.conn(), self.bound, fq, *entity, after, limit).await
     }
 }
 
@@ -499,14 +824,16 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
         &mut self,
         members: &[SqliteImageId],
     ) -> Result<std::collections::HashMap<SqliteImageId, SqliteImageId>, Error> {
-        read::representatives(self.conn.conn(), self.bound, members).await
+        let fq = &*self.queries;
+        read::representatives(self.conn.conn(), self.bound, fq, members).await
     }
 
     async fn image_class(
         &mut self,
         member: &SqliteImageId,
     ) -> Result<EquivClass<SqliteImageId>, Error> {
-        read::equiv_class(self.conn.conn(), self.bound, *member).await
+        let fq = &*self.queries;
+        read::equiv_class(self.conn.conn(), self.bound, fq, *member).await
     }
 
     /// The temporal streams answer empty pages for the same reason as
@@ -518,15 +845,16 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
         limit: std::num::NonZeroUsize,
     ) -> Result<ClassWalkPage<SqliteFactStore, SqliteImageId>, Error> {
         let bound = self.bound;
+        let fq = &*self.queries;
         let conn = self.conn.conn();
         match stream {
             ImageStream::BySourceUrl { url } => {
                 let key = FacetKey::SourceUrl(url.as_str());
-                read::keyed_class_page(conn, bound, key, sourced_image, after, limit).await
+                read::keyed_class_page(conn, bound, fq, key, sourced_image, after, limit).await
             }
-            ImageStream::All => read::all_class_page(conn, bound, after, limit).await,
+            ImageStream::All => read::all_class_page(conn, bound, fq, after, limit).await,
             ImageStream::InViewport(viewport) => {
-                read::spatial_image_page(conn, bound, viewport, after, limit).await
+                read::spatial_image_page(conn, bound, fq, viewport, after, limit).await
             }
             ImageStream::InTimeRange(_) | ImageStream::InViewportAndTimeRange { .. } => {
                 Ok(empty_class_page())
@@ -564,7 +892,8 @@ impl<C: AsConn> SqliteHandle<C> {
         &mut self,
         entity: SqliteEntityId,
     ) -> Result<Vec<chronoscope_core::solvers::TemporalConflict>, Error> {
-        let scan = read::temporal_conflict_scan(self.conn.conn(), self.bound, entity).await?;
+        let fq = &*self.queries;
+        let scan = read::temporal_conflict_scan(self.conn.conn(), self.bound, fq, entity).await?;
         Ok(chronoscope_core::solvers::conflicts_via_index(&scan))
     }
 }
@@ -591,6 +920,7 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
     {
         // sqlx tracks transaction depth on the connection, so this begin
         // opens a savepoint nested in the write transaction.
+        let queries = self.queries.clone();
         let scope_tx = self
             .conn
             .conn()
@@ -600,6 +930,7 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         let mut scope = SqliteHandle {
             conn: ScopeTx(scope_tx),
             bound: ReadBound::Union,
+            queries,
         };
         let result = f(&mut scope).await;
         if result.is_ok() {
@@ -651,6 +982,7 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
     }
 
     async fn stage_fact(&mut self, fact: SqlStoredFact) -> Result<FactId, Error> {
+        let fq = &*self.queries;
         let conn = self.conn.conn();
         let facets = facet_columns(&fact)?;
         let subjects = subject_rows(&fact);
@@ -666,9 +998,9 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
             Some(hash) => read::commit_seq(&mut *conn, hash).await?,
             None => None,
         };
-        // SQL assigns the dense id (see INSERT_FACT); rows are never
+        // SQL assigns the dense id (see insert_fact_sql); rows are never
         // deleted, so ids stay dense for the store's life.
-        let staged = sqlx::query(queries::INSERT_FACT.sql)
+        let staged = sqlx::query(&fq.insert_fact)
             .bind(&fact_json)
             .bind(&facets.name_norm)
             .bind(&facets.name_language)
@@ -722,10 +1054,10 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         // staging, so a rejected submit's savepoint unwinds its rep rows
         // with its fact rows.
         if let (Some(kind), Some(a), Some(b)) = (facets.edge_kind, facets.edge_a, facets.edge_b) {
-            maintain::record_identity_edge(&mut *conn, kind, a, b, fid_raw).await?;
+            maintain::record_identity_edge(&mut *conn, fq, kind, a, b, fid_raw).await?;
         }
         if facets.retracts_fact_id.is_some() || retracts_commit_seq.is_some() {
-            maintain::record_retraction(&mut *conn, fid_raw).await?;
+            maintain::record_retraction(&mut *conn, fq, fid_raw).await?;
         }
         Ok(FactId::new(i64_to_u64(fid_raw, "staged fact id")?))
     }
@@ -739,10 +1071,11 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         commit: StoredCommit,
         result: &SqlSubmitResult,
     ) -> Result<(), Error> {
+        let insert = &self.queries.insert_commit;
         let conn = self.conn.conn();
         let commit_json = commit_to_json(&commit, result)?;
         let result_json = result_to_json(result)?;
-        let inserted = sqlx::query(queries::INSERT_COMMIT.sql)
+        let inserted = sqlx::query(insert)
             .bind(commit.commit_id.as_str())
             .bind(&commit_json)
             .bind(&result_json)

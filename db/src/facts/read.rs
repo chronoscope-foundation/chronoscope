@@ -37,13 +37,14 @@ use chronoscope_core::submit::{FactLookup, LocatedSubject, StoredFact, SubmitRes
 use super::convert::{i64_to_u64, seed_ids, u64_to_i64};
 use super::error::{SqliteFactStoreError, json, sql};
 use super::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
-use super::queries;
+use super::queries::{self, FactQueries};
 use super::storage::{
     SubjectColumn, day_number, depiction_subjects, fact_from_json, kind_tag, result_from_json,
 };
 
 /// A read's visibility: a pool view's pinned exclusive upper bound, or the
-/// whole of what the connection sees (a transaction's union view).
+/// whole of what the connection sees (a transaction's union view). The resolved
+/// base-aware SQL rides on the store's [`FactQueries`] cache, passed alongside.
 #[derive(Clone, Copy)]
 pub(super) enum ReadBound {
     Pinned(FactId),
@@ -51,6 +52,14 @@ pub(super) enum ReadBound {
 }
 
 impl ReadBound {
+    /// The pinned snapshot, or `None` for the union view.
+    pub(super) fn snapshot(self) -> Option<FactId> {
+        match self {
+            ReadBound::Pinned(snapshot) => Some(snapshot),
+            ReadBound::Union => None,
+        }
+    }
+
     /// SQL bind form. Stored fact ids all fit `i64`, so the union view (and
     /// any larger pin) admits the same rows as the maximum.
     pub(super) fn bind(self) -> i64 {
@@ -69,9 +78,13 @@ impl ReadBound {
     }
 }
 
-/// One past the highest stored fact id; 0 on an empty store.
-pub(super) async fn next_fact_id(conn: &mut SqliteConnection) -> Result<u64, SqliteFactStoreError> {
-    let (next,): (i64,) = sqlx::query_as(queries::NEXT_FACT_ID.sql)
+/// One past the highest stored fact id over the mounted layers; 0 on an empty
+/// store.
+pub(super) async fn next_fact_id(
+    conn: &mut SqliteConnection,
+    fq: &FactQueries,
+) -> Result<u64, SqliteFactStoreError> {
+    let (next,): (i64,) = sqlx::query_as(&fq.next_fact_id)
         .fetch_one(&mut *conn)
         .await
         .map_err(sql("reading next fact id"))?;
@@ -122,14 +135,14 @@ pub(super) async fn fact_lookup(
     bound: ReadBound,
     fact_id: FactId,
 ) -> Result<FactLookup<SqliteIds>, SqliteFactStoreError> {
-    if let ReadBound::Pinned(snapshot) = bound
+    if let Some(snapshot) = bound.snapshot()
         && fact_id.get() >= snapshot.get()
     {
         return Ok(FactLookup::Future);
     }
-    let missing = match bound {
-        ReadBound::Pinned(_) => FactLookup::Unknown,
-        ReadBound::Union => FactLookup::Future,
+    let missing = match bound.snapshot() {
+        Some(_) => FactLookup::Unknown,
+        None => FactLookup::Future,
     };
     // An id past the storable range has no row.
     let Ok(fid) = u64_to_i64(fact_id.get(), "fact lookup id") else {
@@ -200,7 +213,7 @@ pub(super) async fn placement(
     bound: ReadBound,
     id: FactId,
 ) -> Result<FactPlacement, SqliteFactStoreError> {
-    if let ReadBound::Pinned(snapshot) = bound
+    if let Some(snapshot) = bound.snapshot()
         && id.get() >= snapshot.get()
     {
         return Ok(FactPlacement::Absent);
@@ -228,10 +241,11 @@ pub(super) async fn placement(
 pub(super) async fn resolve_rep_raw(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     kind: &str,
     member: i64,
 ) -> Result<i64, SqliteFactStoreError> {
-    let row: Option<(i64,)> = sqlx::query_as(queries::RESOLVE_REP.sql)
+    let row: Option<(i64,)> = sqlx::query_as(&fq.resolve_rep)
         .bind(kind)
         .bind(member)
         .bind(bound.bind())
@@ -265,6 +279,7 @@ pub(super) async fn class_members_raw(
 async fn resolve_rep_cached(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     kind: &str,
     member: i64,
     cache: &mut std::collections::HashMap<i64, i64>,
@@ -272,7 +287,7 @@ async fn resolve_rep_cached(
     if let Some(rep) = cache.get(&member) {
         return Ok(*rep);
     }
-    let rep = resolve_rep_raw(conn, bound, kind, member).await?;
+    let rep = resolve_rep_raw(conn, bound, fq, kind, member).await?;
     cache.insert(member, rep);
     Ok(rep)
 }
@@ -281,9 +296,10 @@ async fn resolve_rep_cached(
 pub(super) async fn representative<S: SubjectColumn>(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     member: S,
 ) -> Result<S, SqliteFactStoreError> {
-    let rep = resolve_rep_raw(conn, bound, kind_tag(S::KIND), member.raw()).await?;
+    let rep = resolve_rep_raw(conn, bound, fq, kind_tag(S::KIND), member.raw()).await?;
     Ok(S::from_raw(rep))
 }
 
@@ -295,6 +311,7 @@ pub(super) async fn representative<S: SubjectColumn>(
 pub(super) async fn representatives<S: SubjectColumn + std::hash::Hash>(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     members: &[S],
 ) -> Result<std::collections::HashMap<S, S>, SqliteFactStoreError> {
     if members.is_empty() {
@@ -303,7 +320,7 @@ pub(super) async fn representatives<S: SubjectColumn + std::hash::Hash>(
     let raw_ids: Vec<i64> = members.iter().map(|m| m.raw()).collect();
     let members_json =
         serde_json::to_string(&raw_ids).map_err(json("encoding representative member list"))?;
-    let rows: Vec<(i64, i64)> = sqlx::query_as(queries::RESOLVE_REPS.sql)
+    let rows: Vec<(i64, i64)> = sqlx::query_as(&fq.resolve_reps)
         .bind(kind_tag(S::KIND))
         .bind(&members_json)
         .bind(bound.bind())
@@ -322,9 +339,10 @@ pub(super) async fn representatives<S: SubjectColumn + std::hash::Hash>(
 pub(super) async fn equiv_class<S: SubjectColumn>(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     member: S,
 ) -> Result<EquivClass<S>, SqliteFactStoreError> {
-    let rep = resolve_rep_raw(conn, bound, kind_tag(S::KIND), member.raw()).await?;
+    let rep = resolve_rep_raw(conn, bound, fq, kind_tag(S::KIND), member.raw()).await?;
     let mut members: std::collections::BTreeSet<S> =
         class_members_raw(conn, bound, kind_tag(S::KIND), rep)
             .await?
@@ -498,6 +516,7 @@ impl FacetKey<'_> {
 async fn rep_class_page<S: SubjectColumn>(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     subjects: Vec<(S, FactId)>,
     after: Option<(S, FactId)>,
     limit: std::num::NonZeroUsize,
@@ -505,8 +524,8 @@ async fn rep_class_page<S: SubjectColumn>(
     let mut reps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     let mut rows: std::collections::BTreeSet<(S, FactId)> = std::collections::BTreeSet::new();
     for (subject, fid) in subjects {
-        let rep =
-            resolve_rep_cached(conn, bound, kind_tag(S::KIND), subject.raw(), &mut reps).await?;
+        let rep = resolve_rep_cached(conn, bound, fq, kind_tag(S::KIND), subject.raw(), &mut reps)
+            .await?;
         rows.insert((S::from_raw(rep), fid));
     }
     Ok(pagination::class_page(&rows, after, limit))
@@ -520,6 +539,7 @@ async fn rep_class_page<S: SubjectColumn>(
 pub(super) async fn keyed_class_page<S: SubjectColumn>(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     key: FacetKey<'_>,
     subject_of: impl Fn(&StoredFact<SqliteIds>) -> Option<S>,
     after: Option<(S, FactId)>,
@@ -542,7 +562,7 @@ pub(super) async fn keyed_class_page<S: SubjectColumn>(
         };
         subjects.push((subject, *fid));
     }
-    rep_class_page(conn, bound, subjects, after, limit).await
+    rep_class_page(conn, bound, fq, subjects, after, limit).await
 }
 
 /// One page of the depiction walk: the depiction facts of `entity`'s
@@ -557,6 +577,7 @@ pub(super) async fn keyed_class_page<S: SubjectColumn>(
 pub(super) async fn depiction_page(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     entity: SqliteEntityId,
     after: Option<(SqliteImageId, FactId)>,
     limit: std::num::NonZeroUsize,
@@ -564,7 +585,7 @@ pub(super) async fn depiction_page(
     DepictionPage<StoredFact<SqliteIds>, SqliteImageId, (SqliteImageId, FactId)>,
     SqliteFactStoreError,
 > {
-    let members = equiv_class(conn, bound, entity).await?.members;
+    let members = equiv_class(conn, bound, fq, entity).await?.members;
     // A depiction names one entity, so each candidate appears under exactly
     // one member; the map keys by fact id regardless.
     let mut candidates: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
@@ -600,6 +621,7 @@ pub(super) async fn depiction_page(
         let rep = resolve_rep_cached(
             conn,
             bound,
+            fq,
             kind_tag(SqliteImageId::KIND),
             image.raw(),
             &mut reps,
@@ -640,12 +662,16 @@ pub(super) async fn depiction_page(
 async fn located_in_viewport(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     viewport: &Viewport,
     kinds: (&str, &str),
 ) -> Result<Vec<(FactId, StoredFact<SqliteIds>)>, SqliteFactStoreError> {
+    // The spatial read can't span layers through a temp view (an rtree drives
+    // its index only when named directly), so the candidate SQL unions the base
+    // and overlay rtree branches explicitly when a base is mounted.
     let mut candidates: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
     for half in viewport.halves() {
-        let rows: Vec<(i64, String)> = sqlx::query_as(queries::SPATIAL_CANDIDATES.sql)
+        let rows: Vec<(i64, String)> = sqlx::query_as(&fq.spatial_candidates)
             .bind(half.min_lat)
             .bind(half.max_lat)
             .bind(half.min_lon)
@@ -730,6 +756,7 @@ async fn event_owners(
 pub(super) async fn spatial_entity_page(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     viewport: &Viewport,
     after: Option<(SqliteEntityId, FactId)>,
     limit: std::num::NonZeroUsize,
@@ -738,7 +765,7 @@ pub(super) async fn spatial_entity_page(
         kind_tag(SqliteEntityId::KIND),
         kind_tag(SqliteEventId::KIND),
     );
-    let located = located_in_viewport(conn, bound, viewport, kinds).await?;
+    let located = located_in_viewport(conn, bound, fq, viewport, kinds).await?;
     let mut subjects: Vec<(SqliteEntityId, FactId)> = Vec::new();
     let mut moved: Vec<(SqliteEventId, FactId)> = Vec::new();
     for (fid, fact) in &located {
@@ -756,7 +783,7 @@ pub(super) async fn spatial_entity_page(
             subjects.push((*entity, fid));
         }
     }
-    rep_class_page(conn, bound, subjects, after, limit).await
+    rep_class_page(conn, bound, fq, subjects, after, limit).await
 }
 
 /// One page of the image `InViewport` class walk: [`located_in_viewport`] facts of
@@ -765,19 +792,20 @@ pub(super) async fn spatial_entity_page(
 pub(super) async fn spatial_image_page(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     viewport: &Viewport,
     after: Option<(SqliteImageId, FactId)>,
     limit: std::num::NonZeroUsize,
 ) -> Result<ClassPage<SqliteImageId, (SqliteImageId, FactId)>, SqliteFactStoreError> {
     let kind = kind_tag(SqliteImageId::KIND);
-    let located = located_in_viewport(conn, bound, viewport, (kind, kind)).await?;
+    let located = located_in_viewport(conn, bound, fq, viewport, (kind, kind)).await?;
     let mut subjects: Vec<(SqliteImageId, FactId)> = Vec::new();
     for (fid, fact) in &located {
         if let Some((_, LocatedSubject::Image(image))) = fact.located_subject() {
             subjects.push((*image, *fid));
         }
     }
-    rep_class_page(conn, bound, subjects, after, limit).await
+    rep_class_page(conn, bound, fq, subjects, after, limit).await
 }
 
 /// The `(rep, fact_id)` SQL binds for an All-walk cursor. `None` opens the
@@ -792,8 +820,8 @@ fn all_cursor_binds<S: SubjectColumn>(after: Option<(S, FactId)>) -> (i64, i64) 
 }
 
 /// One page of the All-stream class walk: the single-statement walk
-/// ([`CLASS_WALK_ALL`](super::queries::CLASS_WALK_ALL)) fetches one row past
-/// the page to learn whether candidates remain, then the batched retractor
+/// ([`class_walk_all_sql`](super::queries::class_walk_all_sql)) fetches one row
+/// past the page to learn whether candidates remain, then the batched retractor
 /// closure drops retracted candidates in Rust. `next` resumes past the last
 /// candidate consumed (active or not), so a page can come back short with a
 /// live cursor. `next_class` follows the last emitted row's representative:
@@ -803,6 +831,7 @@ fn all_cursor_binds<S: SubjectColumn>(after: Option<(S, FactId)>) -> (i64, i64) 
 pub(super) async fn all_class_page<S: SubjectColumn>(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     after: Option<(S, FactId)>,
     limit: std::num::NonZeroUsize,
 ) -> Result<ClassPage<S, (S, FactId)>, SqliteFactStoreError> {
@@ -810,7 +839,7 @@ pub(super) async fn all_class_page<S: SubjectColumn>(
     let fetch = i64::try_from(limit.get())
         .unwrap_or(i64::MAX)
         .saturating_add(1);
-    let mut candidates: Vec<(i64, i64)> = sqlx::query_as(queries::CLASS_WALK_ALL.sql)
+    let mut candidates: Vec<(i64, i64)> = sqlx::query_as(&fq.class_walk_all)
         .bind(kind_tag(S::KIND))
         .bind(bound.bind())
         .bind(after_rep)
@@ -863,7 +892,7 @@ pub(super) async fn all_class_page<S: SubjectColumn>(
                 // exhausted cursor, one extra round trip and correct
                 // termination. Deliberate: filtering the probe would cost a
                 // retraction closure at every page end.
-                let probe: Option<(i64, i64)> = sqlx::query_as(queries::CLASS_WALK_ALL.sql)
+                let probe: Option<(i64, i64)> = sqlx::query_as(&fq.class_walk_all)
                     .bind(kind_tag(S::KIND))
                     .bind(bound.bind())
                     .bind(last_raw)
@@ -1091,9 +1120,10 @@ async fn witness_groups(
 pub(super) async fn temporal_conflict_scan(
     conn: &mut SqliteConnection,
     bound: ReadBound,
+    fq: &FactQueries,
     entity: SqliteEntityId,
 ) -> Result<WitnessScan, SqliteFactStoreError> {
-    let members = equiv_class(conn, bound, entity).await?.members;
+    let members = equiv_class(conn, bound, fq, entity).await?.members;
     let owned = owned_events(conn, bound, &members).await?;
 
     let construction_starts =

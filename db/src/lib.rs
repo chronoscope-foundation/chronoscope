@@ -27,8 +27,9 @@ use chronoscope_integrations::IntegrationRegistry;
 
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use facts::{
-    FACTS_CODEC_VERSION, SqliteEntityId, SqliteEventId, SqliteFactStore, SqliteFactStoreError,
-    SqliteIds, SqliteImageId,
+    FACTS_CODEC_VERSION, FactStoreLocations, FactsFileError, SqliteEntityId, SqliteEventId,
+    SqliteFactStore, SqliteFactStoreError, SqliteIds, SqliteImageId, create_facts_file,
+    validate_facts_file,
 };
 pub use models::{
     FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
@@ -188,7 +189,10 @@ impl Database {
         let registry = chronoscope_integrations::create_registry(None)?;
         let pool = create_pool(database_url).await?;
 
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        // App tables only — the fact tables live in a separate facts database
+        // (see `db/migrations/facts/` and [`SqliteFactStore`]), migrated by
+        // whoever creates that file.
+        sqlx::migrate!("./migrations/app").run(&pool).await?;
 
         #[cfg(any(test, feature = "test-support"))]
         let worker_progress_tx = watch::channel(0).0;
@@ -220,13 +224,14 @@ impl Database {
         })
     }
 
-    /// Verify all query plans (static queries + queue-generated queries).
+    /// Verify all query plans (static app queries + queue-generated queries).
+    ///
+    /// The fact-store queries verify against their own base+overlay-attached
+    /// pool in [`SqliteFactStore::open`]; this app pool has no fact-store
+    /// attach, so they can't resolve here.
     async fn verify_all_query_plans(&self) -> DbResult<()> {
         // Verify static queries
         queries::verify_all_query_plans(&self.pool).await?;
-
-        // Verify fact-store queries
-        facts::verify_query_plans(&self.pool).await?;
 
         // Verify queue-generated queries
         for queue in &self.all_queues {
@@ -239,10 +244,45 @@ impl Database {
     }
 }
 
+/// The fact-store databases a connection attaches. The `overlay` is always
+/// writable — every submit stages there — and `base`, when set, is a frozen
+/// artifact the union reads span beneath it. Mutability is fixed per layer:
+/// the base attaches read-only and immutable, the overlay read-write. The
+/// producer (`ingest build-db`, a fixture base) writes an artifact by mounting
+/// it as the overlay with no base; serving mounts that finished artifact as a
+/// base under a fresh writable overlay.
+pub(crate) struct FactMount<'a> {
+    /// The writable overlay facts database — a bare filesystem path attached
+    /// as `ovl`.
+    pub overlay: &'a str,
+    /// The frozen base facts database attached read-only+immutable as `base`,
+    /// or `None` for an overlay-only mount (reads resolve straight to `ovl`).
+    pub base: Option<&'a str>,
+}
+
 /// Create the SQLite connection pool with SpatiaLite loaded. A free function
 /// rather than a `Database` method so the fact-store tests can build the same
 /// pool shape without the queue/registry plumbing.
 pub(crate) async fn create_pool(database_url: &str) -> DbResult<SqlitePool> {
+    create_pool_with_overlay(database_url, None).await
+}
+
+/// Build the pool over `database_url` as `main`, with SpatiaLite loaded. When
+/// `mount` is `Some(..)`, every connection attaches the fact-store layers: the
+/// writable overlay as schema `ovl`, and (when the mount carries one) a frozen
+/// base as `base` through a `mode=ro&immutable=1` URI — so an immutable pin, a
+/// 0444 nix-store artifact with no room for WAL/-shm sidecars, attaches with no
+/// write probe or locking. With a base attached, each connection also builds a
+/// temp union view per fact table ([`facts::UNION_VIEW_TABLES`]) so the
+/// unqualified reads span both layers; the overlay-only mount leaves the reads
+/// resolving straight to `ovl`. The attach and view build run in
+/// `after_connect`, alongside the SpatiaLite `.extension()` load: the extension
+/// is a connect option applied during the connect, the setup a post-connect
+/// hook, so the two coexist.
+pub(crate) async fn create_pool_with_overlay(
+    database_url: &str,
+    mount: Option<FactMount<'_>>,
+) -> DbResult<SqlitePool> {
     let spatialite_dir = std::env::var("SPATIALITE_LIBRARY_PATH")
         .map_err(|_| DbError::Config("SPATIALITE_LIBRARY_PATH must be set".to_string()))?;
 
@@ -250,7 +290,7 @@ pub(crate) async fn create_pool(database_url: &str) -> DbResult<SqlitePool> {
     // connection opens the filename independently, and without
     // cache=shared every connection would see its own empty database.
     // The per-pool sequence number keeps separate pools isolated.
-    let options = if database_url == "sqlite::memory:" {
+    let mut options = if database_url == "sqlite::memory:" {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seqno = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -270,14 +310,62 @@ pub(crate) async fn create_pool(database_url: &str) -> DbResult<SqlitePool> {
     .busy_timeout(Duration::from_secs(5))
     .extension(format!("{spatialite_dir}/mod_spatialite"));
 
+    // SpatiaLite's geometry-maintenance triggers keep the shadow rtree in sync
+    // on an overlay `facts_spatial` insert; they call functions it flags as
+    // unsafe, which fire only under `trusted_schema=ON`. Every fact mount owns
+    // a writable overlay that stages those inserts, so the pragma rides the
+    // fact-store pools; the app pool holds no fact tables and never fires a
+    // maintenance trigger, so it goes without.
+    if mount.is_some() {
+        options = options.pragma("trusted_schema", "ON");
+    }
+
     // Fact-store read views hold a connection for their lifetime (one WAL
     // read transaction each), so the cap covers concurrent held views plus
     // the writer and short CRUD/queue acquires — not just transient
     // statements.
-    let pool = SqlitePoolOptions::new()
-        .max_connections(16)
-        .connect_with(options)
-        .await?;
+    let mut builder = SqlitePoolOptions::new().max_connections(16);
+    if let Some(mount) = mount {
+        let overlay = mount.overlay.to_owned();
+        // sqlx opens every connection with `SQLITE_OPEN_URI`, so the immutable
+        // `file:` URI processes on `ATTACH`.
+        let base = mount
+            .base
+            .map(|path| format!("file:{path}?mode=ro&immutable=1"));
+        builder = builder.after_connect(move |conn, _meta| {
+            let overlay = overlay.clone();
+            let base = base.clone();
+            Box::pin(async move {
+                // The filename binds as a parameter; the schema name is a fixed
+                // identifier ATTACH won't accept as a bind.
+                sqlx::query("ATTACH DATABASE ?1 AS ovl")
+                    .bind(overlay)
+                    .execute(&mut *conn)
+                    .await?;
+                if let Some(base) = base {
+                    sqlx::query("ATTACH DATABASE ?1 AS base")
+                        .bind(base)
+                        .execute(&mut *conn)
+                        .await?;
+                    // Temp objects win name resolution, so the unqualified reads
+                    // transparently span base ∪ overlay. Fact ids are disjoint
+                    // across the layers (the overlay mints past the base's max),
+                    // so UNION ALL never double-counts a subject.
+                    for table in facts::UNION_VIEW_TABLES {
+                        sqlx::query(&format!(
+                            "CREATE TEMP VIEW {table} AS \
+                             SELECT * FROM base.{table} \
+                             UNION ALL SELECT * FROM ovl.{table}"
+                        ))
+                        .execute(&mut *conn)
+                        .await?;
+                    }
+                }
+                Ok(())
+            })
+        });
+    }
+    let pool = builder.connect_with(options).await?;
 
     Ok(pool)
 }

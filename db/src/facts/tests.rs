@@ -11,11 +11,14 @@ use sqlx::sqlite::SqlitePool;
 
 use chronoscope_core::grammar::assertions::FactualAssertion;
 use chronoscope_core::grammar::attribute;
+use chronoscope_core::grammar::citations::Language;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::store::conformance::fixtures::{
-    commit_err, commit_name, fixed_time, local_bundle, name_fact, user_author,
+    commit_err, commit_name, commit_result, construction_at, construction_started_fact, fixed_time,
+    local_bundle, name_fact, retract_fact, same_entity_fact, sample_viewport, user_author,
 };
 use chronoscope_core::store::conformance::{TestError, TestResult, UnmintedIds};
+use chronoscope_core::store::schema::EntityStream;
 use chronoscope_core::store::{EntityView, FactStore, FactView, FactWrite};
 use chronoscope_core::submit::{
     Commit as SubmitBundle, Decl, EntityIdx, FactLookup, ResolutionOrigin, StoredFact, SubmitError,
@@ -37,22 +40,33 @@ impl UnmintedIds for SqliteFactStore {
     }
 }
 
-/// A fresh migrated pool with the crate's standard shape (SpatiaLite loaded).
-async fn fresh_pool(database_url: &str) -> Result<SqlitePool, DbError> {
-    let pool = crate::create_pool(database_url).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
-    Ok(pool)
+/// A fresh pool over the facts file at `overlay` (a filesystem path): the
+/// file is created + migrated if absent, then attached as `ovl` on a
+/// throwaway in-memory `main` — the two-file layout every fact-store test
+/// rides. Routes the path through [`FactStoreLocations::standalone_at`], the
+/// one place a tempdir path becomes the overlay string. No plan verification
+/// (that is its own test), so the conformance suite stays fast.
+async fn fresh_pool(overlay: &std::path::Path) -> Result<SqlitePool, DbError> {
+    let overlay = super::path_string(overlay, "overlay")?;
+    crate::create_facts_file(&overlay).await?;
+    crate::create_pool_with_overlay(
+        "sqlite::memory:",
+        Some(crate::FactMount {
+            overlay: &overlay,
+            base: None,
+        }),
+    )
+    .await
 }
 
-/// A fresh file-backed store per case, plus the tempdir holding its
-/// database. Views hold read transactions for their lifetime, and only a
-/// file-backed database gives WAL's reader/writer independence — a
-/// shared-cache in-memory database serializes them at table locks. The
-/// witness homomorphism suite reuses it for the same reader/writer reason.
+/// A fresh file-backed store per case, plus the tempdir holding its overlay
+/// facts file. Views hold read transactions on the overlay (WAL) for their
+/// lifetime; only a file-backed overlay gives WAL's reader/writer
+/// independence — an in-memory overlay would serialize them at table locks.
+/// The witness homomorphism suite reuses it for the same reader/writer reason.
 pub(super) async fn fresh_store() -> Result<(SqliteFactStore, tempfile::TempDir), TestError> {
     let dir = tempfile::tempdir()?;
-    let url = format!("sqlite:{}", dir.path().join("facts.sqlite3").display());
-    let pool = fresh_pool(&url).await?;
+    let pool = fresh_pool(&dir.path().join("facts.sqlite3")).await?;
     Ok((SqliteFactStore::new(pool), dir))
 }
 
@@ -62,7 +76,11 @@ chronoscope_core::fact_store_conformance!(fresh_store());
 /// runtime — the teardown that keeps SpatiaLite's dlclose off the exit path.
 #[tokio::test]
 async fn open_migrates_the_store_and_close_tears_it_down() -> TestResult {
-    let store = SqliteFactStore::open("sqlite::memory:").await?;
+    let dir = tempfile::tempdir()?;
+    let store = SqliteFactStore::open(FactStoreLocations::standalone_at(
+        &dir.path().join("facts.sqlite3"),
+    )?)
+    .await?;
     assert_eq!(
         store.next_fact_id().await?,
         FactId::new(0),
@@ -80,10 +98,10 @@ async fn open_migrates_the_store_and_close_tears_it_down() -> TestResult {
 #[tokio::test]
 async fn reopened_file_store_serves_committed_facts() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let url = format!("sqlite:{}", dir.path().join("facts.sqlite3").display());
+    let overlay = dir.path().join("facts.sqlite3");
 
     let (commit_id, fact_id) = {
-        let pool = fresh_pool(&url).await?;
+        let pool = fresh_pool(&overlay).await?;
         let store = SqliteFactStore::new(pool.clone());
         let result = commit_name(&store, "durable").await?;
         let fact_id = *result.fact_ids.first().ok_or("no fact id")?;
@@ -91,7 +109,7 @@ async fn reopened_file_store_serves_committed_facts() -> TestResult {
         (result.commit_id, fact_id)
     };
 
-    let pool = fresh_pool(&url).await?;
+    let pool = fresh_pool(&overlay).await?;
     let store = SqliteFactStore::new(pool.clone());
     assert_eq!(
         store.next_fact_id().await?,
@@ -334,8 +352,7 @@ async fn negative_existing_entity_id_rejected_as_unknown() -> TestResult {
 #[tokio::test]
 async fn begin_immediate_serializes_concurrent_writers() -> TestResult {
     let dir = tempfile::tempdir()?;
-    let url = format!("sqlite:{}", dir.path().join("facts.sqlite3").display());
-    let pool = fresh_pool(&url).await?;
+    let pool = fresh_pool(&dir.path().join("facts.sqlite3")).await?;
     let store = Arc::new(SqliteFactStore::new(pool.clone()));
 
     let first_finished = Arc::new(AtomicBool::new(false));
@@ -419,10 +436,501 @@ async fn begin_immediate_serializes_concurrent_writers() -> TestResult {
 // --- query-plan gate ---
 
 /// Every fact-store query plans without a full table scan against the real
-/// migrated schema.
+/// migrated schema, with the fact tables in the attached `ovl` overlay — the
+/// unqualified reads and the `ovl.`-qualified writes must all resolve there.
 #[tokio::test]
 async fn fact_store_query_plans_use_indexes() -> TestResult {
-    let pool = fresh_pool("sqlite::memory:").await?;
-    super::queries::verify_query_plans(&pool).await?;
+    let dir = tempfile::tempdir()?;
+    let pool = fresh_pool(&dir.path().join("facts.sqlite3")).await?;
+    let fact_queries = super::queries::FactQueries::resolve(false);
+    super::queries::verify_query_plans(&pool, &fact_queries).await?;
+    Ok(())
+}
+
+/// Every fact-store query still plans without a full table scan over a mounted
+/// base ∪ overlay — the reads resolve through the temp union views and the
+/// spatial candidate SQL through its two-branch rtree union, so the no-full-scan
+/// gate keeps its teeth across the layers, not just overlay-only. `open` runs
+/// the plan verification internally, so a full-scan plan would fail this mount.
+#[tokio::test]
+async fn fact_store_query_plans_use_indexes_over_a_mounted_base() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    commit_result(
+        &base,
+        local_bundle::<SqliteIds>(1, 0, 0, 0, vec![construction_at(0, 40.5, -73.5)?])?,
+    )
+    .await?;
+    finish_base(base).await?;
+    let overlay = dir.path().join("overlay.sqlite3");
+    let store =
+        SqliteFactStore::open(FactStoreLocations::mounted_at(&base_path, &overlay)?).await?;
+    store.close().await;
+    Ok(())
+}
+
+// --- base build helpers ---
+
+/// Open a fresh overlay-only store to build a base artifact at `path`. The
+/// caller submits into it, then finishes it with [`finish_base`].
+async fn open_base(path: &std::path::Path) -> Result<SqliteFactStore, TestError> {
+    Ok(SqliteFactStore::open(FactStoreLocations::standalone_at(path)?).await?)
+}
+
+/// Stamp and close a base artifact so it is a valid, immutable-ready pin. The
+/// stamp's TRUNCATE checkpoint folds the overlay's WAL into the file, so an
+/// immutable reader (which ignores the WAL) later sees everything.
+async fn finish_base(store: SqliteFactStore) -> Result<(), TestError> {
+    store.stamp_codec_version().await?;
+    store.close().await;
+    Ok(())
+}
+
+/// Mount `base_path` beneath a fresh scratch overlay in `dir`.
+async fn mount_over(
+    dir: &tempfile::TempDir,
+    base_path: &std::path::Path,
+) -> Result<SqliteFactStore, TestError> {
+    let overlay = dir.path().join("overlay.sqlite3");
+    Ok(SqliteFactStore::open(FactStoreLocations::mounted_at(base_path, &overlay)?).await?)
+}
+
+// --- base validation ---
+
+/// `open` validates any base pin rather than fabricating: a missing path and an
+/// unstamped/partial build both fail loud, while a completed, codec-stamped
+/// build mounts. A `create_facts_file`-only DB stands in for an interrupted
+/// build — migrated but never stamped (`user_version` 0). The real consumer is
+/// the dev server mounting a pinned artifact.
+#[tokio::test]
+async fn open_rejects_an_invalid_base_pin() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let bad = || FactStoreLocations::mounted_at(&base_path, &dir.path().join("overlay.sqlite3"));
+
+    // Missing base: no fabrication, a loud config error.
+    let missing = SqliteFactStore::open(bad()?).await;
+    assert!(
+        matches!(missing, Err(DbError::Config(_))),
+        "mounting a missing base must fail loud, got {missing:?}"
+    );
+
+    // Migrated but unstamped (the interrupted-build state): still rejected.
+    crate::create_facts_file(super::path_string(&base_path, "base")?.as_str()).await?;
+    let unstamped = SqliteFactStore::open(bad()?).await;
+    assert!(
+        matches!(unstamped, Err(DbError::Config(_))),
+        "mounting an unstamped/partial base must fail loud, got {unstamped:?}"
+    );
+    assert!(matches!(
+        crate::validate_facts_file(&base_path),
+        Err(crate::FactsFileError::CodecMismatch { found: 0, .. })
+    ));
+
+    // Stamp it (what `ingest build-db` does after a successful ingest), and the
+    // mount now succeeds.
+    finish_base(open_base(&base_path).await?).await?;
+    let store = mount_over(&dir, &base_path).await?;
+    assert_eq!(store.next_fact_id().await?, FactId::new(0));
+    store.close().await;
+    Ok(())
+}
+
+/// `stamp_codec_version`'s TRUNCATE checkpoint folds the stamp into the file
+/// header immediately, so [`validate_facts_file`](crate::validate_facts_file) —
+/// which reads the raw header bytes (`user_version` at offset 60..64,
+/// big-endian), never opening a connection — sees the current codec version
+/// while the writing connection is still open, before any close-time
+/// checkpoint. A bare `PRAGMA user_version` without the truncate checkpoint
+/// would leave the stamp in the WAL until close and fail this pre-close read —
+/// the exact WAL-durability regression the assertion guards.
+#[tokio::test]
+async fn stamp_reaches_file_header_before_close() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let store = open_base(&base_path).await?;
+    commit_name(&store, "resident").await?;
+    store.stamp_codec_version().await?;
+    // Read the raw header before close: the stamp must already be in the file.
+    crate::validate_facts_file(&base_path)
+        .map_err(|e| format!("stamp did not reach the file header before close: {e}"))?;
+    store.close().await;
+    // And it survives the close.
+    crate::validate_facts_file(&base_path).map_err(|e| format!("stamped file rejected: {e}"))?;
+    Ok(())
+}
+
+// --- cross-layer reads ---
+
+/// A mounted store's unqualified reads span the base through the union views: a
+/// base fact reads Active and turns up in its subject's backlink. The union is
+/// load-bearing — the same fact id in a fresh overlay-only store (empty overlay,
+/// no base) reads Future, so the base data reaches the reader only through the
+/// union.
+#[tokio::test]
+async fn mounted_reads_span_base_facts() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    let base_result = commit_name(&base, "base-entity").await?;
+    let base_fact = *base_result.fact_ids.first().ok_or("no base fact id")?;
+    let base_entity = base_result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("base entity resolution missing")?
+        .id;
+    finish_base(base).await?;
+
+    let store = mount_over(&dir, &base_path).await?;
+    let mut view = store.now().await?;
+    assert!(
+        matches!(view.fact(base_fact).await?, FactLookup::Active(_)),
+        "the mounted store must serve the base fact through the union view"
+    );
+    let limit = std::num::NonZeroUsize::new(100).ok_or("limit is nonzero")?;
+    let page = view
+        .all_facts_about_entity(&base_entity, None, limit)
+        .await?;
+    assert_eq!(
+        page.items.len(),
+        1,
+        "the base entity's backlink must span the base facts"
+    );
+    drop(view);
+    store.close().await;
+
+    // Overlay-only, no base: the same fact id is unknown, so the base data
+    // above reached the reader only through the union.
+    let (bare, _bare_dir) = fresh_store().await?;
+    let mut bare_view = bare.now().await?;
+    assert!(
+        matches!(bare_view.fact(base_fact).await?, FactLookup::Future),
+        "an overlay-only store has no base fact to serve"
+    );
+    Ok(())
+}
+
+/// A fresh overlay over a populated base mints past the base's ids rather than
+/// colliding: the seed lifts the overlay's counters and the union `MAX`
+/// continues the fact ids. Three base entities minted 0..2, so the overlay's
+/// first fresh entity is 3 and its first fact continues past the base's.
+#[tokio::test]
+async fn overlay_mint_continues_past_base_ids() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    let base_result = commit_result(
+        &base,
+        local_bundle::<SqliteIds>(
+            3,
+            0,
+            0,
+            0,
+            vec![name_fact(0, "a")?, name_fact(1, "b")?, name_fact(2, "c")?],
+        )?,
+    )
+    .await?;
+    let base_next_fact = base_result.fact_ids.len() as u64;
+    finish_base(base).await?;
+
+    let store = mount_over(&dir, &base_path).await?;
+    assert_eq!(
+        store.next_fact_id().await?,
+        FactId::new(base_next_fact),
+        "the overlay's clock must continue past the base's facts"
+    );
+    let result = commit_name(&store, "overlay-entity").await?;
+    let minted = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity resolution missing")?
+        .id;
+    assert_eq!(
+        minted,
+        SqliteEntityId(3),
+        "a fresh overlay mint must continue past the base's three entities, not collide at 0"
+    );
+    assert_eq!(
+        result.fact_ids.first(),
+        Some(&FactId::new(base_next_fact)),
+        "the overlay's fact ids continue past the base's"
+    );
+    store.close().await;
+    Ok(())
+}
+
+/// An overlay `SameEntity` merging a base entity into a base class re-points the
+/// whole losing class — including members whose only rep row lives in the base.
+/// The base merges entities 1,2 (rep 1); the overlay then merges 0 with that
+/// class, and member 2 (base-only rep row) must follow to representative 0.
+/// Without the union, the merge's class gather would miss the base row and
+/// leave member 2 stranded at representative 1.
+#[tokio::test]
+async fn overlay_same_entity_merges_a_base_class() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    commit_result(
+        &base,
+        local_bundle::<SqliteIds>(
+            3,
+            0,
+            0,
+            0,
+            vec![
+                name_fact(0, "a")?,
+                name_fact(1, "b")?,
+                name_fact(2, "c")?,
+                same_entity_fact(1, 2)?,
+            ],
+        )?,
+    )
+    .await?;
+    finish_base(base).await?;
+
+    let store = mount_over(&dir, &base_path).await?;
+    // Merge base entity 0 with the base class {1, 2} via existing-id decls.
+    commit_result(
+        &store,
+        SubmitBundle::<SqliteIds> {
+            author: user_author()?,
+            recorded_at: fixed_time() + chrono::Duration::seconds(10),
+            entities: vec![
+                Decl::Existing {
+                    id: SqliteEntityId(0),
+                },
+                Decl::Existing {
+                    id: SqliteEntityId(1),
+                },
+            ],
+            events: Vec::new(),
+            images: Vec::new(),
+            facts: [same_entity_fact(0, 1)?].into_iter().collect(),
+        },
+    )
+    .await?;
+
+    let mut view = store.now().await?;
+    let class = view.entity_class(&SqliteEntityId(0)).await?;
+    let members: std::collections::BTreeSet<SqliteEntityId> =
+        class.members.iter().copied().collect();
+    assert_eq!(
+        members,
+        [SqliteEntityId(0), SqliteEntityId(1), SqliteEntityId(2)]
+            .into_iter()
+            .collect(),
+        "the overlay merge must pull the base member 2 into the class across the union"
+    );
+    assert_eq!(
+        view.entity_representative(&SqliteEntityId(2)).await?,
+        SqliteEntityId(0),
+        "base member 2 must resolve to the merged representative 0"
+    );
+    drop(view);
+    store.close().await;
+    Ok(())
+}
+
+/// An overlay retraction hides a base fact: the retractor row lives in the
+/// overlay, its target in the base, and the closure spans both — seeding from
+/// the base fact and reaching the overlay retractor through the union. Without
+/// the union the base seed would not be found and the fact would read Active.
+#[tokio::test]
+async fn overlay_retraction_hides_a_base_fact() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    let base_result = commit_result(
+        &base,
+        local_bundle::<SqliteIds>(
+            1,
+            0,
+            0,
+            0,
+            vec![name_fact(0, "alpha")?, construction_started_fact(0)?],
+        )?,
+    )
+    .await?;
+    let target = *base_result
+        .fact_ids
+        .get(1)
+        .ok_or("no base construction fact")?;
+    finish_base(base).await?;
+
+    let store = mount_over(&dir, &base_path).await?;
+    {
+        let mut view = store.now().await?;
+        assert!(
+            matches!(view.fact(target).await?, FactLookup::Active(_)),
+            "the base construction fact starts Active"
+        );
+    }
+    commit_result(
+        &store,
+        SubmitBundle::<SqliteIds> {
+            author: user_author()?,
+            recorded_at: fixed_time() + chrono::Duration::seconds(10),
+            entities: Vec::new(),
+            events: Vec::new(),
+            images: Vec::new(),
+            facts: [retract_fact(target)?].into_iter().collect(),
+        },
+    )
+    .await?;
+
+    let mut view = store.now().await?;
+    assert!(
+        matches!(view.fact(target).await?, FactLookup::Retracted { .. }),
+        "the overlay retraction must hide the base fact across the union"
+    );
+    drop(view);
+    store.close().await;
+    Ok(())
+}
+
+/// An overlay split shadows a base rep with a later overlay row while earlier
+/// snapshots stay merged. The base merges 0,1 (member 1 → rep 0); the overlay
+/// retracts that edge, splitting them, and appends a later rep row (member 1 →
+/// self). At `now` member 1 resolves to itself; a snapshot pinned between the
+/// base merge and the overlay split still resolves it to 0 through the base
+/// row — the append-only, historically-immutable rep log across the union.
+#[tokio::test]
+async fn overlay_split_shadows_base_rep_earlier_snapshots_stay_merged() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    let base_result = commit_result(
+        &base,
+        local_bundle::<SqliteIds>(
+            2,
+            0,
+            0,
+            0,
+            vec![
+                name_fact(0, "a")?,
+                name_fact(1, "b")?,
+                same_entity_fact(0, 1)?,
+            ],
+        )?,
+    )
+    .await?;
+    // The identity edge is the last base fact; retracting it splits the class.
+    let edge = *base_result.fact_ids.last().ok_or("no base identity fact")?;
+    let merged_snapshot = FactId::new(edge.get() + 1);
+    finish_base(base).await?;
+
+    let store = mount_over(&dir, &base_path).await?;
+    {
+        let mut view = store.now().await?;
+        assert_eq!(
+            view.entity_representative(&SqliteEntityId(1)).await?,
+            SqliteEntityId(0),
+            "the base merge holds before the overlay splits it"
+        );
+    }
+    commit_result(
+        &store,
+        SubmitBundle::<SqliteIds> {
+            author: user_author()?,
+            recorded_at: fixed_time() + chrono::Duration::seconds(10),
+            entities: Vec::new(),
+            events: Vec::new(),
+            images: Vec::new(),
+            facts: [retract_fact(edge)?].into_iter().collect(),
+        },
+    )
+    .await?;
+
+    let mut now_view = store.now().await?;
+    assert_eq!(
+        now_view.entity_representative(&SqliteEntityId(1)).await?,
+        SqliteEntityId(1),
+        "the overlay split shadows the base rep at now"
+    );
+    drop(now_view);
+
+    let mut past_view = store.no_later_than(merged_snapshot).await?;
+    assert_eq!(
+        past_view.entity_representative(&SqliteEntityId(1)).await?,
+        SqliteEntityId(0),
+        "a snapshot before the overlay split still reads the base merge through the union"
+    );
+    drop(past_view);
+    store.close().await;
+    Ok(())
+}
+
+/// The class and spatial walks span both layers: a `ByName` walk surfaces a base
+/// entity, and an `InViewport` walk surfaces a base-located entity through the
+/// two-branch rtree union — over a 0444 base pin (no room for WAL/-shm sidecars)
+/// attached `mode=ro&immutable=1`, the shape the dev server serves. The overlay
+/// then accepts a submit on top, so serving a frozen pin still takes writes.
+#[tokio::test]
+async fn walks_span_base_and_overlay_over_a_read_only_pin() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    let base_result = commit_result(
+        &base,
+        local_bundle::<SqliteIds>(
+            1,
+            0,
+            0,
+            0,
+            vec![name_fact(0, "landmark")?, construction_at(0, 40.5, -73.5)?],
+        )?,
+    )
+    .await?;
+    let base_entity = base_result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("base entity resolution missing")?
+        .id;
+    finish_base(base).await?;
+
+    // Pin the base read-only, as a 0444 nix-store facts DB is served.
+    let mut perms = std::fs::metadata(&base_path)?.permissions();
+    perms.set_mode(0o444);
+    std::fs::set_permissions(&base_path, perms)?;
+
+    let store = mount_over(&dir, &base_path).await?;
+    let limit = std::num::NonZeroUsize::new(100).ok_or("limit is nonzero")?;
+
+    let mut view = store.now().await?;
+    let named = view
+        .walk_entity_classes(
+            &EntityStream::ByName {
+                name: "landmark",
+                language: &Language::new("en")?,
+            },
+            None,
+            limit,
+        )
+        .await?;
+    let named_reps: Vec<SqliteEntityId> = named.rows.iter().map(|r| r.representative).collect();
+    assert!(
+        named_reps.contains(&base_entity),
+        "the ByName walk must surface the base entity across the union, got {named_reps:?}"
+    );
+
+    let viewport = sample_viewport()?;
+    let spatial = view
+        .walk_entity_classes(&EntityStream::InViewport(&viewport), None, limit)
+        .await?;
+    let spatial_reps: Vec<SqliteEntityId> = spatial.rows.iter().map(|r| r.representative).collect();
+    assert!(
+        spatial_reps.contains(&base_entity),
+        "the InViewport walk must surface the base-located entity through the two-branch rtree, \
+         got {spatial_reps:?}"
+    );
+    drop(view);
+
+    // Serving a frozen pin still takes writes: the submit lands in the overlay.
+    let result = commit_name(&store, "overlay-addition").await?;
+    assert!(!result.previously_committed);
+    store.close().await;
     Ok(())
 }

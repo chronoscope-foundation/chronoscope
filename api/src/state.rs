@@ -72,8 +72,16 @@ impl DnsResolver for TokioResolver {
 
 /// Configuration for the application
 pub struct Config {
-    /// Database URL (e.g., "sqlite:chronoscope.db" or "`sqlite::memory`:")
+    /// App database URL (e.g., "sqlite:chronoscope.db" or "`sqlite::memory`:").
+    /// Holds the app tables (auth, research, media); the fact tables live in
+    /// the separate [`facts_database`](Self::facts_database).
     pub database_url: String,
+
+    /// The facts database — a `sqlite:` URL (or bare path), holding the fact
+    /// tables. Required, set via `CHRONOSCOPE_FACTS_DB`; the server pins it as
+    /// the frozen read-only base (a completed, codec-stamped build) beneath a
+    /// fresh writable overlay, so it is validated, never created or migrated.
+    pub facts_database: String,
 
     /// `WebAuthn` Relying Party ID (e.g., "chronoscope.io")
     pub rp_id: String,
@@ -96,11 +104,19 @@ impl Config {
     /// Load configuration from environment variables
     ///
     /// # Errors
-    /// Returns `ConfigError::InvalidBindAddr` if the bind address is invalid, or
-    /// `ConfigError::InvalidCdnUrl` if `CDN_BASE_URL` is not a valid base URL.
+    /// Returns `ConfigError::MissingFactsDb` if `CHRONOSCOPE_FACTS_DB` is
+    /// unset, `ConfigError::InvalidBindAddr` if the bind address is invalid,
+    /// or `ConfigError::InvalidCdnUrl` if `CDN_BASE_URL` is not a valid base
+    /// URL.
     pub fn from_env() -> Result<Self, ConfigError> {
         let database_url =
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:chronoscope.db".to_string());
+
+        // The facts database is the completed, codec-stamped artifact built by
+        // `ingest build-db` that the server pins as its frozen read-only base.
+        // Its path is a required, explicit input so the mount is deterministic.
+        let facts_database =
+            std::env::var("CHRONOSCOPE_FACTS_DB").map_err(|_| ConfigError::MissingFactsDb)?;
 
         let rp_id = std::env::var("RP_ID").unwrap_or_else(|_| "localhost".to_string());
 
@@ -126,6 +142,7 @@ impl Config {
 
         Ok(Self {
             database_url,
+            facts_database,
             rp_id,
             rp_origin,
             bind_addr,
@@ -168,6 +185,12 @@ pub enum ConfigError {
 
     #[error("Invalid CDN base URL: {0}")]
     InvalidCdnUrl(String),
+
+    #[error(
+        "CHRONOSCOPE_FACTS_DB must be set to the facts database path \
+         (built by `ingest build-db`)"
+    )]
+    MissingFactsDb,
 }
 
 #[derive(Error, Debug)]
@@ -235,7 +258,8 @@ pub struct AppState {
     #[cfg(feature = "embedded-media")]
     pub media_store: Arc<dyn MediaStore>,
     /// The fact store of submitted entity and image facts — the
-    /// [`ServerFactStore`] backend, sharing the server's SQLite pool.
+    /// [`ServerFactStore`] backend over its own pool (the frozen base and
+    /// writable overlay, separate from the app `db` above).
     pub facts: ServerFactStore,
     /// Resolved media keys for every fact-store image, keyed by image id. The
     /// entity read path serves thumbnails and detail images from these keys; an

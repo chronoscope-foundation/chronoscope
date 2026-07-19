@@ -9,13 +9,13 @@
 //! - Integration tests (with VCR HTTP client and localhost)
 
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config, ServerFactStore};
+use chronoscope_db::FactStoreLocations;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId};
 use chronoscope_workers::analysis::AnalysisWorker;
@@ -60,110 +60,15 @@ fn placeholder_jpeg() -> Result<bytes::Bytes, Box<dyn std::error::Error + Send +
 /// test environment points it at the curated build.
 pub const FACTS_DB_ENV: &str = "CHRONOSCOPE_FACTS_DB";
 
-/// Clone a read-only facts database (a Nix store artifact) into `dest`,
-/// copy-on-write where the filesystem supports it: APFS clonefile via the
-/// system BSD `/bin/cp -c` on macOS — by absolute path, because nix dev
-/// shells put GNU coreutils first in `PATH` and GNU `cp` doesn't know `-c` —
-/// and PATH-resolved `cp --reflink=auto` elsewhere (which itself degrades to
-/// a plain copy on non-reflink filesystems). A failed clone attempt falls
-/// back quietly to a plain copy, so the worst case is a full copy — the
-/// store path itself is never opened read-write; the attempt's stderr
-/// surfaces only if the fallback also fails. The clone is made
-/// user-writable, since the source carries the store's read-only mode.
-pub fn clone_facts_db(source: &Path, dest: &Path) -> Result<(), DevServerError> {
-    let (cp, cow_flag) = if cfg!(target_os = "macos") {
-        ("/bin/cp", "-c")
-    } else {
-        ("cp", "--reflink=auto")
-    };
-    // Capture rather than inherit stderr: an unsupported-filesystem failure
-    // is an expected branch, not console noise.
-    let attempt = std::process::Command::new(cp)
-        .arg(cow_flag)
-        .arg(source)
-        .arg(dest)
-        .output();
-    let clone_failure = match &attempt {
-        Ok(output) if output.status.success() => None,
-        Ok(output) => Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
-        Err(e) => Some(e.to_string()),
-    };
-    if let Some(clone_failure) = clone_failure {
-        std::fs::copy(source, dest).map_err(|e| {
-            DevServerError(format!(
-                "copying facts DB {}: {e} (after the copy-on-write attempt failed: \
-                 {clone_failure})",
-                source.display()
-            ))
-        })?;
-    }
-    let mut perms = std::fs::metadata(dest)
-        .map_err(|e| DevServerError(format!("reading facts DB clone metadata: {e}")))?
-        .permissions();
-    use std::os::unix::fs::PermissionsExt;
-    perms.set_mode(0o644);
-    std::fs::set_permissions(dest, perms)
-        .map_err(|e| DevServerError(format!("making facts DB clone writable: {e}")))?;
-    Ok(())
-}
-
-/// The first 16 bytes of every SQLite database file.
-const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
-
-/// Validate the mount source before anything clones or opens it: a real,
-/// non-empty SQLite file whose `PRAGMA user_version` stamp matches this
-/// build's [`FACTS_CODEC_VERSION`](chronoscope_db::FACTS_CODEC_VERSION). The
-/// stamp is read straight off the file header (bytes 60..64, big-endian) —
-/// artifacts are checkpointed with no WAL sidecar, so the header is
-/// authoritative — and an unstamped or garbage file fails here with the
-/// fetch command to run, never boots as a silently-empty migrated store.
-fn validate_facts_db_source(source: &Path, subset: &str) -> Result<(), DevServerError> {
-    use std::io::Read;
-
-    let refuse = |what: String| {
-        DevServerError(format!(
-            "facts DB {} {what} — re-fetch it with `just fetch-wikidata-db {subset}`",
-            source.display()
-        ))
-    };
-
-    let len = std::fs::metadata(source)
-        .map_err(|e| refuse(format!("is unreadable ({e})")))?
-        .len();
-    if len < 64 {
-        return Err(refuse(format!(
-            "is not a SQLite database ({len} bytes, shorter than the 64-byte header)"
-        )));
-    }
-    let mut file =
-        std::fs::File::open(source).map_err(|e| refuse(format!("failed to open ({e})")))?;
-    let mut header = [0u8; 64];
-    file.read_exact(&mut header)
-        .map_err(|e| refuse(format!("header read failed ({e})")))?;
-    if &header[0..16] != SQLITE_MAGIC {
-        return Err(refuse(
-            "is not a SQLite database (magic header mismatch)".to_owned(),
-        ));
-    }
-    let stamped = i32::from_be_bytes([header[60], header[61], header[62], header[63]]);
-    if stamped != chronoscope_db::FACTS_CODEC_VERSION {
-        return Err(refuse(format!(
-            "carries facts codec version {stamped}, but this build expects {} \
-             (an unstamped artifact reads 0)",
-            chronoscope_db::FACTS_CODEC_VERSION
-        )));
-    }
-    Ok(())
-}
-
-/// Resolve [`FACTS_DB_ENV`], validate the named artifact
-/// (`validate_facts_db_source`), and clone it into `dest_dir`, returning
-/// the clone's `sqlite:` URL for [`DevServerConfig::database_url`]. The
-/// server opens the clone read-write as its whole database — facts plus
-/// mutable test data on top. `subset` names the fetch to run in every
-/// refusal, so a missing, stale, or garbage artifact fails with the exact
-/// command.
-pub fn mount_facts_db(dest_dir: &Path, subset: &str) -> Result<String, DevServerError> {
+/// Resolve [`FACTS_DB_ENV`] and validate the named pre-built facts DB (via the
+/// shared [`validate_facts_file`](chronoscope_db::validate_facts_file) — the
+/// one definition of "valid, current facts DB", also used by the fact store's
+/// mount), returning its path for [`FactsDbSource::Mounted`]. The dev server
+/// pins it as the frozen read-only base, immutable, so a 0444 nix-store
+/// artifact serves in place — no clone, no writable copy. `subset` names the
+/// fetch to run in every refusal, so a missing, stale, or garbage artifact
+/// fails with the exact command.
+pub fn mount_facts_db(subset: &str) -> Result<String, DevServerError> {
     let source = std::env::var(FACTS_DB_ENV).map_err(|_| {
         DevServerError(format!(
             "{FACTS_DB_ENV} not set — run inside the web shell (`nix develop .#web`; \
@@ -171,17 +76,14 @@ pub fn mount_facts_db(dest_dir: &Path, subset: &str) -> Result<String, DevServer
              `just fetch-wikidata-db {subset}` and export the path"
         ))
     })?;
-    let source = PathBuf::from(source);
-    if !source.is_file() {
-        return Err(DevServerError(format!(
-            "{FACTS_DB_ENV}={} is not a file — re-fetch with `just fetch-wikidata-db {subset}`",
-            source.display()
-        )));
-    }
-    validate_facts_db_source(&source, subset)?;
-    let dest = dest_dir.join("facts.db");
-    clone_facts_db(&source, &dest)?;
-    Ok(format!("sqlite:{}", dest.display()))
+    // The shared validator names the specific fault (missing / not SQLite /
+    // stale codec); the mount adds the fetch remedy around it.
+    chronoscope_db::validate_facts_file(std::path::Path::new(&source)).map_err(|e| {
+        DevServerError(format!(
+            "{e} — re-fetch it with `just fetch-wikidata-db {subset}`"
+        ))
+    })?;
+    Ok(source)
 }
 
 /// The facts-DB subset in play: `CHRONOSCOPE_FACTS_DB_SUBSET` when set (the
@@ -220,6 +122,12 @@ pub struct RunningDevServer {
     /// Database pool for direct access in tests
     db: Arc<Database>,
 
+    /// The fact store, kept for its graceful shutdown. It owns a separate
+    /// SpatiaLite-loaded pool (the `Arc`-backed pool is shared with the copy
+    /// handed to the server), and its close must run on the live runtime for
+    /// the same reason `db.close()` does.
+    facts: ServerFactStore,
+
     /// Send `true` to trigger graceful shutdown of workers
     shutdown_tx: watch::Sender<bool>,
 
@@ -249,9 +157,12 @@ impl RunningDevServer {
             let _ = handle.await;
         }
 
-        // Close the SQLite pool while the runtime is alive, so each
-        // connection's SpatiaLite `dlclose` completes before process exit.
+        // Close both SpatiaLite-loaded pools — the app pool and the fact
+        // store's own — while the runtime is alive, so each connection's
+        // `dlclose` completes before process exit instead of on an ungraceful
+        // drop at teardown.
         self.db.close().await;
+        self.facts.close().await;
     }
 }
 
@@ -264,10 +175,36 @@ impl Drop for RunningDevServer {
     }
 }
 
+/// Where the dev server's fact store comes from.
+pub enum FactsDbSource {
+    /// A pre-built, codec-stamped facts DB pinned as the frozen `base` from
+    /// [`mount_facts_db`], read beneath a fresh writable `overlay` scratch.
+    /// The base attaches `mode=ro&immutable=1`, so a 0444 nix-store pin serves
+    /// with no clone; submissions land in the overlay and are discarded on
+    /// relaunch. `overlay` is a per-launch scratch path in the caller's tempdir.
+    Mounted {
+        /// The read-only base pin.
+        base: String,
+        /// The writable scratch overlay path.
+        overlay: String,
+    },
+    /// A writable overlay only, no base — created and migrated if absent, the
+    /// URL-fetch harness's empty scratch file. Nothing stages facts into it; it
+    /// only has to exist and carry the fact schema.
+    Writable(String),
+}
+
 /// Configuration for starting the dev server.
 pub struct DevServerConfig {
-    /// Optional database URL. If `None`, uses `sqlite::memory:`.
+    /// Optional app database URL (auth/queues/media). If `None`, uses
+    /// `sqlite::memory:`. Distinct from the facts overlay ([`facts`](Self::facts)),
+    /// which holds the fact tables.
     pub database_url: Option<String>,
+
+    /// The fact store to serve: a read-only pre-built pin (`web-dev`, the
+    /// browser tests, the ngrok dev server) or a writable scratch file created
+    /// on demand (the URL-fetch harnesses). See [`FactsDbSource`].
+    pub facts: FactsDbSource,
 
     /// HTTP client for workers to use (real or VCR)
     pub http_client: Arc<dyn HttpClient>,
@@ -552,6 +489,10 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
 
     let api_config = Config {
         database_url: "sqlite::memory:".to_string(), // Not used - we pass db directly
+        // The fact store is built below from `config.facts` (a `FactsDbSource`)
+        // and handed to `AppState` directly, so this app `Config` field goes
+        // unused here.
+        facts_database: "sqlite::memory:".to_string(),
         rp_id,
         rp_origin,
         bind_addr: format!("127.0.0.1:{port}")
@@ -591,10 +532,19 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         ..Default::default()
     };
 
-    // The fact store rides the same pool as the rest of the schema, so
-    // whatever facts the database file holds — a mounted clone of a
-    // pre-built facts DB, typically — are served as-is; no boot-time ingest.
-    let facts = ServerFactStore::new(db.pool_ref().clone());
+    // The fact store owns its pool (throwaway in-memory `main` + the fact-store
+    // layers). A mounted source pins the base read-only+immutable beneath a
+    // fresh writable overlay scratch; a writable source is one overlay,
+    // created+migrated if absent. No boot-time ingest either way.
+    let facts = match &config.facts {
+        FactsDbSource::Mounted { base, overlay } => {
+            ServerFactStore::open(FactStoreLocations::mounted(base.clone(), overlay.clone())).await
+        }
+        FactsDbSource::Writable(url) => {
+            ServerFactStore::open(FactStoreLocations::standalone(url.clone())).await
+        }
+    }
+    .map_err(|e| format!("opening fact store: {e}"))?;
 
     // Resolve every fact-store image into the media store, so the read path
     // serves thumbnails and detail images from our own `/media/{key}` rather
@@ -609,6 +559,10 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         .await,
     );
     info!(log, "Resolved fact-store images"; "count" => image_media.len());
+
+    // Keep a handle to the fact store for graceful shutdown; the copy handed to
+    // the server shares the same `Arc`-backed pool.
+    let facts_for_shutdown = facts.clone();
 
     // Create AppState with our shared database, media store, and fact store
     let app_state = AppState::new(
@@ -651,6 +605,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         auth_token,
         test_user_id,
         db,
+        facts: facts_for_shutdown,
         shutdown_tx,
         worker_handles,
     })

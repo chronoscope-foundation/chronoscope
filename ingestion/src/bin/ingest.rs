@@ -29,13 +29,14 @@ enum Command {
     /// Load a Wikidata entities JSONL dump into a SQLite fact store.
     ///
     /// Streams the input in batches, submitting one commit per entity to the
-    /// on-disk (or in-memory) store under a single ingester run.
+    /// on-disk store under a single ingester run.
     BuildDb {
         /// Input entities JSONL, one entity per line
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Fact-store database URL (e.g. `sqlite:facts.db` or `sqlite::memory:`)
+        /// Fact-store database URL for the persistent artifact (e.g.
+        /// `sqlite:facts.db`)
         #[arg(long)]
         database_url: String,
 
@@ -87,8 +88,14 @@ async fn cmd_build_db(
     limit: Option<u64>,
 ) -> Result<()> {
     use chronoscope_core::grammar::ids::IngesterRunId;
+    use chronoscope_db::FactStoreLocations;
 
-    let store = chronoscope_db::SqliteFactStore::open(database_url)
+    // `open` creates+migrates the facts file (the artifact), then attaches it
+    // as `ovl` for the ingest writes — the two-file layout, with a throwaway
+    // in-memory `main` since the ingest touches no app tables. The codec
+    // stamp comes AFTER a successful ingest (`build_and_stamp`), so an
+    // interrupted build leaves the file unstamped and consumers reject it.
+    let store = chronoscope_db::SqliteFactStore::open(FactStoreLocations::standalone(database_url))
         .await
         .with_context(|| format!("opening fact store at {database_url}"))?;
     let run = IngesterRunId::new("wikidata-dump");
@@ -107,7 +114,9 @@ async fn cmd_build_db(
 }
 
 /// Ingest the dump, then stamp the finished artifact with the facts codec
-/// version — the consumer-side mount refuses an unstamped or mismatched DB.
+/// version — the certificate of a completed build that `validate_facts_file`
+/// and the dev mount require. Stamping only on success means an interrupted
+/// or failed ingest leaves an unstamped partial DB that both reject.
 async fn build_and_stamp(
     store: &chronoscope_db::SqliteFactStore,
     input: &Path,

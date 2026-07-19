@@ -756,9 +756,13 @@ mod tests {
         // so a future value would yield a view that silently grows as writes
         // land — the loud 400 stops that. Runs only on the standalone-snapshot
         // branch (no cursor).
-        // An empty store through the server's backend alias — one operation,
-        // no held views, so `sqlite::memory:` suffices here.
-        let facts = ServerFactStore::open("sqlite::memory:")
+        // An empty store through the server's backend alias — a file-backed
+        // overlay so `open` can create+attach it.
+        let dir = tempfile::tempdir().map_err(|e| format!("{e:?}"))?;
+        let locations =
+            chronoscope_db::FactStoreLocations::standalone_at(&dir.path().join("facts.sqlite3"))
+                .map_err(|e| format!("{e:?}"))?;
+        let facts = ServerFactStore::open(locations)
             .await
             .map_err(|e| format!("{e:?}"))?;
         let future = encode_snapshot(FactId::new(1)).map_err(|e| format!("{e:?}"))?;

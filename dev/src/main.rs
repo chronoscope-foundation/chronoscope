@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use chronoscope_api::state::default_dns_resolver;
 use chronoscope_dev::{
-    DevServerConfig, ImageResolveMode, facts_db_subset, mount_facts_db, start_dev_server,
+    DevServerConfig, FactsDbSource, ImageResolveMode, facts_db_subset, mount_facts_db,
+    start_dev_server,
 };
 use chronoscope_workers::{ApifyConfig, ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
@@ -265,15 +266,22 @@ async fn run_dev_server(
         ApifyConfig::new(api_token)
     });
 
-    // 8. Mount the pre-built facts DB (a fresh copy-on-write clone of the
-    // artifact `CHRONOSCOPE_FACTS_DB` names) as this run's database. The
-    // TempDir guard cleans up on every exit path, early errors included.
+    // 8. Mount the pre-built facts DB (the artifact `CHRONOSCOPE_FACTS_DB`
+    // names) as the frozen read-only `base` beneath a fresh writable overlay
+    // scratch; the app tables get a sibling db in the same TempDir. The guard
+    // cleans up on every exit path, early errors included.
     let db_dir = tempfile::TempDir::with_prefix("chronoscope-dev-")?;
-    let database_url = mount_facts_db(db_dir.path(), &facts_db_subset())?;
+    let facts_pin = mount_facts_db(&facts_db_subset())?;
+    let database_url = format!("sqlite:{}", db_dir.path().join("app.db").display());
+    let facts_overlay = db_dir.path().join("facts-overlay.db").display().to_string();
 
     // 9. Start the dev server with ngrok URL as CDN base
     let server = start_dev_server(DevServerConfig {
         database_url: Some(database_url),
+        facts: FactsDbSource::Mounted {
+            base: facts_pin,
+            overlay: facts_overlay,
+        },
         http_client,
         worker_idle_backoff: Duration::from_secs(5),
         retry_config: RetryConfig::default(),

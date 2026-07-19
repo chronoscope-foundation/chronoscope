@@ -255,7 +255,7 @@ clippy target="all":
 
 # Start the integrated web dev server (API + Trunk live reload) over a
 # mounted facts DB (curated|1k|100k|full — realized on demand via Nix,
-# cloned copy-on-write per launch). The binary picks
+# served read-only in place). The binary picks
 # free ports for API + Trunk automatically — no need to kill anything else
 # on common ports.
 web-dev subset="curated":

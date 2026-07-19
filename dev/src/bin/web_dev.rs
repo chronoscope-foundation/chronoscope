@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use chronoscope_api::state::permissive_dns_resolver;
 use chronoscope_dev::{
-    DevServerConfig, ImageResolveMode, facts_db_subset, find_available_port, mount_facts_db,
-    start_dev_server,
+    DevServerConfig, FactsDbSource, ImageResolveMode, facts_db_subset, find_available_port,
+    mount_facts_db, start_dev_server,
 };
 use chronoscope_workers::{ReqwestClient, RetryConfig};
 use dropshot::{ConfigLogging, ConfigLoggingLevel};
@@ -45,15 +45,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(log, "API server will bind to port {}", api_port);
     info!(log, "Trunk will bind to port {}", trunk_port);
 
-    // 2. Mount the pre-built facts DB: a fresh copy-on-write clone of the
-    // read-only artifact `CHRONOSCOPE_FACTS_DB` names (resolved by
-    // `just web-dev [subset]` from the pinned fetch), opened read-write as
-    // this run's whole database. A TempDir guard because SQLite writes
-    // -wal/-shm siblings next to the .db; dropping it cleans up on every
-    // exit path, early errors included.
+    // 2. Mount the pre-built facts DB: the read-only artifact
+    // `CHRONOSCOPE_FACTS_DB` names (resolved by `just web-dev [subset]` from the
+    // pinned fetch), pinned as the frozen `base` (attached `mode=ro&immutable=1`,
+    // no clone) beneath a fresh writable overlay. The app tables
+    // (auth/queues/media) and the overlay scratch get sibling files in a TempDir,
+    // whose -wal/-shm siblings are cleaned up when the guard drops on every exit
+    // path, early errors included.
     let db_dir = tempfile::TempDir::with_prefix("chronoscope-web-dev-")?;
-    let database_url = mount_facts_db(db_dir.path(), &facts_db_subset())?;
-    info!(log, "Facts DB clone at {database_url}");
+    let facts_pin = mount_facts_db(&facts_db_subset())?;
+    let database_url = format!("sqlite:{}", db_dir.path().join("app.db").display());
+    let facts_overlay = db_dir.path().join("facts-overlay.db").display().to_string();
+    info!(log, "Serving facts DB (read-only base) from {facts_pin}");
 
     // 4. Start the API server
     let http_client =
@@ -61,6 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let server = start_dev_server(DevServerConfig {
         database_url: Some(database_url),
+        facts: FactsDbSource::Mounted {
+            base: facts_pin,
+            overlay: facts_overlay,
+        },
         http_client,
         worker_idle_backoff: Duration::from_secs(60),
         retry_config: RetryConfig::default(),

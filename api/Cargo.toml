@@ -62,6 +62,9 @@ semver = "1"
 openapiv3 = "2.2"
 indexmap = "2"
 
+# Scratch overlay directory for the mounted fact store
+tempfile = "3"
+
 hickory-resolver = "0.25"
 async-trait = "0.1"
 

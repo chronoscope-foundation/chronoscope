@@ -24,7 +24,8 @@ use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
 use chromiumoxide::page::ScreenshotParams;
 use chronoscope_dev::{
-    DevServerConfig, ImageResolveMode, RunningDevServer, find_available_port, start_dev_server,
+    DevServerConfig, FactsDbSource, ImageResolveMode, RunningDevServer, find_available_port,
+    start_dev_server,
 };
 use chronoscope_workers::RetryConfig;
 use dropshot::ConfigLogging;
@@ -315,16 +316,23 @@ impl WebTest {
         let http_client: Arc<dyn chronoscope_workers::HttpClient> =
             Arc::new(chronoscope_workers::ReqwestClient::new()?);
 
-        // Fresh copy-on-write clone of the curated facts DB per test (the
-        // artifact `CHRONOSCOPE_FACTS_DB` names, provided by the nix test
-        // env), opened read-write as the test's whole database. TempDir so
-        // the -wal/-shm siblings SQLite writes next to the .db are cleaned
-        // up together.
+        // Serve the curated facts DB (the artifact `CHRONOSCOPE_FACTS_DB` names,
+        // provided by the nix test env) as the frozen read-only `base` — attached
+        // `mode=ro&immutable=1`, so every test shares the one immutable pin with
+        // no per-test clone — beneath a fresh per-test writable overlay. The app
+        // tables and the overlay scratch get sibling files in a TempDir, whose
+        // -wal/-shm siblings are cleaned up together.
         let db_dir = tempfile::tempdir()?;
-        let database_url = chronoscope_dev::mount_facts_db(db_dir.path(), "curated")?;
+        let facts_pin = chronoscope_dev::mount_facts_db("curated")?;
+        let database_url = format!("sqlite:{}", db_dir.path().join("app.db").display());
+        let facts_overlay = db_dir.path().join("facts-overlay.db").display().to_string();
 
         let server = start_dev_server(DevServerConfig {
             database_url: Some(database_url),
+            facts: FactsDbSource::Mounted {
+                base: facts_pin,
+                overlay: facts_overlay,
+            },
             http_client,
             worker_idle_backoff: Duration::from_secs(60), // Workers not needed for frontend tests
             retry_config: RetryConfig::default(),

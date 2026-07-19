@@ -31,7 +31,7 @@ use chronoscope_core::store::schema::EquivClass;
 
 use super::convert::seed_ids;
 use super::error::{SqliteFactStoreError, sql};
-use super::queries;
+use super::queries::{self, FactQueries};
 use super::read::{ReadBound, class_members_raw, resolve_rep_raw, retraction_edges};
 use super::storage::{WitnessRow, witness_date_columns, witness_date_json};
 
@@ -125,13 +125,15 @@ pub(super) async fn record_witness(
 /// against.
 pub(super) async fn record_identity_edge(
     conn: &mut SqliteConnection,
+    fq: &FactQueries,
     kind: &'static str,
     a: i64,
     b: i64,
     as_of: i64,
 ) -> Result<(), SqliteFactStoreError> {
-    let rep_a = resolve_rep_raw(conn, ReadBound::Union, kind, a).await?;
-    let rep_b = resolve_rep_raw(conn, ReadBound::Union, kind, b).await?;
+    let bound = ReadBound::Union;
+    let rep_a = resolve_rep_raw(conn, bound, fq, kind, a).await?;
+    let rep_b = resolve_rep_raw(conn, bound, fq, kind, b).await?;
     if rep_a == rep_b {
         return Ok(());
     }
@@ -142,7 +144,7 @@ pub(super) async fn record_identity_edge(
     };
     // The set dedups the losing representative: after a split it carries a
     // rep = self log row, so the gather already returns it.
-    let mut losing: BTreeSet<i64> = class_members_raw(conn, ReadBound::Union, kind, loser)
+    let mut losing: BTreeSet<i64> = class_members_raw(conn, bound, kind, loser)
         .await?
         .into_iter()
         .collect();
@@ -163,18 +165,19 @@ async fn live_component(
     kind: &str,
     member: i64,
 ) -> Result<EquivClass<i64>, SqliteFactStoreError> {
+    let bound = ReadBound::Union;
     let rows: Vec<(i64, i64, i64)> = sqlx::query_as(queries::EQUIV_COMPONENT.sql)
         .bind(member)
         .bind(kind)
-        .bind(ReadBound::Union.bind())
+        .bind(bound.bind())
         .fetch_all(&mut *conn)
         .await
         .map_err(sql("fetching identity-edge component"))?;
     let seeds = seed_ids(rows.iter().map(|(fid, _, _)| fid), "component edge fact id")?;
-    let retraction = retraction_edges(conn, ReadBound::Union, &seeds).await?;
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
     let mut edges = Vec::with_capacity(rows.len());
     for ((_, a, b), fid) in rows.iter().zip(&seeds) {
-        if effective_retractor(*fid, ReadBound::Union.fact_id(), &retraction).is_some() {
+        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
             continue;
         }
         edges.push((*a, *b));
@@ -187,9 +190,11 @@ async fn live_component(
 /// position of every row this writes.
 pub(super) async fn record_retraction(
     conn: &mut SqliteConnection,
+    fq: &FactQueries,
     staged: i64,
 ) -> Result<(), SqliteFactStoreError> {
-    let edges: Vec<(String, i64, i64)> = sqlx::query_as(queries::IDENTITY_TARGETS.sql)
+    let bound = ReadBound::Union;
+    let edges: Vec<(String, i64, i64)> = sqlx::query_as(&fq.identity_targets)
         .bind(staged)
         .fetch_all(&mut *conn)
         .await
@@ -224,12 +229,12 @@ pub(super) async fn record_retraction(
         let mut current: BTreeMap<i64, i64> = BTreeMap::new();
         let mut gathered: BTreeSet<i64> = BTreeSet::new();
         for &seed in seeds {
-            let rep = resolve_rep_raw(conn, ReadBound::Union, kind, seed).await?;
+            let rep = resolve_rep_raw(conn, bound, fq, kind, seed).await?;
             if !gathered.insert(rep) {
                 continue;
             }
             current.insert(rep, rep);
-            for member in class_members_raw(conn, ReadBound::Union, kind, rep).await? {
+            for member in class_members_raw(conn, bound, kind, rep).await? {
                 current.insert(member, rep);
             }
         }
@@ -241,7 +246,7 @@ pub(super) async fn record_retraction(
             .copied()
             .collect();
         for member in missing {
-            let rep = resolve_rep_raw(conn, ReadBound::Union, kind, member).await?;
+            let rep = resolve_rep_raw(conn, bound, fq, kind, member).await?;
             current.insert(member, rep);
         }
 
