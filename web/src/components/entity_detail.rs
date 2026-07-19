@@ -642,18 +642,20 @@ impl DateCell {
 }
 
 impl TimelineRow {
-    /// This row as a point on a conflict's time axis, when it carries a date.
-    /// The witness flag marks a mid-life row — an existence witness or interior
-    /// event — the out-of-lifetime side a conflict highlights.
+    /// This row as a point on a conflict's time axis, when it carries a date. A
+    /// mid-life row — an existence witness or interior event — plays the witness,
+    /// the out-of-lifetime side a conflict highlights; a bookend plays the anchor.
     fn point(&self) -> Option<ConflictPoint> {
         let instant = self.date.instant()?;
+        let role = if self.role.is_midlife() {
+            ConflictRole::Witness
+        } else {
+            ConflictRole::Anchor
+        };
         Some(ConflictPoint {
             label: self.label.clone(),
-            // Bare year, matching the conflict line's bare year; `%Y` would
-            // zero-pad an ancient year ("0082") and read apart from it.
-            year: instant.year().to_string(),
-            pos: f64::from(instant.num_days_from_ce()),
-            is_witness: self.role.is_midlife(),
+            instant,
+            role,
         })
     }
 }
@@ -668,15 +670,23 @@ struct ConflictInfo {
     facts: Vec<FactId>,
 }
 
-/// One participant plotted on a conflict's time axis: the row's label, the year
-/// it sits at, a monotonic position for scaling, and whether it's the witness —
-/// the out-of-lifetime evidence the conflict highlights.
+/// One participant plotted on a conflict's time axis: the row's label, the
+/// instant it sits at, and which side it plays — the witness (out-of-lifetime
+/// evidence the conflict highlights) or the lifetime bookend it clashes with. The
+/// year label and scaling position derive from `instant` at render.
 #[derive(Debug, Clone)]
 struct ConflictPoint {
     label: String,
-    year: String,
-    pos: f64,
-    is_witness: bool,
+    instant: NaiveDate,
+    role: ConflictRole,
+}
+
+/// Which side of a conflict a plotted point plays: the witness (out-of-lifetime
+/// evidence) or the lifetime bookend it sits on the wrong side of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictRole {
+    Witness,
+    Anchor,
 }
 
 /// A conflict resolved against the timeline for one marker: its summary and the
@@ -1366,7 +1376,8 @@ fn matched_precision(witness: &UncertainDate, bound: NaiveDate) -> (String, Stri
 }
 
 /// The distinct participant points a conflict's facts resolve to, left-to-right.
-/// Facts landing on the same row collapse to one point.
+/// Points sharing a label and a displayed year — the axis prints only the year —
+/// collapse to one, so same-year facts don't smudge into an illegible duplicate.
 fn resolve_points(
     facts: &[FactId],
     points: &BTreeMap<FactId, ConflictPoint>,
@@ -1374,14 +1385,14 @@ fn resolve_points(
     let mut out: Vec<ConflictPoint> = Vec::new();
     for fact in facts {
         if let Some(point) = points.get(fact)
-            && !out
-                .iter()
-                .any(|seen| seen.label == point.label && seen.year == point.year)
+            && !out.iter().any(|seen| {
+                seen.label == point.label && seen.instant.year() == point.instant.year()
+            })
         {
             out.push(point.clone());
         }
     }
-    out.sort_by(|a, b| a.pos.total_cmp(&b.pos));
+    out.sort_by_key(|p| p.instant);
     out
 }
 
@@ -1796,10 +1807,49 @@ fn conflict_axis(conflict: &ResolvedConflict) -> AnyView {
     }
 }
 
+/// A point's scaling position: its instant as a day count, monotonic in date so
+/// the axis lays participants out in order.
+fn point_pos(point: &ConflictPoint) -> f64 {
+    f64::from(point.instant.num_days_from_ce())
+}
+
+/// The index of the anchor nearest a witness in time — the bookend it brackets
+/// to. `None` when the conflict names no anchor.
+fn nearest_anchor_index(witness: &ConflictPoint, anchors: &[&ConflictPoint]) -> Option<usize> {
+    anchors
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, anchor)| (witness.instant - anchor.instant).num_days().abs())
+        .map(|(i, _)| i)
+}
+
+/// One bracket per anchor that owns witnesses: the anchor paired with the farthest
+/// witness grouped under it (each witness grouped to its nearest anchor). A single
+/// bracket then encloses every out-of-lifetime witness on that anchor's side, so
+/// the bracket count follows the anchors, not the witnesses.
+fn conflict_brackets(points: &[ConflictPoint]) -> Vec<(&ConflictPoint, &ConflictPoint)> {
+    let anchors: Vec<&ConflictPoint> = points
+        .iter()
+        .filter(|p| p.role == ConflictRole::Anchor)
+        .collect();
+    anchors
+        .iter()
+        .enumerate()
+        .filter_map(|(gi, anchor)| {
+            let farthest = points
+                .iter()
+                .filter(|p| p.role == ConflictRole::Witness)
+                .filter(|w| nearest_anchor_index(w, &anchors) == Some(gi))
+                .max_by_key(|w| (w.instant - anchor.instant).num_days().abs())?;
+            Some((*anchor, farthest))
+        })
+        .collect()
+}
+
 /// Build the inline-SVG markup for a conflict's time-axis, or `None` when no
 /// participant carries a plottable date. Positions scale to the participants'
-/// date range with padding; the witness point and the "before"/"after" bracket
-/// use the amber conflict tones.
+/// date range with padding; each witness point and its "before"/"after" bracket
+/// to the nearest anchor use the amber conflict tones.
 fn build_conflict_svg(conflict: &ResolvedConflict) -> Option<String> {
     const VB_W: f64 = 240.0;
     const VB_H: f64 = 88.0;
@@ -1820,12 +1870,12 @@ fn build_conflict_svg(conflict: &ResolvedConflict) -> Option<String> {
     let min = conflict
         .points
         .iter()
-        .map(|p| p.pos)
+        .map(point_pos)
         .fold(f64::INFINITY, f64::min);
     let max = conflict
         .points
         .iter()
-        .map(|p| p.pos)
+        .map(point_pos)
         .fold(f64::NEG_INFINITY, f64::max);
     let range = if (max - min).abs() < 1.0 {
         1.0
@@ -1841,19 +1891,22 @@ fn build_conflict_svg(conflict: &ResolvedConflict) -> Option<String> {
         r#"<line x1="{PAD_X:.1}" y1="{AXIS_Y:.1}" x2="{right:.1}" y2="{AXIS_Y:.1}" style="stroke:var(--color-sepia);stroke-opacity:0.3" stroke-width="1"/>"#
     ));
 
-    // The impossible ordering: the witness bracketed to the bookend it can't
-    // precede (a construction start) or follow (a demolition).
-    let witness = conflict.points.iter().find(|p| p.is_witness);
-    let anchor = conflict.points.iter().find(|p| !p.is_witness);
-    if let (Some(w), Some(a)) = (witness, anchor) {
-        let wx = x_of(w.pos);
-        let ax = x_of(a.pos);
+    // Draw each anchor's bracket, stepping successive ones up so they stay legible;
+    // clamp the offset so a heavily-disputed bookend's many anchors can't climb off
+    // the top of the viewBox.
+    for (gi, (anchor, w)) in conflict_brackets(&conflict.points).into_iter().enumerate() {
+        let wx = x_of(point_pos(w));
+        let ax = x_of(point_pos(anchor));
         let (x1, x2) = if wx <= ax { (wx, ax) } else { (ax, wx) };
         let mid = (x1 + x2) / 2.0;
-        let bracket_y = AXIS_Y - 24.0;
+        let bracket_y = (AXIS_Y - 24.0 - 6.0 * gi as f64).max(12.0);
         let foot = AXIS_Y - 9.0;
         let label_pos = bracket_y - 3.0;
-        let relation = if w.pos < a.pos { "before" } else { "after" };
+        let relation = if w.instant < anchor.instant {
+            "before"
+        } else {
+            "after"
+        };
         body.push_str(&format!(
             r#"<path d="M {x1:.1} {foot:.1} L {x1:.1} {bracket_y:.1} L {x2:.1} {bracket_y:.1} L {x2:.1} {foot:.1}" style="stroke:var(--color-disputed)" fill="none" stroke-width="1"/>"#
         ));
@@ -1863,14 +1916,16 @@ fn build_conflict_svg(conflict: &ResolvedConflict) -> Option<String> {
     }
 
     for point in &conflict.points {
-        let cx = x_of(point.pos);
-        let (dot, year_fill) = if point.is_witness {
-            ("var(--color-disputed)", "var(--color-disputed-deep)")
-        } else {
-            ("var(--color-sepia)", "var(--color-sepia)")
+        let cx = x_of(point_pos(point));
+        let (dot, year_fill) = match point.role {
+            ConflictRole::Witness => ("var(--color-disputed)", "var(--color-disputed-deep)"),
+            ConflictRole::Anchor => ("var(--color-sepia)", "var(--color-sepia)"),
         };
         let label = svg_escape(&point.label);
-        let year = svg_escape(&point.year);
+        // Bare year, matching the conflict line's bare year; `%Y` would zero-pad
+        // an ancient year ("0082") and read apart from it.
+        let year_text = point.instant.year().to_string();
+        let year = svg_escape(&year_text);
         body.push_str(&format!(
             r#"<line x1="{cx:.1}" y1="{tick_top:.1}" x2="{cx:.1}" y2="{tick_bot:.1}" style="stroke:var(--color-sepia);stroke-opacity:0.4" stroke-width="1"/>"#
         ));
@@ -2152,4 +2207,51 @@ fn source_label(reference: &ExternalReference) -> Option<String> {
         ExternalReference::WikimediaCommonsCategory { .. } => "Wikimedia Commons".to_string(),
         ExternalReference::UnmodeledUrl { url } => url.host_str().map(str::to_string)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Datelike;
+
+    use super::{ConflictPoint, ConflictRole, NaiveDate, conflict_brackets};
+
+    fn point(label: &str, ymd: (i32, u32, u32), role: ConflictRole) -> Option<ConflictPoint> {
+        Some(ConflictPoint {
+            label: label.to_string(),
+            instant: NaiveDate::from_ymd_opt(ymd.0, ymd.1, ymd.2)?,
+            role,
+        })
+    }
+
+    #[test]
+    fn witnesses_before_one_anchor_share_a_bracket_to_the_farthest() -> Result<(), String> {
+        // Three witnesses all before a single construction anchor collapse to one
+        // bracket, reaching the earliest — the most out-of-lifetime — witness.
+        let built = point("Constructed", (1850, 1, 1), ConflictRole::Anchor).ok_or("bad date")?;
+        let near =
+            point("Known to exist", (1840, 1, 1), ConflictRole::Witness).ok_or("bad date")?;
+        let far = point("Known to exist", (1820, 1, 1), ConflictRole::Witness).ok_or("bad date")?;
+        let mid = point("Known to exist", (1830, 1, 1), ConflictRole::Witness).ok_or("bad date")?;
+        let points = vec![built, near, far, mid];
+        let brackets = conflict_brackets(&points);
+        assert_eq!(brackets.len(), 1);
+        let &(anchor, farthest) = brackets.first().ok_or("no bracket")?;
+        assert_eq!(anchor.label.as_str(), "Constructed");
+        assert_eq!(farthest.instant.year(), 1820);
+        Ok(())
+    }
+
+    #[test]
+    fn a_witness_by_each_anchor_gets_its_own_bracket() -> Result<(), String> {
+        let built = point("Constructed", (1850, 1, 1), ConflictRole::Anchor).ok_or("bad date")?;
+        let demolished =
+            point("Demolished", (1950, 1, 1), ConflictRole::Anchor).ok_or("bad date")?;
+        let early =
+            point("Known to exist", (1845, 1, 1), ConflictRole::Witness).ok_or("bad date")?;
+        let late =
+            point("Known to exist", (1955, 1, 1), ConflictRole::Witness).ok_or("bad date")?;
+        let points = vec![built, demolished, early, late];
+        assert_eq!(conflict_brackets(&points).len(), 2);
+        Ok(())
+    }
 }
