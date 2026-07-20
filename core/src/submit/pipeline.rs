@@ -646,6 +646,11 @@ fn rule_event_has_one_kind<S>(
 /// [`SubmitError::EventOwnershipImmutable`]; an identical re-assertion matches
 /// the pin and passes.
 ///
+/// The pin is the *literal* entity: an event belongs to the entity it was first
+/// typed on, and re-homing it — even onto a `SameEntity`-equivalent id — is
+/// meaningless. Reads fold equivalents into one class, so this pin needs no
+/// equivalence resolution of its own.
+///
 /// The rule fires only when the event carries exactly one distinct active
 /// `HasEvent` claim: zero (missing) and two-or-more (conflicting) are
 /// [`rule_event_has_one_kind`]'s to report, and an event whose only `HasEvent`

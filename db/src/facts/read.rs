@@ -906,12 +906,6 @@ enum Threshold {
     Above(i64),
 }
 
-/// The events a class owns at the bound: every event some member holds a
-/// live `HasEvent` to. Per-edge liveness (the retraction fixpoint over
-/// `has_event`) — the ownership hop `project_entity`'s `event_reachers` takes,
-/// **not** `event_owners`' latest-owner-wins, so re-owning an event (retract old
-/// edge + add new) leaves ownership per-edge and a snapshot where both edges are
-/// transiently live counts the event for both.
 /// The JSON array of raw subject ids a batched witness scan binds to its
 /// `json_each` driver — one indexed probe per id, the `event_owners` shape.
 fn subject_id_json<S: SubjectColumn>(
@@ -922,6 +916,12 @@ fn subject_id_json<S: SubjectColumn>(
     serde_json::to_string(&raw).map_err(json(context))
 }
 
+/// The events a class owns at the bound: every event some member holds a
+/// live `HasEvent` to. Per-edge liveness (the retraction fixpoint over
+/// `has_event`) — the ownership hop `project_entity`'s `event_reachers` takes,
+/// **not** `event_owners`' latest-owner-wins, so re-owning an event (retract old
+/// edge + add new) leaves ownership per-edge and a snapshot where both edges are
+/// transiently live counts the event for both.
 async fn owned_events(
     conn: &mut SqliteConnection,
     bound: ReadBound,
