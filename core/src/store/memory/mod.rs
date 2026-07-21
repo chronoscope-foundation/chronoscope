@@ -699,9 +699,8 @@ impl Pending {
 /// which the brand pattern needs; a covariant or contravariant marker would
 /// let two closures' brands unify.
 ///
-/// Cross-instance misuse is a compile error — see
-/// `CrossInstanceBrandIsCompileError` below for the `compile_fail` doctest,
-/// and `tests::two_commits_share_one_with_tx_brand` for the positive
+/// Invariance is checked below by `BrandIsInvariant`'s `compile_fail`
+/// doctest, with `tests::two_commits_share_one_with_tx_brand` the positive
 /// intra-store check.
 pub struct MemoryTx<'brand> {
     committed: &'brand Inner,
@@ -1423,38 +1422,21 @@ mod matcher_tests;
 #[cfg(test)]
 mod tests;
 
-/// Negative compile-time check for cross-instance brand misuse.
-///
-/// A `Tx<'brand>` from one `with_tx` call can't reach another store's `with_tx`
-/// closure: each body introduces a fresh `'brand` existential, and
-/// `MemoryTx<'brand>`'s invariant `PhantomData` keeps the two from unifying
-/// even for the same backend type.
+/// Negative compile-time check that [`MemoryTx`] is invariant in its brand
+/// lifetime: shrinking the brand is a coercion the compiler must refuse, or
+/// two `with_tx` closures' brands could unify and a tx could cross stores.
+/// A pure variance coercion, so it fails to compile for exactly one reason —
+/// the invariance — where a smuggling scenario would also fail for unrelated
+/// closure or `Send` reasons and pass even if the brand turned covariant.
 ///
 /// ```compile_fail
-/// use chronoscope_core::store::memory::MemoryFactStore;
-/// use chronoscope_core::store::FactStore;
+/// use chronoscope_core::store::memory::MemoryTx;
 ///
-/// async fn smuggle_tx_across_stores() {
-///     let store_a = MemoryFactStore::new();
-///     let store_b = MemoryFactStore::new();
-///     let _ = store_a
-///         .with_tx(|_s_a, tx_a| {
-///             Box::pin(async move {
-///                 // Leaking tx_a into store_b's closure: rejected, the
-///                 // two brands are distinct existentials.
-///                 let _ = store_b
-///                     .with_tx(|_s_b, _tx_b| {
-///                         Box::pin(async move {
-///                             let _smuggled = tx_a;
-///                             Ok::<(), String>(())
-///                         })
-///                     })
-///                     .await;
-///                 Ok::<(), String>(())
-///             })
-///         })
-///         .await;
+/// fn shrink_brand<'long: 'short, 'short>(
+///     tx: MemoryTx<'long>,
+/// ) -> MemoryTx<'short> {
+///     tx
 /// }
 /// ```
 #[cfg(doctest)]
-struct CrossInstanceBrandIsCompileError;
+struct BrandIsInvariant;
