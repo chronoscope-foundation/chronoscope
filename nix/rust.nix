@@ -6,6 +6,9 @@
   # Whole-workspace source (adds web's include_str!'d assets) for the `doc`
   # check, which documents chronoscope-web alongside the native crates.
   docSrc,
+  # PostgreSQL + PostGIS bundle for the `postgres-smoke` check (initdb/pg_ctl
+  # on PATH). Only that check forces it, so it stays lazy like testExtraEnv.
+  postgresWithPostgis,
   # Defaulting to {} keeps this module loadable before wikidata/web exist
   # — see flake.nix for how the lazy cycle resolves.
   testExtraEnv ? { },
@@ -139,6 +142,24 @@ in
         pname = "chronoscope-web-tests";
         cargoTestExtraArgs = "-p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4";
         CHRONOSCOPE_RUN_AFTER = "${clippy} ${doc} ${doctest} ${llvm-cov}";
+      }
+    );
+
+    # Infra spike: can an ephemeral postgres+PostGIS cluster be initdb'd,
+    # started on a unix socket, and reached with sqlx inside the build
+    # environment? Runs only the db crate's `postgres::` smoke test with the
+    # postgres feature on; postgis tools ride in via nativeBuildInputs.
+    #
+    # `pname` is deliberately short: it lengthens the build dir, and the
+    # unix-socket path is capped at ~104 bytes on darwin. The harness keeps the
+    # socket under PG_SOCKET_BASE (default /tmp), so the build-dir depth stays
+    # off the socket path — but a short pname is cheap insurance.
+    postgres-smoke = craneLib.cargoTest (
+      checkArgs
+      // {
+        pname = "pg-smoke";
+        cargoTestExtraArgs = "-p chronoscope-db --features postgres postgres::";
+        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ postgresWithPostgis ];
       }
     );
   };

@@ -84,6 +84,7 @@
             lib
             src
             docSrc
+            postgresWithPostgis
             ;
           # Lazy: only `test`/`llvm-cov` force these, so the wikidata/web
           # cycle stays unresolved at eval time.
@@ -174,6 +175,12 @@
             libspatialite
           ])
           ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
+
+        # PostgreSQL + PostGIS for the ephemeral-cluster smoke test: puts
+        # initdb/pg_ctl/psql on PATH with postgis loadable. Feeds both the api
+        # dev shell (local `cargo test -p chronoscope-db --features postgres`)
+        # and the hermetic `postgres-smoke` check.
+        postgresWithPostgis = pkgs.postgresql_16.withPackages (p: [ p.postgis ]);
         # Runtime env for the api/db/ingestion code paths (consumed by the
         # backend/web dev shells AND by the hermetic test/llvm-cov checks).
         apiRuntimeEnv = {
@@ -376,7 +383,7 @@
           # specific shell (core, db, ingestion, workers, dev, api-client).
           api = pkgs.mkShell {
             nativeBuildInputs = [ toolchain ] ++ commonTools ++ backendNativeBuildInputs;
-            buildInputs = backendBuildInputs;
+            buildInputs = backendBuildInputs ++ [ postgresWithPostgis ];
             env = commonEnv // backendEnv;
             shellHook = ''
               ${gcRootsPrelude}
