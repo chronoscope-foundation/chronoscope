@@ -108,6 +108,7 @@
             pkgs
             lib
             craneLib
+            spatialitePreload
             ;
           rustCommonArgs = rust.commonArgs;
           inherit (rust) cargoArtifacts;
@@ -129,7 +130,7 @@
         };
 
         api = import ./nix/api.nix {
-          inherit pkgs craneLib;
+          inherit pkgs craneLib spatialitePreload;
           rustCommonArgs = rust.commonArgs;
           inherit (rust) cargoArtifacts;
         };
@@ -181,12 +182,29 @@
         # dev shell (local `cargo test -p chronoscope-db --features postgres`)
         # and the hermetic `postgres-smoke` check.
         postgresWithPostgis = pkgs.postgresql_16.withPackages (p: [ p.postgis ]);
+
+        # Preload libspatialite so it and its C++ deps (PROJ/GEOS/libxml2) stay
+        # mapped for the whole process. SQLite dlcloses the mod_spatialite
+        # extension at connection close; without the preload those deps unload
+        # mid-run and their static destructors fault at exit — a known SQLite
+        # loadable-extension teardown bug. mod_spatialite is a Mach-O bundle
+        # (unpreloadable), so we name libspatialite, the sibling library that
+        # links the same deps, and let the loader follow its NEEDED list.
+        #
+        # Darwin-only: validated there (DYLD_INSERT_LIBRARIES). The crash is
+        # unconfirmed on Linux (glibc ≠ dyld), the unversioned `.so` lives in a
+        # different output, and prod is Postgres — so a Linux LD_PRELOAD waits
+        # on a Linux box to validate the path and reproduce the fault.
+        spatialitePreload = lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+          DYLD_INSERT_LIBRARIES = "${pkgs.libspatialite}/lib/libspatialite.dylib";
+        };
         # Runtime env for the api/db/ingestion code paths (consumed by the
         # backend/web dev shells AND by the hermetic test/llvm-cov checks).
         apiRuntimeEnv = {
           SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
           WIKIDATA_ENTITIES_JSONL = "${wikidata.bundles.curated.entities}/entities.jsonl";
-        };
+        }
+        // spatialitePreload;
         backendEnv = apiRuntimeEnv // {
           PROTOC = "${pkgs.protobuf}/bin/protoc";
         };

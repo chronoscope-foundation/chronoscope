@@ -14,6 +14,9 @@
   craneLib,
   rustCommonArgs,
   cargoArtifacts,
+  # Env that preloads libspatialite so `ingest build-db` doesn't segfault at
+  # teardown — see flake.nix. `{}` keeps the module loadable standalone.
+  spatialitePreload ? { },
 }:
 
 let
@@ -242,29 +245,32 @@ let
 
   mkFactsDb =
     name: source: recordedAt: limit:
-    pkgs.stdenvNoCC.mkDerivation {
-      name = "wikidata-facts-db-${name}";
-      nativeBuildInputs = [
-        buildDbBin
-        pkgs.sqlite
-      ];
-      SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
-      buildCommand = ''
-        mkdir -p $out
-        ingest build-db \
-          --input ${source}/entities.jsonl \
-          --database-url sqlite:$out/facts.db \
-          --recorded-at ${lib.escapeShellArg recordedAt} \
-          ${lib.optionalString (limit != null) "--limit ${toString limit}"}
-        # A store DB is read-only, so it must carry no WAL side files: fold the
-        # WAL back in and switch to a rollback journal.
-        sqlite3 $out/facts.db "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"
-        rm -f $out/facts.db-wal $out/facts.db-shm
-        facts=$(sqlite3 $out/facts.db "SELECT count(*) FROM facts")
-        echo "facts DB '${name}' holds $facts facts"
-        test "$facts" -gt 0
-      '';
-    };
+    pkgs.stdenvNoCC.mkDerivation (
+      {
+        name = "wikidata-facts-db-${name}";
+        nativeBuildInputs = [
+          buildDbBin
+          pkgs.sqlite
+        ];
+        SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
+        buildCommand = ''
+          mkdir -p $out
+          ingest build-db \
+            --input ${source}/entities.jsonl \
+            --database-url sqlite:$out/facts.db \
+            --recorded-at ${lib.escapeShellArg recordedAt} \
+            ${lib.optionalString (limit != null) "--limit ${toString limit}"}
+          # A store DB is read-only, so it must carry no WAL side files: fold the
+          # WAL back in and switch to a rollback journal.
+          sqlite3 $out/facts.db "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"
+          rm -f $out/facts.db-wal $out/facts.db-shm
+          facts=$(sqlite3 $out/facts.db "SELECT count(*) FROM facts")
+          echo "facts DB '${name}' holds $facts facts"
+          test "$facts" -gt 0
+        '';
+      }
+      // spatialitePreload
+    );
 
   bulkRecordedAt = "${dumpPin.date}T00:00:00Z";
 
