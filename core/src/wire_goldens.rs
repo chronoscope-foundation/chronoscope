@@ -285,6 +285,18 @@ fn golden_image_fact_medium() -> Result<()> {
 }
 
 #[test]
+fn golden_image_fact_subject_date() -> Result<()> {
+    let f: image::Fact<MemoryIds> = image::Fact::SubjectDate {
+        image: img(1)?,
+        bound: sample_date()?,
+    };
+    assert_golden_roundtrip(
+        &f,
+        r#"{"bound":{"earliest":{"date":"1700-01-01","precision":"year"},"latest":{"date":"1700-01-01","precision":"year"}},"image":"1","type":"subject_date"}"#,
+    )
+}
+
+#[test]
 fn golden_identity_fact_same_entity() -> Result<()> {
     let f = identity::Fact::<MemoryIds>::same_entity(ent(1)?, ent(2)?)?;
     assert_golden_roundtrip(&f, r#"{"pair":{"a":"1","b":"2"},"type":"same_entity"}"#)

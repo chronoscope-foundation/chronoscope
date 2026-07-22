@@ -538,7 +538,8 @@ pub(crate) fn facet_columns(fact: &StoredFact<SqlIds>) -> Result<Facets, CodecEr
                     ..Facets::default()
                 }),
                 image::Fact::CreatedDate { bound, .. }
-                | image::Fact::CapturedDate { bound, .. } => Ok(Facets::date(bound)),
+                | image::Fact::CapturedDate { bound, .. }
+                | image::Fact::SubjectDate { bound, .. } => Ok(Facets::date(bound)),
                 image::Fact::CapturedLocation { location, .. } => Ok(Facets::location(location)),
                 image::Fact::Author { .. } | image::Fact::Medium { .. } => Ok(Facets::default()),
             },

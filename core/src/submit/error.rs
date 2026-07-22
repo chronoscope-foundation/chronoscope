@@ -32,6 +32,8 @@ pub enum DateRole {
     EventDate,
     /// `image::Fact::CreatedDate`.
     ImageCreated,
+    /// `image::Fact::SubjectDate`.
+    ImageSubject,
     /// `image::Fact::CapturedDate`.
     ImageCaptured,
     /// An `ExternalSource` publication/creation date carried by a citation
@@ -48,6 +50,7 @@ impl std::fmt::Display for DateRole {
             Self::ExistenceWitness => "existence witness",
             Self::EventDate => "event date",
             Self::ImageCreated => "image created-date",
+            Self::ImageSubject => "image subject-date",
             Self::ImageCaptured => "image captured-date",
             Self::CitationDate => "citation date",
         };

@@ -580,8 +580,7 @@ where
     }
 }
 
-/// An image fact's contribution: only `Source` (→ `urls`) and `Medium` (→ the
-/// restrictive `medium`) carry image-field projections.
+/// An image fact's contribution to the image-field projection.
 fn inject_image_fact<R: IdScheme, Stored, T>(
     fact_id: &FactId,
     fact: &image::Fact<R>,
@@ -600,6 +599,10 @@ where
         image::Fact::Medium { image: id, medium } => {
             let support = provenance(fact_id, id, stored);
             image.medium = claimed_of(*medium, support);
+        }
+        image::Fact::SubjectDate { image: id, bound } => {
+            let support = provenance(fact_id, id, stored);
+            image.subject_date = Bracket::from((bound.clone(), support));
         }
         image::Fact::Author { .. }
         | image::Fact::CreatedDate { .. }

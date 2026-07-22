@@ -230,14 +230,19 @@ derive_slot!(Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T: Semiring>, {
 /// attribute like a scan's capture date would want the two separated. Whether to
 /// separate them is an open question.
 ///
-/// The medium is restrictive (one settled value once sources agree); the rest
-/// are additive memberships — source URLs, the entities depicted, the composite
-/// edges to a parent or held subimages, and the `SameArtifact` glue tying the
-/// realizations together (mirroring [`Entity`]'s `sameness`).
+/// The medium and subject-date are restrictive (one settled value once sources
+/// agree); the rest are additive memberships — source URLs, the entities
+/// depicted, the composite edges to a parent or held subimages, and the
+/// `SameArtifact` glue tying the realizations together (mirroring [`Entity`]'s
+/// `sameness`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Image<EntId: Ord, ImgId: Ord, T> {
     /// The descriptive medium — a single value once sources agree.
     pub medium: Bracket<Claimed<ImageMedium>, T>,
+    /// When the artifact's content portrays its subject as existing, folded
+    /// across the `SameArtifact` class — the moment depicted, not the moment
+    /// the artifact was made or scanned.
+    pub subject_date: Bracket<UncertainDate, T>,
     /// Source URLs the image's bytes were fetched from.
     pub urls: FactSet<Url, T>,
     /// Entities depicted in this image, keyed by entity id, each with its
@@ -255,5 +260,5 @@ pub struct Image<EntId: Ord, ImgId: Ord, T> {
 }
 
 derive_slot!(Image<EntId: Ord, ImgId: Ord, T: Semiring>, {
-    medium, urls, depicts, parent, subimages, sameness
+    medium, subject_date, urls, depicts, parent, subimages, sameness
 });

@@ -3,19 +3,19 @@
 //! Cluster module for the `Image` variant of
 //! [`crate::grammar::assertions::FactualAssertion`]. One image type carries every
 //! image-level claim: byte-level provenance ([`Fact::Source`]), the underlying
-//! artifact's [`Fact::Author`] and [`Fact::CreatedDate`], the survey/record
-//! [`Fact::CapturedDate`] and viewpoint [`Fact::CapturedLocation`], and a
-//! descriptive [`Fact::Medium`].
+//! artifact's [`Fact::Author`], [`Fact::CreatedDate`], and [`Fact::SubjectDate`],
+//! the survey/record [`Fact::CapturedDate`] and viewpoint
+//! [`Fact::CapturedLocation`], and a descriptive [`Fact::Medium`].
 //!
 //! "Picture" and "map" are not structural kinds that gate which facts an image
 //! may carry — they describe a medium. [`Fact::Medium`] records that medium as a
 //! cited, non-gating hint; every other fact applies to any image.
 //!
-//! Author and created-date describe the underlying artifact, so they propagate
-//! across [`crate::grammar::identity::Fact::SameArtifact`] classes — every scan of
-//! one painting shares them. A survey date or viewpoint is a property of a scan
-//! instance, so the projection that consumes it owns the artifact-class-vs-scan
-//! reconciliation.
+//! Author, created-date, and subject-date describe the underlying artifact, so
+//! they propagate across [`crate::grammar::identity::Fact::SameArtifact`] classes —
+//! every scan of one painting shares them. A survey date or viewpoint is a
+//! property of a scan instance, so the projection that consumes it owns the
+//! artifact-class-vs-scan reconciliation.
 //!
 //! Orientation, scale, and georeferencing are planned, design pending. They are
 //! projection parameters of an image, read off any image with enough structure
@@ -119,6 +119,23 @@ pub enum Fact<R: IdScheme> {
         image: R::Image,
         /// The source-claimed interval for the creation.
         #[date_role = "ImageCreated"]
+        bound: UncertainDate,
+    },
+    /// The moment this image portrays its subject as existing — the
+    /// subject-date. An 1890s bird's-eye view drawn of a city *as it stood in
+    /// 1850* portrays an 1850 subject; that is this date, distinct from the
+    /// 1890s [`Fact::CreatedDate`] when the drawing was made and from any later
+    /// [`Fact::CapturedDate`] when a copy was scanned.
+    ///
+    /// A property of the artifact's content, shared by every scan, so it
+    /// propagates across
+    /// [`crate::grammar::identity::Fact::SameArtifact`] equivalence classes —
+    /// artifact-level, the same side as [`Fact::CreatedDate`], where
+    /// [`Fact::CapturedDate`] and [`Fact::CapturedLocation`] are scan-level.
+    SubjectDate {
+        image: R::Image,
+        /// The source-claimed interval the subject is portrayed as existing in.
+        #[date_role = "ImageSubject"]
         bound: UncertainDate,
     },
     /// When this image was captured — the survey or record date of the

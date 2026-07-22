@@ -124,6 +124,7 @@ mod tests {
     fn empty_image() -> projection::Image<EntId, ImgId, Lin> {
         projection::Image {
             medium: untouched(),
+            subject_date: untouched(),
             urls: FactMap::new(),
             depicts: FactMap::new(),
             parent: FactMap::new(),

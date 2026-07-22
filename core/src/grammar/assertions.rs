@@ -456,8 +456,6 @@ mod traversal_props {
         )
     }
 
-    /// `image::Fact` — all six variants (`Source`, `Author`, `CreatedDate`,
-    /// `CapturedDate`, `CapturedLocation`, `Medium`).
     fn arb_image_fact() -> impl Strategy<Value = image::Fact<MemoryIds>> {
         prop_oneof![
             (arb_image(), sentinel_url())
@@ -469,6 +467,8 @@ mod traversal_props {
             }),
             (arb_image(), sentinel_date())
                 .prop_map(|(image, bound)| image::Fact::CreatedDate { image, bound }),
+            (arb_image(), sentinel_date())
+                .prop_map(|(image, bound)| image::Fact::SubjectDate { image, bound }),
             (arb_image(), sentinel_date())
                 .prop_map(|(image, bound)| image::Fact::CapturedDate { image, bound }),
             arb_image().prop_map(|image| image::Fact::CapturedLocation {

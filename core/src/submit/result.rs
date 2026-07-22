@@ -304,6 +304,7 @@ impl<R: IdScheme> StoredFact<R> {
                 image::Fact::Source { .. }
                 | image::Fact::Author { .. }
                 | image::Fact::CreatedDate { .. }
+                | image::Fact::SubjectDate { .. }
                 | image::Fact::CapturedDate { .. }
                 | image::Fact::Medium { .. } => None,
             },

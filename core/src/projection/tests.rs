@@ -32,10 +32,10 @@ use crate::projection::Claimed;
 use crate::store::memory::{MemoryEntityId, MemoryError, MemoryFactStore, MemoryIds};
 use crate::store::pagination::paginate;
 use crate::store::schema::{FactPage, PageItem};
-use crate::store::{EntityIdOf, EventIdOf, FactStore, ImageIdOf};
+use crate::store::{EntityIdOf, EventIdOf, FactStore, ImageIdOf, SubmitCommitError};
 use crate::submit::{
-    Commit as SubmitBundle, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, StoredFact,
-    SubmitFact, commit_facts,
+    Commit as SubmitBundle, CommitAuthor, DateRole, Decl, EntityIdx, EventIdx, ImageIdx,
+    StoredFact, SubmitError, SubmitFact, commit_facts,
 };
 use proptest::prelude::*;
 
@@ -1901,6 +1901,153 @@ async fn project_image_records_same_artifact_glue() -> TestResult {
     assert!(
         entry.support.atoms().next().is_some(),
         "the recorded glue edge carries the judgment's support"
+    );
+    Ok(())
+}
+
+/// A `SubjectDate` folds into the image's restrictive `subject_date` slot
+/// through the real store drain. Nothing consumes the slot yet; the projection
+/// is the surface later PRs read.
+#[tokio::test]
+async fn project_image_folds_subject_date() -> TestResult {
+    let store = MemoryFactStore::new();
+    let subject = year_date(1850)?;
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [SubmitFact::Factual {
+            assertion: FactualAssertion::Image {
+                fact: crate::grammar::image::Fact::SubjectDate {
+                    image: ImageIdx(0),
+                    bound: subject.clone(),
+                },
+            },
+            citation: sample_citation()?,
+        }]
+        .into_iter()
+        .collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let id = result.images.get(&ImageIdx(0)).ok_or("missing image")?.id;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, image) = project_image::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
+
+    assert_eq!(
+        image.subject_date.consensus.value, subject,
+        "the subject-date folds into its restrictive slot"
+    );
+    assert_eq!(
+        image.subject_date.consensus.support.atoms().count(),
+        1,
+        "the folded subject-date cites its one fact"
+    );
+    Ok(())
+}
+
+/// A `SubjectDate` is artifact-level: asserted on one scan and glued to another
+/// by `SameArtifact`, it surfaces when the class is read through the *other*
+/// scan — the scan that carries no subject-date of its own.
+#[tokio::test]
+async fn subject_date_propagates_across_same_artifact() -> TestResult {
+    let store = MemoryFactStore::new();
+    let subject = year_date(1850)?;
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local, Decl::Local],
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: crate::grammar::image::Fact::SubjectDate {
+                        image: ImageIdx(0),
+                        bound: subject.clone(),
+                    },
+                },
+                citation: sample_citation()?,
+            },
+            same_artifact_fact(0, 1)?,
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let result = commit_facts(&store, bundle)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let scan_a = result.images.get(&ImageIdx(0)).ok_or("missing scan a")?.id;
+    let scan_b = result.images.get(&ImageIdx(1)).ok_or("missing scan b")?.id;
+
+    // Read the class through scan B, which carries no SubjectDate of its own.
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (class, image) = project_image::<MemoryFactStore, _, _>(&mut view, scan_b, member_lineage)
+        .await?
+        .ok_or("known id should project")?;
+    assert!(
+        class.members.contains(&scan_a) && class.members.contains(&scan_b),
+        "the judgment unions both scans into one artifact class"
+    );
+    assert_eq!(
+        image.subject_date.consensus.value, subject,
+        "scan A's subject-date surfaces when the class is read through scan B"
+    );
+    Ok(())
+}
+
+/// A `SubjectDate` carrying a disjunction (a multi-interval date) is rejected at
+/// submit as `NonSingleIntervalDate`, tagged with the `ImageSubject` role — the
+/// `#[date_role]` walk reaches the new payload for free.
+#[tokio::test]
+async fn multi_interval_subject_date_is_rejected() -> TestResult {
+    let store = MemoryFactStore::new();
+    // "1850 or 1870": a genuine two-interval disjunction, no storable claim.
+    let disjunction = year_date(1850)?.join(&year_date(1870)?);
+    assert_eq!(
+        disjunction.intervals().len(),
+        2,
+        "the test needs a real disjunction"
+    );
+    let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
+        author: CommitAuthor::User(UserId::new("alice")),
+        recorded_at: fixed_time(),
+        entities: Vec::new(),
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [SubmitFact::Factual {
+            assertion: FactualAssertion::Image {
+                fact: crate::grammar::image::Fact::SubjectDate {
+                    image: ImageIdx(0),
+                    bound: disjunction,
+                },
+            },
+            citation: sample_citation()?,
+        }]
+        .into_iter()
+        .collect(),
+    };
+    let err = match commit_facts(&store, bundle).await {
+        Ok(_) => return Err("a multi-interval subject-date must be rejected".into()),
+        Err(e) => e,
+    };
+    let SubmitCommitError::Submit(batch) = err else {
+        return Err(format!("expected a submit rejection, got {err:?}").into());
+    };
+    assert!(
+        batch.iter().any(|e| matches!(
+            e,
+            SubmitError::NonSingleIntervalDate {
+                role: DateRole::ImageSubject
+            }
+        )),
+        "got {batch:?}"
     );
     Ok(())
 }
