@@ -50,7 +50,7 @@ pub fn register_api(
     api.register(entities::list_entities)?;
     api.register(entities::get_entity)?;
     api.register(entities::get_entity_images)?;
-    api.register(entities::list_markers)?;
+    api.register(entities::get_tile)?;
 
     // Well-known endpoints
     api.register(well_known::apple_app_site_association)?;

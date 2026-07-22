@@ -44,7 +44,7 @@ pub fn extract_point<EntId: Ord, EvtId, ImgId>(
 /// entity has none. Perspective is read straight off each depiction record's
 /// bracket, so the pick settles a representative without materializing typed
 /// depictions or cloning their localization geometry and citations.
-fn representative_image<EntId, ImgId>(
+pub fn representative_image<EntId, ImgId>(
     depictions: &FactMap<
         ImgId,
         DepictionRecord<MemberLineage<EntId, ImgId>>,
@@ -231,7 +231,7 @@ where
 
 /// The date span of a parsed timeline: the earliest lower bound and latest upper
 /// bound across every dated event, each `None` when nothing dates that side.
-fn timeline_span<EvtId, ImgId>(
+pub fn timeline_span<EvtId, ImgId>(
     events: &[typed::TimelineEvent<EvtId, ImgId>],
 ) -> (Option<NaiveDate>, Option<NaiveDate>) {
     let mut earliest: Option<NaiveDate> = None;

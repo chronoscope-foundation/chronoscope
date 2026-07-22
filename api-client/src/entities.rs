@@ -144,7 +144,9 @@ impl std::fmt::Display for Cursor {
 /// in the append-only log — are server-internal and never inspected
 /// client-side. Distinct from [`Cursor`]: a snapshot pins *where* to read, a
 /// cursor pins where a paginated walk resumes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct Snapshot(String);
 
@@ -233,13 +235,14 @@ pub struct EntityImagesPage<I> {
     pub snapshot: Snapshot,
 }
 
-// ==================== Unified Markers ====================
+// ==================== Map tiles ====================
 
 /// A map marker for one entity (or a co-located group of entities).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Marker<E> {
-    /// The entity id — for a co-located group, the group's first member
-    /// (sorted by earliest date). `click_action` carries every member.
+    /// The cell's representative entity. `click_action` is `Select` for a lone
+    /// entity, `Expand` for a cluster the client zooms into, or `Disambiguate`
+    /// carrying the co-located members.
     pub id: E,
     pub point: GeoPoint,
     /// The representative entity's display name, negotiated server-side from the
@@ -263,6 +266,12 @@ pub enum ClickAction<E> {
     /// Open the entity detail panel.
     #[serde(rename = "select")]
     Select { entity_id: E },
+    /// Zoom the map into a cluster of entities spread across finer tiles.
+    /// `split_level` is the finest tile level at which the cluster subdivides,
+    /// so the client can zoom straight to where the cell breaks apart (a raw
+    /// `u8` on the wire — the core `QuadLevel` has no serialized form).
+    #[serde(rename = "expand")]
+    Expand { split_level: u8 },
     /// Show a disambiguation picker (co-located entities at the same point).
     #[serde(rename = "disambiguate")]
     Disambiguate { entries: Vec<EntityPickerEntry<E>> },
@@ -278,14 +287,18 @@ pub struct EntityPickerEntry<E> {
     pub name: Option<String>,
 }
 
-/// Response for the unified markers endpoint.
+/// Response for the per-tile clustering endpoint `GET /tiles/{z}/{x}/{y}`.
+///
+/// The tile's cluster cells as [`Marker`]s (0..many, one per non-empty
+/// sub-tile). The cell geometry is viewport-free and snapshot-pinned, keyed by
+/// `(snapshot, z, x, y)`. Marker names are localized per `Accept-Language` (the
+/// response carries `Vary: Accept-Language`), so a shared cache must also key on
+/// language.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct MarkersResponse<E> {
+pub struct TileResponse<E> {
     pub markers: Vec<Marker<E>>,
-    /// True if results were truncated at the server limit.
-    pub truncated: bool,
-    /// The read-consistency point these markers were served at. Thread it back
-    /// as `?snapshot=` to pin a follow-up read to the same state.
+    /// The read-consistency point this tile was served at. Thread it back as
+    /// `?snapshot=` to pin follow-up tile reads to the same state.
     pub snapshot: Snapshot,
 }
 

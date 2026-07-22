@@ -134,6 +134,7 @@ impl TestServer {
         let server = start_dev_server(DevServerConfig {
             database_url: Some(database_url),
             facts: FactsDbSource::Writable(facts_database),
+            seed_commits: Vec::new(),
             http_client,
             worker_idle_backoff: Duration::from_millis(50),
             retry_config: RetryConfig {
@@ -155,7 +156,12 @@ impl TestServer {
         })
         .await?;
 
-        let client = Client::new(base_url);
+        // Disabling the idle connection pool avoids reusing a keep-alive
+        // connection the local server has already closed (the IncompleteMessage race).
+        let reqwest_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .build()?;
+        let client = Client::with_reqwest(reqwest_client, base_url);
         let auth = AuthClient::new(client, server.auth_token.clone());
 
         Ok(Self {

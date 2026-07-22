@@ -9,7 +9,19 @@
 
 mod harness;
 
-use harness::{TestResult, WebTest, check, web_test};
+use harness::{TestResult, WebTest, check, web_test, web_test_seeded};
+
+use chronoscope_api::state::ServerIds;
+use chronoscope_core::geo::{GeoPoint, Meters};
+use chronoscope_core::grammar::assertions::FactualAssertion;
+use chronoscope_core::grammar::attribute::{self, NameText, NameType};
+use chronoscope_core::grammar::bookend::ConstructionFact;
+use chronoscope_core::grammar::citations::{Excerpt, ExternalSource, FactualCitation, Language};
+use chronoscope_core::grammar::ids::UserId;
+use chronoscope_core::location::{Location, UnresolvedLocation};
+use chronoscope_core::submit::{Commit, CommitAuthor, Decl, EntityIdx, SubmitFact};
+
+type SeedResult = Result<Commit<ServerIds>, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Hagia Sophia, Istanbul — single entity, good for detail panel tests (lng, lat).
 const HAGIA_SOPHIA: (f64, f64) = (28.979917, 41.008528);
@@ -17,6 +29,111 @@ const HAGIA_SOPHIA: (f64, f64) = (28.979917, 41.008528);
 /// 1633 with no rebuild construction, so it projects as one entity carrying an
 /// existence-after-demolition conflict.
 const CHIOGGIA_CATHEDRAL: (f64, f64) = (12.27725, 45.217056);
+
+// ==================== Fact seeding helpers ====================
+//
+// Browser clustering tests seed entities at open-ocean coordinates (far from
+// any curated entity) so the map geometry under test is fully controlled. The
+// prime meridian (lon 0) is a quadkey tile boundary at *every* level, so two
+// entities placed a few meters apart across it always land in distinct server
+// cells — exactly the near-overlap case client proximity clustering must fold.
+
+fn seed_citation(url: &str) -> Result<FactualCitation, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(FactualCitation::new(
+        ExternalSource::Url {
+            url: url::Url::parse(url)?,
+            published: None,
+        },
+        vec![Excerpt::new("seed")?],
+    )?)
+}
+
+/// The name + construction-location facts that make an entity nameable and
+/// placeable — the minimum for a rendered tile marker.
+fn name_and_location_facts(
+    name: &str,
+    lat: f64,
+    lon: f64,
+) -> Result<Vec<SubmitFact>, Box<dyn std::error::Error + Send + Sync>> {
+    let location = UnresolvedLocation::Resolved(Location::circle(
+        GeoPoint::new(lat, lon)?,
+        Meters::try_new(10.0)?,
+    )?);
+    Ok(vec![
+        SubmitFact::Factual {
+            assertion: FactualAssertion::Attribute {
+                fact: attribute::Fact::Name {
+                    entity: EntityIdx(0),
+                    name: NameText::new(name),
+                    language: Language::new("en")?,
+                    name_type: NameType::Common,
+                    valid_from: None,
+                    valid_to: None,
+                },
+            },
+            citation: seed_citation("https://example.com/seed-name")?,
+        },
+        SubmitFact::Factual {
+            assertion: FactualAssertion::Construction {
+                fact: ConstructionFact::Location {
+                    entity: EntityIdx(0),
+                    location,
+                },
+            },
+            citation: seed_citation("https://example.com/seed-location")?,
+        },
+    ])
+}
+
+/// A commit placing one named entity at `(lat, lon)`.
+fn seed_entity_at(name: &str, lat: f64, lon: f64) -> SeedResult {
+    Ok(Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("seed")),
+        recorded_at: chrono::Utc::now(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: name_and_location_facts(name, lat, lon)?
+            .into_iter()
+            .collect(),
+    })
+}
+
+/// A rendered marker's projected screen position (`_x`/`_y`, CSS pixels), if
+/// the descriptor carries one.
+fn screen_xy(marker: &serde_json::Value) -> Option<(f64, f64)> {
+    Some((marker.get("_x")?.as_f64()?, marker.get("_y")?.as_f64()?))
+}
+
+/// Whether a projected screen position falls within the map-canvas rectangle
+/// `[0, width] × [0, height]`. A rendered marker whose `_x`/`_y` is inside these
+/// bounds is genuinely on-screen — the direction-B guarantee that a populated
+/// viewport shows a marker the user can see, not one whose representative fell
+/// off the visible edge.
+fn in_canvas(xy: (f64, f64), width: f64, height: f64) -> bool {
+    (0.0..=width).contains(&xy.0) && (0.0..=height).contains(&xy.1)
+}
+
+/// The map canvas size in CSS pixels as `(width, height)` — the frame
+/// `marker_properties`/`badge_properties` project into.
+async fn canvas_size(t: &WebTest) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
+    let size = t.map_canvas_size().await?;
+    Ok((
+        size.first().copied().unwrap_or(0.0),
+        size.get(1).copied().unwrap_or(0.0),
+    ))
+}
+
+/// Every rendered map feature — individual markers plus cluster badges. Both
+/// `marker_properties` and `badge_properties` are QRF-backed (they return only
+/// in-viewport features), so this is exactly what the user currently sees.
+async fn rendered_features(
+    t: &WebTest,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut features = t.marker_properties().await?;
+    features.extend(t.badge_properties().await?);
+    Ok(features)
+}
 
 /// Assert the three sidebar/nav links (Explore, About, FAQ) are present.
 async fn check_nav_links(t: &WebTest) -> TestResult {
@@ -484,6 +601,386 @@ async fn test_map_hover_cursor() -> TestResult {
     .await
 }
 
+// ==================== Client-side clustering tests ====================
+//
+// These seed entities at open-ocean coordinates so the map geometry is fully
+// controlled. Pairs straddling the prime meridian (lon 0) always land in
+// distinct server cells — the near-overlap case the client folds — while a
+// lone entity always stays an individual `Select` pin.
+
+/// The headline near-split test: two entities ~44 m apart straddling lon 0
+/// render as ONE badge, and no two individual markers sit within the
+/// proximity-cluster radius. Without client clustering these two distinct
+/// server cells would render as two near-overlapping pins (the Hagia
+/// Sophia/Bostancı artifact).
+#[tokio::test]
+async fn test_near_adjacent_entities_render_one_badge() -> TestResult {
+    let seeds = vec![
+        seed_entity_at("Meridian West", 0.02, -0.0002)?,
+        seed_entity_at("Meridian East", 0.02, 0.0002)?,
+    ];
+    web_test_seeded(seeds, async |t| {
+        // Mid zoom where 44 m projects to ~1 px — well inside the 50 px radius.
+        t.goto_map_at(0.0, 0.02, 12.0).await?;
+
+        // The two entities are distinct server cells; the client folds them into
+        // exactly one badge and leaves no individual pin behind. Had clustering
+        // failed they would render as two near-overlapping pins instead (badge
+        // count 0, marker count 2) — the Hagia Sophia/Bostancı artifact.
+        let badges = t.badge_properties().await?;
+        check(
+            badges.len() == 1,
+            format!("two near-adjacent entities must fold to exactly one badge, got {badges:?}"),
+        )?;
+        let markers = t.marker_properties().await?;
+        check(
+            markers.is_empty(),
+            format!(
+                "both entities fold into the badge, leaving no individual pin, got {markers:?}"
+            ),
+        )?;
+
+        // The badge lands in-view: the client clips out-of-view cells before
+        // clustering, so supercluster only ever sees in-view points and the fold
+        // centroid projects onto the canvas the user is looking at.
+        let (w, h) = canvas_size(t).await?;
+        let badge = badges.first().ok_or("expected exactly one fold badge")?;
+        let badge_xy = screen_xy(badge).ok_or("badge missing screen coords")?;
+        check(
+            in_canvas(badge_xy, w, h),
+            format!("the fold badge must project in-view within {w}x{h}, got {badge_xy:?}"),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// A lone entity renders as an individual `Select` pin (with its name, no
+/// `point_count`, `kind == "entity"`) and never as a badge.
+#[tokio::test]
+async fn test_lone_entity_is_a_pin_not_a_badge() -> TestResult {
+    let seeds = vec![seed_entity_at("Lone Beacon", 25.0, -40.0)?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 12.0).await?;
+
+        let badges = t.badge_properties().await?;
+        check(
+            badges.is_empty(),
+            format!("a lone entity must not render a badge, got {badges:?}"),
+        )?;
+
+        let markers = t.marker_properties().await?;
+        check(
+            markers.len() == 1,
+            format!("expected exactly one individual marker, got {markers:?}"),
+        )?;
+        let marker = &markers[0];
+        check(
+            marker.get("kind").and_then(|k| k.as_str()) == Some("entity"),
+            format!("a lone marker's kind must be 'entity', got {marker:?}"),
+        )?;
+        check(
+            marker.get("name").and_then(|n| n.as_str()) == Some("Lone Beacon"),
+            format!("the lone marker must carry its negotiated name, got {marker:?}"),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Zooming into Rome splits its clustered landmarks into individual pins.
+/// Zoomed out, the central-Rome landmarks fall within the proximity radius and
+/// fold into a cluster badge; clicking the badge eases the map in past the fold
+/// distance, and the cluster breaks apart into individual pins (or, for a deeper
+/// nesting, at least sheds a badge on the way down).
+///
+/// Runs against the curated Rome data, so the exact fold at zoom 10 is a
+/// property of that dataset rather than a seeded geometry.
+#[tokio::test]
+async fn test_zoom_into_rome_splits_cluster_into_individual_pins() -> TestResult {
+    web_test(async |t| {
+        // Zoomed out over Rome, the landmarks fold into a cluster badge.
+        t.goto_map_at(ROME_LNG, ROME_LAT, 10.0).await?;
+        let badges = t.badge_properties().await?;
+        check(
+            !badges.is_empty(),
+            format!(
+                "zoomed out over Rome, the landmarks must fold into a cluster badge, got {badges:?}"
+            ),
+        )?;
+        let badge = badges.first().ok_or("expected a Rome cluster badge")?;
+        let badge_lng = badge
+            .get("_lng")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or("badge descriptor missing _lng")?;
+        let badge_lat = badge
+            .get("_lat")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or("badge descriptor missing _lat")?;
+
+        let zoom_before = t.zoom().await?;
+
+        // Sample the fetch counter, click the badge, then wait for the
+        // expansion's ease-to-triggered re-fetch and the map to settle.
+        let prev_fetch = t.current_fetch_settled().await?;
+        t.click_map_at(badge_lng, badge_lat).await?;
+        t.wait_for_fetch_settled_after(prev_fetch).await?;
+        t.wait_for_map_idle().await?;
+
+        let zoom_after = t.zoom().await?;
+        check(
+            zoom_after > zoom_before,
+            format!(
+                "clicking a Rome cluster badge must zoom the map in: {zoom_before} -> {zoom_after}"
+            ),
+        )?;
+
+        let markers_after = t.marker_properties().await?;
+        let badges_after = t.badge_properties().await?;
+        check(
+            !markers_after.is_empty() || badges_after.len() < badges.len(),
+            format!(
+                "expansion must surface individual pins or drop the badge count: \
+                 badges {} -> {}, individuals {}",
+                badges.len(),
+                badges_after.len(),
+                markers_after.len()
+            ),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Village + wild: a dense group folds to one badge while a distant lone entity
+/// in the same viewport stays an individual pin.
+#[tokio::test]
+async fn test_dense_group_and_lone_entity_render_badge_plus_pin() -> TestResult {
+    // Geometry is chosen so both classifications are decided server-side, off any
+    // coarse Morton boundary. At zoom 11 cells fold at level 11 + CELL_DEPTH(3) =
+    // 14. The three village entities (~55 m apart, open ocean, off lon 0) all fall
+    // in one level-14 sub-tile → one server cluster cell → a badge, with no
+    // reliance on the client merging across a tile boundary. The wild sits 0.0412°
+    // east — a distinct sub-tile (its own Select cell) and ~120 px away at zoom 11,
+    // well past the 50 px fold radius. The map is centered between them so each
+    // lands ~60 px from center, comfortably inside the sidebar-narrowed canvas.
+    let seeds = vec![
+        seed_entity_at("Village A", 20.0000, -30.0000)?,
+        seed_entity_at("Village B", 20.0003, -30.0002)?,
+        seed_entity_at("Village C", 19.9998, -30.0003)?,
+        seed_entity_at("Lonely Wild", 20.0000, -29.9588)?,
+    ];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-29.9794, 20.0, 11.0).await?;
+
+        let (w, h) = canvas_size(t).await?;
+
+        // The dense village folds to a cluster badge that lands in-view.
+        let badges = t.badge_properties().await?;
+        check(
+            !badges.is_empty(),
+            format!("the dense village must fold to a cluster badge, got {badges:?}"),
+        )?;
+        let badge = badges.first().ok_or("expected a village badge")?;
+        let badge_xy = screen_xy(badge).ok_or("badge missing screen coords")?;
+        check(
+            in_canvas(badge_xy, w, h),
+            format!("the village badge must render in-view within {w}x{h}, got {badge_xy:?}"),
+        )?;
+
+        // Only the wild entity renders as an individual pin, also in-view.
+        let markers = t.marker_properties().await?;
+        check(
+            markers.len() == 1,
+            format!("only the wild entity should render as an individual pin, got {markers:?}"),
+        )?;
+        let wild = markers.first().ok_or("expected the wild pin")?;
+        check(
+            wild.get("name").and_then(|n| n.as_str()) == Some("Lonely Wild"),
+            format!("the lone pin must be the wild entity, got {wild:?}"),
+        )?;
+        let wild_xy = screen_xy(wild).ok_or("wild pin missing screen coords")?;
+        check(
+            in_canvas(wild_xy, w, h),
+            format!("the wild pin must render in-view within {w}x{h}, got {wild_xy:?}"),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Direction-B regression (no hidden entity): panning to a populated sub-region
+/// at a medium zoom always renders at least one marker whose projected position
+/// is genuinely on-screen. This is the empty-viewport bug the tiled redesign
+/// exists to fix — a stale coarse feed, or a rollup whose representative fell
+/// off-edge, would leave a populated view blank.
+#[tokio::test]
+async fn test_populated_viewport_always_renders_an_in_view_marker() -> TestResult {
+    // A compact cluster in open ocean, spread ~1 km so the geometry is ours
+    // alone. At this zoom the members sit within the proximity radius and fold to
+    // one badge; folded or not, the region is non-empty and must show it.
+    let seeds = vec![
+        seed_entity_at("Reef North", 25.010, -40.000)?,
+        seed_entity_at("Reef East", 25.000, -40.010)?,
+        seed_entity_at("Reef South", 24.990, -40.000)?,
+    ];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 11.0).await?;
+
+        let features = rendered_features(t).await?;
+        check(
+            !features.is_empty(),
+            "a populated viewport must render at least one marker or badge",
+        )?;
+
+        let (w, h) = canvas_size(t).await?;
+        let any_in_view = features
+            .iter()
+            .filter_map(screen_xy)
+            .any(|xy| in_canvas(xy, w, h));
+        check(
+            any_in_view,
+            format!(
+                "at least one rendered feature must project on-screen within {w}x{h}, got {features:?}"
+            ),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// The direction-B guarantee holds even for a thin, edge-shaped viewport — the
+/// case a coarse-rollup representative is most likely to fall outside. A short
+/// horizontal strip centered on a populated region still renders an in-view
+/// marker.
+#[tokio::test]
+async fn test_thin_viewport_still_renders_a_populated_region() -> TestResult {
+    let seeds = vec![
+        seed_entity_at("Strip West", 25.000, -40.010)?,
+        seed_entity_at("Strip East", 25.000, -39.990)?,
+    ];
+    web_test_seeded(seeds, async |t| {
+        // Set the thin viewport before the map mounts so it initializes at this
+        // shape (mirrors the mobile-layout test's set-then-goto order).
+        t.set_viewport(1280, 150).await?;
+        t.goto_map_at(-40.0, 25.0, 11.0).await?;
+
+        let features = rendered_features(t).await?;
+        check(
+            !features.is_empty(),
+            "a populated thin viewport must still render a marker or badge",
+        )?;
+
+        let (w, h) = canvas_size(t).await?;
+        let any_in_view = features
+            .iter()
+            .filter_map(screen_xy)
+            .any(|xy| in_canvas(xy, w, h));
+        check(
+            any_in_view,
+            format!(
+                "a thin populated viewport must show an in-view feature within {w}x{h}, got {features:?}"
+            ),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Panning across the antimeridian (±180°) must not blank or error: entities on
+/// the Pacific side of the seam still render. The seam-aware viewport bounds and
+/// tile enumeration carry the wrap; a naive box would fold to an antimeridian
+/// sliver and drop them.
+#[tokio::test]
+async fn test_antimeridian_pan_still_renders_markers() -> TestResult {
+    // Two entities straddling the seam — one just west, one just east of ±180°.
+    let seeds = vec![
+        seed_entity_at("Dateline West", 0.0, 179.9)?,
+        seed_entity_at("Dateline East", 0.0, -179.9)?,
+    ];
+    web_test_seeded(seeds, async |t| {
+        // Center on the seam itself, so the viewport spans both sides of ±180°.
+        t.goto_map_at(180.0, 0.0, 5.0).await?;
+
+        let features = rendered_features(t).await?;
+        check(
+            !features.is_empty(),
+            "an antimeridian-straddling viewport must still render markers, not blank",
+        )?;
+
+        let (w, h) = canvas_size(t).await?;
+        let any_in_view = features
+            .iter()
+            .filter_map(screen_xy)
+            .any(|xy| in_canvas(xy, w, h));
+        check(
+            any_in_view,
+            format!(
+                "a seam-straddling viewport must show an in-view feature within {w}x{h}, got {features:?}"
+            ),
+        )?;
+
+        // A blank-or-error regression would surface the fetch-error banner.
+        check(
+            !t.has_text("Retry").await?,
+            "crossing the antimeridian must not raise a fetch error",
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// A failed cache-miss fetch must keep the prior area's last-good render and
+/// cache, not blank the map. Load area A, break the API, pan to a different
+/// populated area B whose fetch now fails, then return to A: with the last-good
+/// guard the cache A latched survives B's failed pass, so A re-renders from cache
+/// with no network fetch even though the API is still broken. Without the guard,
+/// B's failed pass blanks the map and its retain sweep evicts A's cache, so
+/// returning to A is itself a failing cache-miss and the map stays blank.
+///
+/// The final assertion returns to A because `marker_properties` is
+/// `queryRenderedFeatures`-backed — it only reports in-viewport features, so A's
+/// pin can't be observed while the camera sits on B.
+#[tokio::test]
+async fn test_failed_pan_keeps_last_good_render() -> TestResult {
+    // Two lone entities in open ocean → each always an individual pin (never a
+    // badge), 10° apart so B's tiles are a genuine cache-miss from A's viewport.
+    let seeds = vec![
+        seed_entity_at("Area A Beacon", 25.0, -40.0)?,
+        seed_entity_at("Area B Beacon", 25.0, -30.0)?,
+    ];
+    web_test_seeded(seeds, async |t| {
+        // Load area A; its pin renders and its tiles land in the cache.
+        t.goto_map_at(-40.0, 25.0, 12.0).await?;
+        t.wait_for_markers().await?;
+        let before = t.marker_properties().await?;
+        check(
+            !before.is_empty(),
+            format!("area A must render a pin before the failed fetch, got {before:?}"),
+        )?;
+
+        // Break the API, then pan to area B — a cache-miss whose fetch now fails.
+        t.set_api_url("http://127.0.0.1:1").await?;
+        t.pan_map_to(-30.0, 25.0, 12.0).await?;
+
+        // The failure surfaces the error banner.
+        t.wait_for_body_text("Retry").await?;
+
+        // Return to area A. The guard kept A's cache through B's failed pass, so
+        // this is a cache hit (no fetch) and A renders again despite the broken
+        // API — proof the last-good render and cache survived.
+        t.pan_map_to(-40.0, 25.0, 12.0).await?;
+        t.wait_for_markers().await?;
+        let after = t.marker_properties().await?;
+        check(
+            !after.is_empty(),
+            format!("area A must re-render from the kept last-good cache, got {after:?}"),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 // ==================== UI Chrome & Error Recovery Tests ====================
 
 #[tokio::test]
@@ -565,10 +1062,10 @@ async fn test_error_banner_custom_event() -> TestResult {
 
 #[tokio::test]
 async fn test_fetch_error_retry_button() -> TestResult {
-    // Error→retry→recovery without touching the server at all:
+    // Error→retry→recovery driven by the client's own tile fetches:
     // 1. Load page, verify entities appear (API works)
-    // 2. Swap API URL to a bogus value → next fetch fails
-    // 3. Pan map → error state with retry button
+    // 2. Swap API URL to a bogus value, then force a cache-MISS fetch → it fails
+    // 3. Error state with retry button
     // 4. Swap API URL back to the real server
     // 5. Click retry → entities reload
     web_test(async |t| {
@@ -580,30 +1077,40 @@ async fn test_fetch_error_retry_button() -> TestResult {
             format!("entities should load initially, got {count}"),
         )?;
 
-        // Step 2: Break the API by pointing at a bogus URL, then trigger a
-        // re-fetch at the SAME viewport (where entities exist) via the retry
-        // signal. This way we don't change the viewport — we stay right where
-        // the entities are, but the fetch fails because the URL is wrong.
+        // Step 2: Break the API by pointing at a bogus URL, then force a genuine
+        // cache-MISS fetch so the failure actually fires. The tiled client only
+        // fetches tiles it hasn't already cached, so nudging within the current
+        // view would hit cache and never touch the network. Pan to a different
+        // populated region at a moderate zoom — central Rome, zoom 13 — a fresh
+        // location and level whose tiles must be fetched, and that fetch fails.
+        // Zoom 13 keeps the landmarks past the fold radius, so recovery lands
+        // individual pins the count can see (a deeper zoom risks clipping them
+        // all out of the narrow canvas).
         t.set_api_url("http://127.0.0.1:1").await?;
 
-        // Nudge the map to trigger a fetch that will fail against the bogus URL.
-        // `pan_map_to` works for failing fetches too — the fetch-settled
-        // counter advances on both success and failure paths.
-        t.pan_map_to(28.9800, 41.0086, 14.0).await?;
+        // `pan_map_to` works for failing fetches too — the fetch-settled counter
+        // advances on both success and failure paths.
+        t.pan_map_to(ROME_LNG, ROME_LAT, 13.0).await?;
         t.wait_for_body_text("Retry").await?;
 
         t.screenshot("test_retry_step2_error").await?;
 
-        // Step 3: Restore the real API URL
-        let real_url = t.api_base_url();
+        // Step 3: Restore the API URL — to the same-origin `/api` front door the
+        // page's client uses, not the API's direct address (a cross-origin
+        // restore fails now that the API serves no CORS).
+        let real_url = t.same_origin_api_url();
         t.set_api_url(&real_url).await?;
 
-        // Step 4: Click retry and wait for fetch to complete.
+        // Step 4: Click retry and wait for the fetch to complete.
         t.click_and_wait_for_fetch("button[aria-label*=\"Retry\"]")
             .await?;
 
-        // Verify recovery — entities should be back at the same viewport
-        let count = t.marker_count().await?;
+        // The retry re-render is a data-only setData with no camera move, so the
+        // fetch-settled counter bumps before MapLibre paints; a bare marker_count
+        // read would race the paint and see 0. Wait for the reloaded markers to
+        // actually render, then count them.
+        t.wait_for_markers().await?;
+        let count = t.marker_properties().await?.len();
         check(
             count > 0,
             format!("entities should reload after clicking retry, got {count}"),
@@ -759,40 +1266,57 @@ async fn test_detail_panel_focus() -> TestResult {
 
 /// Find an entity that has resolved media via the typed API client, returning its (lng, lat).
 ///
-/// Uses the markers endpoint to find entities with thumbnails, then fetches
-/// detail to find one with media.
+/// The tile endpoint is clustered and bare (no thumbnails), so this enumerates
+/// the singleton markers over the container tiles covering central Rome and
+/// probes each entity's images sub-resource, returning the point of the one with
+/// the most resolved media.
 async fn find_entity_with_media(
     t: &WebTest,
 ) -> Result<(f64, f64), Box<dyn std::error::Error + Send + Sync>> {
     use chronoscope_api_client::Client;
-    use chronoscope_core::geo::Viewport;
+    use chronoscope_core::geo::{mercator_x, mercator_y};
 
     let client = Client::new(t.api_base_url());
-    // Rome's viewport — the 4 Roman entities sit here, several with seeded media.
-    let viewport = Viewport::from_coords(41.5, 42.5, 12.0, 13.0)?;
-    let response = client.list_markers(&viewport).await?;
+
+    // A tight box over central Rome (the 4 Roman entities, several with seeded
+    // media). At container level 14 each well-separated entity folds into its
+    // own singleton sub-tile cell, and the box spans only a handful of tiles.
+    const LEVEL: u8 = 14;
+    let (min_lat, max_lat, min_lon, max_lon) = (41.87, 41.92, 12.44, 12.51);
+    let n = f64::from(1u32 << LEVEL);
+    let tile_x = |lon: f64| (mercator_x(lon) * n).floor() as u32;
+    let tile_y = |lat: f64| (mercator_y(lat) * n).floor() as u32;
+    // Mercator y grows southward, so max_lat is the smaller (northern) row.
+    let (x_lo, x_hi) = (tile_x(min_lon), tile_x(max_lon));
+    let (y_lo, y_hi) = (tile_y(max_lat), tile_y(min_lat));
+
     let images_limit = std::num::NonZeroU32::new(50).ok_or("nonzero image page size")?;
 
-    // Pick the entity with the most resolved media among those whose marker
-    // carries a thumbnail.
+    // Probe each singleton entity's images and keep the one with the most
+    // resolved media. Only a singleton resolves to a clickable detail — a
+    // cluster's click zooms — so cluster/co-located markers are skipped.
     let mut best: Option<(f64, f64, usize, String)> = None;
-    for marker in &response.markers {
-        if marker.thumbnail_url.is_some() {
-            let entity_id = match &marker.click_action {
-                chronoscope_api_client::ClickAction::Select { entity_id } => entity_id.clone(),
-                _ => continue,
-            };
-            let page = client
-                .get_entity_images(&entity_id, images_limit, None, None)
-                .await?;
-            let count = page.images.len();
-            if best.as_ref().is_none_or(|b| count > b.2) {
-                best = Some((
-                    marker.point.lon(),
-                    marker.point.lat(),
-                    count,
-                    entity_id.to_string(),
-                ));
+    for x in x_lo..=x_hi {
+        for y in y_lo..=y_hi {
+            let response = client.fetch_tile(LEVEL, x, y, None).await?;
+            for marker in &response.markers {
+                let chronoscope_api_client::ClickAction::Select { entity_id } =
+                    &marker.click_action
+                else {
+                    continue;
+                };
+                let page = client
+                    .get_entity_images(entity_id, images_limit, None, None)
+                    .await?;
+                let count = page.images.len();
+                if count > 0 && best.as_ref().is_none_or(|b| count > b.2) {
+                    best = Some((
+                        marker.point.lon(),
+                        marker.point.lat(),
+                        count,
+                        entity_id.to_string(),
+                    ));
+                }
             }
         }
     }

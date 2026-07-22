@@ -282,6 +282,7 @@ async fn run_dev_server(
             base: facts_pin,
             overlay: facts_overlay,
         },
+        seed_commits: Vec::new(),
         http_client,
         worker_idle_backoff: Duration::from_secs(5),
         retry_config: RetryConfig::default(),

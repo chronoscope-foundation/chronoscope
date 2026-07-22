@@ -216,12 +216,28 @@ pub fn register_map_hooks(
             arr.push(&center.lat().into());
             JsValue::from(arr)
         }),
+        // Canvas size in CSS pixels `[width, height]` — the frame `project`
+        // returns coordinates in, so a test can bound-check a rendered marker's
+        // `_x`/`_y` against the visible viewport (the direction-B in-view check).
+        map_canvas_size: map_query(&map_handle, JsValue::NULL, |m| {
+            let canvas = m.get_canvas();
+            let arr = js_sys::Array::new();
+            arr.push(&f64::from(canvas.client_width()).into());
+            arr.push(&f64::from(canvas.client_height()).into());
+            JsValue::from(arr)
+        }),
 
-        // Settled-wait baked: marker_properties uses `query_rendered_features`
-        // which needs the MapLibre feature index ready.
+        // Settled-wait baked: both read `query_rendered_features`, which needs
+        // the MapLibre feature index ready. `marker_properties` covers the
+        // individual-entity layers; `badge_properties` covers the cluster
+        // badges (proximity clusters + lone server `Expand` cells).
         marker_properties: {
             let h = map_handle.clone();
-            move || marker_properties_settled(h.clone())
+            move || descriptors_settled(h.clone(), marker_properties)
+        },
+        badge_properties: {
+            let h = map_handle.clone();
+            move || descriptors_settled(h.clone(), badge_properties)
         },
 
         // Composed map actions (settled-wait baked).
@@ -658,19 +674,19 @@ async fn request_animation_frame_async() {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
-/// Waits for map-settled, then returns the marker descriptor array. The
+/// Waits for map-settled, then returns the descriptors `query` reads. The
 /// settled-wait is baked here so the harness wrapper is a one-line macro
 /// entry; MapLibre's `query_rendered_features` needs the feature index
-/// queryable, which requires 2 RAFs after `idle`.
-fn marker_properties_settled(handle: Rc<RefCell<Option<maplibre::Map>>>) -> js_sys::Promise {
+/// queryable, which requires 2 RAFs after `idle`. `query` is a plain fn
+/// pointer so `marker_properties` and `badge_properties` share this wait.
+fn descriptors_settled(
+    handle: Rc<RefCell<Option<maplibre::Map>>>,
+    query: fn(&maplibre::Map) -> JsValue,
+) -> js_sys::Promise {
     let settled = wait_for_map_settled(&handle);
     wasm_bindgen_futures::future_to_promise(async move {
         wasm_bindgen_futures::JsFuture::from(settled).await?;
-        Ok(handle
-            .borrow()
-            .as_ref()
-            .map(marker_properties)
-            .unwrap_or(JsValue::NULL))
+        Ok(handle.borrow().as_ref().map(query).unwrap_or(JsValue::NULL))
     })
 }
 
@@ -931,24 +947,45 @@ fn thumbnail_marker_count(map: &maplibre::Map) -> u32 {
         .length()
 }
 
-/// Return a JS array of marker descriptors for all rendered markers.
-/// Each entry contains the feature `properties` plus `_lng`/`_lat` from
-/// the feature geometry, so tests can both assert on properties and
-/// click on the actual rendered coordinates.
+/// Descriptors for the individual-entity layers (circles + thumbnails) — one
+/// per rendered `Select`/`Disambiguate` marker. Each carries the feature
+/// `properties` plus `_lng`/`_lat` and `_x`/`_y` (see [`layer_descriptors`]),
+/// so tests can assert on properties, click the rendered coordinates, and
+/// measure pairwise screen distance.
 fn marker_properties(map: &maplibre::Map) -> JsValue {
     use crate::components::map::{ENTITY_CIRCLES_LAYER, ENTITY_THUMBNAILS_LAYER};
+    layer_descriptors(map, &[ENTITY_CIRCLES_LAYER, ENTITY_THUMBNAILS_LAYER])
+}
+
+/// Descriptors for the cluster-badge layer — MapLibre proximity clusters
+/// (carrying `point_count`) and lone server `Expand` cells (`kind ==
+/// "cluster"`). Same shape as [`marker_properties`], so a test can count
+/// badges and read each badge's centroid for a click.
+fn badge_properties(map: &maplibre::Map) -> JsValue {
+    use crate::components::map::ENTITY_BADGE_LAYER;
+    layer_descriptors(map, &[ENTITY_BADGE_LAYER])
+}
+
+/// Deduplicated descriptors for every feature rendered across `layers`.
+///
+/// Each descriptor is the feature's flat `properties`, plus `_lng`/`_lat` from
+/// the point geometry and `_x`/`_y` — the geometry projected to CSS pixels via
+/// `map.project`. The pixel coordinates let a test assert that no two rendered
+/// markers sit within the proximity-cluster radius (the near-split check).
+fn layer_descriptors(map: &maplibre::Map, layers: &[&str]) -> JsValue {
     let opts = js_sys::Object::new();
-    let layers = js_sys::Array::new();
-    layers.push(&ENTITY_CIRCLES_LAYER.into());
-    layers.push(&ENTITY_THUMBNAILS_LAYER.into());
-    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
+    let layer_arr = js_sys::Array::new();
+    for layer in layers {
+        layer_arr.push(&(*layer).into());
+    }
+    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layer_arr);
     let features = map.query_rendered_features(&JsValue::UNDEFINED, &opts);
 
-    // Some markers (those with thumbnails) appear in both the circle and
-    // thumbnail layers — dedupe by `feature.id`. The source is configured
-    // with `promoteId: "feature_id"`, so MapLibre uses the stable string
-    // ID from the feature_id property (entity UUID or "cluster-{osm_id}").
-    // If it's ever missing, that's a bug worth surfacing.
+    // Dedupe by `feature.id`: a feature can surface once per tile it spans, and
+    // an individual with a thumbnail is promoted across the circle and
+    // thumbnail layers. The source sets `promoteId: "feature_id"` for leaves
+    // and MapLibre assigns a numeric id to a proximity cluster, so every
+    // rendered feature carries a stable id — a missing one is a bug to surface.
     let seen = js_sys::Set::new(&JsValue::UNDEFINED);
     let result = js_sys::Array::new();
     for i in 0..features.length() {
@@ -956,7 +993,7 @@ fn marker_properties(map: &maplibre::Map) -> JsValue {
         let id = js_sys::Reflect::get(&feature, &"id".into()).unwrap_or(JsValue::UNDEFINED);
         if id.is_undefined() || id.is_null() {
             web_sys::console::warn_1(
-                &"marker_properties: feature missing id (generateId not set?)".into(),
+                &"layer_descriptors: feature missing id (generateId not set?)".into(),
             );
             continue;
         }
@@ -965,7 +1002,7 @@ fn marker_properties(map: &maplibre::Map) -> JsValue {
         }
         seen.add(&id);
 
-        // Build the descriptor: properties + _lng/_lat from geometry
+        // Build the descriptor: properties + _lng/_lat + projected _x/_y.
         let Ok(props) = js_sys::Reflect::get(&feature, &"properties".into()) else {
             continue;
         };
@@ -983,8 +1020,23 @@ fn marker_properties(map: &maplibre::Map) -> JsValue {
             && let Ok(coords) = js_sys::Reflect::get(&geometry, &"coordinates".into())
             && let Some(coords_arr) = coords.dyn_ref::<js_sys::Array>()
         {
-            let _ = js_sys::Reflect::set(&descriptor, &"_lng".into(), &coords_arr.get(0));
-            let _ = js_sys::Reflect::set(&descriptor, &"_lat".into(), &coords_arr.get(1));
+            let lng = coords_arr.get(0);
+            let lat = coords_arr.get(1);
+            if let (Some(lng_f), Some(lat_f)) = (lng.as_f64(), lat.as_f64()) {
+                let screen = project_lnglat(map, lng_f, lat_f);
+                let sx = js_sys::Reflect::get(&screen, &"x".into())
+                    .ok()
+                    .and_then(|v| v.as_f64());
+                let sy = js_sys::Reflect::get(&screen, &"y".into())
+                    .ok()
+                    .and_then(|v| v.as_f64());
+                if let (Some(sx), Some(sy)) = (sx, sy) {
+                    let _ = js_sys::Reflect::set(&descriptor, &"_x".into(), &sx.into());
+                    let _ = js_sys::Reflect::set(&descriptor, &"_y".into(), &sy.into());
+                }
+            }
+            let _ = js_sys::Reflect::set(&descriptor, &"_lng".into(), &lng);
+            let _ = js_sys::Reflect::set(&descriptor, &"_lat".into(), &lat);
         }
         result.push(&descriptor);
     }

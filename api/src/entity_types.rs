@@ -6,25 +6,8 @@
 //! `impl From<CoreType> for ClientType`).
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::num::NonZeroUsize;
 
-use chronoscope_api_client::{ClickAction, EntityPickerEntry, Marker};
-use chronoscope_core::listing::EntitySummary;
 use chronoscope_core::typed::{self, find_by_language};
-use dropshot::HttpError;
-
-use crate::limits;
-
-/// The page-size cap shared by `/entities` and `/markers`, as a `NonZeroUsize`.
-///
-/// # Errors
-/// Returns an internal error if `limits::ENTITY_LIST_MAX_PAGE_SIZE` is ever
-/// misconfigured to zero.
-pub fn max_page_limit() -> Result<NonZeroUsize, HttpError> {
-    NonZeroUsize::new(limits::ENTITY_LIST_MAX_PAGE_SIZE as usize)
-        .ok_or_else(|| HttpError::for_internal_error("page limit must be nonzero".to_string()))
-}
 
 /// English is the negotiation's final fallback before the first-listed name, so
 /// a header-less client (curl, a shared cache, a server-to-server call) gets the
@@ -38,7 +21,7 @@ const DEFAULT_LANGUAGE: &str = "en";
 /// absent, unparseable, or non-finite weight reads as `1.0`), highest first,
 /// ties keeping header order. `None` or an empty/blank header yields an empty
 /// list.
-fn parse_accept_language(accept_language: Option<&str>) -> Vec<String> {
+pub fn parse_accept_language(accept_language: Option<&str>) -> Vec<String> {
     let Some(header) = accept_language else {
         return Vec::new();
     };
@@ -106,12 +89,15 @@ pub fn negotiate_name<I>(
     negotiate_name_for_prefixes(names, &parse_accept_language(accept_language))
 }
 
-/// [`negotiate_name`] over pre-parsed language prefixes — the markers path parses
-/// the header once and negotiates every entity's name against the shared list.
-/// The English [`DEFAULT_LANGUAGE`] rides after the viewer's prefixes, so a
+/// [`negotiate_name`] over pre-parsed language prefixes — the tiles path parses
+/// the header once and negotiates every cell entity's name against the shared
+/// list. The English `DEFAULT_LANGUAGE` rides after the viewer's prefixes, so a
 /// header-less request still lands on the English name before the first-listed
 /// fallback.
-fn negotiate_name_for_prefixes<I>(names: &[typed::Name<I>], prefixes: &[String]) -> Option<String> {
+pub fn negotiate_name_for_prefixes<I>(
+    names: &[typed::Name<I>],
+    prefixes: &[String],
+) -> Option<String> {
     prefixes
         .iter()
         .map(String::as_str)
@@ -119,74 +105,4 @@ fn negotiate_name_for_prefixes<I>(names: &[typed::Name<I>], prefixes: &[String])
         .find_map(|prefix| find_by_language(names, prefix, |n| n.language.as_str()))
         .or_else(|| names.first())
         .map(|n| n.text.clone())
-}
-
-/// Group viewport summaries into markers, collapsing co-located entities (same
-/// point) into one disambiguation marker. Mirrors the coordinate-bucketing the
-/// SQLite-backed marker assembly used (`f64::to_bits` as the group key).
-///
-/// Each entity's display name is negotiated against `accept_language`, parsed
-/// once here and shared across the whole viewport. Each marker also pairs with
-/// its representative entity's thumbnail image id (or `None`); the handler
-/// resolves that id to a URL — kept out of this step because the resolution
-/// reads the fact store.
-///
-/// Assembling markers per-summary in memory is a stopgap at dev scale; a
-/// production listing paginates and indexes the viewport instead.
-pub fn markers_from_summaries<E: Clone, I: Clone>(
-    summaries: Vec<EntitySummary<E, I>>,
-    accept_language: Option<&str>,
-) -> Vec<(Marker<E>, Option<I>)> {
-    let prefixes = parse_accept_language(accept_language);
-    let mut coord_groups: EntityGroups<E, I> = HashMap::new();
-    for summary in summaries {
-        let key = (summary.point.lat().to_bits(), summary.point.lon().to_bits());
-        coord_groups.entry(key).or_default().push(summary);
-    }
-    coord_groups
-        .into_values()
-        .map(|group| marker_from_group(group, &prefixes))
-        .collect()
-}
-
-type EntityGroups<E, I> = HashMap<(u64, u64), Vec<EntitySummary<E, I>>>;
-
-/// One coordinate group's marker: a lone entity selects directly; several
-/// co-located entities disambiguate, sorted by earliest date (undated last).
-/// The sorted group's first entry stands in for the marker's own position,
-/// name, and thumbnail either way. Names are negotiated against `prefixes`.
-/// Returns the representative's thumbnail image id beside the marker for the
-/// handler to resolve.
-fn marker_from_group<E: Clone, I: Clone>(
-    mut group: Vec<EntitySummary<E, I>>,
-    prefixes: &[String],
-) -> (Marker<E>, Option<I>) {
-    group.sort_by_key(|e| (e.earliest.is_none(), e.earliest));
-
-    let click_action = if let [only] = group.as_slice() {
-        ClickAction::Select {
-            entity_id: only.id.clone(),
-        }
-    } else {
-        let entries = group
-            .iter()
-            .map(|e| EntityPickerEntry {
-                id: e.id.clone(),
-                name: negotiate_name_for_prefixes(&e.names, prefixes),
-            })
-            .collect();
-        ClickAction::Disambiguate { entries }
-    };
-
-    // `coord_groups` only ever holds non-empty groups — each is seeded by the
-    // push that creates it — so the sorted group's first entry always exists.
-    let representative = &group[0];
-    let marker = Marker {
-        id: representative.id.clone(),
-        point: representative.point,
-        name: negotiate_name_for_prefixes(&representative.names, prefixes),
-        thumbnail_url: None,
-        click_action,
-    };
-    (marker, representative.thumbnail.clone())
 }

@@ -13,6 +13,7 @@ pub use chronoscope_api_client::{
 /// than spelling them at every use site.
 pub type ClickAction = chronoscope_api_client::ClickAction<EntityId>;
 pub type EntityDetail = chronoscope_api_client::EntityDetail<EntityId, EventId, ImageId>;
+pub type Marker = chronoscope_api_client::Marker<EntityId>;
 
 // ==================== Client construction ====================
 

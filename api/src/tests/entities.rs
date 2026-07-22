@@ -12,10 +12,10 @@ use std::num::NonZeroU32;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 
 use chronoscope_api_client::{
-    ClickAction, Cursor, EntityId, EntityListPage, MarkersResponse, client::ApiError,
+    ClickAction, Cursor, EntityId, EntityListPage, TileResponse, client::ApiError,
 };
 use chronoscope_core::date::{DatePrecision, UncertainDate};
-use chronoscope_core::geo::{GeoPoint, Meters};
+use chronoscope_core::geo::{GeoPoint, Meters, mercator_x, mercator_y};
 use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use chronoscope_core::grammar::attribute::{self, NameText, NameType};
 use chronoscope_core::grammar::bookend::ConstructionFact;
@@ -96,7 +96,7 @@ async fn commit_single_entity(
 
 /// Commit a fresh single-entity, single-fact-set bundle: one name and one
 /// construction location. Enough to make the entity placeable (for
-/// `/markers` and `/entities`) and nameable (for `get_entity`).
+/// `/tiles` and `/entities`) and nameable (for `get_entity`).
 async fn commit_named_entity_at(
     facts: &ServerFactStore,
     name: &str,
@@ -429,7 +429,7 @@ async fn commit_entity_with_existence_witness(
 
 /// Commit a named, placeable entity depicted by one image: an exterior-picture
 /// depiction whose image carries a Commons `Source` URL and a `Picture` medium.
-/// Exercises the image read path (`get_entity` grid, `/markers` thumbnail).
+/// Exercises the image read path (`get_entity` grid, `/tiles` thumbnail).
 async fn commit_entity_with_depicted_image(
     facts: &ServerFactStore,
     name: &str,
@@ -1224,15 +1224,26 @@ async fn get_entity_path_param_round_trips_the_numeric_wire_form() -> TestResult
     Ok(())
 }
 
-// ==================== list_markers ====================
+// ==================== get_tile ====================
+
+/// The container tile `(x, y)` at `z` a lat/lon falls in — the client-side
+/// analogue of the server's tile projection, for asking `/tiles` about a seeded
+/// point.
+fn container_tile(lat: f64, lon: f64, z: u8) -> (u32, u32) {
+    let n = f64::from(1u32 << z);
+    let x = (mercator_x(lon) * n).floor() as u32;
+    let y = (mercator_y(lat) * n).floor() as u32;
+    (x, y)
+}
 
 #[tokio::test]
-async fn list_markers_selects_a_lone_entity() -> TestResult {
+async fn get_tile_selects_a_lone_entity_in_its_container() -> TestResult {
     let ctx = TestContext::new().await?;
-    let id = commit_named_entity_at(&ctx.app_state.facts, "Colosseum", 41.8902, 12.4922).await?;
+    let (lat, lon) = (41.8902, 12.4922);
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Colosseum", lat, lon).await?;
 
-    let viewport = chronoscope_core::geo::Viewport::from_coords(41.8, 42.0, 12.4, 12.6)?;
-    let response = ctx.client.list_markers(&viewport).await?;
+    let (x, y) = container_tile(lat, lon, 10);
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(10, x, y, None).await?;
 
     assert_eq!(response.markers.len(), 1, "expected exactly one marker");
     let marker = &response.markers[0];
@@ -1240,61 +1251,239 @@ async fn list_markers_selects_a_lone_entity() -> TestResult {
     assert_eq!(
         marker.name.as_deref(),
         Some("Colosseum"),
-        "with no Accept-Language the negotiated marker name falls back to the only name"
+        "a lone entity's Select marker carries its negotiated display name"
     );
     assert!(
         marker.thumbnail_url.is_none(),
-        "an entity with no depiction has no marker thumbnail"
+        "an undepicted entity's marker carries no thumbnail"
     );
     match &marker.click_action {
         ClickAction::Select { entity_id } => assert_eq!(*entity_id, wire_entity_id(id)),
         other => return Err(format!("expected Select, got {other:?}").into()),
     }
-    assert!(!response.truncated);
     Ok(())
 }
 
 #[tokio::test]
-async fn list_markers_carries_a_thumbnail_for_a_depicted_entity() -> TestResult {
+async fn get_tile_carries_a_thumbnail_for_a_depicted_entity() -> TestResult {
     let (facts, facts_dir) = super::fresh_fact_store().await?;
-    let src = "https://upload.wikimedia.org/wikipedia/commons/b/b2/Colosseum.jpg";
+    let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Pantheon.jpg";
+    let (lat, lon) = (41.8986, 12.4769);
     let (id, image_id) =
-        commit_entity_with_depicted_image(&facts, "Colosseum", 41.8902, 12.4922, src).await?;
-
-    let media = resolved_media(image_id);
-    let expected_thumb = format!("{TEST_CDN_BASE_URL}/{}", media.thumbnail_key);
+        commit_entity_with_depicted_image(&facts, "Pantheon", lat, lon, src).await?;
+    // The marker thumbnail serves the resolved image's *thumbnail* key from our
+    // own media host, not the upstream Commons original.
+    let expected_thumb = format!(
+        "{TEST_CDN_BASE_URL}/{}",
+        placeholder_thumbnail_key(image_id)
+    );
     let ctx = TestContext::with_facts_and_image_media(
         facts,
         facts_dir,
-        HashMap::from([(image_id, media)]),
+        HashMap::from([(image_id, resolved_media(image_id))]),
     )
     .await?;
 
-    let viewport = chronoscope_core::geo::Viewport::from_coords(41.8, 42.0, 12.4, 12.6)?;
-    let response = ctx.client.list_markers(&viewport).await?;
+    let (x, y) = container_tile(lat, lon, 14);
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None).await?;
 
-    let marker = response
-        .markers
-        .iter()
-        .find(|m| m.id == wire_entity_id(id))
-        .ok_or("expected a marker for the depicted entity")?;
+    assert_eq!(response.markers.len(), 1, "expected exactly one marker");
+    let marker = &response.markers[0];
+    assert_eq!(marker.id, wire_entity_id(id));
     assert_eq!(
         marker.thumbnail_url.as_ref().map(url::Url::as_str),
         Some(expected_thumb.as_str()),
-        "the marker thumbnail serves the resolved image's thumbnail from our media host"
+        "a depicted lone entity's Select marker carries its representative thumbnail"
+    );
+    match &marker.click_action {
+        ClickAction::Select { entity_id } => assert_eq!(*entity_id, wire_entity_id(id)),
+        other => return Err(format!("expected Select, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_tile_accepts_level_zero() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // A tile names a bounded region at any level, so the whole world at z=0 must
+    // fold its sole entity into a marker rather than reject the read.
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Colosseum", 41.8902, 12.4922).await?;
+
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(0, 0, 0, None).await?;
+    assert!(
+        response.markers.iter().any(|m| m.id == wire_entity_id(id)),
+        "the world tile at z=0 must surface the sole entity"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn list_markers_disambiguates_colocated_entities() -> TestResult {
+async fn get_tile_rejects_an_off_grid_coordinate() -> TestResult {
     let ctx = TestContext::new().await?;
-    // Two entities declared at the exact same point.
-    let a = commit_named_entity_at(&ctx.app_state.facts, "Old Chapel", 45.2, 12.27).await?;
-    let b = commit_named_entity_at(&ctx.app_state.facts, "New Chapel", 45.2, 12.27).await?;
+    // At z=2 the grid is 4×4, so x=4 names no tile — a browser-readable 400, not
+    // a 500 out of the store.
+    match ctx.client.fetch_tile(2, 4, 0, None).await {
+        Ok(_) => return Err("an off-grid tile coordinate must 400".into()),
+        Err(ApiError::Api { status, .. }) => assert_eq!(status, 400),
+        Err(other) => return Err(format!("expected an API 400, got {other}").into()),
+    }
+    Ok(())
+}
 
-    let viewport = chronoscope_core::geo::Viewport::from_coords(45.0, 45.4, 12.0, 12.5)?;
-    let response = ctx.client.list_markers(&viewport).await?;
+// ==================== get_tile: co-location & language ====================
+//
+// These flow one commit through the real `cells_to_markers` projection over
+// `GET /tiles/{z}/{x}/{y}`: a co-located sub-tile folds to a `Disambiguate`
+// whose picker orders chronologically, and every name — pin or picker entry — is
+// negotiated against `Accept-Language`. Container level 14 folds sub-tiles at
+// `z + CELL_DEPTH = 17`, so entities at one point always share a sub-tile.
+
+/// Fetch the container tile a point falls in at `z` as a raw HTTP response,
+/// optionally sending an `Accept-Language` header. Handing back the response
+/// (not the parsed body) lets a caller read the negotiated names *and* the
+/// `Vary: Accept-Language` header the tile endpoint advertises.
+async fn get_tile_at_point(
+    ctx: &TestContext,
+    lat: f64,
+    lon: f64,
+    z: u8,
+    accept_language: Option<&str>,
+) -> reqwest::Result<reqwest::Response> {
+    let (x, y) = container_tile(lat, lon, z);
+    let mut req = ctx
+        .client
+        .reqwest_client()
+        .get(ctx.url(&format!("/tiles/{z}/{x}/{y}")));
+    if let Some(lang) = accept_language {
+        req = req.header(reqwest::header::ACCEPT_LANGUAGE, lang);
+    }
+    req.send().await
+}
+
+/// The disambiguation-picker name a tile carries for `target`, read off a raw
+/// `TileResponse`. `None` when no picker entry names it.
+fn picker_name_for(
+    response: &TileResponse<ServerEntityId>,
+    target: ServerEntityId,
+) -> Option<String> {
+    response
+        .markers
+        .iter()
+        .filter_map(|m| match &m.click_action {
+            ClickAction::Disambiguate { entries } => Some(entries),
+            _ => None,
+        })
+        .flatten()
+        .find(|e| e.id == target)
+        .and_then(|e| e.name.clone())
+}
+
+/// The top-level pin name a tile carries for `target`'s marker. `None` when no
+/// marker names it.
+fn marker_name_for(
+    response: &TileResponse<ServerEntityId>,
+    target: ServerEntityId,
+) -> Option<String> {
+    response
+        .markers
+        .iter()
+        .find(|m| m.id == target)
+        .and_then(|m| m.name.clone())
+}
+
+/// Commit a multi-named entity at a point plus a second entity at the identical
+/// point, so the sub-tile folds to a co-located cell whose picker carries the
+/// multi-named entity's negotiated name. Returns the multi-named entity's id.
+async fn commit_colocated_named_entity(
+    facts: &ServerFactStore,
+    names: &[(&str, &str)],
+    lat: f64,
+    lon: f64,
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let target = commit_entity_with_names_at(facts, names, lat, lon).await?;
+    commit_named_entity_at(facts, "Colocated Neighbor", lat, lon).await?;
+    Ok(target)
+}
+
+/// Commit a named, placeable entity, optionally dated with a construction-started
+/// year. The date is what the co-located picker orders by; `None` leaves the
+/// entity undated, so it sorts after every dated member.
+async fn commit_dated_entity_at(
+    facts: &ServerFactStore,
+    name: &str,
+    started_year: Option<i32>,
+    lat: f64,
+    lon: f64,
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let mut facts_vec = vec![
+        SubmitFact::Factual {
+            assertion: FactualAssertion::Attribute {
+                fact: attribute::Fact::Name {
+                    entity: EntityIdx(0),
+                    name: NameText::new(name),
+                    language: Language::new("en")?,
+                    name_type: NameType::Common,
+                    valid_from: None,
+                    valid_to: None,
+                },
+            },
+            citation: citation("https://example.com/name")?,
+        },
+        SubmitFact::Factual {
+            assertion: FactualAssertion::Construction {
+                fact: ConstructionFact::Location {
+                    entity: EntityIdx(0),
+                    location: resolved_point(lat, lon)?,
+                },
+            },
+            citation: citation("https://example.com/location")?,
+        },
+    ];
+    if let Some(year) = started_year {
+        let bound = UncertainDate::with_precision(
+            chrono::NaiveDate::from_ymd_opt(year, 1, 1).ok_or("valid date")?,
+            DatePrecision::Year,
+        )?;
+        facts_vec.push(SubmitFact::Factual {
+            assertion: FactualAssertion::Construction {
+                fact: ConstructionFact::Started {
+                    entity: EntityIdx(0),
+                    bound,
+                },
+            },
+            citation: citation("https://example.com/started")?,
+        });
+    }
+    let commit = Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: facts_vec.into_iter().collect(),
+    };
+    let result = commit_facts(facts, commit)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let id = result
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("entity 0 resolved")?
+        .id;
+    Ok(id)
+}
+
+#[tokio::test]
+async fn get_tile_disambiguates_colocated_entities() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // Two entities declared at the exact same point share the finest tile, so the
+    // cell is co-located — the picker carries both, each with its name.
+    let (lat, lon) = (45.2, 12.27);
+    let a = commit_named_entity_at(&ctx.app_state.facts, "Old Chapel", lat, lon).await?;
+    let b = commit_named_entity_at(&ctx.app_state.facts, "New Chapel", lat, lon).await?;
+
+    let (x, y) = container_tile(lat, lon, 14);
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None).await?;
 
     assert_eq!(
         response.markers.len(),
@@ -1303,8 +1492,18 @@ async fn list_markers_disambiguates_colocated_entities() -> TestResult {
     );
     match &response.markers[0].click_action {
         ClickAction::Disambiguate { entries } => {
-            let ids: std::collections::BTreeSet<_> = entries.iter().map(|e| e.id.clone()).collect();
-            assert_eq!(ids, [a, b].into_iter().map(wire_entity_id).collect());
+            let ids: BTreeSet<_> = entries.iter().map(|e| e.id.clone()).collect();
+            assert_eq!(
+                ids,
+                [a, b].into_iter().map(wire_entity_id).collect(),
+                "the picker lists both co-located members"
+            );
+            let names: BTreeSet<_> = entries.iter().filter_map(|e| e.name.as_deref()).collect();
+            assert_eq!(
+                names,
+                ["New Chapel", "Old Chapel"].into_iter().collect(),
+                "each picker entry carries its entity's negotiated name"
+            );
         }
         other => return Err(format!("expected Disambiguate, got {other:?}").into()),
     }
@@ -1312,93 +1511,130 @@ async fn list_markers_disambiguates_colocated_entities() -> TestResult {
 }
 
 #[tokio::test]
-async fn list_markers_omits_entities_outside_the_viewport() -> TestResult {
+async fn get_tile_expands_a_spread_cluster_to_its_split_level() -> TestResult {
+    use chronoscope_core::geo::{quadkey, split_level};
+
     let ctx = TestContext::new().await?;
-    commit_named_entity_at(&ctx.app_state.facts, "Eiffel Tower", 48.8584, 2.2945).await?;
+    // Two entities at distinct points that share one sub-tile of the container
+    // (container z=10, cells fold at z + CELL_DEPTH = 13) but fall in different
+    // finest (level-24) tiles. That sub-tile folds to a Cluster — a spread across
+    // more than one finest tile, splittable by zoom — not a Colocated group, so
+    // the marker's click action is Expand carrying the split level.
+    let (lat, lon_a, lon_b) = (0.0, 12.49, 12.50);
+    commit_named_entity_at(&ctx.app_state.facts, "Spread West", lat, lon_a).await?;
+    commit_named_entity_at(&ctx.app_state.facts, "Spread East", lat, lon_b).await?;
 
-    // A box nowhere near Paris.
-    let viewport = chronoscope_core::geo::Viewport::from_coords(41.8, 42.0, 12.4, 12.6)?;
-    let response = ctx.client.list_markers(&viewport).await?;
+    // The split level the fold derives from the two survivors' quadkey spread —
+    // computed here through the same `split_level` the server folds through.
+    let qa = quadkey(&GeoPoint::new(lat, lon_a)?);
+    let qb = quadkey(&GeoPoint::new(lat, lon_b)?);
+    let expected = split_level(qa.min(qb), qa.max(qb));
 
-    assert!(response.markers.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn list_markers_accepts_an_antimeridian_viewport() -> TestResult {
-    let ctx = TestContext::new().await?;
-    // An entity just west of the antimeridian.
-    let id = commit_named_entity_at(&ctx.app_state.facts, "Dateline Light", 0.0, 179.5).await?;
-
-    // A box that wraps across the antimeridian: min_lon (170) > max_lon (-170).
-    // The whole path — `Viewport::from_coords`, the server's `request_viewport`, and the
-    // core spatial walk — must accept the wrap rather than 400, and surface the
-    // entity inside it.
-    let viewport = chronoscope_core::geo::Viewport::from_coords(-1.0, 1.0, 170.0, -170.0)?;
-    let response = ctx.client.list_markers(&viewport).await?;
-
-    let marker = response
-        .markers
-        .iter()
-        .find(|m| m.id == wire_entity_id(id))
-        .ok_or("expected the antimeridian entity inside the wrapping box")?;
+    let (x, y) = container_tile(lat, lon_a, 10);
     assert_eq!(
-        marker.name.as_deref(),
-        Some("Dateline Light"),
-        "the wrapping-box marker still carries the entity's name"
+        container_tile(lat, lon_b, 10),
+        (x, y),
+        "both points must share one container tile so the read returns a single cell"
     );
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(10, x, y, None).await?;
+
+    assert_eq!(
+        response.markers.len(),
+        1,
+        "the spread pair folds to one cluster marker"
+    );
+    match &response.markers[0].click_action {
+        ClickAction::Expand { split_level } => assert_eq!(
+            *split_level,
+            expected.get(),
+            "the cluster's Expand carries the split level of the survivors' quadkey spread"
+        ),
+        other => return Err(format!("expected Expand, got {other:?}").into()),
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn list_markers_negotiates_marker_name_by_accept_language() -> TestResult {
+async fn get_tile_orders_the_colocated_picker_chronologically() -> TestResult {
     let ctx = TestContext::new().await?;
-    commit_entity_with_names_at(
+    // Four entities at one point → one co-located cell. Committed out of
+    // chronological order, so a bare insertion order can't pass for the sort; the
+    // picker must reorder by earliest date, oldest first and the undated last.
+    let (lat, lon) = (45.2, 12.27);
+    let middle =
+        commit_dated_entity_at(&ctx.app_state.facts, "Middle", Some(1850), lat, lon).await?;
+    let undated = commit_dated_entity_at(&ctx.app_state.facts, "Undated", None, lat, lon).await?;
+    let oldest =
+        commit_dated_entity_at(&ctx.app_state.facts, "Oldest", Some(1700), lat, lon).await?;
+    let newest =
+        commit_dated_entity_at(&ctx.app_state.facts, "Newest", Some(1950), lat, lon).await?;
+
+    let (x, y) = container_tile(lat, lon, 14);
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None).await?;
+
+    assert_eq!(
+        response.markers.len(),
+        1,
+        "co-located entities collapse into one marker"
+    );
+    match &response.markers[0].click_action {
+        ClickAction::Disambiguate { entries } => {
+            let order: Vec<_> = entries.iter().map(|e| e.id.clone()).collect();
+            let expected: Vec<_> = [oldest, middle, newest, undated]
+                .into_iter()
+                .map(wire_entity_id)
+                .collect();
+            assert_eq!(
+                order, expected,
+                "the picker lists dated members oldest-first, the undated member last"
+            );
+        }
+        other => return Err(format!("expected Disambiguate, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_tile_negotiates_picker_name_by_accept_language() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // The co-located picker exercises per-member name negotiation: the multi-named
+    // entity shares its point with a neighbor, so the cell is a disambiguation
+    // group whose entry for the target carries the negotiated name.
+    let (lat, lon) = (43.7731, 11.2560);
+    let target = commit_colocated_named_entity(
         &ctx.app_state.facts,
         &[("en", "Florence"), ("it", "Firenze")],
-        43.7731,
-        11.2560,
+        lat,
+        lon,
     )
     .await?;
 
-    let query = "/markers?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
-
-    // `it` preference: the Italian name wins.
-    let italian_resp = ctx
-        .client
-        .reqwest_client()
-        .get(ctx.url(query))
-        .header(reqwest::header::ACCEPT_LANGUAGE, "it")
-        .send()
-        .await?;
+    // `it` preference: the Italian name wins, and the response advertises Vary.
+    let italian_resp = get_tile_at_point(&ctx, lat, lon, 14, Some("it")).await?;
     assert_eq!(
         italian_resp
             .headers()
             .get(reqwest::header::VARY)
             .and_then(|v| v.to_str().ok()),
         Some("Accept-Language"),
-        "a language-negotiated response advertises Vary: Accept-Language so caches don't cross-serve locales"
+        "a language-negotiated tile advertises Vary: Accept-Language so caches don't cross-serve locales"
     );
-    let italian: MarkersResponse<ServerEntityId> = italian_resp.json().await?;
+    let italian: TileResponse<ServerEntityId> = italian_resp.json().await?;
     assert_eq!(
-        italian.markers.first().and_then(|m| m.name.as_deref()),
+        picker_name_for(&italian, target).as_deref(),
         Some("Firenze"),
         "an `it` preference selects the Italian name"
     );
 
     // `en-US,en;q=0.9`: both entries reduce to the primary subtag `en`, so the
     // English name wins regardless of the q-weight.
-    let english: MarkersResponse<ServerEntityId> = ctx
-        .client
-        .reqwest_client()
-        .get(ctx.url(query))
-        .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
-        .send()
-        .await?
-        .json()
-        .await?;
+    let english: TileResponse<ServerEntityId> =
+        get_tile_at_point(&ctx, lat, lon, 14, Some("en-US,en;q=0.9"))
+            .await?
+            .json()
+            .await?;
     assert_eq!(
-        english.markers.first().and_then(|m| m.name.as_deref()),
+        picker_name_for(&english, target).as_deref(),
         Some("Florence"),
         "an `en` preference selects the English name"
     );
@@ -1406,30 +1642,24 @@ async fn list_markers_negotiates_marker_name_by_accept_language() -> TestResult 
 }
 
 #[tokio::test]
-async fn list_markers_matches_accept_language_case_insensitively() -> TestResult {
+async fn get_tile_matches_accept_language_case_insensitively() -> TestResult {
     let ctx = TestContext::new().await?;
-    commit_entity_with_names_at(
+    let (lat, lon) = (43.7731, 11.2560);
+    let target = commit_colocated_named_entity(
         &ctx.app_state.facts,
         &[("en", "Florence"), ("it", "Firenze")],
-        43.7731,
-        11.2560,
+        lat,
+        lon,
     )
     .await?;
 
-    let query = "/markers?min_lat=43.7&max_lat=43.8&min_lon=11.2&max_lon=11.3";
-
     // An uppercase `IT` must match the lowercase-canonical stored `it` tag.
-    let response: MarkersResponse<ServerEntityId> = ctx
-        .client
-        .reqwest_client()
-        .get(ctx.url(query))
-        .header(reqwest::header::ACCEPT_LANGUAGE, "IT")
-        .send()
+    let response: TileResponse<ServerEntityId> = get_tile_at_point(&ctx, lat, lon, 14, Some("IT"))
         .await?
         .json()
         .await?;
     assert_eq!(
-        response.markers.first().and_then(|m| m.name.as_deref()),
+        picker_name_for(&response, target).as_deref(),
         Some("Firenze"),
         "an uppercase `IT` header matches the lowercase-canonical `it` tag"
     );
@@ -1437,33 +1667,67 @@ async fn list_markers_matches_accept_language_case_insensitively() -> TestResult
 }
 
 #[tokio::test]
-async fn list_markers_orders_accept_language_by_q_weight() -> TestResult {
+async fn get_tile_orders_accept_language_by_q_weight() -> TestResult {
     let ctx = TestContext::new().await?;
-    commit_entity_with_names_at(
+    let (lat, lon) = (48.1372, 11.5756);
+    let target = commit_colocated_named_entity(
         &ctx.app_state.facts,
         &[("en", "Munich"), ("de", "München")],
-        48.1372,
-        11.5756,
+        lat,
+        lon,
     )
     .await?;
 
-    let query = "/markers?min_lat=48.1&max_lat=48.2&min_lon=11.5&max_lon=11.6";
-
     // `de;q=0.5, en`: `en` carries an implicit q=1.0, outranking `de;q=0.5`
     // despite coming later in the header, so the English name wins.
-    let response: MarkersResponse<ServerEntityId> = ctx
-        .client
-        .reqwest_client()
-        .get(ctx.url(query))
-        .header(reqwest::header::ACCEPT_LANGUAGE, "de;q=0.5, en")
-        .send()
+    let response: TileResponse<ServerEntityId> =
+        get_tile_at_point(&ctx, lat, lon, 14, Some("de;q=0.5, en"))
+            .await?
+            .json()
+            .await?;
+    assert_eq!(
+        picker_name_for(&response, target).as_deref(),
+        Some("Munich"),
+        "the higher q-weight (`en`, implicit 1.0) wins over `de;q=0.5`"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn get_tile_negotiates_singleton_name_by_accept_language() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // A lone entity with two names — its Select marker's top-level name (from
+    // marker_display) must negotiate against the header, not just the co-located
+    // picker.
+    let (lat, lon) = (41.8902, 12.4922);
+    let target = commit_entity_with_names_at(
+        &ctx.app_state.facts,
+        &[("en", "Colosseum"), ("it", "Colosseo")],
+        lat,
+        lon,
+    )
+    .await?;
+
+    // `it` preference: the Italian name wins on the Select marker itself.
+    let italian: TileResponse<ServerEntityId> = get_tile_at_point(&ctx, lat, lon, 14, Some("it"))
         .await?
         .json()
         .await?;
     assert_eq!(
-        response.markers.first().and_then(|m| m.name.as_deref()),
-        Some("Munich"),
-        "the higher q-weight (`en`, implicit 1.0) wins over `de;q=0.5`"
+        marker_name_for(&italian, target).as_deref(),
+        Some("Colosseo"),
+        "an `it` preference selects the Italian name on the singleton Select marker"
+    );
+
+    // No header: the negotiation falls back to the English name.
+    let default: TileResponse<ServerEntityId> = get_tile_at_point(&ctx, lat, lon, 14, None)
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        marker_name_for(&default, target).as_deref(),
+        Some("Colosseum"),
+        "with no Accept-Language the singleton marker falls back to the English name"
     );
     Ok(())
 }
@@ -1485,6 +1749,29 @@ async fn list_entities_lists_placeable_entities_in_the_viewport() -> TestResult 
     assert!(
         page.summaries.iter().any(|s| s.id == id),
         "expected the committed entity in the page, got {:?}",
+        page.summaries.iter().map(|s| s.id).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_entities_accepts_an_antimeridian_viewport() -> TestResult {
+    let ctx = TestContext::new().await?;
+    // An entity just west of the antimeridian.
+    let id = commit_named_entity_at(&ctx.app_state.facts, "Dateline Light", 0.0, 179.5).await?;
+
+    // A box that wraps across the antimeridian: min_lon (170) > max_lon (-170).
+    // `request_viewport` admits the wrap, and the geodesic walk surfaces the
+    // entity inside it.
+    let resp = ctx
+        .get("/entities?min_lat=-1&max_lat=1&min_lon=170&max_lon=-170")
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let page: EntityListPage<ServerEntityId, ServerImageId> = resp.json().await?;
+
+    assert!(
+        page.summaries.iter().any(|s| s.id == id),
+        "expected the antimeridian entity inside the wrapping box, got {:?}",
         page.summaries.iter().map(|s| s.id).collect::<Vec<_>>()
     );
     Ok(())

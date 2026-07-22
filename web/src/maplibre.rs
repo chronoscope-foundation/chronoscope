@@ -102,6 +102,14 @@ extern "C" {
     #[wasm_bindgen(method, js_name = removeImage, catch)]
     pub fn remove_image(this: &Map, id: &str) -> Result<(), JsValue>;
 
+    /// Replace a registered image's pixels in place. This is an atlas-only
+    /// operation — it doesn't reload the source or (with `cluster: true`)
+    /// re-cluster, unlike a source `updateData`/`setData`. THROWS on a
+    /// dimension mismatch, so the replacement image must match the size of
+    /// the image originally registered under `id`.
+    #[wasm_bindgen(method, js_name = updateImage, catch)]
+    pub fn update_image(this: &Map, id: &str, image: &JsValue) -> Result<(), JsValue>;
+
     /// Get the current zoom level.
     #[wasm_bindgen(method, js_name = getZoom)]
     pub fn get_zoom_raw(this: &Map) -> f64;
@@ -167,6 +175,23 @@ extern "C" {
     /// unique IDs (via `promoteId`).
     #[wasm_bindgen(method, js_name = updateData)]
     pub fn update_data(this: &GeoJsonSource, diff: &JsValue);
+
+    /// The zoom at which a proximity cluster splits into its children. In
+    /// MapLibre v5 this returns a `Promise<number>`, so callers `await` it.
+    /// The promise rejects for a `cluster_id` a re-cluster has invalidated.
+    #[wasm_bindgen(method, js_name = getClusterExpansionZoom)]
+    pub fn get_cluster_expansion_zoom(this: &GeoJsonSource, cluster_id: f64) -> js_sys::Promise;
+
+    /// Up to `limit` of a proximity cluster's leaf features (`offset` pages
+    /// through them). In MapLibre v5 this returns a `Promise<Array<Feature>>`,
+    /// so callers `await` it.
+    #[wasm_bindgen(method, js_name = getClusterLeaves)]
+    pub fn get_cluster_leaves(
+        this: &GeoJsonSource,
+        cluster_id: f64,
+        limit: u32,
+        offset: u32,
+    ) -> js_sys::Promise;
 }
 
 // ==================== Clone impls ====================
@@ -199,6 +224,19 @@ pub struct MapOptions<'a> {
     pub center: [f64; 2],
     /// Initial zoom level.
     pub zoom: f64,
+    /// Maximum reachable zoom. Pinned to the server's terminal clustering
+    /// level so a badge's terminal cluster-expansion case is reachable.
+    #[serde(rename = "maxZoom")]
+    pub max_zoom: f64,
+    /// Minimum reachable zoom, floored above the world-wrap point so a
+    /// full-globe view doesn't collapse the bounds to an antimeridian sliver.
+    #[serde(rename = "minZoom")]
+    pub min_zoom: f64,
+    /// Symbol fade window in ms. Thumbnail and label symbols fade in as the
+    /// source reclusters on zoom, so a constituent surfacing from a cluster
+    /// eases in rather than popping. Circles have no equivalent native fade.
+    #[serde(rename = "fadeDuration")]
+    pub fade_duration: f64,
 }
 
 /// Create a new MapLibre map in the given container element.
@@ -267,6 +305,16 @@ pub fn get_viewport_bounds(map: &Map) -> (f64, f64, f64, f64) {
         wrap_lon(bounds.east()),
         bounds.north().clamp(-90.0, 90.0),
     )
+}
+
+/// The map's bounds as raw `(west, south, east, north)`, WITHOUT the
+/// antimeridian wrap [`get_viewport_bounds`] applies. A world-scale view
+/// reports `east - west >= 360` here; the wrap would otherwise fold that span
+/// into a narrow sliver. The density-level guard reads this to detect the
+/// whole-world case before it picks a level.
+pub fn get_raw_viewport_bounds(map: &Map) -> (f64, f64, f64, f64) {
+    let bounds = map.get_bounds();
+    (bounds.west(), bounds.south(), bounds.east(), bounds.north())
 }
 
 // (No unit tests for `wrap_lon` here: the `web` crate is bin-only and

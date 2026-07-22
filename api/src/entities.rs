@@ -1,30 +1,37 @@
 //! Entity API endpoints.
 //!
-//! Read side of the fact store, with resolved image URLs: markers carry a
-//! representative thumbnail and entity detail carries an image grid, both
-//! projected from `AppState.facts` (a `ServerFactStore`) — the single read
-//! source. No region clustering.
+//! Read side of the fact store, with resolved image URLs: entity detail carries
+//! an image grid and `/tiles/{z}/{x}/{y}` clusters the placeable entities by
+//! tile, each marker carrying a representative thumbnail. Both project from
+//! `AppState.facts` (a `ServerFactStore`) — the single read source.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use base64::prelude::*;
+use chrono::NaiveDate;
 use dropshot::{HttpError, HttpResponseHeaders, HttpResponseOk, Query, RequestContext, endpoint};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use chronoscope_api_client::{
-    Cursor, DetailImage, EntityDetail, EntityImagesPage, EntityListPage, MarkersResponse, Snapshot,
+    ClickAction, Cursor, DetailImage, EntityDetail, EntityImagesPage, EntityListPage,
+    EntityPickerEntry, Marker, Snapshot, TileResponse,
 };
 use chronoscope_core::conflicts::fact_lineage;
-use chronoscope_core::geo;
+use chronoscope_core::geo::{self, QuadLevel, TileId};
 use chronoscope_core::grammar::ids::FactId;
-use chronoscope_core::listing::{self, ListCursor, summaries_in_viewport};
+use chronoscope_core::listing::{
+    self, ListCursor, representative_image, summaries_in_viewport, timeline_span,
+};
 use chronoscope_core::projection::{
     member_lineage, project_entity, project_entity_images, project_image,
 };
 use chronoscope_core::solvers;
-use chronoscope_core::store::{EntityIdOf, EntityView, FactStore, FactView, ImageIdOf, ImageView};
+use chronoscope_core::store::schema::{CellKind, ClusterCell, RankKey};
+use chronoscope_core::store::{
+    EntityIdOf, EntityView, EventView, FactStore, FactView, ImageIdOf, ImageView,
+};
 use chronoscope_core::typed;
 
 use crate::cdn;
@@ -46,7 +53,7 @@ fn accept_language(ctx: &RequestContext<Arc<AppState>>) -> Option<&str> {
 }
 
 /// Tag a `200 OK` body with `Vary: Accept-Language`. Both content-negotiated
-/// read endpoints (`get_entity`, `list_markers`) pick their display name from
+/// read endpoints (`get_entity`, `get_tile`) pick their display name from
 /// the request's `Accept-Language`, so a shared cache must key each negotiated
 /// form by that header. The body schema is carried through `T`; the header
 /// stays out of the schema.
@@ -226,8 +233,8 @@ async fn open_read_view<S: FactStore>(
 
 /// Parse the four viewport query fields into the fact store's `Viewport`.
 ///
-/// Shared by `/entities` and `/markers`, whose query params carry the same
-/// viewport corners. `geo::Viewport::from_coords` range-validates each corner (admitting
+/// Used by `/entities`, whose query params carry the viewport corners.
+/// `geo::Viewport::from_coords` range-validates each corner (admitting
 /// an antimeridian-crossing `min_lon > max_lon` box) and rejects an inverted
 /// latitude span; either rejection is a 400.
 fn request_viewport(
@@ -301,10 +308,9 @@ pub struct EntitiesQueryParams {
 /// List entities within a geographic bounding box (public, no authentication required).
 ///
 /// Returns the placeable entities (those whose current marker resolves to a
-/// point) in `viewport`, ordered by the underlying fact-store walk. The primary
-/// live consumer of viewport data is `/markers`; this endpoint keeps a
-/// straightforward first-page-plus-cursor shape rather than fully general
-/// pagination.
+/// point) in `viewport`, ordered by the underlying fact-store walk. The map's
+/// clustered reads go through `/tiles`; this endpoint keeps a straightforward
+/// first-page-plus-cursor shape rather than fully general pagination.
 #[endpoint {
     method = GET,
     path = "/entities",
@@ -559,97 +565,243 @@ pub async fn get_entity_images(
     Ok(HttpResponseOk(response))
 }
 
-// ==================== Unified Markers ====================
+// ==================== Per-tile clustering ====================
 
-/// Query parameters for the unified markers endpoint.
-///
-/// Viewport fields are declared inline because Dropshot's query parameter
-/// deserializer doesn't support `serde(flatten)`.
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct MarkersQueryParams {
-    pub min_lat: f64,
-    pub max_lat: f64,
-    pub min_lon: f64,
-    pub max_lon: f64,
-    /// Pin the read to a previously echoed [`Snapshot`]. Absent reads the live
-    /// point.
-    #[serde(default)]
-    pub snapshot: Option<Snapshot>,
+/// One cell's marker before its thumbnail resolves: the wire [`Marker`] with an
+/// empty `thumbnail_url`, paired with the representative-image class member
+/// (`None` for a cluster cell or an undepicted entity) whose `SameArtifact`
+/// representative the batch pass looks the thumbnail up under.
+struct PendingMarker {
+    marker: Marker<ServerEntityId>,
+    thumbnail: Option<ServerImageId>,
 }
 
-/// Unified map markers endpoint (public, no authentication required).
-///
-/// No clustering: every placeable entity in `viewport` becomes a marker, up to
-/// `limits::ENTITY_LIST_MAX_PAGE_SIZE`, each carrying its representative's
-/// thumbnail URL when it depicts an image. Co-located entities (identical
-/// point) collapse into one disambiguation marker.
-#[endpoint {
-    method = GET,
-    path = "/markers",
-}]
-pub async fn list_markers(
-    ctx: RequestContext<Arc<AppState>>,
-    query: Query<MarkersQueryParams>,
-) -> Result<HttpResponseHeaders<HttpResponseOk<MarkersResponse<ServerEntityId>>>, HttpError> {
-    let state = ctx.context();
-    let params = query.into_inner();
-
-    let core_viewport = request_viewport(
-        params.min_lat,
-        params.max_lat,
-        params.min_lon,
-        params.max_lon,
-    )?;
-
-    let limit = entity_types::max_page_limit()?;
-
-    let mut view = open_read_view(&state.facts, params.snapshot, None).await?;
-    let page =
-        match summaries_in_viewport::<ServerFactStore, _>(&mut view, &core_viewport, None, limit)
+/// The pin fields a lone cell's representative contributes: the viewer's
+/// negotiated name and the representative-image class member (its thumbnail is
+/// resolved later in the batch pass). Both `None` when the id names no committed
+/// fact; the name follows negotiation and the image is `None` with no depiction.
+async fn project_pin<V>(
+    view: &mut V,
+    prefixes: &[String],
+    representative: ServerEntityId,
+) -> Result<(Option<String>, Option<ServerImageId>), HttpError>
+where
+    V: EntityView<ServerFactStore> + EventView<ServerFactStore> + Sync,
+{
+    let Some((class, projected)) =
+        project_entity::<ServerFactStore, _, _>(&mut *view, representative, member_lineage)
             .await
-        {
-            Ok(p) => p,
-            Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
-        };
-    let snapshot = page.snapshot;
+            .map_err(fact_store_err)?
+    else {
+        return Ok((None, None));
+    };
+    let entity = typed::Entity::parse(&projected, &class);
+    let name = entity_types::negotiate_name_for_prefixes(&entity.names, prefixes);
+    Ok((name, representative_image(&projected.depictions)))
+}
 
-    // `markers_from_summaries` is pure assembly; the one fact-store read is the
-    // batched representative resolution below. Each summary's thumbnail id is a
+/// Project a tile's cluster cells into wire [`Marker`]s. Each cell folds to one
+/// marker: a singleton or co-located cell projects its representative for the
+/// pin's name and thumbnail; a cluster folds to a bare `Expand`. A co-located
+/// cell also projects every member for the chronological disambiguation picker
+/// (oldest first, undated last). Names are negotiated against `lang_prefixes`,
+/// the viewer's `Accept-Language` parsed once by the caller.
+///
+/// Thumbnails resolve in one batch: pass one projects the cells and collects each
+/// representative-image class member, pass two resolves every member to its
+/// `SameArtifact` representative in a single `image_representatives` call, and
+/// pass three attaches the URL each representative's stored media
+/// yields — so a tile's thumbnails cost one image read regardless of cell count.
+///
+/// The `/tiles/{z}/{x}/{y}` handler folds its `ClusterCell`s through this.
+async fn cells_to_markers<V>(
+    view: &mut V,
+    state: &AppState,
+    lang_prefixes: &[String],
+    cells: Vec<ClusterCell<ServerEntityId>>,
+) -> Result<Vec<Marker<ServerEntityId>>, HttpError>
+where
+    V: EntityView<ServerFactStore> + EventView<ServerFactStore> + ImageView<ServerFactStore> + Sync,
+{
+    let mut pending = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let representative = cell.representative;
+        let point = cell.point;
+        let (name, thumbnail, click_action) = match cell.kind {
+            CellKind::Singleton => {
+                let (name, thumbnail) =
+                    project_pin(&mut *view, lang_prefixes, representative).await?;
+                (
+                    name,
+                    thumbnail,
+                    ClickAction::Select {
+                        entity_id: representative,
+                    },
+                )
+            }
+            CellKind::Cluster { split_level } => (
+                None,
+                None,
+                ClickAction::Expand {
+                    split_level: split_level.get(),
+                },
+            ),
+            CellKind::Colocated { members } => {
+                // The representative is one of the members, so its pin name and
+                // thumbnail member fall out of the single member walk — captured as
+                // that member passes — rather than a second projection. Order the
+                // picker chronologically — oldest first, undated last — so collect
+                // each member's earliest timeline date alongside its entry, then
+                // sort before building the final list.
+                let mut pin_name = None;
+                let mut pin_thumbnail = None;
+                let mut ranked: Vec<(Option<NaiveDate>, EntityPickerEntry<ServerEntityId>)> =
+                    Vec::with_capacity(members.len());
+                for member in members {
+                    let Some((class, projected)) =
+                        project_entity::<ServerFactStore, _, _>(&mut *view, member, member_lineage)
+                            .await
+                            .map_err(fact_store_err)?
+                    else {
+                        continue;
+                    };
+                    let entity = typed::Entity::parse(&projected, &class);
+                    let member_name =
+                        entity_types::negotiate_name_for_prefixes(&entity.names, lang_prefixes);
+                    let earliest = timeline_span(entity.timeline.events()).0;
+                    if member == representative {
+                        pin_name = member_name.clone();
+                        pin_thumbnail = representative_image(&projected.depictions);
+                    }
+                    ranked.push((
+                        earliest,
+                        EntityPickerEntry {
+                            id: member,
+                            name: member_name,
+                        },
+                    ));
+                }
+                ranked.sort_by_key(|(earliest, _)| (earliest.is_none(), *earliest));
+                let entries = ranked.into_iter().map(|(_, entry)| entry).collect();
+                (
+                    pin_name,
+                    pin_thumbnail,
+                    ClickAction::Disambiguate { entries },
+                )
+            }
+        };
+        pending.push(PendingMarker {
+            marker: Marker {
+                id: representative,
+                point,
+                name,
+                thumbnail_url: None,
+                click_action,
+            },
+            thumbnail,
+        });
+    }
+
+    // One batched image read for the whole tile: each pending thumbnail is a
     // class member; resolving it to the `SameArtifact` representative matches the
-    // key the resolver stored under, and a distinct set keeps co-located markers
-    // sharing a thumbnail to a single resolution. An unresolved representative or
-    // missing media leaves the marker with no thumbnail.
-    let assembled = entity_types::markers_from_summaries(page.summaries, accept_language(&ctx));
-    let thumbnail_ids: Vec<ServerImageId> = assembled
+    // key the resolver stored under, and a distinct set collapses colocated
+    // markers sharing a thumbnail to a single resolution. An unresolved
+    // representative or missing media leaves the marker with no thumbnail.
+    let thumbnail_ids: Vec<ServerImageId> = pending
         .iter()
-        .filter_map(|(_, thumbnail)| *thumbnail)
-        .collect::<std::collections::HashSet<_>>()
+        .filter_map(|p| p.thumbnail)
+        .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
     let representatives = view
         .image_representatives(&thumbnail_ids)
         .await
         .map_err(fact_store_err)?;
-    let mut markers = Vec::with_capacity(assembled.len());
-    for (mut marker, thumbnail) in assembled {
-        if let Some(media) = thumbnail
-            .and_then(|image_id| representatives.get(&image_id))
-            .and_then(|representative| state.image_media.get(representative))
-        {
-            marker.thumbnail_url = Some(cdn::full_url(
-                &state.config.cdn_base_url,
-                &media.thumbnail_key,
-            ));
-        }
-        markers.push(marker);
-    }
-    let truncated = page.next.is_some();
 
-    let response = MarkersResponse {
-        markers,
-        truncated,
-        snapshot: encode_snapshot(snapshot)?,
-    };
+    Ok(pending
+        .into_iter()
+        .map(
+            |PendingMarker {
+                 mut marker,
+                 thumbnail,
+             }| {
+                if let Some(media) = thumbnail
+                    .and_then(|image_id| representatives.get(&image_id))
+                    .and_then(|representative| state.image_media.get(representative))
+                {
+                    marker.thumbnail_url = Some(cdn::full_url(
+                        &state.config.cdn_base_url,
+                        &media.thumbnail_key,
+                    ));
+                }
+                marker
+            },
+        )
+        .collect())
+}
+
+/// Path parameters for the per-tile clustering endpoint: a slippy-map tile
+/// `(z, x, y)`. `z` is the tile level; `x`/`y` are the tile indices, validated
+/// against the level's `[0, 2^z)` grid in the handler.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TilePath {
+    pub z: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// Query parameters for the per-tile clustering endpoint.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TileQueryParams {
+    /// Pin the read to a previously echoed [`Snapshot`]. Absent reads the live
+    /// point.
+    #[serde(default)]
+    pub snapshot: Option<Snapshot>,
+}
+
+/// Per-tile clustering endpoint (public, no authentication required).
+///
+/// Folds container tile `(z, x, y)` into its cluster cells — one [`Marker`] per
+/// non-empty sub-tile at `z + CELL_DEPTH` (`Select` / `Expand` / `Disambiguate`,
+/// with name and thumbnail). The cell geometry is viewport-free and
+/// snapshot-pinned, keyed by `(snapshot, z, x, y)`. Marker names are localized
+/// per `Accept-Language` (hence the `Vary: Accept-Language` on the response), so
+/// a shared or HTTP cache must key on language too.
+///
+/// `z = 0` is accepted — a tile names a bounded region whatever its level, so a
+/// whole-world tile folds its entities rather than rejecting. `x`/`y` off the
+/// level's grid (`≥ 2^z`) is a 400.
+#[endpoint {
+    method = GET,
+    path = "/tiles/{z}/{x}/{y}",
+}]
+pub async fn get_tile(
+    ctx: RequestContext<Arc<AppState>>,
+    path: dropshot::Path<TilePath>,
+    query: Query<TileQueryParams>,
+) -> Result<HttpResponseHeaders<HttpResponseOk<TileResponse<ServerEntityId>>>, HttpError> {
+    let state = ctx.context();
+    let path = path.into_inner();
+    let params = query.into_inner();
+
+    let level = QuadLevel::new(path.z)
+        .map_err(|e| HttpError::for_bad_request(None, format!("Invalid level: {e}")))?;
+    // Validate the tile coordinate at the boundary as a 400 — the resulting
+    // `TileId` carries the on-grid guarantee into the store.
+    let tile = TileId::new(level, path.x, path.y)
+        .map_err(|e| HttpError::for_bad_request(None, format!("Invalid tile coordinate: {e}")))?;
+
+    let mut view = open_read_view(&state.facts, params.snapshot, None).await?;
+    let cells = view
+        .cluster_tile_cells(tile, RankKey::Unranked)
+        .await
+        .map_err(fact_store_err)?;
+
+    let lang_prefixes = entity_types::parse_accept_language(accept_language(&ctx));
+    let markers = cells_to_markers(&mut view, state, &lang_prefixes, cells).await?;
+
+    let snapshot = encode_snapshot(view.snapshot().await.map_err(fact_store_err)?)?;
+    let response = TileResponse { markers, snapshot };
     Ok(vary_language(HttpResponseOk(response)))
 }
 

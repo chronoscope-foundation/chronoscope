@@ -72,7 +72,7 @@ pub fn Landing() -> impl IntoView {
             // Entity detail panel (slides in from right on marker click)
             <EntityDetailPanel api_client=api_client.clone()/>
 
-            // Map status overlays (loading, empty, truncated)
+            // Map status overlays (loading, empty)
             <MapStatusOverlay/>
 
             // Dismissible info card — collapsible "about" overlay for new visitors.
@@ -228,7 +228,7 @@ fn ImageLightbox(lightbox: LightboxState) -> impl IntoView {
     }
 }
 
-/// Renders map status overlays: loading indicator, empty state, and truncation banner.
+/// Renders map status overlays: loading indicator and empty state.
 #[component]
 fn MapStatusOverlay() -> impl IntoView {
     let Some(status) = use_context::<MapStatus>() else {
@@ -236,7 +236,6 @@ fn MapStatusOverlay() -> impl IntoView {
     };
     let loading = status.loading;
     let empty = status.empty;
-    let truncated = status.truncated;
     let fetch_error = status.fetch_error;
     let retry = status.retry;
 
@@ -302,38 +301,6 @@ fn MapStatusOverlay() -> impl IntoView {
                     </div>
                 }
             })}
-
-            // Truncation banner (hidden when detail panel is open)
-            {move || (!panel_open()).then(|| view! {
-                <TruncatedBanner truncated=truncated/>
-            })}
         </div>
     }.into_any()
-}
-
-/// Dismissible banner shown when the entity cap (500) is hit.
-#[component]
-fn TruncatedBanner(truncated: ReadSignal<bool>) -> impl IntoView {
-    let (dismissed, set_dismissed) = signal(false);
-
-    // Reset dismissal when truncated state changes (e.g., user pans to new area)
-    Effect::new(move || {
-        let _ = truncated.get();
-        set_dismissed.set(false);
-    });
-
-    let dismiss = move |_| {
-        set_dismissed.set(true);
-    };
-
-    view! {
-        {move || (truncated.get() && !dismissed.get()).then(|| view! {
-            <div class="absolute bottom-3 left-1/2 -translate-x-1/2 pointer-events-auto">
-                <div class="bg-parchment/95 backdrop-blur-sm rounded-lg shadow-md px-4 py-2 flex items-center gap-3 font-sans text-xs text-sepia">
-                    <span>"Showing first 500 entities. Zoom in for more detail."</span>
-                    <DismissButton on_click=dismiss label="Dismiss" extra_class="shrink-0"/>
-                </div>
-            </div>
-        })}
-    }
 }

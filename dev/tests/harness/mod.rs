@@ -23,6 +23,8 @@ use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverridePar
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
 use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
 use chromiumoxide::page::ScreenshotParams;
+use chronoscope_api::state::ServerIds;
+use chronoscope_core::submit::Commit;
 use chronoscope_dev::{
     DevServerConfig, FactsDbSource, ImageResolveMode, RunningDevServer, find_available_port,
     start_dev_server,
@@ -292,9 +294,12 @@ impl WebTest {
     }
 
     /// Create a new test backed by a fresh throwaway database and the curated
-    /// fact store. Called by `web_test()`; tests go through that runner rather
+    /// fact store, with `seed_commits` written into the writable overlay before
+    /// serving. Called by the `web_test*` runners; tests go through those rather
     /// than constructing `WebTest` directly.
-    async fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    async fn new(
+        seed_commits: Vec<Commit<ServerIds>>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let dist_dir = web_dist()?;
         let (browser, handler_handle, browser_data_dir) = launch_browser().await?;
 
@@ -333,6 +338,7 @@ impl WebTest {
                 base: facts_pin,
                 overlay: facts_overlay,
             },
+            seed_commits,
             http_client,
             worker_idle_backoff: Duration::from_secs(60), // Workers not needed for frontend tests
             retry_config: RetryConfig::default(),
@@ -448,6 +454,15 @@ impl WebTest {
     /// breaks then restores the API endpoint).
     pub fn api_base_url(&self) -> String {
         self.server.base_url.clone()
+    }
+
+    /// The same-origin API base the page's client actually uses: the front
+    /// door's `/api` proxy, not the API server's direct address. Restoring a
+    /// broken client to this (rather than [`Self::api_base_url`]) keeps the
+    /// fetch on the page origin — a cross-origin restore fails now that the API
+    /// serves no CORS.
+    pub fn same_origin_api_url(&self) -> String {
+        format!("{}/api", self.frontend_url)
     }
 
     // ---- Hook invocation primitives ----
@@ -648,7 +663,19 @@ impl WebTest {
         // Map queries (public).
         pub query map_cursor() -> String;
         pub query marker_properties() -> Vec<serde_json::Value>;
+        // Cluster-badge descriptors (proximity clusters + lone server
+        // `Expand` cells) — the complement of `marker_properties`.
+        pub query badge_properties() -> Vec<serde_json::Value>;
         pub query layer_order() -> Vec<String>;
+        // Current map zoom — for asserting a cluster click zooms the map in.
+        pub query zoom() -> f64;
+        // Map canvas size in CSS pixels `[width, height]` — the frame
+        // `marker_properties`/`badge_properties` project `_x`/`_y` into, so a
+        // test can bound-check a rendered marker against the visible viewport.
+        pub query map_canvas_size() -> Vec<f64>;
+        // Fetch-settled counter sample, so a test can click a badge and then
+        // wait for the expansion's re-fetch via `wait_for_fetch_settled_after`.
+        pub query current_fetch_settled() -> f64;
 
         // Actions (public). The raw `jump_to`/`fire_map_click` primitives
         // aren't exposed — tests use `pan_map_to` / `click_map_at`, which
@@ -697,6 +724,11 @@ impl WebTest {
     /// thumbnails-loaded event. Sample-then-await pattern (mirror of
     /// `fetch_around`): sample the thumbnails counter before the pan, then
     /// wait for it to advance — race-free, no listener-attach timing concern.
+    ///
+    /// The thumbnails-loaded event fires only when a thumbnail *renders*, so use
+    /// this at a zoom where at least one thumbnailed marker is unfolded. Where
+    /// they all fold into a badge, none renders — sample the badge via
+    /// `goto_map_at` + `badge_properties` rather than waiting here.
     pub async fn goto_map_with_thumbnails(&self, lng: f64, lat: f64, zoom: f64) -> TestResult {
         self.goto("/").await?;
         self.wait_for_map_idle().await?;
@@ -704,6 +736,27 @@ impl WebTest {
         let prev_thumbs = self.current_thumbnails_loaded().await?;
         self.pan_map_to(lng, lat, zoom).await?;
         self.wait_for_thumbnails_loaded_after(prev_thumbs).await
+    }
+
+    /// Poll until at least one entity marker has rendered, bounded by [`TIMEOUT`].
+    ///
+    /// A retry re-fetch re-renders through a data-only `setData` with no camera
+    /// move, so `wait_for_map_idle` resolves eagerly (the map isn't moving)
+    /// before the reloaded features paint — a bare `marker_count` read then races
+    /// the render and sees zero. `marker_properties` bakes the settle wait (idle +
+    /// two RAF), so each poll is render-safe and frame-paced; the loop returns the
+    /// moment the reloaded markers become queryable.
+    pub async fn wait_for_markers(&self) -> TestResult {
+        let poll = async {
+            loop {
+                if !self.marker_properties().await?.is_empty() {
+                    return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
+                }
+            }
+        };
+        tokio::time::timeout(TIMEOUT, poll)
+            .await
+            .map_err(|_| format!("no entity markers rendered within {TIMEOUT:?}"))?
     }
 }
 
@@ -713,7 +766,26 @@ impl WebTest {
 /// test closure, captures diagnostics on failure, then closes Chrome and awaits
 /// the handler.
 pub async fn web_test(test: impl AsyncFnOnce(&WebTest) -> TestResult) -> TestResult {
-    let t = WebTest::new().await?;
+    run_web_test(Vec::new(), test).await
+}
+
+/// Like [`web_test`], but writes `seed_commits` into the fact store before the
+/// server serves a request. Tests seed entities at chosen (open-ocean)
+/// coordinates so the map geometry under test — proximity clustering,
+/// badge-vs-pin classification, expansion — is fully controlled and isolated
+/// from the curated data.
+pub async fn web_test_seeded(
+    seed_commits: Vec<Commit<ServerIds>>,
+    test: impl AsyncFnOnce(&WebTest) -> TestResult,
+) -> TestResult {
+    run_web_test(seed_commits, test).await
+}
+
+async fn run_web_test(
+    seed_commits: Vec<Commit<ServerIds>>,
+    test: impl AsyncFnOnce(&WebTest) -> TestResult,
+) -> TestResult {
+    let t = WebTest::new(seed_commits).await?;
     let result = test(&t).await;
 
     // Capture diagnostics before closing if the test failed

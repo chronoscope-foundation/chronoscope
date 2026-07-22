@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
-use chronoscope_api::state::{AppState, Config, ServerFactStore};
+use chronoscope_api::state::{AppState, Config, ServerFactStore, ServerIds};
+use chronoscope_core::submit::{Commit, commit_facts};
 use chronoscope_db::FactStoreLocations;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId};
@@ -205,6 +206,13 @@ pub struct DevServerConfig {
     /// browser tests, the ngrok dev server) or a writable scratch file created
     /// on demand (the URL-fetch harnesses). See [`FactsDbSource`].
     pub facts: FactsDbSource,
+
+    /// Commits to write into the fact store before serving. Browser tests use
+    /// this to place entities at chosen coordinates on top of the mounted store;
+    /// submissions land in the writable overlay. Committed after the store opens
+    /// and before image resolution, so a seeded image resolves into the media
+    /// store like any other.
+    pub seed_commits: Vec<Commit<ServerIds>>,
 
     /// HTTP client for workers to use (real or VCR)
     pub http_client: Arc<dyn HttpClient>,
@@ -545,6 +553,15 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         }
     }
     .map_err(|e| format!("opening fact store: {e}"))?;
+
+    // Write any test-provided seed commits before serving, so seeded entities
+    // read back through the same projection as the mounted store and their
+    // images resolve in the pass below. Submissions land in the writable overlay.
+    for commit in config.seed_commits {
+        commit_facts(&facts, commit)
+            .await
+            .map_err(|e| DevServerError(format!("seeding fact store: {e:?}")))?;
+    }
 
     // Resolve every fact-store image into the media store, so the read path
     // serves thumbnails and detail images from our own `/media/{key}` rather

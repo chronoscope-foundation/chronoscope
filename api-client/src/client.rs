@@ -14,13 +14,11 @@ use std::pin::Pin;
 use futures_util::FutureExt;
 use futures_util::stream::{self, Stream};
 
-use chronoscope_core::geo::Viewport;
-
 use crate::auth::{
     AuthTokenResponse, LoginFinishRequest, LoginStartRequest, LoginStartResponse,
     RegisterFinishRequest, RegisterStartRequest, RegisterStartResponse,
 };
-use crate::entities::{Cursor, EntityDetail, EntityImagesPage, MarkersResponse, Snapshot};
+use crate::entities::{Cursor, EntityDetail, EntityImagesPage, Snapshot, TileResponse};
 use crate::ids::{Email, EntityId, EventId, ImageId, ResearchUrlId};
 use crate::pagination::{PageToken, ResultsPage};
 use crate::users::{UpdateUserRequest, UserResponse};
@@ -155,20 +153,25 @@ impl Client {
         self.get_json(&url).await
     }
 
-    /// Fetch map markers for a bounding box. Co-located entities (same point)
-    /// collapse into one disambiguation marker.
-    pub async fn list_markers(
+    /// Fetch one tile's cluster cells as [`Marker`](crate::Marker)s. The
+    /// container tile `(z, x, y)` folds one marker per non-empty sub-tile. The
+    /// cell geometry is viewport-free and keyed by `(snapshot, z, x, y)`, but
+    /// marker names are negotiated per `Accept-Language` (the response carries
+    /// `Vary: Accept-Language`), so a cache shared across languages must key on
+    /// language too. `z = 0` is accepted (a whole-world tile).
+    /// `snapshot` pins the read (`None` reads the live point).
+    pub async fn fetch_tile(
         &self,
-        viewport: &Viewport,
-    ) -> Result<MarkersResponse<EntityId>, ApiError> {
-        let url = format!(
-            "{}/markers?min_lat={}&max_lat={}&min_lon={}&max_lon={}",
-            self.base_url,
-            viewport.min_lat(),
-            viewport.max_lat(),
-            viewport.min_lon(),
-            viewport.max_lon(),
-        );
+        z: u8,
+        x: u32,
+        y: u32,
+        snapshot: Option<&Snapshot>,
+    ) -> Result<TileResponse<EntityId>, ApiError> {
+        let mut url = format!("{}/tiles/{z}/{x}/{y}", self.base_url);
+        if let Some(snapshot) = snapshot {
+            url.push_str("?snapshot=");
+            url.push_str(snapshot.as_str());
+        }
         self.get_json(&url).await
     }
 

@@ -25,6 +25,16 @@ use dropshot::{ConfigLogging, ConfigLoggingLevel};
 use slog::info;
 use tokio::signal;
 
+/// The image-resolve mode for this run. `CHRONOSCOPE_IMAGE_RESOLVE=placeholder`
+/// stores a deterministic placeholder per image with no network; anything else
+/// (including unset) fetches the real source images.
+fn image_resolve_mode() -> ImageResolveMode {
+    match std::env::var("CHRONOSCOPE_IMAGE_RESOLVE").as_deref() {
+        Ok("placeholder") => ImageResolveMode::Placeholder,
+        _ => ImageResolveMode::Fetch,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Workers and the fact-store image resolver report via `tracing`; without a
@@ -62,12 +72,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let http_client =
         Arc::new(ReqwestClient::new().map_err(|e| format!("Failed to create HTTP client: {e}"))?);
 
+    // Interactive dev serves the real Commons images by default; a dense subset's
+    // thousand-image fetch gates startup for many minutes, so
+    // CHRONOSCOPE_IMAGE_RESOLVE=placeholder swaps in the no-network placeholder.
+    let image_resolve = image_resolve_mode();
+    info!(log, "Image resolve mode: {image_resolve:?}");
+
     let server = start_dev_server(DevServerConfig {
         database_url: Some(database_url),
         facts: FactsDbSource::Mounted {
             base: facts_pin,
             overlay: facts_overlay,
         },
+        seed_commits: Vec::new(),
         http_client,
         worker_idle_backoff: Duration::from_secs(60),
         retry_config: RetryConfig::default(),
@@ -76,8 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Thumbnails resolve to the Trunk front door's `/api` proxy, so the
         // browser fetches them same-origin and Trunk forwards to `/media`.
         cdn_base_url: format!("http://127.0.0.1:{trunk_port}/api"),
-        // Interactive dev serves the real Commons images from our media store.
-        image_resolve: ImageResolveMode::Fetch,
+        image_resolve,
         rp_id: None,
         rp_origin: None,
         ios_app_id: None,
@@ -89,8 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .map_err(|e| format!("Failed to start API server: {e}"))?;
 
     // 5. Start Trunk, serving the app and reverse-proxying `/api/*` to the API.
-    // `--proxy-rewrite=/api/` strips the mount prefix, so `/api/markers` reaches
-    // the root `/markers` route — same-origin, so the browser never sees CORS.
+    // `--proxy-rewrite=/api/` strips the mount prefix, so `/api/entities` reaches
+    // the root `/entities` route — same-origin, so the browser never sees CORS.
     let web_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("no parent")?
