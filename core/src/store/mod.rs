@@ -138,10 +138,11 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::geo::{QuadLevel, TileId, Viewport};
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
 use crate::store::schema::{
-    ClassPage, DepictionPage, EntityStream, EquivClass, FactPage, ImageStream,
+    ClassPage, ClusterCell, DepictionPage, EntityStream, EquivClass, FactPage, ImageStream, RankKey,
 };
 use crate::submit;
 use crate::submit::{FactLookup, StoredCommit, StoredFact, SubmitError, SubmitResult};
@@ -552,6 +553,56 @@ pub trait EntityView<S: FactStore>: FactView<S> {
         after: Option<S::ClassCursor<EntityIdOf<S>>>,
         limit: std::num::NonZeroUsize,
     ) -> impl Future<Output = Result<ClassWalkPage<S, EntityIdOf<S>>, S::Error>> + Send + 'a;
+
+    /// Cluster the entities whose location falls inside `viewport` into one
+    /// [`ClusterCell`] per non-empty tile at `level`, ranked by `rank`.
+    ///
+    /// The tile grid is the bucketing key; the fold is viewport-free, so a
+    /// fringe tile the viewport only partly covers still yields a cell. Each
+    /// tile keeps its `(quadkey, fact_id)`-lowest `CLUSTER_TILE_N` candidates
+    /// before retraction, folds them to their `SameEntity` representatives, and
+    /// reports the minimal survivor's entity and position, classifying the cell
+    /// as a singleton, a splittable cluster, or a co-located group.
+    ///
+    /// Unpaginated — the viewport is tile-count-bounded ([`CLUSTER_TILE_CAP`]),
+    /// so the whole cell set returns at once.
+    ///
+    /// [`CLUSTER_TILE_N`]: crate::store::schema::CLUSTER_TILE_N
+    /// [`CLUSTER_TILE_CAP`]: crate::store::schema::CLUSTER_TILE_CAP
+    fn cluster_entities_in_viewport<'a>(
+        &'a mut self,
+        viewport: &'a Viewport,
+        level: QuadLevel,
+        rank: RankKey,
+    ) -> impl Future<Output = Result<Vec<ClusterCell<EntityIdOf<S>>>, S::Error>> + Send + 'a;
+
+    /// Cluster the entities inside container `tile` into one [`ClusterCell`] per
+    /// non-empty sub-tile at `tile.level() + CELL_DEPTH`, ranked by `rank`.
+    ///
+    /// The container is one contiguous Morton block; its `4^CELL_DEPTH` children
+    /// at `level + CELL_DEPTH` partition it with no gap, and each child is a
+    /// bucket. Every bucket keeps its `(quadkey, fact_id)`-lowest
+    /// [`CLUSTER_TILE_N`] candidates before retraction — a **per-sub-tile**
+    /// budget, so a dense low-Morton corner can't starve the container's other
+    /// sub-tiles — folds them to their `SameEntity` representatives, and reports
+    /// the minimal survivor per bucket, classifying each cell as a singleton, a
+    /// splittable cluster, or a co-located group.
+    ///
+    /// The cell geometry is viewport-free: a container yields the same cells
+    /// however a viewport is drawn over it, so it is keyed by `(snapshot, level,
+    /// x, y)`. `level + CELL_DEPTH` folds against the finest level (see
+    /// [`TileId::child_ranges`]), so a container at level 24 folds as one cell.
+    /// The [`TileId`] is already validated on-grid, so this read cannot fault on
+    /// the coordinate.
+    ///
+    /// [`CLUSTER_TILE_N`]: crate::store::schema::CLUSTER_TILE_N
+    /// [`CELL_DEPTH`]: crate::store::schema::CELL_DEPTH
+    /// [`TileId::child_ranges`]: crate::geo::TileId::child_ranges
+    fn cluster_tile_cells(
+        &mut self,
+        tile: TileId,
+        rank: RankKey,
+    ) -> impl Future<Output = Result<Vec<ClusterCell<EntityIdOf<S>>>, S::Error>> + Send;
 
     /// Paginated backlink walk — "which facts mention this entity?". `after` is
     /// a resume token: `None` opens the walk, `Some(cursor)` resumes at the

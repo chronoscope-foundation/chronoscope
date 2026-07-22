@@ -238,10 +238,12 @@ impl Database {
         // Verify static queries
         queries::verify_all_query_plans(&self.pool).await?;
 
-        // Verify queue-generated queries
+        // Verify queue-generated queries. The claim's `ORDER BY … LIMIT` rides
+        // its partial indexes as a `MERGE (UNION ALL)`, so it must plan without
+        // an unbounded sort — no waiver.
         for queue in &self.all_queues {
             for (name, sql) in queue.queries() {
-                queries::verify_query_plan_sql(&self.pool, name, sql).await?;
+                queries::verify_query_plan_sql(&self.pool, name, sql, None).await?;
             }
         }
 

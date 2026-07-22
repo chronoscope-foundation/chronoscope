@@ -75,9 +75,10 @@ use std::sync::Arc;
 use sqlx::sqlite::SqlitePool;
 use sqlx::{Acquire, Sqlite, SqliteConnection, Transaction};
 
+use chronoscope_core::geo::{QuadLevel, TileId, Viewport, quadkey_of_location};
 use chronoscope_core::grammar::ids::{CommitId, FactId, SubjectKind};
 use chronoscope_core::store::schema::{
-    ClassPage, EntityStream, EquivClass, ImageStream, normalize_name,
+    ClassPage, ClusterCell, EntityStream, EquivClass, ImageStream, RankKey, normalize_name,
 };
 use chronoscope_core::store::{
     ClassWalkPage, DepictionWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView,
@@ -127,15 +128,15 @@ pub(crate) const UNION_VIEW_TABLES: &[&str] = &[
     "demolition_completed",
 ];
 
-/// The stored-facts codec version. Bump on ANY change to the stored
-/// `fact_json` / `result_json` shapes or the id encoding conventions —
-/// anything that would make a previously built facts-DB artifact decode
-/// wrongly. `ingest build-db` stamps it into the facts file's
-/// `PRAGMA user_version` after a successful build, and both
-/// [`validate_facts_file`] and the dev mount refuse a file that doesn't carry
-/// it — a stale codec, or an interrupted build (which never reached the
-/// stamp), fails loudly instead of decoding garbage.
-pub const FACTS_CODEC_VERSION: i32 = 1;
+/// The stored-facts codec version. Bump on ANY change that would make a
+/// previously built facts-DB artifact decode wrongly or read incompletely:
+/// the stored `fact_json` / `result_json` shapes, the id encoding conventions,
+/// or the facts-schema columns/indexes a read relies on. `ingest build-db`
+/// stamps it into the facts file's `PRAGMA user_version` after a successful
+/// build, and both [`validate_facts_file`] and the dev mount refuse a file
+/// that doesn't carry it — a stale codec, or an interrupted build (which never
+/// reached the stamp), fails loudly instead of decoding garbage.
+pub const FACTS_CODEC_VERSION: i32 = 2;
 
 /// Why a facts database file is not a valid, current build. Both consumers of
 /// a pre-built base pin — [`SqliteFactStore::open`] mounting one, and the dev
@@ -757,6 +758,26 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
         }
     }
 
+    async fn cluster_entities_in_viewport<'b>(
+        &'b mut self,
+        viewport: &'b Viewport,
+        level: QuadLevel,
+        rank: RankKey,
+    ) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
+        let fq = &*self.queries;
+        read::cluster_entities_in_viewport(self.conn.conn(), self.bound, fq, viewport, level, rank)
+            .await
+    }
+
+    async fn cluster_tile_cells(
+        &mut self,
+        tile: TileId,
+        rank: RankKey,
+    ) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
+        let fq = &*self.queries;
+        read::cluster_tile_cells(self.conn.conn(), self.bound, fq, tile, rank).await
+    }
+
     async fn all_facts_about_entity(
         &mut self,
         entity: &SqlEntityId,
@@ -970,9 +991,17 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         let conn = self.conn.conn();
         let facets = facet_columns(&fact)?;
         let subjects = subject_rows(&fact);
-        let spatial = fact
-            .located_subject()
+        let located = fact.located_subject();
+        let spatial = located
             .map(|(location, subject)| (location.bounding_rects(), kind_tag(subject.kind())));
+        // The clustering facet on the `facts` row: a Morton key and its subject
+        // kind, set together only when the location pins a point (a resolved
+        // circle). quadkey_of_location's None short-circuits both, so the
+        // migration's `(quadkey IS NULL) = (subject_kind IS NULL)` CHECK holds.
+        // A region location still writes a facts_spatial envelope but no quadkey.
+        let cluster_facet = located.and_then(|(location, subject)| {
+            quadkey_of_location(location).map(|quadkey| (quadkey, kind_tag(subject.kind())))
+        });
         let witness = witness_row(&fact);
         let fact_json = fact_to_json(fact)?;
         // A RetractCommit facet stores the target's surrogate seq; an
@@ -995,6 +1024,8 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
             .bind(facets.lat)
             .bind(facets.lon)
             .bind(facets.radius_m)
+            .bind(cluster_facet.map(|(quadkey, _)| quadkey))
+            .bind(cluster_facet.map(|(_, subject_kind)| subject_kind))
             .bind(facets.edge_kind)
             .bind(facets.edge_a)
             .bind(facets.edge_b)

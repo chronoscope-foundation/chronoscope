@@ -61,12 +61,14 @@ use async_lock::{Mutex, MutexGuard};
 
 use schemars::JsonSchema;
 
+use crate::geo::{QuadLevel, TileId, Viewport};
 use crate::grammar::assertions::MetaAssertion;
 use crate::grammar::event;
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
 use crate::store::retraction::RetractionEdges;
 use crate::store::schema::{
-    ClassPage, EntityStream, EquivClass, FactPage, ImageStream, PageItem, normalize_name,
+    ClassPage, ClusterCell, EntityStream, EquivClass, FactPage, ImageStream, PageItem, RankKey,
+    normalize_name,
 };
 use crate::store::{
     ClassWalkPage, DepictionWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView,
@@ -1013,6 +1015,27 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
                 })
             }
         }
+    }
+
+    async fn cluster_entities_in_viewport<'b>(
+        &'b mut self,
+        viewport: &'b Viewport,
+        level: QuadLevel,
+        rank: RankKey,
+    ) -> Result<Vec<ClusterCell<MemoryEntityId>>, MemoryError> {
+        self.with_core(move |core| core.cluster_entities(viewport, level, rank))
+            .await
+            .map_err(|e| MemoryError(format!("clustering viewport: {e}")))
+    }
+
+    async fn cluster_tile_cells(
+        &mut self,
+        tile: TileId,
+        rank: RankKey,
+    ) -> Result<Vec<ClusterCell<MemoryEntityId>>, MemoryError> {
+        Ok(self
+            .with_core(move |core| core.cluster_tile_cells(tile, rank))
+            .await)
     }
 
     async fn all_facts_about_entity(

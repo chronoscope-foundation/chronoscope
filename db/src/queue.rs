@@ -120,6 +120,14 @@ impl<T> Queue<T> {
         &self.name
     }
 
+    /// The `ORDER BY … LIMIT` sits on the three-arm compound, not an outer
+    /// `SELECT id` wrapping it: each arm rides its `(retry_after, created_at)`-
+    /// leading partial index, so the compound streams as a `MERGE (UNION ALL)`
+    /// and the `LIMIT` stops early — no whole-backlog sort. Hoisting the sort to
+    /// an outer select instead materializes and sorts the entire compound before
+    /// row one (`USE TEMP B-TREE FOR ORDER BY`), which the startup plan gate
+    /// rejects. Both this shape and the index leading key are required: with
+    /// `(claimed_at, …)`-leading indexes even this compound sorts each arm.
     fn generate_claim_sql(config: &QueueConfig) -> String {
         let p = config.col_prefix;
         format!(
@@ -136,9 +144,9 @@ impl<T> Queue<T> {
                     UNION ALL
                     SELECT id, {p}retry_after, created_at FROM {table}
                     WHERE {p}status = 'failed' AND {extra_filter} AND {p}retry_after IS NOT NULL AND {p}retry_after <= ?4
+                    ORDER BY {p}retry_after NULLS FIRST, created_at
+                    LIMIT ?5
                 )
-                ORDER BY {p}retry_after NULLS FIRST, created_at
-                LIMIT ?5
             )
             RETURNING {returning_cols}
             "#,

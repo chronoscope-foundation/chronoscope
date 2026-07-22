@@ -37,9 +37,14 @@
 
 use std::collections::BTreeSet;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
+use crate::geo::{
+    GeoPoint, QuadLevel, QuadTileRange, ViewportTilesError, split_level, viewport_tiles,
+};
 use crate::grammar::citations::{ExternalReference, Language};
 use crate::grammar::ids::FactId;
 
@@ -255,4 +260,144 @@ pub struct EquivClass<S: Ord> {
     pub representative: S,
     /// Every member of the class (including the representative).
     pub members: BTreeSet<S>,
+}
+
+// ============================================================================
+// Viewport clustering
+// ============================================================================
+
+/// The most tiles one clustering read enumerates at a level — a marker budget
+/// far under the shared [`viewport_tiles`] OOM
+/// guard. A viewport that trips it asked for a level too fine for its span.
+pub const CLUSTER_TILE_CAP: usize = 256;
+
+/// The viewport's clustering tiles at `level`, capped at [`CLUSTER_TILE_CAP`].
+/// Both backends decompose a viewport through this, so they enumerate the same
+/// tiles under the same cap.
+pub fn cluster_tile_ranges(
+    viewport: &Viewport,
+    level: QuadLevel,
+) -> Result<Vec<QuadTileRange>, ViewportTilesError> {
+    let tiles = viewport_tiles(viewport, level)?;
+    if tiles.len() > CLUSTER_TILE_CAP {
+        return Err(ViewportTilesError::TooManyTiles {
+            count: u64::try_from(tiles.len()).unwrap_or(u64::MAX),
+        });
+    }
+    Ok(tiles)
+}
+
+/// The per-tile candidate bound a clustering read truncates to — by the
+/// `(quadkey, fact_id)` order — before retraction and representative
+/// resolution. A shared semantic parameter: both backends truncate to the
+/// same top-N, so `cluster_entities_in_viewport` returns the same cells.
+///
+/// The cut is over located facts, so a tile holding at most N of them is
+/// exact — the static-architecture corpus today, one location per entity.
+/// Past N the lowest `(quadkey, fact_id)` facts win: a distinct entity sorting
+/// higher can drop out, misreading a `Cluster` as a `Singleton` or `Colocated`
+/// or truncating a `Colocated` group's members, and a tile whose low facts are
+/// all retracted can lose its live entities. The cached-entity layer clusters
+/// one row per entity and retires the bound.
+pub const CLUSTER_TILE_N: usize = 32;
+
+/// How many levels below a container tile the per-tile clustering read
+/// (`cluster_tile_cells`) folds its cells. A container `(z, x, y)` folds one
+/// cell per non-empty sub-tile at `z + CELL_DEPTH`, so the container carries up
+/// to `4^CELL_DEPTH` cells. `saturating` collapses the depth as `z` nears the
+/// finest level, so `z = 24` folds the container as a single cell. Tunable —
+/// larger trades more cells per fetch for finer client-side declutter.
+pub const CELL_DEPTH: u8 = 3;
+
+/// The tuning knob must stay under the fan-out backstop: a `CELL_DEPTH` past
+/// [`MAX_CELL_DEPTH`](crate::geo::MAX_CELL_DEPTH) would be silently clamped by
+/// [`TileId::child_ranges`](crate::geo::TileId::child_ranges), so the per-tile
+/// read would fold fewer levels than configured. Caught at compile time.
+const _: () = assert!(CELL_DEPTH <= crate::geo::MAX_CELL_DEPTH);
+
+/// How a clustering read orders candidates within a tile before its top-N cut
+/// and representative choice. One variant today: [`Unranked`](Self::Unranked)
+/// is ascending `(quadkey, fact_id)`. Future ranks (by recency, by class size)
+/// slot in here as the read's ordering key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RankKey {
+    /// Ascending `(quadkey, fact_id)` — the tile's lowest-Morton fact wins the
+    /// representative.
+    Unranked,
+}
+
+/// How a tile's surviving entities resolve into one marker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CellKind<Id> {
+    /// One distinct entity in the tile.
+    Singleton,
+    /// Two or more distinct entities spread across more than one finest tile —
+    /// zooming splits them. `split_level` is the finest level at which the
+    /// survivors fall into more than one tile, so a client zooming there sees
+    /// the cell subdivide.
+    Cluster { split_level: QuadLevel },
+    /// Two or more distinct entities sharing one finest (level-24) tile —
+    /// unsplittable by zoom. Carries every member for the disambiguation picker.
+    Colocated { members: Vec<Id> },
+}
+
+/// One clustered map marker: a tile's surviving located entities folded to a
+/// single cell. `Id` is the store's entity id kind.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterCell<Id> {
+    /// The `(quadkey, fact_id)`-minimal survivor's entity — the marker's id and
+    /// reported position.
+    pub representative: Id,
+    /// The representative fact's position.
+    pub point: GeoPoint,
+    /// Whether the cell is one entity, a splittable cluster, or a co-located group.
+    pub kind: CellKind<Id>,
+}
+
+/// Fold a tile's surviving located facts — each `(quadkey, fact_id,
+/// representative, point)` — into one [`ClusterCell`]. The `(quadkey,
+/// fact_id)`-minimal survivor supplies the representative and the reported
+/// point. The `kind` classifies the tile three ways: one distinct
+/// representative is a [`Singleton`](CellKind::Singleton); two or more sharing a
+/// single level-24 quadkey are [`Colocated`](CellKind::Colocated), carrying the
+/// sorted distinct representatives; otherwise the tile is a
+/// [`Cluster`](CellKind::Cluster), carrying the [`split_level`] at which the
+/// survivors' quadkeys first fall into separate tiles. Empty input yields no
+/// cell. Both backends fold through this, so their cells agree.
+///
+/// [`split_level`]: crate::geo::split_level
+pub fn fold_cluster_cell<Id: Copy + Ord>(
+    survivors: &[(i64, FactId, Id, GeoPoint)],
+) -> Option<ClusterCell<Id>> {
+    let &(_, _, representative, point) = survivors
+        .iter()
+        .min_by_key(|(quadkey, fid, _, _)| (*quadkey, *fid))?;
+    let reps: BTreeSet<Id> = survivors.iter().map(|(_, _, rep, _)| *rep).collect();
+    // Extremes of the survivors' quadkeys — duplicates don't move them, so this
+    // matches the min/max of the distinct set. A total fold over the non-empty
+    // slice, so there's no `Option` to discharge.
+    let (min_quadkey, max_quadkey) = survivors
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(lo, hi), &(q, _, _, _)| {
+            (lo.min(q), hi.max(q))
+        });
+    let kind = if reps.len() < 2 {
+        CellKind::Singleton
+    } else if min_quadkey == max_quadkey {
+        // Every survivor shares one finest tile — a co-located group, not a
+        // spread zooming could split.
+        CellKind::Colocated {
+            members: reps.into_iter().collect(),
+        }
+    } else {
+        CellKind::Cluster {
+            split_level: split_level(min_quadkey, max_quadkey),
+        }
+    };
+    Some(ClusterCell {
+        representative,
+        point,
+        kind,
+    })
 }

@@ -11,14 +11,19 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::date::{DatePrecision, UncertainDate};
-use crate::geo::{GeoPoint, Meters};
+use crate::geo::{
+    GeoPoint, Meters, QuadLevel, TileId, Viewport, mercator_x_to_lon, mercator_y_to_lat, quadkey,
+    split_level, viewport_tiles,
+};
 use crate::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use crate::grammar::attribute;
 use crate::grammar::citations::{ExternalSource, JudgmentSource, Justification};
 use crate::grammar::identity;
 use crate::grammar::ids::{CommitId, FactId, UserId};
 use crate::location::{Location, LocationReference, UnresolvedLocation};
-use crate::store::schema::{ClassRow, EntityStream, ImageStream};
+use crate::store::schema::{
+    CELL_DEPTH, CLUSTER_TILE_N, CellKind, ClassRow, ClusterCell, EntityStream, ImageStream, RankKey,
+};
 use crate::store::{
     EntityIdOf, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageIdOf,
     ImageView, SubmitCommitError, SubmitCommitInput,
@@ -4700,6 +4705,704 @@ pub async fn class_walk_next_class_cursor_skips_to_the_next_representative<S: Fa
         by_class,
         vec![first, second],
         "the class cursor visits each representative once"
+    );
+    Ok(())
+}
+
+// --- viewport clustering ---
+
+/// The geographic centre of tile `(tx, ty)` at `level` — safely inside the
+/// tile's finest (level-24) cell, so its [`quadkey`] lands in that tile. Used by
+/// the per-tile clustering cases to place entities in chosen sub-tiles.
+fn tile_center(level: QuadLevel, tx: u32, ty: u32) -> Result<GeoPoint, TestError> {
+    let n = f64::from(1u32 << level.get());
+    let ux = (f64::from(tx) + 0.5) / n;
+    let uy = (f64::from(ty) + 0.5) / n;
+    Ok(GeoPoint::new(mercator_y_to_lat(uy), mercator_x_to_lon(ux))?)
+}
+
+/// The per-tile fold is viewport-free: container tile `(z, cx, cy)`'s stand-alone
+/// cells (`cluster_tile_cells`) equal the same sub-tiles' cells folded inside a
+/// viewport that also spans the eastern neighbour container
+/// (`cluster_entities_in_viewport` at `z + CELL_DEPTH`), once the viewport cells
+/// are clipped to the container's Morton block. An entity in the neighbour proves
+/// the clip removes a real out-of-container cell.
+pub async fn cluster_tile_cells_match_the_same_tile_inside_a_viewport<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let z = QuadLevel::new(8)?;
+    let cell_level = QuadLevel::saturating(z.get() + CELL_DEPTH);
+    // An arbitrary interior container tile; the geography is irrelevant since
+    // points are derived from tile coordinates.
+    let (cx, cy) = (75u32, 96u32);
+    let factor = 1u32 << CELL_DEPTH; // sub-tiles per axis in a container
+    let (base_x, base_y) = (cx * factor, cy * factor);
+
+    // Two lone entities in distinct sub-tiles, a co-located pair sharing one
+    // sub-tile (identical point → one finest tile), and one entity in the
+    // eastern neighbour container.
+    let p_lone1 = tile_center(cell_level, base_x + 1, base_y + 2)?;
+    let p_lone2 = tile_center(cell_level, base_x + 5, base_y + 6)?;
+    let p_pair = tile_center(cell_level, base_x + 3, base_y + 4)?;
+    let p_neighbour = tile_center(cell_level, (cx + 1) * factor + 2, base_y + 2)?;
+
+    let place = |p: &GeoPoint, secs: i64| {
+        local_bundle::<S::Ids>(1, 0, 0, secs, vec![construction_at(0, p.lat(), p.lon())?])
+    };
+    commit_result(&store, place(&p_lone1, 0)?).await?;
+    commit_result(&store, place(&p_lone2, 10)?).await?;
+    commit_result(&store, place(&p_pair, 20)?).await?;
+    commit_result(&store, place(&p_pair, 30)?).await?;
+    commit_result(&store, place(&p_neighbour, 40)?).await?;
+
+    let tile = TileId::new(z, cx, cy)?;
+    let container = tile.range();
+    let in_container = |p: &GeoPoint| {
+        let q = quadkey(p);
+        container.lo <= q && q <= container.hi
+    };
+    // Precondition: the three in-container points sit in the block; the neighbour
+    // does not — so the clip below has something real to remove.
+    for p in [&p_lone1, &p_lone2, &p_pair] {
+        assert!(
+            in_container(p),
+            "an in-container point must sit in the block"
+        );
+    }
+    assert!(
+        !in_container(&p_neighbour),
+        "the neighbour point must sit outside the container block"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+
+    let mut tile_cells = view
+        .cluster_tile_cells(tile, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    // A viewport spanning both containers, folded at the sub-tile level. The
+    // corner divisor is the level's tiles-per-axis, derived from `z` so editing
+    // the level can't leave a stale constant behind.
+    let tiles_per_axis = f64::from(1u32 << z.get());
+    let viewport = Viewport::new(
+        GeoPoint::new(
+            mercator_y_to_lat(f64::from(cy + 1) / tiles_per_axis),
+            mercator_x_to_lon(f64::from(cx) / tiles_per_axis),
+        )?,
+        GeoPoint::new(
+            mercator_y_to_lat(f64::from(cy) / tiles_per_axis),
+            mercator_x_to_lon(f64::from(cx + 2) / tiles_per_axis),
+        )?,
+    )?;
+    let vp_all = view
+        .cluster_entities_in_viewport(&viewport, cell_level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        vp_all.len(),
+        4,
+        "the viewport spans three in-container cells plus the neighbour's, got {vp_all:?}"
+    );
+
+    let mut vp_cells: Vec<ClusterCell<EntityIdOf<S>>> = vp_all
+        .into_iter()
+        .filter(|c| in_container(&c.point))
+        .collect();
+
+    tile_cells.sort_by(|a, b| a.representative.cmp(&b.representative));
+    vp_cells.sort_by(|a, b| a.representative.cmp(&b.representative));
+
+    assert_eq!(
+        tile_cells.len(),
+        3,
+        "the container folds two singletons and one co-located cell, got {tile_cells:?}"
+    );
+    assert_eq!(
+        tile_cells, vp_cells,
+        "a container's stand-alone tile cells must equal its clipped viewport cells (the fold is \
+         viewport-free)"
+    );
+    Ok(())
+}
+
+/// The per-sub-tile top-N budget: a container whose low-Morton corner sub-tile
+/// holds more than [`CLUSTER_TILE_N`] entities still yields a cell for a
+/// high-Morton corner sub-tile. A single container-wide `LIMIT` would spend its
+/// whole budget on the low corner (whose quadkeys all sort first) and drop the
+/// high corner — the headline truncation bug the per-sub-tile budget guards.
+pub async fn cluster_tile_cells_keep_high_sub_tiles_under_a_dense_low_corner<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let z = QuadLevel::new(8)?;
+    let cell_level = QuadLevel::saturating(z.get() + CELL_DEPTH);
+    let (cx, cy) = (40u32, 50u32);
+    let factor = 1u32 << CELL_DEPTH;
+    let (base_x, base_y) = (cx * factor, cy * factor);
+
+    let low = tile_center(cell_level, base_x, base_y)?;
+    let high = tile_center(cell_level, base_x + factor - 1, base_y + factor - 1)?;
+
+    // Fill the low corner with more than the per-sub-tile budget, all at the
+    // identical point (one finest tile), so a container-wide LIMIT would exhaust
+    // itself here before ever reaching the high corner.
+    let dense = CLUSTER_TILE_N + 5;
+    for i in 0..dense {
+        commit_result(
+            &store,
+            local_bundle::<S::Ids>(
+                1,
+                0,
+                0,
+                i as i64,
+                vec![construction_at(0, low.lat(), low.lon())?],
+            )?,
+        )
+        .await?;
+    }
+    let high_res = commit_result(
+        &store,
+        local_bundle::<S::Ids>(
+            1,
+            0,
+            0,
+            10_000,
+            vec![construction_at(0, high.lat(), high.lon())?],
+        )?,
+    )
+    .await?;
+    let high_id = high_res
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing high-corner entity")?
+        .id
+        .clone();
+
+    // Preconditions: both corners sit in the container, and the dense low corner
+    // sorts entirely before the high corner.
+    let tile = TileId::new(z, cx, cy)?;
+    let container = tile.range();
+    for p in [&low, &high] {
+        let q = quadkey(p);
+        assert!(
+            container.lo <= q && q <= container.hi,
+            "a corner must sit in the container block"
+        );
+    }
+    assert!(
+        quadkey(&low) < quadkey(&high),
+        "the low corner must sort before the high corner"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let cells = view
+        .cluster_tile_cells(tile, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    assert_eq!(
+        cells.len(),
+        2,
+        "the per-sub-tile budget keeps both the dense low corner and the high corner, got {cells:?}"
+    );
+    let high_cell = cells
+        .iter()
+        .find(|c| c.representative == high_id)
+        .ok_or("the high-corner entity must surface despite the dense low corner")?;
+    assert_eq!(
+        high_cell.kind,
+        CellKind::Singleton,
+        "the high corner holds one entity — a singleton"
+    );
+    Ok(())
+}
+
+/// The clustering read buckets located entities by tile and folds each tile to
+/// one [`ClusterCell`], classified three ways: two distinct entities in one tile
+/// but distinct finest tiles fold to a [`Cluster`](CellKind::Cluster); a
+/// `SameEntity`-merged pair sharing a tile is a [`Singleton`](CellKind::Singleton)
+/// (distinct representatives, not fact count, drive the kind); a lone entity is a
+/// singleton; and an entity just outside the viewport but inside an overhang tile
+/// still yields its own cell — the fold is viewport-free. The `(quadkey,
+/// fact_id)`-minimal survivor sets each cell's representative and point. Runs
+/// against both backends, so it also pins that their bounded per-tile folds agree
+/// cell-for-cell.
+pub async fn cluster_entities_in_viewport_buckets_by_tile<S: FactStore>(store: S) -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let level = QuadLevel::new(14)?;
+
+    // Two two-point clusters and a lone point well inside, plus an overhang
+    // point just north of the viewport. Within each cluster the first point is
+    // north-and-west of the second, so its quadkey is the lower and its fact
+    // wins the tile's representative.
+    let (a_lat, a_lon) = (40.021, -73.981);
+    let (b_lat, b_lon) = (40.020, -73.980);
+    let (c_lat, c_lon) = (40.061, -73.941);
+    let (d_lat, d_lon) = (40.060, -73.940);
+    let (e_lat, e_lon) = (40.030, -73.930);
+    let (f_lat, f_lon) = (40.1005, -73.950);
+
+    // A and B: distinct entities in one tile at distinct finest tiles → a Cluster cell.
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, a_lat, a_lon)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+    let b = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, b_lat, b_lon)?])?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id.clone();
+
+    // C and D: a SameEntity-merged pair meant to share a second tile → a
+    // singleton cell (one representative, though two facts).
+    let cd = commit_result(
+        &store,
+        local_bundle(
+            2,
+            0,
+            0,
+            20,
+            vec![
+                construction_at(0, c_lat, c_lon)?,
+                construction_at(1, d_lat, d_lon)?,
+                same_entity_fact(0, 1)?,
+            ],
+        )?,
+    )
+    .await?;
+    let c_id = cd
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing c")?
+        .id
+        .clone();
+    let d_id = cd
+        .entities
+        .get(&EntityIdx(1))
+        .ok_or("missing d")?
+        .id
+        .clone();
+    let cd_rep = c_id.clone().min(d_id.clone());
+
+    // E: a lone entity in a third tile → a singleton cell.
+    let e = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 30, vec![construction_at(0, e_lat, e_lon)?])?,
+    )
+    .await?;
+    let e_id = e.entities.get(&EntityIdx(0)).ok_or("missing e")?.id.clone();
+
+    // F: just north of the viewport, inside an overhang tile → its own
+    // singleton cell, since the fold is viewport-free.
+    let f = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 40, vec![construction_at(0, f_lat, f_lon)?])?,
+    )
+    .await?;
+    let f_id = f.entities.get(&EntityIdx(0)).ok_or("missing f")?.id.clone();
+
+    // Pin the geometry the case leans on before trusting the fold: A/B share a
+    // tile, C/D share a distinct tile, E is a third, all inside the viewport;
+    // F is outside but inside a viewport-overhang tile.
+    let a_pt = GeoPoint::new(a_lat, a_lon)?;
+    let b_pt = GeoPoint::new(b_lat, b_lon)?;
+    let c_pt = GeoPoint::new(c_lat, c_lon)?;
+    let d_pt = GeoPoint::new(d_lat, d_lon)?;
+    let e_pt = GeoPoint::new(e_lat, e_lon)?;
+    let f_pt = GeoPoint::new(f_lat, f_lon)?;
+    let ranges = viewport_tiles(&viewport, level)?;
+    let tile_of = |p: &GeoPoint| -> Option<usize> {
+        let q = quadkey(p);
+        ranges.iter().position(|r| r.lo <= q && q <= r.hi)
+    };
+    let t_ab = tile_of(&a_pt).ok_or("A must fall in a viewport tile")?;
+    assert_eq!(Some(t_ab), tile_of(&b_pt), "A and B must share a tile");
+    // A and B occupy distinct finest tiles, so their shared query-level tile
+    // folds to a Cluster rather than a co-located group.
+    assert_ne!(
+        quadkey(&a_pt),
+        quadkey(&b_pt),
+        "A and B must occupy distinct finest tiles"
+    );
+    let t_cd = tile_of(&c_pt).ok_or("C must fall in a viewport tile")?;
+    assert_eq!(Some(t_cd), tile_of(&d_pt), "C and D must share a tile");
+    let t_e = tile_of(&e_pt).ok_or("E must fall in a viewport tile")?;
+    assert!(
+        t_ab != t_cd && t_ab != t_e && t_cd != t_e,
+        "the three inside tiles must be distinct: A/B={t_ab}, C/D={t_cd}, E={t_e}"
+    );
+    let t_f = tile_of(&f_pt).ok_or("F must fall in a viewport-overhang tile")?;
+    assert!(
+        t_f != t_ab && t_f != t_cd && t_f != t_e,
+        "F's overhang tile must be distinct from the inside tiles"
+    );
+    for p in [&a_pt, &b_pt, &c_pt, &d_pt, &e_pt] {
+        assert!(
+            viewport.contains(p),
+            "the inside points must be in the viewport"
+        );
+    }
+    // F sits outside the viewport, yet its overhang tile still yields a cell —
+    // the fold is viewport-free.
+    assert!(!viewport.contains(&f_pt), "F must sit outside the viewport");
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut got = view
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    got.sort_by(|x, y| x.representative.cmp(&y.representative));
+
+    let mut want = vec![
+        ClusterCell {
+            representative: a_id.clone(),
+            point: a_pt,
+            // The fold derives the split level from the survivors' quadkeys; A/B
+            // are the two survivors, so recompute it from their points here.
+            kind: CellKind::Cluster {
+                split_level: split_level(quadkey(&a_pt), quadkey(&b_pt)),
+            },
+        },
+        ClusterCell {
+            representative: cd_rep.clone(),
+            point: c_pt,
+            kind: CellKind::Singleton,
+        },
+        ClusterCell {
+            representative: e_id.clone(),
+            point: e_pt,
+            kind: CellKind::Singleton,
+        },
+        ClusterCell {
+            representative: f_id.clone(),
+            point: f_pt,
+            kind: CellKind::Singleton,
+        },
+    ];
+    want.sort_by(|x, y| x.representative.cmp(&y.representative));
+
+    assert_eq!(
+        got, want,
+        "clustering folds A+B into a Cluster cell at A ({a_id:?}, b={b_id:?}), the merged C/D \
+         into a singleton at C (rep {cd_rep:?}), E ({e_id:?}) into a singleton, and F ({f_id:?}) \
+         into its own singleton though outside the viewport; got {got:?}"
+    );
+    Ok(())
+}
+
+/// A clustering read pinned to an earlier snapshot ignores facts committed
+/// after it. Entity A (one tile) exists below the snapshot; entity B (a
+/// distinct tile) is committed after. Reading at the snapshot yields only A's
+/// singleton cell — B adds neither its own cell nor a second representative.
+pub async fn cluster_entities_in_viewport_respects_snapshot<S: FactStore>(store: S) -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let level = QuadLevel::new(14)?;
+
+    let (a_lat, a_lon) = (40.021, -73.981);
+    let (b_lat, b_lon) = (40.061, -73.941);
+
+    // A: committed below the snapshot.
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, a_lat, a_lon)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+
+    let snapshot = store.next_fact_id().await.map_err(|e| format!("{e:?}"))?;
+
+    // B: committed after the snapshot, in a distinct tile.
+    let b = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, b_lat, b_lon)?])?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id.clone();
+
+    // Preconditions: A and B sit in distinct viewport tiles, both inside.
+    let a_pt = GeoPoint::new(a_lat, a_lon)?;
+    let b_pt = GeoPoint::new(b_lat, b_lon)?;
+    let ranges = viewport_tiles(&viewport, level)?;
+    let tile_of = |p: &GeoPoint| -> Option<usize> {
+        let q = quadkey(p);
+        ranges.iter().position(|r| r.lo <= q && q <= r.hi)
+    };
+    let t_a = tile_of(&a_pt).ok_or("A must fall in a viewport tile")?;
+    let t_b = tile_of(&b_pt).ok_or("B must fall in a viewport tile")?;
+    assert_ne!(t_a, t_b, "A and B must occupy distinct tiles");
+    assert!(viewport.contains(&a_pt) && viewport.contains(&b_pt));
+
+    // At the snapshot: only A's singleton cell; B is invisible.
+    let mut pinned = store
+        .no_later_than(snapshot)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let got = pinned
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        got,
+        vec![ClusterCell {
+            representative: a_id.clone(),
+            point: a_pt,
+            kind: CellKind::Singleton,
+        }],
+        "pinned read must see only A ({a_id:?}), never post-snapshot B ({b_id:?}); got {got:?}"
+    );
+
+    // At head: both A and B appear as singleton cells.
+    let mut head = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut head_cells = head
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    head_cells.sort_by(|x, y| x.representative.cmp(&y.representative));
+    let mut want_head = vec![
+        ClusterCell {
+            representative: a_id.clone(),
+            point: a_pt,
+            kind: CellKind::Singleton,
+        },
+        ClusterCell {
+            representative: b_id.clone(),
+            point: b_pt,
+            kind: CellKind::Singleton,
+        },
+    ];
+    want_head.sort_by(|x, y| x.representative.cmp(&y.representative));
+    assert_eq!(
+        head_cells, want_head,
+        "at head both A and B appear as singletons; got {head_cells:?}"
+    );
+    Ok(())
+}
+
+/// Two distinct entities constructed at one point share a finest (level-24)
+/// tile, so their tile folds to a co-located cell rather than a splittable
+/// cluster — zooming can't separate them. The cell carries both entity ids as
+/// sorted members, and its representative is the `(quadkey, fact_id)`-minimal
+/// survivor: with the quadkey shared, the earlier commit's lower fact id breaks
+/// the tie.
+pub async fn cluster_entities_in_viewport_groups_colocated_entities<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let level = QuadLevel::new(14)?;
+
+    let (p_lat, p_lon) = (40.021, -73.981);
+
+    // A and B: distinct entities pinned to the same point.
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, p_lat, p_lon)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+    let b = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, p_lat, p_lon)?])?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id.clone();
+
+    // Preconditions: two distinct entities on the one in-viewport point.
+    let p_pt = GeoPoint::new(p_lat, p_lon)?;
+    assert_ne!(a_id, b_id, "A and B must be distinct entities");
+    assert!(
+        viewport.contains(&p_pt),
+        "the shared point must be in the viewport"
+    );
+
+    // The fold sorts members by id (BTreeSet order); the representative is A,
+    // whose earlier commit gives the lower fact id under the shared quadkey.
+    let mut members = vec![a_id.clone(), b_id.clone()];
+    members.sort();
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let got = view
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        got,
+        vec![ClusterCell {
+            representative: a_id.clone(),
+            point: p_pt,
+            kind: CellKind::Colocated {
+                members: members.clone()
+            },
+        }],
+        "A ({a_id:?}) and B ({b_id:?}) at one point fold to a single Colocated cell carrying \
+         sorted members {members:?}; got {got:?}"
+    );
+    Ok(())
+}
+
+/// A `Cluster` cell collapses to a `Singleton` when one of its two members is
+/// retracted. A and B share a query-level tile but sit in distinct finest tiles
+/// (a cluster); retracting B's placing fact leaves A alone, and the tile folds
+/// to a singleton at A.
+pub async fn cluster_cluster_becomes_singleton_when_a_member_is_retracted<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let level = QuadLevel::new(14)?;
+
+    let (a_lat, a_lon) = (40.021, -73.981);
+    let (b_lat, b_lon) = (40.020, -73.980);
+
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, a_lat, a_lon)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+    let b = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, b_lat, b_lon)?])?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id.clone();
+    let b_fact = *b.fact_ids.first().ok_or("missing b construction fact id")?;
+
+    // Preconditions: A and B share a query-level tile but distinct finest
+    // tiles, both inside the viewport → a cluster before retraction.
+    let a_pt = GeoPoint::new(a_lat, a_lon)?;
+    let b_pt = GeoPoint::new(b_lat, b_lon)?;
+    assert_ne!(a_id, b_id, "A and B must be distinct entities");
+    assert_ne!(
+        quadkey(&a_pt),
+        quadkey(&b_pt),
+        "A and B must occupy distinct finest tiles"
+    );
+    let ranges = viewport_tiles(&viewport, level)?;
+    let tile_of = |p: &GeoPoint| -> Option<usize> {
+        let q = quadkey(p);
+        ranges.iter().position(|r| r.lo <= q && q <= r.hi)
+    };
+    let t_a = tile_of(&a_pt).ok_or("A must fall in a viewport tile")?;
+    assert_eq!(
+        Some(t_a),
+        tile_of(&b_pt),
+        "A and B must share a query-level tile"
+    );
+
+    // Before retraction: one Cluster cell at A.
+    {
+        let mut before = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let cells_before = before
+            .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        assert_eq!(
+            cells_before,
+            vec![ClusterCell {
+                representative: a_id.clone(),
+                point: a_pt,
+                kind: CellKind::Cluster {
+                    split_level: split_level(quadkey(&a_pt), quadkey(&b_pt)),
+                },
+            }],
+            "before retraction A ({a_id:?}) and B ({b_id:?}) form one Cluster cell; got \
+             {cells_before:?}"
+        );
+    }
+
+    commit_retract(&store, b_fact, 20).await?;
+
+    // After retraction: B is gone, the tile folds to a singleton at A.
+    let mut after = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let cells_after = after
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        cells_after,
+        vec![ClusterCell {
+            representative: a_id.clone(),
+            point: a_pt,
+            kind: CellKind::Singleton,
+        }],
+        "retracting B ({b_id:?}) leaves A ({a_id:?}) as a singleton; got {cells_after:?}"
+    );
+    Ok(())
+}
+
+/// A `Colocated` cell collapses to a `Singleton` when one of its two members is
+/// retracted. A and B share one point (a co-located group); retracting B's
+/// placing fact leaves A alone, and the tile folds to a singleton at A.
+pub async fn cluster_colocated_becomes_singleton_when_a_member_is_retracted<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let level = QuadLevel::new(14)?;
+
+    let (p_lat, p_lon) = (40.021, -73.981);
+
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, p_lat, p_lon)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+    let b = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, p_lat, p_lon)?])?,
+    )
+    .await?;
+    let b_id = b.entities.get(&EntityIdx(0)).ok_or("missing b")?.id.clone();
+    let b_fact = *b.fact_ids.first().ok_or("missing b construction fact id")?;
+
+    // Preconditions: two distinct entities on the one in-viewport point → a
+    // co-located group before retraction.
+    let p_pt = GeoPoint::new(p_lat, p_lon)?;
+    assert_ne!(a_id, b_id, "A and B must be distinct entities");
+    assert!(
+        viewport.contains(&p_pt),
+        "the shared point must be in the viewport"
+    );
+
+    // Before retraction: one Colocated cell carrying both members.
+    {
+        let mut members = vec![a_id.clone(), b_id.clone()];
+        members.sort();
+        let mut before = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let cells_before = before
+            .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        assert_eq!(
+            cells_before,
+            vec![ClusterCell {
+                representative: a_id.clone(),
+                point: p_pt,
+                kind: CellKind::Colocated { members },
+            }],
+            "before retraction A ({a_id:?}) and B ({b_id:?}) form one Colocated cell; got \
+             {cells_before:?}"
+        );
+    }
+
+    commit_retract(&store, b_fact, 20).await?;
+
+    // After retraction: B is gone, the tile folds to a singleton at A.
+    let mut after = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let cells_after = after
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        cells_after,
+        vec![ClusterCell {
+            representative: a_id.clone(),
+            point: p_pt,
+            kind: CellKind::Singleton,
+        }],
+        "retracting B ({b_id:?}) leaves A ({a_id:?}) as a singleton; got {cells_after:?}"
     );
     Ok(())
 }

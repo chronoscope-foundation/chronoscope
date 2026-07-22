@@ -19,6 +19,16 @@ pub enum QueryPlanError {
         detail: String,
     },
 
+    #[error(
+        "Query '{query}' plans a full sort ({detail}): the whole input sorts \
+         before the first row, so a trailing LIMIT can't stop it early\nSQL: {sql}"
+    )]
+    UnboundedSort {
+        query: String,
+        sql: String,
+        detail: String,
+    },
+
     #[error("Failed to explain query '{name}': {source}")]
     ExplainFailed {
         name: String,
@@ -38,9 +48,37 @@ pub enum QueryPlanError {
 pub struct QueryDef {
     pub name: &'static str,
     pub sql: &'static str,
+    /// Whether a full ORDER BY/GROUP BY/DISTINCT sort (per `is_unbounded_sort`)
+    /// is waived for this query. `None` holds the query to index-ordered reads;
+    /// `Some(reason)` waives a full sort and states why it's acceptable, so a
+    /// waiver can't exist without a justification carried in the type.
+    pub sort_ok: Option<&'static str>,
 }
 
 impl QueryDef {
+    /// A query the verifier holds to index-ordered reads (no full sort).
+    pub const fn new(name: &'static str, sql: &'static str) -> Self {
+        Self {
+            name,
+            sql,
+            sort_ok: None,
+        }
+    }
+
+    /// A query whose full sort the verifier tolerates — `justification` states
+    /// why it's acceptable and is carried at the definition site.
+    pub const fn sorting(
+        name: &'static str,
+        sql: &'static str,
+        justification: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            sql,
+            sort_ok: Some(justification),
+        }
+    }
+
     /// Create a sqlx Query from this definition, ready for binding parameters.
     pub fn query(&self) -> Query<'_, Sqlite, SqliteArguments<'_>> {
         sqlx::query(self.sql)
@@ -66,21 +104,24 @@ pub(crate) async fn verify_query_defs(
     defs: &[&QueryDef],
 ) -> Result<(), QueryPlanError> {
     for query_def in defs {
-        verify_query_plan_sql(pool, query_def.name, query_def.sql).await?;
+        verify_query_plan_sql(pool, query_def.name, query_def.sql, query_def.sort_ok).await?;
     }
     Ok(())
 }
 
-/// Verify a SQL query uses indexes (no full table scans).
+/// Verify a SQL query uses indexes (no full table scans) and doesn't plan an
+/// unbounded sort (unless `sort_ok` waives it with a justification).
 ///
 /// Used both for static `QueryDef`s and dynamically-generated queue SQL.
 ///
 /// # Errors
-/// Returns `QueryPlanError` if the query would cause a full table scan.
+/// Returns `QueryPlanError` if the query would cause a full table scan, or an
+/// unwaived full ORDER BY/GROUP BY/DISTINCT sort.
 pub async fn verify_query_plan_sql(
     pool: &SqlitePool,
     name: &str,
     sql: &str,
+    sort_ok: Option<&str>,
 ) -> Result<(), QueryPlanError> {
     let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
 
@@ -152,6 +193,18 @@ pub async fn verify_query_plan_sql(
         }
     }
 
+    if sort_ok.is_none()
+        && let Some((_, _, _, detail)) = plan
+            .iter()
+            .find(|(_, _, _, detail)| is_unbounded_sort(detail))
+    {
+        return Err(QueryPlanError::UnboundedSort {
+            query: name.to_string(),
+            sql: sql.to_string(),
+            detail: detail.clone(),
+        });
+    }
+
     Ok(())
 }
 
@@ -198,6 +251,23 @@ fn is_full_table_scan(
         // bounded. Currently the only LEFT-JOIN scans in practice are on
         // `ranked_reps` (small CTE) and `region_centroids` (small CTE).
         && !detail.contains("LEFT-JOIN")
+}
+
+/// Whether an EXPLAIN QUERY PLAN detail line is a full ORDER BY / GROUP BY /
+/// DISTINCT sort.
+///
+/// Such a sort materializes and orders (or dedups) the entire input before
+/// emitting row one, so a trailing LIMIT can't stop it early — the opposite of
+/// the index-ordered top-N scan `is_full_table_scan` waives. A temp-B-tree
+/// DISTINCT is the same class: the index couldn't supply distinctness, so the
+/// whole input dedups up front, and DISTINCT has no bounded `LAST TERM` variant
+/// to spare. SQLite's block-sort line ("USE TEMP B-TREE FOR LAST TERM OF ORDER
+/// BY") stays unmatched: the index already orders every leading term, so only
+/// rows sharing a leading key buffer and LIMIT still bounds the read.
+fn is_unbounded_sort(detail: &str) -> bool {
+    detail.contains("USE TEMP B-TREE FOR ORDER BY")
+        || detail.contains("USE TEMP B-TREE FOR GROUP BY")
+        || detail.contains("USE TEMP B-TREE FOR DISTINCT")
 }
 
 /// Every table and view name in the live schema, across all attached
@@ -247,7 +317,7 @@ async fn partial_index_names(
 
 macro_rules! define_queries {
     ($($name:ident: $sql:literal),* $(,)?) => {
-        $(pub const $name: QueryDef = QueryDef { name: stringify!($name), sql: $sql };)*
+        $(pub const $name: QueryDef = QueryDef::new(stringify!($name), $sql);)*
 
         /// All queries in the system. Used by tests to verify query plans.
         pub const ALL: &[&QueryDef] = &[$(&$name),*];
@@ -359,7 +429,7 @@ mod tests {
             SELECT *
             FROM (WITH users(id) AS MATERIALIZED (SELECT 1) SELECT * FROM users) sub, users
         ";
-        let outcome = verify_query_plan_sql(db.pool(), "cte_shadows_real_table", sql).await;
+        let outcome = verify_query_plan_sql(db.pool(), "cte_shadows_real_table", sql, None).await;
         let Err(QueryPlanError::FullTableScan { detail, .. }) = outcome else {
             return Err(format!("expected a full-table-scan refusal, got {outcome:?}").into());
         };
@@ -377,7 +447,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = Database::new_without_plan_verification("sqlite::memory:").await?;
         let sql = "SELECT created_at, id FROM research_urls ORDER BY created_at DESC, id DESC";
-        let outcome = verify_query_plan_sql(db.pool(), "covering_scan", sql).await;
+        let outcome = verify_query_plan_sql(db.pool(), "covering_scan", sql, None).await;
         let Err(QueryPlanError::FullTableScan { detail, .. }) = outcome else {
             return Err(format!("expected a full-scan refusal, got {outcome:?}").into());
         };
@@ -385,6 +455,78 @@ mod tests {
             detail.starts_with("SCAN research_urls USING COVERING INDEX"),
             "refusal must name the covering scan, got {detail}"
         );
+        Ok(())
+    }
+
+    /// A composite index `(k, b, c)` orders rows within one `k`, but an
+    /// `IN`-list over `k` makes `ORDER BY b, c` sort the concatenation of both
+    /// branches — a full `USE TEMP B-TREE FOR ORDER BY` that runs before row
+    /// one, so a trailing LIMIT can't bound it. The single-`k` form takes its
+    /// order straight from the index and is accepted.
+    #[tokio::test]
+    async fn unbounded_order_by_over_an_in_list_is_refused()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let db = Database::new_without_plan_verification("sqlite::memory:").await?;
+        sqlx::query(
+            "CREATE TABLE sort_probe (id INTEGER PRIMARY KEY, k INTEGER, b INTEGER, c INTEGER)",
+        )
+        .execute(db.pool())
+        .await?;
+        sqlx::query("CREATE INDEX idx_sort_probe ON sort_probe(k, b, c)")
+            .execute(db.pool())
+            .await?;
+
+        let unbounded = "SELECT id FROM sort_probe WHERE k IN (?1, ?2) ORDER BY b, c LIMIT ?3";
+        let outcome = verify_query_plan_sql(db.pool(), "unbounded_sort", unbounded, None).await;
+        let Err(QueryPlanError::UnboundedSort { query, .. }) = outcome else {
+            return Err(format!("expected an unbounded-sort refusal, got {outcome:?}").into());
+        };
+        assert_eq!(query, "unbounded_sort");
+
+        let bounded = "SELECT id FROM sort_probe WHERE k = ?1 ORDER BY b, c LIMIT ?2";
+        verify_query_plan_sql(db.pool(), "bounded_sort", bounded, None).await?;
+        Ok(())
+    }
+
+    /// A `SELECT DISTINCT` whose index can't supply distinctness plans a
+    /// `USE TEMP B-TREE FOR DISTINCT` — it dedups the whole input before row
+    /// one, the same unbounded class as a full ORDER BY. The verifier refuses
+    /// it at `sort_ok = None` and accepts the identical query once a
+    /// justification is supplied, proving the waiver keys on the waiver, not
+    /// the query name.
+    #[tokio::test]
+    async fn temp_btree_for_distinct_is_refused_unless_sort_ok()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let db = Database::new_without_plan_verification("sqlite::memory:").await?;
+        sqlx::query(
+            "CREATE TABLE distinct_probe (id INTEGER PRIMARY KEY, k INTEGER, b INTEGER, c INTEGER)",
+        )
+        .execute(db.pool())
+        .await?;
+        sqlx::query("CREATE INDEX idx_distinct_probe ON distinct_probe(k, b, c)")
+            .execute(db.pool())
+            .await?;
+
+        // Covering `(k, b, c)` orders (b, c) within one k, but an IN-list over
+        // k merges two ordered branches, so distinctness needs a temp B-tree.
+        let distinct = "SELECT DISTINCT b, c FROM distinct_probe WHERE k IN (?1, ?2)";
+
+        let outcome = verify_query_plan_sql(db.pool(), "distinct_walk", distinct, None).await;
+        let Err(QueryPlanError::UnboundedSort { detail, .. }) = outcome else {
+            return Err(format!("expected an unbounded-sort refusal, got {outcome:?}").into());
+        };
+        assert!(
+            detail.contains("USE TEMP B-TREE FOR DISTINCT"),
+            "refusal must name the temp-B-tree DISTINCT line, got {detail}"
+        );
+
+        verify_query_plan_sql(
+            db.pool(),
+            "distinct_walk",
+            distinct,
+            Some("test: dedup over a two-key IN-list is conformance-scale only"),
+        )
+        .await?;
         Ok(())
     }
 

@@ -22,7 +22,7 @@ use sqlx::SqliteConnection;
 
 use chronoscope_core::algebra::lattice::JoinSemilattice;
 use chronoscope_core::date::UncertainDate;
-use chronoscope_core::geo::Viewport;
+use chronoscope_core::geo::{GeoPoint, QuadLevel, QuadTileRange, TileId, Viewport};
 use chronoscope_core::grammar::event;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::solvers::WitnessScan;
@@ -30,7 +30,8 @@ use chronoscope_core::store::FactPlacement;
 use chronoscope_core::store::pagination;
 use chronoscope_core::store::retraction::{RetractionEdges, effective_retractor};
 use chronoscope_core::store::schema::{
-    ClassPage, ClassRow, DepictionPage, EquivClass, FactPage, PageItem,
+    CELL_DEPTH, CLUSTER_TILE_N, ClassPage, ClassRow, ClusterCell, DepictionPage, EquivClass,
+    FactPage, PageItem, RankKey, cluster_tile_ranges, fold_cluster_cell,
 };
 use chronoscope_core::submit::{FactLookup, LocatedSubject, StoredFact, SubmitResult};
 
@@ -800,6 +801,218 @@ pub(super) async fn spatial_image_page(
         }
     }
     rep_class_page(conn, bound, fq, subjects, after, limit).await
+}
+
+/// Attribute a batch of location-bearing facts to their entity
+/// representatives: construction bookends to their own entity, `MovedToLocation`
+/// facts to their [`event_owners`] entity (an orphaned move attributes to
+/// nothing), each resolved to its `SameEntity` representative — one batched
+/// `event_owners` fetch, one cached log seek per distinct subject. The clustering
+/// read's resolve tail.
+///
+/// Quadkey-free by design: the caller keeps whatever tile/point key it needs and
+/// joins it back by `fact_id`. The return reorders (entity facts, then the
+/// attributed moves), so the cluster fold keys off its own `(quadkey, fact_id)`,
+/// never the position here.
+async fn resolve_located_entities(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    fq: &FactQueries,
+    located: Vec<(FactId, StoredFact<SqlIds>)>,
+) -> Result<Vec<(SqlEntityId, FactId)>, SqliteFactStoreError> {
+    let mut subjects: Vec<(SqlEntityId, FactId)> = Vec::new();
+    let mut moved: Vec<(SqlEventId, FactId)> = Vec::new();
+    for (fid, fact) in &located {
+        match fact.located_subject() {
+            Some((_, LocatedSubject::Entity(entity))) => subjects.push((*entity, *fid)),
+            Some((_, LocatedSubject::Event(event))) => moved.push((*event, *fid)),
+            Some((_, LocatedSubject::Image(_))) | None => {}
+        }
+    }
+    let events: BTreeSet<SqlEventId> = moved.iter().map(|(event, _)| *event).collect();
+    let owners = event_owners(conn, bound, &events).await?;
+    for (event, fid) in moved {
+        if let Some(entity) = owners.get(&event) {
+            subjects.push((*entity, fid));
+        }
+    }
+    let mut reps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut resolved: Vec<(SqlEntityId, FactId)> = Vec::with_capacity(subjects.len());
+    for (subject, fid) in subjects {
+        let rep = resolve_rep_cached(
+            conn,
+            bound,
+            fq,
+            kind_tag(SqlEntityId::KIND),
+            subject.raw(),
+            &mut reps,
+        )
+        .await?;
+        resolved.push((SqlEntityId::from_raw(rep), fid));
+    }
+    Ok(resolved)
+}
+
+/// The bounded core under both clustering reads: fetch each of `ranges` for its
+/// `(quadkey, fact_id)`-lowest [`CLUSTER_TILE_N`] entity/event candidates
+/// ([`cluster_tile`](super::queries::FactQueries::cluster_tile), whose `LIMIT`
+/// caps each layer branch at N rows), then fold each range to at most one
+/// [`ClusterCell`]. The range's index is the fold's bucket key, so ranges never
+/// bleed together.
+///
+/// Over a mounted base the union yields up to 2N rows per range (a layer-local
+/// top-N each), so each bucket is **re-truncated in Rust** to its `(quadkey,
+/// fact_id)`-lowest [`CLUSTER_TILE_N`] before retraction — the same cut the
+/// memory oracle applies and the same one the single-table `LIMIT` gives, since
+/// the per-layer id spaces are disjoint (base-top-N ∪ overlay-top-N ⊇
+/// global-top-N). Feeding [`fold_cluster_cell`] the un-truncated ≤2N rows would
+/// misread the cell's kind, members, or split level, so the cut must precede the
+/// fold. The overlay-only path holds ≤N per bucket, so the truncate is a no-op
+/// there.
+///
+/// The batch then drops retracted facts (one closure), attributes survivors to
+/// entity representatives via [`resolve_located_entities`], and folds each range:
+/// the `(quadkey, fact_id)`-minimal survivor gives the cell's representative and
+/// center. The resolve reorders its rows, so each survivor is rejoined to its
+/// range, quadkey, and point by fact id. `cluster_entities_in_viewport` passes
+/// the viewport's tiles and `cluster_tile_cells` the container's child tiles, so
+/// a stand-alone tile and the same tile inside a viewport fold to byte-identical
+/// cells.
+///
+/// `ranges` is consumed by value as an [`IntoIterator`], so the per-tile read
+/// streams its lazy [`TileId::child_ranges`] iterator without ever collecting it,
+/// while the viewport read hands over its already-built `Vec`.
+async fn cluster_ranges(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    fq: &FactQueries,
+    ranges: impl IntoIterator<Item = QuadTileRange>,
+) -> Result<Vec<ClusterCell<SqlEntityId>>, SqliteFactStoreError> {
+    let limit = i64::try_from(CLUSTER_TILE_N).unwrap_or(i64::MAX);
+    // One indexed top-N fetch per range (each layer branch's `LIMIT` caps it),
+    // grouped by the range's index — the fold's bucket key.
+    let mut bucket_rows: BTreeMap<usize, Vec<(i64, FactId, StoredFact<SqlIds>)>> = BTreeMap::new();
+    for (bucket, range) in ranges.into_iter().enumerate() {
+        let rows: Vec<(i64, String, i64)> = sqlx::query_as(&fq.cluster_tile)
+            .bind(range.lo)
+            .bind(range.hi)
+            .bind(bound.bind())
+            .bind(limit)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql("fetching cluster tile candidates"))?;
+        let entry = bucket_rows.entry(bucket).or_default();
+        for (fid, fact_json, quadkey) in rows {
+            entry.push((
+                quadkey,
+                FactId::new(i64_to_u64(fid, "cluster candidate fact id")?),
+                fact_from_json(&fact_json)?,
+            ));
+        }
+    }
+
+    // Re-truncate each bucket to its (quadkey, fact_id)-lowest CLUSTER_TILE_N
+    // before retraction (see the doc above): the union path holds up to 2N per
+    // bucket, and the whole fold reads the survivor slice, so it must see the
+    // single-table top-N. A no-op on the ≤N overlay-only path.
+    let mut candidates: Vec<(usize, FactId, i64, StoredFact<SqlIds>)> = Vec::new();
+    for (bucket, mut rows) in bucket_rows {
+        rows.sort_by_key(|(quadkey, fid, _)| (*quadkey, *fid));
+        rows.truncate(CLUSTER_TILE_N);
+        for (quadkey, fid, fact) in rows {
+            candidates.push((bucket, fid, quadkey, fact));
+        }
+    }
+
+    let seeds: Vec<FactId> = candidates.iter().map(|(_, fid, _, _)| *fid).collect();
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    let mut placed: BTreeMap<FactId, (usize, i64, GeoPoint)> = BTreeMap::new();
+    let mut located: Vec<(FactId, StoredFact<SqlIds>)> = Vec::new();
+    for (bucket, fact_id, quadkey, fact) in candidates {
+        if effective_retractor(fact_id, bound.fact_id(), &retraction).is_some() {
+            continue;
+        }
+        let Some((location, _)) = fact.located_subject() else {
+            continue;
+        };
+        let Some(center) = location.point() else {
+            continue;
+        };
+        placed.insert(fact_id, (bucket, quadkey, *center));
+        located.push((fact_id, fact));
+    }
+
+    let mut folded: BTreeMap<usize, Vec<(i64, FactId, SqlEntityId, GeoPoint)>> = BTreeMap::new();
+    for (rep, fid) in resolve_located_entities(conn, bound, fq, located).await? {
+        if let Some((bucket, quadkey, point)) = placed.get(&fid) {
+            folded
+                .entry(*bucket)
+                .or_default()
+                .push((*quadkey, fid, rep, *point));
+        }
+    }
+    let mut cells = Vec::new();
+    for survivors in folded.into_values() {
+        if let Some(cell) = fold_cluster_cell(&survivors) {
+            cells.push(cell);
+        }
+    }
+    Ok(cells)
+}
+
+/// One [`ClusterCell`] per non-empty tile of `viewport` at `level`, ranked by
+/// `rank` (`Unranked` = `(quadkey, fact_id)`).
+///
+/// [`cluster_tile_ranges`] gives the viewport's tiles — the coarse indexed
+/// pre-filter ranges — and [`cluster_ranges`] fetches each tile's bounded top-N
+/// and folds it. The fold is viewport-free, so a fringe tile the viewport only
+/// partly covers still yields a cell; empty tiles yield nothing.
+///
+/// A viewport spanning too many tiles at the level is refused by
+/// [`cluster_tile_ranges`] — a level too fine for the span.
+pub(super) async fn cluster_entities_in_viewport(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    fq: &FactQueries,
+    viewport: &Viewport,
+    level: QuadLevel,
+    rank: RankKey,
+) -> Result<Vec<ClusterCell<SqlEntityId>>, SqliteFactStoreError> {
+    // The sole rank; its `(quadkey, fact_id)` order is the fetch order and the
+    // per-tile min in the fold.
+    match rank {
+        RankKey::Unranked => {}
+    }
+    let tiles = cluster_tile_ranges(viewport, level)?;
+    cluster_ranges(conn, bound, fq, tiles).await
+}
+
+/// One [`ClusterCell`] per non-empty sub-tile of container `tile` at
+/// `level + CELL_DEPTH` — the viewport-free per-tile fold whose cell geometry is
+/// keyed by `(snapshot, level, x, y)`.
+///
+/// [`TileId::child_ranges`] enumerates the container's children `CELL_DEPTH`
+/// levels finer — at most `4^CELL_DEPTH` ranges, since the depth folds against
+/// the finest level. The children partition the container's Morton block, so each
+/// is one sub-tile bucket; folding each through the shared [`cluster_ranges`]
+/// applies the **per-sub-tile** top-[`CLUSTER_TILE_N`] cut, keeping a dense
+/// low-Morton corner from starving the container's other sub-tiles. That shared
+/// tail matches the viewport read, so a stand-alone tile and the same tile inside
+/// a viewport fold to byte-identical cells. The child ranges stream lazily into
+/// [`cluster_ranges`] — never collected.
+pub(super) async fn cluster_tile_cells(
+    conn: &mut SqliteConnection,
+    bound: ReadBound,
+    fq: &FactQueries,
+    tile: TileId,
+    rank: RankKey,
+) -> Result<Vec<ClusterCell<SqlEntityId>>, SqliteFactStoreError> {
+    // The sole rank; its `(quadkey, fact_id)` order is the fetch order and the
+    // per-sub-tile min in the fold.
+    match rank {
+        RankKey::Unranked => {}
+    }
+    cluster_ranges(conn, bound, fq, tile.child_ranges(CELL_DEPTH)).await
 }
 
 /// The `(rep, fact_id)` SQL binds for an All-walk cursor. `None` opens the

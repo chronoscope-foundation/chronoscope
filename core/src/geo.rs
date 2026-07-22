@@ -8,6 +8,9 @@
 //! - [`Viewport`] is a map viewport built from two [`GeoPoint`] corners, with
 //!   a wrap convention for antimeridian-crossing spans; [`IndexRect`] is its
 //!   non-wrapping half, the shape spatial-index rows store.
+//! - [`QuadLevel`], [`quadkey`], [`QuadTileRange`], and [`viewport_tiles`] are
+//!   the web-mercator quadkey facet: a location's 48-bit Morton (z-order) code
+//!   and the Morton tile ranges a viewport spans at a chosen tile level.
 //! - [`Meters`] is a meter-valued scalar — a WGS84 geodesic distance or radius.
 //! - `Circle` is the compute-side primitive: a cap (disk) about a
 //!   [`GeoPoint`] center. Distance, membership, and the circle-circle boundary
@@ -19,6 +22,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::finite::Finite;
+use crate::location::UnresolvedLocation;
 
 /// A nominal Earth radius in meters. Distances and membership are WGS84 (see
 /// [`Circle`]); this sphere is only the scaffold for the
@@ -534,6 +538,533 @@ pub(crate) fn cap_bounding_rects(center: &GeoPoint, radius: Meters) -> Vec<Index
             max_lon,
         }]
     }
+}
+
+// ============================================================================
+// Quadkey / web-mercator tiling
+// ============================================================================
+
+/// Depth of the web-mercator tile pyramid the quadkey facet is built on:
+/// `2^24` tiles per axis (~2.4 m at the equator), so a [`quadkey`] is a 48-bit
+/// Morton code with room to spare inside an `i64`.
+const MAX_QUAD_LEVEL: u8 = 24;
+
+/// The web-mercator latitude cutoff `atan(sinh(π))`. The projection runs to
+/// infinity at the poles, so the standard slippy-map tiling clamps here to keep
+/// the unit square square.
+const MERCATOR_LAT_LIMIT: f64 = 85.051_128_779_806_59;
+
+/// The largest `f64` below `1.0`. Mercator coordinates live in the half-open
+/// unit square `[0, 1)`, so clamping to this keeps `floor(u · 2^level)` inside
+/// `[0, 2^level)` at the `lon = 180°` seam. (`f64::EPSILON` is one ulp at
+/// `1.0`; half of it is the step down to the predecessor.)
+const UNIT_MAX: f64 = 1.0 - f64::EPSILON / 2.0;
+
+/// A web-mercator tile-pyramid level, `0..=MAX_QUAD_LEVEL`. Level `0` is the
+/// whole world in one tile; each step down halves the tile on each axis.
+///
+/// Internal to coordinate math — no wire surface. The API validates a raw
+/// `u8` into one at its boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct QuadLevel(u8);
+
+/// Errors from [`QuadLevel::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuadLevelError {
+    /// The level exceeded `MAX_QUAD_LEVEL`.
+    TooDeep {
+        /// The rejected level.
+        level: u8,
+    },
+}
+
+impl std::fmt::Display for QuadLevelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooDeep { level } => {
+                write!(
+                    f,
+                    "quad level must be in [0, {MAX_QUAD_LEVEL}], got {level}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for QuadLevelError {}
+
+impl QuadLevel {
+    /// Construct a level. Rejects `level > MAX_QUAD_LEVEL`, past which the tile
+    /// grid outgrows the 48-bit Morton code [`quadkey`] promises.
+    pub fn new(level: u8) -> Result<Self, QuadLevelError> {
+        if level > MAX_QUAD_LEVEL {
+            return Err(QuadLevelError::TooDeep { level });
+        }
+        Ok(Self(level))
+    }
+
+    /// A level clamped into `0..=MAX_QUAD_LEVEL` — the total constructor for
+    /// arithmetic that already proves its result in range (the level searches
+    /// and the split-level derivation), so there's no error to thread.
+    pub const fn saturating(level: u8) -> Self {
+        Self(if level > MAX_QUAD_LEVEL {
+            MAX_QUAD_LEVEL
+        } else {
+            level
+        })
+    }
+
+    /// The level as a raw depth in `0..=MAX_QUAD_LEVEL`.
+    pub fn get(&self) -> u8 {
+        self.0
+    }
+}
+
+/// Web-mercator x for a longitude, in `[0, 1)`. Linear in `lon`, so it carries
+/// no latitude.
+pub fn mercator_x(lon: f64) -> f64 {
+    clamp_unit((lon + 180.0) / 360.0)
+}
+
+/// Web-mercator y for a latitude, in `[0, 1)` and increasing southward.
+/// Latitude is clamped to the mercator limit first, keeping the `tan`/`sec`
+/// terms finite near the poles.
+pub fn mercator_y(lat: f64) -> f64 {
+    let lat_rad = lat
+        .clamp(-MERCATOR_LAT_LIMIT, MERCATOR_LAT_LIMIT)
+        .to_radians();
+    let y = (1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / std::f64::consts::PI) / 2.0;
+    clamp_unit(y)
+}
+
+/// Hold a coordinate inside the half-open unit interval `[0, 1)`.
+fn clamp_unit(u: f64) -> f64 {
+    u.clamp(0.0, UNIT_MAX)
+}
+
+/// Web-mercator projection of a point into the `[0, 1)` unit square: `x`
+/// eastward from the antimeridian, `y` southward from the north limit.
+fn mercator_unit(point: &GeoPoint) -> (f64, f64) {
+    (mercator_x(point.lon()), mercator_y(point.lat()))
+}
+
+/// Longitude of a linear web-mercator x, inverting [`mercator_x`]: `lon = x·360
+/// − 180`. An `x` in `[0, 1)` maps back into `[-180, 180)`.
+pub fn mercator_x_to_lon(x: f64) -> f64 {
+    x * 360.0 - 180.0
+}
+
+/// Latitude of a web-mercator y, inverting [`mercator_y`]. With `y = (1 −
+/// asinh(tan φ)/π)/2`, the inverse is `φ = atan(sinh(π·(1 − 2y)))`; the result is
+/// clamped to the mercator limit so the `[0, 1)` edges round-trip to the same
+/// ±85.05° latitude `mercator_y` folds the poles onto.
+pub fn mercator_y_to_lat(y: f64) -> f64 {
+    let lat = (std::f64::consts::PI * (1.0 - 2.0 * y))
+        .sinh()
+        .atan()
+        .to_degrees();
+    lat.clamp(-MERCATOR_LAT_LIMIT, MERCATOR_LAT_LIMIT)
+}
+
+/// The tile index along one axis at `level` for a unit coordinate, held in
+/// `[0, 2^level - 1]`. A coordinate on the eastern seam sits at `u → 1.0`;
+/// clamping — never a modulo — keeps it in the last tile instead of wrapping
+/// back to tile `0`.
+fn unit_to_tile(unit: f64, level: u8) -> u32 {
+    let tiles = 1u32 << level;
+    (unit * f64::from(tiles))
+        .floor()
+        .clamp(0.0, f64::from(tiles - 1)) as u32
+}
+
+/// The Morton (z-order) code of a location at `MAX_QUAD_LEVEL`, the single
+/// source of the stored quadkey. Both the sqlite column and the in-memory
+/// backend project through this one function, so their keys never drift.
+pub fn quadkey(point: &GeoPoint) -> i64 {
+    let (x, y) = mercator_unit(point);
+    let tx = unit_to_tile(x, MAX_QUAD_LEVEL);
+    let ty = unit_to_tile(y, MAX_QUAD_LEVEL);
+    morton_encode(tx, ty)
+}
+
+/// A location's clustering key: the [`quadkey`] of the single point it pins,
+/// or `None` when it pins none. Only a resolved circle pins one — its center;
+/// a combinator or symbolic reference denotes a region, so it returns `None`.
+///
+/// The one decision "which locations cluster, and where" — the write-path
+/// quadkey column and the in-memory backend both key through here, so the
+/// stored key and the in-memory key can't drift, and extent-based keying for
+/// coarse locations slots in at this one seam.
+pub fn quadkey_of_location(location: &UnresolvedLocation) -> Option<i64> {
+    location.point().map(quadkey)
+}
+
+/// The Morton prefix identifying which tile at `level` a max-level [`quadkey`]
+/// falls in — the high `2·level` bits of the 48-bit code, the low interior bits
+/// dropped. Two quadkeys share a tile at `level` iff their prefixes match, so
+/// this is the bucket key the per-sub-tile clustering fold groups on. The
+/// quadkey is a non-negative 48-bit value, so the arithmetic shift is a logical
+/// one.
+pub fn quadkey_tile_prefix(quadkey: i64, level: QuadLevel) -> i64 {
+    let shift = 2 * u32::from(MAX_QUAD_LEVEL - level.get());
+    quadkey >> shift
+}
+
+/// The finest level at which a set of located facts subdivides into more than
+/// one tile. Pass the minimum and maximum of the distinct max-level
+/// [`quadkey`]s; a sorted set's longest common Morton prefix is the prefix its
+/// two extremes share, so those two codes decide the split.
+///
+/// Computed over the *surviving* quadkeys, so a top-N truncation that drops
+/// codes only shrinks their spread — biasing the split finer, never coarser.
+/// A client refetching at the returned level still finds the tile subdivided.
+pub fn split_level(min_quadkey: i64, max_quadkey: i64) -> QuadLevel {
+    let diff = (min_quadkey ^ max_quadkey) as u64;
+    let level = if diff == 0 {
+        MAX_QUAD_LEVEL
+    } else {
+        // The code is 48-bit inside a 64-bit word, so `leading_zeros` counts 16
+        // padding bits before the real prefix: the shared prefix is
+        // `P = leading_zeros - 16` bits. Two interleaved lanes share a tile down
+        // to `floor(P/2)` and first separate one level deeper.
+        let common_bits = diff.leading_zeros().saturating_sub(16);
+        ((common_bits / 2) + 1).min(u32::from(MAX_QUAD_LEVEL)) as u8
+    };
+    QuadLevel::saturating(level)
+}
+
+/// Spread the low 24 bits of `v` into even bit positions of a 48-bit field,
+/// zeros interleaved — the x-lane of a Morton code (y rides the odd bits, one
+/// step left).
+fn spread_even(v: u32) -> u64 {
+    let mut x = u64::from(v);
+    x = (x | (x << 16)) & 0x0000_ffff_0000_ffff;
+    x = (x | (x << 8)) & 0x00ff_00ff_00ff_00ff;
+    x = (x | (x << 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    x = (x | (x << 2)) & 0x3333_3333_3333_3333;
+    (x | (x << 1)) & 0x5555_5555_5555_5555
+}
+
+/// Interleave two tile indices into a 48-bit Morton code: `x` on even bits,
+/// `y` on odd. The result is non-negative and fits an `i64` with 15 bits to
+/// spare.
+fn morton_encode(x: u32, y: u32) -> i64 {
+    (spread_even(x) | (spread_even(y) << 1)) as i64
+}
+
+/// Gather the even bits of `z` back into a dense integer — the inverse of
+/// [`spread_even`].
+#[cfg(test)]
+fn compact_even(z: u64) -> u32 {
+    let mut x = z & 0x5555_5555_5555_5555;
+    x = (x | (x >> 1)) & 0x3333_3333_3333_3333;
+    x = (x | (x >> 2)) & 0x0f0f_0f0f_0f0f_0f0f;
+    x = (x | (x >> 4)) & 0x00ff_00ff_00ff_00ff;
+    x = (x | (x >> 8)) & 0x0000_ffff_0000_ffff;
+    x = (x | (x >> 16)) & 0x0000_0000_ffff_ffff;
+    x as u32
+}
+
+/// Split a Morton code back into its `(x, y)` tile indices — the exact inverse
+/// of [`morton_encode`], for pinning the encode round-trip.
+#[cfg(test)]
+fn morton_decode(z: i64) -> (u32, u32) {
+    let z = z as u64;
+    (compact_even(z), compact_even(z >> 1))
+}
+
+/// The inclusive Morton range `[lo, hi]` a single tile covers on the quadkey
+/// index. A power-of-two-aligned tile is a contiguous Morton block, so one
+/// `BETWEEN lo AND hi` scan selects exactly its keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuadTileRange {
+    /// Lowest Morton code in the tile.
+    pub lo: i64,
+    /// Highest Morton code in the tile.
+    pub hi: i64,
+}
+
+impl QuadTileRange {
+    /// The Morton range of tile `(x, y)` at `level`. The tile's low
+    /// `2·(MAX_QUAD_LEVEL − level)` Morton bits range over its interior, so
+    /// setting them fills `hi` out from `lo`.
+    ///
+    /// Internal — callers reach it either through [`viewport_tiles`], which
+    /// derives `(x, y)` from the projection, or through [`TileId`], whose smart
+    /// constructor has already proved the indices name a real tile. A raw
+    /// off-grid `x`/`y` here would shift past the 48-bit Morton field and yield a
+    /// garbage range, which is why [`TileId::new`] is the sole entry for a
+    /// client-supplied coordinate.
+    fn for_tile(x: u32, y: u32, level: QuadLevel) -> Self {
+        let shift = MAX_QUAD_LEVEL - level.get();
+        let lo = morton_encode(x << shift, y << shift);
+        let span = (1i64 << (2 * u32::from(shift))) - 1;
+        Self { lo, hi: lo | span }
+    }
+}
+
+/// A safety backstop on [`TileId::child_ranges`]'s fan-out depth: even an
+/// accidental deep `depth` yields at most `4^MAX_CELL_DEPTH` = 4096 ranges,
+/// never the `2^48` an unclamped level-0 subdivision would enumerate. This is a
+/// guardrail, not the tuning knob — the real per-tile clustering depth
+/// [`CELL_DEPTH`] sits well under this cap.
+///
+/// [`CELL_DEPTH`]: crate::store::schema::CELL_DEPTH
+pub const MAX_CELL_DEPTH: u8 = 6;
+
+/// A validated slippy-map tile coordinate `(level, x, y)` — the container the
+/// per-tile clustering read folds. The smart constructor [`TileId::new`] is the
+/// sole off-grid guard: every `TileId` names a real tile (`x, y < 2^level`), so
+/// the clustering path carries no re-validation and its Morton math can't
+/// overflow the 48-bit field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileId {
+    level: QuadLevel,
+    x: u32,
+    y: u32,
+}
+
+impl TileId {
+    /// Construct a tile coordinate, validating that `(x, y)` names a real tile
+    /// at `level` — both indices below `2^level`. The boundary constructor for a
+    /// client-supplied coordinate (the `/tiles/{z}/{x}/{y}` endpoint); off-grid
+    /// indices are rejected here so nothing downstream re-checks.
+    pub fn new(level: QuadLevel, x: u32, y: u32) -> Result<Self, TileCoordError> {
+        let side = 1u32 << level.get();
+        if x >= side || y >= side {
+            return Err(TileCoordError::OffGrid {
+                level: level.get(),
+                x,
+                y,
+            });
+        }
+        Ok(Self { level, x, y })
+    }
+
+    /// The tile's level.
+    pub fn level(&self) -> QuadLevel {
+        self.level
+    }
+
+    /// The tile's x index, in `[0, 2^level)`.
+    pub fn x(&self) -> u32 {
+        self.x
+    }
+
+    /// The tile's y index, in `[0, 2^level)`.
+    pub fn y(&self) -> u32 {
+        self.y
+    }
+
+    /// The tile's own inclusive Morton range `[lo, hi]` — the contiguous block
+    /// its quadkeys occupy on the index.
+    pub fn range(&self) -> QuadTileRange {
+        QuadTileRange::for_tile(self.x, self.y, self.level)
+    }
+
+    /// The Morton ranges of the child tiles `depth` levels finer that partition
+    /// this tile — a lazy, bounded iterator, ascending by `lo`.
+    ///
+    /// The tile is one contiguous Morton block `[lo, hi]`; its `4^depth`
+    /// children at `level + depth` split it into `4^depth` equal contiguous
+    /// sub-ranges. Rather than expand `(x, y)` and re-encode, the split is
+    /// arithmetic: `child_span = (hi − lo + 1) / 4^depth`, and child `k` is
+    /// `[lo + k·child_span, lo + (k+1)·child_span − 1]`. No gap, no overlap, so
+    /// folding each child once covers the tile exactly once.
+    ///
+    /// `depth` is clamped by [`MAX_CELL_DEPTH`] and by the levels of headroom
+    /// below this tile (`MAX_QUAD_LEVEL − level`), so even `child_ranges(24)` on
+    /// a level-0 tile yields at most `4^MAX_CELL_DEPTH` ranges — never the `2^48`
+    /// an unclamped subdivision would. A `depth` of zero (or a tile already at
+    /// the finest level) yields the tile itself as the sole range.
+    ///
+    /// The iterator captures owned primitives, borrowing nothing, so it is
+    /// `Send` and streams without allocating the range vector.
+    pub fn child_ranges(&self, depth: u8) -> impl Iterator<Item = QuadTileRange> {
+        let eff_depth = depth
+            .min(MAX_CELL_DEPTH)
+            .min(MAX_QUAD_LEVEL - self.level.get());
+        let range = self.range();
+        let lo = range.lo;
+        let count = 1u64 << (2 * u32::from(eff_depth));
+        // Exact: the block span is 4^(MAX_QUAD_LEVEL − level) and count is
+        // 4^eff_depth with eff_depth ≤ that exponent, so the division has no
+        // remainder.
+        let child_span = (range.hi - lo + 1) / count as i64;
+        (0..count).map(move |k| {
+            let base = lo + k as i64 * child_span;
+            QuadTileRange {
+                lo: base,
+                hi: base + child_span - 1,
+            }
+        })
+    }
+}
+
+/// A tile coordinate that names no tile at its level: `x` or `y` reached
+/// `2^level`, past the `[0, 2^level)` grid. From [`TileId::new`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TileCoordError {
+    /// An index sat at or past `2^level`.
+    OffGrid {
+        /// The tile level whose grid the indices overran.
+        level: u8,
+        /// The x index supplied.
+        x: u32,
+        /// The y index supplied.
+        y: u32,
+    },
+}
+
+impl std::fmt::Display for TileCoordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OffGrid { level, x, y } => write!(
+                f,
+                "tile ({x}, {y}) is off the grid at level {level}: both indices must be < 2^{level}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TileCoordError {}
+
+/// Cap on the tiles one [`viewport_tiles`] call may span — an OOM guard sitting
+/// far above any real marker budget. A caller that trips it picked a level too
+/// deep for its viewport.
+const MAX_VIEWPORT_TILES: u64 = 65_536;
+
+/// Errors from [`viewport_tiles`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewportTilesError {
+    /// The viewport's tile span exceeded `MAX_VIEWPORT_TILES` at the level.
+    TooManyTiles {
+        /// The tile count that tripped the cap.
+        count: u64,
+    },
+}
+
+impl std::fmt::Display for ViewportTilesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyTiles { count } => {
+                write!(
+                    f,
+                    "viewport spans {count} tiles at this level, over the cap"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ViewportTilesError {}
+
+/// The inclusive `(x0, x1, y0, y1)` tile block each viewport half spans at
+/// `level`. Both [`viewport_tile_count`]'s sum and [`viewport_tiles`]'
+/// enumeration fold over this, so the projection lives in one place and the cap
+/// guard and the collection can never span different tiles.
+fn viewport_blocks(viewport: &Viewport, level: QuadLevel) -> Vec<(u32, u32, u32, u32)> {
+    let depth = level.get();
+    viewport
+        .halves()
+        .into_iter()
+        .map(|half| {
+            let x0 = unit_to_tile(mercator_x(half.min_lon), depth);
+            let x1 = unit_to_tile(mercator_x(half.max_lon), depth);
+            // Mercator y grows southward: max_lat is the northern (smaller-y)
+            // edge, min_lat the southern (larger-y) edge.
+            let y0 = unit_to_tile(mercator_y(half.max_lat), depth);
+            let y1 = unit_to_tile(mercator_y(half.min_lat), depth);
+            (x0, x1, y0, y1)
+        })
+        .collect()
+}
+
+/// The number of tiles `viewport` spans at `level`, as the per-half
+/// block-count sum — the same figure [`viewport_tiles`] guards its cap on,
+/// computed without building the tile set. It over-counts only the sub-column
+/// seam gap a wrap shares between its halves, so it's an upper bound on the
+/// tiles [`viewport_tiles`] enumerates.
+pub fn viewport_tile_count(viewport: &Viewport, level: QuadLevel) -> u64 {
+    viewport_blocks(viewport, level)
+        .into_iter()
+        .map(|(x0, x1, y0, y1)| u64::from(x1 - x0 + 1) * u64::from(y1 - y0 + 1))
+        .sum()
+}
+
+/// The deduped `(x, y)` tiles a viewport covers at `level`, ordered ascending
+/// by `(x, y)`. The single enumeration [`viewport_tiles`] and
+/// [`viewport_tile_xys`] share: the antimeridian sweep folds both
+/// [halves](Viewport::halves)' blocks together here, and a sub-column wrap gap
+/// that lands one boundary column in both halves dedupes to a single entry — so
+/// the two callers can never span different tile sets.
+fn viewport_tile_xy_set(
+    viewport: &Viewport,
+    level: QuadLevel,
+) -> std::collections::BTreeSet<(u32, u32)> {
+    let mut tiles = std::collections::BTreeSet::new();
+    for (x0, x1, y0, y1) in viewport_blocks(viewport, level) {
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                tiles.insert((x, y));
+            }
+        }
+    }
+    tiles
+}
+
+/// The Morton tile ranges a `viewport` spans at `level` — one per tile the
+/// viewport touches, so a viewport query is the union of their range scans.
+/// They come back ascending by `lo` and pairwise disjoint, so a caller can
+/// binary-search a Morton code to its tile.
+///
+/// Each [`Viewport::halves`] rect is already non-wrapping (`min_lon ≤
+/// max_lon`) and becomes a rectangular block of tiles; a seam-crossing
+/// viewport is the two halves' blocks together. Tile indices are clamped into
+/// `[0, 2^level)`, so the eastern seam lands in the last tile rather than
+/// wrapping to the first.
+///
+/// A wrap whose uncovered longitude gap is narrower than one tile column shares
+/// its boundary column between both halves; a sorted set folds that to a single
+/// range. The per-half block sizes sum to an upper bound on the span (dedup only
+/// shrinks it), so the `MAX_VIEWPORT_TILES` cap is checked against that sum and
+/// a too-deep level errors before any tile is collected.
+pub fn viewport_tiles(
+    viewport: &Viewport,
+    level: QuadLevel,
+) -> Result<Vec<QuadTileRange>, ViewportTilesError> {
+    // The cap is checked against the per-half block-count sum — the same upper
+    // bound [`viewport_tile_count`] reports — so a level that overruns is
+    // rejected before any tile is enumerated.
+    let count = viewport_tile_count(viewport, level);
+    if count > MAX_VIEWPORT_TILES {
+        return Err(ViewportTilesError::TooManyTiles { count });
+    }
+
+    let mut ranges: Vec<QuadTileRange> = viewport_tile_xy_set(viewport, level)
+        .into_iter()
+        .map(|(x, y)| QuadTileRange::for_tile(x, y, level))
+        .collect();
+    // The set orders by (x, y); Morton `lo` interleaves those bits, so resort
+    // into the Morton order the range scans and binary searches expect.
+    ranges.sort_by_key(|r| r.lo);
+    Ok(ranges)
+}
+
+/// The `(x, y)` tile indices a `viewport` covers at `level` — the index form of
+/// [`viewport_tiles`], stopping before the Morton-range projection. A caller
+/// wanting the raw grid indices (a client enumerating tiles to fetch) reads
+/// these rather than re-deriving the antimeridian sweep: a seam-crossing
+/// viewport's two [halves](Viewport::halves) contribute their blocks together,
+/// so the wrap is interpreted here once. Indices come back ascending by
+/// `(x, y)` and deduplicated — a sub-column wrap gap that lands one column in
+/// both halves folds to a single entry.
+///
+/// Unlike [`viewport_tiles`], no `MAX_VIEWPORT_TILES` cap: that bound guards
+/// the Morton range-scan path, whereas this is the index primitive a caller
+/// sizes its own request budget against.
+pub fn viewport_tile_xys(viewport: &Viewport, level: QuadLevel) -> Vec<(u32, u32)> {
+    viewport_tile_xy_set(viewport, level).into_iter().collect()
 }
 
 // ============================================================================
@@ -1326,5 +1857,504 @@ mod tests {
         // Findable from any longitude near the pole.
         assert!(rects_hit(&rects, 89.0, 90.0, -170.0, -160.0));
         Ok(())
+    }
+
+    // --- Quadkey / mercator tiling ---
+
+    use proptest::prelude::*;
+
+    /// A validated point spanning the whole WGS-84 domain. In-range coordinates
+    /// always satisfy `GeoPoint::new`, so nothing is discarded.
+    fn arb_geo_point() -> impl Strategy<Value = GeoPoint> {
+        (-90.0f64..=90.0, -180.0f64..=180.0)
+            .prop_filter_map("in-range point", |(lat, lon)| GeoPoint::new(lat, lon).ok())
+    }
+
+    /// A tile level across the full accepted `[0, MAX_QUAD_LEVEL]` range.
+    fn arb_quad_level() -> impl Strategy<Value = QuadLevel> {
+        (0u8..=MAX_QUAD_LEVEL).prop_filter_map("in-range level", |l| QuadLevel::new(l).ok())
+    }
+
+    /// A viewport over the whole domain. The two latitudes are ordered into a
+    /// `min ≤ max` span; the two longitudes stay unordered, so `lon_a > lon_b`
+    /// builds an antimeridian-wrapping box — the seam case the tiling must get
+    /// right.
+    fn arb_viewport() -> impl Strategy<Value = Viewport> {
+        (
+            -90.0f64..=90.0,
+            -90.0f64..=90.0,
+            -180.0f64..=180.0,
+            -180.0f64..=180.0,
+        )
+            .prop_filter_map("valid viewport", |(lat_p, lat_q, lon_a, lon_b)| {
+                let (min_lat, max_lat) = if lat_p <= lat_q {
+                    (lat_p, lat_q)
+                } else {
+                    (lat_q, lat_p)
+                };
+                Viewport::from_coords(min_lat, max_lat, lon_a, lon_b).ok()
+            })
+    }
+
+    proptest! {
+        /// Morton encode/decode is a bijection over the tile grid, and every
+        /// code is a non-negative 48-bit value — the interleave keeps the two
+        /// lanes from bleeding into each other or the sign bit.
+        #[test]
+        fn prop_morton_round_trips(
+            x in 0u32..(1u32 << MAX_QUAD_LEVEL),
+            y in 0u32..(1u32 << MAX_QUAD_LEVEL),
+        ) {
+            let z = morton_encode(x, y);
+            prop_assert!(z >= 0, "a quadkey is never negative");
+            prop_assert!(
+                z < (1i64 << (2 * u32::from(MAX_QUAD_LEVEL))),
+                "a quadkey fits 48 bits"
+            );
+            prop_assert_eq!(morton_decode(z), (x, y), "decode inverts encode");
+        }
+
+        /// A point's quadkey sits inside the Morton range of the tile it decodes
+        /// to at any level: the stored key and the range scan agree on which tile
+        /// owns the point.
+        #[test]
+        fn prop_quadkey_lands_in_its_own_tile(p in arb_geo_point(), level in arb_quad_level()) {
+            let key = quadkey(&p);
+            let shift = MAX_QUAD_LEVEL - level.get();
+            let (tx, ty) = morton_decode(key);
+            let range = QuadTileRange::for_tile(tx >> shift, ty >> shift, level);
+            prop_assert!(
+                range.lo <= key && key <= range.hi,
+                "quadkey {key} must sit in its own tile"
+            );
+        }
+
+        /// The tiles a viewport spans come back ascending by `lo` as a disjoint
+        /// cover: each range is well-formed, they never overlap — the invariant
+        /// a missing dedup broke on a sub-column seam gap — and a point known to
+        /// lie in the viewport falls in exactly one range.
+        #[test]
+        fn prop_viewport_tiles_disjoint_and_covering(
+            vp in arb_viewport(),
+            level in arb_quad_level(),
+            t_lat in 0.0f64..=1.0,
+            t_lon in 0.0f64..=1.0,
+            half_sel in 0usize..2,
+        ) {
+            let Ok(ranges) = viewport_tiles(&vp, level) else {
+                return Ok(());
+            };
+
+            for r in &ranges {
+                prop_assert!(r.lo <= r.hi, "each range is well-formed");
+            }
+            for pair in ranges.windows(2) {
+                prop_assert!(
+                    pair[0].hi < pair[1].lo,
+                    "viewport_tiles returns ranges ascending by lo and pairwise disjoint"
+                );
+            }
+
+            // Interpolate a point within one of the viewport's non-wrapping
+            // halves, so containment holds by construction — no floor-tiling
+            // boundary flake to guard against.
+            let halves: Vec<IndexRect> = vp.halves().into_iter().collect();
+            let half = halves[half_sel % halves.len()];
+            let lat = half.min_lat + t_lat * (half.max_lat - half.min_lat);
+            let lon = half.min_lon + t_lon * (half.max_lon - half.min_lon);
+            let Some(p) = GeoPoint::new(lat, lon).ok() else {
+                return Ok(());
+            };
+            prop_assert!(vp.contains(&p), "the interpolated point must be in the viewport");
+            let key = quadkey(&p);
+            let hits = ranges.iter().filter(|r| r.lo <= key && key <= r.hi).count();
+            prop_assert_eq!(hits, 1, "an inside point lands in exactly one tile range");
+        }
+
+        /// The projection is monotone with no seam wrap: the x-tile never
+        /// decreases as longitude rises (a `mod` at the seam would break this at
+        /// 180°), the y-tile never decreases as latitude falls, and every tile —
+        /// even beyond the ±85° mercator limit — stays inside `[0, 2^level)`.
+        #[test]
+        fn prop_projection_is_monotone_and_in_range(
+            lon_a in -180.0f64..=180.0,
+            lon_b in -180.0f64..=180.0,
+            lat_a in -90.0f64..=90.0,
+            lat_b in -90.0f64..=90.0,
+            level in arb_quad_level(),
+        ) {
+            let depth = level.get();
+            let tiles = 1u32 << depth;
+
+            let (west, east) = if lon_a <= lon_b {
+                (lon_a, lon_b)
+            } else {
+                (lon_b, lon_a)
+            };
+            let x_west = unit_to_tile(mercator_x(west), depth);
+            let x_east = unit_to_tile(mercator_x(east), depth);
+            prop_assert!(x_west <= x_east, "x-tile is monotone in longitude");
+
+            // Mercator y grows southward, so the higher latitude maps to the
+            // smaller-or-equal y-tile.
+            let (north, south) = if lat_a >= lat_b {
+                (lat_a, lat_b)
+            } else {
+                (lat_b, lat_a)
+            };
+            let y_north = unit_to_tile(mercator_y(north), depth);
+            let y_south = unit_to_tile(mercator_y(south), depth);
+            prop_assert!(y_north <= y_south, "y-tile grows southward");
+
+            for t in [x_west, x_east, y_north, y_south] {
+                prop_assert!(t < tiles, "tile index stays in [0, 2^level)");
+            }
+        }
+
+        /// `split_level`'s leading-zeros arithmetic and the shift-scan oracle
+        /// agree on the split of any two 48-bit quadkeys. Both are
+        /// order-independent, so the min/max ordering only feeds `split_level`
+        /// its `min ≤ max` contract.
+        #[test]
+        fn prop_split_level_agrees_with_prefix_scan(
+            a in 0u64..(1u64 << 48),
+            b in 0u64..(1u64 << 48),
+        ) {
+            let min = a.min(b) as i64;
+            let max = a.max(b) as i64;
+            prop_assert_eq!(
+                split_level(min, max).get(),
+                split_level_by_prefix_scan(min, max),
+                "leading-zeros split agrees with the prefix scan"
+            );
+        }
+
+        /// `viewport_tile_count` is an upper bound on the tiles `viewport_tiles`
+        /// enumerates: the arithmetic sum only ever over-counts a seam-gap
+        /// column the dedup collapses.
+        #[test]
+        fn prop_viewport_tile_count_upper_bounds_enumeration(
+            vp in arb_viewport(),
+            level in arb_quad_level(),
+        ) {
+            let Ok(ranges) = viewport_tiles(&vp, level) else {
+                return Ok(());
+            };
+            prop_assert!(
+                viewport_tile_count(&vp, level) >= ranges.len() as u64,
+                "the count never under-reports the enumerated ranges"
+            );
+        }
+
+        /// A container's child ranges partition its Morton block: `4^depth`
+        /// ranges, each well-formed, sorted, pairwise disjoint and contiguous
+        /// (each `hi` abuts the next `lo`), together spanning exactly the
+        /// container's `[lo, hi]` — so every quadkey in the container lands in
+        /// exactly one child.
+        #[test]
+        fn prop_child_ranges_partition_container(
+            level in arb_quad_level(),
+            extra in 0u8..=5,
+            tx in 0u32..(1u32 << MAX_QUAD_LEVEL),
+            ty in 0u32..(1u32 << MAX_QUAD_LEVEL),
+        ) {
+            let side = 1u32 << level.get();
+            let (x, y) = (tx % side, ty % side);
+            // `saturating` folds the depth against the finest level, so `depth`
+            // is the headroom below the container — never above `MAX_CELL_DEPTH`
+            // here, so `child_ranges` reproduces it exactly.
+            let cell_level = QuadLevel::saturating(level.get() + extra);
+            let depth = cell_level.get() - level.get();
+            let Ok(tile) = TileId::new(level, x, y) else {
+                return Ok(());
+            };
+            let container = tile.range();
+            let ranges: Vec<QuadTileRange> = tile.child_ranges(depth).collect();
+
+            prop_assert_eq!(
+                ranges.len() as u64,
+                1u64 << (2 * u32::from(depth)),
+                "one child range per 4^depth sub-tile"
+            );
+            for r in &ranges {
+                prop_assert!(r.lo <= r.hi, "each child range is well-formed");
+            }
+            for pair in ranges.windows(2) {
+                prop_assert_eq!(
+                    pair[0].hi + 1,
+                    pair[1].lo,
+                    "child ranges are contiguous — no gap, no overlap"
+                );
+            }
+            prop_assert_eq!(
+                ranges.first().map(|r| r.lo),
+                Some(container.lo),
+                "the children start at the container's lo"
+            );
+            prop_assert_eq!(
+                ranges.last().map(|r| r.hi),
+                Some(container.hi),
+                "the children end at the container's hi"
+            );
+        }
+    }
+
+    #[test]
+    fn child_ranges_of_the_world_at_cell_depth_is_bounded() -> TestResult {
+        // The level-0 container is the whole Morton space; its children three
+        // levels down are the 64 level-3 tiles, so even the z=0 tile read stays
+        // bounded (64 ranges × the per-range LIMIT). A depth reaching past the
+        // finest level collapses the container to a single child.
+        let world = TileId::new(QuadLevel::new(0)?, 0, 0)?;
+        let ranges: Vec<QuadTileRange> = world.child_ranges(3).collect();
+        assert_eq!(ranges.len(), 64, "the world fans into 64 level-3 children");
+        assert_eq!(ranges.first().map(|r| r.lo), Some(0), "children start at 0");
+
+        let finest = TileId::new(QuadLevel::saturating(MAX_QUAD_LEVEL), 7, 11)?;
+        let one: Vec<QuadTileRange> = finest.child_ranges(3).collect();
+        assert_eq!(one.len(), 1, "a finest-level container folds as one child");
+        assert_eq!(
+            one.first(),
+            Some(&finest.range()),
+            "the sole child is the tile itself"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_ranges_stays_bounded_under_an_absurd_depth() -> TestResult {
+        // The safety backstop: an accidental deep `depth` must not enumerate
+        // `2^48` ranges. A low-level tile has ample headroom, so MAX_CELL_DEPTH —
+        // not the grid — is what caps the fan-out.
+        let tile = TileId::new(QuadLevel::new(2)?, 1, 1)?;
+        let cap = 1u64 << (2 * u32::from(MAX_CELL_DEPTH));
+        let count = tile.child_ranges(30).count() as u64;
+        assert_eq!(
+            count, cap,
+            "child_ranges caps the fan-out at 4^MAX_CELL_DEPTH, not the requested depth"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tile_id_rejects_an_off_grid_coordinate() {
+        // A coordinate off its level's grid can't name a real tile; the smart
+        // constructor is the sole off-grid guard, so it rejects here rather than
+        // let the Morton math overflow downstream.
+        let level = QuadLevel::saturating(4);
+        assert_eq!(
+            TileId::new(level, 1 << 4, 0),
+            Err(TileCoordError::OffGrid {
+                level: 4,
+                x: 1 << 4,
+                y: 0,
+            }),
+        );
+    }
+
+    #[test]
+    fn quadkey_matches_reference_slippy_map_tiles() {
+        // OpenStreetMap slippy tile numbers pin the projection to real
+        // web-mercator, not just a monotonic stand-in: Berlin and Sydney at
+        // zoom 10, each from `xtile = floor((lon+180)/360 · 2^z)` and
+        // `ytile = floor((1 − asinh(tan(lat))/π)/2 · 2^z)`.
+        let cases = [
+            (52.5200, 13.4050, 550, 335),   // Berlin
+            (-33.8688, 151.2093, 942, 614), // Sydney
+        ];
+        for (lat, lon, xtile, ytile) in cases {
+            assert_eq!(
+                unit_to_tile(mercator_x(lon), 10),
+                xtile,
+                "x tile at {lat}, {lon}"
+            );
+            assert_eq!(
+                unit_to_tile(mercator_y(lat), 10),
+                ytile,
+                "y tile at {lat}, {lon}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_viewport_with_subcolumn_gap_has_disjoint_tiles() -> TestResult {
+        // The uncovered gap (0.3°E..0.5°E, ~0.2°) is narrower than one level-8
+        // tile column (~1.4°), so the seam column lands in both halves. Dedup
+        // must leave the ranges pairwise disjoint.
+        let viewport = Viewport::from_coords(0.0, 10.0, 0.5, 0.3)?;
+        let level = QuadLevel::new(8)?;
+        let mut ranges = viewport_tiles(&viewport, level)?;
+        ranges.sort_by_key(|r| r.lo);
+        for pair in ranges.windows(2) {
+            assert!(pair[0].lo <= pair[0].hi, "each range is well-formed");
+            assert!(pair[0].hi < pair[1].lo, "no duplicated boundary column");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_tile_xys_covers_a_normal_viewport() -> TestResult {
+        // A non-wrapping box: the covering indices are exactly the tiles
+        // viewport_tiles projects to Morton ranges — one (x, y) per range.
+        let vp = Viewport::from_coords(40.0, 40.1, -74.0, -73.9)?;
+        let level = QuadLevel::new(14)?;
+        let xys = viewport_tile_xys(&vp, level);
+        let ranges = viewport_tiles(&vp, level)?;
+        assert_eq!(xys.len(), ranges.len(), "one covering index per tile range");
+        let range_los: std::collections::BTreeSet<i64> = ranges.iter().map(|r| r.lo).collect();
+        for &(x, y) in &xys {
+            let lo = QuadTileRange::for_tile(x, y, level).lo;
+            assert!(
+                range_los.contains(&lo),
+                "tile ({x}, {y}) must name a covered range"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_tile_xys_covers_both_sides_of_the_seam() -> TestResult {
+        // A westward span (min_lon > max_lon) wraps the antimeridian: the covering
+        // indices include the far-west (x = 0) and far-east (x = last) seam
+        // columns but never the interior mid-longitude gap between them.
+        let vp = Viewport::from_coords(0.0, 10.0, 179.0, -179.0)?;
+        let level = QuadLevel::new(8)?;
+        let xys = viewport_tile_xys(&vp, level);
+        let last = (1u32 << 8) - 1;
+        assert!(
+            xys.iter().any(|&(x, _)| x == 0),
+            "the west seam column is covered"
+        );
+        assert!(
+            xys.iter().any(|&(x, _)| x == last),
+            "the east seam column is covered"
+        );
+        let mid = unit_to_tile(mercator_x(0.0), 8);
+        assert!(
+            !xys.iter().any(|&(x, _)| x == mid),
+            "the interior gap ({mid}) is outside the wrap"
+        );
+        assert_eq!(
+            xys.len(),
+            viewport_tiles(&vp, level)?.len(),
+            "the same deduped tile set viewport_tiles enumerates"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_tiles_rejects_a_viewport_spanning_too_many_tiles() -> TestResult {
+        // A near-global viewport at level 16 spans billions of tiles, well past
+        // the OOM cap.
+        let viewport = Viewport::from_coords(-85.0, 85.0, -179.0, 179.0)?;
+        let level = QuadLevel::new(16)?;
+        assert!(
+            matches!(
+                viewport_tiles(&viewport, level),
+                Err(ViewportTilesError::TooManyTiles { .. })
+            ),
+            "a near-global deep-level viewport is rejected"
+        );
+        Ok(())
+    }
+
+    // --- split_level / tile count ---
+
+    /// The deepest level whose `2L`-bit Morton prefix both codes share, plus
+    /// one — derived by per-level shift compare, a different mechanism than the
+    /// leading-zeros arithmetic [`split_level`] runs, so a shared bug can't hide
+    /// the two agreeing.
+    fn split_level_by_prefix_scan(q1: i64, q2: i64) -> u8 {
+        let mut shared = 0u8;
+        for l in 0..=MAX_QUAD_LEVEL {
+            let shift = 2 * u32::from(MAX_QUAD_LEVEL - l);
+            if (q1 >> shift) == (q2 >> shift) {
+                shared = l;
+            } else {
+                break;
+            }
+        }
+        (shared + 1).min(MAX_QUAD_LEVEL)
+    }
+
+    #[test]
+    fn split_level_identical_codes_are_maximally_deep() -> TestResult {
+        // No spread among the survivors → they share every level, so the split
+        // is the terminal level rather than any subdivision.
+        assert_eq!(split_level(0, 0).get(), MAX_QUAD_LEVEL);
+        let q = quadkey(&GeoPoint::new(12.3, 45.6)?);
+        assert_eq!(split_level(q, q).get(), MAX_QUAD_LEVEL);
+        Ok(())
+    }
+
+    #[test]
+    fn split_level_lowest_bit_splits_at_the_finest_level() {
+        // Two codes apart only in Morton bit 0 share the top 47 bits, so they
+        // first fall into separate tiles at the finest level.
+        assert_eq!(split_level(0, 1).get(), MAX_QUAD_LEVEL);
+    }
+
+    #[test]
+    fn split_level_applies_the_16_bit_offset() {
+        // Morton bit 47 is the top of the 48-bit code. Codes differing there
+        // share no prefix, so they split at the coarsest subdivision, level 1.
+        assert_eq!(split_level(0, 1i64 << 47).get(), 1);
+        // Dropping the 48-vs-64-bit offset would read the 16 zero pad bits as
+        // shared prefix and report level 9 — eight levels too coarse. Pin that
+        // wrong value so the offset can't be silently removed.
+        let naive = ((1u64 << 47).leading_zeros() / 2 + 1) as u8;
+        assert_eq!(naive, 9);
+    }
+
+    #[test]
+    fn viewport_tile_count_matches_enumerated_tiles_for_a_normal_viewport() -> TestResult {
+        // A non-wrapping box has no seam-gap double count, so the arithmetic sum
+        // equals the deduped enumerated set exactly.
+        let vp = Viewport::from_coords(40.0, 40.1, -74.0, -73.9)?;
+        let level = QuadLevel::new(14)?;
+        let enumerated = viewport_tiles(&vp, level)?.len() as u64;
+        assert_eq!(viewport_tile_count(&vp, level), enumerated);
+        Ok(())
+    }
+
+    #[test]
+    fn viewport_tile_count_upper_bounds_a_seam_gap_wrap() -> TestResult {
+        // The sub-column seam gap lands one column in both halves; the sum
+        // counts that column's rows twice while the enumerated set dedups them,
+        // so the count is a strict upper bound here.
+        let vp = Viewport::from_coords(0.0, 10.0, 0.5, 0.3)?;
+        let level = QuadLevel::new(8)?;
+        let enumerated = viewport_tiles(&vp, level)?.len() as u64;
+        assert!(viewport_tile_count(&vp, level) > enumerated);
+        Ok(())
+    }
+
+    // --- mercator inverse ---
+
+    #[test]
+    fn mercator_x_round_trips_through_its_inverse() {
+        for lon in [-179.0, -90.0, 0.0, 45.0, 179.0] {
+            let back = mercator_x_to_lon(mercator_x(lon));
+            assert!((back - lon).abs() < 1e-9, "lon {lon} round-trips to {back}");
+        }
+    }
+
+    #[test]
+    fn mercator_y_round_trips_through_its_inverse() {
+        // Includes the ±mercator limit, where `mercator_y` folds to the `[0, 1)`
+        // edges and the inverse must return the same clamped latitude.
+        for lat in [
+            0.0,
+            30.0,
+            -45.0,
+            60.0,
+            -80.0,
+            85.0,
+            MERCATOR_LAT_LIMIT,
+            -MERCATOR_LAT_LIMIT,
+        ] {
+            let back = mercator_y_to_lat(mercator_y(lat));
+            assert!((back - lat).abs() < 1e-6, "lat {lat} round-trips to {back}");
+        }
     }
 }

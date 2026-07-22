@@ -88,10 +88,15 @@ CREATE TABLE media (
 CREATE INDEX idx_media_perceptual ON media(perceptual_hash)
     WHERE perceptual_hash IS NOT NULL;
 
--- Analysis queue indexes for images only
-CREATE INDEX idx_media_analysis_pending ON media(analysis_claimed_at, created_at)
+-- Analysis queue indexes for images only. All three lead
+-- (analysis_retry_after, created_at) — the claim's ORDER BY key — so the
+-- three-arm UNION ALL streams as an index-ordered MERGE and its LIMIT stops
+-- early with no whole-backlog sort. The processing arm's staleness bound
+-- (analysis_claimed_at < ?3) rides as a residual filter over in-flight rows,
+-- bounded by worker concurrency.
+CREATE INDEX idx_media_analysis_pending ON media(analysis_retry_after, created_at)
     WHERE analysis_status = 'pending' AND media_type = 'image';
-CREATE INDEX idx_media_analysis_processing ON media(analysis_claimed_at)
+CREATE INDEX idx_media_analysis_processing ON media(analysis_retry_after, created_at)
     WHERE analysis_status = 'processing' AND media_type = 'image';
 CREATE INDEX idx_media_analysis_failed ON media(analysis_retry_after, created_at)
     WHERE analysis_status = 'failed' AND analysis_retry_after IS NOT NULL AND media_type = 'image';
@@ -124,19 +129,24 @@ CREATE TABLE research_urls (
     CHECK (page_id IS NULL OR media_id IS NULL)
 );
 
--- Work queue indexes: support claiming pending/stale URLs and retrying failed URLs
+-- Work queue indexes: claiming pending/stale URLs and retrying failed URLs.
+-- All three arms of a queue's claim lead (retry_after, created_at) — the
+-- claim's ORDER BY key — so the UNION ALL streams as an index-ordered MERGE
+-- and its LIMIT stops early with no whole-backlog sort. The pending/processing
+-- staleness bound (claimed_at) rides as a residual filter, not in the key.
 -- Generic workers (affinity IS NULL)
-CREATE INDEX idx_urls_pending_generic ON research_urls(claimed_at, created_at)
+CREATE INDEX idx_urls_pending_generic ON research_urls(retry_after, created_at)
     WHERE status = 'pending' AND worker_affinity IS NULL;
-CREATE INDEX idx_urls_processing_generic ON research_urls(claimed_at)
+CREATE INDEX idx_urls_processing_generic ON research_urls(retry_after, created_at)
     WHERE status = 'processing' AND worker_affinity IS NULL;
 CREATE INDEX idx_urls_failed_retry_generic ON research_urls(retry_after, created_at)
     WHERE status = 'failed' AND retry_after IS NOT NULL AND worker_affinity IS NULL;
 
--- Specialized workers (affinity-filtered) - affinity first for equality match
-CREATE INDEX idx_urls_pending_affinity ON research_urls(worker_affinity, claimed_at, created_at)
+-- Specialized workers (affinity-filtered) — affinity leads for the equality
+-- match, then (retry_after, created_at) supplies the claim's order within it.
+CREATE INDEX idx_urls_pending_affinity ON research_urls(worker_affinity, retry_after, created_at)
     WHERE status = 'pending' AND worker_affinity IS NOT NULL;
-CREATE INDEX idx_urls_processing_affinity ON research_urls(worker_affinity, claimed_at)
+CREATE INDEX idx_urls_processing_affinity ON research_urls(worker_affinity, retry_after, created_at)
     WHERE status = 'processing' AND worker_affinity IS NOT NULL;
 CREATE INDEX idx_urls_failed_retry_affinity ON research_urls(worker_affinity, retry_after, created_at)
     WHERE status = 'failed' AND retry_after IS NOT NULL AND worker_affinity IS NOT NULL;

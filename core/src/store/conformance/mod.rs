@@ -243,6 +243,13 @@ macro_rules! fact_store_conformance {
             walk_entity_classes_in_viewport_surfaces_conjunction_with_unresolved_member,
             walk_image_classes_in_viewport_surfaces_captured_locations,
             class_walk_next_class_cursor_skips_to_the_next_representative,
+            cluster_tile_cells_match_the_same_tile_inside_a_viewport,
+            cluster_tile_cells_keep_high_sub_tiles_under_a_dense_low_corner,
+            cluster_entities_in_viewport_buckets_by_tile,
+            cluster_entities_in_viewport_respects_snapshot,
+            cluster_entities_in_viewport_groups_colocated_entities,
+            cluster_cluster_becomes_singleton_when_a_member_is_retracted,
+            cluster_colocated_becomes_singleton_when_a_member_is_retracted,
         }
     };
     (@cases => $($(#[$attr:meta])* $case:ident,)+) => {

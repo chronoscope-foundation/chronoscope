@@ -34,7 +34,7 @@ use crate::queries::{QueryDef, QueryPlanError, verify_query_defs, verify_query_p
 
 macro_rules! define_fact_queries {
     ($($name:ident: $sql:expr),* $(,)?) => {
-        $(pub(super) const $name: QueryDef = QueryDef { name: stringify!($name), sql: $sql };)*
+        $(pub(super) const $name: QueryDef = QueryDef::new(stringify!($name), $sql);)*
 
         /// Every fact-store query, for plan verification.
         pub(crate) const ALL: &[&QueryDef] = &[$(&$name),*];
@@ -313,17 +313,17 @@ define_fact_queries! {
 // overlay's counters to the max of their own and the base's, so a fresh overlay
 // over a populated base mints past it and a reused overlay keeps its own
 // frontier; overlay-only write state, so `ovl.`-qualified.
-pub(super) const BASE_COUNTERS: QueryDef = QueryDef {
-    name: "BASE_COUNTERS",
-    sql: "SELECT next_entity_id, next_event_id, next_image_id FROM base.fact_counters WHERE id = 0",
-};
-pub(super) const SEED_COUNTERS: QueryDef = QueryDef {
-    name: "SEED_COUNTERS",
-    sql: "UPDATE ovl.fact_counters SET \
-          next_entity_id = MAX(next_entity_id, ?1), \
-          next_event_id = MAX(next_event_id, ?2), \
-          next_image_id = MAX(next_image_id, ?3) WHERE id = 0",
-};
+pub(super) const BASE_COUNTERS: QueryDef = QueryDef::new(
+    "BASE_COUNTERS",
+    "SELECT next_entity_id, next_event_id, next_image_id FROM base.fact_counters WHERE id = 0",
+);
+pub(super) const SEED_COUNTERS: QueryDef = QueryDef::new(
+    "SEED_COUNTERS",
+    "UPDATE ovl.fact_counters SET \
+     next_entity_id = MAX(next_entity_id, ?1), \
+     next_event_id = MAX(next_event_id, ?2), \
+     next_image_id = MAX(next_image_id, ?3) WHERE id = 0",
+);
 
 // The "one past the highest id/seq" expression over the mounted layers, for
 // the clock read and the staging/commit inserts. The subquery sees the
@@ -362,17 +362,18 @@ pub(super) fn next_fact_id_sql(has_base: bool) -> String {
 // self-correcting. commit_seq stays NULL until the fact's commit records. The
 // new id comes back as the insert's rowid (fact_id is the rowid alias); a
 // RETURNING on a foreign-key parent would drag a scan of the child table into
-// the plan. ?1..?16 bind the row columns.
+// the plan. ?1..?18 bind the row columns.
 pub(super) fn insert_fact_sql(has_base: bool) -> String {
     format!(
         "INSERT INTO ovl.facts (
             fact_id, fact_json,
             name_norm, name_language, external_ref, source_url,
             date_earliest, date_latest, lat, lon, radius_m,
+            quadkey, subject_kind,
             edge_kind, edge_a, edge_b, event_owner,
             retracts_fact_id, retracts_commit_seq
         ) VALUES (({}),
-                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         next_id_expr(has_base, "facts", "fact_id")
     )
 }
@@ -612,6 +613,48 @@ pub(super) fn spatial_candidates_sql(has_base: bool) -> String {
     }
 }
 
+// One tile's clustering candidates over one layer: the entity/event located
+// facts below the snapshot (?3) whose quadkey falls in the tile's Morton range
+// [?1, ?2], lowest (quadkey, fact_id) first, at most ?4. The `subject_kind IN
+// ('entity', 'event')` literal matches idx_facts_quadkey's partial predicate, so
+// the index serves both the range and the (quadkey, fact_id) order: the plan is
+// SEARCH facts USING INDEX idx_facts_quadkey with no temp B-tree, and LIMIT
+// stops the scan early. Retraction and the tile fold run in Rust.
+fn cluster_tile_branch(schema: &str) -> String {
+    format!(
+        "SELECT fact_id, fact_json, quadkey FROM {schema}.facts \
+         WHERE quadkey BETWEEN ?1 AND ?2 \
+           AND fact_id < ?3 \
+           AND subject_kind IN ('entity', 'event') \
+         ORDER BY quadkey, fact_id \
+         LIMIT ?4"
+    )
+}
+
+/// The clustering-candidate SQL for a mount: the overlay branch, plus the base
+/// branch UNION ALL'd when a base is mounted. An index drives its scan only when
+/// its table is named directly, so this reads the `ovl.`/`base.` tables per layer
+/// rather than the union view (which would full-scan). SQLite forbids ORDER
+/// BY/LIMIT directly on a UNION ALL arm, so each branch is wrapped in a subquery
+/// — exactly [`resolve_rep_expr`]'s wrap — sharing the one ?1..?4 bind set. There
+/// is no outer ORDER BY: each branch is its own layer-local top-N, and
+/// [`cluster_ranges`](super::read) re-truncates the ≤2N merged rows to the global
+/// top-N in Rust before retraction, so the fold sees the single-table top-N (the
+/// per-layer id spaces are disjoint, so base-top-N ∪ overlay-top-N ⊇ global-top-N).
+pub(super) fn cluster_tile_sql(has_base: bool) -> String {
+    let overlay = cluster_tile_branch("ovl");
+    if has_base {
+        format!(
+            "SELECT fact_id, fact_json, quadkey FROM ({overlay})\n\
+             UNION ALL\n\
+             SELECT fact_id, fact_json, quadkey FROM ({})",
+            cluster_tile_branch("base")
+        )
+    } else {
+        overlay
+    }
+}
+
 /// The per-store resolved fact-store SQL: the `has_base`-parameterized builders
 /// evaluated once when the store opens (`has_base` is fixed for its lifetime),
 /// so the hot paths bind a cached `&str` instead of re-`format!`-ing ~400 chars
@@ -621,6 +664,7 @@ pub(super) fn spatial_candidates_sql(has_base: bool) -> String {
 /// per-call builder output — only its lifetime moves onto the store.
 #[derive(Debug)]
 pub(super) struct FactQueries {
+    has_base: bool,
     pub next_fact_id: String,
     pub insert_fact: String,
     pub insert_commit: String,
@@ -629,12 +673,34 @@ pub(super) struct FactQueries {
     pub class_walk_all: String,
     pub identity_targets: String,
     pub spatial_candidates: String,
+    pub cluster_tile: String,
 }
+
+// The All-walk enumerates every class, so its DISTINCT-reduced (rep, fact_id)
+// re-sorts every page — a full sort with no index to lean on, in both mount
+// modes. Conformance-scale only; a production consumer triggers reconsidering
+// the stream itself.
+const CLASS_WALK_ALL_SORT_OK: &str = "deliberate full walk: enumerating every \
+    class is this stream's semantics, so the walk visits the whole subject \
+    population and the DISTINCT-reduced (rep, fact_id) re-sorts every page — \
+    conformance-scale only; a production consumer triggers reconsidering the \
+    stream itself";
+
+// Over a mounted base the representative resolve merges two per-layer reverse
+// index seeks (each yielding one row) with `ORDER BY as_of DESC LIMIT 1` to pick
+// the later assignment — a bounded ≤2-row sort, not a table sort. The
+// overlay-only form is a single reverse seek with no sort, so this waiver is
+// scoped to the mounted mode alone.
+const RESOLVE_REP_BASE_SORT_OK: &str = "mounted base: the outer ORDER BY as_of \
+    DESC LIMIT 1 sorts the ≤2-row union of two per-layer reverse index seeks to \
+    pick the later representative assignment — a bounded merge of two one-row \
+    seeks, not a table sort";
 
 impl FactQueries {
     /// Resolve every base-aware builder once for a store's fixed `has_base`.
     pub(super) fn resolve(has_base: bool) -> Self {
         Self {
+            has_base,
             next_fact_id: next_fact_id_sql(has_base),
             insert_fact: insert_fact_sql(has_base),
             insert_commit: insert_commit_sql(has_base),
@@ -643,23 +709,35 @@ impl FactQueries {
             class_walk_all: class_walk_all_sql(has_base),
             identity_targets: identity_targets_sql(has_base),
             spatial_candidates: spatial_candidates_sql(has_base),
+            cluster_tile: cluster_tile_sql(has_base),
         }
     }
 
-    /// Every resolved base-aware query as `(name, sql)` — the one set the plan
-    /// gate iterates, so it verifies the exact strings the store binds rather
-    /// than re-deriving them (which could drift). Every field appears here, so a
-    /// query added to the struct is caught by the gate.
-    fn plan_checked(&self) -> [(&'static str, &str); 8] {
+    /// Every resolved base-aware query as `(name, sql, sort_ok)` — the one set
+    /// the plan gate iterates, so it verifies the exact strings the store binds
+    /// rather than re-deriving them (which could drift). Every field appears
+    /// here, so a query added to the struct is caught by the gate. The `sort_ok`
+    /// slot waives the queries that deliberately re-sort: the All-walk always,
+    /// and the representative resolves only over a mounted base (their
+    /// overlay-only form is a plain reverse seek the gate still polices).
+    fn plan_checked(&self) -> [(&'static str, &str, Option<&'static str>); 9] {
+        let resolve_rep_ok = self.has_base.then_some(RESOLVE_REP_BASE_SORT_OK);
         [
-            ("NEXT_FACT_ID", self.next_fact_id.as_str()),
-            ("INSERT_FACT", self.insert_fact.as_str()),
-            ("INSERT_COMMIT", self.insert_commit.as_str()),
-            ("RESOLVE_REP", self.resolve_rep.as_str()),
-            ("RESOLVE_REPS", self.resolve_reps.as_str()),
-            ("CLASS_WALK_ALL", self.class_walk_all.as_str()),
-            ("IDENTITY_TARGETS", self.identity_targets.as_str()),
-            ("SPATIAL_CANDIDATES", self.spatial_candidates.as_str()),
+            ("NEXT_FACT_ID", self.next_fact_id.as_str(), None),
+            ("INSERT_FACT", self.insert_fact.as_str(), None),
+            ("INSERT_COMMIT", self.insert_commit.as_str(), None),
+            ("RESOLVE_REP", self.resolve_rep.as_str(), resolve_rep_ok),
+            ("RESOLVE_REPS", self.resolve_reps.as_str(), resolve_rep_ok),
+            (
+                "CLASS_WALK_ALL",
+                self.class_walk_all.as_str(),
+                Some(CLASS_WALK_ALL_SORT_OK),
+            ),
+            ("IDENTITY_TARGETS", self.identity_targets.as_str(), None),
+            ("SPATIAL_CANDIDATES", self.spatial_candidates.as_str(), None),
+            // The union's two branches are each index-served top-Ns (no outer
+            // sort), so the gate holds it to a clean plan — `None`, not waived.
+            ("CLUSTER_TILE", self.cluster_tile.as_str(), None),
         ]
     }
 }
@@ -675,8 +753,8 @@ pub(crate) async fn verify_query_plans(
     fq: &FactQueries,
 ) -> Result<(), QueryPlanError> {
     verify_query_defs(pool, ALL).await?;
-    for (name, sql) in fq.plan_checked() {
-        verify_query_plan_sql(pool, name, sql).await?;
+    for (name, sql, sort_ok) in fq.plan_checked() {
+        verify_query_plan_sql(pool, name, sql, sort_ok).await?;
     }
     Ok(())
 }

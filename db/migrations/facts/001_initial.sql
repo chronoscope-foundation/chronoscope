@@ -50,6 +50,11 @@ CREATE TABLE facts (
     date_earliest TEXT, date_latest TEXT,
     lat REAL, lon REAL, radius_m REAL,
 
+    -- Morton-coded location center + its subject kind, for viewport
+    -- clustering. subject_kind gates the partial clustering index below.
+    quadkey INTEGER,
+    subject_kind TEXT CHECK (subject_kind IN ('entity', 'event', 'image')),
+
     -- identity edges (SameEntity / SameEvent / SameArtifact)
     edge_kind TEXT CHECK (edge_kind IN ('entity', 'event', 'image')),
     edge_a INTEGER, edge_b INTEGER,
@@ -60,7 +65,11 @@ CREATE TABLE facts (
     event_owner INTEGER,
 
     -- retraction targets (RetractFact / SupersedeFact / RetractCommit)
-    retracts_fact_id INTEGER, retracts_commit_seq INTEGER
+    retracts_fact_id INTEGER, retracts_commit_seq INTEGER,
+
+    -- quadkey and subject_kind co-occur — both name a resolved point location,
+    -- so no row can enter idx_facts_quadkey with a NULL key.
+    CHECK ((quadkey IS NULL) = (subject_kind IS NULL))
 );
 CREATE INDEX idx_facts_name ON facts(name_norm, name_language, fact_id)
     WHERE name_norm IS NOT NULL;
@@ -68,6 +77,13 @@ CREATE INDEX idx_facts_extref ON facts(external_ref, fact_id)
     WHERE external_ref IS NOT NULL;
 CREATE INDEX idx_facts_srcurl ON facts(source_url, fact_id)
     WHERE source_url IS NOT NULL;
+-- Viewport clustering: a tile is a contiguous quadkey range. The discriminator
+-- lives in the partial predicate, not the key — keying on (quadkey, fact_id)
+-- alone keeps a tile range-scan index-ordered, so ORDER BY quadkey, fact_id
+-- LIMIT stops early with no temp B-tree. Image capture locations still store a
+-- quadkey but stay out of this index.
+CREATE INDEX idx_facts_quadkey ON facts(quadkey, fact_id)
+    WHERE subject_kind IN ('entity', 'event');
 CREATE INDEX idx_facts_edge_a ON facts(edge_kind, edge_a) WHERE edge_a IS NOT NULL;
 CREATE INDEX idx_facts_edge_b ON facts(edge_kind, edge_b) WHERE edge_b IS NOT NULL;
 CREATE INDEX idx_facts_retracts_fact ON facts(retracts_fact_id)

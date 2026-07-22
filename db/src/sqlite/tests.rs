@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use sqlx::sqlite::SqlitePool;
 
+use chronoscope_core::geo::{
+    GeoPoint, QuadLevel, TileId, Viewport, mercator_x_to_lon, mercator_y_to_lat, quadkey,
+};
 use chronoscope_core::grammar::assertions::FactualAssertion;
 use chronoscope_core::grammar::attribute;
 use chronoscope_core::grammar::citations::Language;
@@ -18,7 +21,9 @@ use chronoscope_core::store::conformance::fixtures::{
     local_bundle, name_fact, retract_fact, same_entity_fact, sample_viewport, user_author,
 };
 use chronoscope_core::store::conformance::{TestError, TestResult, UnmintedIds};
-use chronoscope_core::store::schema::EntityStream;
+use chronoscope_core::store::schema::{
+    CELL_DEPTH, CLUSTER_TILE_N, CellKind, ClusterCell, EntityStream, RankKey,
+};
 use chronoscope_core::store::{EntityView, FactStore, FactView, FactWrite};
 use chronoscope_core::submit::{
     Commit as SubmitBundle, Decl, EntityIdx, FactLookup, ResolutionOrigin, StoredFact, SubmitError,
@@ -925,6 +930,195 @@ async fn walks_span_base_and_overlay_over_a_read_only_pin() -> TestResult {
     // Serving a frozen pin still takes writes: the submit lands in the overlay.
     let result = commit_name(&store, "overlay-addition").await?;
     assert!(!result.previously_committed);
+    store.close().await;
+    Ok(())
+}
+
+// --- cross-layer clustering ---
+
+/// The geographic centre of tile `(tx, ty)` at `level` — inside its finest cell,
+/// so its `quadkey` lands in that tile. Places entities in chosen sub-tiles.
+fn tile_center(level: QuadLevel, tx: u32, ty: u32) -> Result<GeoPoint, TestError> {
+    let n = f64::from(1u32 << level.get());
+    let ux = (f64::from(tx) + 0.5) / n;
+    let uy = (f64::from(ty) + 0.5) / n;
+    Ok(GeoPoint::new(mercator_y_to_lat(uy), mercator_x_to_lon(ux))?)
+}
+
+/// The clustering read spans base ∪ overlay through the two-branch quadkey union,
+/// and the container's stand-alone tile cells equal its clipped viewport cells
+/// even when a sub-tile's entities straddle the seam. The co-located pair has one
+/// member in the base and one in the overlay, so a single bucket is folded from
+/// both branches — the union path the overlay-only conformance run can't reach.
+#[tokio::test]
+async fn cluster_tile_and_viewport_agree_across_a_mounted_base() -> TestResult {
+    let z = QuadLevel::new(8)?;
+    let cell_level = QuadLevel::saturating(z.get() + CELL_DEPTH);
+    let (cx, cy) = (75u32, 96u32);
+    let factor = 1u32 << CELL_DEPTH;
+    let (base_x, base_y) = (cx * factor, cy * factor);
+
+    let p_lone1 = tile_center(cell_level, base_x + 1, base_y + 2)?;
+    let p_lone2 = tile_center(cell_level, base_x + 5, base_y + 6)?;
+    let p_pair = tile_center(cell_level, base_x + 3, base_y + 4)?;
+    let p_neighbour = tile_center(cell_level, (cx + 1) * factor + 2, base_y + 2)?;
+
+    let place = |p: &GeoPoint, secs: i64| {
+        local_bundle::<SqlIds>(1, 0, 0, secs, vec![construction_at(0, p.lat(), p.lon())?])
+    };
+
+    // Base holds one lone entity and one half of the co-located pair.
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    commit_result(&base, place(&p_lone1, 0)?).await?;
+    commit_result(&base, place(&p_pair, 20)?).await?;
+    finish_base(base).await?;
+
+    // Overlay holds the other lone entity, the pair's other half, and the
+    // out-of-container neighbour.
+    let store = mount_over(&dir, &base_path).await?;
+    commit_result(&store, place(&p_lone2, 10)?).await?;
+    commit_result(&store, place(&p_pair, 30)?).await?;
+    commit_result(&store, place(&p_neighbour, 40)?).await?;
+
+    let tile = TileId::new(z, cx, cy)?;
+    let container = tile.range();
+    let in_container = |p: &GeoPoint| {
+        let q = quadkey(p);
+        container.lo <= q && q <= container.hi
+    };
+    assert!(
+        !in_container(&p_neighbour),
+        "the neighbour must sit outside the container block"
+    );
+
+    let mut view = store.now().await?;
+    let mut tile_cells = view.cluster_tile_cells(tile, RankKey::Unranked).await?;
+
+    let tiles_per_axis = f64::from(1u32 << z.get());
+    let viewport = Viewport::new(
+        GeoPoint::new(
+            mercator_y_to_lat(f64::from(cy + 1) / tiles_per_axis),
+            mercator_x_to_lon(f64::from(cx) / tiles_per_axis),
+        )?,
+        GeoPoint::new(
+            mercator_y_to_lat(f64::from(cy) / tiles_per_axis),
+            mercator_x_to_lon(f64::from(cx + 2) / tiles_per_axis),
+        )?,
+    )?;
+    let vp_all = view
+        .cluster_entities_in_viewport(&viewport, cell_level, RankKey::Unranked)
+        .await?;
+    assert_eq!(
+        vp_all.len(),
+        4,
+        "the viewport spans three in-container cells plus the neighbour's, got {vp_all:?}"
+    );
+    let mut vp_cells: Vec<ClusterCell<SqlEntityId>> = vp_all
+        .into_iter()
+        .filter(|c| in_container(&c.point))
+        .collect();
+
+    tile_cells.sort_by(|a, b| a.representative.cmp(&b.representative));
+    vp_cells.sort_by(|a, b| a.representative.cmp(&b.representative));
+    assert_eq!(
+        tile_cells.len(),
+        3,
+        "two singletons and one seam-straddling co-located cell, got {tile_cells:?}"
+    );
+    assert!(
+        tile_cells
+            .iter()
+            .any(|c| matches!(c.kind, CellKind::Colocated { ref members } if members.len() == 2)),
+        "the seam-straddling pair must fold to a two-member co-located cell, got {tile_cells:?}"
+    );
+    assert_eq!(
+        tile_cells, vp_cells,
+        "over a mounted base the stand-alone tile cells must equal the clipped viewport cells"
+    );
+    drop(view);
+    store.close().await;
+    Ok(())
+}
+
+/// The overlay union re-truncates each bucket to its `(quadkey, fact_id)`-lowest
+/// `CLUSTER_TILE_N` in Rust before the fold. A sub-tile is packed with
+/// `CLUSTER_TILE_N` co-located entities in the base plus three more in the
+/// overlay: each layer branch returns its own top-N (base N, overlay 3), so the
+/// union hands the fold `N + 3` rows. Without the Rust re-truncate the co-located
+/// cell would carry all `N + 3` members; the cut recovers the single-table top-N,
+/// so exactly the base's `N` (lowest fact ids under the shared quadkey) survive
+/// and the three overlay members drop — the same cells the memory oracle folds.
+#[tokio::test]
+async fn cluster_union_retruncates_a_bucket_to_top_n() -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let level = QuadLevel::new(14)?;
+    let (p_lat, p_lon) = (40.021, -73.981);
+
+    // Base: exactly CLUSTER_TILE_N co-located entities at one point (fact ids
+    // 0..N-1, all sharing one quadkey).
+    let dir = tempfile::tempdir()?;
+    let base_path = dir.path().join("base.sqlite3");
+    let base = open_base(&base_path).await?;
+    for i in 0..CLUSTER_TILE_N {
+        commit_result(
+            &base,
+            local_bundle::<SqlIds>(1, 0, 0, i as i64, vec![construction_at(0, p_lat, p_lon)?])?,
+        )
+        .await?;
+    }
+    finish_base(base).await?;
+
+    // Overlay: three more co-located entities at the same point — higher fact
+    // ids, so the top-N-by-(quadkey, fact_id) cut drops them.
+    let store = mount_over(&dir, &base_path).await?;
+    let mut overlay_ids = Vec::new();
+    for i in 0..3 {
+        let res = commit_result(
+            &store,
+            local_bundle::<SqlIds>(1, 0, 0, 10_000 + i, vec![construction_at(0, p_lat, p_lon)?])?,
+        )
+        .await?;
+        overlay_ids.push(
+            res.entities
+                .get(&EntityIdx(0))
+                .ok_or("missing overlay id")?
+                .id,
+        );
+    }
+
+    let mut view = store.now().await?;
+    let cells = view
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await?;
+    assert_eq!(
+        cells.len(),
+        1,
+        "one bucket, one co-located cell; got {cells:?}"
+    );
+    let CellKind::Colocated { members } = &cells[0].kind else {
+        return Err(format!("expected a co-located cell, got {:?}", cells[0].kind).into());
+    };
+    assert_eq!(
+        members.len(),
+        CLUSTER_TILE_N,
+        "the re-truncate keeps exactly the top-N; a missing cut would carry all N+3 members"
+    );
+    assert!(
+        members.iter().all(|m| m.0 < CLUSTER_TILE_N as i64),
+        "only the base's N lowest-fact-id entities survive; the overlay members drop, got {members:?}"
+    );
+    assert!(
+        overlay_ids.iter().all(|o| !members.contains(o)),
+        "no overlay entity may appear once the bucket is re-truncated to top-N"
+    );
+    assert_eq!(
+        cells[0].representative,
+        SqlEntityId(0),
+        "the (quadkey, fact_id)-minimal survivor is the base's first entity"
+    );
+    drop(view);
     store.close().await;
     Ok(())
 }
