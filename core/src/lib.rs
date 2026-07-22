@@ -91,6 +91,7 @@ pub mod external_ids;
 mod finite;
 pub mod geo;
 pub mod grammar;
+pub mod lifespan;
 pub mod listing;
 pub mod location;
 pub mod moment;
