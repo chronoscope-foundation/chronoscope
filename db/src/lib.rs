@@ -7,8 +7,9 @@ mod common;
 pub mod error;
 pub mod media_store;
 pub mod models;
-// Postgres backend. Only the ephemeral-cluster smoke test exists so far (an
-// infra spike), so the module is test-only behind the `postgres` feature.
+// Postgres fact-store backend. Nothing wires it into production yet (that is a
+// later milestone), so it is exercised only by its own conformance suite and
+// stays test-only behind the `postgres` feature until a consumer needs it.
 #[cfg(all(test, feature = "postgres"))]
 mod postgres;
 pub mod queries;

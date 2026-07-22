@@ -1,283 +1,712 @@
-//! Ephemeral Postgres+PostGIS cluster harness — an infra de-risking spike.
+//! Postgres [`FactStore`] backend — the "straightforward" slice (everything
+//! except retraction's recursive CTEs and `PostGIS` spatial reads).
 //!
-//! This exists to answer one question: can an ephemeral `postgres` cluster be
-//! `initdb`'d, started over a unix socket, and reached with `sqlx` from inside
-//! the hermetic `nix flake check` build environment on darwin? It is **not**
-//! the Postgres backend — no `FactStore` impl, no schema, just enough to prove
-//! the cluster comes up and PostGIS loads. Test-only for now; we promote the
-//! harness to shared test-support once a real backend needs it.
+//! One writable database, no base/overlay union: every read names its tables
+//! directly and every query is a plain constant (see the `queries` module). The
+//! json columns are `JSONB`; the shared [`crate::common::storage`] string codecs
+//! bind through a `$N::jsonb` cast and read back through `col::text`.
 //!
-//! The one non-obvious trap is the socket path length: a unix socket address is
-//! capped at `sizeof(sockaddr_un.sun_path)` (104 bytes on macOS), and nix build
-//! directories are deep, so the socket directory must be short. The data
-//! directory has no such limit, so only the socket dir is pulled out to a short
-//! base (`PG_SOCKET_BASE`, default `/tmp`).
+//! ## Transactions
+//!
+//! [`FactStore::with_tx`] opens a READ COMMITTED transaction and immediately
+//! takes the counters-row lock (`SELECT ... FOR UPDATE`), held through COMMIT.
+//! That single lock serializes the whole match -> mint -> stage sequence — the
+//! Postgres analogue of SQLite's `BEGIN IMMEDIATE` — and, because it is held to
+//! commit, makes fact-id-assignment order == commit-visibility order, so the
+//! scalar [`FactId`] snapshot stays sound. Ids are counter-minted from the
+//! `fact_counters` row (subjects, fact ids, and commit seqs alike); a rolled-back
+//! submit scope unwinds the counter bumps with its staging.
+//!
+//! ## Reads
+//!
+//! A [`PostgresFactView`] owns one pooled connection inside a read transaction;
+//! the `WHERE fact_id < N` bound is the semantic snapshot, so consistency comes
+//! from the commit-order == id-order invariant rather than the transaction
+//! isolation. Representatives and classes read the append-only `subject_reps`
+//! log; the class-stream `ByName` / `ByExternalReference` / `BySourceUrl` / `All`
+//! walks combine the facet indexes with that resolution, and depictions combine
+//! it with the subject backlinks.
+//!
+//! ## Deferred (later units)
+//!
+//! Retraction (the recursive `RETRACTOR_CLOSURE` fixpoint and
+//! `record_retraction`), the `PostGIS` spatial reads/writes, and the
+//! temporal-conflict witness *reads* are later units; here [`read::retraction_edges`]
+//! returns no edges (correct while nothing is retracted), the spatial insert is
+//! skipped, the `InViewport` / `InTimeRange` streams answer empty pages, and the
+//! witness tables are written but not yet read.
 
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+mod error;
+mod harness;
+mod maintain;
+mod queries;
+mod read;
 
-/// macOS caps `sockaddr_un.sun_path` at 104 bytes including the NUL terminator,
-/// so the bind path must be at most 103 bytes. Linux allows 108; take the
-/// tighter bound so the check is portable.
-const SUN_PATH_LIMIT: usize = 104;
+#[cfg(test)]
+mod tests;
 
-/// Postgres binds `<socket_dir>/.s.PGSQL.<port>`; the harness never overrides
-/// the default port 5432, so the suffix length is fixed.
-const SOCKET_SUFFIX: &str = "/.s.PGSQL.5432";
+use std::future::Future;
+use std::marker::PhantomData;
+use std::pin::Pin;
 
-/// Failures bringing up or tearing down the ephemeral cluster. Every arm
-/// carries the operation and, for a failed subprocess, its captured output —
-/// the whole point of a spike is a legible failure, not a bare exit code.
-#[derive(Debug, thiserror::Error)]
-enum PgHarnessError {
-    #[error("failed to create the {what}: {source}")]
-    Io {
-        what: &'static str,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to spawn `{tool}` (is it on PATH?): {source}")]
-    Spawn {
-        tool: &'static str,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("`{tool}` exited with {status}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}")]
-    Command {
-        tool: &'static str,
-        status: std::process::ExitStatus,
-        stdout: String,
-        stderr: String,
-    },
-    #[error(
-        "socket path would be {len} bytes (dir {dir:?} + {SOCKET_SUFFIX}), over the \
-         {SUN_PATH_LIMIT}-byte sockaddr_un limit — set PG_SOCKET_BASE to a shorter directory"
-    )]
-    SocketPathTooLong { dir: String, len: usize },
-    #[error("sqlx failure while {context}: {source}")]
-    Sqlx {
-        context: &'static str,
-        #[source]
-        source: sqlx::Error,
-    },
-}
+use sqlx::postgres::PgPool;
+use sqlx::{Acquire, PgConnection, Postgres, Transaction};
 
-/// A live single-node cluster: its data + socket directories (removed on drop)
-/// and a pool connected over the unix socket.
-struct PgCluster {
-    // Field order is drop order. `Drop::drop` stops the server while both
-    // TempDirs are still live, then these fields drop — removing the
-    // directories — in the order written here.
-    data_dir: tempfile::TempDir,
-    #[expect(
-        dead_code,
-        reason = "held for RAII: its TempDir Drop removes the socket directory when the cluster tears down"
-    )]
-    socket_dir: tempfile::TempDir,
+use chronoscope_core::geo::{QuadLevel, TileId, Viewport};
+use chronoscope_core::grammar::ids::{CommitId, FactId, SubjectKind};
+use chronoscope_core::store::schema::{
+    ClassPage, ClusterCell, EntityStream, EquivClass, ImageStream, RankKey, normalize_name,
+};
+use chronoscope_core::store::{
+    ClassWalkPage, DepictionWalkPage, EntityView, EventView, FactPlacement, FactStore, FactView,
+    FactWrite, ImageView, WalkPage,
+};
+use chronoscope_core::submit::{FactLookup, StoredCommit, StoredFact, SubmitResult};
+
+pub(crate) use self::error::PostgresFactStoreError;
+
+use crate::common::convert::{i64_to_u64, u64_to_i64};
+use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
+use crate::common::storage::{
+    commit_to_json, external_ref_key, facet_columns, fact_to_json, named_entity, referenced_entity,
+    result_to_json, sourced_image, subject_rows, witness_row,
+};
+
+use self::error::sql;
+use self::read::{FacetKey, ReadBound};
+
+// Aliases to keep the spellings short.
+type SqlStoredFact = StoredFact<SqlIds>;
+type SqlFactLookup = FactLookup<SqlIds>;
+type SqlSubmitResult = SubmitResult<SqlIds>;
+type Error = PostgresFactStoreError;
+
+// ============================================================================
+// PostgresFactStore
+// ============================================================================
+
+/// Postgres implementation of [`FactStore`] over one writable database. The pool
+/// is `Arc`-backed (sqlx), so cloning the store is cheap.
+#[derive(Debug, Clone)]
+pub(crate) struct PostgresFactStore {
     pool: PgPool,
 }
 
-/// Run a subprocess to completion, capturing its output and turning a non-zero
-/// exit into a context-rich error. `cmd` is passed already-configured so the
-/// caller reads as a flat argument list.
-fn run(tool: &'static str, cmd: &mut std::process::Command) -> Result<(), PgHarnessError> {
-    let output = cmd
-        .output()
-        .map_err(|source| PgHarnessError::Spawn { tool, source })?;
-    if output.status.success() {
-        return Ok(());
+impl PostgresFactStore {
+    /// Wrap a pool over an already-migrated fact-store database.
+    pub(crate) fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
-    Err(PgHarnessError::Command {
-        tool,
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+
+    /// The underlying pool, for the harness smoke test.
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
 }
 
-/// Start the postmaster in wait mode, sending both pg_ctl's own output and the
-/// server's to a log **file** rather than a captured pipe.
-///
-/// `pg_ctl start` daemonizes the postmaster, which inherits pg_ctl's stdout and
-/// stderr and holds them for its whole lifetime. A captured pipe would then
-/// never reach EOF, so `Command::output()` would block forever even though
-/// pg_ctl itself has already exited. Redirecting to a file makes the inherited
-/// descriptors harmless, and `status()` waits only on pg_ctl.
-fn start_postmaster(data_dir: &std::path::Path, server_opts: &str) -> Result<(), PgHarnessError> {
-    let log_path = data_dir.join("pg_start.log");
-    let log = std::fs::File::create(&log_path).map_err(|source| PgHarnessError::Io {
-        what: "pg_ctl start log file",
-        source,
-    })?;
-    let log_err = log.try_clone().map_err(|source| PgHarnessError::Io {
-        what: "pg_ctl start log handle",
-        source,
-    })?;
+// ============================================================================
+// Connection forms — the storage type is the handle's mode
+// ============================================================================
 
-    let status = std::process::Command::new("pg_ctl")
-        .arg("-D")
-        .arg(data_dir)
-        .arg("-o")
-        .arg(server_opts)
-        .arg("-w")
-        .arg("-t")
-        .arg("60")
-        .arg("start")
-        .stdout(log)
-        .stderr(log_err)
-        .status()
-        .map_err(|source| PgHarnessError::Spawn {
-            tool: "pg_ctl start",
-            source,
-        })?;
-    if status.success() {
-        return Ok(());
-    }
-    Err(PgHarnessError::Command {
-        tool: "pg_ctl start",
-        status,
-        stdout: String::new(),
-        stderr: std::fs::read_to_string(&log_path).unwrap_or_default(),
-    })
+/// A committed read view's connection: an owned read transaction, rolled back
+/// (returning its connection to the pool) on drop.
+pub(crate) struct ViewTx(Transaction<'static, Postgres>);
+
+/// The `with_tx` write handle's connection, borrowed from the transaction the
+/// frame owns and must recover to commit. The marker makes `'t` invariant — it
+/// is [`PostgresTx`]'s brand, and a covariant borrow would let two `with_tx`
+/// closures' brands unify.
+pub(crate) struct FrameConn<'t>(&'t mut PgConnection, PhantomData<fn(&'t ()) -> &'t ()>);
+
+/// A submit scope's connection: an owned savepoint transaction nested in the
+/// write transaction.
+pub(crate) struct ScopeTx<'n>(Transaction<'n, Postgres>);
+
+/// The connection behind a handle. Transactions are connection-scoped, so a
+/// handle is one connection for its lifetime either way; the three forms differ
+/// only in ownership.
+pub(crate) trait AsConn: conn_sealed::Sealed + Send + Sync {
+    fn conn(&mut self) -> &mut PgConnection;
 }
 
-impl PgCluster {
-    /// `initdb` a fresh cluster in a tempdir, start it listening on a unix
-    /// socket only (no TCP), and hand back a connected pool.
-    async fn start() -> Result<Self, PgHarnessError> {
-        let data_dir = tempfile::tempdir().map_err(|source| PgHarnessError::Io {
-            what: "data tempdir",
-            source,
-        })?;
+/// The connection forms carrying the write surface: [`FactWrite`] exists only
+/// over these, so a read view lacks the write methods at compile time.
+pub(crate) trait WriteConn: AsConn {}
 
-        // The socket dir must be short (see the sun_path limit); the base is
-        // overridable because the default `/tmp` may not be the right writable
-        // short path in every build environment.
-        let socket_base = std::env::var_os("PG_SOCKET_BASE").map_or_else(
-            || std::path::PathBuf::from("/tmp"),
-            std::path::PathBuf::from,
-        );
-        let socket_dir = tempfile::Builder::new()
-            .prefix("pgs")
-            .tempdir_in(&socket_base)
-            .map_err(|source| PgHarnessError::Io {
-                what: "socket tempdir",
-                source,
-            })?;
+mod conn_sealed {
+    pub trait Sealed {}
+    impl Sealed for super::ViewTx {}
+    impl Sealed for super::FrameConn<'_> {}
+    impl Sealed for super::ScopeTx<'_> {}
+}
 
-        // Guard the sun_path limit before postgres does, so the failure names
-        // the cause instead of surfacing as an opaque bind error deep in startup.
-        let sock_len = socket_dir.path().as_os_str().len() + SOCKET_SUFFIX.len();
-        if sock_len >= SUN_PATH_LIMIT {
-            return Err(PgHarnessError::SocketPathTooLong {
-                dir: socket_dir.path().display().to_string(),
-                len: sock_len,
-            });
-        }
+impl AsConn for ViewTx {
+    fn conn(&mut self) -> &mut PgConnection {
+        &mut self.0
+    }
+}
 
-        run(
-            "initdb",
-            std::process::Command::new("initdb")
-                .arg("-D")
-                .arg(data_dir.path())
-                .arg("-U")
-                .arg("postgres")
-                .arg("--auth=trust")
-                .arg("--no-sync")
-                .arg("-E")
-                .arg("UTF8"),
-        )?;
+impl AsConn for FrameConn<'_> {
+    fn conn(&mut self) -> &mut PgConnection {
+        self.0
+    }
+}
 
-        // pg_ctl runs the server via `/bin/sh -c`, so the -o string is shell
-        // parsed: `''` becomes an empty listen_addresses (unix socket only) and
-        // the quoted socket dir tolerates any path chars.
-        let server_opts = format!(
-            "-k '{}' -c listen_addresses=''",
-            socket_dir.path().display()
-        );
-        start_postmaster(data_dir.path(), &server_opts)?;
+impl AsConn for ScopeTx<'_> {
+    fn conn(&mut self) -> &mut PgConnection {
+        &mut self.0
+    }
+}
 
-        let pool = PgPoolOptions::new()
-            .max_connections(4)
-            .connect_with(
-                PgConnectOptions::new()
-                    .socket(socket_dir.path())
-                    .username("postgres")
-                    .database("postgres"),
-            )
+impl WriteConn for FrameConn<'_> {}
+impl WriteConn for ScopeTx<'_> {}
+
+// ============================================================================
+// PostgresHandle — the one read/write handle over a connection
+// ============================================================================
+
+/// Read (and, for the write forms, write) handle over one connection. Core's
+/// view traits are foreign in this crate, so they can't hang off a local source
+/// trait (orphan rule); this one concrete type carries each view-trait impl once
+/// for every connection form, and keeps its fields private so handles come only
+/// from the store.
+pub(crate) struct PostgresHandle<C> {
+    conn: C,
+    /// The read scope — the snapshot bound.
+    bound: ReadBound,
+}
+
+/// Snapshot-scoped read view: an owned read transaction plus the pinned
+/// exclusive upper bound.
+pub(crate) type PostgresFactView = PostgresHandle<ViewTx>;
+
+/// Branded transaction handle for [`PostgresFactStore`] — the [`FactWrite`]
+/// surface over one open transaction.
+pub(crate) type PostgresTx<'brand> = PostgresHandle<FrameConn<'brand>>;
+
+/// Refuse the transaction if any visible `facts` row is unclaimed — committed
+/// state never holds one, so a hit is this transaction's own staging that no
+/// recorded commit stands behind.
+async fn audit_unclaimed_staging(conn: &mut PgConnection) -> Result<(), Error> {
+    let row: Option<(i64,)> = sqlx::query_as(queries::UNCLAIMED_STAGED_FACT)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(sql("auditing staged rows"))?;
+    match row {
+        Some((fact_id,)) => Err(Error::UnclaimedStaging { fact_id }),
+        None => Ok(()),
+    }
+}
+
+async fn mint(conn: &mut PgConnection, kind: SubjectKind) -> Result<i64, Error> {
+    let (query, context) = match kind {
+        SubjectKind::Entity => (queries::MINT_ENTITY, "minting entity id"),
+        SubjectKind::Event => (queries::MINT_EVENT, "minting event id"),
+        SubjectKind::Image => (queries::MINT_IMAGE, "minting image id"),
+    };
+    let (id,): (i64,) = sqlx::query_as(query)
+        .fetch_one(conn)
+        .await
+        .map_err(sql(context))?;
+    Ok(id)
+}
+
+async fn mint_fact_id(conn: &mut PgConnection) -> Result<i64, Error> {
+    let (id,): (i64,) = sqlx::query_as(queries::MINT_FACT_ID)
+        .fetch_one(conn)
+        .await
+        .map_err(sql("minting fact id"))?;
+    Ok(id)
+}
+
+async fn mint_commit_seq(conn: &mut PgConnection) -> Result<i64, Error> {
+    let (id,): (i64,) = sqlx::query_as(queries::MINT_COMMIT_SEQ)
+        .fetch_one(conn)
+        .await
+        .map_err(sql("minting commit seq"))?;
+    Ok(id)
+}
+
+/// The `(entity, event, image)` mint counters, read fresh per known-id check so
+/// the row stays the one source of what the store has minted.
+async fn counters(conn: &mut PgConnection) -> Result<(i64, i64, i64), Error> {
+    sqlx::query_as(queries::MINT_COUNTERS)
+        .fetch_one(conn)
+        .await
+        .map_err(sql("reading mint counters"))
+}
+
+// ============================================================================
+// FactStore impl
+// ============================================================================
+
+impl FactStore for PostgresFactStore {
+    type Error = PostgresFactStoreError;
+    type Ids = SqlIds;
+    type Cursor = FactId;
+    type ClassCursor<Rep>
+        = (Rep, FactId)
+    where
+        Rep: Send;
+    type Tx<'brand> = PostgresTx<'brand>;
+    type View<'a> = PostgresFactView;
+
+    async fn with_tx<F, T, E>(&self, f: F) -> Result<Result<T, E>, Self::Error>
+    where
+        F: for<'brand> FnOnce(
+                &'brand Self,
+                &'brand mut Self::Tx<'brand>,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<T, E>> + Send + 'brand>,
+            > + Send,
+        T: Send,
+        E: Send,
+    {
+        let mut tx = self
+            .pool
+            .begin()
             .await
-            .map_err(|source| PgHarnessError::Sqlx {
-                context: "connecting to the ephemeral cluster",
-                source,
-            })?;
+            .map_err(sql("opening write transaction"))?;
+        // The counters-row lock, taken now and held through COMMIT, is the
+        // serialization point: match -> mint -> stage runs under it, so
+        // fact-id order equals commit order.
+        sqlx::query(queries::LOCK_COUNTERS)
+            .execute(&mut *tx)
+            .await
+            .map_err(sql("locking the counters row"))?;
+        let mut handle = PostgresHandle {
+            conn: FrameConn(&mut tx, PhantomData),
+            bound: ReadBound::Union,
+        };
+        let result = f(self, &mut handle).await;
+        if result.is_ok() {
+            if let Err(refusal) = audit_unclaimed_staging(&mut tx).await {
+                // The refusal is the diagnosis; a rollback failure on this
+                // already-doomed transaction would only mask it.
+                let _ = tx.rollback().await;
+                return Err(refusal);
+            }
+            tx.commit().await.map_err(sql("committing transaction"))?;
+        } else {
+            // The closure's error is the diagnosis; the dropped transaction
+            // rolls back regardless.
+            let _ = tx.rollback().await;
+        }
+        Ok(result)
+    }
 
-        Ok(Self {
-            data_dir,
-            socket_dir,
-            pool,
+    async fn next_fact_id(&self) -> Result<FactId, Self::Error> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(sql("acquiring clock connection"))?;
+        Ok(FactId::new(read::next_fact_id(&mut conn).await?))
+    }
+
+    async fn no_later_than(&self, snapshot: FactId) -> Result<Self::View<'_>, Self::Error> {
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(sql("opening view read transaction"))?;
+        Ok(PostgresHandle {
+            conn: ViewTx(tx),
+            bound: ReadBound::Pinned(snapshot),
+        })
+    }
+
+    async fn now(&self) -> Result<Self::View<'_>, Self::Error> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(sql("opening view read transaction"))?;
+        let snapshot = FactId::new(read::next_fact_id(&mut tx).await?);
+        Ok(PostgresHandle {
+            conn: ViewTx(tx),
+            bound: ReadBound::Pinned(snapshot),
         })
     }
 }
 
-impl Drop for PgCluster {
-    fn drop(&mut self) {
-        // Best-effort teardown. A failure here leaks an ephemeral cluster the
-        // OS reclaims anyway; panicking in Drop would poison unrelated test
-        // teardown, so report and move on.
-        match std::process::Command::new("pg_ctl")
-            .arg("-D")
-            .arg(self.data_dir.path())
-            .arg("-m")
-            .arg("immediate")
-            .arg("stop")
-            .output()
-        {
-            Ok(output) if !output.status.success() => {
-                eprintln!(
-                    "PgCluster teardown: pg_ctl stop exited with {}:\n{}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("PgCluster teardown: could not spawn pg_ctl stop: {e}"),
+// ============================================================================
+// View-trait impls — once, generic over the connection form
+// ============================================================================
+
+impl<C: AsConn> FactView<PostgresFactStore> for PostgresHandle<C> {
+    /// A pinned view answers its stored bound; a write handle's union bound
+    /// reads the mint counter (one past the highest fact staged on its
+    /// connection).
+    async fn snapshot(&mut self) -> Result<FactId, Error> {
+        match self.bound.snapshot() {
+            Some(snapshot) => Ok(snapshot),
+            None => Ok(FactId::new(read::next_fact_id(self.conn.conn()).await?)),
         }
+    }
+
+    async fn fact(&mut self, fact_id: FactId) -> Result<SqlFactLookup, Error> {
+        read::fact_lookup(self.conn.conn(), self.bound, fact_id).await
+    }
+
+    async fn commit_known(&mut self, id: &CommitId) -> Result<bool, Error> {
+        read::commit_known(self.conn.conn(), id).await
+    }
+
+    async fn placement(&mut self, id: FactId) -> Result<FactPlacement, Error> {
+        read::placement(self.conn.conn(), self.bound, id).await
     }
 }
 
-/// The spike's whole answer: bring up the cluster, load PostGIS, and prove the
-/// extension is live by reading its version and a WKT round-trip.
-#[tokio::test]
-async fn ephemeral_cluster_loads_postgis_over_unix_socket() -> Result<(), PgHarnessError> {
-    let cluster = PgCluster::start().await?;
+impl<C: AsConn> EntityView<PostgresFactStore> for PostgresHandle<C> {
+    async fn entity_representative(&mut self, member: &SqlEntityId) -> Result<SqlEntityId, Error> {
+        read::representative(self.conn.conn(), self.bound, *member).await
+    }
 
-    sqlx::query("CREATE EXTENSION IF NOT EXISTS postgis")
-        .execute(&cluster.pool)
-        .await
-        .map_err(|source| PgHarnessError::Sqlx {
-            context: "creating the postgis extension",
-            source,
-        })?;
+    async fn entity_class(
+        &mut self,
+        member: &SqlEntityId,
+    ) -> Result<EquivClass<SqlEntityId>, Error> {
+        read::equiv_class(self.conn.conn(), self.bound, *member).await
+    }
 
-    let (lib_version,): (String,) = sqlx::query_as("SELECT postgis_lib_version()")
-        .fetch_one(&cluster.pool)
-        .await
-        .map_err(|source| PgHarnessError::Sqlx {
-            context: "reading postgis_lib_version()",
-            source,
-        })?;
-    assert!(
-        !lib_version.trim().is_empty(),
-        "postgis_lib_version() returned empty"
-    );
+    /// The spatial (`InViewport`) and temporal (`InTimeRange`) streams answer
+    /// empty pages until their later units land; the empty page is the
+    /// contract's nothing-found answer and must stay quiet, since the submit
+    /// matcher drains keyed walks on every submit with `Local` decls.
+    async fn walk_entity_classes<'b>(
+        &'b mut self,
+        stream: &'b EntityStream<'b>,
+        after: Option<(SqlEntityId, FactId)>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ClassWalkPage<PostgresFactStore, SqlEntityId>, Error> {
+        let bound = self.bound;
+        let conn = self.conn.conn();
+        match stream {
+            EntityStream::ByName { name, language } => {
+                let key = FacetKey::Name {
+                    norm: normalize_name(name),
+                    language: language.as_str(),
+                };
+                read::keyed_class_page(conn, bound, key, named_entity, after, limit).await
+            }
+            EntityStream::ByExternalReference { reference } => {
+                let key = FacetKey::ExternalRef(external_ref_key(reference)?);
+                read::keyed_class_page(conn, bound, key, referenced_entity, after, limit).await
+            }
+            EntityStream::All => read::all_class_page(conn, bound, after, limit).await,
+            EntityStream::InViewport(_)
+            | EntityStream::InTimeRange(_)
+            | EntityStream::InViewportAndTimeRange { .. } => Ok(empty_class_page()),
+        }
+    }
 
-    let (wkt,): (String,) = sqlx::query_as("SELECT ST_AsText(ST_MakePoint(1, 2))")
-        .fetch_one(&cluster.pool)
-        .await
-        .map_err(|source| PgHarnessError::Sqlx {
-            context: "reading ST_AsText(ST_MakePoint(1, 2))",
-            source,
-        })?;
-    assert_eq!(wkt, "POINT(1 2)");
+    /// Tiled clustering is a spatial read; it rides the same deferral as the
+    /// `InViewport` streams (the pg spatial unit), answering empty until then.
+    async fn cluster_entities_in_viewport<'b>(
+        &'b mut self,
+        _viewport: &'b Viewport,
+        _level: QuadLevel,
+        _rank: RankKey,
+    ) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
+        Ok(Vec::new())
+    }
 
-    Ok(())
+    async fn cluster_tile_cells(
+        &mut self,
+        _tile: TileId,
+        _rank: RankKey,
+    ) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
+        Ok(Vec::new())
+    }
+
+    async fn all_facts_about_entity(
+        &mut self,
+        entity: &SqlEntityId,
+        after: Option<FactId>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WalkPage<PostgresFactStore, SqlEntityId>, Error> {
+        read::backlink_page(self.conn.conn(), self.bound, *entity, after, limit).await
+    }
+
+    async fn walk_entity_depictions<'b>(
+        &'b mut self,
+        entity: &'b SqlEntityId,
+        after: Option<(SqlImageId, FactId)>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<DepictionWalkPage<PostgresFactStore>, Error> {
+        read::depiction_page(self.conn.conn(), self.bound, *entity, after, limit).await
+    }
+}
+
+impl<C: AsConn> EventView<PostgresFactStore> for PostgresHandle<C> {
+    async fn event_representative(&mut self, member: &SqlEventId) -> Result<SqlEventId, Error> {
+        Ok(*member)
+    }
+
+    async fn event_class(&mut self, member: &SqlEventId) -> Result<EquivClass<SqlEventId>, Error> {
+        Ok(singleton_class(*member))
+    }
+
+    async fn all_facts_about_event(
+        &mut self,
+        event: &SqlEventId,
+        after: Option<FactId>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WalkPage<PostgresFactStore, SqlEventId>, Error> {
+        read::backlink_page(self.conn.conn(), self.bound, *event, after, limit).await
+    }
+
+    async fn all_has_events_about_event(
+        &mut self,
+        event: &SqlEventId,
+        after: Option<FactId>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WalkPage<PostgresFactStore, SqlEventId>, Error> {
+        read::has_event_backlink_page(self.conn.conn(), self.bound, *event, after, limit).await
+    }
+}
+
+impl<C: AsConn> ImageView<PostgresFactStore> for PostgresHandle<C> {
+    async fn image_representatives(
+        &mut self,
+        members: &[SqlImageId],
+    ) -> Result<std::collections::HashMap<SqlImageId, SqlImageId>, Error> {
+        read::representatives(self.conn.conn(), self.bound, members).await
+    }
+
+    async fn image_class(&mut self, member: &SqlImageId) -> Result<EquivClass<SqlImageId>, Error> {
+        read::equiv_class(self.conn.conn(), self.bound, *member).await
+    }
+
+    async fn walk_image_classes<'b>(
+        &'b mut self,
+        stream: &'b ImageStream<'b>,
+        after: Option<(SqlImageId, FactId)>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<ClassWalkPage<PostgresFactStore, SqlImageId>, Error> {
+        let bound = self.bound;
+        let conn = self.conn.conn();
+        match stream {
+            ImageStream::BySourceUrl { url } => {
+                let key = FacetKey::SourceUrl(url.as_str());
+                read::keyed_class_page(conn, bound, key, sourced_image, after, limit).await
+            }
+            ImageStream::All => read::all_class_page(conn, bound, after, limit).await,
+            ImageStream::InViewport(_)
+            | ImageStream::InTimeRange(_)
+            | ImageStream::InViewportAndTimeRange { .. } => Ok(empty_class_page()),
+        }
+    }
+
+    async fn all_facts_about_image(
+        &mut self,
+        image: &SqlImageId,
+        after: Option<FactId>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<WalkPage<PostgresFactStore, SqlImageId>, Error> {
+        read::backlink_page(self.conn.conn(), self.bound, *image, after, limit).await
+    }
+}
+
+// ============================================================================
+// FactWrite impl — the write connection forms only
+// ============================================================================
+
+impl<C: WriteConn> FactWrite<PostgresFactStore> for PostgresHandle<C> {
+    type Nested<'n>
+        = PostgresHandle<ScopeTx<'n>>
+    where
+        Self: 'n;
+
+    async fn with_submit_scope<'s, R, E, F>(&'s mut self, f: F) -> Result<Result<R, E>, Error>
+    where
+        Self: 's,
+        R: Send,
+        E: std::fmt::Debug + Send,
+        F: for<'n> FnOnce(
+                &'n mut Self::Nested<'s>,
+            ) -> Pin<Box<dyn Future<Output = Result<R, E>> + Send + 'n>>
+            + Send,
+    {
+        // sqlx tracks transaction depth on the connection, so this begin opens a
+        // savepoint nested in the write transaction.
+        let scope_tx = self
+            .conn
+            .conn()
+            .begin()
+            .await
+            .map_err(sql("opening submit scope"))?;
+        let mut scope = PostgresHandle {
+            conn: ScopeTx(scope_tx),
+            bound: ReadBound::Union,
+        };
+        let result = f(&mut scope).await;
+        if result.is_ok() {
+            scope
+                .conn
+                .0
+                .commit()
+                .await
+                .map_err(sql("committing submit scope"))?;
+        }
+        // A failed scope's savepoint rolls back when its transaction drops.
+        Ok(result)
+    }
+
+    async fn mint_entity(&mut self) -> Result<SqlEntityId, Error> {
+        Ok(SqlEntityId(
+            mint(self.conn.conn(), SubjectKind::Entity).await?,
+        ))
+    }
+
+    async fn mint_event(&mut self) -> Result<SqlEventId, Error> {
+        Ok(SqlEventId(
+            mint(self.conn.conn(), SubjectKind::Event).await?,
+        ))
+    }
+
+    async fn mint_image(&mut self) -> Result<SqlImageId, Error> {
+        Ok(SqlImageId(
+            mint(self.conn.conn(), SubjectKind::Image).await?,
+        ))
+    }
+
+    // Ids mint dense from zero, so the known checks bound both sides — a
+    // wire-supplied negative id is as unknown as one past the counter.
+
+    async fn entity_known(&mut self, id: &SqlEntityId) -> Result<bool, Error> {
+        let (entities, _, _) = counters(self.conn.conn()).await?;
+        Ok((0..entities).contains(&id.0))
+    }
+
+    async fn event_known(&mut self, id: &SqlEventId) -> Result<bool, Error> {
+        let (_, events, _) = counters(self.conn.conn()).await?;
+        Ok((0..events).contains(&id.0))
+    }
+
+    async fn image_known(&mut self, id: &SqlImageId) -> Result<bool, Error> {
+        let (_, _, images) = counters(self.conn.conn()).await?;
+        Ok((0..images).contains(&id.0))
+    }
+
+    async fn stage_fact(&mut self, fact: SqlStoredFact) -> Result<FactId, Error> {
+        let conn = self.conn.conn();
+        let facets = facet_columns(&fact)?;
+        let subjects = subject_rows(&fact);
+        let witness = witness_row(&fact);
+        let fact_json = fact_to_json(fact)?;
+        // A RetractCommit facet stores the target's surrogate seq; an unrecorded
+        // target resolves NULL, and the validator rejects the bundle before
+        // anything reads it. fact_json keeps the raw hash.
+        let retracts_commit_seq = match &facets.retracts_commit_id {
+            Some(hash) => read::commit_seq(&mut *conn, hash).await?,
+            None => None,
+        };
+        // Mint the dense fact id, then insert the row bound to it — no MAX(col)+1
+        // splice; the counter is the id source under the held row lock.
+        let fid_raw = mint_fact_id(&mut *conn).await?;
+        sqlx::query(queries::INSERT_FACT)
+            .bind(fid_raw)
+            .bind(&fact_json)
+            .bind(&facets.name_norm)
+            .bind(&facets.name_language)
+            .bind(&facets.external_ref)
+            .bind(&facets.source_url)
+            .bind(&facets.date_earliest)
+            .bind(&facets.date_latest)
+            .bind(facets.lat)
+            .bind(facets.lon)
+            .bind(facets.radius_m)
+            .bind(facets.edge_kind)
+            .bind(facets.edge_a)
+            .bind(facets.edge_b)
+            .bind(facets.event_owner)
+            .bind(facets.retracts_fact_id)
+            .bind(retracts_commit_seq)
+            .execute(&mut *conn)
+            .await
+            .map_err(sql("staging fact row"))?;
+        for (kind, subject) in subjects {
+            sqlx::query(queries::INSERT_SUBJECT)
+                .bind(fid_raw)
+                .bind(kind)
+                .bind(subject)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql("inserting fact subject row"))?;
+        }
+        // The spatial insert (facts_spatial) and record_retraction are later
+        // units; witness and representative-log maintenance run on the same
+        // connection as the staging, so a rejected submit's savepoint unwinds
+        // their rows with its fact rows.
+        if let Some(witness) = witness {
+            maintain::record_witness(&mut *conn, fid_raw, witness).await?;
+        }
+        if let (Some(kind), Some(a), Some(b)) = (facets.edge_kind, facets.edge_a, facets.edge_b) {
+            maintain::record_identity_edge(&mut *conn, kind, a, b, fid_raw).await?;
+        }
+        Ok(FactId::new(i64_to_u64(fid_raw, "staged fact id")?))
+    }
+
+    async fn cached_result(&mut self, id: &CommitId) -> Result<Option<SqlSubmitResult>, Error> {
+        read::cached_result(self.conn.conn(), id).await
+    }
+
+    async fn record_commit(
+        &mut self,
+        commit: StoredCommit,
+        result: &SqlSubmitResult,
+    ) -> Result<(), Error> {
+        let conn = self.conn.conn();
+        let commit_json = commit_to_json(&commit, result)?;
+        let result_json = result_to_json(result)?;
+        let commit_seq = mint_commit_seq(&mut *conn).await?;
+        sqlx::query(queries::INSERT_COMMIT)
+            .bind(commit_seq)
+            .bind(commit.commit_id.as_str())
+            .bind(&commit_json)
+            .bind(&result_json)
+            .execute(&mut *conn)
+            .await
+            .map_err(sql("recording commit metadata"))?;
+        // The `commit_seq IS NULL` guard makes a claim of an unknown or
+        // already-owned row update nothing — refused here, named.
+        for fid in &commit.fact_ids {
+            let fid_bind = u64_to_i64(fid.get(), "recorded fact id")?;
+            let claimed = sqlx::query(queries::CLAIM_FACT)
+                .bind(commit_seq)
+                .bind(fid_bind)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql("claiming recorded fact"))?;
+            if claimed.rows_affected() != 1 {
+                return Err(Error::FactClaim {
+                    commit_id: commit.commit_id.as_str().to_owned(),
+                    fact_id: fid.get(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Empty-page shapes
+// ============================================================================
+
+fn empty_class_page<Rep>() -> ClassPage<Rep, (Rep, FactId)> {
+    ClassPage {
+        rows: Vec::new(),
+        next: None,
+        next_class: None,
+    }
+}
+
+fn singleton_class<S: Ord + Copy>(member: S) -> EquivClass<S> {
+    EquivClass {
+        representative: member,
+        members: std::iter::once(member).collect(),
+    }
 }

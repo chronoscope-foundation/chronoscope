@@ -1,0 +1,197 @@
+//! Postgres fact-store query definitions.
+//!
+//! Postgres is one writable database — no base/overlay union, so every query is
+//! a plain `&str` constant (the SQLite backend's `has_base`-parameterized
+//! builders have no analogue here). The json columns are `JSONB`: writes bind
+//! the codec's JSON string with a `$N::jsonb` cast (sqlx sends the parameter as
+//! `text`, and the explicit cast turns it into `jsonb`), and reads project
+//! `col::text` so the [`crate::common::storage`] string codecs decode unchanged.
+//!
+//! Id-set-driven reads use `= ANY($n::bigint[])` / `unnest($n::bigint[])` over a
+//! bound `Vec<i64>` where the SQLite backend drove a `json_each` virtual table.
+//!
+//! Recursive-CTE reads (retraction closure, equivalence component, identity
+//! targets) and the spatial reads live in later units; the query-plan validator
+//! (seed + ANALYZE + bound-constant EXPLAIN) is a later unit too, so these
+//! strings are not plan-gated yet.
+
+// ---- Mints ----
+//
+// Bump-and-return against the single counters row. RETURNING evaluates
+// post-update, so `- 1` hands back the id just consumed. The counters row lock
+// taken at `with_tx` start (SELECT ... FOR UPDATE, held to commit) serializes
+// every mint, so no separate advisory lock is needed.
+pub(super) const MINT_ENTITY: &str = "UPDATE fact_counters SET next_entity_id = next_entity_id + 1 WHERE id = 0 RETURNING next_entity_id - 1";
+pub(super) const MINT_EVENT: &str = "UPDATE fact_counters SET next_event_id = next_event_id + 1 WHERE id = 0 RETURNING next_event_id - 1";
+pub(super) const MINT_IMAGE: &str = "UPDATE fact_counters SET next_image_id = next_image_id + 1 WHERE id = 0 RETURNING next_image_id - 1";
+pub(super) const MINT_FACT_ID: &str = "UPDATE fact_counters SET next_fact_id = next_fact_id + 1 WHERE id = 0 RETURNING next_fact_id - 1";
+pub(super) const MINT_COMMIT_SEQ: &str = "UPDATE fact_counters SET next_commit_seq = next_commit_seq + 1 WHERE id = 0 RETURNING next_commit_seq - 1";
+
+/// The counters-row lock: taken immediately after `BEGIN`, held through COMMIT,
+/// so match -> mint -> stage runs under one serialization point (decision #2).
+pub(super) const LOCK_COUNTERS: &str = "SELECT 1 FROM fact_counters WHERE id = 0 FOR UPDATE";
+
+/// The `(entity, event, image)` mint counters, read fresh per known-id check so
+/// the row stays the one source of what the store has minted.
+pub(super) const MINT_COUNTERS: &str =
+    "SELECT next_entity_id, next_event_id, next_image_id FROM fact_counters WHERE id = 0";
+
+/// The clock: one past the highest minted fact id. The counter is incremented
+/// per staged fact and rolled back with a failed submit scope, so on a
+/// committed reader it equals `max committed fact_id + 1`, and on the write tx
+/// it equals `max staged fact_id + 1`.
+pub(super) const NEXT_FACT_ID: &str = "SELECT next_fact_id FROM fact_counters WHERE id = 0";
+
+// ---- Inserts ----
+
+pub(super) const INSERT_SUBJECT: &str =
+    "INSERT INTO fact_subjects (fact_id, kind, subject_id) VALUES ($1, $2, $3)";
+
+// The pre-minted fact id binds as $1; fact_json binds as $2 (a JSON string cast
+// to jsonb). $3..$17 are the facet columns.
+pub(super) const INSERT_FACT: &str = "\
+    INSERT INTO facts (
+        fact_id, fact_json,
+        name_norm, name_language, external_ref, source_url,
+        date_earliest, date_latest, lat, lon, radius_m,
+        edge_kind, edge_a, edge_b, event_owner,
+        retracts_fact_id, retracts_commit_seq
+    ) VALUES (
+        $1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+    )";
+
+// The pre-minted commit seq binds as $1; commit_json / result_json as jsonb.
+pub(super) const INSERT_COMMIT: &str = "\
+    INSERT INTO fact_commits (commit_seq, commit_id, commit_json, result_json) \
+     VALUES ($1, $2, $3::jsonb, $4::jsonb)";
+
+pub(super) const INSERT_REP: &str =
+    "INSERT INTO subject_reps (kind, member, as_of, rep) VALUES ($1, $2, $3, $4)";
+
+// ---- Claim / audit ----
+
+pub(super) const CLAIM_FACT: &str =
+    "UPDATE facts SET commit_seq = $1 WHERE fact_id = $2 AND commit_seq IS NULL";
+
+// Any visible row still unclaimed. Committed state never holds one, so a hit is
+// the current transaction's own staging that no recorded commit claimed; probes
+// the idx_facts_unclaimed partial index.
+pub(super) const UNCLAIMED_STAGED_FACT: &str =
+    "SELECT fact_id FROM facts WHERE commit_seq IS NULL LIMIT 1";
+
+// ---- Point reads ----
+
+pub(super) const CACHED_RESULT: &str =
+    "SELECT result_json::text FROM fact_commits WHERE commit_id = $1";
+pub(super) const COMMIT_KNOWN: &str = "SELECT 1 FROM fact_commits WHERE commit_id = $1";
+pub(super) const COMMIT_SEQ: &str = "SELECT commit_seq FROM fact_commits WHERE commit_id = $1";
+pub(super) const FACT_ROW: &str = "SELECT fact_json::text FROM facts WHERE fact_id = $1";
+pub(super) const PLACEMENT_ROW: &str =
+    "SELECT commit_seq IS NOT NULL FROM facts WHERE fact_id = $1";
+
+// ---- Representative log ----
+
+// The member's last log row strictly below the exclusive bound wins; no row
+// means the member has always been its own representative.
+pub(super) const RESOLVE_REP: &str = "\
+    SELECT rep FROM subject_reps \
+     WHERE kind = $1 AND member = $2 AND as_of < $3 \
+     ORDER BY as_of DESC LIMIT 1";
+
+// Batch representative resolution: the resolve rule applied to every member of
+// a bigint[] ($2) in one query. Each member resolves through the same rule
+// (COALESCE to the member where it has no log row), so batch and point paths
+// can't disagree.
+pub(super) const RESOLVE_REPS: &str = "\
+    SELECT m AS member, \
+           COALESCE(( \
+             SELECT rep FROM subject_reps \
+              WHERE kind = $1 AND member = m AND as_of < $3 \
+              ORDER BY as_of DESC LIMIT 1 \
+           ), m) AS rep \
+    FROM unnest($2::bigint[]) AS m";
+
+// Every member whose latest log row below $3 names $2 as its representative,
+// each anti-joined against its own later rows. The representative itself
+// (rowless when it never moved) is the caller's to add.
+pub(super) const CLASS_MEMBERS: &str = "\
+    SELECT s.member FROM subject_reps s \
+     WHERE s.kind = $1 AND s.rep = $2 AND s.as_of < $3 \
+       AND NOT EXISTS ( \
+         SELECT 1 FROM subject_reps later \
+          WHERE later.kind = $1 AND later.member = s.member \
+            AND later.as_of > s.as_of AND later.as_of < $3 \
+       )";
+
+// The All-stream class walk: every subject of kind $1 below snapshot $2
+// resolved to its representative by the correlated one-seek log rule, deduped,
+// ordered by the computed (rep, fact_id), resuming strictly past cursor
+// ($3, $4), at most $5 rows. Retraction filtering happens in Rust.
+//
+// DELIBERATE FULL WALK: enumerating every class IS this stream's semantics, so
+// the kind-prefixed index search visits the whole subject population and every
+// page re-sorts the walk — conformance-scale only.
+pub(super) const CLASS_WALK_ALL: &str = "\
+    SELECT rep, fact_id FROM ( \
+        SELECT DISTINCT \
+            COALESCE(( \
+              SELECT r.rep FROM subject_reps r \
+               WHERE r.kind = $1 AND r.member = fs.subject_id AND r.as_of < $2 \
+               ORDER BY r.as_of DESC LIMIT 1 \
+            ), fs.subject_id) AS rep, \
+            fs.fact_id AS fact_id \
+        FROM fact_subjects fs \
+        WHERE fs.kind = $1 AND fs.fact_id < $2 \
+    ) u \
+    WHERE (u.rep, u.fact_id) > ($3, $4) \
+    ORDER BY u.rep, u.fact_id \
+    LIMIT $5";
+
+// ---- Backlinks / keyed candidates ----
+
+// One backlink-walk page of candidates: facts mentioning subject ($1 kind, $2
+// id), ascending, strictly past cursor $3 (-1 opens the walk), below snapshot
+// $4, at most $5 rows.
+pub(super) const BACKLINK_PAGE: &str = "\
+    SELECT s.fact_id, f.fact_json::text \
+     FROM fact_subjects s JOIN facts f ON f.fact_id = s.fact_id \
+     WHERE s.kind = $1 AND s.subject_id = $2 AND s.fact_id > $3 AND s.fact_id < $4 \
+     ORDER BY s.fact_id \
+     LIMIT $5";
+
+// Every fact mentioning subject ($1 kind, $2 id) below snapshot $3 —
+// BACKLINK_PAGE without the page cut. The depiction walk fetches each entity
+// class member's whole backlink set and filters to depictions in Rust.
+pub(super) const SUBJECT_FACTS: &str = "\
+    SELECT s.fact_id, f.fact_json::text \
+     FROM fact_subjects s JOIN facts f ON f.fact_id = s.fact_id \
+     WHERE s.kind = $1 AND s.subject_id = $2 AND s.fact_id < $3";
+
+// Keyed class-walk candidates: every fact under one facet key, below the
+// snapshot bound (the trailing parameter). The subject comes out of fact_json.
+pub(super) const CLASS_CANDIDATES_BY_NAME: &str = "\
+    SELECT fact_id, fact_json::text FROM facts \
+     WHERE name_norm = $1 AND name_language = $2 AND fact_id < $3";
+pub(super) const CLASS_CANDIDATES_BY_EXTREF: &str = "\
+    SELECT fact_id, fact_json::text FROM facts \
+     WHERE external_ref = $1 AND fact_id < $2";
+pub(super) const CLASS_CANDIDATES_BY_SRCURL: &str = "\
+    SELECT fact_id, fact_json::text FROM facts \
+     WHERE source_url = $1 AND fact_id < $2";
+
+// ---- Temporal-conflict witness inserts ----
+//
+// One row per relevant staged fact, under its immutable subject. Written in the
+// staging fact's submit savepoint, so a rejected submit unwinds them. The
+// witness *reads* (temporal_conflicts_indexed) land in a later unit alongside
+// retraction, but the writes populate the tables now.
+pub(super) const INSERT_EXISTENCE_WITNESS: &str = "INSERT INTO existence_witness (member, date_earliest, date_latest, date_json, fact_id) \
+     VALUES ($1, $2, $3, $4::jsonb, $5)";
+pub(super) const INSERT_EVENT_WITNESS: &str = "INSERT INTO event_witness (event, date_earliest, date_latest, date_json, fact_id, role) \
+     VALUES ($1, $2, $3, $4::jsonb, $5, $6)";
+pub(super) const INSERT_HAS_EVENT: &str =
+    "INSERT INTO has_event (member, event, fact_id) VALUES ($1, $2, $3)";
+pub(super) const INSERT_CONSTRUCTION_START: &str =
+    "INSERT INTO construction_start (member, date_json, fact_id) VALUES ($1, $2::jsonb, $3)";
+pub(super) const INSERT_DEMOLITION_COMPLETED: &str =
+    "INSERT INTO demolition_completed (member, date_json, fact_id) VALUES ($1, $2::jsonb, $3)";
