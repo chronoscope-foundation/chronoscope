@@ -44,7 +44,7 @@ use chronoscope_core::submit::{
     commit_facts,
 };
 
-use super::{SqliteEntityId, SqliteEventId, SqliteFactStore, SqliteFactView, SqliteIds};
+use super::{SqlEntityId, SqlEventId, SqlIds, SqliteFactStore, SqliteFactView};
 // The homomorphism check opens a fresh read view per snapshot, so it needs the
 // WAL reader/writer independence only a file-backed store gives — hence reusing
 // the crate's file-backed `fresh_store` builder rather than a fresh in-memory one.
@@ -183,12 +183,12 @@ fn name_fact(entity: usize, name: &str) -> Result<SubmitFact, TestError> {
 /// on content address.
 async fn try_commit(
     store: &SqliteFactStore,
-    entities: Vec<Decl<SqliteEntityId>>,
-    events: Vec<Decl<SqliteEventId>>,
+    entities: Vec<Decl<SqlEntityId>>,
+    events: Vec<Decl<SqlEventId>>,
     secs: i64,
     facts: Vec<SubmitFact>,
-) -> Option<SubmitResult<SqliteIds>> {
-    let commit = Commit::<SqliteIds> {
+) -> Option<SubmitResult<SqlIds>> {
+    let commit = Commit::<SqlIds> {
         author: CommitAuthor::User(UserId::new("prop")),
         recorded_at: fixed_time() + Duration::seconds(secs),
         entities,
@@ -204,17 +204,17 @@ async fn try_commit(
 async fn commit_one(
     store: &SqliteFactStore,
     secs: i64,
-    entities: Vec<Decl<SqliteEntityId>>,
-    events: Vec<Decl<SqliteEventId>>,
+    entities: Vec<Decl<SqlEntityId>>,
+    events: Vec<Decl<SqlEventId>>,
     facts: Vec<SubmitFact>,
-) -> Result<SubmitResult<SqliteIds>, TestError> {
+) -> Result<SubmitResult<SqlIds>, TestError> {
     try_commit(store, entities, events, secs, facts)
         .await
         .ok_or_else(|| "commit rejected".into())
 }
 
 /// The resolved id at an entity declaration slot of a commit result.
-fn entity_id(result: &SubmitResult<SqliteIds>, idx: usize) -> Result<SqliteEntityId, TestError> {
+fn entity_id(result: &SubmitResult<SqlIds>, idx: usize) -> Result<SqlEntityId, TestError> {
     Ok(result
         .entities
         .get(&EntityIdx(idx))
@@ -223,7 +223,7 @@ fn entity_id(result: &SubmitResult<SqliteIds>, idx: usize) -> Result<SqliteEntit
 }
 
 /// The resolved id at an event declaration slot of a commit result.
-fn event_id(result: &SubmitResult<SqliteIds>, idx: usize) -> Result<SqliteEventId, TestError> {
+fn event_id(result: &SubmitResult<SqlIds>, idx: usize) -> Result<SqlEventId, TestError> {
     Ok(result
         .events
         .get(&EventIdx(idx))
@@ -234,7 +234,7 @@ fn event_id(result: &SubmitResult<SqliteIds>, idx: usize) -> Result<SqliteEventI
 /// The live `HasEvent` fact id of an event at `now()`.
 async fn has_event_fact_id(
     store: &SqliteFactStore,
-    event: SqliteEventId,
+    event: SqlEventId,
 ) -> Result<FactId, TestError> {
     let mut view = store.now().await?;
     let limit = NonZeroUsize::new(256).ok_or("nonzero limit")?;
@@ -270,9 +270,9 @@ fn normalize(conflicts: &[TemporalConflict]) -> Vec<(BTreeSet<FactId>, TemporalC
 /// Assert the witness read equals the projection oracle for `entity` on this
 /// snapshot view. An id no fact names projects as `None` — no entity, no
 /// conflicts — which the witness read also answers empty.
-async fn assert_agrees(view: &mut SqliteFactView, entity: SqliteEntityId) -> Result<(), TestError> {
+async fn assert_agrees(view: &mut SqliteFactView, entity: SqlEntityId) -> Result<(), TestError> {
     let oracle = match project_entity::<SqliteFactStore, _, _>(view, entity, fact_lineage).await? {
-        Some((_, projected)) => temporal_conflicts::<SqliteIds>(&projected),
+        Some((_, projected)) => temporal_conflicts::<SqlIds>(&projected),
         None => Vec::new(),
     };
     let indexed = view.temporal_conflicts_indexed(entity).await?;
@@ -291,7 +291,7 @@ async fn assert_agrees(view: &mut SqliteFactView, entity: SqliteEntityId) -> Res
 /// facts, `next_fact_id` = now). One read view per snapshot serves all entities.
 async fn assert_homomorphism(
     store: &SqliteFactStore,
-    entities: &[SqliteEntityId],
+    entities: &[SqlEntityId],
 ) -> Result<(), TestError> {
     let next = store.next_fact_id().await?.get();
     for snapshot in 0..=next {
@@ -328,7 +328,7 @@ fn band(y: u8) -> i32 {
 }
 
 /// The `Decl::Existing` for a pool slot (mod 3).
-fn existing(entities: &[SqliteEntityId], slot: u8) -> Decl<SqliteEntityId> {
+fn existing(entities: &[SqlEntityId], slot: u8) -> Decl<SqlEntityId> {
     Decl::Existing {
         id: entities[usize::from(slot) % 3],
     }
@@ -357,7 +357,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
 async fn run_ops(
     store: &SqliteFactStore,
     ops: &[Op],
-) -> Result<(Vec<SqliteEntityId>, Vec<FactId>), TestError> {
+) -> Result<(Vec<SqlEntityId>, Vec<FactId>), TestError> {
     let mut secs: i64 = 0;
     let setup = commit_one(
         store,
@@ -373,7 +373,7 @@ async fn run_ops(
     .await?;
     secs += 1;
 
-    let entities: Vec<SqliteEntityId> = (0..3)
+    let entities: Vec<SqlEntityId> = (0..3)
         .map(|i| entity_id(&setup, i))
         .collect::<Result<_, _>>()?;
     let mut fact_ids: Vec<FactId> = setup.fact_ids.clone();

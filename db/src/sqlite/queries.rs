@@ -2,7 +2,7 @@
 //!
 //! Same [`QueryDef`] + startup `EXPLAIN QUERY PLAN` discipline as
 //! [`crate::queries`]; kept beside the fact-store code because these queries
-//! and the row codecs in [`super::storage`] change together.
+//! and the row codecs in [`crate::common::storage`] change together.
 //! [`verify_query_plans`] runs when a [`SqliteFactStore`](super::SqliteFactStore)
 //! opens (its `attach` step), against the pool that has the `ovl` overlay
 //! attached — the only place the fact tables these queries name resolve.

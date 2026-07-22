@@ -34,8 +34,8 @@ use chronoscope_core::submit::{
 };
 
 use super::convert::u64_to_i64;
-use super::error::SqliteFactStoreError;
-use super::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
+use super::error::CodecError;
+use super::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
 
 // ============================================================================
 // Subject-kind column tags
@@ -43,7 +43,7 @@ use super::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
 
 /// The `fact_subjects.kind` / `facts.edge_kind` column value for a subject
 /// kind. One home for the tag strings, shared by inserts and reads.
-pub(super) fn kind_tag(kind: SubjectKind) -> &'static str {
+pub(crate) fn kind_tag(kind: SubjectKind) -> &'static str {
     match kind {
         SubjectKind::Entity => "entity",
         SubjectKind::Event => "event",
@@ -54,13 +54,13 @@ pub(super) fn kind_tag(kind: SubjectKind) -> &'static str {
 /// A typed subject id viewed as its storage columns: the kind tag it files
 /// under and the raw `i64`. Lets the subject-parametric reads run once,
 /// generic over the three id kinds.
-pub(super) trait SubjectColumn: Copy + Ord + Send + Sync {
+pub(crate) trait SubjectColumn: Copy + Ord + Send + Sync {
     const KIND: SubjectKind;
     fn raw(self) -> i64;
     fn from_raw(raw: i64) -> Self;
 }
 
-impl SubjectColumn for SqliteEntityId {
+impl SubjectColumn for SqlEntityId {
     const KIND: SubjectKind = SubjectKind::Entity;
     fn raw(self) -> i64 {
         self.0
@@ -70,7 +70,7 @@ impl SubjectColumn for SqliteEntityId {
     }
 }
 
-impl SubjectColumn for SqliteEventId {
+impl SubjectColumn for SqlEventId {
     const KIND: SubjectKind = SubjectKind::Event;
     fn raw(self) -> i64 {
         self.0
@@ -80,7 +80,7 @@ impl SubjectColumn for SqliteEventId {
     }
 }
 
-impl SubjectColumn for SqliteImageId {
+impl SubjectColumn for SqlImageId {
     const KIND: SubjectKind = SubjectKind::Image;
     fn raw(self) -> i64 {
         self.0
@@ -94,18 +94,18 @@ impl SubjectColumn for SqliteImageId {
 // fact_json
 // ============================================================================
 
-/// Storage form of a [`StoredFact<SqliteIds>`] — the `facts.fact_json`
+/// Storage form of a [`StoredFact<SqlIds>`] — the `facts.fact_json`
 /// column.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "category", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum FactJson {
+pub(crate) enum FactJson {
     Factual {
-        assertion: FactualAssertion<SqliteIds>,
+        assertion: FactualAssertion<SqlIds>,
         citation: FactualCitation,
     },
     Judgment {
-        assertion: JudgmentAssertion<SqliteIds>,
-        source: JudgmentSource<SqliteImageId>,
+        assertion: JudgmentAssertion<SqlIds>,
+        source: JudgmentSource<SqlImageId>,
     },
     Meta {
         assertion: MetaAssertion,
@@ -113,8 +113,8 @@ pub(super) enum FactJson {
     },
 }
 
-impl From<StoredFact<SqliteIds>> for FactJson {
-    fn from(fact: StoredFact<SqliteIds>) -> Self {
+impl From<StoredFact<SqlIds>> for FactJson {
+    fn from(fact: StoredFact<SqlIds>) -> Self {
         match fact {
             StoredFact::Factual(StoredFactualFact {
                 assertion,
@@ -133,7 +133,7 @@ impl From<StoredFact<SqliteIds>> for FactJson {
     }
 }
 
-impl From<FactJson> for StoredFact<SqliteIds> {
+impl From<FactJson> for StoredFact<SqlIds> {
     fn from(row: FactJson) -> Self {
         match row {
             FactJson::Factual {
@@ -154,14 +154,14 @@ impl From<FactJson> for StoredFact<SqliteIds> {
 }
 
 /// Decode a `facts.fact_json` column.
-pub(super) fn fact_from_json(json: &str) -> Result<StoredFact<SqliteIds>, SqliteFactStoreError> {
+pub(crate) fn fact_from_json(json: &str) -> Result<StoredFact<SqlIds>, CodecError> {
     let row: FactJson =
         serde_json::from_str(json).map_err(super::error::json("decoding fact_json"))?;
     Ok(row.into())
 }
 
 /// Encode a fact for the `facts.fact_json` column.
-pub(super) fn fact_to_json(fact: StoredFact<SqliteIds>) -> Result<String, SqliteFactStoreError> {
+pub(crate) fn fact_to_json(fact: StoredFact<SqlIds>) -> Result<String, CodecError> {
     serde_json::to_string(&FactJson::from(fact)).map_err(super::error::json("encoding fact_json"))
 }
 
@@ -179,9 +179,9 @@ pub(super) fn fact_to_json(fact: StoredFact<SqliteIds>) -> Result<String, Sqlite
 struct CommitJson<'a> {
     author: Cow<'a, chronoscope_core::submit::CommitAuthor>,
     recorded_at: chrono::DateTime<chrono::Utc>,
-    entities: Vec<Decl<SqliteEntityId>>,
-    events: Vec<Decl<SqliteEventId>>,
-    images: Vec<Decl<SqliteImageId>>,
+    entities: Vec<Decl<SqlEntityId>>,
+    events: Vec<Decl<SqlEventId>>,
+    images: Vec<Decl<SqlImageId>>,
     fact_ids: Cow<'a, [FactId]>,
 }
 
@@ -192,20 +192,20 @@ fn decl_list<Idx, Id>(
     map: &std::collections::HashMap<Idx, Resolution<Id>>,
     idx: fn(usize) -> Idx,
     kind: &str,
-) -> Result<Vec<Decl<Id>>, SqliteFactStoreError>
+) -> Result<Vec<Decl<Id>>, CodecError>
 where
     Idx: Eq + std::hash::Hash,
     Id: Clone,
 {
     (0..map.len())
         .map(|position| {
-            let resolution =
-                map.get(&idx(position))
-                    .ok_or_else(|| SqliteFactStoreError::CommitRow {
-                        message: format!(
-                            "resolution map missing {kind} declaration position {position}"
-                        ),
-                    })?;
+            let resolution = map
+                .get(&idx(position))
+                .ok_or_else(|| CodecError::CommitRow {
+                    message: format!(
+                        "resolution map missing {kind} declaration position {position}"
+                    ),
+                })?;
             Ok(match &resolution.origin {
                 ResolutionOrigin::DeclaredExisting => Decl::Existing {
                     id: resolution.id.clone(),
@@ -217,10 +217,10 @@ where
 }
 
 /// Encode a commit record for the `fact_commits.commit_json` column.
-pub(super) fn commit_to_json(
+pub(crate) fn commit_to_json(
     commit: &StoredCommit,
-    result: &SubmitResult<SqliteIds>,
-) -> Result<String, SqliteFactStoreError> {
+    result: &SubmitResult<SqlIds>,
+) -> Result<String, CodecError> {
     let row = CommitJson {
         author: Cow::Borrowed(&commit.author),
         recorded_at: commit.recorded_at,
@@ -333,7 +333,7 @@ where
     entries
 }
 
-/// Storage form of a [`SubmitResult<SqliteIds>`] — the
+/// Storage form of a [`SubmitResult<SqlIds>`] — the
 /// `fact_commits.result_json` column.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -341,14 +341,14 @@ struct ResultJson<'a> {
     commit_id: Cow<'a, CommitId>,
     previously_committed: bool,
     fact_ids: Cow<'a, [FactId]>,
-    entities: Vec<(EntityIdx, ResolutionJson<'a, SqliteEntityId>)>,
-    events: Vec<(EventIdx, ResolutionJson<'a, SqliteEventId>)>,
-    images: Vec<(ImageIdx, ResolutionJson<'a, SqliteImageId>)>,
+    entities: Vec<(EntityIdx, ResolutionJson<'a, SqlEntityId>)>,
+    events: Vec<(EventIdx, ResolutionJson<'a, SqlEventId>)>,
+    images: Vec<(ImageIdx, ResolutionJson<'a, SqlImageId>)>,
     companion_commit_id: Option<Cow<'a, CommitId>>,
 }
 
-impl<'a> From<&'a SubmitResult<SqliteIds>> for ResultJson<'a> {
-    fn from(result: &'a SubmitResult<SqliteIds>) -> Self {
+impl<'a> From<&'a SubmitResult<SqlIds>> for ResultJson<'a> {
+    fn from(result: &'a SubmitResult<SqlIds>) -> Self {
         let SubmitResult {
             commit_id,
             previously_committed,
@@ -370,7 +370,7 @@ impl<'a> From<&'a SubmitResult<SqliteIds>> for ResultJson<'a> {
     }
 }
 
-impl From<ResultJson<'_>> for SubmitResult<SqliteIds> {
+impl From<ResultJson<'_>> for SubmitResult<SqlIds> {
     fn from(row: ResultJson<'_>) -> Self {
         let ResultJson {
             commit_id,
@@ -408,17 +408,13 @@ where
 }
 
 /// Encode a submit result for the `fact_commits.result_json` column.
-pub(super) fn result_to_json(
-    result: &SubmitResult<SqliteIds>,
-) -> Result<String, SqliteFactStoreError> {
+pub(crate) fn result_to_json(result: &SubmitResult<SqlIds>) -> Result<String, CodecError> {
     serde_json::to_string(&ResultJson::from(result))
         .map_err(super::error::json("encoding result_json"))
 }
 
 /// Decode a `fact_commits.result_json` column.
-pub(super) fn result_from_json(
-    json: &str,
-) -> Result<SubmitResult<SqliteIds>, SqliteFactStoreError> {
+pub(crate) fn result_from_json(json: &str) -> Result<SubmitResult<SqlIds>, CodecError> {
     let row: ResultJson =
         serde_json::from_str(json).map_err(super::error::json("decoding result_json"))?;
     Ok(row.into())
@@ -431,7 +427,7 @@ pub(super) fn result_from_json(
 /// The nullable facet columns of one `facts` row. Every field mirrors a
 /// column; [`facet_columns`] is the single extraction site.
 #[derive(Default)]
-pub(super) struct Facets {
+pub(crate) struct Facets {
     pub name_norm: Option<String>,
     pub name_language: Option<String>,
     pub external_ref: Option<String>,
@@ -489,14 +485,12 @@ impl Facets {
 
 /// The `external_ref` column key for a reference — its JSON encoding, the
 /// same on the write path and any index-backed lookup.
-pub(super) fn external_ref_key(
-    reference: &ExternalReference,
-) -> Result<String, SqliteFactStoreError> {
+pub(crate) fn external_ref_key(reference: &ExternalReference) -> Result<String, CodecError> {
     serde_json::to_string(reference).map_err(super::error::json("encoding external_ref key"))
 }
 
 /// Project a stored fact's single-valued facet columns.
-pub(super) fn facet_columns(fact: &StoredFact<SqliteIds>) -> Result<Facets, SqliteFactStoreError> {
+pub(crate) fn facet_columns(fact: &StoredFact<SqlIds>) -> Result<Facets, CodecError> {
     match fact {
         StoredFact::Factual(StoredFactualFact { assertion, .. }) => match assertion {
             FactualAssertion::Attribute { fact } => match fact {
@@ -585,7 +579,7 @@ pub(super) fn facet_columns(fact: &StoredFact<SqliteIds>) -> Result<Facets, Sqli
 // beside it so a facet's column and its subject stay one pairing.
 
 /// The entity a stored `Name` fact names.
-pub(super) fn named_entity(fact: &StoredFact<SqliteIds>) -> Option<SqliteEntityId> {
+pub(crate) fn named_entity(fact: &StoredFact<SqlIds>) -> Option<SqlEntityId> {
     match fact {
         StoredFact::Factual(StoredFactualFact {
             assertion:
@@ -599,7 +593,7 @@ pub(super) fn named_entity(fact: &StoredFact<SqliteIds>) -> Option<SqliteEntityI
 }
 
 /// The entity a stored `ExternalReference` fact names.
-pub(super) fn referenced_entity(fact: &StoredFact<SqliteIds>) -> Option<SqliteEntityId> {
+pub(crate) fn referenced_entity(fact: &StoredFact<SqlIds>) -> Option<SqlEntityId> {
     match fact {
         StoredFact::Factual(StoredFactualFact {
             assertion:
@@ -613,7 +607,7 @@ pub(super) fn referenced_entity(fact: &StoredFact<SqliteIds>) -> Option<SqliteEn
 }
 
 /// The image a stored `Source` fact names.
-pub(super) fn sourced_image(fact: &StoredFact<SqliteIds>) -> Option<SqliteImageId> {
+pub(crate) fn sourced_image(fact: &StoredFact<SqlIds>) -> Option<SqlImageId> {
     match fact {
         StoredFact::Factual(StoredFactualFact {
             assertion:
@@ -627,9 +621,7 @@ pub(super) fn sourced_image(fact: &StoredFact<SqliteIds>) -> Option<SqliteImageI
 }
 
 /// The `(entity, image)` pair a stored `Depiction` judgment links.
-pub(super) fn depiction_subjects(
-    fact: &StoredFact<SqliteIds>,
-) -> Option<(SqliteEntityId, SqliteImageId)> {
+pub(crate) fn depiction_subjects(fact: &StoredFact<SqlIds>) -> Option<(SqlEntityId, SqlImageId)> {
     match fact {
         StoredFact::Judgment(StoredJudgmentFact {
             assertion:
@@ -656,7 +648,7 @@ const ROLE_COMPLETED: i64 = 2;
 
 /// The witness / bookend index row a staged fact contributes, keyed by the
 /// fact's *immutable* subject. `None` for facts that seed no temporal index.
-pub(super) enum WitnessRow {
+pub(crate) enum WitnessRow {
     /// An `Existence` witness, under its entity.
     Existence { member: i64, date: UncertainDate },
     /// An interior-event date witness, under its event; `role` is the
@@ -675,9 +667,9 @@ pub(super) enum WitnessRow {
 }
 
 /// The temporal-index row a staged fact seeds, if any — the write-side half of
-/// the composed read in [`super::read`]. Only the five fact shapes the
+/// the composed read in [`crate::sqlite::read`]. Only the five fact shapes the
 /// temporal-conflict read consumes appear here; everything else seeds nothing.
-pub(super) fn witness_row(fact: &StoredFact<SqliteIds>) -> Option<WitnessRow> {
+pub(crate) fn witness_row(fact: &StoredFact<SqlIds>) -> Option<WitnessRow> {
     let StoredFact::Factual(StoredFactualFact { assertion, .. }) = fact else {
         return None;
     };
@@ -727,22 +719,22 @@ pub(super) fn witness_row(fact: &StoredFact<SqliteIds>) -> Option<WitnessRow> {
 /// bijection, so `<` / `>` on it is date order for BCE years and years past
 /// 9999 alike, where a date string would not sort. One definition both the
 /// stored endpoint and the scan threshold share, so the two can never drift.
-pub(super) fn day_number(date: NaiveDate) -> i64 {
+pub(crate) fn day_number(date: NaiveDate) -> i64 {
     i64::from(date.num_days_from_ce())
 }
 
 /// The full `UncertainDate` JSON a witness index row stores. Bookend rows, read
 /// whole rather than value-scanned, store only this.
-pub(super) fn witness_date_json(date: &UncertainDate) -> Result<String, SqliteFactStoreError> {
+pub(crate) fn witness_date_json(date: &UncertainDate) -> Result<String, CodecError> {
     serde_json::to_string(date).map_err(super::error::json("encoding witness date"))
 }
 
 /// The sortable endpoint days and JSON a value-scanned witness index row stores
 /// for a date: `(earliest, latest)` as [`day_number`]s, each `None` for an open
 /// side, plus the full `UncertainDate` JSON.
-pub(super) fn witness_date_columns(
+pub(crate) fn witness_date_columns(
     date: &UncertainDate,
-) -> Result<(Option<i64>, Option<i64>, String), SqliteFactStoreError> {
+) -> Result<(Option<i64>, Option<i64>, String), CodecError> {
     Ok((
         date.earliest().map(day_number),
         date.latest().map(day_number),
@@ -752,14 +744,14 @@ pub(super) fn witness_date_columns(
 
 /// The distinct `(kind tag, subject id)` pairs a fact mentions — its
 /// `fact_subjects` rows. A fact naming one id twice contributes one row.
-pub(super) fn subject_rows(fact: &StoredFact<SqliteIds>) -> Vec<(&'static str, i64)> {
+pub(crate) fn subject_rows(fact: &StoredFact<SqlIds>) -> Vec<(&'static str, i64)> {
     let mut entities: Vec<i64> = Vec::new();
     let mut events: Vec<i64> = Vec::new();
     let mut images: Vec<i64> = Vec::new();
     fact.for_each_id(
-        &mut |e: &SqliteEntityId| entities.push(e.0),
-        &mut |v: &SqliteEventId| events.push(v.0),
-        &mut |i: &SqliteImageId| images.push(i.0),
+        &mut |e: &SqlEntityId| entities.push(e.0),
+        &mut |v: &SqlEventId| events.push(v.0),
+        &mut |i: &SqlImageId| images.push(i.0),
     );
     let mut subjects: std::collections::BTreeSet<(&'static str, i64)> =
         std::collections::BTreeSet::new();
@@ -805,7 +797,7 @@ mod tests {
             fact_ids: vec![FactId::new(0), FactId::new(7)],
         };
         // Decl 0 was Existing, decl 1 minted fresh.
-        let result = SubmitResult::<SqliteIds> {
+        let result = SubmitResult::<SqlIds> {
             commit_id: commit.commit_id.clone(),
             previously_committed: false,
             fact_ids: commit.fact_ids.clone(),
@@ -813,14 +805,14 @@ mod tests {
                 (
                     EntityIdx(0),
                     Resolution {
-                        id: SqliteEntityId(3),
+                        id: SqlEntityId(3),
                         origin: ResolutionOrigin::DeclaredExisting,
                     },
                 ),
                 (
                     EntityIdx(1),
                     Resolution {
-                        id: SqliteEntityId(4),
+                        id: SqlEntityId(4),
                         origin: ResolutionOrigin::NewlyMinted,
                     },
                 ),
@@ -838,12 +830,7 @@ mod tests {
         assert_eq!(decoded.fact_ids.as_ref(), commit.fact_ids.as_slice());
         assert_eq!(
             decoded.entities,
-            vec![
-                Decl::Existing {
-                    id: SqliteEntityId(3)
-                },
-                Decl::Local,
-            ]
+            vec![Decl::Existing { id: SqlEntityId(3) }, Decl::Local,]
         );
         assert!(decoded.events.is_empty());
         assert!(decoded.images.is_empty());

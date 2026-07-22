@@ -29,14 +29,14 @@ use crate::DbError;
 
 /// Counters mint dense from zero, so `i64::MAX` is never assigned.
 impl UnmintedIds for SqliteFactStore {
-    fn unminted_entity() -> SqliteEntityId {
-        SqliteEntityId(i64::MAX)
+    fn unminted_entity() -> SqlEntityId {
+        SqlEntityId(i64::MAX)
     }
-    fn unminted_event() -> SqliteEventId {
-        SqliteEventId(i64::MAX)
+    fn unminted_event() -> SqlEventId {
+        SqlEventId(i64::MAX)
     }
-    fn unminted_image() -> SqliteImageId {
-        SqliteImageId(i64::MAX)
+    fn unminted_image() -> SqlImageId {
+        SqlImageId(i64::MAX)
     }
 }
 
@@ -174,7 +174,7 @@ async fn failed_transaction_rolls_back_mint_counters() -> TestResult {
         .id;
     assert_eq!(
         minted,
-        SqliteEntityId(0),
+        SqlEntityId(0),
         "rolled-back mints must not burn counter values"
     );
     Ok(())
@@ -191,10 +191,10 @@ async fn rejected_submit_unwinds_and_the_transaction_stays_usable() -> TestResul
     let (store, _dir) = fresh_store().await?;
     // Decl 1 is never referenced: the bundle stages its one fact, then
     // rejects with UnusedDeclaration.
-    let doomed = local_bundle::<SqliteIds>(2, 0, 0, 0, vec![name_fact(0, "shared-name")?])?;
+    let doomed = local_bundle::<SqlIds>(2, 0, 0, 0, vec![name_fact(0, "shared-name")?])?;
     // The same name on the healthy bundle: leaked staging would hand the
     // matcher a candidate.
-    let healthy = local_bundle::<SqliteIds>(1, 0, 0, 10, vec![name_fact(0, "shared-name")?])?;
+    let healthy = local_bundle::<SqlIds>(1, 0, 0, 10, vec![name_fact(0, "shared-name")?])?;
 
     let result = store
         .with_tx(move |s, tx| {
@@ -237,10 +237,9 @@ async fn rejected_submit_unwinds_and_the_transaction_stays_usable() -> TestResul
 #[tokio::test]
 async fn swallowed_rejection_commits_only_the_recorded_commits() -> TestResult {
     let (store, _dir) = fresh_store().await?;
-    let doomed =
-        local_bundle::<SqliteIds>(2, 0, 0, 0, vec![name_fact(0, "staged-then-rejected")?])?;
+    let doomed = local_bundle::<SqlIds>(2, 0, 0, 0, vec![name_fact(0, "staged-then-rejected")?])?;
     let doomed_id = doomed.id()?;
-    let healthy = local_bundle::<SqliteIds>(1, 0, 0, 10, vec![name_fact(0, "kept")?])?;
+    let healthy = local_bundle::<SqlIds>(1, 0, 0, 10, vec![name_fact(0, "kept")?])?;
 
     store
         .with_tx(move |s, tx| {
@@ -308,12 +307,12 @@ async fn unminted_ids_read_as_domain_answers() -> TestResult {
         "an unstorable fact id was never minted, got {lookup:?}"
     );
 
-    let huge = SqliteEntityId(i64::MAX - 1);
+    let huge = SqlEntityId(i64::MAX - 1);
     assert_eq!(view.entity_representative(&huge).await?, huge);
     let class = view.entity_class(&huge).await?;
     assert_eq!(class.members.len(), 1);
 
-    let negative = SqliteEntityId(-7);
+    let negative = SqlEntityId(-7);
     assert_eq!(view.entity_representative(&negative).await?, negative);
     Ok(())
 }
@@ -326,11 +325,11 @@ async fn negative_existing_entity_id_rejected_as_unknown() -> TestResult {
     let (store, _dir) = fresh_store().await?;
     commit_name(&store, "resident").await?;
 
-    let bundle: SubmitBundle<SqliteIds> = SubmitBundle {
+    let bundle: SubmitBundle<SqlIds> = SubmitBundle {
         author: user_author()?,
         recorded_at: fixed_time() + chrono::Duration::seconds(10),
         entities: vec![Decl::Existing {
-            id: SqliteEntityId(-1),
+            id: SqlEntityId(-1),
         }],
         events: Vec::new(),
         images: Vec::new(),
@@ -416,11 +415,11 @@ async fn begin_immediate_serializes_concurrent_writers() -> TestResult {
         .with_tx(|_s, tx| {
             Box::pin(async move {
                 let one = tx
-                    .entity_known(&SqliteEntityId(1))
+                    .entity_known(&SqlEntityId(1))
                     .await
                     .map_err(|e| e.to_string())?;
                 let two = tx
-                    .entity_known(&SqliteEntityId(2))
+                    .entity_known(&SqlEntityId(2))
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok((one, two))
@@ -459,7 +458,7 @@ async fn fact_store_query_plans_use_indexes_over_a_mounted_base() -> TestResult 
     let base = open_base(&base_path).await?;
     commit_result(
         &base,
-        local_bundle::<SqliteIds>(1, 0, 0, 0, vec![construction_at(0, 40.5, -73.5)?])?,
+        local_bundle::<SqlIds>(1, 0, 0, 0, vec![construction_at(0, 40.5, -73.5)?])?,
     )
     .await?;
     finish_base(base).await?;
@@ -622,7 +621,7 @@ async fn overlay_mint_continues_past_base_ids() -> TestResult {
     let base = open_base(&base_path).await?;
     let base_result = commit_result(
         &base,
-        local_bundle::<SqliteIds>(
+        local_bundle::<SqlIds>(
             3,
             0,
             0,
@@ -648,7 +647,7 @@ async fn overlay_mint_continues_past_base_ids() -> TestResult {
         .id;
     assert_eq!(
         minted,
-        SqliteEntityId(3),
+        SqlEntityId(3),
         "a fresh overlay mint must continue past the base's three entities, not collide at 0"
     );
     assert_eq!(
@@ -673,7 +672,7 @@ async fn overlay_same_entity_merges_a_base_class() -> TestResult {
     let base = open_base(&base_path).await?;
     commit_result(
         &base,
-        local_bundle::<SqliteIds>(
+        local_bundle::<SqlIds>(
             3,
             0,
             0,
@@ -693,16 +692,12 @@ async fn overlay_same_entity_merges_a_base_class() -> TestResult {
     // Merge base entity 0 with the base class {1, 2} via existing-id decls.
     commit_result(
         &store,
-        SubmitBundle::<SqliteIds> {
+        SubmitBundle::<SqlIds> {
             author: user_author()?,
             recorded_at: fixed_time() + chrono::Duration::seconds(10),
             entities: vec![
-                Decl::Existing {
-                    id: SqliteEntityId(0),
-                },
-                Decl::Existing {
-                    id: SqliteEntityId(1),
-                },
+                Decl::Existing { id: SqlEntityId(0) },
+                Decl::Existing { id: SqlEntityId(1) },
             ],
             events: Vec::new(),
             images: Vec::new(),
@@ -712,19 +707,18 @@ async fn overlay_same_entity_merges_a_base_class() -> TestResult {
     .await?;
 
     let mut view = store.now().await?;
-    let class = view.entity_class(&SqliteEntityId(0)).await?;
-    let members: std::collections::BTreeSet<SqliteEntityId> =
-        class.members.iter().copied().collect();
+    let class = view.entity_class(&SqlEntityId(0)).await?;
+    let members: std::collections::BTreeSet<SqlEntityId> = class.members.iter().copied().collect();
     assert_eq!(
         members,
-        [SqliteEntityId(0), SqliteEntityId(1), SqliteEntityId(2)]
+        [SqlEntityId(0), SqlEntityId(1), SqlEntityId(2)]
             .into_iter()
             .collect(),
         "the overlay merge must pull the base member 2 into the class across the union"
     );
     assert_eq!(
-        view.entity_representative(&SqliteEntityId(2)).await?,
-        SqliteEntityId(0),
+        view.entity_representative(&SqlEntityId(2)).await?,
+        SqlEntityId(0),
         "base member 2 must resolve to the merged representative 0"
     );
     drop(view);
@@ -743,7 +737,7 @@ async fn overlay_retraction_hides_a_base_fact() -> TestResult {
     let base = open_base(&base_path).await?;
     let base_result = commit_result(
         &base,
-        local_bundle::<SqliteIds>(
+        local_bundle::<SqlIds>(
             1,
             0,
             0,
@@ -768,7 +762,7 @@ async fn overlay_retraction_hides_a_base_fact() -> TestResult {
     }
     commit_result(
         &store,
-        SubmitBundle::<SqliteIds> {
+        SubmitBundle::<SqlIds> {
             author: user_author()?,
             recorded_at: fixed_time() + chrono::Duration::seconds(10),
             entities: Vec::new(),
@@ -802,7 +796,7 @@ async fn overlay_split_shadows_base_rep_earlier_snapshots_stay_merged() -> TestR
     let base = open_base(&base_path).await?;
     let base_result = commit_result(
         &base,
-        local_bundle::<SqliteIds>(
+        local_bundle::<SqlIds>(
             2,
             0,
             0,
@@ -824,14 +818,14 @@ async fn overlay_split_shadows_base_rep_earlier_snapshots_stay_merged() -> TestR
     {
         let mut view = store.now().await?;
         assert_eq!(
-            view.entity_representative(&SqliteEntityId(1)).await?,
-            SqliteEntityId(0),
+            view.entity_representative(&SqlEntityId(1)).await?,
+            SqlEntityId(0),
             "the base merge holds before the overlay splits it"
         );
     }
     commit_result(
         &store,
-        SubmitBundle::<SqliteIds> {
+        SubmitBundle::<SqlIds> {
             author: user_author()?,
             recorded_at: fixed_time() + chrono::Duration::seconds(10),
             entities: Vec::new(),
@@ -844,16 +838,16 @@ async fn overlay_split_shadows_base_rep_earlier_snapshots_stay_merged() -> TestR
 
     let mut now_view = store.now().await?;
     assert_eq!(
-        now_view.entity_representative(&SqliteEntityId(1)).await?,
-        SqliteEntityId(1),
+        now_view.entity_representative(&SqlEntityId(1)).await?,
+        SqlEntityId(1),
         "the overlay split shadows the base rep at now"
     );
     drop(now_view);
 
     let mut past_view = store.no_later_than(merged_snapshot).await?;
     assert_eq!(
-        past_view.entity_representative(&SqliteEntityId(1)).await?,
-        SqliteEntityId(0),
+        past_view.entity_representative(&SqlEntityId(1)).await?,
+        SqlEntityId(0),
         "a snapshot before the overlay split still reads the base merge through the union"
     );
     drop(past_view);
@@ -875,7 +869,7 @@ async fn walks_span_base_and_overlay_over_a_read_only_pin() -> TestResult {
     let base = open_base(&base_path).await?;
     let base_result = commit_result(
         &base,
-        local_bundle::<SqliteIds>(
+        local_bundle::<SqlIds>(
             1,
             0,
             0,
@@ -910,7 +904,7 @@ async fn walks_span_base_and_overlay_over_a_read_only_pin() -> TestResult {
             limit,
         )
         .await?;
-    let named_reps: Vec<SqliteEntityId> = named.rows.iter().map(|r| r.representative).collect();
+    let named_reps: Vec<SqlEntityId> = named.rows.iter().map(|r| r.representative).collect();
     assert!(
         named_reps.contains(&base_entity),
         "the ByName walk must surface the base entity across the union, got {named_reps:?}"
@@ -920,7 +914,7 @@ async fn walks_span_base_and_overlay_over_a_read_only_pin() -> TestResult {
     let spatial = view
         .walk_entity_classes(&EntityStream::InViewport(&viewport), None, limit)
         .await?;
-    let spatial_reps: Vec<SqliteEntityId> = spatial.rows.iter().map(|r| r.representative).collect();
+    let spatial_reps: Vec<SqlEntityId> = spatial.rows.iter().map(|r| r.representative).collect();
     assert!(
         spatial_reps.contains(&base_entity),
         "the InViewport walk must surface the base-located entity through the two-branch rtree, \

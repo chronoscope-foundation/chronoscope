@@ -34,11 +34,12 @@ use chronoscope_core::store::schema::{
 };
 use chronoscope_core::submit::{FactLookup, LocatedSubject, StoredFact, SubmitResult};
 
-use super::convert::{i64_to_u64, seed_ids, u64_to_i64};
-use super::error::{SqliteFactStoreError, json, sql};
-use super::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
+use super::error::{SqliteFactStoreError, sql};
 use super::queries::{self, FactQueries};
-use super::storage::{
+use crate::common::convert::{i64_to_u64, seed_ids, u64_to_i64};
+use crate::common::error::json;
+use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
+use crate::common::storage::{
     SubjectColumn, day_number, depiction_subjects, fact_from_json, kind_tag, result_from_json,
 };
 
@@ -134,7 +135,7 @@ pub(super) async fn fact_lookup(
     conn: &mut SqliteConnection,
     bound: ReadBound,
     fact_id: FactId,
-) -> Result<FactLookup<SqliteIds>, SqliteFactStoreError> {
+) -> Result<FactLookup<SqlIds>, SqliteFactStoreError> {
     if let Some(snapshot) = bound.snapshot()
         && fact_id.get() >= snapshot.get()
     {
@@ -195,14 +196,15 @@ pub(super) async fn commit_seq(
 pub(super) async fn cached_result(
     conn: &mut SqliteConnection,
     id: &chronoscope_core::grammar::ids::CommitId,
-) -> Result<Option<SubmitResult<SqliteIds>>, SqliteFactStoreError> {
+) -> Result<Option<SubmitResult<SqlIds>>, SqliteFactStoreError> {
     let row: Option<(String,)> = sqlx::query_as(queries::CACHED_RESULT.sql)
         .bind(id.as_str())
         .fetch_optional(&mut *conn)
         .await
         .map_err(sql("fetching cached submit result"))?;
-    row.map(|(result_json,)| result_from_json(&result_json))
-        .transpose()
+    Ok(row
+        .map(|(result_json,)| result_from_json(&result_json))
+        .transpose()?)
 }
 
 /// Where a fact id sits relative to the snapshot. A row whose commit hasn't
@@ -368,7 +370,7 @@ pub(super) async fn backlink_page<S: SubjectColumn>(
     subject: S,
     after: Option<FactId>,
     limit: std::num::NonZeroUsize,
-) -> Result<FactPage<StoredFact<SqliteIds>, S, FactId>, SqliteFactStoreError> {
+) -> Result<FactPage<StoredFact<SqlIds>, S, FactId>, SqliteFactStoreError> {
     // -1 sits below every stored id, so it opens the strictly-past scan.
     let cursor_bind = match after {
         None => -1,
@@ -418,10 +420,10 @@ pub(super) async fn backlink_page<S: SubjectColumn>(
 pub(super) async fn has_event_backlink_page(
     conn: &mut SqliteConnection,
     bound: ReadBound,
-    event: SqliteEventId,
+    event: SqlEventId,
     after: Option<FactId>,
     limit: std::num::NonZeroUsize,
-) -> Result<FactPage<StoredFact<SqliteIds>, SqliteEventId, FactId>, SqliteFactStoreError> {
+) -> Result<FactPage<StoredFact<SqlIds>, SqlEventId, FactId>, SqliteFactStoreError> {
     // -1 sits below every stored id, so it opens the strictly-past scan.
     let cursor_bind = match after {
         None => -1,
@@ -432,7 +434,7 @@ pub(super) async fn has_event_backlink_page(
         .unwrap_or(i64::MAX)
         .saturating_add(1);
     let mut rows: Vec<(i64, String)> = sqlx::query_as(queries::BACKLINK_PAGE.sql)
-        .bind(kind_tag(SqliteEventId::KIND))
+        .bind(kind_tag(SqlEventId::KIND))
         .bind(event.raw())
         .bind(cursor_bind)
         .bind(bound.bind())
@@ -465,7 +467,7 @@ pub(super) async fn has_event_backlink_page(
 /// The facet key a keyed class walk fetches candidates under. Each variant
 /// carries exactly the columns of its partial index; the key values arrive
 /// pre-encoded by the same functions the write path uses ([`normalize_name`]
-/// for names, [`external_ref_key`](super::storage::external_ref_key) for
+/// for names, [`external_ref_key`](crate::common::storage::external_ref_key) for
 /// references), so the walk and the stored facets cannot drift.
 ///
 /// [`normalize_name`]: chronoscope_core::store::schema::normalize_name
@@ -541,7 +543,7 @@ pub(super) async fn keyed_class_page<S: SubjectColumn>(
     bound: ReadBound,
     fq: &FactQueries,
     key: FacetKey<'_>,
-    subject_of: impl Fn(&StoredFact<SqliteIds>) -> Option<S>,
+    subject_of: impl Fn(&StoredFact<SqlIds>) -> Option<S>,
     after: Option<(S, FactId)>,
     limit: std::num::NonZeroUsize,
 ) -> Result<ClassPage<S, (S, FactId)>, SqliteFactStoreError> {
@@ -578,20 +580,18 @@ pub(super) async fn depiction_page(
     conn: &mut SqliteConnection,
     bound: ReadBound,
     fq: &FactQueries,
-    entity: SqliteEntityId,
-    after: Option<(SqliteImageId, FactId)>,
+    entity: SqlEntityId,
+    after: Option<(SqlImageId, FactId)>,
     limit: std::num::NonZeroUsize,
-) -> Result<
-    DepictionPage<StoredFact<SqliteIds>, SqliteImageId, (SqliteImageId, FactId)>,
-    SqliteFactStoreError,
-> {
+) -> Result<DepictionPage<StoredFact<SqlIds>, SqlImageId, (SqlImageId, FactId)>, SqliteFactStoreError>
+{
     let members = equiv_class(conn, bound, fq, entity).await?.members;
     // A depiction names one entity, so each candidate appears under exactly
     // one member; the map keys by fact id regardless.
     let mut candidates: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
     for member in &members {
         let rows: Vec<(i64, String)> = sqlx::query_as(queries::SUBJECT_FACTS.sql)
-            .bind(kind_tag(SqliteEntityId::KIND))
+            .bind(kind_tag(SqlEntityId::KIND))
             .bind(member.raw())
             .bind(bound.bind())
             .fetch_all(&mut *conn)
@@ -603,9 +603,9 @@ pub(super) async fn depiction_page(
     let retraction = retraction_edges(conn, bound, &seeds).await?;
 
     let mut reps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-    let mut rows: std::collections::BTreeSet<(SqliteImageId, FactId)> =
+    let mut rows: std::collections::BTreeSet<(SqlImageId, FactId)> =
         std::collections::BTreeSet::new();
-    let mut facts: std::collections::BTreeMap<FactId, StoredFact<SqliteIds>> =
+    let mut facts: std::collections::BTreeMap<FactId, StoredFact<SqlIds>> =
         std::collections::BTreeMap::new();
     for ((_, fact_json), fid) in candidates.iter().zip(&seeds) {
         if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
@@ -622,17 +622,17 @@ pub(super) async fn depiction_page(
             conn,
             bound,
             fq,
-            kind_tag(SqliteImageId::KIND),
+            kind_tag(SqlImageId::KIND),
             image.raw(),
             &mut reps,
         )
         .await?;
-        rows.insert((SqliteImageId::from_raw(rep), *fid));
+        rows.insert((SqlImageId::from_raw(rep), *fid));
         facts.insert(*fid, fact);
     }
 
     let (pairs, next_class) = pagination::grouped_class_page(&rows, after, limit);
-    let mut page: Vec<PageItem<StoredFact<SqliteIds>, SqliteImageId>> = Vec::new();
+    let mut page: Vec<PageItem<StoredFact<SqlIds>, SqlImageId>> = Vec::new();
     for (representative, fact_id) in pairs {
         // Every row's fact was kept when the row was built.
         if let Some(fact) = facts.remove(&fact_id) {
@@ -665,7 +665,7 @@ async fn located_in_viewport(
     fq: &FactQueries,
     viewport: &Viewport,
     kinds: (&str, &str),
-) -> Result<Vec<(FactId, StoredFact<SqliteIds>)>, SqliteFactStoreError> {
+) -> Result<Vec<(FactId, StoredFact<SqlIds>)>, SqliteFactStoreError> {
     // The spatial read can't span layers through a temp view (an rtree drives
     // its index only when named directly), so the candidate SQL unions the base
     // and overlay rtree branches explicitly when a base is mounted.
@@ -713,8 +713,8 @@ async fn located_in_viewport(
 async fn event_owners(
     conn: &mut SqliteConnection,
     bound: ReadBound,
-    events: &std::collections::BTreeSet<SqliteEventId>,
-) -> Result<std::collections::BTreeMap<SqliteEventId, SqliteEntityId>, SqliteFactStoreError> {
+    events: &std::collections::BTreeSet<SqlEventId>,
+) -> Result<std::collections::BTreeMap<SqlEventId, SqlEntityId>, SqliteFactStoreError> {
     if events.is_empty() {
         return Ok(std::collections::BTreeMap::new());
     }
@@ -722,7 +722,7 @@ async fn event_owners(
     let event_json = serde_json::to_string(&event_ids).map_err(json("encoding event id list"))?;
     let rows: Vec<(i64, i64, i64)> = sqlx::query_as(queries::EVENT_OWNERS.sql)
         .bind(&event_json)
-        .bind(kind_tag(SqliteEventId::KIND))
+        .bind(kind_tag(SqlEventId::KIND))
         .bind(bound.bind())
         .fetch_all(&mut *conn)
         .await
@@ -740,10 +740,7 @@ async fn event_owners(
         if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
             continue;
         }
-        owners.insert(
-            SqliteEventId::from_raw(*event),
-            SqliteEntityId::from_raw(*owner),
-        );
+        owners.insert(SqlEventId::from_raw(*event), SqlEntityId::from_raw(*owner));
     }
     Ok(owners)
 }
@@ -758,16 +755,13 @@ pub(super) async fn spatial_entity_page(
     bound: ReadBound,
     fq: &FactQueries,
     viewport: &Viewport,
-    after: Option<(SqliteEntityId, FactId)>,
+    after: Option<(SqlEntityId, FactId)>,
     limit: std::num::NonZeroUsize,
-) -> Result<ClassPage<SqliteEntityId, (SqliteEntityId, FactId)>, SqliteFactStoreError> {
-    let kinds = (
-        kind_tag(SqliteEntityId::KIND),
-        kind_tag(SqliteEventId::KIND),
-    );
+) -> Result<ClassPage<SqlEntityId, (SqlEntityId, FactId)>, SqliteFactStoreError> {
+    let kinds = (kind_tag(SqlEntityId::KIND), kind_tag(SqlEventId::KIND));
     let located = located_in_viewport(conn, bound, fq, viewport, kinds).await?;
-    let mut subjects: Vec<(SqliteEntityId, FactId)> = Vec::new();
-    let mut moved: Vec<(SqliteEventId, FactId)> = Vec::new();
+    let mut subjects: Vec<(SqlEntityId, FactId)> = Vec::new();
+    let mut moved: Vec<(SqlEventId, FactId)> = Vec::new();
     for (fid, fact) in &located {
         match fact.located_subject() {
             Some((_, LocatedSubject::Entity(entity))) => subjects.push((*entity, *fid)),
@@ -775,7 +769,7 @@ pub(super) async fn spatial_entity_page(
             Some((_, LocatedSubject::Image(_))) | None => {}
         }
     }
-    let events: std::collections::BTreeSet<SqliteEventId> =
+    let events: std::collections::BTreeSet<SqlEventId> =
         moved.iter().map(|(event, _)| *event).collect();
     let owners = event_owners(conn, bound, &events).await?;
     for (event, fid) in moved {
@@ -794,12 +788,12 @@ pub(super) async fn spatial_image_page(
     bound: ReadBound,
     fq: &FactQueries,
     viewport: &Viewport,
-    after: Option<(SqliteImageId, FactId)>,
+    after: Option<(SqlImageId, FactId)>,
     limit: std::num::NonZeroUsize,
-) -> Result<ClassPage<SqliteImageId, (SqliteImageId, FactId)>, SqliteFactStoreError> {
-    let kind = kind_tag(SqliteImageId::KIND);
+) -> Result<ClassPage<SqlImageId, (SqlImageId, FactId)>, SqliteFactStoreError> {
+    let kind = kind_tag(SqlImageId::KIND);
     let located = located_in_viewport(conn, bound, fq, viewport, (kind, kind)).await?;
-    let mut subjects: Vec<(SqliteImageId, FactId)> = Vec::new();
+    let mut subjects: Vec<(SqlImageId, FactId)> = Vec::new();
     for (fid, fact) in &located {
         if let Some((_, LocatedSubject::Image(image))) = fact.located_subject() {
             subjects.push((*image, *fid));
@@ -942,7 +936,7 @@ fn subject_id_json<S: SubjectColumn>(
     context: &'static str,
 ) -> Result<String, SqliteFactStoreError> {
     let raw: Vec<i64> = ids.iter().map(|&id| id.raw()).collect();
-    serde_json::to_string(&raw).map_err(json(context))
+    Ok(serde_json::to_string(&raw).map_err(json(context))?)
 }
 
 /// The events a class owns at the bound: every event some member holds a
@@ -954,8 +948,8 @@ fn subject_id_json<S: SubjectColumn>(
 async fn owned_events(
     conn: &mut SqliteConnection,
     bound: ReadBound,
-    members: &BTreeSet<SqliteEntityId>,
-) -> Result<BTreeSet<SqliteEventId>, SqliteFactStoreError> {
+    members: &BTreeSet<SqlEntityId>,
+) -> Result<BTreeSet<SqlEventId>, SqliteFactStoreError> {
     let members_json = subject_id_json(members, "encoding has-event member id list")?;
     // Keyed by fact id so the retraction filter runs over deduped edge facts.
     let mut candidates: BTreeMap<i64, i64> = BTreeMap::new();
@@ -975,7 +969,7 @@ async fn owned_events(
         if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
             continue;
         }
-        owned.insert(SqliteEventId::from_raw(*event));
+        owned.insert(SqlEventId::from_raw(*event));
     }
     Ok(owned)
 }
@@ -986,7 +980,7 @@ async fn owned_events(
 async fn bookend_facts(
     conn: &mut SqliteConnection,
     bound: ReadBound,
-    members: &BTreeSet<SqliteEntityId>,
+    members: &BTreeSet<SqlEntityId>,
     query: &'static str,
 ) -> Result<Vec<(FactId, UncertainDate)>, SqliteFactStoreError> {
     let members_json = subject_id_json(members, "encoding bookend member id list")?;
@@ -1020,8 +1014,8 @@ async fn bookend_facts(
 async fn witness_groups(
     conn: &mut SqliteConnection,
     bound: ReadBound,
-    members: &BTreeSet<SqliteEntityId>,
-    owned: &BTreeSet<SqliteEventId>,
+    members: &BTreeSet<SqlEntityId>,
+    owned: &BTreeSet<SqlEventId>,
     threshold: Threshold,
 ) -> Result<Vec<Vec<(FactId, UncertainDate)>>, SqliteFactStoreError> {
     let (existence_sql, event_sql, day) = match threshold {
@@ -1121,7 +1115,7 @@ pub(super) async fn temporal_conflict_scan(
     conn: &mut SqliteConnection,
     bound: ReadBound,
     fq: &FactQueries,
-    entity: SqliteEntityId,
+    entity: SqlEntityId,
 ) -> Result<WitnessScan, SqliteFactStoreError> {
     let members = equiv_class(conn, bound, fq, entity).await?.members;
     let owned = owned_events(conn, bound, &members).await?;

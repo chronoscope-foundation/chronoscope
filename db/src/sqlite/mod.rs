@@ -56,14 +56,10 @@
 //! region predicate; the temporal streams still answer empty pages until their
 //! index exists, with their conformance cases ignored.
 
-mod convert;
 mod error;
 mod maintain;
 mod queries;
 mod read;
-mod storage;
-
-pub mod ids;
 
 #[cfg(test)]
 mod tests;
@@ -90,22 +86,22 @@ use chronoscope_core::store::{
 use chronoscope_core::submit::{FactLookup, StoredCommit, StoredFact, SubmitResult};
 
 pub use self::error::SqliteFactStoreError;
-pub use self::ids::{SqliteEntityId, SqliteEventId, SqliteIds, SqliteImageId};
 
-use self::error::sql;
-use self::queries::FactQueries;
-use self::read::{FacetKey, ReadBound};
-use self::storage::{
+use crate::common::convert::{i64_to_u64, u64_to_i64};
+use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
+use crate::common::storage::{
     commit_to_json, external_ref_key, facet_columns, fact_to_json, kind_tag, named_entity,
     referenced_entity, result_to_json, sourced_image, subject_rows, witness_row,
 };
 
-use self::convert::{i64_to_u64, u64_to_i64};
+use self::error::sql;
+use self::queries::FactQueries;
+use self::read::{FacetKey, ReadBound};
 
 // Aliases to keep the spellings short.
-type SqlStoredFact = StoredFact<SqliteIds>;
-type SqlFactLookup = FactLookup<SqliteIds>;
-type SqlSubmitResult = SubmitResult<SqliteIds>;
+type SqlStoredFact = StoredFact<SqlIds>;
+type SqlFactLookup = FactLookup<SqlIds>;
+type SqlSubmitResult = SubmitResult<SqlIds>;
 type Error = SqliteFactStoreError;
 
 // ============================================================================
@@ -588,7 +584,7 @@ async fn counters(conn: &mut SqliteConnection) -> Result<(i64, i64, i64), Error>
 
 impl FactStore for SqliteFactStore {
     type Error = SqliteFactStoreError;
-    type Ids = SqliteIds;
+    type Ids = SqlIds;
     type Cursor = FactId;
     type ClassCursor<Rep>
         = (Rep, FactId)
@@ -713,18 +709,15 @@ impl<C: AsConn> FactView<SqliteFactStore> for SqliteHandle<C> {
 }
 
 impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
-    async fn entity_representative(
-        &mut self,
-        member: &SqliteEntityId,
-    ) -> Result<SqliteEntityId, Error> {
+    async fn entity_representative(&mut self, member: &SqlEntityId) -> Result<SqlEntityId, Error> {
         let fq = &*self.queries;
         read::representative(self.conn.conn(), self.bound, fq, *member).await
     }
 
     async fn entity_class(
         &mut self,
-        member: &SqliteEntityId,
-    ) -> Result<EquivClass<SqliteEntityId>, Error> {
+        member: &SqlEntityId,
+    ) -> Result<EquivClass<SqlEntityId>, Error> {
         let fq = &*self.queries;
         read::equiv_class(self.conn.conn(), self.bound, fq, *member).await
     }
@@ -736,9 +729,9 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
     async fn walk_entity_classes<'b>(
         &'b mut self,
         stream: &'b EntityStream<'b>,
-        after: Option<(SqliteEntityId, FactId)>,
+        after: Option<(SqlEntityId, FactId)>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<ClassWalkPage<SqliteFactStore, SqliteEntityId>, Error> {
+    ) -> Result<ClassWalkPage<SqliteFactStore, SqlEntityId>, Error> {
         let bound = self.bound;
         let fq = &*self.queries;
         let conn = self.conn.conn();
@@ -766,17 +759,17 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
 
     async fn all_facts_about_entity(
         &mut self,
-        entity: &SqliteEntityId,
+        entity: &SqlEntityId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WalkPage<SqliteFactStore, SqliteEntityId>, Error> {
+    ) -> Result<WalkPage<SqliteFactStore, SqlEntityId>, Error> {
         read::backlink_page(self.conn.conn(), self.bound, *entity, after, limit).await
     }
 
     async fn walk_entity_depictions<'b>(
         &'b mut self,
-        entity: &'b SqliteEntityId,
-        after: Option<(SqliteImageId, FactId)>,
+        entity: &'b SqlEntityId,
+        after: Option<(SqlImageId, FactId)>,
         limit: std::num::NonZeroUsize,
     ) -> Result<DepictionWalkPage<SqliteFactStore>, Error> {
         let fq = &*self.queries;
@@ -785,35 +778,29 @@ impl<C: AsConn> EntityView<SqliteFactStore> for SqliteHandle<C> {
 }
 
 impl<C: AsConn> EventView<SqliteFactStore> for SqliteHandle<C> {
-    async fn event_representative(
-        &mut self,
-        member: &SqliteEventId,
-    ) -> Result<SqliteEventId, Error> {
+    async fn event_representative(&mut self, member: &SqlEventId) -> Result<SqlEventId, Error> {
         Ok(*member)
     }
 
-    async fn event_class(
-        &mut self,
-        member: &SqliteEventId,
-    ) -> Result<EquivClass<SqliteEventId>, Error> {
+    async fn event_class(&mut self, member: &SqlEventId) -> Result<EquivClass<SqlEventId>, Error> {
         Ok(singleton_class(*member))
     }
 
     async fn all_facts_about_event(
         &mut self,
-        event: &SqliteEventId,
+        event: &SqlEventId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WalkPage<SqliteFactStore, SqliteEventId>, Error> {
+    ) -> Result<WalkPage<SqliteFactStore, SqlEventId>, Error> {
         read::backlink_page(self.conn.conn(), self.bound, *event, after, limit).await
     }
 
     async fn all_has_events_about_event(
         &mut self,
-        event: &SqliteEventId,
+        event: &SqlEventId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WalkPage<SqliteFactStore, SqliteEventId>, Error> {
+    ) -> Result<WalkPage<SqliteFactStore, SqlEventId>, Error> {
         read::has_event_backlink_page(self.conn.conn(), self.bound, *event, after, limit).await
     }
 }
@@ -822,16 +809,13 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
     /// One `RESOLVE_REPS` query resolves the whole batch in a single round trip.
     async fn image_representatives(
         &mut self,
-        members: &[SqliteImageId],
-    ) -> Result<std::collections::HashMap<SqliteImageId, SqliteImageId>, Error> {
+        members: &[SqlImageId],
+    ) -> Result<std::collections::HashMap<SqlImageId, SqlImageId>, Error> {
         let fq = &*self.queries;
         read::representatives(self.conn.conn(), self.bound, fq, members).await
     }
 
-    async fn image_class(
-        &mut self,
-        member: &SqliteImageId,
-    ) -> Result<EquivClass<SqliteImageId>, Error> {
+    async fn image_class(&mut self, member: &SqlImageId) -> Result<EquivClass<SqlImageId>, Error> {
         let fq = &*self.queries;
         read::equiv_class(self.conn.conn(), self.bound, fq, *member).await
     }
@@ -841,9 +825,9 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
     async fn walk_image_classes<'b>(
         &'b mut self,
         stream: &'b ImageStream<'b>,
-        after: Option<(SqliteImageId, FactId)>,
+        after: Option<(SqlImageId, FactId)>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<ClassWalkPage<SqliteFactStore, SqliteImageId>, Error> {
+    ) -> Result<ClassWalkPage<SqliteFactStore, SqlImageId>, Error> {
         let bound = self.bound;
         let fq = &*self.queries;
         let conn = self.conn.conn();
@@ -864,10 +848,10 @@ impl<C: AsConn> ImageView<SqliteFactStore> for SqliteHandle<C> {
 
     async fn all_facts_about_image(
         &mut self,
-        image: &SqliteImageId,
+        image: &SqlImageId,
         after: Option<FactId>,
         limit: std::num::NonZeroUsize,
-    ) -> Result<WalkPage<SqliteFactStore, SqliteImageId>, Error> {
+    ) -> Result<WalkPage<SqliteFactStore, SqlImageId>, Error> {
         read::backlink_page(self.conn.conn(), self.bound, *image, after, limit).await
     }
 }
@@ -890,7 +874,7 @@ impl<C: AsConn> SqliteHandle<C> {
     /// Returns [`SqliteFactStoreError`] on a backend failure.
     pub async fn temporal_conflicts_indexed(
         &mut self,
-        entity: SqliteEntityId,
+        entity: SqlEntityId,
     ) -> Result<Vec<chronoscope_core::solvers::TemporalConflict>, Error> {
         let fq = &*self.queries;
         let scan = read::temporal_conflict_scan(self.conn.conn(), self.bound, fq, entity).await?;
@@ -945,20 +929,20 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         Ok(result)
     }
 
-    async fn mint_entity(&mut self) -> Result<SqliteEntityId, Error> {
-        Ok(SqliteEntityId(
+    async fn mint_entity(&mut self) -> Result<SqlEntityId, Error> {
+        Ok(SqlEntityId(
             mint(self.conn.conn(), SubjectKind::Entity).await?,
         ))
     }
 
-    async fn mint_event(&mut self) -> Result<SqliteEventId, Error> {
-        Ok(SqliteEventId(
+    async fn mint_event(&mut self) -> Result<SqlEventId, Error> {
+        Ok(SqlEventId(
             mint(self.conn.conn(), SubjectKind::Event).await?,
         ))
     }
 
-    async fn mint_image(&mut self) -> Result<SqliteImageId, Error> {
-        Ok(SqliteImageId(
+    async fn mint_image(&mut self) -> Result<SqlImageId, Error> {
+        Ok(SqlImageId(
             mint(self.conn.conn(), SubjectKind::Image).await?,
         ))
     }
@@ -966,17 +950,17 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
     // Ids mint dense from zero, so the known checks bound both sides — a
     // wire-supplied negative id is as unknown as one past the counter.
 
-    async fn entity_known(&mut self, id: &SqliteEntityId) -> Result<bool, Error> {
+    async fn entity_known(&mut self, id: &SqlEntityId) -> Result<bool, Error> {
         let (entities, _, _) = counters(self.conn.conn()).await?;
         Ok((0..entities).contains(&id.0))
     }
 
-    async fn event_known(&mut self, id: &SqliteEventId) -> Result<bool, Error> {
+    async fn event_known(&mut self, id: &SqlEventId) -> Result<bool, Error> {
         let (_, events, _) = counters(self.conn.conn()).await?;
         Ok((0..events).contains(&id.0))
     }
 
-    async fn image_known(&mut self, id: &SqliteImageId) -> Result<bool, Error> {
+    async fn image_known(&mut self, id: &SqlImageId) -> Result<bool, Error> {
         let (_, _, images) = counters(self.conn.conn()).await?;
         Ok((0..images).contains(&id.0))
     }
@@ -1130,7 +1114,7 @@ fn singleton_class<S: Ord + Copy>(member: S) -> EquivClass<S> {
 /// cross stores.
 ///
 /// ```compile_fail
-/// use chronoscope_db::facts::{FrameConn, SqliteHandle};
+/// use chronoscope_db::sqlite::{FrameConn, SqliteHandle};
 ///
 /// fn shrink_brand<'long: 'short, 'short>(
 ///     handle: SqliteHandle<FrameConn<'long>>,

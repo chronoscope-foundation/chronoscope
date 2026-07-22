@@ -717,7 +717,7 @@ mod tests {
         // the alias flip updates this fixture alongside the store pick.
         let entity_cursor = encode_cursor(&ListCursor {
             snapshot: FactId::new(0),
-            walk: (chronoscope_db::SqliteEntityId(1), FactId::new(2)),
+            walk: (chronoscope_db::SqlEntityId(1), FactId::new(2)),
         })
         .map_err(|e| format!("{e:?}"))?;
         assert_rejected_400(decode_images_cursor(&entity_cursor))
@@ -731,7 +731,7 @@ mod tests {
         // Constructed concretely: a raw id mints only from the backend type.
         let entity_cursor = encode_cursor(&ListCursor {
             snapshot: FactId::new(0),
-            walk: (chronoscope_db::SqliteEntityId(1), FactId::new(2)),
+            walk: (chronoscope_db::SqlEntityId(1), FactId::new(2)),
         })
         .map_err(|e| format!("{e:?}"))?;
         let as_snapshot = Snapshot::new(entity_cursor.as_str().to_string());

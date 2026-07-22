@@ -3,13 +3,14 @@
 //! This crate provides database access for the Chronoscope platform.
 //! It is used by both the API server and background workers.
 
+mod common;
 pub mod error;
-pub mod facts;
 pub mod media_store;
 pub mod models;
 pub mod queries;
 pub mod queue;
 pub(crate) mod row;
+pub mod sqlite;
 pub mod types;
 pub mod url;
 pub mod workers;
@@ -25,17 +26,17 @@ use tokio::sync::watch;
 
 use chronoscope_integrations::IntegrationRegistry;
 
+pub use common::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
 pub use error::{DbError, DbResult, is_unique_violation};
-pub use facts::{
-    FACTS_CODEC_VERSION, FactStoreLocations, FactsFileError, SqliteEntityId, SqliteEventId,
-    SqliteFactStore, SqliteFactStoreError, SqliteIds, SqliteImageId, create_facts_file,
-    validate_facts_file,
-};
 pub use models::{
     FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
     ResolvedContent, ResolvedTarget, User,
 };
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
+pub use sqlite::{
+    FACTS_CODEC_VERSION, FactStoreLocations, FactsFileError, SqliteFactStore, SqliteFactStoreError,
+    create_facts_file, validate_facts_file,
+};
 pub use types::{
     AnalysisStatus, Email, MediaAnalysisState, MediaId, MediaType, PageId, ResearchUrlId,
     ResearchUrlStatus, UserId,
@@ -273,7 +274,7 @@ pub(crate) async fn create_pool(database_url: &str) -> DbResult<SqlitePool> {
 /// base as `base` through a `mode=ro&immutable=1` URI — so an immutable pin, a
 /// 0444 nix-store artifact with no room for WAL/-shm sidecars, attaches with no
 /// write probe or locking. With a base attached, each connection also builds a
-/// temp union view per fact table ([`facts::UNION_VIEW_TABLES`]) so the
+/// temp union view per fact table ([`sqlite::UNION_VIEW_TABLES`]) so the
 /// unqualified reads span both layers; the overlay-only mount leaves the reads
 /// resolving straight to `ovl`. The attach and view build run in
 /// `after_connect`, alongside the SpatiaLite `.extension()` load: the extension
@@ -351,7 +352,7 @@ pub(crate) async fn create_pool_with_overlay(
                     // transparently span base ∪ overlay. Fact ids are disjoint
                     // across the layers (the overlay mints past the base's max),
                     // so UNION ALL never double-counts a subject.
-                    for table in facts::UNION_VIEW_TABLES {
+                    for table in sqlite::UNION_VIEW_TABLES {
                         sqlx::query(&format!(
                             "CREATE TEMP VIEW {table} AS \
                              SELECT * FROM base.{table} \

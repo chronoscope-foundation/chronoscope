@@ -29,11 +29,11 @@ use chronoscope_core::store::equiv::EquivAdjacency;
 use chronoscope_core::store::retraction::effective_retractor;
 use chronoscope_core::store::schema::EquivClass;
 
-use super::convert::seed_ids;
 use super::error::{SqliteFactStoreError, sql};
 use super::queries::{self, FactQueries};
 use super::read::{ReadBound, class_members_raw, resolve_rep_raw, retraction_edges};
-use super::storage::{WitnessRow, witness_date_columns, witness_date_json};
+use crate::common::convert::seed_ids;
+use crate::common::storage::{WitnessRow, witness_date_columns, witness_date_json};
 
 async fn insert_rep(
     conn: &mut SqliteConnection,

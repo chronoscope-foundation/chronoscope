@@ -1086,7 +1086,7 @@ async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> 
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 3).await?;
     let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..8i64)
         .map(|i| {
-            let image_id = chronoscope_db::SqliteImageId(i);
+            let image_id = chronoscope_db::SqlImageId(i);
             (image_id, resolved_media(image_id))
         })
         .collect();
@@ -1186,7 +1186,7 @@ async fn get_entity_404s_for_an_id_no_fact_ever_named() -> TestResult {
     // A fresh store mints entity ids from 0; this id was never declared by
     // any commit, so no fact anywhere mentions it.
     // Constructed concretely: a raw id mints only from the backend type.
-    let unknown = chronoscope_db::SqliteEntityId(999_999);
+    let unknown = chronoscope_db::SqlEntityId(999_999);
 
     match ctx.client.get_entity(&wire_entity_id(unknown)).await {
         Ok(entity) => {
@@ -1693,7 +1693,7 @@ async fn entity_images_at_the_detail_snapshot_exclude_later_writes() -> TestResu
     // doesn't.
     let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..4i64)
         .map(|i| {
-            let image_id = chronoscope_db::SqliteImageId(i);
+            let image_id = chronoscope_db::SqlImageId(i);
             (image_id, resolved_media(image_id))
         })
         .collect();
@@ -1758,7 +1758,7 @@ async fn get_entity_images_cursor_and_snapshot_must_agree() -> TestResult {
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 2).await?;
     let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..8i64)
         .map(|i| {
-            let image_id = chronoscope_db::SqliteImageId(i);
+            let image_id = chronoscope_db::SqlImageId(i);
             (image_id, resolved_media(image_id))
         })
         .collect();
