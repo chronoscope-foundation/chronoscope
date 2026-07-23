@@ -2,14 +2,12 @@
 //! against [`PostgresFactStore`] over the ephemeral-cluster harness, plus a
 //! `PostGIS` smoke check.
 //!
-//! The ignore list is exactly the retraction- and spatial-touching cases —
-//! deferred to their own units (the recursive `RETRACTOR_CLOSURE` fixpoint and
-//! the `PostGIS` reads). Everything else runs GREEN. The retraction stub breaks
-//! every retraction case *loudly* (a red assertion, never a false green), so a
-//! missed ignore surfaces on the first run; the list is the grep of case names
-//! for `retract|retraction|retracted|supersede|in_viewport|viewport` plus the
-//! one grep-miss (`re_merging_a_split_pair_...`, which `commit_retract`s an edge
-//! under a "restores" name).
+//! The ignore list is exactly the spatial-touching cases — the `PostGIS`
+//! `InViewport` reads and tiled clustering, deferred to their own unit.
+//! Retraction now lands (the recursive `RETRACTOR_CLOSURE` fixpoint +
+//! `record_retraction`), so every retraction case runs GREEN. Anything the
+//! spatial stubs break fails *loudly* (a red assertion, never a false green), so
+//! a missed ignore surfaces on the first run.
 
 use super::PostgresFactStore;
 use super::harness::fresh_pg_store;
@@ -32,53 +30,6 @@ impl UnmintedIds for PostgresFactStore {
 chronoscope_core::fact_store_conformance!(
     fresh_pg_store(),
     ignore(
-        // --- retraction (recursive RETRACTOR_CLOSURE + record_retraction) ---
-        retracted_identity_edge_splits_classes_and_earlier_snapshots_stay_merged:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        re_merging_a_split_pair_submits_cleanly_and_restores_the_class:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retract_commit_targeting_unrecorded_commit_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retract_commit_targeting_recorded_commit_succeeds:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retract_commit_of_earlier_commit_in_same_tx_lands:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retract_fact_targeting_same_commit_fact_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retract_fact_targeting_prior_fact_accepted:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        supersede_fact_targeting_same_commit_fact_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        supersede_fact_with_equal_target_and_replacement_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retract_fact_hides_target_only_after_its_commit:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retract_commit_hides_every_fact_of_target:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        supersede_fact_hides_target_and_keeps_replacement:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retraction_of_retraction_restores_visibility:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        supersede_fact_with_unminted_replacement_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        retracted_by_reports_lowest_still_effective_retractor:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        all_facts_about_image_excludes_retracted:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        event_retype_across_same_commit_retraction_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        event_rehome_across_retraction_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        event_retype_across_retraction_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        event_reassert_identical_has_event_after_retraction_accepted:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        event_readopt_retracted_id_under_new_owner_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        event_retype_without_retracting_stale_payload_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
-        observation_depiction_retracted_in_same_commit_rejected:
-            "retraction (recursive RETRACTOR_CLOSURE) deferred to a later unit",
         // --- `PostGIS` spatial reads (InViewport streams) ---
         walk_entity_classes_in_viewport_surfaces_located_and_moved_in_entities:
             "PostGIS spatial reads deferred to a later unit",
@@ -88,7 +39,8 @@ chronoscope_core::fact_store_conformance!(
             "PostGIS spatial reads deferred to a later unit",
         walk_image_classes_in_viewport_surfaces_captured_locations:
             "PostGIS spatial reads deferred to a later unit",
-        // --- tiled clustering (spatial read; two cases also retract a member) ---
+        // --- tiled clustering (spatial read; the clustering read, not
+        //     retraction, is what these still wait on) ---
         cluster_tile_cells_match_the_same_tile_inside_a_viewport:
             "tiled clustering (spatial read) deferred to the pg spatial unit",
         cluster_tile_cells_keep_high_sub_tiles_under_a_dense_low_corner:
@@ -100,9 +52,9 @@ chronoscope_core::fact_store_conformance!(
         cluster_entities_in_viewport_groups_colocated_entities:
             "tiled clustering (spatial read) deferred to the pg spatial unit",
         cluster_cluster_becomes_singleton_when_a_member_is_retracted:
-            "tiled clustering + retraction deferred to later units",
+            "tiled clustering (spatial read) deferred to the pg spatial unit",
         cluster_colocated_becomes_singleton_when_a_member_is_retracted:
-            "tiled clustering + retraction deferred to later units",
+            "tiled clustering (spatial read) deferred to the pg spatial unit",
     )
 );
 

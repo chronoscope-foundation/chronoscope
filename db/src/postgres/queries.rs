@@ -10,8 +10,10 @@
 //! Id-set-driven reads use `= ANY($n::bigint[])` / `unnest($n::bigint[])` over a
 //! bound `Vec<i64>` where the SQLite backend drove a `json_each` virtual table.
 //!
-//! Recursive-CTE reads (retraction closure, equivalence component, identity
-//! targets) and the spatial reads live in later units; the query-plan validator
+//! The recursive retraction CTEs (retractor closure, equivalence component,
+//! identity targets) are rewritten to a single self-reference each, since
+//! Postgres forbids SQLite's doubled recursive references (see their constants
+//! below). The spatial reads live in a later unit; the query-plan validator
 //! (seed + ANALYZE + bound-constant EXPLAIN) is a later unit too, so these
 //! strings are not plan-gated yet.
 
@@ -195,3 +197,83 @@ pub(super) const INSERT_CONSTRUCTION_START: &str =
     "INSERT INTO construction_start (member, date_json, fact_id) VALUES ($1, $2::jsonb, $3)";
 pub(super) const INSERT_DEMOLITION_COMPLETED: &str =
     "INSERT INTO demolition_completed (member, date_json, fact_id) VALUES ($1, $2::jsonb, $3)";
+
+// ---- Retraction — recursive CTEs ----
+//
+// Each SQLite counterpart references its recursive working table in more than
+// one branch of the recursive term, which Postgres forbids. The rewrites below
+// keep a single top-level self-reference and return the same set (conformance,
+// with SQLite as oracle, is the equality check); the effective-retraction
+// fixpoint over the fetched edges runs in Rust (chronoscope_core::store::retraction).
+
+// The retractor closure of a seed set: every retraction edge reachable upward
+// from the seeds below the snapshot bound. $1 is a bigint[] of seed fact ids,
+// $2 the exclusive snapshot. The recursion climbs the reachable *node* set with
+// one self-reference (the OR unifies the per-fact and per-commit retractor
+// kinds), then the final SELECT emits every (target, retractor) edge off it —
+// the same edge set SQLite's four-branch `edge` CTE yields. A staged seed's NULL
+// commit_seq never matches `NULL = NULL`, so it behaves as under SQLite's
+// json_each seeds.
+pub(super) const RETRACTOR_CLOSURE: &str = "
+    WITH RECURSIVE reach(fact_id, commit_seq) AS (
+        SELECT f.fact_id, f.commit_seq FROM facts f WHERE f.fact_id = ANY($1::bigint[])
+        UNION
+        SELECT r.fact_id, r.commit_seq FROM reach
+          JOIN facts r ON (r.retracts_fact_id = reach.fact_id
+                           OR r.retracts_commit_seq = reach.commit_seq)
+         WHERE r.fact_id < $2
+    )
+    SELECT reach.fact_id AS target_id, r.fact_id AS retractor_id
+    FROM reach JOIN facts r
+      ON (r.retracts_fact_id = reach.fact_id OR r.retracts_commit_seq = reach.commit_seq)
+     WHERE r.fact_id < $2
+";
+
+// The identity-edge facts of $1's connected component under edge kind $2, below
+// snapshot $3, retracted edges included. One self-reference (SQLite grows the
+// component in two directional branches): a single join over either endpoint,
+// picking the far endpoint via CASE. Over-approximation is safe — the caller
+// re-walks in Rust over live edges only, so an edge reached through a retracted
+// link costs a fetched row, never a wrong class. Filtering the final select on
+// edge_a alone is complete because membership propagates both ways.
+pub(super) const EQUIV_COMPONENT: &str = "
+    WITH RECURSIVE member(id) AS (
+        SELECT $1
+        UNION
+        SELECT CASE WHEN f.edge_a = member.id THEN f.edge_b ELSE f.edge_a END
+        FROM member JOIN facts f
+          ON f.edge_kind = $2 AND (f.edge_a = member.id OR f.edge_b = member.id)
+         WHERE f.fact_id < $3
+    )
+    SELECT f.fact_id, f.edge_a, f.edge_b FROM member JOIN facts f
+      ON f.edge_kind = $2 AND f.edge_a = member.id WHERE f.fact_id < $3
+";
+
+// The identity edges a staged meta-fact ($1) can change the liveness of: its
+// transitive targets, descending through retracts_fact_id and through a
+// retracted commit's fact_ids (a jsonb array on commit_json). The downward
+// mirror of RETRACTOR_CLOSURE; targets sit strictly below their retractors, so
+// the descent terminates. `target` stays the single top-level self-reference —
+// the two descent kinds live in a CROSS JOIN LATERAL over the joined `facts t`
+// (Postgres allows the LATERAL to reference `t`, not the recursive `target`).
+// `je.value` is the jsonb_array_elements column; ::text::bigint parses the JSON
+// number into a fact id. Identity facts retract nothing, so they are the leaves
+// the final select keeps.
+pub(super) const IDENTITY_TARGETS: &str = "
+    WITH RECURSIVE target(fact_id) AS (
+        SELECT $1
+        UNION
+        SELECT nxt.fact_id FROM target
+          JOIN facts t ON t.fact_id = target.fact_id
+          CROSS JOIN LATERAL (
+            SELECT t.retracts_fact_id AS fact_id WHERE t.retracts_fact_id IS NOT NULL
+            UNION ALL
+            SELECT je.value::text::bigint AS fact_id
+            FROM fact_commits c
+            CROSS JOIN jsonb_array_elements(c.commit_json->'fact_ids') je
+            WHERE c.commit_seq = t.retracts_commit_seq
+          ) nxt
+    )
+    SELECT f.edge_kind, f.edge_a, f.edge_b FROM target
+      JOIN facts f ON f.fact_id = target.fact_id WHERE f.edge_kind IS NOT NULL
+";

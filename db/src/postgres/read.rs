@@ -8,11 +8,10 @@
 //! gives commit-order == id-order, so every fact with id < N is already
 //! committed at view time.
 //!
-//! Retraction filtering is structurally two-phase everywhere (a batched edge
-//! fetch, then the shared fixpoint), but the edge fetch — the recursive
-//! `RETRACTOR_CLOSURE` — is a later unit, so [`retraction_edges`] returns no
-//! edges. `effective_retractor` then filters nothing, which is correct exactly
-//! when no retraction facts exist below the bound.
+//! Retraction filtering is two-phase everywhere: one batched
+//! [`RETRACTOR_CLOSURE`](super::queries::RETRACTOR_CLOSURE) fetch for the rows
+//! in hand, then the shared fixpoint
+//! ([`chronoscope_core::store::retraction`]) in Rust.
 //!
 //! Representatives and classes resolve through the `subject_reps` log, kept
 //! equal to the live-edge components at every snapshot by the write path
@@ -82,14 +81,38 @@ pub(super) async fn next_fact_id(conn: &mut PgConnection) -> Result<u64, Error> 
     Ok(i64_to_u64(next, "next fact id")?)
 }
 
-/// The retractor-closure edges for `seeds`. The recursive fetch is a later unit,
-/// so this returns none — correct whenever nothing is retracted below the bound.
+/// The retractor-closure edges for `seeds`, fetched once per batch of rows under
+/// consideration and resolved in memory by the shared fixpoint
+/// ([`effective_retractor`]). The seed ids bind directly as a `bigint[]` (the
+/// SQLite backend drives a `json_each` string instead).
 pub(super) async fn retraction_edges(
-    _conn: &mut PgConnection,
-    _bound: ReadBound,
-    _seeds: &[FactId],
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    seeds: &[FactId],
 ) -> Result<RetractionEdges, Error> {
-    Ok(RetractionEdges::from_edges(std::iter::empty()))
+    if seeds.is_empty() {
+        return Ok(RetractionEdges::from_edges(std::iter::empty()));
+    }
+    let seed_ids: Vec<i64> = seeds
+        .iter()
+        .map(|fid| u64_to_i64(fid.get(), "retraction seed fact id"))
+        .collect::<Result<_, _>>()?;
+    let rows: Vec<(i64, i64)> = sqlx::query_as(queries::RETRACTOR_CLOSURE)
+        .bind(seed_ids)
+        .bind(bound.bind())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("fetching retractor closure"))?;
+    let edges: Vec<(FactId, FactId)> = rows
+        .into_iter()
+        .map(|(target, retractor)| {
+            Ok((
+                FactId::new(i64_to_u64(target, "retraction target id")?),
+                FactId::new(i64_to_u64(retractor, "retractor fact id")?),
+            ))
+        })
+        .collect::<Result<_, Error>>()?;
+    Ok(RetractionEdges::from_edges(edges))
 }
 
 /// Look up a fact under the bound, preserving the four outcomes. Fact rows are

@@ -1,5 +1,6 @@
-//! Postgres [`FactStore`] backend — the "straightforward" slice (everything
-//! except retraction's recursive CTEs and `PostGIS` spatial reads).
+//! Postgres [`FactStore`] backend. Retraction lands (the recursive CTEs
+//! rewritten to a single self-reference each — see the `queries` module); the
+//! `PostGIS` spatial reads remain a later unit.
 //!
 //! One writable database, no base/overlay union: every read names its tables
 //! directly and every query is a plain constant (see the `queries` module). The
@@ -29,12 +30,10 @@
 //!
 //! ## Deferred (later units)
 //!
-//! Retraction (the recursive `RETRACTOR_CLOSURE` fixpoint and
-//! `record_retraction`), the `PostGIS` spatial reads/writes, and the
-//! temporal-conflict witness *reads* are later units; here [`read::retraction_edges`]
-//! returns no edges (correct while nothing is retracted), the spatial insert is
-//! skipped, the `InViewport` / `InTimeRange` streams answer empty pages, and the
-//! witness tables are written but not yet read.
+//! The `PostGIS` spatial reads/writes and the temporal-conflict witness *reads*
+//! are later units; here the spatial insert is skipped, the `InViewport` /
+//! `InTimeRange` streams answer empty pages, and the witness tables are written
+//! but not yet read.
 
 mod error;
 mod harness;
@@ -637,15 +636,20 @@ impl<C: WriteConn> FactWrite<PostgresFactStore> for PostgresHandle<C> {
                 .await
                 .map_err(sql("inserting fact subject row"))?;
         }
-        // The spatial insert (facts_spatial) and record_retraction are later
-        // units; witness and representative-log maintenance run on the same
+        // The spatial insert (facts_spatial) is a later unit; witness,
+        // representative-log, and retraction maintenance run on the same
         // connection as the staging, so a rejected submit's savepoint unwinds
-        // their rows with its fact rows.
+        // their rows with its fact rows. record_retraction runs last, after the
+        // fact + facets + subjects are visible, so its own component recompute
+        // (at the union bound) sees the staged retraction fact.
         if let Some(witness) = witness {
             maintain::record_witness(&mut *conn, fid_raw, witness).await?;
         }
         if let (Some(kind), Some(a), Some(b)) = (facets.edge_kind, facets.edge_a, facets.edge_b) {
             maintain::record_identity_edge(&mut *conn, kind, a, b, fid_raw).await?;
+        }
+        if facets.retracts_fact_id.is_some() || retracts_commit_seq.is_some() {
+            maintain::record_retraction(&mut *conn, fid_raw).await?;
         }
         Ok(FactId::new(i64_to_u64(fid_raw, "staged fact id")?))
     }
