@@ -636,10 +636,15 @@ async fn summaries_in_viewport_surfaces_located_excludes_reference() -> TestResu
 
     let viewport = sample_viewport()?;
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page =
-        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, PAGE_100)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_viewport::<MemoryFactStore, _>(
+        &mut view,
+        &viewport,
+        None,
+        PAGE_100,
+        chrono::NaiveDate::MIN,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
 
     let ids: std::collections::BTreeSet<MemoryEntityId> =
         page.summaries.iter().map(|s| s.id).collect();
@@ -688,10 +693,15 @@ async fn summaries_in_viewport_surfaces_moved_in_entity_at_current_marker() -> T
 
     let viewport = sample_viewport()?;
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page =
-        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, PAGE_100)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_viewport::<MemoryFactStore, _>(
+        &mut view,
+        &viewport,
+        None,
+        PAGE_100,
+        chrono::NaiveDate::MIN,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
 
     let summary = page
         .summaries
@@ -734,10 +744,15 @@ async fn summaries_in_viewport_excludes_built_in_moved_out_entity() -> TestResul
 
     let viewport = sample_viewport()?;
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let page =
-        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, PAGE_100)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_viewport::<MemoryFactStore, _>(
+        &mut view,
+        &viewport,
+        None,
+        PAGE_100,
+        chrono::NaiveDate::MIN,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
 
     assert!(
         page.summaries.iter().all(|s| s.id != moved_id),
@@ -772,10 +787,15 @@ async fn summaries_in_viewport_paginates_each_entity_once() -> TestResult {
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let limit = std::num::NonZeroUsize::new(2).ok_or("nonzero limit")?;
 
-    let page1 =
-        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, limit)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+    let page1 = listing::summaries_in_viewport::<MemoryFactStore, _>(
+        &mut view,
+        &viewport,
+        None,
+        limit,
+        chrono::NaiveDate::MIN,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
     let cursor = page1
         .next
         .clone()
@@ -785,6 +805,7 @@ async fn summaries_in_viewport_paginates_each_entity_once() -> TestResult {
         &viewport,
         Some(cursor),
         limit,
+        chrono::NaiveDate::MIN,
     )
     .await
     .map_err(|e| format!("{e:?}"))?;
@@ -829,10 +850,15 @@ async fn summaries_in_viewport_pins_snapshot() -> TestResult {
     .await?;
 
     let viewport = sample_viewport()?;
-    let page =
-        listing::summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, PAGE_100)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_viewport::<MemoryFactStore, _>(
+        &mut view,
+        &viewport,
+        None,
+        PAGE_100,
+        chrono::NaiveDate::MIN,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
     assert_eq!(
         page.summaries.len(),
         1,

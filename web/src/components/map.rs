@@ -746,7 +746,9 @@ async fn refresh_tiles_for_viewport(
     let client_ref = client;
     let snapshot_ref = pass_snapshot.as_ref();
     let fetches = missing.into_iter().map(move |(x, y)| async move {
-        let result = client_ref.fetch_tile(level_z, x, y, snapshot_ref).await;
+        let result = client_ref
+            .fetch_tile(level_z, x, y, snapshot_ref, None)
+            .await;
         (x, y, result)
     });
     // Cancellation: a newer pass aborts this future, dropping the in-flight

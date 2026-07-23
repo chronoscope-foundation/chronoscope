@@ -21,6 +21,7 @@ use chronoscope_api_client::{
 use chronoscope_core::conflicts::fact_lineage;
 use chronoscope_core::geo::{self, QuadLevel, TileId};
 use chronoscope_core::grammar::ids::FactId;
+use chronoscope_core::lifespan::ExistenceState;
 use chronoscope_core::listing::{
     self, ListCursor, representative_image, summaries_in_viewport, timeline_span,
 };
@@ -303,6 +304,17 @@ pub struct EntitiesQueryParams {
     /// snapshot.
     #[serde(default)]
     pub snapshot: Option<Snapshot>,
+    /// The domain instant to report each entity's existence at (`YYYY-MM-DD`) —
+    /// the map slider's position. Absent defaults to today, so a summary always
+    /// carries a verdict.
+    #[serde(default)]
+    pub as_of: Option<NaiveDate>,
+}
+
+/// The wall-clock date the existence default resolves to. The valid-time "now":
+/// a request with no slider position reads existence as of today.
+fn today() -> NaiveDate {
+    chrono::Utc::now().date_naive()
 }
 
 /// List entities within a geographic bounding box (public, no authentication required).
@@ -349,13 +361,18 @@ pub async fn list_entities(
     // pinned snapshot stays readable forever — a cursor is never stale.
     let cursor_snapshot = cursor.as_ref().map(|c| c.snapshot);
     let mut view = open_read_view(&state.facts, params.snapshot, cursor_snapshot).await?;
-    let page =
-        match summaries_in_viewport::<ServerFactStore, _>(&mut view, &core_viewport, cursor, limit)
-            .await
-        {
-            Ok(p) => p,
-            Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
-        };
+    let page = match summaries_in_viewport::<ServerFactStore, _>(
+        &mut view,
+        &core_viewport,
+        cursor,
+        limit,
+        params.as_of.unwrap_or_else(today),
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(listing::ListError::Backend(e)) => return Err(fact_store_err(e)),
+    };
 
     // The pinned snapshot the walk latched is echoed here and embedded in
     // `page.next`, so the DTO's snapshot and the cursor's can't drift apart.
@@ -576,15 +593,26 @@ struct PendingMarker {
     thumbnail: Option<ServerImageId>,
 }
 
-/// The pin fields a lone cell's representative contributes: the viewer's
-/// negotiated name and the representative-image class member (its thumbnail is
-/// resolved later in the batch pass). Both `None` when the id names no committed
-/// fact; the name follows negotiation and the image is `None` with no depiction.
+/// The pin fields one cell's representative contributes. Every field is empty
+/// when the id names no committed fact; individually, the name follows
+/// negotiation, the image is `None` with no depiction, and the existence verdict
+/// is present whenever the entity projected at all.
+#[derive(Default)]
+struct Pin {
+    name: Option<String>,
+    /// The representative-image class member; its thumbnail resolves later in
+    /// the batch pass.
+    thumbnail: Option<ServerImageId>,
+    existence: Option<ExistenceState>,
+}
+
+/// Project one representative into its [`Pin`], reporting existence at `as_of`.
 async fn project_pin<V>(
     view: &mut V,
     prefixes: &[String],
     representative: ServerEntityId,
-) -> Result<(Option<String>, Option<ServerImageId>), HttpError>
+    as_of: NaiveDate,
+) -> Result<Pin, HttpError>
 where
     V: EntityView<ServerFactStore> + EventView<ServerFactStore> + Sync,
 {
@@ -593,11 +621,14 @@ where
             .await
             .map_err(fact_store_err)?
     else {
-        return Ok((None, None));
+        return Ok(Pin::default());
     };
     let entity = typed::Entity::parse(&projected, &class);
-    let name = entity_types::negotiate_name_for_prefixes(&entity.names, prefixes);
-    Ok((name, representative_image(&projected.depictions)))
+    Ok(Pin {
+        name: entity_types::negotiate_name_for_prefixes(&entity.names, prefixes),
+        thumbnail: representative_image(&projected.depictions),
+        existence: Some(projected.lifespan.classify(as_of)),
+    })
 }
 
 /// Project a tile's cluster cells into wire [`Marker`]s. Each cell folds to one
@@ -606,6 +637,9 @@ where
 /// cell also projects every member for the chronological disambiguation picker
 /// (oldest first, undated last). Names are negotiated against `lang_prefixes`,
 /// the viewer's `Accept-Language` parsed once by the caller.
+///
+/// Existence is reported at `as_of` for the cells that project an entity; a
+/// cluster stands for many and carries none.
 ///
 /// Thumbnails resolve in one batch: pass one projects the cells and collects each
 /// representative-image class member, pass two resolves every member to its
@@ -619,6 +653,7 @@ async fn cells_to_markers<V>(
     state: &AppState,
     lang_prefixes: &[String],
     cells: Vec<ClusterCell<ServerEntityId>>,
+    as_of: NaiveDate,
 ) -> Result<Vec<Marker<ServerEntityId>>, HttpError>
 where
     V: EntityView<ServerFactStore> + EventView<ServerFactStore> + ImageView<ServerFactStore> + Sync,
@@ -627,21 +662,22 @@ where
     for cell in cells {
         let representative = cell.representative;
         let point = cell.point;
-        let (name, thumbnail, click_action) = match cell.kind {
+        let (pin, click_action) = match cell.kind {
             CellKind::Singleton => {
-                let (name, thumbnail) =
-                    project_pin(&mut *view, lang_prefixes, representative).await?;
+                let pin = project_pin(&mut *view, lang_prefixes, representative, as_of).await?;
                 (
-                    name,
-                    thumbnail,
+                    pin,
                     ClickAction::Select {
                         entity_id: representative,
                     },
                 )
             }
+            // A cluster stands for many entities across a sub-tile, so it has no
+            // single existence verdict — and resolving one would mean projecting
+            // every member, the work clustering exists to avoid. Expanding it
+            // yields pins that each carry their own.
             CellKind::Cluster { split_level } => (
-                None,
-                None,
+                Pin::default(),
                 ClickAction::Expand {
                     split_level: split_level.get(),
                 },
@@ -653,8 +689,7 @@ where
                 // picker chronologically — oldest first, undated last — so collect
                 // each member's earliest timeline date alongside its entry, then
                 // sort before building the final list.
-                let mut pin_name = None;
-                let mut pin_thumbnail = None;
+                let mut pin = Pin::default();
                 let mut ranked: Vec<(Option<NaiveDate>, EntityPickerEntry<ServerEntityId>)> =
                     Vec::with_capacity(members.len());
                 for member in members {
@@ -669,9 +704,12 @@ where
                     let member_name =
                         entity_types::negotiate_name_for_prefixes(&entity.names, lang_prefixes);
                     let earliest = timeline_span(entity.timeline.events()).0;
+                    // The shared pin shows while any member may have stood, so it
+                    // takes the most present verdict (`Ord` is presence-ascending).
+                    pin.existence = pin.existence.max(Some(projected.lifespan.classify(as_of)));
                     if member == representative {
-                        pin_name = member_name.clone();
-                        pin_thumbnail = representative_image(&projected.depictions);
+                        pin.name = member_name.clone();
+                        pin.thumbnail = representative_image(&projected.depictions);
                     }
                     ranked.push((
                         earliest,
@@ -683,22 +721,19 @@ where
                 }
                 ranked.sort_by_key(|(earliest, _)| (earliest.is_none(), *earliest));
                 let entries = ranked.into_iter().map(|(_, entry)| entry).collect();
-                (
-                    pin_name,
-                    pin_thumbnail,
-                    ClickAction::Disambiguate { entries },
-                )
+                (pin, ClickAction::Disambiguate { entries })
             }
         };
         pending.push(PendingMarker {
             marker: Marker {
                 id: representative,
                 point,
-                name,
+                name: pin.name,
                 thumbnail_url: None,
                 click_action,
+                existence: pin.existence,
             },
-            thumbnail,
+            thumbnail: pin.thumbnail,
         });
     }
 
@@ -757,6 +792,12 @@ pub struct TileQueryParams {
     /// point.
     #[serde(default)]
     pub snapshot: Option<Snapshot>,
+    /// The domain instant to report each marker's existence at (`YYYY-MM-DD`) —
+    /// the map slider's position. Absent defaults to today. Orthogonal to
+    /// `snapshot`, which fixes which facts are read rather than when they speak
+    /// about.
+    #[serde(default)]
+    pub as_of: Option<NaiveDate>,
 }
 
 /// Per-tile clustering endpoint (public, no authentication required).
@@ -798,7 +839,8 @@ pub async fn get_tile(
         .map_err(fact_store_err)?;
 
     let lang_prefixes = entity_types::parse_accept_language(accept_language(&ctx));
-    let markers = cells_to_markers(&mut view, state, &lang_prefixes, cells).await?;
+    let as_of = params.as_of.unwrap_or_else(today);
+    let markers = cells_to_markers(&mut view, state, &lang_prefixes, cells, as_of).await?;
 
     let snapshot = encode_snapshot(view.snapshot().await.map_err(fact_store_err)?)?;
     let response = TileResponse { markers, snapshot };

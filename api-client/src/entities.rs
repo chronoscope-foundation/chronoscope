@@ -15,6 +15,7 @@ use url::Url;
 use chronoscope_core::GeoPoint;
 use chronoscope_core::grammar::depiction::Perspective;
 use chronoscope_core::grammar::image::ImageMedium;
+use chronoscope_core::lifespan::ExistenceState;
 use chronoscope_core::solvers::TemporalConflict;
 use chronoscope_core::{listing, typed};
 
@@ -257,6 +258,16 @@ pub struct Marker<E> {
     pub thumbnail_url: Option<Url>,
     /// What happens when the user clicks this marker.
     pub click_action: ClickAction<E>,
+    /// The existence verdict at the request's `as_of` instant (defaulting to
+    /// today). For a co-located group this is its most present member — the pin
+    /// shows while any of them may have stood.
+    ///
+    /// `None` for a cluster pin: it stands for many entities across a sub-tile
+    /// and has no single verdict, and resolving one would mean projecting every
+    /// member — the work clustering exists to avoid. Expanding the cluster
+    /// yields pins that each carry their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existence: Option<ExistenceState>,
 }
 
 /// What happens when a marker is clicked.

@@ -657,6 +657,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::algebra::monoid::CommutativeMonoid;
     use crate::grammar::attribute::NameText;
     use crate::location::Location;
 
@@ -722,6 +723,7 @@ mod tests {
             events: FactMap::new(),
             depictions: FactMap::new(),
             sameness: FactMap::new(),
+            lifespan: CommutativeMonoid::identity(),
         }
     }
 
@@ -820,7 +822,6 @@ mod tests {
 
     #[test]
     fn conflicting_kind_routes_to_ambiguous_with_candidates() -> TestResult {
-        use crate::algebra::monoid::CommutativeMonoid;
         let mut record = empty_event()?;
         // Two sources disagree on the kind: the meet empties, the extent keeps
         // both rivals.

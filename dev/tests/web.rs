@@ -1298,7 +1298,7 @@ async fn find_entity_with_media(
     let mut best: Option<(f64, f64, usize, String)> = None;
     for x in x_lo..=x_hi {
         for y in y_lo..=y_hi {
-            let response = client.fetch_tile(LEVEL, x, y, None).await?;
+            let response = client.fetch_tile(LEVEL, x, y, None, None).await?;
             for marker in &response.markers {
                 let chronoscope_api_client::ClickAction::Select { entity_id } =
                     &marker.click_action

@@ -20,6 +20,7 @@ use crate::grammar::citations::{
 use crate::grammar::composites::SubimageRegion;
 use crate::grammar::depiction::Perspective;
 use crate::grammar::event;
+use crate::grammar::existence;
 use crate::grammar::geometry::ImageGeometry;
 use crate::grammar::identity::{self, OrderedDistinctPair};
 use crate::grammar::ids::{FactId, UserId};
@@ -27,6 +28,7 @@ use crate::grammar::image::ImageMedium;
 use crate::grammar::lifecycle::{
     DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, PointKind,
 };
+use crate::lifespan::{ExistenceState, Lifespan};
 use crate::location::ConflictStatus;
 use crate::projection::Claimed;
 use crate::store::memory::{MemoryEntityId, MemoryError, MemoryFactStore, MemoryIds};
@@ -151,6 +153,48 @@ fn construction_started_fact(
             fact: bookend::ConstructionFact::Started {
                 entity: EntityIdx(entity_idx),
                 bound: year_date(year)?,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+fn demolition_started_fact(
+    entity_idx: usize,
+    year: i32,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Demolition {
+            fact: bookend::DemolitionFact::Started {
+                entity: EntityIdx(entity_idx),
+                bound: year_date(year)?,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+fn demolition_completed_fact(
+    entity_idx: usize,
+    year: i32,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Demolition {
+            fact: bookend::DemolitionFact::Completed {
+                entity: EntityIdx(entity_idx),
+                bound: year_date(year)?,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+fn existence_fact(entity_idx: usize, year: i32) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Existence {
+            fact: existence::Fact {
+                entity: EntityIdx(entity_idx),
+                at: year_date(year)?,
             },
         },
         citation: sample_citation()?,
@@ -738,6 +782,127 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
 }
 
 // ------------------------------------------------------------------
+// Existence lifespan — the per-fact fold behind the map's time slider
+//
+// Each case is a row of the denotational spec, committed as real facts and
+// read back off the projection, so a failure names the semantics it broke.
+// ------------------------------------------------------------------
+
+/// One instant to ask the classifier about.
+fn day(y: i32, m: u32, d: u32) -> Result<chrono::NaiveDate, &'static str> {
+    chrono::NaiveDate::from_ymd_opt(y, m, d).ok_or("valid date")
+}
+
+/// Commit `facts` about a single entity and read back the lifespan its
+/// projection accumulated.
+async fn lifespan_of(facts: Vec<SubmitFact>) -> Result<Lifespan, Box<dyn std::error::Error>> {
+    let store = MemoryFactStore::new();
+    let result = submit(&store, 1, facts).await?;
+    let id = result.entities.get(&EntityIdx(0)).ok_or("entity 0")?.id;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, entity) = project_entity::<MemoryFactStore, _, _>(&mut view, id, member_lineage)
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("known id should project")?;
+    Ok(entity.lifespan)
+}
+
+#[tokio::test]
+async fn construction_and_demolition_bracket_a_green_span() -> TestResult {
+    let lifespan = lifespan_of(vec![
+        construction_started_fact(0, 1900)?,
+        demolition_completed_fact(0, 1950)?,
+    ])
+    .await?;
+
+    assert_eq!(
+        lifespan.classify(day(1925, 6, 1)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(
+        lifespan.classify(day(1899, 12, 31)?),
+        ExistenceState::Absent
+    );
+    assert_eq!(lifespan.classify(day(1951, 1, 1)?), ExistenceState::Absent);
+    Ok(())
+}
+
+/// Two sources disagree on when construction started. The later claim denies
+/// the whole span before it while the hull still spans both, so the disputed
+/// era reads as one contested band — the assertion-quantified deny channel. A
+/// fold over the merged bracket would lose the rivalry and paint it green.
+#[tokio::test]
+async fn disputed_construction_starts_paint_a_contested_era() -> TestResult {
+    let lifespan = lifespan_of(vec![
+        construction_started_fact(0, 1900)?,
+        construction_started_fact(0, 2000)?,
+        existence_fact(0, 1950)?,
+    ])
+    .await?;
+
+    assert_eq!(
+        lifespan.classify(day(1899, 12, 31)?),
+        ExistenceState::Absent
+    );
+    assert_eq!(
+        lifespan.classify(day(1950, 1, 1)?),
+        ExistenceState::Contested
+    );
+    assert_eq!(
+        lifespan.classify(day(1999, 12, 31)?),
+        ExistenceState::Contested
+    );
+    assert_eq!(
+        lifespan.classify(day(2000, 6, 1)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(
+        lifespan.classify(day(2001, 1, 1)?),
+        ExistenceState::Presumed
+    );
+    Ok(())
+}
+
+/// A lone sighting confirms its own range and nothing before it; with no
+/// demolition on record, existence persists forward.
+#[tokio::test]
+async fn a_lone_witness_is_green_then_presumed_forward() -> TestResult {
+    let lifespan = lifespan_of(vec![existence_fact(0, 1950)?]).await?;
+
+    assert_eq!(
+        lifespan.classify(day(1949, 12, 31)?),
+        ExistenceState::Unknown
+    );
+    assert_eq!(
+        lifespan.classify(day(1950, 6, 1)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(
+        lifespan.classify(day(2000, 1, 1)?),
+        ExistenceState::Presumed
+    );
+    Ok(())
+}
+
+/// A demolition that started and never completed denies no instant, yet
+/// removal-in-progress withdraws the forward presumption.
+#[tokio::test]
+async fn an_uncompleted_demolition_suppresses_the_forward_presumption() -> TestResult {
+    let lifespan = lifespan_of(vec![demolition_started_fact(0, 1973)?]).await?;
+
+    assert_eq!(
+        lifespan.classify(day(1972, 12, 31)?),
+        ExistenceState::Unknown
+    );
+    assert_eq!(
+        lifespan.classify(day(1973, 6, 1)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(lifespan.classify(day(1974, 1, 1)?), ExistenceState::Unknown);
+    Ok(())
+}
+
+// ------------------------------------------------------------------
 // Interior events — product shape, value-mode conflict
 //
 // `project_facts` is the pure fold over an entity's facts; it is exercised
@@ -883,6 +1048,13 @@ async fn entity_projects_has_event_linked_event() -> TestResult {
             values: BTreeSet::from([DamageCause::Fire])
         },
         "the value-mode cause payload projects"
+    );
+    // The event happened to it, so the entity was there: its date witnesses
+    // existence, reaching the lifespan through the same HasEvent bridge.
+    assert_eq!(
+        entity.lifespan.classify(day(1850, 6, 1)?),
+        ExistenceState::Uncontested,
+        "the interior event's date witnesses the entity's existence"
     );
     Ok(())
 }

@@ -29,6 +29,7 @@ use crate::grammar::identity;
 use crate::grammar::ids::{FactId, IdScheme};
 use crate::grammar::image;
 use crate::grammar::lifecycle::DurationalRole;
+use crate::lifespan::Lifespan;
 use crate::projection::Claimed;
 use crate::submit::StoredFact;
 
@@ -157,12 +158,14 @@ where
             let support = provenance(fact_id, fact.subject(), stored);
             let mut entity = Entity::identity();
             inject_construction(fact, support, &mut entity.construction);
+            entity.lifespan = lifespan_contribution(assertion);
             entity
         }
         FactualAssertion::Demolition { fact } => {
             let support = provenance(fact_id, fact.subject(), stored);
             let mut entity = Entity::identity();
             inject_demolition(fact, support, &mut entity.demolition);
+            entity.lifespan = lifespan_contribution(assertion);
             entity
         }
         FactualAssertion::Existence { fact } => {
@@ -171,15 +174,72 @@ where
             entity
                 .existence
                 .insert(fact.at.clone(), Cited { value: (), support });
+            entity.lifespan = lifespan_contribution(assertion);
             entity
         }
-        FactualAssertion::Event { fact } => {
-            inject_event_fact(fact_id, fact, stored, reachers, provenance)
-        }
+        FactualAssertion::Event { fact } => inject_event_fact(
+            fact_id,
+            fact,
+            stored,
+            reachers,
+            provenance,
+            lifespan_contribution(assertion),
+        ),
         // A gap is an ordering relationship, not a single subject's field.
         FactualAssertion::Gap { .. } => Entity::identity(),
         // Image facts feed the sibling image projection, not an entity field.
         FactualAssertion::Image { .. } => Entity::identity(),
+    }
+}
+
+/// The existence claim one factual assertion makes, as a singleton for the
+/// `lifespan` fold. The four bookend endpoints carry their own deny and affirm
+/// powers; an existence attestation and an interior event's date are pure
+/// witnesses. Every other assertion is silent about existence, so it folds as
+/// the identity.
+///
+/// Quantification is per *assertion*: two sources claiming different
+/// construction starts each deny their own past, and the later one wins the
+/// floor. That distinction is gone by the time the claims have merged into a
+/// bracket, which is why this rides the raw fact.
+fn lifespan_contribution<R: IdScheme>(assertion: &FactualAssertion<R>) -> Lifespan {
+    match assertion {
+        FactualAssertion::Construction { fact } => match fact {
+            bookend::ConstructionFact::Started { bound, .. } => {
+                Lifespan::construction_started(bound.clone())
+            }
+            bookend::ConstructionFact::Completed { bound, .. } => {
+                Lifespan::construction_completed(bound.clone())
+            }
+            // Kept as a nested exhaustive match rather than one outer match with a
+            // trailing wildcard: a new dated fact variant is then a compile error
+            // here, not a silent fall-through to the identity.
+            bookend::ConstructionFact::Location { .. } => Lifespan::identity(),
+        },
+        FactualAssertion::Demolition { fact } => match fact {
+            bookend::DemolitionFact::Started { bound, .. } => {
+                Lifespan::demolition_started(bound.clone())
+            }
+            bookend::DemolitionFact::Completed { bound, .. } => {
+                Lifespan::demolition_completed(bound.clone())
+            }
+        },
+        FactualAssertion::Existence { fact } => Lifespan::witness(fact.at.clone()),
+        FactualAssertion::Event { fact } => match fact {
+            event::Fact::DurationalDate { bound, .. } | event::Fact::PointDate { bound, .. } => {
+                Lifespan::witness(bound.clone())
+            }
+            event::Fact::HasEvent { .. }
+            | event::Fact::MovedToLocation { .. }
+            | event::Fact::DamageCause { .. }
+            | event::Fact::MoveMethod { .. }
+            | event::Fact::UsageChange { .. }
+            | event::Fact::Designation { .. }
+            | event::Fact::Description { .. } => Lifespan::identity(),
+        },
+        FactualAssertion::Attribute { .. }
+        | FactualAssertion::Gap { .. }
+        | FactualAssertion::Image { .. } => Lifespan::identity(),
     }
 }
 
@@ -346,12 +406,17 @@ fn inject_demolition<R: IdScheme, T>(
 /// An interior event fact's contribution, tagged with the one entity whose
 /// `HasEvent` owns the event. An event with no owner (no `HasEvent` in the bag)
 /// contributes nothing.
+///
+/// `lifespan` is the event's existence witness, which rides that same ownership:
+/// the event testifies for the entity whose lifetime holds it, so one gate
+/// decides both.
 fn inject_event_fact<R: IdScheme, Stored, T>(
     fact_id: &FactId,
     fact: &event::Fact<R>,
     stored: &Stored,
     reachers: &BTreeMap<R::Event, R::Entity>,
     provenance: &impl Fn(&FactId, &R::Entity, &Stored) -> T,
+    lifespan: Lifespan,
 ) -> Entity<R::Entity, R::Event, R::Image, T>
 where
     T: Semiring + Clone,
@@ -362,6 +427,7 @@ where
     let support = provenance(fact_id, owner, stored);
     let mut entity = Entity::identity();
     inject_event(fact, support, &mut entity);
+    entity.lifespan = lifespan;
     entity
 }
 

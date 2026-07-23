@@ -18,7 +18,7 @@ use chronoscope_core::date::{DatePrecision, UncertainDate};
 use chronoscope_core::geo::{GeoPoint, Meters, mercator_x, mercator_y};
 use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use chronoscope_core::grammar::attribute::{self, NameText, NameType};
-use chronoscope_core::grammar::bookend::ConstructionFact;
+use chronoscope_core::grammar::bookend::{ConstructionFact, DemolitionFact};
 use chronoscope_core::grammar::citations::{
     Excerpt, ExternalSource, FactualCitation, JudgmentSource, Language,
 };
@@ -28,6 +28,7 @@ use chronoscope_core::grammar::existence;
 use chronoscope_core::grammar::ids::UserId;
 use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::grammar::lifecycle::{LifetimeEventKind, PointKind};
+use chronoscope_core::lifespan::ExistenceState;
 use chronoscope_core::location::{Location, UnresolvedLocation};
 use chronoscope_core::solvers::TemporalConflictKind;
 use chronoscope_core::submit::{
@@ -131,6 +132,71 @@ async fn commit_named_entity_at(
                     },
                 },
                 citation: citation("https://example.com/location")?,
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    commit_single_entity(facts, commit).await
+}
+
+/// Commit a placeable entity that was built and later demolished, so a read can
+/// ask whether it existed at a given instant.
+async fn commit_demolished_entity_at(
+    facts: &ServerFactStore,
+    name: &str,
+    lat: f64,
+    lon: f64,
+    built: i32,
+    demolished: i32,
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("test")),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name {
+                        entity: EntityIdx(0),
+                        name: NameText::new(name),
+                        language: Language::new("en")?,
+                        name_type: NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                },
+                citation: citation("https://example.com/name")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Location {
+                        entity: EntityIdx(0),
+                        location: resolved_point(lat, lon)?,
+                    },
+                },
+                citation: citation("https://example.com/location")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Started {
+                        entity: EntityIdx(0),
+                        bound: year(built)?,
+                    },
+                },
+                citation: citation("https://example.com/built")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Demolition {
+                    fact: DemolitionFact::Completed {
+                        entity: EntityIdx(0),
+                        bound: year(demolished)?,
+                    },
+                },
+                citation: citation("https://example.com/demolished")?,
             },
         ]
         .into_iter()
@@ -1243,7 +1309,7 @@ async fn get_tile_selects_a_lone_entity_in_its_container() -> TestResult {
     let id = commit_named_entity_at(&ctx.app_state.facts, "Colosseum", lat, lon).await?;
 
     let (x, y) = container_tile(lat, lon, 10);
-    let response: TileResponse<EntityId> = ctx.client.fetch_tile(10, x, y, None).await?;
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(10, x, y, None, None).await?;
 
     assert_eq!(response.markers.len(), 1, "expected exactly one marker");
     let marker = &response.markers[0];
@@ -1285,7 +1351,7 @@ async fn get_tile_carries_a_thumbnail_for_a_depicted_entity() -> TestResult {
     .await?;
 
     let (x, y) = container_tile(lat, lon, 14);
-    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None).await?;
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None, None).await?;
 
     assert_eq!(response.markers.len(), 1, "expected exactly one marker");
     let marker = &response.markers[0];
@@ -1309,7 +1375,7 @@ async fn get_tile_accepts_level_zero() -> TestResult {
     // fold its sole entity into a marker rather than reject the read.
     let id = commit_named_entity_at(&ctx.app_state.facts, "Colosseum", 41.8902, 12.4922).await?;
 
-    let response: TileResponse<EntityId> = ctx.client.fetch_tile(0, 0, 0, None).await?;
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(0, 0, 0, None, None).await?;
     assert!(
         response.markers.iter().any(|m| m.id == wire_entity_id(id)),
         "the world tile at z=0 must surface the sole entity"
@@ -1322,7 +1388,7 @@ async fn get_tile_rejects_an_off_grid_coordinate() -> TestResult {
     let ctx = TestContext::new().await?;
     // At z=2 the grid is 4×4, so x=4 names no tile — a browser-readable 400, not
     // a 500 out of the store.
-    match ctx.client.fetch_tile(2, 4, 0, None).await {
+    match ctx.client.fetch_tile(2, 4, 0, None, None).await {
         Ok(_) => return Err("an off-grid tile coordinate must 400".into()),
         Err(ApiError::Api { status, .. }) => assert_eq!(status, 400),
         Err(other) => return Err(format!("expected an API 400, got {other}").into()),
@@ -1483,7 +1549,7 @@ async fn get_tile_disambiguates_colocated_entities() -> TestResult {
     let b = commit_named_entity_at(&ctx.app_state.facts, "New Chapel", lat, lon).await?;
 
     let (x, y) = container_tile(lat, lon, 14);
-    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None).await?;
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None, None).await?;
 
     assert_eq!(
         response.markers.len(),
@@ -1536,7 +1602,7 @@ async fn get_tile_expands_a_spread_cluster_to_its_split_level() -> TestResult {
         (x, y),
         "both points must share one container tile so the read returns a single cell"
     );
-    let response: TileResponse<EntityId> = ctx.client.fetch_tile(10, x, y, None).await?;
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(10, x, y, None, None).await?;
 
     assert_eq!(
         response.markers.len(),
@@ -1570,7 +1636,7 @@ async fn get_tile_orders_the_colocated_picker_chronologically() -> TestResult {
         commit_dated_entity_at(&ctx.app_state.facts, "Newest", Some(1950), lat, lon).await?;
 
     let (x, y) = container_tile(lat, lon, 14);
-    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None).await?;
+    let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None, None).await?;
 
     assert_eq!(
         response.markers.len(),
@@ -1728,6 +1794,129 @@ async fn get_tile_negotiates_singleton_name_by_accept_language() -> TestResult {
         marker_name_for(&default, target).as_deref(),
         Some("Colosseum"),
         "with no Accept-Language the singleton marker falls back to the English name"
+    );
+    Ok(())
+}
+
+// ==================== get_tile: existence at an instant ====================
+
+#[tokio::test]
+async fn get_tile_reports_existence_at_the_requested_instant() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let (lat, lon) = (51.5285, -0.1339);
+    commit_demolished_entity_at(&ctx.app_state.facts, "Euston Arch", lat, lon, 1837, 1962).await?;
+    let (x, y) = container_tile(lat, lon, 10);
+
+    let during: TileResponse<EntityId> = ctx
+        .client
+        .fetch_tile(
+            10,
+            x,
+            y,
+            None,
+            Some(NaiveDate::from_ymd_opt(1900, 6, 1).ok_or("date")?),
+        )
+        .await?;
+    assert_eq!(
+        during.markers.first().and_then(|m| m.existence),
+        Some(ExistenceState::Uncontested),
+        "the arch stood in 1900, and no source denies it"
+    );
+
+    let after: TileResponse<EntityId> = ctx
+        .client
+        .fetch_tile(
+            10,
+            x,
+            y,
+            None,
+            Some(NaiveDate::from_ymd_opt(2020, 1, 1).ok_or("date")?),
+        )
+        .await?;
+    assert_eq!(
+        after.markers.first().and_then(|m| m.existence),
+        Some(ExistenceState::Absent),
+        "the demolition denies existence in 2020"
+    );
+
+    // No instant defaults to today, and the arch came down in 1962.
+    let untimed: TileResponse<EntityId> = ctx.client.fetch_tile(10, x, y, None, None).await?;
+    assert_eq!(
+        untimed.markers.first().and_then(|m| m.existence),
+        Some(ExistenceState::Absent),
+        "an as_of-less read defaults to today, where the arch is long gone"
+    );
+    Ok(())
+}
+
+/// A shared pin shows while any co-located member may have stood, so it reports
+/// the most present member's verdict.
+#[tokio::test]
+async fn get_tile_reports_a_colocated_pin_by_its_most_present_member() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let (lat, lon) = (45.2, 12.27);
+    commit_demolished_entity_at(&ctx.app_state.facts, "Old Hall", lat, lon, 1700, 1850).await?;
+    commit_demolished_entity_at(&ctx.app_state.facts, "New Hall", lat, lon, 1860, 1990).await?;
+    let (x, y) = container_tile(lat, lon, 14);
+
+    let response: TileResponse<EntityId> = ctx
+        .client
+        .fetch_tile(
+            14,
+            x,
+            y,
+            None,
+            Some(NaiveDate::from_ymd_opt(1900, 1, 1).ok_or("date")?),
+        )
+        .await?;
+
+    assert_eq!(response.markers.len(), 1, "the two share a point");
+    assert_eq!(
+        response.markers[0].existence,
+        Some(ExistenceState::Uncontested),
+        "the successor stood in 1900, so the shared pin reads uncontested \
+         even though its predecessor was gone by then"
+    );
+    Ok(())
+}
+
+/// A cluster pin stands for many entities across a sub-tile, so it reports no
+/// verdict — resolving one would mean projecting every member, the work
+/// clustering exists to avoid.
+#[tokio::test]
+async fn get_tile_reports_no_existence_for_a_cluster_pin() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let (lat, lon_a, lon_b) = (0.0, 12.49, 12.50);
+    commit_demolished_entity_at(&ctx.app_state.facts, "Spread West", lat, lon_a, 1700, 1850)
+        .await?;
+    commit_demolished_entity_at(&ctx.app_state.facts, "Spread East", lat, lon_b, 1860, 1990)
+        .await?;
+
+    let (x, y) = container_tile(lat, lon_a, 10);
+    let response: TileResponse<EntityId> = ctx
+        .client
+        .fetch_tile(
+            10,
+            x,
+            y,
+            None,
+            Some(NaiveDate::from_ymd_opt(1900, 1, 1).ok_or("date")?),
+        )
+        .await?;
+
+    assert_eq!(
+        response.markers.len(),
+        1,
+        "the spread pair folds to a cluster"
+    );
+    let marker = &response.markers[0];
+    match &marker.click_action {
+        ClickAction::Expand { .. } => {}
+        other => return Err(format!("expected Expand, got {other:?}").into()),
+    }
+    assert_eq!(
+        marker.existence, None,
+        "a cluster stands for many entities and carries no single verdict"
     );
     Ok(())
 }

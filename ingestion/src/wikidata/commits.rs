@@ -1265,9 +1265,15 @@ mod tests {
         // A box around central Rome, comfortably covering the P625 point.
         let viewport = Viewport::new(GeoPoint::new(41.8, 12.4)?, GeoPoint::new(42.0, 12.6)?)?;
         let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
-        let page = summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, limit)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+        let page = summaries_in_viewport::<MemoryFactStore, _>(
+            &mut view,
+            &viewport,
+            None,
+            limit,
+            chrono::NaiveDate::MIN,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
 
         let summary = page
             .summaries
@@ -1302,9 +1308,15 @@ mod tests {
         // A box over the mid-Atlantic — nowhere near Rome.
         let viewport = Viewport::new(GeoPoint::new(0.0, -40.0)?, GeoPoint::new(10.0, -30.0)?)?;
         let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
-        let page = summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, limit)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+        let page = summaries_in_viewport::<MemoryFactStore, _>(
+            &mut view,
+            &viewport,
+            None,
+            limit,
+            chrono::NaiveDate::MIN,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
 
         assert!(
             page.summaries.iter().all(|s| s.id != id),

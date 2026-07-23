@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::geo::{GeoPoint, Viewport};
 use crate::grammar::depiction::Perspective;
 use crate::grammar::ids::FactId;
+use crate::lifespan::ExistenceState;
 use crate::projection::{
     Bracket, Claimed, DepictionRecord, FactMap, MemberLineage, member_lineage, project_entity,
 };
@@ -96,6 +97,9 @@ pub struct EntitySummary<EntId, ImgId> {
     /// The latest upper date bound across the timeline, or `None` when the
     /// entity is undated.
     pub latest: Option<NaiveDate>,
+    /// The existence verdict our sources support at the instant the listing was
+    /// asked about — `Absent` when they place it gone or not-yet-built there.
+    pub existence: ExistenceState,
     /// The image whose thumbnail stands in for this entity on the map, or
     /// `None` when the entity has no depiction. The marker read path resolves
     /// it to a URL; see `representative_image`.
@@ -150,11 +154,18 @@ pub enum ListError<E> {
 /// the view at the `cursor`'s snapshot, so the walk continues over the same
 /// pinned state the first page read. The `next` cursor carries that snapshot
 /// forward. A fresh listing passes `None`.
+///
+/// `as_of` is the domain instant each summary's existence verdict answers for —
+/// the map slider's position. It is orthogonal to the snapshot, which fixes
+/// *which facts* are read rather than *when they speak about*. A caller with no
+/// slider position of its own passes the reading's "now"; the default is the
+/// caller's to choose, so this stays a pure function of the date it is handed.
 pub async fn summaries_in_viewport<S, V>(
     view: &mut V,
     viewport: &Viewport,
     cursor: Option<ListCursor<S::ClassCursor<EntityIdOf<S>>>>,
     limit: NonZeroUsize,
+    as_of: NaiveDate,
 ) -> Result<
     EntityListPage<EntityIdOf<S>, ImageIdOf<S>, S::ClassCursor<EntityIdOf<S>>>,
     ListError<S::Error>,
@@ -211,6 +222,7 @@ where
                     earliest,
                     latest,
                     thumbnail,
+                    existence: projected.lifespan.classify(as_of),
                 });
             }
         }

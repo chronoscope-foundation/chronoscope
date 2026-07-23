@@ -11,6 +11,7 @@ use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::pin::Pin;
 
+use chrono::NaiveDate;
 use futures_util::FutureExt;
 use futures_util::stream::{self, Stream};
 
@@ -159,18 +160,30 @@ impl Client {
     /// marker names are negotiated per `Accept-Language` (the response carries
     /// `Vary: Accept-Language`), so a cache shared across languages must key on
     /// language too. `z = 0` is accepted (a whole-world tile).
-    /// `snapshot` pins the read (`None` reads the live point).
+    /// `snapshot` pins the read (`None` reads the live point). `as_of` is the
+    /// domain instant each marker's existence is reported at — the time slider's
+    /// position — defaulting to today; a cluster cell stands for many entities
+    /// and carries no verdict.
     pub async fn fetch_tile(
         &self,
         z: u8,
         x: u32,
         y: u32,
         snapshot: Option<&Snapshot>,
+        as_of: Option<NaiveDate>,
     ) -> Result<TileResponse<EntityId>, ApiError> {
-        let mut url = format!("{}/tiles/{z}/{x}/{y}", self.base_url);
+        // Both params are optional, so neither can own the leading `?`.
+        let mut params: Vec<String> = Vec::new();
         if let Some(snapshot) = snapshot {
-            url.push_str("?snapshot=");
-            url.push_str(snapshot.as_str());
+            params.push(format!("snapshot={}", snapshot.as_str()));
+        }
+        if let Some(at) = as_of {
+            params.push(format!("as_of={at}"));
+        }
+        let mut url = format!("{}/tiles/{z}/{x}/{y}", self.base_url);
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
         }
         self.get_json(&url).await
     }

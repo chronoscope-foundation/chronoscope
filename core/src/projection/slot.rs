@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use crate::algebra::lattice::BoundedLattice;
 use crate::algebra::monoid::CommutativeMonoid;
 use crate::algebra::semiring::Semiring;
+use crate::lifespan::Lifespan;
 use crate::location::ConflictStatus;
 
 use super::bracket::{Bracket, ConsensusConflict};
@@ -45,6 +46,16 @@ impl CommutativeMonoid for () {
 }
 
 impl Slot for () {
+    fn conflict(&self) -> ConflictStatus {
+        ConflictStatus::Consistent
+    }
+}
+
+/// Contested existence is a verdict about an *instant* — `classify` returns
+/// `Orange` there — not an over-determined field, and the bookend brackets the
+/// dispute came from carry their own consensus conflict. So the accumulator
+/// never contributes to the entity's verdict.
+impl Slot for Lifespan {
     fn conflict(&self) -> ConflictStatus {
         ConflictStatus::Consistent
     }

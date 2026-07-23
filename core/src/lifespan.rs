@@ -1,9 +1,11 @@
 //! Existence `Lifespan` — the map-slider's five-state existence classifier.
 //!
 //! For one entity, folds post-inference facts — construction and demolition
-//! bookends, sightings — and answers, at any instant, one of five states: green
-//! (confirmed), orange (a source disagreement), presumed (soft forward
-//! persistence), unknown (no evidence), absent (denied and unsupported).
+//! bookends, sightings — and answers, at any instant, one of five states:
+//! uncontested (supported, no source denies it), contested (a source
+//! disagreement), presumed (soft forward persistence), unknown (no evidence),
+//! absent (denied and unsupported). Each state is what our *assertions* say, not
+//! a claim about reality.
 //!
 //! The model is assertion-∀/∃. An assertion *denies* an instant only when its own
 //! date makes existence there impossible — a construction's earliest start floors
@@ -23,26 +25,35 @@
 //! exists.
 
 use chrono::NaiveDate;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::algebra::monoid::CommutativeMonoid;
 use crate::date::UncertainDate;
 
-/// The map-slider's existence verdict at one instant — total and mutually
-/// exclusive over the timeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The existence verdict our assertions support at one instant — total and
+/// mutually exclusive over the timeline.
+///
+/// The variant order is *presence-ascending* and load-bearing: `Ord` ranks a
+/// weaker claim below a stronger one, so a co-located group of entities shows
+/// its most-present member with `.max()`. Reordering the variants silently
+/// changes what a shared map pin renders.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum ExistenceState {
-    /// Confirmed by evidence, uncontested.
-    Green,
-    /// A genuine source disagreement — some evidence supports existence here
-    /// while a source denies it (a sighting past a demolition, a disputed era).
-    Orange,
-    /// Soft forward closed-world tail: presumed still extant, defeasible.
-    Presumed,
+    /// Denied and unsupported — our sources place it gone or not yet built.
+    Absent,
     /// Nothing affirms and nothing denies — grey "no data".
     Unknown,
-    /// Denied and unsupported — definitely gone or not yet built.
-    Absent,
+    /// Soft forward closed-world tail: presumed still extant, defeasible.
+    Presumed,
+    /// A genuine source disagreement — some evidence supports existence here
+    /// while a source denies it (a sighting past a demolition, a disputed era).
+    Contested,
+    /// Supported by evidence, and no source denies it.
+    Uncontested,
 }
 
 /// The affirmed hull — the convex span every assertion vouches for. `None` on an
@@ -242,10 +253,10 @@ impl Lifespan {
         // Partition on (denied, supported), then split the supported side by
         // whether the instant sits inside the affirmed hull.
         match (denied, supported, affirmed) {
-            (true, true, _) => ExistenceState::Orange,
+            (true, true, _) => ExistenceState::Contested,
             (true, false, _) => ExistenceState::Absent,
             (false, false, _) => ExistenceState::Unknown,
-            (false, true, true) => ExistenceState::Green,
+            (false, true, true) => ExistenceState::Uncontested,
             (false, true, false) => ExistenceState::Presumed,
         }
     }
@@ -309,7 +320,7 @@ fn max_bound(a: Option<NaiveDate>, b: Option<NaiveDate>) -> Option<NaiveDate> {
 
 #[cfg(test)]
 mod tests {
-    use super::ExistenceState::{Absent, Green, Orange, Presumed, Unknown};
+    use super::ExistenceState::{Absent, Contested, Presumed, Uncontested, Unknown};
     use super::*;
     use crate::date::{DateBound, DatePrecision};
     use proptest::prelude::*;
@@ -377,9 +388,9 @@ mod tests {
             Lifespan::construction_started(year(1900)?),
             Lifespan::demolition_completed(year(1950)?),
         ]);
-        assert_eq!(ls.classify(nd(1900, 1, 1)?), Green);
-        assert_eq!(ls.classify(nd(1925, 6, 1)?), Green);
-        assert_eq!(ls.classify(nd(1950, 12, 31)?), Green);
+        assert_eq!(ls.classify(nd(1900, 1, 1)?), Uncontested);
+        assert_eq!(ls.classify(nd(1925, 6, 1)?), Uncontested);
+        assert_eq!(ls.classify(nd(1950, 12, 31)?), Uncontested);
         assert_eq!(ls.classify(nd(1899, 12, 31)?), Absent);
         assert_eq!(ls.classify(nd(1951, 1, 1)?), Absent);
         Ok(())
@@ -394,10 +405,10 @@ mod tests {
             Lifespan::demolition_completed(year(1950)?),
             Lifespan::demolition_completed(year(1960)?),
         ]);
-        assert_eq!(ls.classify(nd(1925, 1, 1)?), Green);
-        assert_eq!(ls.classify(nd(1950, 12, 31)?), Green);
-        assert_eq!(ls.classify(nd(1951, 1, 1)?), Orange);
-        assert_eq!(ls.classify(nd(1960, 12, 31)?), Orange);
+        assert_eq!(ls.classify(nd(1925, 1, 1)?), Uncontested);
+        assert_eq!(ls.classify(nd(1950, 12, 31)?), Uncontested);
+        assert_eq!(ls.classify(nd(1951, 1, 1)?), Contested);
+        assert_eq!(ls.classify(nd(1960, 12, 31)?), Contested);
         assert_eq!(ls.classify(nd(1961, 1, 1)?), Absent);
         assert_eq!(ls.classify(nd(1895, 1, 1)?), Absent);
         Ok(())
@@ -413,9 +424,9 @@ mod tests {
             Lifespan::witness(year(1950)?),
         ]);
         assert_eq!(ls.classify(nd(1895, 1, 1)?), Absent);
-        assert_eq!(ls.classify(nd(1950, 1, 1)?), Orange);
-        assert_eq!(ls.classify(nd(1999, 12, 31)?), Orange);
-        assert_eq!(ls.classify(nd(2000, 6, 1)?), Green);
+        assert_eq!(ls.classify(nd(1950, 1, 1)?), Contested);
+        assert_eq!(ls.classify(nd(1999, 12, 31)?), Contested);
+        assert_eq!(ls.classify(nd(2000, 6, 1)?), Uncontested);
         assert_eq!(ls.classify(nd(2001, 1, 1)?), Presumed);
         Ok(())
     }
@@ -429,9 +440,9 @@ mod tests {
             Lifespan::construction_started(year(2000)?),
         ]);
         assert_eq!(ls.classify(nd(1895, 1, 1)?), Absent);
-        assert_eq!(ls.classify(nd(1950, 1, 1)?), Orange);
-        assert_eq!(ls.classify(nd(1999, 12, 31)?), Orange);
-        assert_eq!(ls.classify(nd(2000, 6, 1)?), Green);
+        assert_eq!(ls.classify(nd(1950, 1, 1)?), Contested);
+        assert_eq!(ls.classify(nd(1999, 12, 31)?), Contested);
+        assert_eq!(ls.classify(nd(2000, 6, 1)?), Uncontested);
         assert_eq!(ls.classify(nd(2001, 1, 1)?), Presumed);
         Ok(())
     }
@@ -441,9 +452,9 @@ mod tests {
         // "demolished 1890s" reads green across the entire decade, edge to edge —
         // the whole range is solid, with a clean cutover at 1900.
         let ls = fold([Lifespan::demolition_completed(decade(1890)?)]);
-        assert_eq!(ls.classify(nd(1890, 1, 1)?), Green);
-        assert_eq!(ls.classify(nd(1895, 6, 1)?), Green);
-        assert_eq!(ls.classify(nd(1899, 12, 31)?), Green);
+        assert_eq!(ls.classify(nd(1890, 1, 1)?), Uncontested);
+        assert_eq!(ls.classify(nd(1895, 6, 1)?), Uncontested);
+        assert_eq!(ls.classify(nd(1899, 12, 31)?), Uncontested);
         assert_eq!(ls.classify(nd(1900, 1, 1)?), Absent);
         // No construction to deny the past, so before the demolition is unknown.
         assert_eq!(ls.classify(nd(1889, 12, 31)?), Unknown);
@@ -455,7 +466,7 @@ mod tests {
         // DS 1973 affirms its year, suppresses the forward presumption, and denies
         // nothing — unknown on both sides.
         let ls = fold([Lifespan::demolition_started(year(1973)?)]);
-        assert_eq!(ls.classify(nd(1973, 6, 1)?), Green);
+        assert_eq!(ls.classify(nd(1973, 6, 1)?), Uncontested);
         assert_eq!(ls.classify(nd(1972, 12, 31)?), Unknown);
         assert_eq!(ls.classify(nd(1974, 1, 1)?), Unknown);
         Ok(())
@@ -470,9 +481,9 @@ mod tests {
             Lifespan::construction_started(year(1900)?),
             Lifespan::demolition_completed(year(1850)?),
         ]);
-        assert_eq!(ls.classify(nd(1860, 1, 1)?), Orange);
-        assert_eq!(ls.classify(nd(1875, 1, 1)?), Orange);
-        assert_eq!(ls.classify(nd(1900, 12, 31)?), Orange);
+        assert_eq!(ls.classify(nd(1860, 1, 1)?), Contested);
+        assert_eq!(ls.classify(nd(1875, 1, 1)?), Contested);
+        assert_eq!(ls.classify(nd(1900, 12, 31)?), Contested);
         assert_eq!(ls.classify(nd(1849, 12, 31)?), Absent);
         assert_eq!(ls.classify(nd(1920, 1, 1)?), Absent);
         Ok(())
@@ -483,7 +494,7 @@ mod tests {
         // A photo's year is green, the future presumed (no demolition on record),
         // the past unknown (no construction on record).
         let ls = fold([Lifespan::witness(year(1950)?)]);
-        assert_eq!(ls.classify(nd(1950, 6, 1)?), Green);
+        assert_eq!(ls.classify(nd(1950, 6, 1)?), Uncontested);
         assert_eq!(ls.classify(nd(1949, 12, 31)?), Unknown);
         assert_eq!(ls.classify(nd(2000, 1, 1)?), Presumed);
         Ok(())
@@ -512,9 +523,9 @@ mod tests {
             Lifespan::witness(year(1850)?),
         ]);
         assert_eq!(ls.classify(nd(1849, 12, 31)?), Absent);
-        assert_eq!(ls.classify(nd(1850, 6, 1)?), Orange);
-        assert_eq!(ls.classify(nd(1875, 1, 1)?), Orange);
-        assert_eq!(ls.classify(nd(1900, 6, 1)?), Green);
+        assert_eq!(ls.classify(nd(1850, 6, 1)?), Contested);
+        assert_eq!(ls.classify(nd(1875, 1, 1)?), Contested);
+        assert_eq!(ls.classify(nd(1900, 6, 1)?), Uncontested);
         assert_eq!(ls.classify(nd(1950, 1, 1)?), Presumed);
         Ok(())
     }
@@ -524,7 +535,7 @@ mod tests {
         // CS 1900 alone — construction year green, forward presumed, backward
         // absent.
         let ls = fold([Lifespan::construction_started(year(1900)?)]);
-        assert_eq!(ls.classify(nd(1900, 6, 1)?), Green);
+        assert_eq!(ls.classify(nd(1900, 6, 1)?), Uncontested);
         assert_eq!(ls.classify(nd(1899, 12, 31)?), Absent);
         assert_eq!(ls.classify(nd(2000, 1, 1)?), Presumed);
         Ok(())
@@ -539,9 +550,9 @@ mod tests {
             Lifespan::construction_started(span(1940, 1947)?),
             Lifespan::demolition_completed(span(1943, 1947)?),
         ]);
-        assert_eq!(ls.classify(nd(1940, 1, 1)?), Green);
-        assert_eq!(ls.classify(nd(1945, 6, 1)?), Green);
-        assert_eq!(ls.classify(nd(1947, 12, 31)?), Green);
+        assert_eq!(ls.classify(nd(1940, 1, 1)?), Uncontested);
+        assert_eq!(ls.classify(nd(1945, 6, 1)?), Uncontested);
+        assert_eq!(ls.classify(nd(1947, 12, 31)?), Uncontested);
         assert_eq!(ls.classify(nd(1939, 12, 31)?), Absent);
         assert_eq!(ls.classify(nd(1948, 1, 1)?), Absent);
         Ok(())
@@ -584,8 +595,8 @@ mod tests {
         ]);
         assert_eq!(ls.classify(nd(1000, 1, 1)?), Unknown);
         assert_eq!(ls.classify(nd(1899, 6, 1)?), Unknown);
-        assert_eq!(ls.classify(nd(1950, 1, 1)?), Green);
-        assert_eq!(ls.classify(nd(2000, 1, 1)?), Green);
+        assert_eq!(ls.classify(nd(1950, 1, 1)?), Uncontested);
+        assert_eq!(ls.classify(nd(2000, 1, 1)?), Uncontested);
         assert_eq!(ls.classify(nd(2500, 1, 1)?), Presumed);
         Ok(())
     }
@@ -605,14 +616,14 @@ mod tests {
     #[test]
     fn two_after_sightings_bracket_no_green() -> Res {
         // "after 1906" + "after 1950" leave the hull's lower edge unanchored (+∞),
-        // so the hull is empty — two forward-open sightings pin no instant. Green
+        // so the hull is empty — two forward-open sightings pin no instant. Uncontested
         // nowhere.
         let ls = fold([
             Lifespan::witness(after(1906)?),
             Lifespan::witness(after(1950)?),
         ]);
         for &(y, m, d) in &[(1800, 1, 1), (1906, 1, 1), (1950, 1, 1), (3000, 1, 1)] {
-            assert_ne!(ls.classify(nd(y, m, d)?), Green, "at {y}-{m}-{d}");
+            assert_ne!(ls.classify(nd(y, m, d)?), Uncontested, "at {y}-{m}-{d}");
         }
         assert_eq!(ls.classify(nd(1950, 1, 1)?), Unknown);
         assert_eq!(ls.classify(nd(1951, 1, 1)?), Presumed);
@@ -629,9 +640,21 @@ mod tests {
             Lifespan::witness(before(2000)?),
         ]);
         for &(y, m, d) in &[(1906, 1, 1), (1950, 1, 1), (1999, 1, 1), (2000, 6, 1)] {
-            assert_ne!(ls.classify(nd(y, m, d)?), Green, "at {y}-{m}-{d}");
+            assert_ne!(ls.classify(nd(y, m, d)?), Uncontested, "at {y}-{m}-{d}");
         }
         Ok(())
+    }
+
+    /// The presence order a shared map pin resolves by: co-located entities
+    /// collapse to one marker showing its most-present member (`.max()`), so this
+    /// chain decides what the user sees. Pinned because it lives in the variant
+    /// declaration order — a reorder would silently change the render.
+    #[test]
+    fn presence_order_ranks_uncontested_over_contested_over_presumed_over_unknown_over_absent() {
+        assert!(Absent < Unknown);
+        assert!(Unknown < Presumed);
+        assert!(Presumed < Contested);
+        assert!(Contested < Uncontested);
     }
 
     // --- The monoid contract (associativity / commutativity / idempotence /
@@ -717,9 +740,9 @@ mod tests {
             prop_assert_eq!(held, 1);
 
             let expected = if green {
-                Green
+                Uncontested
             } else if orange {
-                Orange
+                Contested
             } else if presumed {
                 Presumed
             } else if unknown {

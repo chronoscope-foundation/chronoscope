@@ -15,6 +15,7 @@ use crate::grammar::geometry::ImageGeometry;
 use crate::grammar::identity::OrderedDistinctPair;
 use crate::grammar::image::ImageMedium;
 use crate::grammar::lifecycle::{DamageCause, LifetimeEventKind, MoveMethod, Usage};
+use crate::lifespan::Lifespan;
 use crate::location::UnresolvedLocation;
 use crate::projection::Claimed;
 
@@ -214,10 +215,18 @@ pub struct Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T> {
     /// The class's `SameEntity` glue: each judgment's endpoint pair and support.
     /// The root summary and the per-field connecting edges derive from it.
     pub sameness: Sameness<EntId, T>,
+    /// The existence classifier the map slider reads, accumulated per fact.
+    ///
+    /// It rides beside the slots its facts also feed rather than deriving from
+    /// them: the deny channel quantifies over *assertions* (the rival claiming
+    /// the latest start denies the most past), which a merged bracket has
+    /// already collapsed. Folding at inject time keeps each claim separate.
+    pub lifespan: Lifespan,
 }
 
 derive_slot!(Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T: Semiring>, {
-    names, relations, refs, construction, demolition, existence, events, depictions, sameness
+    names, relations, refs, construction, demolition, existence, events, depictions, sameness,
+    lifespan
 });
 
 /// A pure projected image: a product of slots over the image's `SameArtifact`

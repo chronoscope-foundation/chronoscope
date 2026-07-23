@@ -93,9 +93,15 @@ async fn placeable_in(
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let viewport = Viewport::new(GeoPoint::new(sw.0, sw.1)?, GeoPoint::new(ne.0, ne.1)?)?;
     let limit = NonZeroUsize::new(64).ok_or("nonzero limit")?;
-    let page = summaries_in_viewport::<MemoryFactStore, _>(&mut view, &viewport, None, limit)
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+    let page = summaries_in_viewport::<MemoryFactStore, _>(
+        &mut view,
+        &viewport,
+        None,
+        limit,
+        chrono::NaiveDate::MIN,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
     for s in &page.summaries {
         assert!(
             viewport.contains(&s.point),
