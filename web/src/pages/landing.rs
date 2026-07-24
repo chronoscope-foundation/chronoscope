@@ -8,6 +8,7 @@ use crate::api::Client;
 use crate::components::dismiss_button::DismissButton;
 use crate::components::entity_detail::{EntityDetailPanel, LightboxState};
 use crate::components::map::{MapStatus, MapView, SelectedEntity};
+use crate::components::time_slider::TimeSlider;
 
 const INFO_DISMISSED_KEY: &str = "chronoscope-info-dismissed";
 
@@ -74,6 +75,9 @@ pub fn Landing() -> impl IntoView {
 
             // Map status overlays (loading, empty)
             <MapStatusOverlay/>
+
+            // The time control — rewinds the map to a historical moment.
+            <TimeSlider/>
 
             // Dismissible info card — collapsible "about" overlay for new visitors.
             // Dismissal persists in localStorage so returning users get a clean map.

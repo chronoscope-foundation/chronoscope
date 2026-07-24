@@ -689,6 +689,8 @@ impl WebTest {
         pub wait click_map_at(lng: f64, lat: f64);
         pub wait pan_map_to(lng: f64, lat: f64, zoom: f64);
         pub wait click_and_wait_for_fetch(selector: &str);
+        // Drive the time slider to a year and await the refetch it triggers.
+        pub wait set_time_slider_year(year: f64);
 
         // Internal: the thumbnails-loaded counter is consumed only by the
         // bespoke `goto_map_with_thumbnails` composer below.

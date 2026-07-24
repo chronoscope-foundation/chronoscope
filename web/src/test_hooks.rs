@@ -273,6 +273,9 @@ pub fn register_map_hooks(
             move || wait_for_map_idle(&h)
         },
 
+        // Time slider — set a year and await the refetch it triggers.
+        set_time_slider_year: |year: f64| set_time_slider_year(year),
+
         // Thumbnails loaded — sample-then-await pattern (mirrors fetch-settled).
         current_thumbnails_loaded: || crate::components::map::current_thumbnails_loaded() as f64,
         wait_for_thumbnails_loaded_after: |prev: f64| {
@@ -739,6 +742,41 @@ fn click_and_wait_for_fetch(selector: String) -> js_sys::Promise {
     wasm_bindgen_futures::future_to_promise(async move {
         let prev = current_fetch_settled();
         wasm_bindgen_futures::JsFuture::from(click(selector)).await?;
+        wasm_bindgen_futures::JsFuture::from(wait_for_fetch_settled_after(prev)).await?;
+        Ok(JsValue::NULL)
+    })
+}
+
+/// Drive the time slider to `year` and await the refetch it triggers.
+///
+/// Sets the range input's value and dispatches the `input` event the component
+/// listens for, so the test exercises the same path a user's drag does rather
+/// than poking the signal behind it.
+fn set_time_slider_year(year: f64) -> js_sys::Promise {
+    wasm_bindgen_futures::future_to_promise(async move {
+        let prev = current_fetch_settled();
+        wasm_bindgen_futures::JsFuture::from(wait_for_selector("#time-slider".to_string())).await?;
+        let input = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.query_selector("#time-slider").ok().flatten())
+            .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok());
+        let Some(input) = input else {
+            return Err(JsValue::from_str("time slider input not found"));
+        };
+        // A year the slider already holds arms no refetch, so awaiting the
+        // settled counter would hang until timeout instead of returning. Report
+        // it as an error the test can read rather than a mysterious stall.
+        let target = (year as i64).to_string();
+        if input.value() == target {
+            return Err(JsValue::from_str(
+                "set_time_slider_year: the slider is already at that year, so no refetch would follow",
+            ));
+        }
+        input.set_value(&target);
+        // Dispatched on the input itself, which is where Leptos attached the
+        // listener, so the event needs no bubbling.
+        let event = web_sys::Event::new("input")?;
+        input.dispatch_event(&event)?;
         wasm_bindgen_futures::JsFuture::from(wait_for_fetch_settled_after(prev)).await?;
         Ok(JsValue::NULL)
     })

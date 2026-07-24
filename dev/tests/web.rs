@@ -11,11 +11,13 @@ mod harness;
 
 use harness::{TestResult, WebTest, check, web_test, web_test_seeded};
 
+use chrono::Datelike;
 use chronoscope_api::state::ServerIds;
+use chronoscope_core::date::{DatePrecision, UncertainDate};
 use chronoscope_core::geo::{GeoPoint, Meters};
 use chronoscope_core::grammar::assertions::FactualAssertion;
 use chronoscope_core::grammar::attribute::{self, NameText, NameType};
-use chronoscope_core::grammar::bookend::ConstructionFact;
+use chronoscope_core::grammar::bookend::{ConstructionFact, DemolitionFact};
 use chronoscope_core::grammar::citations::{Excerpt, ExternalSource, FactualCitation, Language};
 use chronoscope_core::grammar::ids::UserId;
 use chronoscope_core::location::{Location, UnresolvedLocation};
@@ -85,6 +87,51 @@ fn name_and_location_facts(
     ])
 }
 
+/// A commit placing one named entity at `(lat, lon)` that was built in `built`
+/// and demolished in `demolished` — so it exists at instants between them and
+/// nowhere else.
+fn seed_demolished_entity_at(
+    name: &str,
+    lat: f64,
+    lon: f64,
+    built: i32,
+    demolished: i32,
+) -> SeedResult {
+    let year = |y: i32| -> Result<UncertainDate, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(UncertainDate::with_precision(
+            chrono::NaiveDate::from_ymd_opt(y, 1, 1).ok_or("valid year")?,
+            DatePrecision::Year,
+        )?)
+    };
+    let mut facts = name_and_location_facts(name, lat, lon)?;
+    facts.push(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: ConstructionFact::Started {
+                entity: EntityIdx(0),
+                bound: year(built)?,
+            },
+        },
+        citation: seed_citation("https://example.com/seed-built")?,
+    });
+    facts.push(SubmitFact::Factual {
+        assertion: FactualAssertion::Demolition {
+            fact: DemolitionFact::Completed {
+                entity: EntityIdx(0),
+                bound: year(demolished)?,
+            },
+        },
+        citation: seed_citation("https://example.com/seed-demolished")?,
+    });
+    Ok(Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("seed")),
+        recorded_at: chrono::Utc::now(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
+        facts: facts.into_iter().collect(),
+    })
+}
+
 /// A commit placing one named entity at `(lat, lon)`.
 fn seed_entity_at(name: &str, lat: f64, lon: f64) -> SeedResult {
     Ok(Commit::<ServerIds> {
@@ -133,6 +180,73 @@ async fn rendered_features(
     let mut features = t.marker_properties().await?;
     features.extend(t.badge_properties().await?);
     Ok(features)
+}
+
+/// The time slider rewinds the map: an entity demolished long ago is absent
+/// today and so draws nothing, appears when the slider reaches a year inside its
+/// life, and vanishes again on the return to now.
+///
+/// This is the whole feature end to end — the slider's DOM event, the refetch it
+/// debounces, the server's verdict at that instant, and the render's decision to
+/// draw or drop the marker.
+#[tokio::test]
+async fn test_time_slider_reveals_a_demolished_entity() -> TestResult {
+    let seeds = vec![seed_demolished_entity_at(
+        "Old Lighthouse",
+        25.0,
+        -40.0,
+        1700,
+        1800,
+    )?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 11.0).await?;
+
+        // Today: the lighthouse came down in 1800, so nothing is drawn.
+        check(
+            rendered_features(t).await?.is_empty(),
+            "an entity demolished in 1800 must not render on the present-day map",
+        )?;
+
+        // Rewound inside its life: the marker appears.
+        t.set_time_slider_year(1750.0).await?;
+        check(
+            !rendered_features(t).await?.is_empty(),
+            "rewinding to 1750 must reveal an entity that stood from 1700 to 1800",
+        )?;
+
+        // Before it was built: gone again — the slider reads both directions.
+        t.set_time_slider_year(1650.0).await?;
+        check(
+            rendered_features(t).await?.is_empty(),
+            "rewinding past the construction date must hide it again",
+        )?;
+
+        // Back into its life, so the reset below has something to take away —
+        // asserting emptiness from an already-empty view would pass no matter
+        // where the reset landed.
+        t.set_time_slider_year(1750.0).await?;
+        check(
+            !rendered_features(t).await?.is_empty(),
+            "returning to 1750 must reveal the entity again",
+        )?;
+
+        // The reset lands on the present, where the entity is long gone: the
+        // marker must disappear, and the slider must read the current year.
+        t.click_and_wait_for_fetch("button[aria-label*=\"present day\"]")
+            .await?;
+        check(
+            rendered_features(t).await?.is_empty(),
+            "the reset must return the map to the present, where the entity is absent",
+        )?;
+        let this_year = chrono::Utc::now().year().to_string();
+        let shown_year = t.text("#time-slider-year").await?;
+        check(
+            shown_year.trim() == this_year,
+            format!("after the reset the slider must read {this_year}, got: {shown_year:?}"),
+        )?;
+        Ok(())
+    })
+    .await
 }
 
 /// Assert the three sidebar/nav links (Explore, About, FAQ) are present.
@@ -511,6 +625,10 @@ async fn test_chioggia_existence_after_demolition_conflict() -> TestResult {
     web_test(async |t| {
         t.goto_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1, 14.0)
             .await?;
+        // Demolished in 1623, so it is absent from the present-day map. Rewind
+        // into the disputed era — after the demolition, at the 1633 witness —
+        // where the cathedral is exactly the contested pin this test is about.
+        t.set_time_slider_year(1633.0).await?;
         t.click_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1)
             .await?;
         t.wait_for_selector("[role='complementary']").await?;

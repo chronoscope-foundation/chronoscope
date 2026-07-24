@@ -4,3 +4,4 @@ pub mod error_banner;
 pub mod map;
 pub mod markdown_article;
 pub mod nav;
+pub mod time_slider;

@@ -10,8 +10,11 @@ use serde_json::json;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
+use chrono::NaiveDate;
+
 use chronoscope_api_client::EntityId;
 use chronoscope_core::geo::{GeoPoint, QuadLevel, Viewport};
+use chronoscope_core::lifespan::ExistenceState;
 
 use crate::api;
 use crate::api::Snapshot;
@@ -212,6 +215,10 @@ struct MapMarker {
     /// icon id (the placeholder→raster load path) and seeds the id→URL registry
     /// the `styleimagemissing` handler resolves against.
     thumbnail_url: Option<String>,
+    /// What the sources say about this entity's existence at the slider's
+    /// instant. `None` for a cluster pin, which stands for many entities and
+    /// carries no single verdict.
+    existence: Option<ExistenceState>,
 }
 
 /// Signal carrying the current map selection.
@@ -220,6 +227,22 @@ pub struct SelectedEntity(
     pub ReadSignal<Option<EntitySelection>>,
     pub WriteSignal<Option<EntitySelection>>,
 );
+
+/// The map's time control, provided via context: the instant the map is rewound
+/// to, and the setter the time slider drives it with.
+///
+/// The map owns the signal so the slider can live anywhere in the layout, and so
+/// a pan and a scrub read one instant rather than two.
+#[derive(Clone, Copy)]
+pub struct TimeControl {
+    pub as_of: ReadSignal<NaiveDate>,
+    pub set_as_of: WriteSignal<NaiveDate>,
+    /// The day the session opened, sampled once. Carried here so the slider's
+    /// upper bound and its "is this the default view" test come from the same
+    /// instant the map initialized with — a second `today()` call could land on
+    /// the other side of midnight.
+    pub now: NaiveDate,
+}
 
 /// Map loading/status signals provided via context.
 #[derive(Clone)]
@@ -236,6 +259,23 @@ pub struct MapStatus {
 
 // ==================== GeoJSON construction ====================
 
+/// The browser's current date — the map's default instant, and what the "now"
+/// reset returns to.
+///
+/// Read through `js_sys` rather than `chrono::Utc::now`, which needs chrono's
+/// `wasmbind` feature to work in a browser at all.
+pub(crate) fn today() -> NaiveDate {
+    let now = js_sys::Date::new_0();
+    // A `Date`'s components are always a real calendar day, so the fallback is
+    // unreachable; `unwrap_or_default` keeps it total without a panic path.
+    NaiveDate::from_ymd_opt(
+        now.get_full_year() as i32,
+        now.get_month() + 1,
+        now.get_date(),
+    )
+    .unwrap_or_default()
+}
+
 /// The style-image id for a marker's thumbnail raster.
 ///
 /// This id is the single point of coordination between three places: the
@@ -246,11 +286,39 @@ fn thumbnail_image_id(marker_id: &str) -> String {
     format!("thumb-{marker_id}")
 }
 
+/// The GeoJSON property value each existence verdict renders under. The layer
+/// paint expressions match on these strings, so the mapping lives here alone.
+fn existence_property(state: ExistenceState) -> &'static str {
+    match state {
+        ExistenceState::Uncontested => "uncontested",
+        ExistenceState::Contested => "contested",
+        ExistenceState::Presumed => "presumed",
+        ExistenceState::Unknown => "unknown",
+        ExistenceState::Absent => "absent",
+    }
+}
+
+/// Whether a marker is drawn at the slider's instant. An entity the sources
+/// place as gone (or not yet built) is dropped entirely rather than styled away.
+///
+/// Applied when the in-view set is *assembled*, not when it is serialized, so
+/// that one list is the drawn set: the empty-state signal, the thumbnail
+/// registry, and the GeoJSON all read the same markers. Filtering at
+/// serialization instead left every other consumer counting entities nobody can
+/// see.
+///
+/// A cluster pin has no verdict and always draws.
+fn is_drawn(marker: &MapMarker) -> bool {
+    marker.existence != Some(ExistenceState::Absent)
+}
+
 /// Build a GeoJSON `FeatureCollection` from a list of map markers.
 ///
 /// One marker = one feature. The server handles co-location grouping, so
 /// there's no client-side coordinate dedup; each feature's `kind` (entity vs
-/// cluster) is derived from its click action.
+/// cluster) is derived from its click action. Markers absent at the slider's
+/// instant were already dropped when the in-view set was assembled
+/// ([`is_drawn`]).
 fn build_markers_geojson(markers: &[MapMarker]) -> Option<JsValue> {
     use geojson::{Feature, FeatureCollection, Geometry, Value, feature};
 
@@ -288,6 +356,9 @@ fn build_markers_geojson(markers: &[MapMarker]) -> Option<JsValue> {
                 }
             };
             props.insert("kind".into(), kind.into());
+            if let Some(state) = marker.existence {
+                props.insert("existence".into(), existence_property(state).into());
+            }
 
             // A thumbnailed marker carries its style-image id upfront, so it
             // lands in the symbol layer from the first `setData`. The id points
@@ -380,6 +451,45 @@ fn init_source_and_layers(map: &maplibre::Map) {
         ["!=", ["get", "kind"], "cluster"]
     ]);
 
+    // How the drawn existence states read (absent markers are dropped upstream,
+    // in `build_markers_geojson`). A cluster carries no verdict and falls through
+    // to the default arm.
+    //
+    // `presumed` deliberately renders exactly like `uncontested`. We never hold
+    // positive evidence that something stood at a given instant — only events we
+    // infer it from — so presumption is the ordinary way a standing building
+    // reads, not a degraded one. A palace sighted once in 1343 and never since is
+    // presumed every day after, and fading that would fade most of the map.
+    //
+    // What the render does distinguish is having *no* evidence (`unknown`, washed
+    // out) and sources *disagreeing* (`contested`, ringed).
+    // Coalesced like the other property reads: a marker whose representative
+    // failed to project carries no verdict, and a bare `get` would feed `match` a
+    // null. No evidence is exactly `unknown`, so that is the honest default.
+    let existence = json!(["coalesce", ["get", "existence"], "unknown"]);
+    let fill_opacity = json!(["match", existence.clone(), "unknown", 0.25, 0.85]);
+    let fill_color = json!(["match", existence.clone(), "unknown", "#9A9A9A", "#8B5E3C"]);
+    // A contested marker gets a heavier ring in a colour nothing else uses, so a
+    // source disagreement is visible without opening the entity.
+    let stroke_color = json!([
+        "case",
+        get_selected,
+        "#FFFFFF",
+        ["==", existence.clone(), "contested"],
+        "#C2410C",
+        ["==", existence.clone(), "unknown"],
+        "#B8B8B8",
+        "#F5F0E8"
+    ]);
+    let stroke_width = json!([
+        "case",
+        get_selected,
+        4,
+        ["==", existence.clone(), "contested"],
+        3,
+        2
+    ]);
+
     // Circle layer for the bare marker dots. A thumbnailed marker carries a
     // `thumbnail` id from t=0 and so renders in the symbol layer instead —
     // this filter excludes it, and the symbol layer's `styleimagemissing`
@@ -391,10 +501,10 @@ fn init_source_and_layers(map: &maplibre::Map) {
         "filter": ["all", ["!", ["has", "thumbnail"]], not_cluster.clone()],
         "paint": {
             "circle-radius": 10,
-            "circle-color": "#8B5E3C",
-            "circle-stroke-width": ["case", get_selected, 4, 2],
-            "circle-stroke-color": ["case", get_selected, "#FFFFFF", "#F5F0E8"],
-            "circle-opacity": 0.85
+            "circle-color": fill_color,
+            "circle-stroke-width": stroke_width,
+            "circle-stroke-color": stroke_color,
+            "circle-opacity": fill_opacity
         }
     });
     let Ok(circle_js) = to_js(&circle) else {
@@ -497,7 +607,14 @@ fn init_source_and_layers(map: &maplibre::Map) {
             "icon-anchor": "bottom"
         },
         "paint": {
-            "icon-opacity": 0.95
+            // A thumbnailed marker fades on the same scale as a bare dot, so a
+            // photographed entity and an unphotographed one read the same
+            // confidence at a given instant.
+            "icon-opacity": [
+                "match", ["coalesce", ["get", "existence"], "unknown"],
+                "unknown", 0.35,
+                0.95
+            ]
         }
     });
     let Ok(thumbnails_js) = to_js(&thumbnails) else {
@@ -560,9 +677,14 @@ struct ViewportSignals {
 /// Cache key for a fetched container tile. Snapshot-first so a snapshot change
 /// can never serve a stale cell: keying on `(snapshot, level, x, y)` isolates
 /// each read-consistency point's tiles.
+///
+/// `as_of` is part of the key because the server reports each marker's existence
+/// at that instant — the same tile at a different slider position is a different
+/// answer, not a cache hit.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct TileKey {
     snapshot: Snapshot,
+    as_of: NaiveDate,
     level: u8,
     x: u32,
     y: u32,
@@ -612,6 +734,7 @@ fn marker_from_wire(m: api::Marker) -> MapMarker {
         label: m.name,
         click_action: m.click_action,
         thumbnail_url: m.thumbnail_url.map(|url| url.as_str().to_string()),
+        existence: m.existence,
     }
 }
 
@@ -679,6 +802,10 @@ async fn refresh_tiles_for_viewport(
     let level_z = level.get();
     let tiles = tiles_for_bounds(&viewport, level, TILE_MARGIN);
 
+    // One read for the whole pass: the slider can move mid-fetch, and a pass
+    // that probed one instant must not cache or render under another.
+    let as_of = state.as_of.get();
+
     // Guardrail: never fan out a request storm. The prior render (and cache)
     // stay, so the view degrades to slightly-stale rather than blank.
     if tiles.len() > MAX_TILES_PER_PASS {
@@ -724,6 +851,7 @@ async fn refresh_tiles_for_viewport(
             let cache = state.tile_cache.borrow();
             let mut probe = TileKey {
                 snapshot: snapshot.clone(),
+                as_of,
                 level: level_z,
                 x: 0,
                 y: 0,
@@ -747,7 +875,7 @@ async fn refresh_tiles_for_viewport(
     let snapshot_ref = pass_snapshot.as_ref();
     let fetches = missing.into_iter().map(move |(x, y)| async move {
         let result = client_ref
-            .fetch_tile(level_z, x, y, snapshot_ref, None)
+            .fetch_tile(level_z, x, y, snapshot_ref, Some(as_of))
             .await;
         (x, y, result)
     });
@@ -779,6 +907,7 @@ async fn refresh_tiles_for_viewport(
                     cache.insert(
                         TileKey {
                             snapshot: response.snapshot,
+                            as_of,
                             level: level_z,
                             x,
                             y,
@@ -806,6 +935,7 @@ async fn refresh_tiles_for_viewport(
         let cache = state.tile_cache.borrow();
         let mut probe = TileKey {
             snapshot: snapshot.clone(),
+            as_of,
             level: level_z,
             x: 0,
             y: 0,
@@ -817,7 +947,7 @@ async fn refresh_tiles_for_viewport(
                 in_view.extend(
                     cells
                         .iter()
-                        .filter(|c| viewport.contains(&c.point))
+                        .filter(|c| viewport.contains(&c.point) && is_drawn(c))
                         .cloned(),
                 );
             }
@@ -829,23 +959,38 @@ async fn refresh_tiles_for_viewport(
     // the retain sweep below would evict the prior area's still-good cache. Keep
     // the last-good render and cache instead, surfacing only the error. Gated on
     // the error so a genuinely empty area (no error) still renders empty below.
+    // Only sound while the instant is unchanged: keeping the prior render then
+    // means "slightly old viewport". After a scrub it would mean markers from
+    // another year sitting under a slider that reads the new one, so a failed
+    // scrub clears instead.
     if fetch_error.is_some() && in_view.is_empty() {
+        let same_instant = state.rendered_as_of.get() == Some(as_of);
         signals.set_loading.set(false);
         signals.set_empty.set(false);
         signals.set_fetch_error.set(fetch_error);
+        if !same_instant {
+            state.rendered_as_of.set(Some(as_of));
+            signals.set_cached_markers.set(Vec::new());
+        }
         #[cfg(feature = "test-hooks")]
         record_fetch_settled();
         return;
     }
 
     // Bound the cache to the window this pass assembled: keep only cells at the
-    // pinned snapshot and current level whose tile the viewport+margin
-    // enumeration covered. A pan, zoom, or snapshot change keys past everything
-    // else, so without this sweep the cache grows unbounded as the map moves.
+    // pinned snapshot, current level, and current instant whose tile the
+    // viewport+margin enumeration covered. A pan, zoom, snapshot change, or
+    // slider move keys past everything else, so without this sweep the cache
+    // grows unbounded as the map moves — and `as_of` belongs in the predicate for
+    // the same reason as the rest: a scrub across a century would otherwise
+    // retain a full tile set per year it passed through.
     if let Some(snapshot) = &effective_snapshot {
         let window: BTreeSet<(u32, u32)> = tiles.iter().copied().collect();
         state.tile_cache.borrow_mut().retain(|key, _| {
-            key.snapshot == *snapshot && key.level == level_z && window.contains(&(key.x, key.y))
+            key.snapshot == *snapshot
+                && key.as_of == as_of
+                && key.level == level_z
+                && window.contains(&(key.x, key.y))
         });
     }
 
@@ -901,6 +1046,7 @@ async fn refresh_tiles_for_viewport(
         *cur = next;
     }
 
+    state.rendered_as_of.set(Some(as_of));
     signals.set_cached_markers.set(in_view);
 
     #[cfg(feature = "test-hooks")]
@@ -1866,6 +2012,16 @@ struct MapState {
     /// entry when it resumes, so a pass that outlives unmount never drives the
     /// removed map or writes a disposed signal.
     disposed: Rc<Cell<bool>>,
+    /// The instant the map is rewound to — the time slider's position, and the
+    /// `as_of` every tile fetch and cache key carries. Shared state rather than a
+    /// pass argument so a pan and a scrub read the same value and cannot race
+    /// two different instants into one assembly.
+    as_of: Rc<Cell<NaiveDate>>,
+    /// The instant the markers currently on screen were read at. Lets a failed
+    /// pass tell "stale viewport, same year" (keep the render) from "stale year"
+    /// (drop it — markers labelled with a date they don't belong to are worse
+    /// than none).
+    rendered_as_of: Rc<Cell<Option<NaiveDate>>>,
 }
 
 /// Create the map, register the style-load callback (which adds source/layers,
@@ -2118,6 +2274,66 @@ fn effect_retry_on_signal(
     });
 }
 
+/// Re-read the visible tiles whenever the time slider moves.
+///
+/// The instant lives in `MapState` so the fetch pass reads one value; this
+/// effect writes it there, then fires the pass through the *same* debounce timer
+/// the pan path uses, so a scrub and a pan can never drive two passes at once.
+/// Verdicts come from the server, so a new instant is a new read — the tile
+/// cache keys on `as_of` and simply misses.
+fn effect_refetch_on_as_of(
+    as_of: ReadSignal<NaiveDate>,
+    map_handle: Rc<RefCell<Option<maplibre::Map>>>,
+    state: MapState,
+    signals: ViewportSignals,
+) {
+    // One reusable `Fn` closure for every scrub, built once and kept alive here.
+    // A dragged range input fires `input` per pixel, and a `Closure::once_into_js`
+    // is only freed when it runs — so a per-event closure would leak its captured
+    // state on every cancelled debounce, which is most of them.
+    let timer_state = state.clone();
+    let timer_map = Rc::clone(&map_handle);
+    let timeout_cb: Rc<Closure<dyn Fn()>> = Rc::new(Closure::new(move || {
+        timer_state.debounce_timer.set(None);
+        let map_ref = timer_map.borrow();
+        let Some(map) = map_ref.as_ref() else { return };
+        let map = map.clone();
+        let st_pass = timer_state.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(client) = api::get_or_init_client(&st_pass.api_client).await else {
+                signals
+                    .set_fetch_error
+                    .set(Some("Failed to load API configuration".to_string()));
+                return;
+            };
+            refresh_tiles_for_viewport(&map, &client, signals, &st_pass).await;
+        });
+    }));
+
+    Effect::new(move || {
+        let instant = as_of.get();
+        if state.as_of.get() == instant {
+            return;
+        }
+        state.as_of.set(instant);
+
+        if let Some(timer_id) = state.debounce_timer.get()
+            && let Some(w) = web_sys::window()
+        {
+            w.clear_timeout_with_handle(timer_id);
+        }
+
+        if let Some(w) = web_sys::window()
+            && let Ok(id) = w.set_timeout_with_callback_and_timeout_and_arguments_0(
+                timeout_cb.as_ref().as_ref().unchecked_ref(),
+                MOVEEND_DEBOUNCE_MS,
+            )
+        {
+            state.debounce_timer.set(Some(id));
+        }
+    });
+}
+
 // ==================== Component ====================
 
 #[component]
@@ -2145,6 +2361,18 @@ pub fn MapView(
         empty,
         fetch_error,
         retry: set_retry,
+    });
+
+    // The instant the map reads existence at. Defaults to the present, so the
+    // first view is the world as it stands; the slider rewinds from there.
+    // Sampled once and shared with `MapState` below: two `today()` calls could
+    // straddle midnight and start the signal and the fetch state a day apart.
+    let initial_as_of = today();
+    let (as_of, set_as_of) = signal(initial_as_of);
+    provide_context(TimeControl {
+        as_of,
+        set_as_of,
+        now: initial_as_of,
     });
 
     let (map_error, set_map_error) = signal(None::<String>);
@@ -2179,6 +2407,8 @@ pub fn MapView(
         pass_generation: Rc::new(Cell::new(0)),
         pass_abort: Rc::new(RefCell::new(None)),
         disposed: Rc::new(Cell::new(false)),
+        as_of: Rc::new(Cell::new(initial_as_of)),
+        rendered_as_of: Rc::new(Cell::new(None)),
     };
     effect_mount_map(
         container,
@@ -2195,6 +2425,7 @@ pub fn MapView(
         Rc::clone(&state.source_generation),
     );
     effect_selection(signals, Rc::clone(&map_handle), state.source_initialized);
+    effect_refetch_on_as_of(as_of, Rc::clone(&map_handle), state.clone(), signals);
     effect_retry_on_signal(
         retry_signal,
         set_retry,
