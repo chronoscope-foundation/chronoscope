@@ -12,6 +12,8 @@
 //! per-field home and surfaces as an entity-level [`TemporalConflict`], distinct
 //! from the per-slot disputed consensus a single over-determined date carries.
 
+pub mod replay;
+
 use std::collections::BTreeSet;
 
 use chrono::NaiveDate;
@@ -27,7 +29,7 @@ use crate::grammar::assertions::FactualAssertion;
 use crate::grammar::bookend::DemolitionFact;
 use crate::grammar::ids::{FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
-use crate::projection::{self, Bracket};
+use crate::projection::{self, Bracket, Event};
 use crate::submit::StoredFact;
 
 /// An entity-level temporal contradiction: facts that can't jointly hold.
@@ -118,13 +120,9 @@ pub fn temporal_conflicts<R: IdScheme>(entity: &CitedEntity<R>) -> Vec<TemporalC
     // Each event's endpoint dates bundle together, so a durational span with
     // both ends outside one bound reads as one conflict, not one per endpoint.
     for entry in entity.events.values() {
-        let event = &entry.value;
-        let dates: Vec<(FactId, UncertainDate)> =
-            [&event.occurred_at, &event.started_at, &event.completed_at]
-                .into_iter()
-                .flat_map(|slot| slot.extent.support.atoms())
-                .filter_map(|atom| fact_date(&atom.fact).map(|date| (atom.id, date)))
-                .collect();
+        let dates: Vec<(FactId, UncertainDate)> = event_endpoint_dates(&entry.value)
+            .map(|(atom, date)| (atom.id, date))
+            .collect();
         bundle_conflicts(
             &mut conflicts,
             &mut seen,
@@ -253,15 +251,9 @@ pub fn inject_derived_bounds<R: IdScheme>(entity: &mut CitedEntity<R>) {
             }
         }
         for entry in entity.events.values() {
-            let event = &entry.value;
-            for slot in [&event.occurred_at, &event.started_at, &event.completed_at] {
-                for atom in slot.extent.support.atoms() {
-                    if let Some(date) = fact_date(&atom.fact)
-                        && let (Some(latest), Some(bound)) =
-                            (date.latest(), date.latest_bound().copied())
-                    {
-                        witnesses.push((latest, bound, atom));
-                    }
+            for (atom, date) in event_endpoint_dates(&entry.value) {
+                if let (Some(latest), Some(bound)) = (date.latest(), date.latest_bound().copied()) {
+                    witnesses.push((latest, bound, atom));
                 }
             }
         }
@@ -297,6 +289,18 @@ pub fn inject_derived_bounds<R: IdScheme>(entity: &mut CitedEntity<R>) {
             .clone()
             .combine(Bracket::from((derived, support)));
     }
+}
+
+/// Each interior-event endpoint atom paired with the date its fact carries. An
+/// event implies existence at every endpoint, so the three passes reading these
+/// endpoints share one iteration and can't drift on which endpoints count.
+fn event_endpoint_dates<R: IdScheme>(
+    event: &Event<Label<FactAtom<R>>>,
+) -> impl Iterator<Item = (&FactAtom<R>, UncertainDate)> {
+    [&event.occurred_at, &event.started_at, &event.completed_at]
+        .into_iter()
+        .flat_map(|slot| slot.extent.support.atoms())
+        .filter_map(|atom| fact_date(&atom.fact).map(|date| (atom, date)))
 }
 
 /// ∃-satisfiability of a derived date constraint against a slot's asserted
@@ -516,15 +520,17 @@ mod tests {
     };
     use crate::typed;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    // The `pub(super)` fixtures are shared with the `replay` folds' tests, which
+    // build the same commits to exercise their oracle path.
+    pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn fixed_time() -> Result<DateTime<Utc>, &'static str> {
+    pub(super) fn fixed_time() -> Result<DateTime<Utc>, &'static str> {
         Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
             .single()
             .ok_or("fixed timestamp is unambiguous")
     }
 
-    fn citation(url: &str) -> Result<FactualCitation, Box<dyn std::error::Error>> {
+    pub(super) fn citation(url: &str) -> Result<FactualCitation, Box<dyn std::error::Error>> {
         let source = ExternalSource::Url {
             url: url::Url::parse(url)?,
             published: None,
@@ -532,7 +538,7 @@ mod tests {
         Ok(FactualCitation::new(source, vec![Excerpt::new("source")?])?)
     }
 
-    fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+    pub(super) fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
         Ok(UncertainDate::with_precision(
             chrono::NaiveDate::from_ymd_opt(y, 1, 1).ok_or("valid year")?,
             DatePrecision::Year,
@@ -558,7 +564,7 @@ mod tests {
     }
 
     /// A construction start fact for entity 0, dated `y`.
-    fn construction_started(y: i32) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    pub(super) fn construction_started(y: i32) -> Result<SubmitFact, Box<dyn std::error::Error>> {
         Ok(SubmitFact::Factual {
             assertion: FactualAssertion::Construction {
                 fact: ConstructionFact::Started {
@@ -1040,7 +1046,7 @@ mod tests {
 
     /// A `UsageChanged` point event on entity 0 / event 0, dated `y` — an
     /// interior event whose date is an existence witness (the Colosseum opening).
-    fn point_event_at(y: i32) -> Result<Vec<SubmitFact>, Box<dyn std::error::Error>> {
+    pub(super) fn point_event_at(y: i32) -> Result<Vec<SubmitFact>, Box<dyn std::error::Error>> {
         Ok(vec![
             SubmitFact::Factual {
                 assertion: FactualAssertion::Event {
@@ -1068,7 +1074,7 @@ mod tests {
 
     /// The one-sided "before `y`" bound the producer derives from a year-`y`
     /// witness — construction ≤ end of `y`, preserving the witness's precision.
-    fn before(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+    pub(super) fn before(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
         Ok(UncertainDate::bounded(
             None,
             year(y)?.latest_bound().copied(),

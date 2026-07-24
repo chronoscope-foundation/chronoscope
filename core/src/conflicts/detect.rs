@@ -73,6 +73,26 @@ pub fn fact_lineage<R: IdScheme>(
     })
 }
 
+/// The date a fact carries in an `accept`ed [`DateRole`], or `None` when the fact
+/// isn't `Factual` or names no accepted date. Reads it off the derived
+/// `visit_dates` walk so the set of positions a role can occupy can't drift from
+/// the grammar's single-interval rule.
+pub(crate) fn date_for_role<R: IdScheme>(
+    fact: &StoredFact<R>,
+    accept: impl Fn(DateRole) -> bool,
+) -> Option<UncertainDate> {
+    let StoredFact::Factual(f) = fact else {
+        return None;
+    };
+    let mut found = None;
+    f.assertion.visit_dates(&mut |role, date| {
+        if accept(role) {
+            found = Some(date.clone());
+        }
+    });
+    found
+}
+
 /// The date a bookend or event date fact carries. A date-conflict pass needs each
 /// fighting fact's own interval back: the consensus meet reports only that a slot
 /// bottomed out, not which facts' intervals are mutually disjoint.
@@ -81,20 +101,9 @@ pub fn fact_lineage<R: IdScheme>(
 /// already sorts the facts by side — each routes to its own endpoint slot, so a
 /// slot's support holds one side only, and the caller is always inside one slot.
 pub(crate) fn fact_date<R: IdScheme>(fact: &StoredFact<R>) -> Option<UncertainDate> {
-    let StoredFact::Factual(f) = fact else {
-        return None;
-    };
-    // A bookend or event-date fact carries exactly one such bound; the other
-    // fact-payload dates (name windows, existence, image) route to other slots
-    // and aren't this pass's endpoint intervals. Reuse the derived walk so the
-    // set of endpoint positions can't drift from the single-interval rule's.
-    let mut bound = None;
-    f.assertion.visit_dates(&mut |role, date| {
-        if matches!(role, DateRole::BookendBound | DateRole::EventDate) {
-            bound = Some(date.clone());
-        }
-    });
-    bound
+    date_for_role(fact, |role| {
+        matches!(role, DateRole::BookendBound | DateRole::EventDate)
+    })
 }
 
 /// Whether a stored fact is a [`ConstructionFact::Started`](bookend::ConstructionFact::Started)
