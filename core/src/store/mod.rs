@@ -866,10 +866,12 @@ pub trait FactWrite<S: FactStore>:
 /// `with_tx` closure. Written against the in-memory backend, since the
 /// mechanism is the trait signature's, not any one backend's.
 ///
-/// The same nesting without the cross-use compiles, so what the compiler
-/// rejects here is the smuggle rather than the shape. `swap` demands the two
-/// brands unify; the `async fn` is never called, and an uncalled one is
-/// still typechecked.
+/// `swap` demands the two brands unify; the `async fn` is never called, and an
+/// uncalled one is still typechecked. [`BrandsNestWithoutSmuggling`] is the
+/// positive control: the same nesting minus the cross-use, as a normal
+/// doctest. A `compile_fail` block passes on any compile error, so the pair is
+/// what pins the rejection to the smuggle — break the shape itself and the
+/// control fails loudly instead of this block passing for the wrong reason.
 ///
 /// ```compile_fail
 /// use chronoscope_core::store::FactStore;
@@ -897,3 +899,38 @@ pub trait FactWrite<S: FactStore>:
 /// ```
 #[cfg(doctest)]
 struct BrandsCannotUnify;
+
+/// Positive control for [`BrandsCannotUnify`]: two stores' `with_tx` calls
+/// nest, each closure using only its own tx, and that compiles.
+///
+/// Same shape, same backend, same uncalled-`async fn` trick — only the smuggle
+/// is gone. Each handle is put to work (a mint) so the brands are exercised
+/// rather than merely bound.
+///
+/// ```
+/// use chronoscope_core::store::memory::MemoryFactStore;
+/// use chronoscope_core::store::{FactStore, FactWrite};
+///
+/// async fn nest() {
+///     let a = MemoryFactStore::new();
+///     let b = MemoryFactStore::new();
+///     let _ = a
+///         .with_tx(move |_, ta| {
+///             Box::pin(async move {
+///                 let _ = ta.mint_entity().await;
+///                 let _ = b
+///                     .with_tx(move |_, tb| {
+///                         Box::pin(async move {
+///                             let _ = tb.mint_entity().await;
+///                             Ok::<(), ()>(())
+///                         })
+///                     })
+///                     .await;
+///                 Ok::<(), ()>(())
+///             })
+///         })
+///         .await;
+/// }
+/// ```
+#[cfg(doctest)]
+struct BrandsNestWithoutSmuggling;
