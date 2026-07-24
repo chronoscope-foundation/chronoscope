@@ -1133,7 +1133,7 @@ mod tests {
         let mut entity = empty_entity();
         entity.names.insert(
             NameKey {
-                name: NameText::new("Pantheon"),
+                name: NameText::new("Pantheon")?,
                 language: Language::new("en")?,
                 name_type: NameType::Common,
             },

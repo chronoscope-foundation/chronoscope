@@ -28,7 +28,9 @@ use crate::external_ids::{
     WikidataEntityId, WikidataPropertyId,
 };
 use crate::grammar::geometry::ImageGeometry;
-use crate::grammar::ids::{AnalyzerProcess, AnalyzerVersion, FactId, IngesterRunId, UserId};
+use crate::grammar::ids::{
+    AnalyzerProcess, AnalyzerVersion, FactId, IngesterRunId, UserId, reject_nul,
+};
 use crate::nonempty::NonEmptyVec;
 
 // ============================================================================
@@ -55,6 +57,9 @@ impl Excerpt {
         let s = text.into();
         if s.is_empty() {
             return Err(ExcerptError::Empty);
+        }
+        if reject_nul(&s).is_err() {
+            return Err(ExcerptError::ContainsNul);
         }
         let char_count = s.chars().count();
         if char_count > EXCERPT_MAX_LEN {
@@ -102,6 +107,10 @@ pub enum ExcerptError {
     /// The supplied text exceeded [`EXCERPT_MAX_LEN`] characters.
     #[error("excerpt too long: {len} chars (max {max})")]
     TooLong { len: usize, max: usize },
+    /// The supplied text held a NUL (`U+0000`), which Postgres jsonb cannot
+    /// store.
+    #[error("excerpt contains a NUL character (U+0000)")]
+    ContainsNul,
 }
 
 // ============================================================================
@@ -954,6 +963,26 @@ mod tests {
             Excerpt::new(big),
             Err(ExcerptError::TooLong { .. })
         ));
+    }
+
+    #[test]
+    fn excerpt_rejects_nul() {
+        assert_eq!(Excerpt::new("a\u{0}b"), Err(ExcerptError::ContainsNul));
+    }
+
+    #[test]
+    fn validated_string_newtype_rejects_nul() {
+        // The shared macro constructor rejects a NUL before its length checks.
+        assert!(matches!(
+            WikimediaCategoryName::new("a\u{0}b"),
+            Err(crate::grammar::ids::ValidatedStringError::ContainsNul { .. })
+        ));
+    }
+
+    #[test]
+    fn validated_string_newtype_accepts_nul_free_value() -> TestResult {
+        assert_eq!(WikimediaCategoryName::new("Pantheon")?.as_str(), "Pantheon");
+        Ok(())
     }
 
     #[test]

@@ -352,7 +352,7 @@ mod tests {
             assertion: FactualAssertion::Attribute {
                 fact: attribute::Fact::Name {
                     entity: EntityIdx(0),
-                    name: NameText::new(name),
+                    name: NameText::new(name)?,
                     language,
                     name_type: NameType::Common,
                     valid_from: None,

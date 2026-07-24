@@ -267,6 +267,13 @@ impl FactStore for PostgresFactStore {
             .begin()
             .await
             .map_err(sql("opening write transaction"))?;
+        // Pin RC before any statement runs: the counters-row FOR UPDATE
+        // serializer below degrades into spurious serialization-failure aborts
+        // under a stricter isolation, so we don't lean on the session default.
+        sqlx::query(queries::SET_ISOLATION)
+            .execute(&mut *tx)
+            .await
+            .map_err(sql("setting transaction isolation"))?;
         // The counters-row lock, taken now and held through COMMIT, is the
         // serialization point: match -> mint -> stage runs under it, so
         // fact-id order equals commit order.

@@ -280,10 +280,18 @@ async fn build_shared_cluster() -> Result<SharedCluster, PgHarnessError> {
     start_postmaster(data_dir.path(), &server_opts)?;
     spawn_watchdog(data_dir.path(), socket_dir.path())?;
 
+    // Hand both temp dirs to the watchdog the instant it is up: `keep()` consumes
+    // each `TempDir` so its `Drop` no longer `rm -rf`s the directory. Any failure
+    // below (CREATE DATABASE, migrate) then leaves the watchdog as sole owner of a
+    // still-running postmaster and its PGDATA, stopping the one before removing the
+    // other at process exit.
+    let socket_path = socket_dir.keep();
+    let _data_path = data_dir.keep();
+
     // Build the template on single connections (no pool): create the database,
     // migrate it, then close both connections so the template has no live
     // sessions when a test clones it.
-    let mut admin = connect_one(socket_dir.path(), "postgres").await?;
+    let mut admin = connect_one(&socket_path, "postgres").await?;
     sqlx::query(&format!("CREATE DATABASE \"{TEMPLATE_DB}\""))
         .execute(&mut admin)
         .await
@@ -293,17 +301,12 @@ async fn build_shared_cluster() -> Result<SharedCluster, PgHarnessError> {
         })?;
     close(admin).await;
 
-    let mut template = connect_one(socket_dir.path(), TEMPLATE_DB).await?;
+    let mut template = connect_one(&socket_path, TEMPLATE_DB).await?;
     sqlx::migrate!("./migrations-postgres/facts")
         .run(&mut template)
         .await
         .map_err(|source| PgHarnessError::Migrate { source })?;
     close(template).await;
-
-    // Persist the temp directories (the watchdog owns their removal now), and
-    // keep only the socket path.
-    let socket_path = socket_dir.keep();
-    let _ = data_dir.keep();
 
     Ok(SharedCluster { socket_path })
 }
@@ -325,6 +328,24 @@ async fn shared_cluster() -> Result<&'static SharedCluster, PgHarnessError> {
 /// database is reclaimed when the whole cluster tears down at process exit.
 pub(crate) async fn fresh_pg_store() -> Result<(PostgresFactStore, ()), Box<dyn std::error::Error>>
 {
+    fresh_pg_store_with(None).await
+}
+
+/// Like [`fresh_pg_store`], but the per-test database carries a session default
+/// `default_transaction_isolation` of `iso`, so every connection the pool opens
+/// begins its transactions there unless a statement overrides them. Lets a test
+/// prove the write path pins its own isolation rather than riding the default.
+pub(crate) async fn fresh_pg_store_at_default_isolation(
+    iso: &str,
+) -> Result<(PostgresFactStore, ()), Box<dyn std::error::Error>> {
+    fresh_pg_store_with(Some(iso)).await
+}
+
+/// Clone the migrated template into a fresh per-test database, optionally pin its
+/// session-default isolation, then build a store over a pool to the clone.
+async fn fresh_pg_store_with(
+    default_isolation: Option<&str>,
+) -> Result<(PostgresFactStore, ()), Box<dyn std::error::Error>> {
     let cluster = shared_cluster().await?;
     let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dbname = format!("cf_test_{n}");
@@ -341,6 +362,20 @@ pub(crate) async fn fresh_pg_store() -> Result<(PostgresFactStore, ()), Box<dyn 
         context: "cloning the template database",
         source,
     })?;
+    // `ALTER DATABASE ... SET` bakes the default into the clone so every new
+    // session inherits it — the startup `options` packet can't carry it, because
+    // a value like `repeatable read` has a space the `-c` parser splits on.
+    if let Some(iso) = default_isolation {
+        sqlx::query(&format!(
+            "ALTER DATABASE \"{dbname}\" SET default_transaction_isolation = '{iso}'"
+        ))
+        .execute(&mut admin)
+        .await
+        .map_err(|source| PgHarnessError::Sqlx {
+            context: "setting the per-test database isolation default",
+            source,
+        })?;
+    }
     close(admin).await;
     let pool = connect_pool(&cluster.socket_path, &dbname, 5).await?;
     Ok((PostgresFactStore::new(pool), ()))

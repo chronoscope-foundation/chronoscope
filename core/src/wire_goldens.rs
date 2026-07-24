@@ -165,7 +165,7 @@ where
 fn golden_attribute_fact_name() -> Result<()> {
     let f: attribute::Fact<MemoryIds> = attribute::Fact::Name {
         entity: ent(1)?,
-        name: NameText::new("Pantheon"),
+        name: NameText::new("Pantheon")?,
         language: en()?,
         name_type: NameType::Common,
         valid_from: None,
@@ -540,7 +540,7 @@ fn golden_submit_fact_factual() -> Result<()> {
     let assertion = FactualAssertion::Attribute {
         fact: attribute::Fact::Name {
             entity: EntityIdx(0),
-            name: NameText::new("X"),
+            name: NameText::new("X")?,
             language: en()?,
             name_type: NameType::Common,
             valid_from: None,
@@ -623,7 +623,7 @@ fn golden_commit_canonical_jcs_full_bundle() -> Result<()> {
         assertion: FactualAssertion::Attribute {
             fact: attribute::Fact::Name {
                 entity: EntityIdx(0),
-                name: NameText::new("Pantheon"),
+                name: NameText::new("Pantheon")?,
                 language: en()?,
                 name_type: NameType::Common,
                 valid_from: None,

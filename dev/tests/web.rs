@@ -66,7 +66,7 @@ fn name_and_location_facts(
             assertion: FactualAssertion::Attribute {
                 fact: attribute::Fact::Name {
                     entity: EntityIdx(0),
-                    name: NameText::new(name),
+                    name: NameText::new(name)?,
                     language: Language::new("en")?,
                     name_type: NameType::Common,
                     valid_from: None,

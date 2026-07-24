@@ -10,8 +10,9 @@
 //! a missed ignore surfaces on the first run.
 
 use super::PostgresFactStore;
-use super::harness::fresh_pg_store;
+use super::harness::{fresh_pg_store, fresh_pg_store_at_default_isolation};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlImageId};
+use chronoscope_core::store::FactStore;
 use chronoscope_core::store::conformance::{TestResult, UnmintedIds};
 
 /// Counters mint dense from zero, so `i64::MAX` is never assigned.
@@ -69,6 +70,35 @@ async fn postgis_extension_loads_in_a_fresh_store() -> TestResult {
     assert!(
         !version.trim().is_empty(),
         "postgis_lib_version() returned empty"
+    );
+    Ok(())
+}
+
+/// The write path issues `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` after
+/// `BEGIN` because the counters-row `FOR UPDATE` serializer needs RC. Run it
+/// against a database whose *session default* is `repeatable read`: the write tx
+/// must still observe `read committed`, proving it pins its own isolation rather
+/// than riding whatever the session default happens to be.
+#[tokio::test]
+async fn write_tx_pins_read_committed_despite_a_stricter_session_default() -> TestResult {
+    use super::AsConn;
+
+    let (store, _cx) = fresh_pg_store_at_default_isolation("repeatable read").await?;
+    let observed = store
+        .with_tx(|_s, tx| {
+            Box::pin(async move {
+                let (iso,): (String,) = sqlx::query_as("SHOW transaction_isolation")
+                    .fetch_one(tx.conn.conn())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok::<String, String>(iso)
+            })
+        })
+        .await??;
+    assert_eq!(
+        observed, "read committed",
+        "with_tx must pin READ COMMITTED for the FOR UPDATE serializer, \
+         regardless of the database's default_transaction_isolation"
     );
     Ok(())
 }

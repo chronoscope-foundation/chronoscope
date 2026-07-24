@@ -230,6 +230,28 @@ macro_rules! subject_id_newtype {
 // Validated-string-newtype macro and shared error
 // ============================================================================
 
+/// A free-text string field held a NUL (`U+0000`).
+///
+/// Postgres's `$N::jsonb` cast rejects a NUL outright (jsonb cannot hold one)
+/// while SQLite stores it silently, so the two backends would otherwise disagree
+/// on what is storable. Every free-text string constructor rejects it at the
+/// grammar boundary so both agree — and so no NUL survives to truncate a
+/// C-string downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("string contains a NUL character (U+0000), which cannot be stored")]
+pub(crate) struct NulError;
+
+/// Reject a NUL (`U+0000`) anywhere in a free-text field. The one shared check
+/// behind every free-text constructor, so no string type can drift on whether a
+/// NUL is storable.
+pub(crate) fn reject_nul(s: &str) -> Result<(), NulError> {
+    if s.contains('\u{0000}') {
+        Err(NulError)
+    } else {
+        Ok(())
+    }
+}
+
 /// Errors from [`validated_string_newtype`](crate::validated_string_newtype)-generated constructors.
 ///
 /// Single shared error type so the macro doesn't have to mint a fresh
@@ -256,6 +278,12 @@ pub enum ValidatedStringError {
         len: usize,
         /// Configured maximum.
         max: usize,
+    },
+    /// The string held a NUL (`U+0000`), which Postgres jsonb cannot store.
+    #[error("{type_name} contains a NUL character (U+0000)")]
+    ContainsNul {
+        /// The label of the type (the macro invocation's identifier).
+        type_name: &'static str,
     },
 }
 
@@ -311,6 +339,13 @@ macro_rules! validated_string_newtype {
             ) -> ::std::result::Result<Self, $crate::grammar::ids::ValidatedStringError> {
                 let raw = s.as_ref();
                 let candidate = $crate::__validated_string_newtype_maybe_trim!(raw $(, $trim)?);
+                if $crate::grammar::ids::reject_nul(candidate).is_err() {
+                    return ::std::result::Result::Err(
+                        $crate::grammar::ids::ValidatedStringError::ContainsNul {
+                            type_name: stringify!($name),
+                        },
+                    );
+                }
                 let len = candidate.chars().count();
                 if len < Self::MIN_LEN {
                     return ::std::result::Result::Err(

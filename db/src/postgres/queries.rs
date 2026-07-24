@@ -29,6 +29,13 @@ pub(super) const MINT_IMAGE: &str = "UPDATE fact_counters SET next_image_id = ne
 pub(super) const MINT_FACT_ID: &str = "UPDATE fact_counters SET next_fact_id = next_fact_id + 1 WHERE id = 0 RETURNING next_fact_id - 1";
 pub(super) const MINT_COMMIT_SEQ: &str = "UPDATE fact_counters SET next_commit_seq = next_commit_seq + 1 WHERE id = 0 RETURNING next_commit_seq - 1";
 
+/// Pin the write transaction to READ COMMITTED before it runs any statement.
+/// The counters-row `FOR UPDATE` serializer needs exactly RC: under a stricter
+/// isolation (REPEATABLE READ / SERIALIZABLE) the held lock's contention surfaces
+/// as spurious serialization-failure aborts instead of the clean block-then-
+/// proceed RC gives. `SET TRANSACTION` must precede the first query in the tx.
+pub(super) const SET_ISOLATION: &str = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED";
+
 /// The counters-row lock: taken immediately after `BEGIN`, held through COMMIT,
 /// so match -> mint -> stage runs under one serialization point (decision #2).
 pub(super) const LOCK_COUNTERS: &str = "SELECT 1 FROM fact_counters WHERE id = 0 FOR UPDATE";

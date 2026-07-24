@@ -309,16 +309,19 @@ mod traversal_props {
     /// distinct entities into the directional `DistinctPair`.
     fn arb_attribute() -> impl Strategy<Value = attribute::Fact<MemoryIds>> {
         prop_oneof![
-            (arb_entity(), sentinel_language()).prop_map(|(entity, language)| {
-                attribute::Fact::Name {
-                    entity,
-                    name: attribute::NameText::new("name"),
-                    language,
-                    name_type: attribute::NameType::Common,
-                    valid_from: None,
-                    valid_to: None,
+            (arb_entity(), sentinel_language()).prop_filter_map(
+                "valid name text",
+                |(entity, language)| {
+                    Some(attribute::Fact::Name {
+                        entity,
+                        name: attribute::NameText::new("name").ok()?,
+                        language,
+                        name_type: attribute::NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    })
                 }
-            }),
+            ),
             arb_entity().prop_map(|entity| attribute::Fact::ExternalReference {
                 entity,
                 reference: sentinel_external_reference(),

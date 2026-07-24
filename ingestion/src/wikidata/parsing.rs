@@ -87,6 +87,13 @@ pub fn extract_names(
             warnings.push(format!("label {}: unparseable language tag", lang.0));
             continue;
         };
+        let name = match NameText::new(&label.value) {
+            Ok(name) => name,
+            Err(e) => {
+                warnings.push(format!("label {}: {e}", lang.0));
+                continue;
+            }
+        };
         let citation = match ctx.citation(
             WikidataField::Label {
                 language: language.clone(),
@@ -100,7 +107,7 @@ pub fn extract_names(
             }
         };
         names.push(ExtractedName {
-            name: NameText::new(&label.value),
+            name,
             language,
             name_type: NameType::Common,
             citation,
@@ -122,6 +129,13 @@ pub fn extract_names(
                 warnings.push(format!("P1448: unparseable language tag {}", mono.language));
                 continue;
             };
+            let name = match NameText::new(&mono.text) {
+                Ok(name) => name,
+                Err(e) => {
+                    warnings.push(format!("P1448: {e}"));
+                    continue;
+                }
+            };
             let citation =
                 match ctx.statement_citation(p1448, format!("{}:{}", mono.language, mono.text)) {
                     Ok(citation) => citation,
@@ -131,7 +145,7 @@ pub fn extract_names(
                     }
                 };
             names.push(ExtractedName {
-                name: NameText::new(&mono.text),
+                name,
                 language,
                 name_type: NameType::Official,
                 citation,

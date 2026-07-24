@@ -117,7 +117,7 @@ async fn commit_named_entity_at(
                 assertion: FactualAssertion::Attribute {
                     fact: attribute::Fact::Name {
                         entity: EntityIdx(0),
-                        name: NameText::new(name),
+                        name: NameText::new(name)?,
                         language: Language::new("en")?,
                         name_type: NameType::Common,
                         valid_from: None,
@@ -223,7 +223,7 @@ async fn commit_entity_with_names_at(
             assertion: FactualAssertion::Attribute {
                 fact: attribute::Fact::Name {
                     entity: EntityIdx(0),
-                    name: NameText::new(name),
+                    name: NameText::new(name)?,
                     language: Language::new(language)?,
                     name_type: NameType::Common,
                     valid_from: None,
@@ -298,7 +298,7 @@ async fn commit_entity_with_conflicting_start_dates(
                 assertion: FactualAssertion::Attribute {
                     fact: attribute::Fact::Name {
                         entity: EntityIdx(0),
-                        name: NameText::new(name),
+                        name: NameText::new(name)?,
                         language: Language::new("en")?,
                         name_type: NameType::Common,
                         valid_from: None,
@@ -351,7 +351,7 @@ async fn commit_entity_with_conflicting_event_dates(
                 assertion: FactualAssertion::Attribute {
                     fact: attribute::Fact::Name {
                         entity: EntityIdx(0),
-                        name: NameText::new(name),
+                        name: NameText::new(name)?,
                         language: Language::new("en")?,
                         name_type: NameType::Common,
                         valid_from: None,
@@ -403,7 +403,7 @@ async fn commit_entity_with_event_before_construction(
                 assertion: FactualAssertion::Attribute {
                     fact: attribute::Fact::Name {
                         entity: EntityIdx(0),
-                        name: NameText::new(name),
+                        name: NameText::new(name)?,
                         language: Language::new("en")?,
                         name_type: NameType::Common,
                         valid_from: None,
@@ -469,7 +469,7 @@ async fn commit_entity_with_existence_witness(
                 assertion: FactualAssertion::Attribute {
                     fact: attribute::Fact::Name {
                         entity: EntityIdx(0),
-                        name: NameText::new(name),
+                        name: NameText::new(name)?,
                         language: Language::new("en")?,
                         name_type: NameType::Common,
                         valid_from: None,
@@ -516,7 +516,7 @@ async fn commit_entity_with_depicted_image(
                 assertion: FactualAssertion::Attribute {
                     fact: attribute::Fact::Name {
                         entity: EntityIdx(0),
-                        name: NameText::new(name),
+                        name: NameText::new(name)?,
                         language: Language::new("en")?,
                         name_type: NameType::Common,
                         valid_from: None,
@@ -949,7 +949,7 @@ async fn commit_entity_with_depicted_images(
             assertion: FactualAssertion::Attribute {
                 fact: attribute::Fact::Name {
                     entity: EntityIdx(0),
-                    name: NameText::new(name),
+                    name: NameText::new(name)?,
                     language: Language::new("en")?,
                     name_type: NameType::Common,
                     valid_from: None,
@@ -1490,7 +1490,7 @@ async fn commit_dated_entity_at(
             assertion: FactualAssertion::Attribute {
                 fact: attribute::Fact::Name {
                     entity: EntityIdx(0),
-                    name: NameText::new(name),
+                    name: NameText::new(name)?,
                     language: Language::new("en")?,
                     name_type: NameType::Common,
                     valid_from: None,

@@ -107,6 +107,25 @@ let
       ];
     }
   );
+
+  # The db crate's postgres conformance suite over an ephemeral postgres+PostGIS
+  # cluster (initdb/pg_ctl on PATH via nativeBuildInputs). Compile- and
+  # cluster-heavy, so it is let-bound like the other heavy checks and ordered
+  # before `web-test` (see `CHRONOSCOPE_RUN_AFTER` there): left co-schedulable,
+  # it would starve the headless-Chrome CDP event loop the same way.
+  #
+  # `pname` is deliberately short: it lengthens the build dir, and the unix-socket
+  # path is capped at ~104 bytes on darwin. The harness keeps the socket under
+  # PG_SOCKET_BASE (default /tmp), so the build-dir depth stays off the socket
+  # path — but a short pname is cheap insurance.
+  postgres-smoke = craneLib.cargoTest (
+    checkArgs
+    // {
+      pname = "pg-smoke";
+      cargoTestExtraArgs = "-p chronoscope-db --features postgres postgres::";
+      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ postgresWithPostgis ];
+    }
+  );
 in
 {
   checks = {
@@ -121,6 +140,7 @@ in
       doc
       doctest
       llvm-cov
+      postgres-smoke
       ;
 
     # Dedicated check for the browser test suite, with `--test-threads=4`.
@@ -133,33 +153,16 @@ in
     # the compile- and coverage-heavy checks under `nix flake check`, the
     # browser tests stall and time out (they pass reliably with the box to
     # themselves — cf. `just test web`). Referencing those checks' outputs
-    # orders this derivation after them, so the browser tests run unstarved;
-    # the reference only establishes build order.
+    # (including the heavy `postgres-smoke`) orders this derivation after them,
+    # so the browser tests run unstarved; the reference only establishes build
+    # order.
     web-test = craneLib.cargoTest (
       checkArgs
       // testExtraEnv
       // {
         pname = "chronoscope-web-tests";
         cargoTestExtraArgs = "-p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4";
-        CHRONOSCOPE_RUN_AFTER = "${clippy} ${doc} ${doctest} ${llvm-cov}";
-      }
-    );
-
-    # Infra spike: can an ephemeral postgres+PostGIS cluster be initdb'd,
-    # started on a unix socket, and reached with sqlx inside the build
-    # environment? Runs only the db crate's `postgres::` smoke test with the
-    # postgres feature on; postgis tools ride in via nativeBuildInputs.
-    #
-    # `pname` is deliberately short: it lengthens the build dir, and the
-    # unix-socket path is capped at ~104 bytes on darwin. The harness keeps the
-    # socket under PG_SOCKET_BASE (default /tmp), so the build-dir depth stays
-    # off the socket path — but a short pname is cheap insurance.
-    postgres-smoke = craneLib.cargoTest (
-      checkArgs
-      // {
-        pname = "pg-smoke";
-        cargoTestExtraArgs = "-p chronoscope-db --features postgres postgres::";
-        nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ postgresWithPostgis ];
+        CHRONOSCOPE_RUN_AFTER = "${clippy} ${doc} ${doctest} ${llvm-cov} ${postgres-smoke}";
       }
     );
   };

@@ -251,7 +251,7 @@ pub fn name_fact_in_language(
         assertion: FactualAssertion::Attribute {
             fact: attribute::Fact::Name {
                 entity: EntityIdx(entity_idx),
-                name: NameText::new(name),
+                name: NameText::new(name)?,
                 language,
                 name_type: NameType::Common,
                 valid_from: None,
@@ -275,7 +275,7 @@ pub fn name_window_fact(
         assertion: FactualAssertion::Attribute {
             fact: attribute::Fact::Name {
                 entity: EntityIdx(entity_idx),
-                name: NameText::new("name"),
+                name: NameText::new("name")?,
                 language,
                 name_type: NameType::Common,
                 valid_from,

@@ -64,7 +64,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::date::UncertainDate;
 use crate::grammar::citations::{ExternalReference, Language};
-use crate::grammar::ids::IdScheme;
+use crate::grammar::ids::{IdScheme, reject_nul};
 
 // ============================================================================
 // NameText — NFC-canonical name text
@@ -86,12 +86,18 @@ pub struct NameText {
 }
 
 impl NameText {
-    /// Wrap name text, normalizing it to NFC. Infallible — every string has
-    /// an NFC form.
-    pub fn new(text: impl AsRef<str>) -> Self {
-        Self {
-            inner: text.as_ref().nfc().collect(),
+    /// Wrap name text, rejecting a NUL then normalizing to NFC. Fallible only on
+    /// a NUL (`U+0000`); every NUL-free string has an NFC form. The
+    /// NFC-normalize keeps `new` lenient about casing/composition — only
+    /// [`NameText::deserialize`] is strict about non-NFC input.
+    pub fn new(text: impl AsRef<str>) -> Result<Self, NameTextError> {
+        let raw = text.as_ref();
+        if reject_nul(raw).is_err() {
+            return Err(NameTextError::ContainsNul);
         }
+        Ok(Self {
+            inner: raw.nfc().collect(),
+        })
     }
 
     pub fn as_str(&self) -> &str {
@@ -105,8 +111,11 @@ impl<'de> Deserialize<'de> for NameText {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
+        if reject_nul(&s).is_err() {
+            return Err(serde::de::Error::custom(NameTextError::ContainsNul));
+        }
         if !unicode_normalization::is_nfc(&s) {
-            return Err(serde::de::Error::custom(NameTextError {
+            return Err(serde::de::Error::custom(NameTextError::NotNfc {
                 input: s.clone(),
                 canonical: s.nfc().collect(),
             }));
@@ -127,13 +136,22 @@ impl AsRef<str> for NameText {
     }
 }
 
-/// Error from [`NameText`] deserialization: the wire input was not NFC. The
-/// wire form feeds the commit hash, so the boundary rejects it.
+/// Errors from [`NameText`] construction and deserialization.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("name text {input:?} is not NFC (canonical form is {canonical:?})")]
-pub struct NameTextError {
-    pub input: String,
-    pub canonical: String,
+pub enum NameTextError {
+    /// Wire input parsed but was not NFC. The wire form feeds the commit hash,
+    /// so the boundary rejects it. Only [`NameText::deserialize`] raises this;
+    /// [`NameText::new`] normalizes non-NFC input instead.
+    #[error("name text {input:?} is not NFC (canonical form is {canonical:?})")]
+    NotNfc {
+        /// The non-canonical input as received.
+        input: String,
+        /// Its NFC form.
+        canonical: String,
+    },
+    /// The text held a NUL (`U+0000`), which Postgres jsonb cannot store.
+    #[error("name text contains a NUL character (U+0000)")]
+    ContainsNul,
 }
 
 /// Attribute-cluster fact.
@@ -253,4 +271,29 @@ pub enum EntityRelationType {
     MergedFrom,
     /// This entity was split off from the target.
     SplitFrom,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_text_new_rejects_nul() {
+        assert_eq!(NameText::new("a\u{0}b"), Err(NameTextError::ContainsNul));
+    }
+
+    #[test]
+    fn name_text_new_normalizes_nul_free_input_to_nfc() -> Result<(), NameTextError> {
+        // Decomposed "e" + combining acute normalizes to precomposed "é".
+        let name = NameText::new("e\u{0301}")?;
+        assert_eq!(name.as_str(), "\u{e9}");
+        Ok(())
+    }
+
+    #[test]
+    fn name_text_deserialize_rejects_nul() {
+        // A NUL escaped in the wire string must be refused, even though it is NFC.
+        let result: Result<NameText, _> = serde_json::from_str("\"a\\u0000b\"");
+        assert!(result.is_err(), "a NUL in wire input must be rejected");
+    }
 }

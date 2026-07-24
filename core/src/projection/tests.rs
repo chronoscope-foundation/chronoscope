@@ -112,7 +112,7 @@ fn name_fact_from(
         assertion: FactualAssertion::Attribute {
             fact: attribute::Fact::Name {
                 entity: EntityIdx(entity_idx),
-                name: NameText::new(name),
+                name: NameText::new(name)?,
                 language: Language::new(language)?,
                 name_type: NameType::Common,
                 valid_from: None,
@@ -723,7 +723,7 @@ async fn drain_continues_past_short_page_with_cursor() -> TestResult {
                 assertion: FactualAssertion::Attribute {
                     fact: attribute::Fact::Name {
                         entity: MemoryEntityId(0),
-                        name: NameText::new("stub"),
+                        name: NameText::new("stub")?,
                         language: Language::new("en")?,
                         name_type: NameType::Common,
                         valid_from: None,
