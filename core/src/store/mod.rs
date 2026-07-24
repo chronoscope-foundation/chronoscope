@@ -111,13 +111,21 @@
 //!
 //! ## Cross-store safety
 //!
-//! The `for<'brand>` HRTB plus the invariant `'brand` on `Tx<'brand>` stops
-//! a tx from one store reaching another store of the same type. Each
-//! `with_tx(...)` mints a fresh existential `'brand`, so passing a tx from
-//! `store_a.with_tx(...)` into `store_b.with_tx(...)`'s closure fails to
-//! typecheck — the brands are distinct existentials and the lifetime is
-//! invariant. The closure is the only way to name a `Tx<'brand>`, and the
-//! returned future is bounded by `'brand`, so handles can't leak past it.
+//! A tx from one store can't reach another store of the same type. Each
+//! `with_tx(...)` mints a fresh existential `'brand` under the `for<'brand>`
+//! HRTB and hands the closure a `&'brand mut Tx<'brand>`; `&mut` is
+//! invariant in its pointee, which is what keeps two calls' brands from
+//! unifying. So a tx from `store_a.with_tx(...)` used inside
+//! `store_b.with_tx(...)`'s closure fails to typecheck. The closure is the
+//! only way to name a `Tx<'brand>`, and the returned future is bounded by
+//! `'brand`, so handles can't leak past it.
+//!
+//! `BrandsCannotUnify`'s `compile_fail` doctest pins that guarantee, with
+//! `conformance::cases::two_commits_share_one_with_tx_brand` the positive
+//! intra-store check. Each backend's `Tx` additionally carries a
+//! `PhantomData<fn(&'brand ()) -> &'brand ()>` marker as defense in depth:
+//! it makes the handle type itself invariant, so the brand holds for an
+//! owned `Tx<'brand>` as much as for the `&mut` every API hands out today.
 //!
 //! `'brand`'s role is the type-level tag; whether it doubles as a real
 //! borrow is the backend's business.
@@ -852,3 +860,40 @@ pub trait FactWrite<S: FactStore>:
             ) -> Pin<Box<dyn Future<Output = Result<R, E>> + Send + 'n>>
             + Send;
 }
+
+/// Negative compile-time check for the cross-store guarantee: a tx opened by
+/// one store's [`FactStore::with_tx`] can't be used inside another store's
+/// `with_tx` closure. Written against the in-memory backend, since the
+/// mechanism is the trait signature's, not any one backend's.
+///
+/// The same nesting without the cross-use compiles, so what the compiler
+/// rejects here is the smuggle rather than the shape. `swap` demands the two
+/// brands unify; the `async fn` is never called, and an uncalled one is
+/// still typechecked.
+///
+/// ```compile_fail
+/// use chronoscope_core::store::FactStore;
+/// use chronoscope_core::store::memory::MemoryFactStore;
+///
+/// async fn smuggle() {
+///     let a = MemoryFactStore::new();
+///     let b = MemoryFactStore::new();
+///     let _ = a
+///         .with_tx(move |_, ta| {
+///             Box::pin(async move {
+///                 let _ = b
+///                     .with_tx(move |_, tb| {
+///                         Box::pin(async move {
+///                             std::mem::swap(ta, tb);
+///                             Ok::<(), ()>(())
+///                         })
+///                     })
+///                     .await;
+///                 Ok::<(), ()>(())
+///             })
+///         })
+///         .await;
+/// }
+/// ```
+#[cfg(doctest)]
+struct BrandsCannotUnify;

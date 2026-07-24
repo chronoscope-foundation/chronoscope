@@ -12,6 +12,7 @@
 use super::PostgresFactStore;
 use super::harness::{fresh_pg_store, fresh_pg_store_at_default_isolation};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlImageId};
+use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::store::FactStore;
 use chronoscope_core::store::conformance::{TestResult, UnmintedIds};
 
@@ -100,5 +101,30 @@ async fn write_tx_pins_read_committed_despite_a_stricter_session_default() -> Te
         "with_tx must pin READ COMMITTED for the FOR UPDATE serializer, \
          regardless of the database's default_transaction_isolation"
     );
+    Ok(())
+}
+
+/// A view's consistency is the `fact_id < N` bound, so its transaction pins RC
+/// as well — a long paginated walk stays immune to serialization failures on a
+/// database defaulted to something stricter. Both constructors are checked: they
+/// open their own transaction, so each has to pin its own isolation.
+#[tokio::test]
+async fn read_views_pin_read_committed_despite_a_stricter_database_default() -> TestResult {
+    use super::AsConn;
+
+    let (store, _cx) = fresh_pg_store_at_default_isolation("repeatable read").await?;
+    for (label, mut view) in [
+        ("now", store.now().await?),
+        ("no_later_than", store.no_later_than(FactId::new(0)).await?),
+    ] {
+        let (observed,): (String,) = sqlx::query_as("SHOW transaction_isolation")
+            .fetch_one(view.conn.conn())
+            .await?;
+        assert_eq!(
+            observed, "read committed",
+            "{label} must pin READ COMMITTED, regardless of the database's \
+             default_transaction_isolation"
+        );
+    }
     Ok(())
 }

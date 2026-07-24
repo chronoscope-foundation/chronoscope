@@ -23,7 +23,9 @@
 //! A [`PostgresFactView`] owns one pooled connection inside a read transaction;
 //! the `WHERE fact_id < N` bound is the semantic snapshot, so consistency comes
 //! from the commit-order == id-order invariant rather than the transaction
-//! isolation. Representatives and classes read the append-only `subject_reps`
+//! isolation. The read transaction pins READ COMMITTED for that reason: a long
+//! paginated view runs to completion under any ambient database default.
+//! Representatives and classes read the append-only `subject_reps`
 //! log; the class-stream `ByName` / `ByExternalReference` / `BySourceUrl` / `All`
 //! walks combine the facet indexes with that resolution, and depictions combine
 //! it with the subject backlinks.
@@ -113,9 +115,9 @@ impl PostgresFactStore {
 pub(crate) struct ViewTx(Transaction<'static, Postgres>);
 
 /// The `with_tx` write handle's connection, borrowed from the transaction the
-/// frame owns and must recover to commit. The marker makes `'t` invariant — it
-/// is [`PostgresTx`]'s brand, and a covariant borrow would let two `with_tx`
-/// closures' brands unify.
+/// frame owns and must recover to commit. `'t` is [`PostgresTx`]'s brand; the
+/// marker pins this handle type's own invariance in it as defense in depth,
+/// with the cross-store mechanism documented in [`chronoscope_core::store`].
 pub(crate) struct FrameConn<'t>(&'t mut PgConnection, PhantomData<fn(&'t ()) -> &'t ()>);
 
 /// A submit scope's connection: an owned savepoint transaction nested in the
@@ -312,11 +314,15 @@ impl FactStore for PostgresFactStore {
     }
 
     async fn no_later_than(&self, snapshot: FactId) -> Result<Self::View<'_>, Self::Error> {
-        let tx = self
+        let mut tx = self
             .pool
             .begin()
             .await
             .map_err(sql("opening view read transaction"))?;
+        sqlx::query(queries::SET_ISOLATION)
+            .execute(&mut *tx)
+            .await
+            .map_err(sql("setting view transaction isolation"))?;
         Ok(PostgresHandle {
             conn: ViewTx(tx),
             bound: ReadBound::Pinned(snapshot),
@@ -329,6 +335,10 @@ impl FactStore for PostgresFactStore {
             .begin()
             .await
             .map_err(sql("opening view read transaction"))?;
+        sqlx::query(queries::SET_ISOLATION)
+            .execute(&mut *tx)
+            .await
+            .map_err(sql("setting view transaction isolation"))?;
         let snapshot = FactId::new(read::next_fact_id(&mut tx).await?);
         Ok(PostgresHandle {
             conn: ViewTx(tx),

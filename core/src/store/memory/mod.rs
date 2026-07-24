@@ -697,12 +697,10 @@ impl Pending {
 /// handle that owned the guard could never release it back to `with_tx` for
 /// the apply step.
 ///
-/// `PhantomData<fn(&'brand ()) -> &'brand ()>` is invariant in `'brand`,
-/// which the brand pattern needs; a covariant or contravariant marker would
-/// let two closures' brands unify.
-///
-/// Invariance is checked below by `BrandIsInvariant`'s `compile_fail`
-/// doctest, with `tests::two_commits_share_one_with_tx_brand` the positive
+/// `PhantomData<fn(&'brand ()) -> &'brand ()>` pins this handle type's own
+/// invariance in `'brand` as defense in depth; the cross-store mechanism is
+/// documented in [`chronoscope_core::store`](crate::store).
+/// `conformance::cases::two_commits_share_one_with_tx_brand` is the positive
 /// intra-store check.
 pub struct MemoryTx<'brand> {
     committed: &'brand Inner,
@@ -1444,22 +1442,3 @@ impl FactStore for MemoryFactStore {
 mod matcher_tests;
 #[cfg(test)]
 mod tests;
-
-/// Negative compile-time check that [`MemoryTx`] is invariant in its brand
-/// lifetime: shrinking the brand is a coercion the compiler must refuse, or
-/// two `with_tx` closures' brands could unify and a tx could cross stores.
-/// A pure variance coercion, so it fails to compile for exactly one reason —
-/// the invariance — where a smuggling scenario would also fail for unrelated
-/// closure or `Send` reasons and pass even if the brand turned covariant.
-///
-/// ```compile_fail
-/// use chronoscope_core::store::memory::MemoryTx;
-///
-/// fn shrink_brand<'long: 'short, 'short>(
-///     tx: MemoryTx<'long>,
-/// ) -> MemoryTx<'short> {
-///     tx
-/// }
-/// ```
-#[cfg(doctest)]
-struct BrandIsInvariant;

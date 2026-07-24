@@ -284,7 +284,9 @@ async fn build_shared_cluster() -> Result<SharedCluster, PgHarnessError> {
     // each `TempDir` so its `Drop` no longer `rm -rf`s the directory. Any failure
     // below (CREATE DATABASE, migrate) then leaves the watchdog as sole owner of a
     // still-running postmaster and its PGDATA, stopping the one before removing the
-    // other at process exit.
+    // other at process exit. Ordering it after the spawn is the accepted trade: a
+    // failed spawn drops the dirs under a live postmaster, where keeping them would
+    // leak the cluster with no one left to reap it.
     let socket_path = socket_dir.keep();
     let _data_path = data_dir.keep();
 

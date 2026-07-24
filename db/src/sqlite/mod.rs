@@ -469,9 +469,10 @@ impl SqliteFactStore {
 pub struct ViewTx(Transaction<'static, Sqlite>);
 
 /// The `with_tx` write handle's connection, borrowed from the immediate
-/// transaction the frame owns and must recover to commit. The marker makes
-/// `'t` invariant — it is [`SqliteTx`]'s brand, and a covariant borrow
-/// would let two `with_tx` closures' brands unify.
+/// transaction the frame owns and must recover to commit. `'t` is
+/// [`SqliteTx`]'s brand; the marker pins this handle type's own invariance in
+/// it as defense in depth, with the cross-store mechanism documented in
+/// [`chronoscope_core::store`].
 pub struct FrameConn<'t>(&'t mut SqliteConnection, PhantomData<fn(&'t ()) -> &'t ()>);
 
 /// A submit scope's connection: an owned savepoint transaction nested in
@@ -1138,20 +1139,3 @@ fn singleton_class<S: Ord + Copy>(member: S) -> EquivClass<S> {
         members: std::iter::once(member).collect(),
     }
 }
-
-/// Negative compile-time check that the write handle is invariant in its
-/// brand lifetime: shrinking the brand is a coercion the compiler must
-/// refuse, or two `with_tx` closures' brands could unify and a handle could
-/// cross stores.
-///
-/// ```compile_fail
-/// use chronoscope_db::sqlite::{FrameConn, SqliteHandle};
-///
-/// fn shrink_brand<'long: 'short, 'short>(
-///     handle: SqliteHandle<FrameConn<'long>>,
-/// ) -> SqliteHandle<FrameConn<'short>> {
-///     handle
-/// }
-/// ```
-#[cfg(doctest)]
-struct BrandIsInvariant;
