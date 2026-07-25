@@ -866,7 +866,7 @@ mod tests {
     /// The observed value a citation quotes.
     fn citation_value(citation: &FactualCitation) -> Result<&str, String> {
         match &citation.source {
-            ExternalSource::Wikidata { value, .. } => Ok(value),
+            ExternalSource::Wikidata { value, .. } => Ok(value.as_str()),
             other => Err(format!("expected Wikidata source, got {other:?}")),
         }
     }

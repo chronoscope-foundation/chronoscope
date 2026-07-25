@@ -16,6 +16,7 @@ serde_json.workspace = true
 chrono.workspace = true
 url.workspace = true
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Geospatial math (coordinate precision conversion)
 geo = "0.29"
@@ -29,6 +30,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
 proptest = "1.4"
+tempfile = "3"
 
 [lints]
 workspace = true

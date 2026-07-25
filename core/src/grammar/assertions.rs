@@ -185,6 +185,7 @@ mod traversal_props {
         Usage,
     };
     use crate::grammar::spatial::TopologicalRel;
+    use crate::grammar::text::Text;
     use crate::grammar::{
         attribute, bookend, composites, depiction, event, existence, identity, image, observation,
     };
@@ -251,10 +252,18 @@ mod traversal_props {
         })
     }
 
-    fn sentinel_location() -> UnresolvedLocation {
-        UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "sentinel".to_owned(),
+    fn sentinel_location() -> impl Strategy<Value = UnresolvedLocation> {
+        Just(()).prop_filter_map("valid sentinel place name", |()| {
+            Some(UnresolvedLocation::Reference(
+                LocationReference::NamedPlace {
+                    name: Text::new("sentinel").ok()?,
+                },
+            ))
         })
+    }
+
+    fn sentinel_text(value: &'static str) -> impl Strategy<Value = Text> {
+        Just(value).prop_filter_map("valid sentinel text", |value| Text::new(value).ok())
     }
 
     fn sentinel_external_reference() -> ExternalReference {
@@ -341,9 +350,8 @@ mod traversal_props {
                 .prop_map(|(entity, bound)| bookend::ConstructionFact::Started { entity, bound }),
             (arb_entity(), sentinel_date())
                 .prop_map(|(entity, bound)| bookend::ConstructionFact::Completed { entity, bound }),
-            arb_entity().prop_map(|entity| bookend::ConstructionFact::Location {
-                entity,
-                location: sentinel_location(),
+            (arb_entity(), sentinel_location()).prop_map(|(entity, location)| {
+                bookend::ConstructionFact::Location { entity, location }
             }),
         ]
     }
@@ -398,10 +406,8 @@ mod traversal_props {
             }),
             (arb_event(), sentinel_date())
                 .prop_map(|(event, bound)| event::Fact::PointDate { event, bound }),
-            arb_event().prop_map(|event| event::Fact::MovedToLocation {
-                event,
-                location: sentinel_location(),
-            }),
+            (arb_event(), sentinel_location())
+                .prop_map(|(event, location)| event::Fact::MovedToLocation { event, location }),
             arb_event().prop_map(|event| event::Fact::DamageCause {
                 event,
                 cause: DamageCause::Fire,
@@ -414,14 +420,10 @@ mod traversal_props {
                 event,
                 new_usages: std::iter::once(Usage::Commercial).collect(),
             }),
-            arb_event().prop_map(|event| event::Fact::Designation {
-                event,
-                designation: "landmark".to_owned(),
-            }),
-            arb_event().prop_map(|event| event::Fact::Description {
-                event,
-                text: "text".to_owned(),
-            }),
+            (arb_event(), sentinel_text("landmark"))
+                .prop_map(|(event, designation)| event::Fact::Designation { event, designation }),
+            (arb_event(), sentinel_text("text"))
+                .prop_map(|(event, text)| event::Fact::Description { event, text }),
         ]
     }
 
@@ -463,21 +465,21 @@ mod traversal_props {
         prop_oneof![
             (arb_image(), sentinel_url())
                 .prop_map(|(image, url)| image::Fact::Source { image, url }),
-            (arb_image(), sentinel_language()).prop_map(|(image, language)| image::Fact::Author {
-                image,
-                name: "author".to_owned(),
-                language,
-            }),
+            (arb_image(), sentinel_text("author"), sentinel_language()).prop_map(
+                |(image, name, language)| image::Fact::Author {
+                    image,
+                    name,
+                    language,
+                },
+            ),
             (arb_image(), sentinel_date())
                 .prop_map(|(image, bound)| image::Fact::CreatedDate { image, bound }),
             (arb_image(), sentinel_date())
                 .prop_map(|(image, bound)| image::Fact::SubjectDate { image, bound }),
             (arb_image(), sentinel_date())
                 .prop_map(|(image, bound)| image::Fact::CapturedDate { image, bound }),
-            arb_image().prop_map(|image| image::Fact::CapturedLocation {
-                image,
-                location: sentinel_location(),
-            }),
+            (arb_image(), sentinel_location())
+                .prop_map(|(image, location)| image::Fact::CapturedLocation { image, location }),
             (arb_image(), arb_image_medium())
                 .prop_map(|(image, medium)| image::Fact::Medium { image, medium }),
         ]

@@ -62,7 +62,7 @@ pub use grpc::GrpcTritonClient;
 pub use schema::{
     AnalysisRequest, AnalysisResult, AnalyzedMediaType, BoundingBox, EMBEDDING_DIM, Embedding,
     EntityType, ModelVersions, PhotoColor, Region, RegionAnalysis, RegionIndex, RegionRelation,
-    RelationType, RleMask, SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds,
-    SurroundingType, Surroundings,
+    RelationType, RleCounts, RleMask, SceneAnalysis, SceneType, Subimage, SubimageAnalysis,
+    SubimageBounds, SurroundingType, Surroundings,
 };
 pub use service::TritonService;

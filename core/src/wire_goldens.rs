@@ -49,6 +49,7 @@ use crate::grammar::image::{self, ImageMedium};
 use crate::grammar::lifecycle::{DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod};
 use crate::grammar::observation;
 use crate::grammar::spatial::TopologicalRel;
+use crate::grammar::text::Text;
 use crate::location::Location;
 use crate::store::memory::{MemoryEntityId, MemoryEventId, MemoryIds, MemoryImageId};
 use crate::submit::{Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact};
@@ -429,7 +430,7 @@ fn golden_external_source_wikidata_statement() -> Result<()> {
             property_id: WikidataPropertyId::new(571),
         },
         revision_id: 123456789,
-        value: "1889-03-31".to_string(),
+        value: Text::new("1889-03-31")?,
     };
     assert_golden_roundtrip(
         &source,
@@ -443,7 +444,7 @@ fn golden_external_source_wikidata_label() -> Result<()> {
         entity_id: WikidataEntityId::new(243),
         field: WikidataField::Label { language: en()? },
         revision_id: 123456789,
-        value: "Eiffel Tower".to_string(),
+        value: Text::new("Eiffel Tower")?,
     };
     assert_golden_roundtrip(
         &source,
@@ -456,10 +457,10 @@ fn golden_external_source_wikidata_sitelink() -> Result<()> {
     let source = ExternalSource::Wikidata {
         entity_id: WikidataEntityId::new(243),
         field: WikidataField::Sitelink {
-            site: "enwiki".to_owned(),
+            site: Text::new("enwiki")?,
         },
         revision_id: 123456789,
-        value: "Eiffel Tower".to_string(),
+        value: Text::new("Eiffel Tower")?,
     };
     assert_golden_roundtrip(
         &source,
@@ -476,7 +477,7 @@ fn golden_external_source_wikidata_item() -> Result<()> {
         entity_id: WikidataEntityId::new(243),
         field: WikidataField::Item,
         revision_id: 123456789,
-        value: "Q243".to_string(),
+        value: Text::new("Q243")?,
     };
     assert_golden_roundtrip(
         &source,

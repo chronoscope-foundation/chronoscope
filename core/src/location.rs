@@ -44,6 +44,7 @@ use crate::external_ids::{OhmId, OsmElementType, OsmId};
 use crate::geo::{
     Circle, GeoPoint, GeoPointError, IndexRect, Meters, Viewport, cap_bounding_rects,
 };
+use crate::grammar::text::Text;
 
 /// Sanity bound on a circle's uncertainty radius: a circle wider than this
 /// almost certainly signals a unit slip or a bad resolution, not a real claim.
@@ -1214,9 +1215,9 @@ pub enum LocationReference {
     #[serde(rename = "ohm_reference")]
     Ohm { ohm_id: OhmId },
     /// Human-readable place name (e.g., "Paris", "Brooklyn Bridge").
-    NamedPlace { name: String },
+    NamedPlace { name: Text },
     /// Street address (e.g., "123 Main St, Springfield").
-    Address { address_text: String },
+    Address { address_text: Text },
     /// Near some other reference, with optional qualitative distance.
     /// "Near Paris", "near 1600 Penn Ave" all use this.
     Near {
@@ -1257,6 +1258,7 @@ mod tests {
     use super::*;
     use super::{resolved, unresolved};
     use crate::geo::MetersError;
+    use crate::grammar::ids::ValidatedStringError;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1384,10 +1386,10 @@ mod tests {
     fn one_of_serde_roundtrip() -> TestResult {
         let loc = UnresolvedLocation::one_of(vec![
             UnresolvedLocation::Reference(LocationReference::NamedPlace {
-                name: "Paris".to_string(),
+                name: Text::new("Paris")?,
             }),
             UnresolvedLocation::Reference(LocationReference::Address {
-                address_text: "123 Main St".to_string(),
+                address_text: Text::new("123 Main St")?,
             }),
         ])?;
 
@@ -1422,7 +1424,7 @@ mod tests {
     fn near_reference_serde_roundtrip() -> TestResult {
         let loc = UnresolvedLocation::Reference(LocationReference::Near {
             reference: Box::new(LocationReference::NamedPlace {
-                name: "Paris".to_string(),
+                name: Text::new("Paris")?,
             }),
             distance: Some(Distance::WalkingDistance),
         });
@@ -1491,10 +1493,10 @@ mod tests {
     #[test]
     fn one_of_entry_order_is_canonical() -> TestResult {
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let address = UnresolvedLocation::Reference(LocationReference::Address {
-            address_text: "123 Main St".to_string(),
+            address_text: Text::new("123 Main St")?,
         });
         let forward = UnresolvedLocation::one_of(vec![paris.clone(), address.clone()])?;
         let reversed = UnresolvedLocation::one_of(vec![address, paris])?;
@@ -1508,10 +1510,10 @@ mod tests {
     #[test]
     fn one_of_flattens_nested_and_dedups() -> TestResult {
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let london = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "London".to_string(),
+            name: Text::new("London")?,
         });
         // A nested OneOf plus a duplicate of one of its entries flatten and
         // dedup to {London, Paris}.
@@ -1529,7 +1531,7 @@ mod tests {
     #[test]
     fn one_of_all_equal_rejected() -> TestResult {
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let result = UnresolvedLocation::one_of(vec![paris.clone(), paris]);
         assert!(matches!(result, Err(LocationError::TooFewEntries { .. })));
@@ -1539,27 +1541,29 @@ mod tests {
     // --- ⊤/⊥ in a OneOf disjunction ---
 
     #[test]
-    fn one_of_join_with_unbounded_collapses_to_unbounded() {
+    fn one_of_join_with_unbounded_collapses_to_unbounded() -> TestResult {
         use crate::algebra::lattice::JoinSemilattice;
         // ⊤ absorbs the disjunction: joining a symbolic reference with
         // `Resolved(Unbounded)` leaves just ⊤, even unresolved.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let top = UnresolvedLocation::Resolved(Location::Unbounded);
         assert_eq!(paris.join(top.clone()), top);
+        Ok(())
     }
 
     #[test]
-    fn one_of_join_drops_empty_entry() {
+    fn one_of_join_drops_empty_entry() -> TestResult {
         use crate::algebra::lattice::JoinSemilattice;
         // ⊥ is the join identity: joining a reference with `Resolved(Empty)`
         // drops the empty entry, leaving the reference alone.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let bottom = UnresolvedLocation::Resolved(Location::Empty);
         assert_eq!(paris.clone().join(bottom), paris);
+        Ok(())
     }
 
     // --- canonicalization property tests ---
@@ -1708,10 +1712,10 @@ mod tests {
     #[test]
     fn all_of_flattens_and_dedups() -> TestResult {
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let london = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "London".to_string(),
+            name: Text::new("London")?,
         });
         let nested = UnresolvedLocation::all_of(vec![
             UnresolvedLocation::all_of(vec![paris.clone(), london])?,
@@ -1725,27 +1729,29 @@ mod tests {
     }
 
     #[test]
-    fn all_of_meet_with_empty_collapses_to_empty() {
+    fn all_of_meet_with_empty_collapses_to_empty() -> TestResult {
         use crate::algebra::lattice::MeetSemilattice;
         // ⊥ absorbs the conjunction: meeting a reference with `Resolved(Empty)`
         // leaves just ⊥, even unresolved — the dual of `OneOf` ⊤-absorption.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let bottom = UnresolvedLocation::Resolved(Location::Empty);
         assert_eq!(paris.meet(bottom.clone()), bottom);
+        Ok(())
     }
 
     #[test]
-    fn all_of_meet_drops_unbounded_entry() {
+    fn all_of_meet_drops_unbounded_entry() -> TestResult {
         use crate::algebra::lattice::MeetSemilattice;
         // ⊤ is the meet identity: meeting a reference with `Resolved(Unbounded)`
         // drops the unbounded entry, leaving the reference alone.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let top = UnresolvedLocation::Resolved(Location::Unbounded);
         assert_eq!(paris.clone().meet(top), paris);
+        Ok(())
     }
 
     // --- Lattice law harness ---
@@ -1881,11 +1887,13 @@ mod tests {
     /// extremes and duplicate entries recur, exercising the identity-absorption
     /// and dedup paths.
     fn arb_unresolved_location() -> impl Strategy<Value = UnresolvedLocation> {
-        let references =
-            prop_oneof![Just("Paris"), Just("London"), Just("Tokyo"),].prop_map(|name| {
-                UnresolvedLocation::Reference(LocationReference::NamedPlace {
-                    name: name.to_string(),
-                })
+        let references = prop_oneof![Just("Paris"), Just("London"), Just("Tokyo"),]
+            .prop_filter_map("valid place name", |name| {
+                Some(UnresolvedLocation::Reference(
+                    LocationReference::NamedPlace {
+                        name: Text::new(name).ok()?,
+                    },
+                ))
             });
         let leaf = prop_oneof![
             5 => references,
@@ -1967,10 +1975,10 @@ mod tests {
         // The equivalence must reject genuinely different symbolic forms, else
         // the laws pass vacuously. Paris alone differs from Paris-or-Tokyo.
         let paris = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let tokyo = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Tokyo".to_string(),
+            name: Text::new("Tokyo")?,
         });
         let union = UnresolvedLocation::one_of(vec![paris.clone(), tokyo])?;
         assert!(resolve_then_denote(&paris, &paris));
@@ -2263,7 +2271,7 @@ mod tests {
             Meters::new_unchecked(1000.0),
         )?);
         let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         let loc = UnresolvedLocation::all_of(vec![circle, reference])?;
         assert_eq!(loc.conflict_status(), ConflictStatus::Pending);
@@ -2288,13 +2296,14 @@ mod tests {
     }
 
     #[test]
-    fn lone_reference_is_pending() {
+    fn lone_reference_is_pending() -> TestResult {
         // An unresolved reference alone projects to ⊤ (non-empty) and still
         // carries a reference, so Pending.
         let loc = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Paris".to_string(),
+            name: Text::new("Paris")?,
         });
         assert_eq!(loc.conflict_status(), ConflictStatus::Pending);
+        Ok(())
     }
 
     #[test]
@@ -2585,7 +2594,7 @@ mod tests {
     fn intersects_unresolved_reference_matches_no_viewport() -> TestResult {
         let v = viewport()?;
         let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "somewhere".to_owned(),
+            name: Text::new("somewhere")?,
         });
         assert!(!reference.known_geometry_intersects(&v));
         let resolved = UnresolvedLocation::Resolved(Location::circle(
@@ -2603,10 +2612,12 @@ mod tests {
     #[test]
     fn intersects_unknowns_are_combinator_identity() -> TestResult {
         let v = viewport()?;
-        let reference = |name: &str| {
-            UnresolvedLocation::Reference(LocationReference::NamedPlace {
-                name: name.to_owned(),
-            })
+        let reference = |name: &str| -> Result<UnresolvedLocation, ValidatedStringError> {
+            Ok(UnresolvedLocation::Reference(
+                LocationReference::NamedPlace {
+                    name: Text::new(name)?,
+                },
+            ))
         };
         let near = UnresolvedLocation::Resolved(Location::circle(
             gp(40.5, -73.5)?,
@@ -2619,25 +2630,25 @@ mod tests {
 
         // The intersection's resolved member decides either way.
         assert!(
-            UnresolvedLocation::all_of(vec![reference("lot 12"), near.clone()])?
+            UnresolvedLocation::all_of(vec![reference("lot 12")?, near.clone()])?
                 .known_geometry_intersects(&v)
         );
         assert!(
-            !UnresolvedLocation::all_of(vec![reference("lot 12"), far.clone()])?
+            !UnresolvedLocation::all_of(vec![reference("lot 12")?, far.clone()])?
                 .known_geometry_intersects(&v)
         );
         // A union's unknown adds nothing beyond its resolved members.
         assert!(
-            UnresolvedLocation::one_of(vec![reference("lot 12"), near.clone()])?
+            UnresolvedLocation::one_of(vec![reference("lot 12")?, near.clone()])?
                 .known_geometry_intersects(&v)
         );
         assert!(
-            !UnresolvedLocation::one_of(vec![reference("lot 12"), far])?
+            !UnresolvedLocation::one_of(vec![reference("lot 12")?, far])?
                 .known_geometry_intersects(&v)
         );
         // No evidence at all answers false.
         assert!(
-            !UnresolvedLocation::all_of(vec![reference("lot 12"), reference("lot 13")])?
+            !UnresolvedLocation::all_of(vec![reference("lot 12")?, reference("lot 13")?])?
                 .known_geometry_intersects(&v)
         );
         // A raw ⊤ entry (this level's canonicalizer would drop it, but the
@@ -2721,10 +2732,12 @@ mod tests {
         // The unresolved lift's unknown-bearing compounds: unknowns are the
         // identity of their combinator, so evidence can come from any
         // resolved member and the rects must still cover it.
-        let reference = |name: &str| {
-            UnresolvedLocation::Reference(LocationReference::NamedPlace {
-                name: name.to_owned(),
-            })
+        let reference = |name: &str| -> Result<UnresolvedLocation, ValidatedStringError> {
+            Ok(UnresolvedLocation::Reference(
+                LocationReference::NamedPlace {
+                    name: Text::new(name)?,
+                },
+            ))
         };
         let near = UnresolvedLocation::Resolved(Location::circle(
             gp(40.5, -73.5)?,
@@ -2735,8 +2748,8 @@ mod tests {
             Meters::new_unchecked(10.0),
         )?);
         let unresolved = [
-            UnresolvedLocation::all_of(vec![reference("lot 12"), near.clone()])?,
-            UnresolvedLocation::one_of(vec![reference("lot 12"), near.clone()])?,
+            UnresolvedLocation::all_of(vec![reference("lot 12")?, near.clone()])?,
+            UnresolvedLocation::one_of(vec![reference("lot 12")?, near.clone()])?,
             // Built raw: the canonicalizer drops a ⊤ entry, but the evidence
             // arms must stay total for a value reaching them another way.
             UnresolvedLocation::AllOf(Members::canonicalize(
@@ -2746,13 +2759,13 @@ mod tests {
                 ],
                 |entries| entries,
             )),
-            UnresolvedLocation::all_of(vec![reference("lot 12"), reference("lot 13")])?,
+            UnresolvedLocation::all_of(vec![reference("lot 12")?, reference("lot 13")?])?,
             // Both members are unknown-bearing unions: whichever union holds
             // the positive evidence varies with the viewport, so the AllOf
             // rects must cover both.
             UnresolvedLocation::all_of(vec![
-                UnresolvedLocation::one_of(vec![reference("lot 12"), far])?,
-                UnresolvedLocation::one_of(vec![reference("lot 13"), near])?,
+                UnresolvedLocation::one_of(vec![reference("lot 12")?, far])?,
+                UnresolvedLocation::one_of(vec![reference("lot 13")?, near])?,
             ])?,
         ];
         for (ui, loc) in unresolved.iter().enumerate() {

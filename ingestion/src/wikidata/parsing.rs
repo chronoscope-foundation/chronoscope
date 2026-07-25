@@ -11,6 +11,7 @@ use chronoscope_core::grammar::attribute::{NameText, NameType};
 use chronoscope_core::grammar::citations::{
     ExternalReference, FactualCitation, Language, WikidataField, WikimediaCategoryName,
 };
+use chronoscope_core::grammar::text::Text;
 use chronoscope_integrations::wikidata::{DataValue, Snak, WikidataEntity, WikidataPrecision};
 use url::Url;
 
@@ -161,40 +162,71 @@ pub fn extract_names(
 /// Wikidata sitelinks use suffixes like "enwiki", "dewiki", "commonswiki".
 /// The `*wiki` pattern catches Wikipedia sites (extracting the language
 /// prefix); "commonswiki" maps `Category:` pages to the structured category
-/// reference and other Commons pages to their URL. Other Wikimedia projects
-/// ("enwikiquote" doesn't end in "wiki") return `None`.
-#[must_use]
-pub fn parse_sitelink(site: &str, title: &str) -> Option<ExternalReference> {
+/// reference and other Commons pages to their URL.
+///
+/// `None` covers both ways a sitelink yields nothing, and `warnings` tells them
+/// apart. A site outside the modeled set — a `*wiki` prefix that is no BCP-47
+/// language tag (underscore-form editions like `be_x_oldwiki`, and projects
+/// that merely end in `wiki`) — filters in silence: there was nothing to model.
+/// A title the store can't hold records a warning naming the sitelink and costs
+/// that one reference, matching how
+/// [`ExternalReference::from_url`](chronoscope_core::grammar::citations::ExternalReference::from_url)
+/// degrades the same title rather than failing.
+pub fn parse_sitelink(
+    site: &str,
+    title: &str,
+    warnings: &mut Vec<String>,
+) -> Option<ExternalReference> {
     if title.is_empty() {
+        warnings.push(format!("sitelink {site}: empty title"));
         return None;
     }
     if site == "commonswiki" {
         match title.strip_prefix("Category:") {
-            Some(category) => Some(ExternalReference::WikimediaCommonsCategory {
-                category: WikimediaCategoryName::new(category.replace('_', " ")).ok()?,
-            }),
+            Some(category) => match WikimediaCategoryName::new(category.replace('_', " ")) {
+                Ok(category) => Some(ExternalReference::WikimediaCommonsCategory { category }),
+                Err(e) => {
+                    warnings.push(format!("sitelink {site}: {e}"));
+                    None
+                }
+            },
             // Non-category Commons pages (galleries, File: pages) keep their
-            // URL form; file pages are ingested as images elsewhere. Commons
-            // page URLs are underscore-form, so normalize spaces to match a
-            // P973 `described at URL` pointing at the same page.
-            None => {
-                let mut url = Url::parse("https://commons.wikimedia.org").ok()?;
-                url.set_path(&format!("/wiki/{}", title.replace(' ', "_")));
-                Some(ExternalReference::UnmodeledUrl { url })
-            }
+            // URL form; file pages are ingested as images elsewhere.
+            None => match commons_page_url(title) {
+                Some(url) => Some(ExternalReference::UnmodeledUrl { url }),
+                None => {
+                    warnings.push(format!("sitelink {site}: title forms no Commons URL"));
+                    None
+                }
+            },
         }
-    } else if site.ends_with("wiki") {
+    } else if let Some(prefix) = site.strip_suffix("wiki") {
         // Wikidata sitelinks are exclusively Wikimedia projects (enwiki,
         // dewiki, etc.). The BCP-47 parse acts as a secondary filter on the
         // language prefix.
-        let language = Language::new(site.strip_suffix("wiki")?).ok()?;
-        Some(ExternalReference::Wikipedia {
-            language,
-            title: title.to_owned(),
-        })
+        let language = Language::new(prefix).ok()?;
+        // The citation quoting the title goes through the same `Text` cap, so
+        // an unstorable title leaves nothing to cite a degraded reference from.
+        match Text::new(title) {
+            Ok(title) => Some(ExternalReference::Wikipedia { language, title }),
+            Err(e) => {
+                warnings.push(format!("sitelink {site}: {e}"));
+                None
+            }
+        }
     } else {
         None
     }
+}
+
+/// The Commons page URL for a title. Commons page URLs are underscore-form, so
+/// spaces are normalized to match a P973 `described at URL` pointing at the same
+/// page, and `set_path` percent-encodes the rest so the URL round-trips through
+/// [`ExternalReference::from_url`](chronoscope_core::grammar::citations::ExternalReference::from_url).
+fn commons_page_url(title: &str) -> Option<Url> {
+    let mut url = Url::parse("https://commons.wikimedia.org").ok()?;
+    url.set_path(&format!("/wiki/{}", title.replace(' ', "_")));
+    Some(url)
 }
 
 #[cfg(test)]
@@ -455,7 +487,7 @@ mod tests {
                 language: Language::new("en")?,
             }
         );
-        assert_eq!(value, "Eiffel Tower");
+        assert_eq!(value.as_str(), "Eiffel Tower");
 
         let french = names
             .iter()
@@ -501,7 +533,7 @@ mod tests {
                 property_id: WikidataPropertyId::new(1448),
             }
         );
-        assert_eq!(value, "fr:Tour Eiffel");
+        assert_eq!(value.as_str(), "fr:Tour Eiffel");
         Ok(())
     }
 
@@ -555,13 +587,38 @@ mod tests {
     // parse_sitelink Unit Tests
     // =============================================================================
 
+    /// The reference a sitelink builds, or a test failure naming the site.
+    /// Asserts the build was silent — a warning here means a lost reference.
+    fn sitelink_reference(
+        site: &str,
+        title: &str,
+    ) -> Result<ExternalReference, Box<dyn std::error::Error>> {
+        let mut warnings = Vec::new();
+        let reference = parse_sitelink(site, title, &mut warnings)
+            .ok_or_else(|| format!("{site} builds a reference, warnings: {warnings:?}"))?;
+        assert!(warnings.is_empty(), "a built reference warns about nothing");
+        Ok(reference)
+    }
+
+    /// The warning a sitelink that builds no reference left behind, or `None`
+    /// when it filtered in silence.
+    fn sitelink_warning(site: &str, title: &str) -> Result<Option<String>, String> {
+        let mut warnings = Vec::new();
+        match parse_sitelink(site, title, &mut warnings) {
+            Some(reference) => Err(format!(
+                "{site} was expected to build nothing: {reference:?}"
+            )),
+            None => Ok(warnings.into_iter().next()),
+        }
+    }
+
     #[test]
     fn test_sitelink_english_wikipedia() -> TestResult {
-        let reference = parse_sitelink("enwiki", "Empire State Building").ok_or("should parse")?;
+        let reference = sitelink_reference("enwiki", "Empire State Building")?;
         match reference {
             ExternalReference::Wikipedia { language, title } => {
                 assert_eq!(language.as_str(), "en");
-                assert_eq!(title, "Empire State Building");
+                assert_eq!(title.as_str(), "Empire State Building");
             }
             other => return Err(format!("expected Wikipedia, got {other:?}").into()),
         }
@@ -570,11 +627,11 @@ mod tests {
 
     #[test]
     fn test_sitelink_german_wikipedia() -> TestResult {
-        let reference = parse_sitelink("dewiki", "Berliner Dom").ok_or("should parse")?;
+        let reference = sitelink_reference("dewiki", "Berliner Dom")?;
         match reference {
             ExternalReference::Wikipedia { language, title } => {
                 assert_eq!(language.as_str(), "de");
-                assert_eq!(title, "Berliner Dom");
+                assert_eq!(title.as_str(), "Berliner Dom");
             }
             other => return Err(format!("expected Wikipedia, got {other:?}").into()),
         }
@@ -583,8 +640,7 @@ mod tests {
 
     #[test]
     fn test_sitelink_commons_category() -> TestResult {
-        let reference =
-            parse_sitelink("commonswiki", "Category:Buildings").ok_or("should parse")?;
+        let reference = sitelink_reference("commonswiki", "Category:Buildings")?;
         match reference {
             ExternalReference::WikimediaCommonsCategory { category } => {
                 assert_eq!(category.as_str(), "Buildings");
@@ -599,8 +655,7 @@ mod tests {
         // The sitelink carries the space-form title; a P973 `described at URL`
         // carries the underscore-form page URL. Both must resolve to the same
         // reference so a lookup joins them.
-        let from_sitelink =
-            parse_sitelink("commonswiki", "Notre-Dame de Paris").ok_or("should parse")?;
+        let from_sitelink = sitelink_reference("commonswiki", "Notre-Dame de Paris")?;
         let from_url = ExternalReference::from_url(&Url::parse(
             "https://commons.wikimedia.org/wiki/Notre-Dame_de_Paris",
         )?);
@@ -608,15 +663,76 @@ mod tests {
         Ok(())
     }
 
+    /// A sitelink with no title is a broken record, not an absent one, so it
+    /// leaves a diagnostic behind rather than filtering in silence.
     #[test]
-    fn empty_sitelink_title_is_skipped() {
-        assert!(parse_sitelink("enwiki", "").is_none());
-        assert!(parse_sitelink("commonswiki", "").is_none());
+    fn empty_sitelink_title_warns_and_yields_no_reference() -> TestResult {
+        for site in ["enwiki", "commonswiki"] {
+            let warning =
+                sitelink_warning(site, "")?.ok_or_else(|| format!("{site} with no title warns"))?;
+            assert!(
+                warning.contains(site) && warning.contains("empty title"),
+                "the warning names the sitelink and the reason, got: {warning}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The warning has to name the sitelink: a bulk run's log line is the only
+    /// record of why a reference was dropped, and "text value: …" alone doesn't
+    /// say which of an item's strings to go fix.
+    #[test]
+    fn sitelink_title_holding_a_nul_warns_naming_its_site_and_yields_no_reference() -> TestResult {
+        let warning = sitelink_warning("enwiki", "Pan\u{0}theon")?
+            .ok_or("a title holding a NUL is diagnosed")?;
+        assert!(
+            warning.starts_with("sitelink enwiki: "),
+            "the warning names the sitelink it came from, got: {warning}"
+        );
+        assert!(
+            warning.contains("NUL"),
+            "the warning keeps its reason, got: {warning}"
+        );
+        Ok(())
+    }
+
+    /// A `Category:` prefix with nothing after it names no category page. It
+    /// costs that one reference — the entity's labels, dates and coordinates
+    /// have nothing to do with a degenerate Commons title.
+    #[test]
+    fn commons_title_that_is_only_the_category_prefix_warns_and_yields_no_reference() -> TestResult
+    {
+        let warning = sitelink_warning("commonswiki", "Category:")?
+            .ok_or("a bare `Category:` prefix is diagnosed")?;
+        assert!(
+            warning.starts_with("sitelink commonswiki: "),
+            "the warning names the sitelink it came from, got: {warning}"
+        );
+        Ok(())
+    }
+
+    /// A Wikipedia title the store can't hold reaches Chronoscope by two
+    /// routes, and neither may cost more than the reference it belongs to:
+    /// `from_url` degrades such a title to an unmodeled URL, so the sitelink
+    /// path warns and skips instead of failing its entity.
+    #[test]
+    fn an_unstorable_wikipedia_title_costs_only_its_reference_on_either_route() -> TestResult {
+        assert!(
+            sitelink_warning("enwiki", "Pan\u{0}theon")?.is_some(),
+            "the sitelink route diagnoses it"
+        );
+        let from_url =
+            ExternalReference::from_url(&Url::parse("https://en.wikipedia.org/wiki/Pan%00theon")?);
+        assert!(
+            matches!(from_url, ExternalReference::UnmodeledUrl { .. }),
+            "the URL route degrades it rather than rejecting it, got: {from_url:?}"
+        );
+        Ok(())
     }
 
     #[test]
     fn test_sitelink_commons_gallery_page_keeps_url_form() -> TestResult {
-        let reference = parse_sitelink("commonswiki", "Rome").ok_or("should parse")?;
+        let reference = sitelink_reference("commonswiki", "Rome")?;
         match reference {
             ExternalReference::UnmodeledUrl { url } => {
                 assert_eq!(url.as_str(), "https://commons.wikimedia.org/wiki/Rome");
@@ -626,17 +742,34 @@ mod tests {
         Ok(())
     }
 
+    /// The `*wiki` suffix alone doesn't make a site a Wikipedia edition: real
+    /// dumps carry underscore-form editions and sibling projects that merely
+    /// end in `wiki`. Sites outside the modeled set are filtered by design, so
+    /// they leave the warning list alone — a dump's non-edition sites would
+    /// otherwise bury the diagnostics that name a genuinely lost reference.
     #[test]
-    fn test_sitelink_unknown_site() {
-        let reference = parse_sitelink("unknownsite", "Test");
-        assert!(reference.is_none());
-    }
-
-    #[test]
-    fn test_sitelink_wikiquote_not_supported() {
-        // We only support wikipedia and commons
-        // "enwikiquote" ends with "e", not "wiki", so naturally filtered out
-        let reference = parse_sitelink("enwikiquote", "Test");
-        assert!(reference.is_none());
+    fn sites_outside_the_modeled_set_yield_no_reference_and_no_warning() -> TestResult {
+        for site in [
+            "be_x_oldwiki",
+            "zh_min_nanwiki",
+            "nds_nlwiki",
+            "bat_smgwiki",
+            "roa_rupwiki",
+            "map_bmswiki",
+            "fiu_vrowiki",
+            "cbk_zamwiki",
+            "mediawikiwiki",
+            // We only model wikipedia and commons; "enwikiquote" ends in "e",
+            // not "wiki", so it filters out for the same reason.
+            "enwikiquote",
+            "unknownsite",
+        ] {
+            assert_eq!(
+                sitelink_warning(site, "Test")?,
+                None,
+                "{site} is outside the modeled set, so it filters in silence"
+            );
+        }
+        Ok(())
     }
 }

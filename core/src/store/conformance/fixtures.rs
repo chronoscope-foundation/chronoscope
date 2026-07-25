@@ -22,6 +22,7 @@ use crate::grammar::ids::{CommitId, FactId, IdScheme, UserId};
 use crate::grammar::lifecycle::{
     DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, MoveMethod, PointKind,
 };
+use crate::grammar::text::Text;
 use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::nonempty::NonEmptyVec;
 use crate::store::pagination::paginate;
@@ -201,10 +202,12 @@ pub fn disjunctive_date() -> Result<UncertainDate, TestError> {
 }
 
 /// A symbolic named-place location reference.
-pub fn sample_location() -> UnresolvedLocation {
-    UnresolvedLocation::Reference(LocationReference::NamedPlace {
-        name: "somewhere".to_owned(),
-    })
+pub fn sample_location() -> Result<UnresolvedLocation, TestError> {
+    Ok(UnresolvedLocation::Reference(
+        LocationReference::NamedPlace {
+            name: Text::new("somewhere")?,
+        },
+    ))
 }
 
 /// A resolved `OneOf` of `n` distinct-center, equal-radius circles — none
@@ -342,7 +345,7 @@ pub fn construction_location_in(entity_idx: usize, place: &str) -> Result<Submit
             fact: bookend::ConstructionFact::Location {
                 entity: EntityIdx(entity_idx),
                 location: UnresolvedLocation::Reference(LocationReference::NamedPlace {
-                    name: place.to_owned(),
+                    name: Text::new(place)?,
                 }),
             },
         },
@@ -356,7 +359,7 @@ pub fn construction_location_fact(entity_idx: usize) -> Result<SubmitFact, TestE
         assertion: FactualAssertion::Construction {
             fact: bookend::ConstructionFact::Location {
                 entity: EntityIdx(entity_idx),
-                location: sample_location(),
+                location: sample_location()?,
             },
         },
         citation: sample_citation()?,
@@ -534,7 +537,7 @@ pub fn event_description_fact(event_idx: usize) -> Result<SubmitFact, TestError>
         assertion: FactualAssertion::Event {
             fact: crate::grammar::event::Fact::Description {
                 event: EventIdx(event_idx),
-                text: "an interior event".to_owned(),
+                text: Text::new("an interior event")?,
             },
         },
         citation: sample_citation()?,
@@ -588,7 +591,7 @@ pub fn event_moved_to_location_fact(event_idx: usize) -> Result<SubmitFact, Test
         assertion: FactualAssertion::Event {
             fact: crate::grammar::event::Fact::MovedToLocation {
                 event: EventIdx(event_idx),
-                location: sample_location(),
+                location: sample_location()?,
             },
         },
         citation: sample_citation()?,

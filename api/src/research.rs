@@ -572,7 +572,8 @@ mod tests {
     fn test_convert_analysis_complete_with_results() -> TestResult {
         use chronoscope_analysis::{
             AnalysisResult, AnalyzedMediaType, BoundingBox, Embedding, ModelVersions, PhotoColor,
-            RleMask, SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds,
+            RleCounts, RleMask, SceneAnalysis, SceneType, Subimage, SubimageAnalysis,
+            SubimageBounds,
         };
 
         let analysis_result = AnalysisResult::Success {
@@ -585,7 +586,7 @@ mod tests {
                         height: 100,
                     },
                     mask: RleMask {
-                        counts: "01".to_string(),
+                        counts: RleCounts::new("01").map_err(|e| test_err(&e.to_string()))?,
                     },
                 },
                 analysis: SubimageAnalysis::Analyzed {
@@ -636,8 +637,8 @@ mod tests {
     #[test]
     fn test_convert_analysis_complete_with_rejected_subimage() -> TestResult {
         use chronoscope_analysis::{
-            AnalysisResult, BoundingBox, ModelVersions, RleMask, Subimage, SubimageAnalysis,
-            SubimageBounds,
+            AnalysisResult, BoundingBox, ModelVersions, RleCounts, RleMask, Subimage,
+            SubimageAnalysis, SubimageBounds,
         };
 
         let analysis_result = AnalysisResult::Success {
@@ -650,7 +651,7 @@ mod tests {
                         height: 100,
                     },
                     mask: RleMask {
-                        counts: "01".to_string(),
+                        counts: RleCounts::new("01").map_err(|e| test_err(&e.to_string()))?,
                     },
                 },
                 analysis: SubimageAnalysis::Rejected {

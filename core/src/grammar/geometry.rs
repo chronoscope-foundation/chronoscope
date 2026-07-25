@@ -32,6 +32,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::finite::Finite;
 
+crate::validated_string_newtype! {
+    /// The compressed run lengths of an [`RleMask`], as the producing
+    /// segmenter encoded them.
+    ///
+    /// Encoded data rather than free text, so it carries its own name. The
+    /// constructor rejects a NUL (`U+0000`), which is what keeps the SQLite
+    /// and Postgres stores agreeing on what a fact may hold: Postgres's
+    /// `jsonb` cast refuses one outright, SQLite takes it silently.
+    /// NUL-freedom is the guarantee the type carries; COCO's modified-LEB128
+    /// ASCII is the content producers write and the downstream decoder reads.
+    ///
+    /// Length is uncapped: it scales with mask complexity, so a free-text
+    /// bound like [`TEXT_MAX_LEN`](crate::grammar::text::TEXT_MAX_LEN) would
+    /// reject legitimate masks.
+    RleCounts
+}
+
 /// Run-length-encoded binary mask in the COCO compressed-string format.
 ///
 /// `counts` holds compressed run lengths as ASCII bytes (modified LEB128
@@ -42,7 +59,7 @@ use crate::finite::Finite;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RleMask {
     /// Compressed run-length bytes, COCO format.
-    pub counts: String,
+    pub counts: RleCounts,
 }
 
 /// One coordinate component in `0.0..=1.0` proportional image space — the
@@ -394,6 +411,20 @@ mod tests {
     use proptest::prelude::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn rle_counts_rejects_nul() {
+        assert!(matches!(
+            RleCounts::new("PQRS\u{0}TU"),
+            Err(crate::grammar::ids::ValidatedStringError::ContainsNul { .. })
+        ));
+    }
+
+    #[test]
+    fn rle_counts_accepts_coco_ascii() -> TestResult {
+        assert_eq!(RleCounts::new("PPQi0")?.as_str(), "PPQi0");
+        Ok(())
+    }
 
     // Coordinate values that keep `-0.0` reachable: a plain `0.0..` float
     // strategy almost never samples exactly `-0.0`, so the bug this guards

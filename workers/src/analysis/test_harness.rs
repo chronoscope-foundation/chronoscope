@@ -45,13 +45,14 @@ fn sha2_hash(data: &[u8]) -> Vec<u8> {
 // ==================== Test Fixtures ====================
 
 /// Create a minimal valid `AnalysisResult` for testing.
-pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
+pub fn minimal_analysis_result()
+-> Result<chronoscope_analysis::AnalysisResult, Box<dyn std::error::Error + Send + Sync>> {
     use chronoscope_analysis::{
-        AnalysisResult, AnalyzedMediaType, BoundingBox, PhotoColor, RleMask, SceneAnalysis,
-        SceneType, Subimage, SubimageAnalysis, SubimageBounds,
+        AnalysisResult, AnalyzedMediaType, BoundingBox, PhotoColor, RleCounts, RleMask,
+        SceneAnalysis, SceneType, Subimage, SubimageAnalysis, SubimageBounds,
     };
 
-    AnalysisResult::Success {
+    Ok(AnalysisResult::Success {
         subimages: vec![Subimage {
             bounds: SubimageBounds {
                 bbox: BoundingBox {
@@ -61,7 +62,7 @@ pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
                     height: 100,
                 },
                 mask: RleMask {
-                    counts: "01".to_string(),
+                    counts: RleCounts::new("01")?,
                 },
             },
             analysis: SubimageAnalysis::Analyzed {
@@ -82,7 +83,7 @@ pub fn minimal_analysis_result() -> chronoscope_analysis::AnalysisResult {
             dinov3: "test-dinov3".to_string(),
             git_sha: "test-sha".to_string(),
         },
-    }
+    })
 }
 
 // ==================== Test Harness ====================
@@ -214,7 +215,7 @@ mod tests {
         harness.create_media_for_analysis().await?;
 
         let triton = Arc::new(MockTritonService::with_analysis_result(
-            minimal_analysis_result(),
+            minimal_analysis_result()?,
         ));
 
         let (_media, result) = harness.process_with_mock(triton).await?;
@@ -311,7 +312,7 @@ mod tests {
 
         // The triton client won't even be called - storage lookup fails first
         let triton = Arc::new(MockTritonService::with_analysis_result(
-            minimal_analysis_result(),
+            minimal_analysis_result()?,
         ));
 
         let (_media, result) = harness.process_with_mock(triton).await?;

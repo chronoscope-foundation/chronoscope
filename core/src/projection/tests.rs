@@ -28,6 +28,7 @@ use crate::grammar::image::ImageMedium;
 use crate::grammar::lifecycle::{
     DamageCause, DurationalKind, DurationalRole, LifetimeEventKind, PointKind,
 };
+use crate::grammar::text::Text;
 use crate::lifespan::{ExistenceState, Lifespan};
 use crate::location::ConflictStatus;
 use crate::projection::Claimed;
@@ -1173,7 +1174,7 @@ fn point_event_projects_kind_and_payloads() -> TestResult {
             1,
             event::Fact::Designation {
                 event: evt(1),
-                designation: "national landmark".to_owned(),
+                designation: Text::new("national landmark")?,
             },
         )?,
         event_stored(
@@ -1274,7 +1275,7 @@ fn unresolved_move_location_is_pending() -> TestResult {
     use crate::location::{LocationReference, UnresolvedLocation};
 
     let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-        name: "Springfield".to_owned(),
+        name: Text::new("Springfield")?,
     });
     let facts: BTreeMap<FactId, _> = [
         has_event_stored(

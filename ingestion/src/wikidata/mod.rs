@@ -23,8 +23,42 @@ use chronoscope_core::external_ids::{WikidataEntityId, WikidataPropertyId};
 use chronoscope_core::grammar::citations::{
     Excerpt, ExcerptError, ExternalSource, FactualCitation, WikidataField,
 };
+use chronoscope_core::grammar::ids::ValidatedStringError;
+use chronoscope_core::grammar::text::Text;
 use chronoscope_core::nonempty::NonEmptyVec;
 use chronoscope_integrations::wikidata::{Claim, Rank};
+
+/// A Wikidata value that can't be shaped into a citation.
+#[derive(Debug)]
+pub enum CitationError {
+    /// The quoted excerpt was empty or over-length.
+    Excerpt(ExcerptError),
+    /// The observed value held a character the fact store can't store.
+    Value(ValidatedStringError),
+}
+
+impl std::fmt::Display for CitationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Excerpt(e) => write!(f, "excerpt: {e}"),
+            Self::Value(e) => write!(f, "observed value: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for CitationError {}
+
+impl From<ExcerptError> for CitationError {
+    fn from(e: ExcerptError) -> Self {
+        Self::Excerpt(e)
+    }
+}
+
+impl From<ValidatedStringError> for CitationError {
+    fn from(e: ValidatedStringError) -> Self {
+        Self::Value(e)
+    }
+}
 
 /// Claims eligible for assertion: everything except `Rank::Deprecated`.
 ///
@@ -47,7 +81,7 @@ pub struct ItemContext {
 impl ItemContext {
     /// Build a context for one item snapshot, constructing the item-record
     /// citation up front.
-    pub fn new(entity_id: WikidataEntityId, revision_id: u64) -> Result<Self, ExcerptError> {
+    pub fn new(entity_id: WikidataEntityId, revision_id: u64) -> Result<Self, CitationError> {
         let item_citation = Self::build_citation(
             entity_id,
             revision_id,
@@ -70,8 +104,9 @@ impl ItemContext {
         revision_id: u64,
         field: WikidataField,
         value: String,
-    ) -> Result<FactualCitation, ExcerptError> {
-        let excerpt = Excerpt::new(value.clone())?;
+    ) -> Result<FactualCitation, CitationError> {
+        let value = Text::new(value)?;
+        let excerpt = Excerpt::new(value.as_str())?;
         Ok(FactualCitation {
             source: ExternalSource::Wikidata {
                 entity_id,
@@ -99,7 +134,7 @@ impl ItemContext {
         &self,
         field: WikidataField,
         value: impl Into<String>,
-    ) -> Result<FactualCitation, ExcerptError> {
+    ) -> Result<FactualCitation, CitationError> {
         Self::build_citation(self.entity_id, self.revision_id, field, value.into())
     }
 
@@ -108,7 +143,7 @@ impl ItemContext {
         &self,
         property_id: WikidataPropertyId,
         value: impl Into<String>,
-    ) -> Result<FactualCitation, ExcerptError> {
+    ) -> Result<FactualCitation, CitationError> {
         self.citation(WikidataField::Statement { property_id }, value)
     }
 
@@ -148,7 +183,7 @@ mod tests {
             }
         );
         assert_eq!(*revision_id, 42);
-        assert_eq!(value, "test_raw");
+        assert_eq!(value.as_str(), "test_raw");
         assert_eq!(citation.excerpts.first().as_str(), "test_raw");
         Ok(())
     }
@@ -161,7 +196,7 @@ mod tests {
             return Err("expected Wikidata source".into());
         };
         assert_eq!(*field, WikidataField::Item);
-        assert_eq!(value, "Q1234");
+        assert_eq!(value.as_str(), "Q1234");
         Ok(())
     }
 

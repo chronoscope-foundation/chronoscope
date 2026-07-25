@@ -17,9 +17,10 @@ use chronoscope_core::grammar::citations::{
 use chronoscope_core::grammar::depiction::{self, Perspective};
 use chronoscope_core::grammar::event;
 use chronoscope_core::grammar::existence;
-use chronoscope_core::grammar::ids::{IdScheme, IngesterRunId};
+use chronoscope_core::grammar::ids::{IdScheme, IngesterRunId, ValidatedStringError};
 use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::grammar::lifecycle::DurationalRole;
+use chronoscope_core::grammar::text::Text;
 use chronoscope_core::nonempty::NonEmptyVec;
 use chronoscope_core::store::FactStore;
 use chronoscope_core::submit::{
@@ -31,16 +32,29 @@ use chronoscope_integrations::wikidata::{CommonsFilename, WikidataEntity, url_fo
 use crate::wikidata::handlers::extract_link_references;
 use crate::wikidata::lifecycle::{CitedDate, Contribution, EventShape, build_lifecycles};
 use crate::wikidata::parsing::{extract_names, parse_sitelink};
-use crate::wikidata::{ItemContext, asserted_claims};
+use crate::wikidata::{CitationError, ItemContext, asserted_claims};
 
 /// A failure while turning a Wikidata entity into a commit.
 ///
-/// Distinct from "skip this entity" (a non-Q id), which is `Ok(None)`: these are
-/// malformed inputs the boundary rejects.
+/// The structural backstop, not the boundary's rejection channel: a value the
+/// store can't hold costs the image, reference or name it belongs to and leaves
+/// a warning, so what remains here is the entity's own scaffolding — its
+/// citation context and the edges between its splits. Distinct again from "skip
+/// this entity" (a non-Q id), which is `Ok(None)`.
 #[derive(Debug)]
 pub enum BuildError {
+    /// A rejection, named by the entity field the value was read from.
+    Field {
+        /// Where the value came from, as an operator would name it —
+        /// `"predecessor demolition value"`.
+        field: &'static str,
+        /// Why it was rejected.
+        source: Box<BuildError>,
+    },
     /// A citation excerpt was empty or over-length.
     Excerpt(ExcerptError),
+    /// A grammar text value held a character the fact store can't store.
+    Text(ValidatedStringError),
     /// A `Replaces` relationship's endpoints collapsed to one entity.
     SelfRelationship,
 }
@@ -48,7 +62,12 @@ pub enum BuildError {
 impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Excerpt(e) => write!(f, "citation excerpt: {e}"),
+            // The wrapped rejections name themselves ("excerpt too long",
+            // "Text contains a NUL"), so the field is all the framing a log
+            // line needs.
+            Self::Field { field, source } => write!(f, "{field}: {source}"),
+            Self::Excerpt(e) => write!(f, "{e}"),
+            Self::Text(e) => write!(f, "{e}"),
             Self::SelfRelationship => {
                 write!(f, "replaces relationship collapsed to a self-loop")
             }
@@ -58,9 +77,43 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
+/// Name the field a rejected value was read from.
+///
+/// An item carries dozens of strings, and a bare rejection ("… too long") says
+/// which rule was broken but not which string broke it. A dropped entity leaves
+/// one warning line behind, so the field has to travel in it.
+pub trait FieldContext<T> {
+    /// Attribute a rejection to `field`.
+    fn in_field(self, field: &'static str) -> Result<T, BuildError>;
+}
+
+impl<T, E: Into<BuildError>> FieldContext<T> for Result<T, E> {
+    fn in_field(self, field: &'static str) -> Result<T, BuildError> {
+        self.map_err(|e| BuildError::Field {
+            field,
+            source: Box::new(e.into()),
+        })
+    }
+}
+
 impl From<ExcerptError> for BuildError {
     fn from(e: ExcerptError) -> Self {
         Self::Excerpt(e)
+    }
+}
+
+impl From<ValidatedStringError> for BuildError {
+    fn from(e: ValidatedStringError) -> Self {
+        Self::Text(e)
+    }
+}
+
+impl From<CitationError> for BuildError {
+    fn from(e: CitationError) -> Self {
+        match e {
+            CitationError::Excerpt(e) => Self::Excerpt(e),
+            CitationError::Value(e) => Self::Text(e),
+        }
     }
 }
 
@@ -74,9 +127,12 @@ impl From<ExcerptError> for BuildError {
 /// pattern); every split, its events, its images, and the `Replaces` edges
 /// between adjacent splits go in the one commit, all declared `Local`.
 ///
-/// Extraction skips (unparseable dates, uncitable names, unrecognized event
-/// QIDs) are collected into `warnings` for the ingest driver to surface; they
-/// don't fail the build.
+/// A value the fact store can't hold costs the thing it belongs to and nothing
+/// more — an unstorable filename costs its image, an unstorable title costs its
+/// reference. Those skips join the extraction skips (unparseable dates,
+/// uncitable names, unrecognized event QIDs) in `warnings` for the ingest driver
+/// to surface; they don't fail the build. `Err` is left for the entity's own
+/// scaffolding failing, which no dump value can provoke.
 pub fn build_commit<R: IdScheme>(
     entity: &WikidataEntity,
     run: &IngesterRunId,
@@ -89,7 +145,7 @@ pub fn build_commit<R: IdScheme>(
     let ctx = ItemContext::new(entity_id, entity.lastrevid.0)?;
 
     let names = extract_names(entity, &ctx, warnings);
-    let refs = collect_external_references(entity, &ctx, warnings)?;
+    let refs = collect_external_references(entity, &ctx, warnings);
 
     let (mut splits, lifecycle_warnings) = build_lifecycles(&entity.claims, &ctx);
     warnings.extend(lifecycle_warnings);
@@ -127,7 +183,7 @@ pub fn build_commit<R: IdScheme>(
         }
     }
     let event_count = push_lifecycle_facts(&mut facts, &splits);
-    let image_count = push_image_facts(&mut facts, entity, latest, &ctx)?;
+    let image_count = push_image_facts(&mut facts, entity, latest, &ctx, warnings);
     push_replaces_facts(&mut facts, &splits, &ctx)?;
 
     Ok(Some(Commit {
@@ -148,11 +204,15 @@ pub fn build_commit<R: IdScheme>(
 /// its link-property references (OSM, Pleiades, URLs). Each is paired with the
 /// citation naming where it was read from. Emitted on every split — a lookup by
 /// external ref returns the whole demolish→rebuild set, not one split.
+///
+/// A reference whose site, title or claim value the store can't hold is dropped
+/// with a warning naming it. The item's own QID reference is built from the
+/// parsed entity id, so an item always carries at least that one.
 fn collect_external_references(
     entity: &WikidataEntity,
     ctx: &ItemContext,
     warnings: &mut Vec<String>,
-) -> Result<Vec<(ExternalReference, FactualCitation)>, BuildError> {
+) -> Vec<(ExternalReference, FactualCitation)> {
     let mut refs = Vec::new();
 
     refs.push((
@@ -163,35 +223,34 @@ fn collect_external_references(
     ));
 
     for (site, sitelink) in &entity.sitelinks {
-        let title = sitelink.title.as_str();
-        match parse_sitelink(site.as_str(), title) {
-            Some(reference) => {
-                let citation = ctx.citation(
-                    WikidataField::Sitelink {
-                        site: site.as_str().to_owned(),
-                    },
-                    sitelink.title.clone(),
-                )?;
-                refs.push((reference, citation));
+        let site = site.as_str();
+        let Some(reference) = parse_sitelink(site, sitelink.title.as_str(), warnings) else {
+            continue;
+        };
+        let field = match Text::new(site) {
+            Ok(site) => WikidataField::Sitelink { site },
+            Err(e) => {
+                warnings.push(format!("sitelink {site}: {e}"));
+                continue;
             }
-            // An empty title is malformed and worth a diagnostic; a non-empty
-            // title on an unsupported project (wikiquote, wikisource) is
-            // filtered by design and stays silent.
-            None if title.is_empty() => {
-                warnings.push(format!("sitelink {site}: empty title"));
-            }
-            None => {}
+        };
+        match ctx.citation(field, sitelink.title.clone()) {
+            Ok(citation) => refs.push((reference, citation)),
+            Err(e) => warnings.push(format!("sitelink {site}: {e}")),
         }
     }
 
     let (links, issues) = extract_link_references(&entity.claims);
     warnings.extend(issues);
     for link in links {
-        let citation = ctx.statement_citation(link.property_id, link.raw)?;
-        refs.push((link.reference, citation));
+        let property_id = link.property_id;
+        match ctx.statement_citation(property_id, link.raw) {
+            Ok(citation) => refs.push((link.reference, citation)),
+            Err(e) => warnings.push(format!("{property_id}: {e}")),
+        }
     }
 
-    Ok(refs)
+    refs
 }
 
 // ============================================================================
@@ -342,12 +401,17 @@ fn push_durational_dates(
 /// Emit `Source` + `Medium` facts and a depiction judgment for each image the
 /// item names, attaching depictions to the latest split (a photo shows the
 /// current building, not a demolished predecessor). Returns the image count.
+///
+/// A filename the store can't hold costs that one image: it is warned about and
+/// passed over before an `ImageIdx` is minted, so the declaration list stays
+/// dense and the item's other photos are unaffected.
 fn push_image_facts(
     facts: &mut Vec<SubmitFact>,
     entity: &WikidataEntity,
     latest: usize,
     ctx: &ItemContext,
-) -> Result<usize, BuildError> {
+    warnings: &mut Vec<String>,
+) -> usize {
     let mut image_count = 0usize;
     for (property, claims) in &entity.claims {
         let Some((medium, perspective)) = image_medium_perspective(property.as_str()) else {
@@ -360,11 +424,25 @@ fn push_image_facts(
             let Some(filename) = claim.mainsnak.string_value() else {
                 continue;
             };
+            let value = match Text::new(filename) {
+                Ok(value) => value,
+                Err(e) => {
+                    warnings.push(format!("{property_id}: image filename: {e}"));
+                    continue;
+                }
+            };
+            let citation = match ctx.statement_citation(property_id, filename) {
+                Ok(citation) => citation,
+                Err(e) => {
+                    warnings.push(format!("{property_id}: image filename: {e}"));
+                    continue;
+                }
+            };
+
             let url = url_for_filename(&CommonsFilename(filename.to_owned()));
             let image = ImageIdx(image_count);
             image_count += 1;
 
-            let citation = ctx.statement_citation(property_id, filename)?;
             facts.push(image_fact(
                 image::Fact::Source { image, url },
                 citation.clone(),
@@ -385,13 +463,13 @@ fn push_image_facts(
                         entity_id: ctx.entity_id(),
                         field: WikidataField::Statement { property_id },
                         revision_id: ctx.revision_id(),
-                        value: filename.to_owned(),
+                        value,
                     },
                 },
             });
         }
     }
-    Ok(image_count)
+    image_count
 }
 
 /// The medium and depiction perspective an image property carries: photos
@@ -426,10 +504,10 @@ fn push_replaces_facts(
 
         let mut excerpts = Vec::new();
         if let Some(v) = bookend_raw_value(&splits[k], BookendPhase::Demolition) {
-            excerpts.push(Excerpt::new(v)?);
+            excerpts.push(Excerpt::new(v).in_field("predecessor demolition value")?);
         }
         if let Some(v) = bookend_raw_value(&splits[k + 1], BookendPhase::Construction) {
-            excerpts.push(Excerpt::new(v)?);
+            excerpts.push(Excerpt::new(v).in_field("successor construction value")?);
         }
         let excerpts = match NonEmptyVec::try_from_vec(excerpts) {
             Ok(excerpts) => excerpts,
@@ -440,7 +518,7 @@ fn push_replaces_facts(
             entity_id: ctx.entity_id(),
             field: WikidataField::Item,
             revision_id: ctx.revision_id(),
-            value: "demolish→rebuild".to_owned(),
+            value: Text::new("demolish→rebuild")?,
         };
         facts.push(attribute_fact(fact, FactualCitation { source, excerpts }));
     }
@@ -543,8 +621,15 @@ pub struct IngestStats {
     pub entities: usize,
     /// Facts across those commits.
     pub facts: usize,
-    /// Entities skipped because their id wasn't a `Q`-item.
+    /// Entities skipped because their id wasn't a `Q`-item — a property or
+    /// lexeme carries nothing to model, so there was no commit to build.
     pub skipped: usize,
+    /// Entities dropped because their commit wouldn't build. Unlike `skipped`,
+    /// there was something to model and the build refused it. Values the store
+    /// can't hold are counted in `issues` instead — they cost their own fact,
+    /// not the entity — so this counts only an entity whose own scaffolding
+    /// failed.
+    pub failed: usize,
     /// Extraction warnings across those commits — uncitable names, unparseable
     /// dates, unrecognized event QIDs, and other per-claim skips.
     pub issues: usize,
@@ -559,44 +644,43 @@ impl std::ops::AddAssign for IngestStats {
             entities,
             facts,
             skipped,
+            failed,
             issues,
         } = rhs;
         self.commits += commits;
         self.entities += entities;
         self.facts += facts;
         self.skipped += skipped;
+        self.failed += failed;
         self.issues += issues;
     }
 }
 
-/// A failure during an ingest pass.
+/// The store rejected a commit, ending the ingest pass.
+///
+/// Holds the backend error rendered — backend errors aren't `Eq`.
 #[derive(Debug)]
-pub enum IngestError {
-    /// A commit couldn't be built from an entity.
-    Build(BuildError),
-    /// The store rejected a commit (rendered, since the backend error isn't
-    /// `Eq`).
-    Submit(String),
-}
+pub struct IngestError(String);
 
 impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Build(e) => write!(f, "build commit: {e}"),
-            Self::Submit(msg) => write!(f, "submit commit: {msg}"),
-        }
+        write!(f, "submit commit: {}", self.0)
     }
 }
 
 impl std::error::Error for IngestError {}
 
-impl From<BuildError> for IngestError {
-    fn from(e: BuildError) -> Self {
-        Self::Build(e)
-    }
-}
-
 /// Build and submit one commit per entity, tallying as it goes.
+///
+/// An entity whose commit won't build is warned about, counted in
+/// [`IngestStats::failed`], and passed over, so a bulk run over millions of
+/// items outlives one malformed record. It is the backstop rather than the
+/// common path: a value the store can't hold costs its own fact and lands in
+/// [`IngestStats::issues`], leaving the entity to commit what remains.
+///
+/// A store rejection stays fatal. It can't be told apart from a store outage,
+/// and a run that carried on through one would report success having ingested
+/// nothing.
 pub async fn ingest_entities<S: FactStore>(
     store: &S,
     entities: impl IntoIterator<Item = WikidataEntity>,
@@ -606,20 +690,30 @@ pub async fn ingest_entities<S: FactStore>(
     let mut stats = IngestStats::default();
     for entity in entities {
         let mut warnings = Vec::new();
-        match build_commit(&entity, run, recorded_at, &mut warnings)? {
-            Some(commit) => {
-                for warning in &warnings {
-                    tracing::warn!(qid = entity.id.as_str(), "ingestion: {warning}");
-                }
-                stats.issues += warnings.len();
+        let built = build_commit(&entity, run, recorded_at, &mut warnings);
+
+        // Surfaced whatever the outcome: a build that then fails has already
+        // collected the skips behind it, and one pass over the dump is meant to
+        // name everything an operator has to fix.
+        for warning in &warnings {
+            tracing::warn!(qid = entity.id.as_str(), "ingestion: {warning}");
+        }
+        stats.issues += warnings.len();
+
+        match built {
+            Ok(Some(commit)) => {
                 stats.entities += commit.entities.len();
                 stats.facts += commit.facts.len();
                 commit_facts(store, commit)
                     .await
-                    .map_err(|e| IngestError::Submit(format!("{e:?}")))?;
+                    .map_err(|e| IngestError(format!("{e:?}")))?;
                 stats.commits += 1;
             }
-            None => stats.skipped += 1,
+            Ok(None) => stats.skipped += 1,
+            Err(e) => {
+                tracing::warn!(qid = entity.id.as_str(), "ingestion: entity dropped: {e}");
+                stats.failed += 1;
+            }
         }
     }
     Ok(stats)
@@ -637,6 +731,7 @@ mod tests {
     use chronoscope_core::geo::{GeoPoint, Viewport};
     use chronoscope_core::grammar::attribute::NameType;
     use chronoscope_core::grammar::lifecycle::{DurationalKind, LifetimeEventKind, PointKind};
+    use chronoscope_core::grammar::text::TEXT_MAX_LEN;
     use chronoscope_core::listing::summaries_in_viewport;
     use chronoscope_core::projection::{member_lineage, project_entity};
     use chronoscope_core::store::FactStore;
@@ -1163,6 +1258,7 @@ mod tests {
         assert_eq!(stats.commits, 1);
         assert_eq!(stats.entities, 1);
         assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.failed, 0);
         assert_eq!(stats.issues, 0, "the clean fixture raises no warnings");
         assert!(stats.facts > 0, "the commit carries facts");
         Ok(())
@@ -1192,27 +1288,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn empty_sitelink_title_is_skipped_without_aborting_the_commit() -> TestResult {
-        let mut entity = item(
-            "Q321",
-            BTreeMap::from([label("en", "Placeholder")]),
-            BTreeMap::new(),
-        )?;
-        entity.sitelinks.insert(
-            SiteId("commonswiki".to_owned()),
-            Sitelink {
-                title: String::new(),
-            },
-        );
-
-        let mut warnings = Vec::new();
-        let commit = build_commit::<MemoryIds>(&entity, &run_id(), fixed_time()?, &mut warnings)?
-            .ok_or("the item still builds a commit")?;
-
-        // The item's own QID is the only external reference; the empty-title
-        // sitelink contributes none.
-        let external_refs = commit
+    fn external_reference_count(commit: &Commit<MemoryIds>) -> usize {
+        commit
             .facts
             .iter()
             .filter(|f| {
@@ -1226,12 +1303,225 @@ mod tests {
                     }
                 )
             })
-            .count();
-        assert_eq!(external_refs, 1, "only the QID reference survives");
-        assert!(
-            warnings.iter().any(|w| w.contains("empty title")),
-            "the empty sitelink title records a warning, got: {warnings:?}"
+            .count()
+    }
+
+    /// An item carrying one sitelink, for the skip paths.
+    fn item_with_sitelink(
+        site: &str,
+        title: String,
+    ) -> Result<WikidataEntity, Box<dyn std::error::Error>> {
+        let mut entity = item(
+            "Q321",
+            BTreeMap::from([label("en", "Placeholder")]),
+            BTreeMap::new(),
+        )?;
+        entity
+            .sitelinks
+            .insert(SiteId(site.to_owned()), Sitelink { title });
+        Ok(entity)
+    }
+
+    #[test]
+    fn empty_sitelink_title_leaves_the_commit_a_reference_short() -> TestResult {
+        let entity = item_with_sitelink("commonswiki", String::new())?;
+
+        let mut warnings = Vec::new();
+        let commit = build_commit::<MemoryIds>(&entity, &run_id(), fixed_time()?, &mut warnings)?
+            .ok_or("the item still builds a commit")?;
+
+        // The item's own QID is the only external reference; the empty-title
+        // sitelink names no page, so there is nothing to build from it.
+        assert_eq!(
+            external_reference_count(&commit),
+            1,
+            "only the QID reference survives"
         );
+        assert!(
+            warnings.iter().any(|w| w.contains("commonswiki")),
+            "the empty title is diagnosed, got: {warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// A Commons gallery title (no `Category:` prefix) parses straight into a
+    /// URL reference, so an unstorable title first bites at the citation step.
+    /// It costs that one reference: the item's labels, dates and coordinates
+    /// have nothing to do with a title Commons happens to carry.
+    #[tokio::test]
+    async fn unstorable_commons_gallery_title_costs_its_reference_not_its_entity() -> TestResult {
+        for title in ["Gal\u{0}lery".to_owned(), "G".repeat(TEXT_MAX_LEN + 1)] {
+            let entity = item_with_sitelink("commonswiki", title)?;
+
+            let mut warnings = Vec::new();
+            let commit =
+                build_commit::<MemoryIds>(&entity, &run_id(), fixed_time()?, &mut warnings)?
+                    .ok_or("the item still builds a commit")?;
+            assert_eq!(
+                external_reference_count(&commit),
+                1,
+                "the sitelink reference is dropped, the QID one stays"
+            );
+            assert!(
+                warnings.iter().any(|w| w.contains("commonswiki")),
+                "the dropped reference is diagnosed, got: {warnings:?}"
+            );
+            assert!(
+                commit.facts.iter().any(|f| matches!(
+                    f,
+                    SubmitFact::Factual {
+                        assertion: FactualAssertion::Attribute {
+                            fact: attribute::Fact::Name { .. }
+                        },
+                        ..
+                    }
+                )),
+                "the item's label still commits"
+            );
+
+            let store = MemoryFactStore::new();
+            let stats = ingest_entities(&store, [entity], &run_id(), fixed_time()?).await?;
+            assert_eq!(stats.commits, 1, "the entity is submitted");
+            assert_eq!(stats.failed, 0, "a bad value is not a build failure");
+            assert!(stats.issues > 0, "the drop is tallied as an issue");
+        }
+        Ok(())
+    }
+
+    /// An unstorable filename costs its own image and mints no `ImageIdx`, so
+    /// the images behind it keep the indices their facts reference — a gap
+    /// would leave the declaration list disagreeing with the facts.
+    #[test]
+    fn an_unstorable_image_filename_costs_that_image_and_leaves_no_index_gap() -> TestResult {
+        let claims = BTreeMap::from([(
+            PropertyId::try_from("P18".to_owned())?,
+            vec![string_claim("Bro\u{0}ken.jpg"), string_claim("Current.jpg")],
+        )]);
+
+        let mut warnings = Vec::new();
+        let commit = build_commit::<MemoryIds>(
+            &item("Q11", BTreeMap::new(), claims)?,
+            &run_id(),
+            fixed_time()?,
+            &mut warnings,
+        )?
+        .ok_or("the item still builds a commit")?;
+
+        assert_eq!(
+            commit.images.len(),
+            1,
+            "only the storable photo is declared"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("P18") && w.contains("image filename")),
+            "the dropped image is diagnosed by property and field, got: {warnings:?}"
+        );
+        assert!(
+            commit.facts.iter().any(|f| matches!(
+                f,
+                SubmitFact::Factual {
+                    assertion: FactualAssertion::Image {
+                        fact: image::Fact::Source { image, url }
+                    },
+                    ..
+                } if *image == ImageIdx(0) && url.as_str().contains("Current.jpg")
+            )),
+            "the surviving photo takes the first declared index"
+        );
+        Ok(())
+    }
+
+    /// A link statement whose value can't be quoted costs that reference alone.
+    #[test]
+    fn an_unquotable_link_statement_costs_its_reference_not_its_entity() -> TestResult {
+        let claims = BTreeMap::from([(
+            PropertyId::try_from("P856".to_owned())?,
+            vec![string_claim("https://example.com/a\u{0}b")],
+        )]);
+
+        let mut warnings = Vec::new();
+        let commit = build_commit::<MemoryIds>(
+            &item("Q12", BTreeMap::from([label("en", "Placeholder")]), claims)?,
+            &run_id(),
+            fixed_time()?,
+            &mut warnings,
+        )?
+        .ok_or("the item still builds a commit")?;
+
+        assert_eq!(
+            external_reference_count(&commit),
+            1,
+            "the official-website reference is dropped, the QID one stays"
+        );
+        // The URL itself parses — a NUL percent-encodes into the path — so the
+        // rejection lands where the citation quotes the raw claim value.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("P856") && w.contains("NUL")),
+            "the dropped reference is diagnosed with its reason, got: {warnings:?}"
+        );
+        Ok(())
+    }
+
+    /// One item full of values the store can't hold must not cost the items
+    /// queued around it — a bulk run over millions would otherwise be lost to
+    /// it. Every rejection lands on the fact it belongs to, so all three commit.
+    #[tokio::test]
+    async fn an_item_whose_values_are_all_rejected_still_commits_alongside_its_neighbours()
+    -> TestResult {
+        let mut bad = item_with_sitelink("commonswiki", "Gal\u{0}lery".to_owned())?;
+        bad.sitelinks.insert(
+            SiteId("enwiki".to_owned()),
+            Sitelink {
+                title: "Pan\u{0}theon".to_owned(),
+            },
+        );
+        bad.claims.insert(
+            PropertyId::try_from("P18".to_owned())?,
+            vec![string_claim("Bro\u{0}ken.jpg")],
+        );
+        let after = item(
+            "Q999",
+            BTreeMap::from([label("en", "Behind the bad one")]),
+            BTreeMap::new(),
+        )?;
+
+        let store = MemoryFactStore::new();
+        let stats =
+            ingest_entities(&store, [pantheon()?, bad, after], &run_id(), fixed_time()?).await?;
+
+        assert_eq!(stats.commits, 3, "every item commits what it could");
+        assert_eq!(stats.failed, 0, "no item is dropped over a bad value");
+        assert!(stats.issues >= 3, "each rejection is tallied: {stats:?}");
+        Ok(())
+    }
+
+    /// Sites outside the modeled set are filtered by design, so they leave the
+    /// issue list alone — a dump's non-edition `*wiki` sites would otherwise
+    /// bury the diagnostics that name a lost reference.
+    #[test]
+    fn sites_outside_the_modeled_set_are_skipped_in_silence() -> TestResult {
+        for site in ["be_x_oldwiki", "mediawikiwiki", "enwikiquote"] {
+            let entity = item_with_sitelink(site, "Placeholder".to_owned())?;
+
+            let mut warnings = Vec::new();
+            let commit =
+                build_commit::<MemoryIds>(&entity, &run_id(), fixed_time()?, &mut warnings)?
+                    .ok_or("the item still builds a commit")?;
+
+            assert_eq!(
+                external_reference_count(&commit),
+                1,
+                "{site} contributes no reference"
+            );
+            assert!(
+                warnings.is_empty(),
+                "{site} is filtered in silence, got: {warnings:?}"
+            );
+        }
         Ok(())
     }
 

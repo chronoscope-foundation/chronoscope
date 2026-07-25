@@ -1010,8 +1010,8 @@ fn external_source_label(source: &ExternalSource) -> String {
             .map(|host| host.to_string())
             .unwrap_or_else(|| "Source".to_string()),
         ExternalSource::Dbpedia { .. } => "DBpedia".to_string(),
-        ExternalSource::Book { title, .. } => title.clone(),
-        ExternalSource::Archive { collection, .. } => collection.clone(),
+        ExternalSource::Book { title, .. } => title.as_str().to_owned(),
+        ExternalSource::Archive { collection, .. } => collection.as_str().to_owned(),
     }
 }
 
@@ -1135,7 +1135,7 @@ fn damage_cause_label(cause: &DamageCause) -> String {
         DamageCause::Vandalism => "Vandalism".to_string(),
         DamageCause::War => "War".to_string(),
         DamageCause::Weather => "Weather".to_string(),
-        DamageCause::Other { description } => description.clone(),
+        DamageCause::Other { description } => description.as_str().to_owned(),
     }
 }
 
@@ -1157,7 +1157,7 @@ fn usage_label(usage: &Usage) -> String {
         Usage::Religious => "Religious".to_string(),
         Usage::Residential => "Residential".to_string(),
         Usage::Transportation => "Transportation".to_string(),
-        Usage::Other { description } => description.clone(),
+        Usage::Other { description } => description.as_str().to_owned(),
     }
 }
 
@@ -1187,9 +1187,11 @@ fn move_method_label(method: &MoveMethod) -> &'static str {
 /// combinator yields `None` rather than a fabricated label.
 fn location_display(location: &UnresolvedLocation) -> Option<String> {
     match location {
-        UnresolvedLocation::Reference(LocationReference::NamedPlace { name }) => Some(name.clone()),
+        UnresolvedLocation::Reference(LocationReference::NamedPlace { name }) => {
+            Some(name.as_str().to_owned())
+        }
         UnresolvedLocation::Reference(LocationReference::Address { address_text }) => {
-            Some(address_text.clone())
+            Some(address_text.as_str().to_owned())
         }
         _ => None,
     }

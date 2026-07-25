@@ -31,6 +31,7 @@ use crate::grammar::geometry::ImageGeometry;
 use crate::grammar::ids::{
     AnalyzerProcess, AnalyzerVersion, FactId, IngesterRunId, UserId, reject_nul,
 };
+use crate::grammar::text::Text;
 use crate::nonempty::NonEmptyVec;
 
 // ============================================================================
@@ -397,7 +398,7 @@ pub enum WikidataField {
     /// An entity label in a given language.
     Label { language: Language },
     /// A sitelink to another wiki (enwiki, commonswiki, …).
-    Sitelink { site: String },
+    Sitelink { site: Text },
     /// The item record as a whole — its existence/identity (backs the
     /// entity's own QID `ExternalReference` fact).
     Item,
@@ -453,7 +454,7 @@ pub enum ExternalSource {
         /// The pinned revision id; lets us re-fetch the exact claim.
         revision_id: u64,
         /// The read value as observed at ingest time.
-        value: String,
+        value: Text,
     },
     /// A specific DBpedia triple pinned to a snapshot version. RDF-style
     /// addressing: both subject and predicate are URIs because the
@@ -466,18 +467,18 @@ pub enum ExternalSource {
         #[schemars(with = "String")]
         property_uri: Url,
         /// The DBpedia snapshot version label.
-        version: String,
+        version: Text,
         /// The property value as observed at ingest time.
-        value: String,
+        value: Text,
     },
     /// A physical publication — machine-unverifiable but human-checkable.
     /// The citation must carry at least one excerpt.
     Book {
-        title: String,
+        title: Text,
         /// ISBN, when known.
         isbn: Option<Isbn>,
         /// Page reference (free-form, e.g. `"p. 142"` or `"pp. 12-15"`).
-        page: Option<String>,
+        page: Option<Text>,
         /// Publication date of the cited edition (its copyright page), when
         /// known — the edition's date, not the underlying work's. A 1995
         /// reprint of an 1820 memoir is `published: 1995`, with 1820 in the
@@ -488,9 +489,9 @@ pub enum ExternalSource {
     /// An archival or museum-collection item. The citation must carry
     /// at least one excerpt.
     Archive {
-        collection: String,
+        collection: Text,
         /// Catalog or accession identifier, when known.
-        catalog_id: Option<String>,
+        catalog_id: Option<Text>,
         /// When the artifact was created — the photograph taken, the letter
         /// written. Not when the archive accessioned or digitized it.
         #[date_role = "CitationDate"]
@@ -741,7 +742,7 @@ pub enum ExternalReference {
         /// in canonical form.
         language: Language,
         /// The article title (URL-decoded, no `_` substitutions).
-        title: String,
+        title: Text,
     },
     /// `GeoNames` feature.
     GeoNames { id: GeoNamesId },
@@ -773,8 +774,11 @@ impl ExternalReference {
     /// Dispatch a URL to the structured variant matching its host and path
     /// shape. Falls through to [`ExternalReference::UnmodeledUrl`] whenever any
     /// expected component is missing or malformed — including Commons `File:`
-    /// pages (which are ingested as images) and any host that isn't on the
-    /// recognized list.
+    /// pages (which are ingested as images), a Wikipedia title that
+    /// percent-decodes to a NUL (`%00`, which [`Text`] refuses), and any host
+    /// that isn't on the recognized list. The URL survives verbatim in the
+    /// fallback, so nothing is lost; it lands in a different dedup class than a
+    /// structured variant would.
     ///
     /// Each known host has its full path shape encoded in the match arm, so
     /// only a URL whose segments match that shape produces a structured
@@ -812,7 +816,7 @@ impl ExternalReference {
                 )
             }
             Self::Wikipedia { language, title } => {
-                let title = title.replace(' ', "_");
+                let title = title.as_str().replace(' ', "_");
                 build(
                     &format!("https://{}.wikipedia.org", language.as_str()),
                     &["wiki", title.as_str()],
@@ -941,7 +945,7 @@ fn parse_wikipedia(host: &str, segments: &[&str]) -> Option<ExternalReference> {
     }
     Some(ExternalReference::Wikipedia {
         language,
-        title: decoded.replace('_', " "),
+        title: Text::new(decoded.replace('_', " ")).ok()?,
     })
 }
 
@@ -1108,7 +1112,7 @@ mod tests {
         match ExternalReference::from_url(&url) {
             ExternalReference::Wikipedia { language, title } => {
                 assert_eq!(language.as_str(), "en");
-                assert_eq!(title, "Pantheon");
+                assert_eq!(title.as_str(), "Pantheon");
             }
             other => return Err(format!("expected Wikipedia variant, got {other:?}").into()),
         }
@@ -1120,7 +1124,7 @@ mod tests {
         let url = Url::parse("https://en.wikipedia.org/wiki/Empire_State_Building")?;
         match ExternalReference::from_url(&url) {
             ExternalReference::Wikipedia { title, .. } => {
-                assert_eq!(title, "Empire State Building");
+                assert_eq!(title.as_str(), "Empire State Building");
             }
             other => return Err(format!("expected Wikipedia variant, got {other:?}").into()),
         }
@@ -1218,7 +1222,7 @@ mod tests {
         match ExternalReference::from_url(&url) {
             ExternalReference::Wikipedia { language, title } => {
                 assert_eq!(language.as_str(), "en");
-                assert_eq!(title, "Pantheon");
+                assert_eq!(title.as_str(), "Pantheon");
             }
             other => return Err(format!("expected Wikipedia variant, got {other:?}").into()),
         }
@@ -1333,7 +1337,7 @@ mod tests {
             },
             ExternalReference::Wikipedia {
                 language: Language::new("en")?,
-                title: "Empire State Building".to_string(),
+                title: Text::new("Empire State Building")?,
             },
             ExternalReference::GeoNames {
                 id: GeoNamesId::new(3169070),
@@ -1365,7 +1369,7 @@ mod tests {
     fn external_reference_to_url_encodes_wikipedia_spaces_as_underscores() -> TestResult {
         let reference = ExternalReference::Wikipedia {
             language: Language::new("en")?,
-            title: "Empire State Building".to_string(),
+            title: Text::new("Empire State Building")?,
         };
         assert_eq!(
             reference.to_url().as_str(),
@@ -1381,7 +1385,7 @@ mod tests {
         // round-trip back through from_url.
         let reference = ExternalReference::Wikipedia {
             language: Language::new("en")?,
-            title: "Who? (album)".to_string(),
+            title: Text::new("Who? (album)")?,
         };
         let url = reference.to_url();
         assert_eq!(url.as_str(), "https://en.wikipedia.org/wiki/Who%3F_(album)");
@@ -1402,7 +1406,7 @@ mod tests {
         // is excluded from the round-trip test above.
         let reference = ExternalReference::Wikipedia {
             language: Language::new("en")?,
-            title: "AC/DC".to_string(),
+            title: Text::new("AC/DC")?,
         };
         assert_eq!(
             reference.to_url().as_str(),

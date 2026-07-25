@@ -39,15 +39,29 @@ pub enum LoadError {
     /// path is threaded through rather than assumed away.
     #[error("curated snapshot recorded-at timestamp is invalid")]
     RecordedAt,
-    /// The store rejected a curated entity. A bad curated entity is a
-    /// fixture bug — this is fatal, not skipped.
+    /// The store rejected a commit, which ends the ingest pass.
     #[error("ingesting curated entities: {0}")]
     Ingest(#[from] IngestError),
+    /// Curated entities the build refused. A bulk dump run drops these and
+    /// carries on, but a bad curated entity is a fixture bug, so the loader
+    /// reads the tally back and fails on it — the count is the signal, since
+    /// the drop never reaches [`LoadError::Ingest`].
+    #[error(
+        "{failed} curated entities failed to build (each was logged with its QID); \
+         fix the fixture"
+    )]
+    Failed {
+        /// How many entities the build refused.
+        failed: usize,
+    },
 }
 
 /// Read `jsonl_path`, parse each non-empty line as a [`WikidataEntity`], and
 /// ingest all of them into `store` under one ingester run. Returns the
 /// ingest tally so the caller can log it.
+///
+/// Every entity has to land: a fixture that quietly loses one makes every test
+/// reading this store assert against a set nobody chose.
 ///
 /// Every entity is recorded under the same fixed timestamp — the curated
 /// snapshot's own date, not the load time — so re-loading the same snapshot
@@ -80,6 +94,11 @@ pub async fn load_curated_fact_store<S: FactStore>(
     let recorded_at = curated_snapshot_recorded_at()?;
     let run = IngesterRunId::new("dev-startup");
     let stats = ingest_entities(store, entities, &run, recorded_at).await?;
+    if stats.failed > 0 {
+        return Err(LoadError::Failed {
+            failed: stats.failed,
+        });
+    }
     Ok(stats)
 }
 

@@ -20,6 +20,7 @@ use crate::grammar::attribute;
 use crate::grammar::citations::{ExternalSource, JudgmentSource, Justification};
 use crate::grammar::identity;
 use crate::grammar::ids::{CommitId, FactId, UserId};
+use crate::grammar::text::Text;
 use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::store::schema::{
     CELL_DEPTH, CLUSTER_TILE_N, CellKind, ClassRow, ClusterCell, EntityStream, ImageStream, RankKey,
@@ -3180,7 +3181,7 @@ pub async fn pending_conjunction_location_accepted<S: FactStore>(store: S) -> Te
         Meters::new_unchecked(1000.0),
     )?);
     let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-        name: "Paris".to_owned(),
+        name: Text::new("Paris")?,
     });
     let pending = UnresolvedLocation::all_of(vec![circle, reference])?;
     commit_ok(
@@ -4268,7 +4269,7 @@ pub async fn disjunctive_meta_citation_date_rejected<S: FactStore>(store: S) -> 
         },
         citation: crate::grammar::citations::MetaSource::External {
             source: ExternalSource::Archive {
-                collection: "fonds".to_owned(),
+                collection: Text::new("fonds")?,
                 catalog_id: None,
                 created: Some(disjunctive_date()?),
             },
@@ -4526,7 +4527,7 @@ pub async fn walk_entity_classes_in_viewport_surfaces_conjunction_with_unresolve
     let conjunction_at = |lat: f64, lon: f64| -> Result<UnresolvedLocation, TestError> {
         Ok(UnresolvedLocation::all_of(vec![
             UnresolvedLocation::Reference(LocationReference::NamedPlace {
-                name: "lot 12".to_owned(),
+                name: Text::new("lot 12")?,
             }),
             UnresolvedLocation::Resolved(Location::circle(
                 GeoPoint::new(lat, lon)?,

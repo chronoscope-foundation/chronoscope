@@ -509,7 +509,7 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
     // Both regions should have segmentation_confidence ~0.66-0.69 (from recorded fixture)
     for (i, region) in regions.iter().enumerate() {
         assert!(
-            !region.mask.counts.is_empty(),
+            !region.mask.counts.as_str().is_empty(),
             "region {i} mask should have RLE counts"
         );
         assert!(

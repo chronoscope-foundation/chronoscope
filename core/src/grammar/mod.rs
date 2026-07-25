@@ -10,6 +10,7 @@
 //!
 //! - [`ids`] — identifier newtypes ([`ids::FactId`], [`ids::CommitId`],
 //!   plus the macro-generated string IDs).
+//! - [`text`] — [`text::Text`], the shared free-text value.
 //! - [`citations`] — citation flavors and source enums.
 //! - [`lifecycle`] — lifetime-event kinds, durational roles, and the
 //!   supporting domain enums (`DamageCause`, `MoveMethod`, `Usage`).
@@ -68,3 +69,4 @@ pub mod image;
 pub mod lifecycle;
 pub mod observation;
 pub mod spatial;
+pub mod text;

@@ -469,11 +469,11 @@ fn inject_event<R: IdScheme, T>(
             record.usages = claimed_of(new_usages.clone(), support.clone());
         }
         event::Fact::Designation { designation, .. } => {
-            record.designation = claimed_of(designation.clone(), support.clone());
+            record.designation = claimed_of(designation.as_str().to_owned(), support.clone());
         }
         event::Fact::Description { text, .. } => {
             record.descriptions.insert(
-                text.clone(),
+                text.as_str().to_owned(),
                 Cited {
                     value: (),
                     support: support.clone(),

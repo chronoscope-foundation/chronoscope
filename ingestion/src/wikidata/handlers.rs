@@ -160,7 +160,7 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert!(matches!(
             &refs[0].reference,
-            ExternalReference::Wikipedia { title, .. } if title == "Pantheon"
+            ExternalReference::Wikipedia { title, .. } if title.as_str() == "Pantheon"
         ));
         Ok(())
     }

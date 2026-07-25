@@ -27,8 +27,8 @@
 //!
 //! Image-cluster facts have no per-kind structural rejection rules beyond the
 //! wire-boundary validation each variant's payload already enforces (URL
-//! parsing, non-empty `Author.name`, [`crate::date::UncertainDate`]
-//! well-formedness).
+//! parsing, [`Text`] for the free-text payloads,
+//! [`crate::date::UncertainDate`] well-formedness).
 //!
 //! # Conflicts (surfaced at projection time)
 //!
@@ -50,6 +50,7 @@ use url::Url;
 use crate::date::UncertainDate;
 use crate::grammar::citations::Language;
 use crate::grammar::ids::IdScheme;
+use crate::grammar::text::Text;
 use crate::location::UnresolvedLocation;
 
 /// What kind of image this is — a render hint, never a gate.
@@ -92,8 +93,7 @@ pub enum Fact<R: IdScheme> {
     /// the photograph, the painter who painted the painting. The name
     /// pairs with a BCP-47 language tag because authorship is recorded
     /// in different languages across sources (a Russian-language
-    /// archive's attribution carries its own language tag). The submit
-    /// layer rejects an empty `name`.
+    /// archive's attribution carries its own language tag).
     ///
     /// Propagates across
     /// [`crate::grammar::identity::Fact::SameArtifact`] equivalence
@@ -102,7 +102,7 @@ pub enum Fact<R: IdScheme> {
     Author {
         image: R::Image,
         /// The author's name as the source recorded it.
-        name: String,
+        name: Text,
         /// BCP-47 language tag for the name, in canonical form.
         language: Language,
     },

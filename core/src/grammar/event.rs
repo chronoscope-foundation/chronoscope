@@ -130,6 +130,7 @@ use crate::grammar::ids::IdScheme;
 use crate::grammar::lifecycle::{
     DamageCause, DurationalRole, LifetimeEventKind, MoveMethod, Usage,
 };
+use crate::grammar::text::Text;
 use crate::location::UnresolvedLocation;
 
 /// Event-cluster fact.
@@ -202,10 +203,10 @@ pub enum Fact<R: IdScheme> {
     Designation {
         event: R::Event,
         /// The designation as the source phrased it.
-        designation: String,
+        designation: Text,
     },
     /// Free-form descriptive text attached to a lifetime event.
-    Description { event: R::Event, text: String },
+    Description { event: R::Event, text: Text },
 }
 
 impl<R: IdScheme> Fact<R> {

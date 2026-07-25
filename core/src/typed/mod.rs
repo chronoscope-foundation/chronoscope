@@ -726,6 +726,7 @@ mod test_support {
 #[cfg(test)]
 mod tests {
     use crate::date::UncertainDate;
+    use crate::grammar::text::Text;
     use crate::location::{LocationReference, UnresolvedLocation};
 
     use super::test_support::*;
@@ -896,7 +897,7 @@ mod tests {
     #[test]
     fn bracket_unresolved_reference_is_pending() -> TestResult {
         let reference = UnresolvedLocation::Reference(LocationReference::NamedPlace {
-            name: "Springfield".to_owned(),
+            name: Text::new("Springfield")?,
         });
         let b = claim(reference, lin(1, "https://a")?);
         let out = bracket(&b);

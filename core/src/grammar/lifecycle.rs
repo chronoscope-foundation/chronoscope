@@ -18,6 +18,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 
+use crate::grammar::text::Text;
+
 /// Role for a date bound on a durational lifetime event.
 ///
 /// Durational events ([`DurationalKind`]) span an interval rather than a
@@ -176,7 +178,7 @@ pub enum DamageCause {
     /// description.
     Other {
         /// Human-readable description of the cause.
-        description: String,
+        description: Text,
     },
 }
 
@@ -235,6 +237,6 @@ pub enum Usage {
     /// Use not covered by the named variants, with a freeform description.
     Other {
         /// Human-readable description of the use.
-        description: String,
+        description: Text,
     },
 }
