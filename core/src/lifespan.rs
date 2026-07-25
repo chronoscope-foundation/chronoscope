@@ -56,6 +56,52 @@ pub enum ExistenceState {
     Uncontested,
 }
 
+/// The span of instants an entity's sources place it at — the whole of
+/// [`classify`](Lifespan::classify)'s non-`Unknown`, non-`Absent` verdict, as one
+/// interval.
+///
+/// It is always contiguous, which is what makes an existence filter indexable:
+/// the affirmed hull and the forward presumption are adjacent, never disjoint, so
+/// their union never splits. A caller filtering by time needs only this, not the
+/// whole classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SupportWindow {
+    /// No instant is supported. Nothing dates the entity, or its only evidence is
+    /// an open ray anchoring no forward edge — either way it can answer no
+    /// question about a moment, so it matches no timed query.
+    Empty,
+    /// Supported from `from` through `through`, both inclusive. `through` absent
+    /// runs forward without bound: the closed-world presumption that a built
+    /// thing stands until something records its removal.
+    Span {
+        from: NaiveDate,
+        through: Option<NaiveDate>,
+    },
+}
+
+impl SupportWindow {
+    /// Whether the sources place the entity at `at`.
+    pub fn contains(self, at: NaiveDate) -> bool {
+        match self {
+            SupportWindow::Empty => false,
+            SupportWindow::Span { from, through } => from <= at && through.is_none_or(|t| at <= t),
+        }
+    }
+
+    /// Whether the entity is placed anywhere within `[start, end]` — the
+    /// existential reading a bbox+interval query wants, with an instant its
+    /// degenerate `[T, T]` case.
+    pub fn overlaps(self, start: NaiveDate, end: NaiveDate) -> bool {
+        match self {
+            SupportWindow::Empty => false,
+            SupportWindow::Span { from, through } => {
+                from <= end && through.is_none_or(|t| start <= t)
+            }
+        }
+    }
+}
+
 /// The affirmed hull — the convex span every assertion vouches for. `None` on an
 /// edge is that side's fold identity (a bound the fold never anchored), so an
 /// un-anchored side yields to any present one under `combine`.
@@ -135,6 +181,11 @@ impl Hull {
     /// The upper edge — the forward-presumption anchor.
     fn hi(self) -> Option<NaiveDate> {
         self.hi
+    }
+
+    /// The lower edge — the earliest instant any assertion vouches for.
+    fn lo(self) -> Option<NaiveDate> {
+        self.lo
     }
 }
 
@@ -236,6 +287,42 @@ impl Lifespan {
             hull: Hull::spanning(&date),
             birth: BirthBound::Open,
             death: DeathBound::Open,
+        }
+    }
+
+    /// The span of instants this lifespan's assertions support — the interval
+    /// form of [`classify`](Self::classify)'s supported verdicts, for a caller
+    /// that needs to *filter* by time rather than explain a single moment.
+    ///
+    /// Contiguous by construction: the affirmed hull runs to `hull.hi` and the
+    /// presumption picks up immediately after it, so the two never leave a gap.
+    /// An entity with no forward anchor supports nothing at all — that is the
+    /// undated entity, and the reason a timed query cannot return one.
+    pub fn support(&self) -> SupportWindow {
+        // No forward anchor: neither the hull nor the presumption reaches an
+        // instant, whatever the lower edge says.
+        let Some(hi) = self.hull.hi() else {
+            return SupportWindow::Empty;
+        };
+        let presumes = self.death == DeathBound::Open;
+        match self.hull.lo() {
+            // A hull that contains something: supported from its lower edge, and
+            // onward without bound when no demolition closes it.
+            Some(lo) if lo <= hi => SupportWindow::Span {
+                from: lo,
+                through: if presumes { None } else { Some(hi) },
+            },
+            // The hull affirms nothing — unanchored below, or crossed by a
+            // same-direction pair of open claims — so only the forward
+            // presumption can support anything, and only past `hi`.
+            _ if presumes => match hi.succ_opt() {
+                Some(from) => SupportWindow::Span {
+                    from,
+                    through: None,
+                },
+                None => SupportWindow::Empty,
+            },
+            _ => SupportWindow::Empty,
         }
     }
 
@@ -751,6 +838,55 @@ mod tests {
                 Absent
             };
             prop_assert_eq!(ls.classify(at), expected);
+        }
+
+        /// The support window is exactly the supported verdicts, at every
+        /// instant. This is the law that lets a filter use the interval instead
+        /// of the classification: an index may prune on `support()` and still
+        /// agree with `classify` about which entities a timed query returns.
+        ///
+        /// It also pins contiguity — a single interval could not track `classify`
+        /// everywhere if the supported set were ever split.
+        #[test]
+        fn support_window_holds_exactly_the_supported_instants(
+            ls in arb_lifespan(),
+            at in arb_instant(),
+        ) {
+            let supported = matches!(ls.classify(at), Uncontested | Contested | Presumed);
+            prop_assert_eq!(ls.support().contains(at), supported);
+        }
+
+        /// An instant is the degenerate interval, so the two reads agree there.
+        /// This is the contract a timed query rests on: asking about a moment is
+        /// asking about `[T, T]`.
+        #[test]
+        fn overlaps_at_a_degenerate_interval_is_contains(
+            ls in arb_lifespan(),
+            at in arb_instant(),
+        ) {
+            let window = ls.support();
+            prop_assert_eq!(window.overlaps(at, at), window.contains(at));
+        }
+
+        /// Over a range, `overlaps` is the existential reading: it matches iff
+        /// some instant within is supported. Checked against a day-by-day scan —
+        /// the honest oracle — over a bounded span, since an unbounded one walks
+        /// millions of days whenever the answer is false.
+        #[test]
+        fn overlaps_is_some_supported_instant_in_range(
+            ls in arb_lifespan(),
+            start in arb_instant(),
+            span in 0u64..400,
+        ) {
+            let Some(end) = start.checked_add_days(chrono::Days::new(span)) else {
+                return Ok(());
+            };
+            let window = ls.support();
+            let any = start
+                .iter_days()
+                .take_while(|d| *d <= end)
+                .any(|d| window.contains(d));
+            prop_assert_eq!(window.overlaps(start, end), any);
         }
 
         /// Order- and duplicate-independence: the fold is the same under any
