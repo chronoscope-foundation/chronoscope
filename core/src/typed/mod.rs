@@ -25,7 +25,9 @@ use crate::nonempty::NonEmptyVec;
 use crate::projection::Claimed;
 use crate::store::schema::EquivClass;
 
-use crate::projection::{Bracket, Citation, Cited, ConsensusConflict, DepictionRecord, Sameness};
+use crate::projection::{
+    Bracket, Citation, Cited, ConsensusConflict, DepictionRecord, DerivationRule, Premise, Sameness,
+};
 
 mod entity;
 mod image;
@@ -44,16 +46,18 @@ pub struct Attributed<V, ImgId> {
     pub sources: Vec<Citation<ImgId>>,
 }
 
-/// Why a value is present when no source directly asserted it. `None` = asserted;
-/// `Some(kind)` = derived by that rule. One variant per derivation rule; the
-/// witnesses ride in the slot's own `sources`/`facts`/value, so variants stay
-/// lean and don't duplicate them.
+/// How a value came to hold. Every value is derived; a source's own claim is
+/// derived by the trivial step [`Asserted`](Derivation::Asserted) names, and
+/// anything reaching past what a source stated names the rules that took it
+/// there. The rules' witnesses ride in the slot's own `sources`/`facts`/value, so
+/// the variants stay lean and don't duplicate them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Derivation {
-    /// `construction ≤ W`, because the entity was witnessed existing at `W` — a
-    /// "built by" bound the solver injected from existence witnesses.
-    ExistenceWitness,
+    /// Every premise behind this value is a source's own claim.
+    Asserted,
+    /// One or more inference rules participated in producing it.
+    Inferred { rules: NonEmptyVec<DerivationRule> },
 }
 
 /// The `T`-flattened mirror of the projection's [`Bracket`], for any lattice
@@ -76,11 +80,11 @@ pub struct Bounded<V, ImgId> {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<FactId>,
     pub consensus: Consensus<V, ImgId>,
-    /// Set when the value was derived rather than asserted, naming the rule that
-    /// derived it. The value, citations, and facts above are the derivation's
-    /// witnesses; a reader shows the bound inline and tags it inferred.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub derivation: Option<Derivation>,
+    /// How the value above came to hold — a source's own claim, or the inference
+    /// rules that reached past one. The value, citations, and facts are the
+    /// derivation's witnesses; a reader shows the bound inline and tags an
+    /// inferred one.
+    pub derivation: Derivation,
 }
 
 impl<X: Ord, ImgId> Bounded<Claimed<X>, ImgId> {
@@ -224,12 +228,10 @@ pub trait SupportAtom {
         None
     }
 
-    /// Whether this atom directly asserts a construction start. A present
-    /// construction-start slot whose support holds no such atom carries a derived
-    /// "built by" bound; this is how the flatten reads asserted-vs-derived off
-    /// the support. `false` for atoms that back no construction-start fact.
-    fn asserts_construction_start(&self) -> bool {
-        false
+    /// The inference rule this atom records, when it is one. A support holding
+    /// any rule atom produced a bound that goes beyond what a source stated.
+    fn rule(&self) -> Option<DerivationRule> {
+        None
     }
 }
 
@@ -237,6 +239,27 @@ impl<EntId, ImgId: Clone> SupportAtom for (EntId, Citation<ImgId>) {
     type Img = ImgId;
     fn citation(&self) -> Option<Citation<ImgId>> {
         Some(self.1.clone())
+    }
+}
+
+/// A premise reads as whatever it wraps: evidence delegates to the fact atom, a
+/// rule warrants no citation and names no fact — it records only itself.
+impl<F: SupportAtom> SupportAtom for Premise<F> {
+    type Img = F::Img;
+    fn citation(&self) -> Option<Citation<Self::Img>> {
+        self.fact()?.citation()
+    }
+    fn fact_id(&self) -> Option<FactId> {
+        self.fact()?.fact_id()
+    }
+    fn date_premise(&self) -> Option<(FactId, UncertainDate)> {
+        self.fact()?.date_premise()
+    }
+    fn rule(&self) -> Option<DerivationRule> {
+        match self {
+            Premise::Fact(_) => None,
+            Premise::Rule(r) => Some(*r),
+        }
     }
 }
 
@@ -250,9 +273,6 @@ impl<R: IdScheme> SupportAtom for FactAtom<R> {
     }
     fn date_premise(&self) -> Option<(FactId, UncertainDate)> {
         Some((self.id, fact_date(&self.fact)?))
-    }
-    fn asserts_construction_start(&self) -> bool {
-        crate::conflicts::is_construction_start(&self.fact)
     }
 }
 
@@ -273,19 +293,55 @@ where
         .collect()
 }
 
-/// The fact ids a support's atoms name, deduped and ordered — the
-/// provenance-by-id mirror of [`sources`]. Empty for a member-lineage support.
-pub(super) fn fact_ids<S, X>(support: &S) -> Vec<FactId>
+/// Everything a flattened slot reports about its support, read together.
+pub(super) struct Provenance<ImgId> {
+    /// The citations the atoms attribute, deduped — [`sources`]'s reading.
+    sources: Vec<Citation<ImgId>>,
+    /// The fact ids the atoms name, deduped and ordered — the provenance-by-id
+    /// mirror of `sources`. Empty for a member-lineage support.
+    facts: Vec<FactId>,
+    /// How the value came to hold: the rules the atoms record, or
+    /// [`Derivation::Asserted`] when none do.
+    ///
+    /// The read is existential — *any* rule atom means inferred — which is sound
+    /// because a rule stamps itself only when it created or changed the claim. A
+    /// slot holding one rule-narrowed claim beside an untouched one is inferred,
+    /// since the narrowed claim is the one setting the extent's edge. Zero
+    /// support carries no atoms, so an untouched slot reads asserted without a
+    /// special case.
+    derivation: Derivation,
+}
+
+/// The three provenance readings of one support, taken in a single walk of its
+/// atoms.
+///
+/// [`Support::atoms`] deduplicates across environments, so each call rebuilds a
+/// set over the whole support; a slot that asked for citations, fact ids and
+/// rules separately paid that three times over. The listing path projects
+/// hundreds of entities per viewport, so the flatten walks each support once.
+pub(super) fn provenance<S, X>(support: &S) -> Provenance<X::Img>
 where
     S: Support<Atom = X>,
     X: SupportAtom,
+    X::Img: Ord,
 {
-    support
-        .atoms()
-        .filter_map(SupportAtom::fact_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    let mut sources: BTreeSet<Citation<X::Img>> = BTreeSet::new();
+    let mut facts: BTreeSet<FactId> = BTreeSet::new();
+    let mut rules: BTreeSet<DerivationRule> = BTreeSet::new();
+    for atom in support.atoms() {
+        sources.extend(atom.citation());
+        facts.extend(atom.fact_id());
+        rules.extend(atom.rule());
+    }
+    let derivation = match NonEmptyVec::try_from_vec(rules.into_iter().collect()) {
+        Ok(rules) => Derivation::Inferred { rules },
+        Err(_) => Derivation::Asserted,
+    };
+    Provenance {
+        sources: sources.into_iter().collect(),
+        facts: facts.into_iter().collect(),
+        derivation,
+    }
 }
 
 /// Flatten a restrictive field. `Absent` when the extent support is the semiring
@@ -304,7 +360,7 @@ where
             sources: Vec::new(),
             facts: Vec::new(),
             consensus: Consensus::Absent,
-            derivation: None,
+            derivation: Derivation::Asserted,
         };
     }
 
@@ -321,11 +377,16 @@ where
         },
     };
 
+    let Provenance {
+        sources,
+        facts,
+        derivation,
+    } = provenance(&b.extent.support);
+
     // Producer-only invariants the bracket types leave loose: a present field
     // cites at least one fact, and a settled consensus sits below the extent.
-    let srcs = sources(&b.extent.support);
     debug_assert!(
-        !srcs.is_empty(),
+        !sources.is_empty(),
         "a present field's extent support must cite a fact"
     );
     if let Consensus::Reached { value } = &consensus {
@@ -337,10 +398,10 @@ where
 
     Bounded {
         possible,
-        sources: srcs,
-        facts: fact_ids(&b.extent.support),
+        sources,
+        facts,
         consensus,
-        derivation: None,
+        derivation,
     }
 }
 
@@ -509,6 +570,7 @@ mod test_support {
     use url::Url;
 
     use crate::algebra::semiring::{Label, Semiring};
+    use crate::conflicts::FactLineage;
     use crate::date::{DatePrecision, UncertainDate};
     use crate::grammar::assertions::FactualAssertion;
     use crate::grammar::bookend;
@@ -538,7 +600,7 @@ mod test_support {
     }
 
     /// The entity typed flatten's fact-atom support, over the [`TestIds`] scheme.
-    pub(super) type FactLin = Label<FactAtom<TestIds>>;
+    pub(super) type FactLin = FactLineage<TestIds>;
 
     /// A factual citation distinguished by source url, so distinct sources keep
     /// distinct citations.
@@ -563,7 +625,7 @@ mod test_support {
 
     /// A member-lineage premise for one id citing one source.
     pub(super) fn lin(id: EntId, url: &str) -> Result<Lin, Box<dyn std::error::Error>> {
-        Ok(Label::premise((id, factual(url)?)))
+        Ok(Label::premise(Premise::Fact((id, factual(url)?))))
     }
 
     /// A fact-atom lineage citing one source, keyed by a fact id derived from
@@ -590,10 +652,10 @@ mod test_support {
             },
             citation: factual_citation(url)?,
         });
-        Ok(Label::premise(FactAtom {
+        Ok(Label::premise(Premise::Fact(FactAtom {
             id: FactId::new(hasher.finish()),
             fact,
-        }))
+        })))
     }
 
     /// A single claim's bracket: both bounds the value, backed by `support`.
@@ -684,7 +746,7 @@ mod tests {
                 sources: Vec::new(),
                 facts: Vec::new(),
                 consensus,
-                derivation: None,
+                derivation: Derivation::Asserted,
             }
         }
 
@@ -858,6 +920,63 @@ mod tests {
             out.possible,
             UncertainDate::bottom(),
             "an absent field's extent is the honest ⊥"
+        );
+        Ok(())
+    }
+
+    // ---- derivation read ----
+
+    /// The shape a narrowing rule leaves on a multi-claim slot: two claims, one
+    /// the rule tightened and one it left alone, so only one environment carries
+    /// the rule. The slot still reads inferred — the stamped claim is the one
+    /// setting the extent's edge — where a per-environment ∀ read would call it
+    /// asserted on the strength of the untouched sibling.
+    ///
+    /// The two halves differ only by the stamp, so the marker can't be coming
+    /// from the multi-claim shape itself.
+    ///
+    /// The read side is all this observes. [`Support::atoms`] flattens across
+    /// environments, so the assertions below see a rule present in the slot's
+    /// support, never which environment holds it; a producer that stamped every
+    /// environment instead of the narrowed claim alone would read identically
+    /// here. Separating those needs per-environment access `Support` does not
+    /// expose, and waits for the narrowing rules that emit the shape.
+    #[test]
+    fn a_rule_on_one_of_two_claims_marks_the_whole_slot_inferred() -> TestResult {
+        use crate::algebra::monoid::CommutativeMonoid;
+        use crate::projection::derived;
+
+        let evidence = fact_lin_dated(1, "https://a", 1940)?;
+        let sibling = claim(year(1945)?, fact_lin_dated(2, "https://b", 1945)?);
+
+        let plain = bracket(&claim(year(1947)?, evidence.clone()).combine(sibling.clone()));
+        assert_eq!(
+            plain.derivation,
+            Derivation::Asserted,
+            "two plain claims are both asserted"
+        );
+
+        let stamped = bracket(
+            &claim(
+                year(1947)?,
+                derived(DerivationRule::ExistenceWitness, evidence),
+            )
+            .combine(sibling),
+        );
+        assert_eq!(
+            stamped.derivation,
+            Derivation::Inferred {
+                rules: NonEmptyVec::singleton(DerivationRule::ExistenceWitness)
+            },
+            "a rule on one claim marks the slot, though the sibling names none"
+        );
+        assert_eq!(
+            stamped.facts, plain.facts,
+            "the rule atom adds no fact to the slot's provenance"
+        );
+        assert_eq!(
+            stamped.sources, plain.sources,
+            "the rule atom warrants no citation of its own"
         );
         Ok(())
     }

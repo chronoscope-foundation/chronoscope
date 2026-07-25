@@ -615,12 +615,13 @@ enum DateCell {
         value: UncertainDate,
         rivals: Vec<CiteEntry>,
     },
-    /// A bound no source asserted — the solver derived it from an existence
-    /// witness ("built by W"). The value reads inline in the muted sage tone; the
-    /// derivation and its witnesses ride alongside for the marker's popover.
+    /// A bound no source asserted — one or more solver rules reached past what
+    /// the sources stated. The value reads inline in the muted sage tone; the
+    /// rules that reached it and the facts they consumed ride alongside for the
+    /// marker's popover, which phrases the claim from the rules themselves.
     Inferred {
         value: UncertainDate,
-        derivation: Derivation,
+        rules: NonEmptyVec<DerivationRule>,
         witnesses: Vec<CiteEntry>,
     },
 }
@@ -741,7 +742,8 @@ use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::grammar::lifecycle::{DamageCause, MoveMethod, Usage};
 use chronoscope_core::location::{LocationReference, UnresolvedLocation};
 use chronoscope_core::moment::TransitionRole;
-use chronoscope_core::projection::Citation;
+use chronoscope_core::nonempty::NonEmptyVec;
+use chronoscope_core::projection::{Citation, DerivationRule};
 use chronoscope_core::solvers::TemporalConflictKind;
 use chronoscope_core::typed::{
     Attributed, Bounded, Consensus, Derivation, EventDetail, InteriorEvent, MomentView,
@@ -869,10 +871,10 @@ fn date_display(bounded: Option<&Bounded<UncertainDate, ImageId>>) -> DateCell {
     let Some(b) = bounded else {
         return DateCell::Unknown;
     };
-    // A derived bound rides in an empty slot the solver filled from a witness, so
-    // it outranks the consensus read: the value is inferred, and the inferred
-    // marker owns its witnesses — the row shows no separate citation bullet.
-    if let Some(derivation) = &b.derivation {
+    // An inferred bound outranks the consensus read: its value reaches past what
+    // any source stated, and the inferred marker owns the witnesses behind it, so
+    // the row shows no separate citation bullet.
+    if let Derivation::Inferred { rules } = &b.derivation {
         // The witness lines cite the attested year `W` the source states; the
         // bound itself rides on the cell's value, formatted at render.
         let witnessed = b
@@ -882,7 +884,7 @@ fn date_display(bounded: Option<&Bounded<UncertainDate, ImageId>>) -> DateCell {
             .unwrap_or_else(|| format_uncertain_date(&b.possible));
         return DateCell::Inferred {
             value: b.possible.clone(),
-            derivation: derivation.clone(),
+            rules: rules.clone(),
             witnesses: cite_entries(&witnessed, &b.sources),
         };
     }
@@ -1242,10 +1244,10 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
     let inferred_marker = match &row.date {
         DateCell::Inferred {
             value,
-            derivation,
+            rules,
             witnesses,
         } => Some(view! {
-            <InferredMarker value=value.clone() derivation=derivation.clone() witnesses=witnesses.clone()/>
+            <InferredMarker value=value.clone() rules=rules.clone() witnesses=witnesses.clone()/>
         }),
         _ => None,
     };
@@ -1637,7 +1639,8 @@ const POPOVER_WIDTH_PX: f64 = 240.0;
 
 /// The hue a citation/marker popover carries: neutral for a plain source list,
 /// disputed (amber) for a contested field or a temporal conflict, inferred (sage)
-/// for a derived "built by" bound. Drives the border, accent, and header color.
+/// for a bound the solver rules derived. Drives the border, accent, and header
+/// color.
 #[derive(Clone, Copy)]
 enum PopoverTone {
     Neutral,
@@ -1941,18 +1944,17 @@ fn conflict_glyph_class(open: bool) -> String {
 
 // ==================== Inferred marker ====================
 
-/// An inferred marker: a solid sage disc beside the citation bullet on a
-/// construction row whose date the solver derived from an existence witness
-/// rather than any source asserting it. Tapping it opens a sage-toned [`Popover`]
-/// naming the derivation ("built by W"), the witness reason, and the underlying
-/// witness citations.
+/// An inferred marker: a solid sage disc beside the citation bullet on a row whose
+/// date one or more solver rules reached past what the sources stated. Tapping it
+/// opens a sage-toned [`Popover`] naming the claim those rules make, the reason
+/// they give for it, and the citations of the facts they consumed.
 #[component]
 fn InferredMarker(
     value: UncertainDate,
-    derivation: Derivation,
+    rules: NonEmptyVec<DerivationRule>,
     witnesses: Vec<CiteEntry>,
 ) -> impl IntoView {
-    let (claim, reason) = inferred_text(&derivation, &value);
+    let (claim, reason) = inferred_text(&rules, &value);
     let aria_label = format!("inferred date, {claim}");
     let heading = format!("Inferred \u{00b7} {claim}");
 
@@ -1991,11 +1993,14 @@ fn InferredMarker(
 }
 
 /// The claim a derived bound asserts and the evidence behind it, both phrased
-/// from the structured [`Derivation`] and the bound's own value — a future locale
-/// layer swaps only these templates, and a new rule brings its own words.
-fn inferred_text(derivation: &Derivation, value: &UncertainDate) -> (String, String) {
-    match derivation {
-        Derivation::ExistenceWitness => {
+/// from the structured [`DerivationRule`]s and the bound's own value — a future
+/// locale layer swaps only these templates, and a new rule brings its own words.
+///
+/// The lead rule names the claim; a chain of them wants a line each, which the
+/// panel can grow into once more than one rule exists.
+fn inferred_text(rules: &NonEmptyVec<DerivationRule>, value: &UncertainDate) -> (String, String) {
+    match rules.first() {
+        DerivationRule::ExistenceWitness => {
             let w = value
                 .latest_bound()
                 .map(format_date_bound)

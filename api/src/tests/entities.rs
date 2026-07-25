@@ -30,6 +30,8 @@ use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::grammar::lifecycle::{LifetimeEventKind, PointKind};
 use chronoscope_core::lifespan::ExistenceState;
 use chronoscope_core::location::{Location, UnresolvedLocation};
+use chronoscope_core::nonempty::NonEmptyVec;
+use chronoscope_core::projection::DerivationRule;
 use chronoscope_core::solvers::TemporalConflictKind;
 use chronoscope_core::submit::{
     Commit, CommitAuthor, Decl, EntityIdx, EventIdx, ImageIdx, SubmitFact, commit_facts,
@@ -771,7 +773,9 @@ async fn get_entity_infers_a_built_by_bound_from_an_existence_witness() -> TestR
 
     assert_eq!(
         construction.started.derivation,
-        Some(Derivation::ExistenceWitness),
+        Derivation::Inferred {
+            rules: NonEmptyVec::singleton(DerivationRule::ExistenceWitness)
+        },
         "the inferred start is marked derived, got {:?}",
         construction.started.derivation
     );

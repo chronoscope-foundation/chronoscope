@@ -434,7 +434,7 @@ mod tests {
     use super::*;
     use crate::algebra::lattice::JoinSemilattice;
     use crate::date::{DatePrecision, UncertainDate};
-    use crate::typed::{Consensus, Period};
+    use crate::typed::{Consensus, Derivation, Period};
     use chrono::NaiveDate;
 
     type Entry = TimelineEvent<(), ()>;
@@ -451,7 +451,7 @@ mod tests {
             sources: Vec::new(),
             facts: Vec::new(),
             consensus: Consensus::Reached { value },
-            derivation: None,
+            derivation: Derivation::Asserted,
         })
     }
 
@@ -462,7 +462,7 @@ mod tests {
             sources: Vec::new(),
             facts: Vec::new(),
             consensus: Consensus::Absent,
-            derivation: None,
+            derivation: Derivation::Asserted,
         }
     }
 

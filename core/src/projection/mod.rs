@@ -22,7 +22,7 @@ mod types;
 pub use bracket::{Bracket, ConsensusConflict, MAX_PROJECTED_LOCATION_CIRCLES};
 pub use claimed::Claimed;
 pub(crate) use merge::citation_of;
-pub use provenance::{Citation, Cited, MemberLineage};
+pub use provenance::{Citation, Cited, DerivationRule, MemberLineage, Premise, derived};
 pub use slot::{FactMap, FactSet, Slot};
 pub use types::{
     Bookend, DepictionRecord, Entity, Event, GlueEdge, Image, NameKey, NameRecord, RegionRecord,
@@ -61,7 +61,7 @@ where
     Id: Ord + Clone,
 {
     match merge::citation_of(fact) {
-        Some(citation) => Label::premise((id.clone(), citation)),
+        Some(citation) => Label::premise(Premise::Fact((id.clone(), citation))),
         None => Label::empty(),
     }
 }

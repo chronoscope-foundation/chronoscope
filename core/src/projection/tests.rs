@@ -50,6 +50,15 @@ type Lin = MemberLineage<MemEntId, MemImgId>;
 /// ids, so the source-id atom is an image id.
 type ImgLin = MemberLineage<MemImgId, MemImgId>;
 
+/// The `(member id, citation)` pairs a lineage's evidence atoms carry, skipping
+/// the rule atoms an inference stamps — these assertions are all about who cited
+/// what.
+fn cited_atoms<EntId: Ord, ImgId: Ord + Clone>(
+    support: &MemberLineage<EntId, ImgId>,
+) -> impl Iterator<Item = &(EntId, Citation<ImgId>)> {
+    support.atoms().filter_map(Premise::fact)
+}
+
 fn fixed_time() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc
         .with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
@@ -634,17 +643,9 @@ async fn populated_fields_carry_factual_support() -> TestResult {
     // SameEntity judgment drives grouping, not a field, so every value's
     // support is factual.
     for entry in entity.names.values() {
-        assert!(entry.support.atoms().all(is_factual));
+        assert!(cited_atoms(&entry.support).all(is_factual));
     }
-    assert!(
-        entity
-            .construction
-            .started_at
-            .consensus
-            .support
-            .atoms()
-            .all(is_factual)
-    );
+    assert!(cited_atoms(&entity.construction.started_at.consensus.support).all(is_factual));
     Ok(())
 }
 
@@ -1357,8 +1358,9 @@ async fn shared_field_surfaces_the_connecting_glue() -> TestResult {
     // The construction-start field was asserted by both members, so its
     // support carries both ids and the connecting judgment is load-bearing.
     let started = &entity.construction.started_at;
-    let support_ids: BTreeSet<&MemEntId> =
-        started.extent.support.atoms().map(|(id, _)| id).collect();
+    let support_ids: BTreeSet<&MemEntId> = cited_atoms(&started.extent.support)
+        .map(|(id, _)| id)
+        .collect();
     assert_eq!(
         support_ids,
         BTreeSet::from([&x, &y]),
@@ -1392,7 +1394,7 @@ async fn single_member_field_has_no_glue() -> TestResult {
     // The name was asserted by one member only; no SameEntity edge fits
     // inside a single-id support set, so nothing is load-bearing for it.
     let (_, name) = name_by_language(&entity, "en").ok_or("no name")?;
-    let name_ids: BTreeSet<&MemEntId> = name.support.atoms().map(|(id, _)| id).collect();
+    let name_ids: BTreeSet<&MemEntId> = cited_atoms(&name.support).map(|(id, _)| id).collect();
     assert_eq!(
         name_ids,
         BTreeSet::from([&x]),
@@ -1419,7 +1421,7 @@ async fn identity_root_accumulates_the_merge_judgment() -> TestResult {
     // SameEntity edge is tagged symmetrically, so the root carries both
     // endpoints' ids.
     let root = sameness_summary(&entity.sameness);
-    let root_ids: BTreeSet<&MemEntId> = root.atoms().map(|(id, _)| id).collect();
+    let root_ids: BTreeSet<&MemEntId> = cited_atoms(&root).map(|(id, _)| id).collect();
     assert_eq!(
         root_ids,
         BTreeSet::from([&x, &y]),
@@ -1442,16 +1444,13 @@ async fn judgment_citation_is_live_in_provenance() -> TestResult {
     // no longer drops judgments: it lands on the `sameness` edge.
     let root = sameness_summary(&entity.sameness);
     assert!(
-        root.atoms()
-            .any(|(_, c)| matches!(c, Citation::Judgment { .. })),
+        cited_atoms(&root).any(|(_, c)| matches!(c, Citation::Judgment { .. })),
         "the merge judgment's citation surfaces on the derived root"
     );
     let pair = OrderedDistinctPair::new(x, y)?;
     let edge = entity.sameness.get(&pair).ok_or("no sameness edge")?;
     assert!(
-        edge.support
-            .atoms()
-            .any(|(_, c)| matches!(c, Citation::Judgment { .. })),
+        cited_atoms(&edge.support).any(|(_, c)| matches!(c, Citation::Judgment { .. })),
         "the same judgment citation backs the recorded glue edge"
     );
     Ok(())

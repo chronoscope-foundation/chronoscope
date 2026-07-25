@@ -20,7 +20,7 @@ use crate::location::UnresolvedLocation;
 use crate::projection::Claimed;
 
 use super::bracket::Bracket;
-use super::provenance::MemberLineage;
+use super::provenance::{MemberLineage, Premise};
 use super::slot::{FactMap, FactSet, derive_slot};
 
 /// The dedup key for a name claim: a name collapses only on an exact triple. Its
@@ -170,7 +170,11 @@ where
     EntId: Ord + Clone + 'e,
     ImgId: Ord + Clone + 'e,
 {
-    let ids: BTreeSet<&EntId> = support.atoms().map(|(id, _)| id).collect();
+    let ids: BTreeSet<&EntId> = support
+        .atoms()
+        .filter_map(Premise::fact)
+        .map(|(id, _)| id)
+        .collect();
     sameness
         .iter()
         .filter(|(pair, _)| ids.contains(pair.a()) && ids.contains(pair.b()))

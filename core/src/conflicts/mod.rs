@@ -8,5 +8,5 @@
 mod detect;
 pub mod minimize;
 
-pub use detect::{FactAtom, fact_lineage};
+pub use detect::{FactAtom, FactLineage, fact_lineage};
 pub(crate) use detect::{date_for_role, fact_date, is_construction_start, minimal_fighting_sets};

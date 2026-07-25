@@ -13,6 +13,7 @@ use crate::grammar::assertions::FactualAssertion;
 use crate::grammar::bookend;
 use crate::grammar::ids::{FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
+use crate::projection::Premise;
 use crate::submit::{DateRole, StoredFact};
 
 use super::minimize::minimize;
@@ -57,6 +58,11 @@ impl<R: IdScheme> std::hash::Hash for FactAtom<R> {
     }
 }
 
+/// A projection's support when every atom carries the whole stored fact — what
+/// the solvers read to recover a slot's fighting evidence, and what an inference
+/// stamps its [`DerivationRule`](crate::projection::DerivationRule) into.
+pub type FactLineage<R> = Label<Premise<FactAtom<R>>>;
+
 /// The provenance closure for a fact-carrying projection: the fact's atom is the
 /// premise `{{(id, fact)}}`. A caller passes this to
 /// [`project_entity`](crate::projection::project_entity) to get a projection whose
@@ -66,11 +72,11 @@ pub fn fact_lineage<R: IdScheme>(
     fact_id: &FactId,
     _subject: &R::Entity,
     fact: &StoredFact<R>,
-) -> Label<FactAtom<R>> {
-    Label::premise(FactAtom {
+) -> FactLineage<R> {
+    Label::premise(Premise::Fact(FactAtom {
         id: *fact_id,
         fact: fact.clone(),
-    })
+    }))
 }
 
 /// The date a fact carries in an `accept`ed [`DateRole`], or `None` when the fact
@@ -107,9 +113,7 @@ pub(crate) fn fact_date<R: IdScheme>(fact: &StoredFact<R>) -> Option<UncertainDa
 }
 
 /// Whether a stored fact is a [`ConstructionFact::Started`](bookend::ConstructionFact::Started)
-/// claim — the fact a temporal conflict names as the floor a witness fell below,
-/// and the direct assertion that tells an asserted construction start apart from
-/// a derived "built by" bound.
+/// claim — the fact a temporal conflict names as the floor a witness fell below.
 pub(crate) fn is_construction_start<R: IdScheme>(fact: &StoredFact<R>) -> bool {
     matches!(
         fact,

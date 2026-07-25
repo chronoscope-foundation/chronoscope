@@ -248,7 +248,7 @@ mod tests {
     use super::*;
     use crate::algebra::lattice::JoinSemilattice;
     use crate::date::DatePrecision;
-    use crate::typed::{Consensus, InteriorEvent, Period};
+    use crate::typed::{Consensus, Derivation, InteriorEvent, Period};
     use chrono::{Datelike, NaiveDate};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -262,7 +262,7 @@ mod tests {
             sources: Vec::new(),
             facts: Vec::new(),
             consensus: Consensus::Reached { value },
-            derivation: None,
+            derivation: Derivation::Asserted,
         })
     }
 
@@ -274,7 +274,7 @@ mod tests {
             sources: Vec::new(),
             facts: Vec::new(),
             consensus: Consensus::Absent,
-            derivation: None,
+            derivation: Derivation::Asserted,
         }
     }
 

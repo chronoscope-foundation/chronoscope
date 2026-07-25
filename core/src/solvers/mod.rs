@@ -23,13 +23,13 @@ use serde::{Deserialize, Serialize};
 use crate::algebra::lattice::JoinSemilattice;
 use crate::algebra::monoid::CommutativeMonoid;
 use crate::algebra::semiring::{Label, Semiring, Support};
-use crate::conflicts::{FactAtom, fact_date, is_construction_start};
+use crate::conflicts::{FactAtom, FactLineage, fact_date, is_construction_start};
 use crate::date::{DateBound, UncertainDate};
 use crate::grammar::assertions::FactualAssertion;
 use crate::grammar::bookend::DemolitionFact;
 use crate::grammar::ids::{FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
-use crate::projection::{self, Bracket, Event};
+use crate::projection::{self, Bracket, DerivationRule, Event, Premise, derived};
 use crate::submit::StoredFact;
 
 /// An entity-level temporal contradiction: facts that can't jointly hold.
@@ -72,8 +72,19 @@ type CitedEntity<R> = projection::Entity<
     <R as IdScheme>::Entity,
     <R as IdScheme>::Event,
     <R as IdScheme>::Image,
-    Label<FactAtom<R>>,
+    FactLineage<R>,
 >;
+
+/// A support's fact atoms, skipping the rule atoms an inference stamped.
+///
+/// Everything here reasons about what could be *false* — which fact a witness
+/// contradicts, which bookend pins a bound — and a rule is an always-true
+/// indeterminate that can never be the retraction repairing a contradiction. So
+/// the truth-facing passes see facts only; reading the rules is the provenance
+/// flatten's job.
+fn fact_atoms<R: IdScheme>(support: &FactLineage<R>) -> impl Iterator<Item = &FactAtom<R>> {
+    support.atoms().filter_map(Premise::fact)
+}
 
 /// The entity-level temporal contradictions in one entity's projection.
 ///
@@ -102,9 +113,7 @@ pub fn temporal_conflicts<R: IdScheme>(entity: &CitedEntity<R>) -> Vec<TemporalC
     // Existence witnesses: each dated attestation the entity was already there,
     // its facts all sharing the one attested date.
     for (date, entry) in &entity.existence {
-        let dates: Vec<(FactId, UncertainDate)> = entry
-            .support
-            .atoms()
+        let dates: Vec<(FactId, UncertainDate)> = fact_atoms(&entry.support)
             .map(|atom| (atom.id, date.clone()))
             .collect();
         bundle_conflicts(
@@ -225,8 +234,10 @@ fn witness_ceiling(completions: &[(FactId, UncertainDate)]) -> Option<LifetimeBo
 /// Inject a derived "built by" bound into an empty construction start. Reads the
 /// same witnesses [`temporal_conflicts`] does — existence facts and interior-event
 /// dates — derives `construction ≤ earliest-witness` preserving that witness's
-/// precision, and folds it into the empty slot with support a premise on the
-/// binding witness fact(s).
+/// precision, and folds it into the empty slot with support the binding witness
+/// fact(s) joined with the [`ExistenceWitness`](DerivationRule::ExistenceWitness)
+/// rule that used them, so the flatten reads the bound as inferred off its own
+/// provenance.
 ///
 /// Only an empty construction start is touched. An asserted start a witness
 /// predates is the detector's alarm, not the producer's; one a witness agrees
@@ -238,14 +249,14 @@ pub fn inject_derived_bounds<R: IdScheme>(entity: &mut CitedEntity<R>) {
         return;
     }
 
-    let injection: Option<(UncertainDate, Label<FactAtom<R>>)> = {
+    let injection: Option<(UncertainDate, FactLineage<R>)> = {
         // Every witness with a definite upper bound, paired with the precision-
         // keeping bound and the fact it rests on. An open-above witness ("after
         // 1800") floors the start at +∞ — no information — so it contributes none.
         let mut witnesses: Vec<(NaiveDate, DateBound, &FactAtom<R>)> = Vec::new();
         for (date, entry) in &entity.existence {
             if let (Some(latest), Some(bound)) = (date.latest(), date.latest_bound().copied()) {
-                for atom in entry.support.atoms() {
+                for atom in fact_atoms(&entry.support) {
                     witnesses.push((latest, bound, atom));
                 }
             }
@@ -264,7 +275,7 @@ pub fn inject_derived_bounds<R: IdScheme>(entity: &mut CitedEntity<R>) {
             None => None,
             Some(earliest) => {
                 let mut derived_bound: Option<DateBound> = None;
-                let mut support = Label::empty();
+                let mut evidence = Label::empty();
                 for (latest, bound, atom) in &witnesses {
                     if *latest == earliest {
                         // Ties share the instant — keep the finest precision.
@@ -272,22 +283,22 @@ pub fn inject_derived_bounds<R: IdScheme>(entity: &mut CitedEntity<R>) {
                             Some(current) if current.precision() <= bound.precision() => current,
                             _ => *bound,
                         });
-                        support = support.plus(Label::premise((*atom).clone()));
+                        evidence = evidence.plus(Label::premise(Premise::Fact((*atom).clone())));
                     }
                 }
                 derived_bound
                     .and_then(|bound| UncertainDate::bounded(None, Some(bound)).ok())
-                    .map(|derived| (derived, support))
+                    .map(|bound| (bound, derived(DerivationRule::ExistenceWitness, evidence)))
             }
         }
     };
 
-    if let Some((derived, support)) = injection {
+    if let Some((bound, support)) = injection {
         entity.construction.started_at = entity
             .construction
             .started_at
             .clone()
-            .combine(Bracket::from((derived, support)));
+            .combine(Bracket::from((bound, support)));
     }
 }
 
@@ -295,11 +306,11 @@ pub fn inject_derived_bounds<R: IdScheme>(entity: &mut CitedEntity<R>) {
 /// event implies existence at every endpoint, so the three passes reading these
 /// endpoints share one iteration and can't drift on which endpoints count.
 fn event_endpoint_dates<R: IdScheme>(
-    event: &Event<Label<FactAtom<R>>>,
+    event: &Event<FactLineage<R>>,
 ) -> impl Iterator<Item = (&FactAtom<R>, UncertainDate)> {
     [&event.occurred_at, &event.started_at, &event.completed_at]
         .into_iter()
-        .flat_map(|slot| slot.extent.support.atoms())
+        .flat_map(|slot| fact_atoms(&slot.extent.support))
         .filter_map(|atom| fact_date(&atom.fact).map(|date| (atom, date)))
 }
 
@@ -336,10 +347,7 @@ struct LifetimeBound {
 fn construction_floor<R: IdScheme>(entity: &CitedEntity<R>) -> Option<LifetimeBound> {
     let started = &entity.construction.started_at;
     let instant = started.extent.value.earliest()?;
-    let facts: Vec<FactId> = started
-        .extent
-        .support
-        .atoms()
+    let facts: Vec<FactId> = fact_atoms(&started.extent.support)
         .filter(|atom| is_construction_start(&atom.fact))
         .map(|atom| atom.id)
         .collect();
@@ -360,10 +368,7 @@ fn construction_floor<R: IdScheme>(entity: &CitedEntity<R>) -> Option<LifetimeBo
 fn demolition_ceiling<R: IdScheme>(entity: &CitedEntity<R>) -> Option<LifetimeBound> {
     let completed = &entity.demolition.completed_at;
     let instant = completed.extent.value.latest()?;
-    let facts: Vec<FactId> = completed
-        .extent
-        .support
-        .atoms()
+    let facts: Vec<FactId> = fact_atoms(&completed.extent.support)
         .filter(|atom| is_demolition_completed(&atom.fact))
         .map(|atom| atom.id)
         .collect();
@@ -519,6 +524,7 @@ mod tests {
         Commit, CommitAuthor, Decl, EntityIdx, EventIdx, SubmitFact, commit_facts,
     };
     use crate::typed;
+    use crate::typed::SupportAtom;
 
     // The `pub(super)` fixtures are shared with the `replay` folds' tests, which
     // build the same commits to exercise their oracle path.
@@ -649,12 +655,7 @@ mod tests {
     /// The construction-start fact id and the existence witness id off a
     /// projection, for asserting a conflict names both.
     fn started_id(entity: &CitedEntity<MemoryIds>) -> Option<FactId> {
-        entity
-            .construction
-            .started_at
-            .extent
-            .support
-            .atoms()
+        fact_atoms(&entity.construction.started_at.extent.support)
             .find(|atom| is_construction_start(&atom.fact))
             .map(|atom| atom.id)
     }
@@ -664,19 +665,36 @@ mod tests {
             .existence
             .values()
             .next()
-            .and_then(|entry| entry.support.atoms().next())
+            .and_then(|entry| fact_atoms(&entry.support).next())
+            .map(|atom| atom.id)
+    }
+
+    /// The inference rules a slot's support records — the provenance the typed
+    /// flatten's inferred marker is read off.
+    ///
+    /// Flattened across environments, since that is all
+    /// [`Support::atoms`](crate::algebra::semiring::Support::atoms) exposes: which
+    /// environment a rule sits in is invisible here, so an assertion over this set
+    /// says a rule is present, never that it rides one witness's environment.
+    /// Pinning that shape needs per-environment access `Support` does not offer,
+    /// and waits for the narrowing rules that make the distinction observable.
+    fn rules_in(support: &FactLineage<MemoryIds>) -> BTreeSet<DerivationRule> {
+        support.atoms().filter_map(SupportAtom::rule).collect()
+    }
+
+    /// The fact id behind the projection's lone interior event's own date — the
+    /// witness an event contributes.
+    fn event_date_id(entity: &CitedEntity<MemoryIds>) -> Option<FactId> {
+        let event = entity.events.values().next()?;
+        fact_atoms(&event.value.occurred_at.extent.support)
+            .next()
             .map(|atom| atom.id)
     }
 
     /// The demolition-completion fact id off a projection, for asserting a
     /// conflict names it alongside the witness.
     fn demolished_id(entity: &CitedEntity<MemoryIds>) -> Option<FactId> {
-        entity
-            .demolition
-            .completed_at
-            .extent
-            .support
-            .atoms()
+        fact_atoms(&entity.demolition.completed_at.extent.support)
             .find(|atom| is_demolition_completed(&atom.fact))
             .map(|atom| atom.id)
     }
@@ -831,16 +849,7 @@ mod tests {
         let entity = project(&store, commit).await?;
 
         let started = started_id(&entity).ok_or("construction start fact")?;
-        let event = entity.events.values().next().ok_or("one event")?;
-        let event_date_id = event
-            .value
-            .occurred_at
-            .extent
-            .support
-            .atoms()
-            .next()
-            .ok_or("event date fact")?
-            .id;
+        let event_date = event_date_id(&entity).ok_or("event date fact")?;
 
         let conflicts = temporal_conflicts::<MemoryIds>(&entity);
         assert_eq!(conflicts.len(), 1, "the event-before-start pair conflicts");
@@ -853,7 +862,7 @@ mod tests {
             .collect();
         assert_eq!(
             named,
-            BTreeSet::from([event_date_id, started]),
+            BTreeSet::from([event_date, started]),
             "the conflict names the event's date fact and the construction-start fact"
         );
         Ok(())
@@ -1004,12 +1013,7 @@ mod tests {
         };
         let entity = project(&store, commit).await?;
 
-        let starts: BTreeSet<FactId> = entity
-            .construction
-            .started_at
-            .extent
-            .support
-            .atoms()
+        let starts: BTreeSet<FactId> = fact_atoms(&entity.construction.started_at.extent.support)
             .filter(|atom| is_construction_start(&atom.fact))
             .map(|atom| atom.id)
             .collect();
@@ -1120,11 +1124,18 @@ mod tests {
             before(81)?,
             "the empty slot gains construction ≤ 81"
         );
-        let atoms: BTreeSet<FactId> = started.extent.support.atoms().map(|atom| atom.id).collect();
+        let atoms: BTreeSet<FactId> = fact_atoms(&started.extent.support)
+            .map(|atom| atom.id)
+            .collect();
         assert_eq!(
             atoms,
             BTreeSet::from([witness]),
             "the derived bound rests on the witness fact alone"
+        );
+        assert_eq!(
+            rules_in(&started.extent.support),
+            BTreeSet::from([DerivationRule::ExistenceWitness]),
+            "the existence-witness rule is the one rule the filled slot records"
         );
 
         // The flatten surfaces the bound inline on the construction row, marked
@@ -1141,7 +1152,9 @@ mod tests {
             .ok_or("a constructed row")?;
         assert_eq!(
             period.started.derivation,
-            Some(typed::Derivation::ExistenceWitness),
+            typed::Derivation::Inferred {
+                rules: NonEmptyVec::singleton(DerivationRule::ExistenceWitness)
+            },
             "the inferred start is marked derived by the existence-witness rule"
         );
         assert_eq!(
@@ -1177,19 +1190,7 @@ mod tests {
         };
         let mut entity = project(&store, commit).await?;
 
-        let event_date = entity
-            .events
-            .values()
-            .next()
-            .ok_or("one event")?
-            .value
-            .occurred_at
-            .extent
-            .support
-            .atoms()
-            .next()
-            .ok_or("event date fact")?
-            .id;
+        let event_date = event_date_id(&entity).ok_or("event date fact")?;
 
         inject_derived_bounds::<MemoryIds>(&mut entity);
 
@@ -1199,7 +1200,9 @@ mod tests {
             before(81)?,
             "the event date floors the built-by bound"
         );
-        let atoms: BTreeSet<FactId> = started.extent.support.atoms().map(|atom| atom.id).collect();
+        let atoms: BTreeSet<FactId> = fact_atoms(&started.extent.support)
+            .map(|atom| atom.id)
+            .collect();
         assert_eq!(
             atoms,
             BTreeSet::from([event_date]),
@@ -1210,7 +1213,15 @@ mod tests {
 
     /// An asserted construction start is the producer's boundary: a witness
     /// consistent with it makes the derived bound redundant, so the asserted slot
-    /// stays byte-for-byte untouched and its flattened row carries no derivation.
+    /// stays byte-for-byte untouched and its flattened row reads asserted.
+    ///
+    /// What this pins is the gate, not the stamp-only-on-change discipline the
+    /// existential marker read rests on: `inject_derived_bounds` returns before it
+    /// ever looks at a witness here, so no rule fires. The discipline's own case —
+    /// a rule that fires and changes nothing — is unreachable through this
+    /// producer, whose only firing path fills an empty slot and so always changes
+    /// it. A rule that narrows an already-asserted bound is what makes it
+    /// observable.
     #[tokio::test]
     async fn asserted_construction_start_blocks_inference() -> TestResult {
         let store = MemoryFactStore::new();
@@ -1253,8 +1264,9 @@ mod tests {
             })
             .ok_or("a constructed row")?;
         assert_eq!(
-            period.started.derivation, None,
-            "an asserted start is not marked derived"
+            period.started.derivation,
+            typed::Derivation::Asserted,
+            "the producer never fired on the asserted slot, so the start reads asserted"
         );
         Ok(())
     }
@@ -1279,34 +1291,21 @@ mod tests {
         let mut entity = project(&store, commit).await?;
 
         let witness = witness_id(&entity).ok_or("existence witness fact")?;
-        let event_date = entity
-            .events
-            .values()
-            .next()
-            .ok_or("one event")?
-            .value
-            .occurred_at
-            .extent
-            .support
-            .atoms()
-            .next()
-            .ok_or("event date fact")?
-            .id;
+        let event_date = event_date_id(&entity).ok_or("event date fact")?;
 
         inject_derived_bounds::<MemoryIds>(&mut entity);
 
-        let atoms: BTreeSet<FactId> = entity
-            .construction
-            .started_at
-            .extent
-            .support
-            .atoms()
-            .map(|atom| atom.id)
-            .collect();
+        let support = &entity.construction.started_at.extent.support;
+        let atoms: BTreeSet<FactId> = fact_atoms(support).map(|atom| atom.id).collect();
         assert_eq!(
             atoms,
             BTreeSet::from([witness, event_date]),
             "both witnesses tied at 81 bind the inferred bound"
+        );
+        assert_eq!(
+            rules_in(support),
+            BTreeSet::from([DerivationRule::ExistenceWitness]),
+            "two binding witnesses still record the single rule that used them"
         );
         Ok(())
     }
