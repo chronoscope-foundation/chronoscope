@@ -110,7 +110,7 @@ async fn cmd_build_db(
     let store = chronoscope_db::SqliteFactStore::open(FactStoreLocations::standalone(database_url))
         .await
         .with_context(|| format!("opening fact store at {database_url}"))?;
-    let run = IngesterRunId::new("wikidata-dump");
+    let run = IngesterRunId::new("wikidata-dump")?;
 
     // Tear the pool down inside the runtime whatever the outcome, so
     // SpatiaLite's dlclose stays off the process-exit path even on error.
@@ -288,7 +288,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::TimeZone;
-    use chronoscope_core::grammar::ids::IngesterRunId;
+    use chronoscope_core::grammar::ids::{IngesterRunId, ValidatedStringError};
     use chronoscope_core::store::memory::MemoryFactStore;
     use chronoscope_integrations::wikidata::{
         RevisionId, SiteId, Sitelink, WikidataEntity, WikidataEntityType, WikidataId,
@@ -296,7 +296,7 @@ mod tests {
 
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-    fn run_id() -> IngesterRunId {
+    fn run_id() -> Result<IngesterRunId, ValidatedStringError> {
         IngesterRunId::new("wikidata-test")
     }
 
@@ -369,7 +369,7 @@ mod tests {
         let (_dir, path) = dump(&[&before, "{\"id\": truncated", &after])?;
 
         let store = MemoryFactStore::new();
-        let tally = ingest_jsonl(&store, &path, &run_id(), recorded_at()?, None).await?;
+        let tally = ingest_jsonl(&store, &path, &run_id()?, recorded_at()?, None).await?;
 
         assert_eq!(tally.malformed_lines, 1, "only the bad line is lost");
         assert_eq!(
@@ -404,7 +404,7 @@ mod tests {
         let (_dir, path) = dump_bytes(&bytes)?;
 
         let store = MemoryFactStore::new();
-        let tally = ingest_jsonl(&store, &path, &run_id(), recorded_at()?, None).await?;
+        let tally = ingest_jsonl(&store, &path, &run_id()?, recorded_at()?, None).await?;
 
         assert_eq!(tally.malformed_lines, 1, "only the bad line is lost");
         assert_eq!(
@@ -437,7 +437,7 @@ mod tests {
         let (_dir, path) = dump(&[&before, &bad, &after])?;
 
         let store = MemoryFactStore::new();
-        let tally = ingest_jsonl(&store, &path, &run_id(), recorded_at()?, None).await?;
+        let tally = ingest_jsonl(&store, &path, &run_id()?, recorded_at()?, None).await?;
 
         assert_eq!(tally.malformed_lines, 0, "every line parsed");
         let stats = tally.into_stats()?;
@@ -457,7 +457,7 @@ mod tests {
         let (_dir, path) = dump(&lines.iter().map(String::as_str).collect::<Vec<_>>())?;
 
         let store = MemoryFactStore::new();
-        let stats = ingest_jsonl(&store, &path, &run_id(), recorded_at()?, None)
+        let stats = ingest_jsonl(&store, &path, &run_id()?, recorded_at()?, None)
             .await?
             .into_stats()?;
 

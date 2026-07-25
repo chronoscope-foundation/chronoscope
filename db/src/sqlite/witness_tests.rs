@@ -187,16 +187,16 @@ async fn try_commit(
     events: Vec<Decl<SqlEventId>>,
     secs: i64,
     facts: Vec<SubmitFact>,
-) -> Option<SubmitResult<SqlIds>> {
+) -> Result<Option<SubmitResult<SqlIds>>, TestError> {
     let commit = Commit::<SqlIds> {
-        author: CommitAuthor::User(UserId::new("prop")),
+        author: CommitAuthor::User(UserId::new("prop")?),
         recorded_at: fixed_time() + Duration::seconds(secs),
         entities,
         events,
         images: Vec::new(),
         facts: facts.into_iter().collect(),
     };
-    commit_facts(store, commit).await.ok()
+    Ok(commit_facts(store, commit).await.ok())
 }
 
 /// Submit one commit that must land, returning its result. The fixtures build
@@ -209,7 +209,7 @@ async fn commit_one(
     facts: Vec<SubmitFact>,
 ) -> Result<SubmitResult<SqlIds>, TestError> {
     try_commit(store, entities, events, secs, facts)
-        .await
+        .await?
         .ok_or_else(|| "commit rejected".into())
 }
 
@@ -388,7 +388,7 @@ async fn run_ops(
                     secs,
                     vec![existence_fact(0, band(*year))?],
                 )
-                .await
+                .await?
             }
             Op::Construction { entity, year } => {
                 try_commit(
@@ -398,7 +398,7 @@ async fn run_ops(
                     secs,
                     vec![construction_fact(0, band(*year))?],
                 )
-                .await
+                .await?
             }
             Op::Demolition { entity, year } => {
                 try_commit(
@@ -408,7 +408,7 @@ async fn run_ops(
                     secs,
                     vec![demolition_fact(0, band(*year))?],
                 )
-                .await
+                .await?
             }
             Op::PointEvent { entity, year } => {
                 try_commit(
@@ -421,7 +421,7 @@ async fn run_ops(
                         point_date_fact(0, band(*year))?,
                     ],
                 )
-                .await
+                .await?
             }
             Op::DurationalEvent { entity, start, end } => {
                 try_commit(
@@ -435,7 +435,7 @@ async fn run_ops(
                         durational_date_fact(0, DurationalRole::Completed, band(*end))?,
                     ],
                 )
-                .await
+                .await?
             }
             Op::Merge { a, b } => {
                 if usize::from(*a) % 3 == usize::from(*b) % 3 {
@@ -448,7 +448,7 @@ async fn run_ops(
                         secs,
                         vec![same_entity_fact(0, 1)?],
                     )
-                    .await
+                    .await?
                 }
             }
             Op::Retract { fact } => {
@@ -463,7 +463,7 @@ async fn run_ops(
                         secs,
                         vec![retract_fact(target)?],
                     )
-                    .await
+                    .await?
                 }
             }
         };
@@ -552,7 +552,7 @@ async fn reowning_an_event_to_a_different_entity_is_rejected() -> Result<(), Tes
         2,
         vec![retract_fact(old_edge)?, has_event_point_fact(0, 0)?],
     )
-    .await;
+    .await?;
     assert!(
         reowned.is_none(),
         "re-homing an event to a different entity must be rejected by ownership immutability"

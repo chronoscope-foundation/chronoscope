@@ -1010,7 +1010,7 @@ pub async fn walk_entity_depictions_pages_across_the_next_class_cursor<S: FactSt
                     fact: same_artifact,
                 },
                 citation: JudgmentSource::PersonalKnowledge {
-                    user: UserId::new("alice"),
+                    user: UserId::new("alice")?,
                     justification: Justification::new("These two scans are the same artifact.")?,
                 },
             },
@@ -1262,7 +1262,7 @@ pub async fn entity_class_contains_both_same_entity_members<S: FactStore>(store:
                 fact: identity_pair,
             },
             citation: JudgmentSource::PersonalKnowledge {
-                user: UserId::new("alice"),
+                user: UserId::new("alice")?,
                 justification: Justification::new("These two refer to the same entity.")?,
             },
         }]
@@ -1315,7 +1315,7 @@ pub async fn entity_representative_is_canonical_across_same_entity_members<S: Fa
                 fact: identity_pair,
             },
             citation: JudgmentSource::PersonalKnowledge {
-                user: UserId::new("alice"),
+                user: UserId::new("alice")?,
                 justification: Justification::new("These two refer to the same entity.")?,
             },
         }]
@@ -1381,7 +1381,7 @@ pub async fn event_class_contains_both_same_event_members<S: FactStore>(store: S
                 fact: identity_pair,
             },
             citation: JudgmentSource::PersonalKnowledge {
-                user: UserId::new("alice"),
+                user: UserId::new("alice")?,
                 justification: Justification::new("These two refer to the same event.")?,
             },
         }]
@@ -1435,7 +1435,7 @@ pub async fn event_representative_is_canonical_across_same_event_members<S: Fact
                 fact: identity_pair,
             },
             citation: JudgmentSource::PersonalKnowledge {
-                user: UserId::new("alice"),
+                user: UserId::new("alice")?,
                 justification: Justification::new("These two refer to the same event.")?,
             },
         }]
@@ -1499,7 +1499,7 @@ pub async fn image_class_contains_both_same_artifact_members<S: FactStore>(store
                 fact: identity_pair,
             },
             citation: JudgmentSource::PersonalKnowledge {
-                user: UserId::new("alice"),
+                user: UserId::new("alice")?,
                 justification: Justification::new("These two scans are the same artifact.")?,
             },
         }]
@@ -1551,7 +1551,7 @@ pub async fn image_representative_is_canonical_across_same_artifact_members<S: F
                 fact: identity_pair,
             },
             citation: JudgmentSource::PersonalKnowledge {
-                user: UserId::new("alice"),
+                user: UserId::new("alice")?,
                 justification: Justification::new("These two scans are the same artifact.")?,
             },
         }]
@@ -1623,7 +1623,7 @@ pub async fn image_representatives_batch_matches_per_id_resolution<S: FactStore>
                     fact: identity_pair,
                 },
                 citation: JudgmentSource::PersonalKnowledge {
-                    user: UserId::new("alice"),
+                    user: UserId::new("alice")?,
                     justification: Justification::new("These two scans are the same artifact.")?,
                 },
             },
@@ -2019,7 +2019,7 @@ pub async fn same_entity_resolving_to_one_id_rejected_at_substitution<S: FactSto
         .clone();
 
     let identity_pair = identity::Fact::same_entity(EntityIdx(0), EntityIdx(1))?;
-    let user = UserId::new("alice");
+    let user = UserId::new("alice")?;
     let justification =
         Justification::new("Two existing decls collapse to the same id after resolution.")?;
     let bundle: SubmitCommitInput<S> = SubmitBundle {

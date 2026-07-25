@@ -496,7 +496,7 @@ fn build_companion_commit<S: FactStore>(
     if matched.entities.is_empty() && matched.images.is_empty() {
         return Ok(None);
     }
-    let (process, version) = matcher::matcher_identity();
+    let (process, version) = matcher::matcher_identity().map_err(companion_bug::<S, _>)?;
     let derivation = |basis: &BTreeSet<FactId>| JudgmentSource::Derivation {
         process: process.clone(),
         version: version.clone(),

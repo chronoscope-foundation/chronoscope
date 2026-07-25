@@ -19,7 +19,7 @@ use url::Url;
 use super::{Decl, EntityIdx, ImageIdx, SubmitFact};
 use crate::grammar::assertions::FactualAssertion;
 use crate::grammar::citations::{ExternalReference, Language};
-use crate::grammar::ids::{AnalyzerProcess, AnalyzerVersion, FactId};
+use crate::grammar::ids::{AnalyzerProcess, AnalyzerVersion, FactId, ValidatedStringError};
 use crate::grammar::{attribute, image};
 use crate::store::pagination::{PAGE_SIZE, paginate};
 use crate::store::schema::{EntityStream, ImageStream, normalize_name};
@@ -35,11 +35,15 @@ const MATCHER_PROCESS: &str = "submit-matcher";
 
 /// The submit matcher's analyzer identity: `MATCHER_PROCESS` at this
 /// build's [`BUILD_VERSION`](crate::BUILD_VERSION).
-pub fn matcher_identity() -> (AnalyzerProcess, AnalyzerVersion) {
-    (
-        AnalyzerProcess::new(MATCHER_PROCESS),
-        AnalyzerVersion::new(crate::BUILD_VERSION),
-    )
+///
+/// [`BUILD_VERSION`](crate::BUILD_VERSION) comes from the build environment,
+/// so the id constructors' validation is threaded through rather than assumed
+/// away.
+pub fn matcher_identity() -> Result<(AnalyzerProcess, AnalyzerVersion), ValidatedStringError> {
+    Ok((
+        AnalyzerProcess::new(MATCHER_PROCESS)?,
+        AnalyzerVersion::new(crate::BUILD_VERSION)?,
+    ))
 }
 
 // ============================================================================

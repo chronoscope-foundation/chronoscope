@@ -137,7 +137,7 @@ pub fn fixed_time() -> chrono::DateTime<chrono::Utc> {
 
 /// The user author every fixture commit records.
 pub fn user_author() -> Result<CommitAuthor, TestError> {
-    Ok(CommitAuthor::User(UserId::new("alice")))
+    Ok(CommitAuthor::User(UserId::new("alice")?))
 }
 
 /// A URL-sourced factual citation with one excerpt.
@@ -154,7 +154,7 @@ pub fn sample_citation() -> Result<FactualCitation, TestError> {
 /// A personal-knowledge judgment citation.
 pub fn judgment_citation() -> Result<JudgmentSource<ImageIdx>, TestError> {
     Ok(JudgmentSource::PersonalKnowledge {
-        user: UserId::new("alice"),
+        user: UserId::new("alice")?,
         justification: Justification::new("a test judgment")?,
     })
 }
@@ -165,7 +165,7 @@ pub fn image_observation_citation(image_idx: usize) -> Result<JudgmentSource<Ima
         image: ImageIdx(image_idx),
         region: None,
         observer: crate::grammar::citations::Observer::User {
-            user: UserId::new("alice"),
+            user: UserId::new("alice")?,
             justification: None,
         },
     })
@@ -769,7 +769,7 @@ pub fn retract_commit_fact(target: CommitId) -> Result<SubmitFact, TestError> {
             reason: crate::grammar::assertions::RetractionReason::FactualError,
         },
         citation: crate::grammar::citations::MetaSource::PersonalKnowledge {
-            user: UserId::new("alice"),
+            user: UserId::new("alice")?,
             justification: Justification::new("The targeted commit is wrong.")?,
         },
     })
@@ -784,7 +784,7 @@ pub fn retract_fact(target: FactId) -> Result<SubmitFact, TestError> {
             reason: crate::grammar::assertions::RetractionReason::FactualError,
         },
         citation: crate::grammar::citations::MetaSource::PersonalKnowledge {
-            user: UserId::new("alice"),
+            user: UserId::new("alice")?,
             justification: Justification::new("The targeted fact is wrong.")?,
         },
     })
@@ -799,7 +799,7 @@ pub fn supersede_fact(target: FactId, replacement: FactId) -> Result<SubmitFact,
             reason: crate::grammar::assertions::RetractionReason::FactualError,
         },
         citation: crate::grammar::citations::MetaSource::PersonalKnowledge {
-            user: UserId::new("alice"),
+            user: UserId::new("alice")?,
             justification: Justification::new("The targeted fact is superseded.")?,
         },
     })

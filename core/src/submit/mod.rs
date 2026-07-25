@@ -323,7 +323,7 @@ mod tests {
     use crate::grammar::assertions::FactualAssertion;
     use crate::grammar::attribute::{self, NameText, NameType};
     use crate::grammar::citations::{Excerpt, ExternalSource, FactualCitation, Language};
-    use crate::grammar::ids::{IngesterRunId, UserId};
+    use crate::grammar::ids::{IngesterRunId, UserId, ValidatedStringError};
     use crate::store::memory::{MemoryEntityId, MemoryIds};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -363,12 +363,12 @@ mod tests {
         })
     }
 
-    fn alice_author() -> CommitAuthor {
-        CommitAuthor::User(UserId::new("alice"))
+    fn alice_author() -> Result<CommitAuthor, ValidatedStringError> {
+        Ok(CommitAuthor::User(UserId::new("alice")?))
     }
 
-    fn bob_author() -> CommitAuthor {
-        CommitAuthor::User(UserId::new("bob"))
+    fn bob_author() -> Result<CommitAuthor, ValidatedStringError> {
+        Ok(CommitAuthor::User(UserId::new("bob")?))
     }
 
     fn bundle_with_facts(
@@ -408,7 +408,7 @@ mod tests {
                 image: observed,
                 region: None,
                 observer: Observer::User {
-                    user: UserId::new("alice"),
+                    user: UserId::new("alice")?,
                     justification: None,
                 },
             },
@@ -429,8 +429,8 @@ mod tests {
     #[test]
     fn commit_id_is_deterministic_for_same_components() -> TestResult {
         let facts = vec![named_fact("a")?, named_fact("b")?];
-        let lhs = bundle_with_facts(alice_author(), fixed_time()?, facts.clone()).id()?;
-        let rhs = bundle_with_facts(alice_author(), fixed_time()?, facts).id()?;
+        let lhs = bundle_with_facts(alice_author()?, fixed_time()?, facts.clone()).id()?;
+        let rhs = bundle_with_facts(alice_author()?, fixed_time()?, facts).id()?;
         assert_eq!(lhs, rhs);
         Ok(())
     }
@@ -438,13 +438,13 @@ mod tests {
     #[test]
     fn commit_id_is_insensitive_to_fact_order() -> TestResult {
         let lhs = bundle_with_facts(
-            alice_author(),
+            alice_author()?,
             fixed_time()?,
             vec![named_fact("a")?, named_fact("b")?],
         )
         .id()?;
         let rhs = bundle_with_facts(
-            alice_author(),
+            alice_author()?,
             fixed_time()?,
             vec![named_fact("b")?, named_fact("a")?],
         )
@@ -457,16 +457,16 @@ mod tests {
     fn commit_id_quantizes_subseconds() -> TestResult {
         let base = fixed_time()?;
         let with_ns = base + chrono::Duration::nanoseconds(123_456_789);
-        let lhs = bundle_with_facts(alice_author(), base, vec![named_fact("a")?]).id()?;
-        let rhs = bundle_with_facts(alice_author(), with_ns, vec![named_fact("a")?]).id()?;
+        let lhs = bundle_with_facts(alice_author()?, base, vec![named_fact("a")?]).id()?;
+        let rhs = bundle_with_facts(alice_author()?, with_ns, vec![named_fact("a")?]).id()?;
         assert_eq!(lhs, rhs);
         Ok(())
     }
 
     #[test]
     fn commit_id_differs_for_different_authors() -> TestResult {
-        let lhs = bundle_with_facts(alice_author(), fixed_time()?, vec![named_fact("a")?]).id()?;
-        let rhs = bundle_with_facts(bob_author(), fixed_time()?, vec![named_fact("a")?]).id()?;
+        let lhs = bundle_with_facts(alice_author()?, fixed_time()?, vec![named_fact("a")?]).id()?;
+        let rhs = bundle_with_facts(bob_author()?, fixed_time()?, vec![named_fact("a")?]).id()?;
         assert_ne!(lhs, rhs);
         Ok(())
     }
@@ -475,8 +475,8 @@ mod tests {
     /// canonical form prefixes the kind (`user:` / `ingester:`).
     #[test]
     fn commit_id_differs_across_author_kinds_with_same_inner_string() -> TestResult {
-        let user = CommitAuthor::User(UserId::new("shared"));
-        let ingester = CommitAuthor::Ingester(IngesterRunId::new("shared"));
+        let user = CommitAuthor::User(UserId::new("shared")?);
+        let ingester = CommitAuthor::Ingester(IngesterRunId::new("shared")?);
         let lhs = bundle_with_facts(user, fixed_time()?, vec![named_fact("a")?]).id()?;
         let rhs = bundle_with_facts(ingester, fixed_time()?, vec![named_fact("a")?]).id()?;
         assert_ne!(lhs, rhs);
@@ -485,9 +485,9 @@ mod tests {
 
     #[test]
     fn commit_id_differs_for_different_recorded_at_seconds() -> TestResult {
-        let lhs = bundle_with_facts(alice_author(), fixed_time()?, vec![named_fact("a")?]).id()?;
+        let lhs = bundle_with_facts(alice_author()?, fixed_time()?, vec![named_fact("a")?]).id()?;
         let rhs = bundle_with_facts(
-            alice_author(),
+            alice_author()?,
             fixed_time()? + chrono::Duration::seconds(1),
             vec![named_fact("a")?],
         )
@@ -503,7 +503,7 @@ mod tests {
     fn commit_id_differs_for_local_vs_existing_decl() -> TestResult {
         let facts: BTreeSet<SubmitFact> = std::iter::once(named_fact("a")?).collect();
         let local: Commit<MemoryIds> = Commit {
-            author: alice_author(),
+            author: alice_author()?,
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -511,7 +511,7 @@ mod tests {
             facts: facts.clone(),
         };
         let existing: Commit<MemoryIds> = Commit {
-            author: alice_author(),
+            author: alice_author()?,
             recorded_at: fixed_time()?,
             entities: vec![Decl::Existing {
                 id: MemoryEntityId(5),

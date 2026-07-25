@@ -144,7 +144,7 @@ async fn match_by_name_joins_existing_entity_class() -> TestResult {
         .clone()
         .ok_or("expected a companion commit")?;
     let companion = stored_commit(&store, &companion_id).await?;
-    let (process, version) = matcher::matcher_identity();
+    let (process, version) = matcher::matcher_identity()?;
     assert_eq!(
         companion.author,
         CommitAuthor::Analyzer {

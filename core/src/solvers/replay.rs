@@ -112,7 +112,7 @@ mod tests {
     /// judgments the subject-date tests submit.
     fn judgment_source() -> Result<JudgmentSource<ImageIdx>, Box<dyn std::error::Error>> {
         Ok(JudgmentSource::PersonalKnowledge {
-            user: UserId::new("test"),
+            user: UserId::new("test")?,
             justification: Justification::new("same artifact under test")?,
         })
     }
@@ -183,7 +183,7 @@ mod tests {
     async fn subject_date_folds_as_existence_witness() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -211,7 +211,7 @@ mod tests {
     async fn subject_date_reaches_entity_across_same_artifact() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -249,7 +249,7 @@ mod tests {
             citation: citation("https://example.com/subject-before")?,
         };
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -280,7 +280,7 @@ mod tests {
     async fn lifespan_is_neutral_to_derived_bound_injection() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: vec![Decl::Local],

@@ -123,7 +123,7 @@ fn seed_demolished_entity_at(
         citation: seed_citation("https://example.com/seed-demolished")?,
     });
     Ok(Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("seed")),
+        author: CommitAuthor::User(UserId::new("seed")?),
         recorded_at: chrono::Utc::now(),
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -135,7 +135,7 @@ fn seed_demolished_entity_at(
 /// A commit placing one named entity at `(lat, lon)`.
 fn seed_entity_at(name: &str, lat: f64, lon: f64) -> SeedResult {
     Ok(Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("seed")),
+        author: CommitAuthor::User(UserId::new("seed")?),
         recorded_at: chrono::Utc::now(),
         entities: vec![Decl::Local],
         events: Vec::new(),

@@ -854,14 +854,14 @@ mod tests {
         item("Q1234", labels, claims)
     }
 
-    fn run_id() -> IngesterRunId {
+    fn run_id() -> Result<IngesterRunId, ValidatedStringError> {
         IngesterRunId::new("wikidata-test")
     }
 
     #[test]
     fn build_commit_emits_names_qid_bookend_event_and_image() -> TestResult {
         let commit =
-            build_commit::<MemoryIds>(&pantheon()?, &run_id(), fixed_time()?, &mut Vec::new())?
+            build_commit::<MemoryIds>(&pantheon()?, &run_id()?, fixed_time()?, &mut Vec::new())?
                 .ok_or("a Q-item builds a commit")?;
 
         assert_eq!(commit.entities.len(), 1, "no demolish→rebuild, one entity");
@@ -1000,7 +1000,7 @@ mod tests {
         )]);
         let commit = build_commit::<MemoryIds>(
             &item("Q7", BTreeMap::new(), claims)?,
-            &run_id(),
+            &run_id()?,
             fixed_time()?,
             &mut Vec::new(),
         )?
@@ -1033,7 +1033,7 @@ mod tests {
         )]);
         let commit = build_commit::<MemoryIds>(
             &item("Q8", BTreeMap::new(), claims)?,
-            &run_id(),
+            &run_id()?,
             fixed_time()?,
             &mut Vec::new(),
         )?
@@ -1106,7 +1106,7 @@ mod tests {
     fn demolish_rebuild_emits_replaces_edge_citing_bookend_dates() -> TestResult {
         let commit = build_commit::<MemoryIds>(
             &rebuilt_church()?,
-            &run_id(),
+            &run_id()?,
             fixed_time()?,
             &mut Vec::new(),
         )?
@@ -1151,7 +1151,7 @@ mod tests {
     fn predecessor_inherits_location_without_dates() -> TestResult {
         let commit = build_commit::<MemoryIds>(
             &rebuilt_church()?,
-            &run_id(),
+            &run_id()?,
             fixed_time()?,
             &mut Vec::new(),
         )?
@@ -1189,7 +1189,7 @@ mod tests {
     async fn round_trip_projects_names_refs_and_timeline() -> TestResult {
         let store = MemoryFactStore::new();
         let recorded = fixed_time()?;
-        let commit = build_commit(&pantheon()?, &run_id(), recorded, &mut Vec::new())?
+        let commit = build_commit(&pantheon()?, &run_id()?, recorded, &mut Vec::new())?
             .ok_or("expected commit")?;
         let result = commit_facts(&store, commit)
             .await
@@ -1254,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_entities_tallies_and_skips_non_q_items() -> TestResult {
         let store = MemoryFactStore::new();
-        let stats = ingest_entities(&store, [pantheon()?], &run_id(), fixed_time()?).await?;
+        let stats = ingest_entities(&store, [pantheon()?], &run_id()?, fixed_time()?).await?;
         assert_eq!(stats.commits, 1);
         assert_eq!(stats.entities, 1);
         assert_eq!(stats.skipped, 0);
@@ -1279,7 +1279,7 @@ mod tests {
         let entity = item("Q123", BTreeMap::from([label("en", "Mystery")]), claims)?;
 
         let store = MemoryFactStore::new();
-        let stats = ingest_entities(&store, [entity], &run_id(), fixed_time()?).await?;
+        let stats = ingest_entities(&store, [entity], &run_id()?, fixed_time()?).await?;
         assert_eq!(stats.commits, 1, "the item still commits");
         assert!(
             stats.issues > 0,
@@ -1327,7 +1327,7 @@ mod tests {
         let entity = item_with_sitelink("commonswiki", String::new())?;
 
         let mut warnings = Vec::new();
-        let commit = build_commit::<MemoryIds>(&entity, &run_id(), fixed_time()?, &mut warnings)?
+        let commit = build_commit::<MemoryIds>(&entity, &run_id()?, fixed_time()?, &mut warnings)?
             .ok_or("the item still builds a commit")?;
 
         // The item's own QID is the only external reference; the empty-title
@@ -1355,7 +1355,7 @@ mod tests {
 
             let mut warnings = Vec::new();
             let commit =
-                build_commit::<MemoryIds>(&entity, &run_id(), fixed_time()?, &mut warnings)?
+                build_commit::<MemoryIds>(&entity, &run_id()?, fixed_time()?, &mut warnings)?
                     .ok_or("the item still builds a commit")?;
             assert_eq!(
                 external_reference_count(&commit),
@@ -1380,7 +1380,7 @@ mod tests {
             );
 
             let store = MemoryFactStore::new();
-            let stats = ingest_entities(&store, [entity], &run_id(), fixed_time()?).await?;
+            let stats = ingest_entities(&store, [entity], &run_id()?, fixed_time()?).await?;
             assert_eq!(stats.commits, 1, "the entity is submitted");
             assert_eq!(stats.failed, 0, "a bad value is not a build failure");
             assert!(stats.issues > 0, "the drop is tallied as an issue");
@@ -1401,7 +1401,7 @@ mod tests {
         let mut warnings = Vec::new();
         let commit = build_commit::<MemoryIds>(
             &item("Q11", BTreeMap::new(), claims)?,
-            &run_id(),
+            &run_id()?,
             fixed_time()?,
             &mut warnings,
         )?
@@ -1444,7 +1444,7 @@ mod tests {
         let mut warnings = Vec::new();
         let commit = build_commit::<MemoryIds>(
             &item("Q12", BTreeMap::from([label("en", "Placeholder")]), claims)?,
-            &run_id(),
+            &run_id()?,
             fixed_time()?,
             &mut warnings,
         )?
@@ -1491,7 +1491,7 @@ mod tests {
 
         let store = MemoryFactStore::new();
         let stats =
-            ingest_entities(&store, [pantheon()?, bad, after], &run_id(), fixed_time()?).await?;
+            ingest_entities(&store, [pantheon()?, bad, after], &run_id()?, fixed_time()?).await?;
 
         assert_eq!(stats.commits, 3, "every item commits what it could");
         assert_eq!(stats.failed, 0, "no item is dropped over a bad value");
@@ -1509,7 +1509,7 @@ mod tests {
 
             let mut warnings = Vec::new();
             let commit =
-                build_commit::<MemoryIds>(&entity, &run_id(), fixed_time()?, &mut warnings)?
+                build_commit::<MemoryIds>(&entity, &run_id()?, fixed_time()?, &mut warnings)?
                     .ok_or("the item still builds a commit")?;
 
             assert_eq!(
@@ -1534,7 +1534,7 @@ mod tests {
     async fn committed_pantheon()
     -> Result<(MemoryFactStore, MemoryEntityId), Box<dyn std::error::Error>> {
         let store = MemoryFactStore::new();
-        let commit = build_commit(&pantheon()?, &run_id(), fixed_time()?, &mut Vec::new())?
+        let commit = build_commit(&pantheon()?, &run_id()?, fixed_time()?, &mut Vec::new())?
             .ok_or("expected commit")?;
         let result = commit_facts(&store, commit)
             .await

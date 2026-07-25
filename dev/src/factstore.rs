@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
-use chronoscope_core::grammar::ids::IngesterRunId;
+use chronoscope_core::grammar::ids::{IngesterRunId, ValidatedStringError};
 use chronoscope_core::store::FactStore;
 use chronoscope_ingestion::wikidata::commits::{IngestError, IngestStats, ingest_entities};
 use chronoscope_integrations::wikidata::WikidataEntity;
@@ -39,6 +39,9 @@ pub enum LoadError {
     /// path is threaded through rather than assumed away.
     #[error("curated snapshot recorded-at timestamp is invalid")]
     RecordedAt,
+    /// The loader's ingester run id failed validation.
+    #[error("constructing the curated-load ingester run id: {0}")]
+    RunId(#[from] ValidatedStringError),
     /// The store rejected a commit, which ends the ingest pass.
     #[error("ingesting curated entities: {0}")]
     Ingest(#[from] IngestError),
@@ -92,7 +95,7 @@ pub async fn load_curated_fact_store<S: FactStore>(
     }
 
     let recorded_at = curated_snapshot_recorded_at()?;
-    let run = IngesterRunId::new("dev-startup");
+    let run = IngesterRunId::new("dev-startup")?;
     let stats = ingest_entities(store, entities, &run, recorded_at).await?;
     if stats.failed > 0 {
         return Err(LoadError::Failed {

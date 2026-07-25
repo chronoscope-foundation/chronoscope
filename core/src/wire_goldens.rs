@@ -90,7 +90,7 @@ fn sample_judgment_source() -> Result<JudgmentSource<ImageIdx>> {
         image: ImageIdx(0),
         region: None,
         observer: Observer::User {
-            user: UserId::new("alice"),
+            user: UserId::new("alice")?,
             justification: None,
         },
     })
@@ -100,8 +100,8 @@ fn sample_judgment_source() -> Result<JudgmentSource<ImageIdx>> {
 /// bytes are independent of the build environment.
 fn sample_derivation_source() -> Result<JudgmentSource<ImageIdx>> {
     Ok(JudgmentSource::Derivation {
-        process: AnalyzerProcess::new("matcher"),
-        version: AnalyzerVersion::new("test-version"),
+        process: AnalyzerProcess::new("matcher")?,
+        version: AnalyzerVersion::new("test-version")?,
         basis: [FactId::new(3), FactId::new(5)].into_iter().collect(),
         snapshot: FactId::new(7),
     })
@@ -641,7 +641,7 @@ fn golden_commit_canonical_jcs_full_bundle() -> Result<()> {
     });
 
     let bundle: Commit<MemoryIds> = Commit {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: chrono::Utc
             .with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
             .single()
@@ -663,8 +663,8 @@ fn golden_commit_canonical_jcs_full_bundle() -> Result<()> {
 #[test]
 fn golden_commit_author_analyzer() -> Result<()> {
     let author = CommitAuthor::Analyzer {
-        process: AnalyzerProcess::new("matcher"),
-        version: AnalyzerVersion::new("test-version"),
+        process: AnalyzerProcess::new("matcher")?,
+        version: AnalyzerVersion::new("test-version")?,
     };
     assert_golden_roundtrip(
         &author,
@@ -690,8 +690,8 @@ fn golden_commit_canonical_jcs_analyzer_companion_bundle() -> Result<()> {
 
     let bundle: Commit<MemoryIds> = Commit {
         author: CommitAuthor::Analyzer {
-            process: AnalyzerProcess::new("matcher"),
-            version: AnalyzerVersion::new("test-version"),
+            process: AnalyzerProcess::new("matcher")?,
+            version: AnalyzerVersion::new("test-version")?,
         },
         recorded_at: chrono::Utc
             .with_ymd_and_hms(2024, 1, 1, 12, 0, 0)

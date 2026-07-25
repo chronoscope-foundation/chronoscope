@@ -13,7 +13,7 @@
 //! Internal infrastructure IDs (`UserId`, `IngesterRunId`,
 //! `AnalyzerProcess`, etc.) live in [`crate::grammar::ids`] and follow the same
 //! "parse at the wire boundary" pattern via the
-//! [`string_id_newtype`](crate::string_id_newtype) macro.
+//! [`validated_string_newtype`](crate::validated_string_newtype) macro.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

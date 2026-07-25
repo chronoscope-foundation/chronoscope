@@ -107,7 +107,7 @@ async fn commit_named_entity_at(
     lon: f64,
 ) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -154,7 +154,7 @@ async fn commit_demolished_entity_at(
     demolished: i32,
 ) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -164,7 +164,7 @@ async fn commit_demolished_entity_at(
                 assertion: FactualAssertion::Attribute {
                     fact: attribute::Fact::Name {
                         entity: EntityIdx(0),
-                        name: NameText::new(name),
+                        name: NameText::new(name)?,
                         language: Language::new("en")?,
                         name_type: NameType::Common,
                         valid_from: None,
@@ -247,7 +247,7 @@ async fn commit_entity_with_names_at(
         citation: citation("https://example.com/location")?,
     });
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -288,7 +288,7 @@ async fn commit_entity_with_conflicting_start_dates(
             })
         };
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -341,7 +341,7 @@ async fn commit_entity_with_conflicting_event_dates(
             })
         };
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: vec![Decl::Local],
@@ -393,7 +393,7 @@ async fn commit_entity_with_event_before_construction(
     event: i32,
 ) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: vec![Decl::Local],
@@ -459,7 +459,7 @@ async fn commit_entity_with_existence_witness(
     witness: i32,
 ) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -506,7 +506,7 @@ async fn commit_entity_with_depicted_image(
     image_source_url: &str,
 ) -> Result<(ServerEntityId, ServerImageId), Box<dyn std::error::Error + Send + Sync>> {
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -998,7 +998,7 @@ async fn commit_entity_with_depicted_images(
         });
     }
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -1035,7 +1035,7 @@ async fn commit_extra_depiction_on(
     image_source_url: &str,
 ) -> Result<ServerImageId, Box<dyn std::error::Error + Send + Sync>> {
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Existing { id: entity_id }],
         events: Vec::new(),
@@ -1525,7 +1525,7 @@ async fn commit_dated_entity_at(
         });
     }
     let commit = Commit::<ServerIds> {
-        author: CommitAuthor::User(UserId::new("test")),
+        author: CommitAuthor::User(UserId::new("test")?),
         recorded_at: fixed_time()?,
         entities: vec![Decl::Local],
         events: Vec::new(),

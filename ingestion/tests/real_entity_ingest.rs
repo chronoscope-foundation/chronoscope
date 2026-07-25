@@ -44,7 +44,7 @@ async fn ingest_curated() -> Result<Option<MemoryFactStore>, BoxError> {
         return Ok(None);
     };
     let content = std::fs::read_to_string(&path)?;
-    let run = IngesterRunId::new("round-trip");
+    let run = IngesterRunId::new("round-trip")?;
     let recorded_at = Utc
         .with_ymd_and_hms(2022, 1, 3, 0, 0, 0)
         .single()

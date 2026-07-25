@@ -3,11 +3,12 @@
 //! Two families live here:
 //!
 //! - **String-shaped IDs** (`UserId`, `IngesterRunId`, `AnalyzerProcess`,
-//!   `AnalyzerVersion`). Wrappers around `String` with no validation
-//!   invariants — the constructor is infallible. The `string_id_newtype`
-//!   macro keeps their derives + serde shape in lockstep. `AnalyzerProcess` /
-//!   `AnalyzerVersion` name the machine process behind an analyzer commit and
-//!   the build that ran it.
+//!   `AnalyzerVersion`). Transparent `String` newtypes built by the
+//!   [`validated_string_newtype`](crate::validated_string_newtype) macro, so
+//!   the smart constructor and the wire boundary alike run the shared NUL
+//!   check and the [`ID_MAX_LEN`] cap. `AnalyzerProcess` / `AnalyzerVersion`
+//!   name the machine process behind an analyzer commit and the build that
+//!   ran it.
 //! - **Integer-shaped IDs** (`FactId`, `CommitId`). [`FactId`] is a `u64`
 //!   newtype that prevents intermixing with other integer ids. [`CommitId`] is
 //!   content-addressed — derived from the commit's canonical encoding so
@@ -86,72 +87,6 @@ pub trait IdScheme: Clone + std::fmt::Debug + Eq + Ord + std::hash::Hash + 'stat
     type Event: SchemeId;
     /// The image id kind.
     type Image: SchemeId;
-}
-
-// ============================================================================
-// String-ID macro
-// ============================================================================
-
-/// Emit a transparent string newtype with infallible construction.
-///
-/// The generated type carries: constructor `new`, `as_str`,
-/// `Display`, `AsRef<str>`, `From<String>` / `From<&str>`, `JsonSchema`,
-/// `Serialize`, `Deserialize`. Construction is infallible — these wrappers
-/// give a string type-distinct identity.
-#[macro_export]
-macro_rules! string_id_newtype {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[derive(
-            Debug,
-            Clone,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Hash,
-            ::serde::Serialize,
-            ::serde::Deserialize,
-            ::schemars::JsonSchema,
-        )]
-        #[serde(transparent)]
-        pub struct $name(::std::string::String);
-
-        impl $name {
-            #[doc = "Wrap a string as this id type. Infallible."]
-            pub fn new(id: impl ::std::convert::Into<::std::string::String>) -> Self {
-                Self(id.into())
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl ::std::convert::From<::std::string::String> for $name {
-            fn from(s: ::std::string::String) -> Self {
-                Self(s)
-            }
-        }
-
-        impl ::std::convert::From<&str> for $name {
-            fn from(s: &str) -> Self {
-                Self(s.to_string())
-            }
-        }
-
-        impl ::std::fmt::Display for $name {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                ::std::fmt::Display::fmt(&self.0, f)
-            }
-        }
-
-        impl ::std::convert::AsRef<str> for $name {
-            fn as_ref(&self) -> &str {
-                &self.0
-            }
-        }
-    };
 }
 
 // ============================================================================
@@ -438,35 +373,41 @@ macro_rules! __validated_string_newtype_maybe_trim {
 // String IDs (macro-generated)
 // ============================================================================
 
-string_id_newtype! {
+/// Maximum length in characters of an identifier-shaped string.
+///
+/// Wire defense sized for identifiers: a UUID is 36 characters, an email
+/// address at most 254.
+pub const ID_MAX_LEN: usize = 256;
+
+crate::validated_string_newtype! {
     /// User ID for attribution. Opaque identifier minted by the
     /// auth/identity layer. Core reads it as the author of
     /// `IngestedBy::User` commits.
-    UserId
+    UserId, max = ID_MAX_LEN
 }
 
-string_id_newtype! {
+crate::validated_string_newtype! {
     /// Ingester run ID. Opaque identifier minted at the start of an
     /// ingester run (URL worker, Wikidata pipeline, image analysis);
     /// stable for the lifetime of the run. Stored as the author of
     /// `IngestedBy::Ingester` commits.
-    IngesterRunId
+    IngesterRunId, max = ID_MAX_LEN
 }
 
-string_id_newtype! {
+crate::validated_string_newtype! {
     /// The name of a machine analysis process (e.g. the submit matcher).
     /// Names *what kind* of computation authored a judgment, so consumers can
     /// filter and group machine-authored commits without string parsing.
-    AnalyzerProcess
+    AnalyzerProcess, max = ID_MAX_LEN
 }
 
-string_id_newtype! {
+crate::validated_string_newtype! {
     /// The version label of a machine analysis process — the build that ran
     /// it (a git SHA, or a crate version when none was injected; see
     /// [`crate::BUILD_VERSION`]). Paired with [`AnalyzerProcess`] it pins what
     /// produced a judgment, so a re-derivation check knows which code to
     /// re-run.
-    AnalyzerVersion
+    AnalyzerVersion, max = ID_MAX_LEN
 }
 
 // ============================================================================
@@ -700,6 +641,66 @@ mod tests {
         let hex = "0".repeat(COMMIT_ID_HEX_LEN);
         let parsed = CommitId::parse(hex.clone())?;
         assert_eq!(parsed.as_str(), hex);
+        Ok(())
+    }
+
+    // --- string-id validation ---
+
+    #[test]
+    fn user_id_new_rejects_a_nul() {
+        assert!(matches!(
+            UserId::new("ali\u{0}ce"),
+            Err(ValidatedStringError::ContainsNul { .. })
+        ));
+    }
+
+    /// The error text, not just the failure: a bare-`String` deserialize has
+    /// no other way to fail, so only the message shows the NUL check ran.
+    fn deserialize_error<T: serde::de::DeserializeOwned>(wire: serde_json::Value) -> String {
+        match serde_json::from_value::<T>(wire) {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The wire is the path that matters: a `UserId` rides inside
+    /// `commit_json.author`, so a NUL arriving over submit reaches a Postgres
+    /// `jsonb` cast that refuses it while SQLite takes it silently.
+    #[test]
+    fn user_id_deserialize_rejects_a_nul() {
+        assert!(
+            deserialize_error::<UserId>(serde_json::json!("ali\u{0}ce")).contains("NUL"),
+            "a NUL in the wire form must be refused by the UserId constructor"
+        );
+    }
+
+    #[test]
+    fn ingester_run_id_deserialize_rejects_a_nul() {
+        assert!(
+            deserialize_error::<IngesterRunId>(serde_json::json!("run\u{0}1")).contains("NUL"),
+            "a NUL in the wire form must be refused by the IngesterRunId constructor"
+        );
+    }
+
+    #[test]
+    fn analyzer_process_takes_the_cap_length_and_rejects_one_char_past_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let at_cap = "x".repeat(ID_MAX_LEN);
+        assert_eq!(
+            AnalyzerProcess::new(&at_cap)?.as_str().chars().count(),
+            ID_MAX_LEN
+        );
+
+        let over_cap = "x".repeat(ID_MAX_LEN + 1);
+        assert!(matches!(
+            AnalyzerProcess::new(&over_cap),
+            Err(ValidatedStringError::TooLong { len, max, .. })
+                if len == ID_MAX_LEN + 1 && max == ID_MAX_LEN
+        ));
+        assert!(
+            deserialize_error::<AnalyzerVersion>(serde_json::json!(over_cap)).contains("too long"),
+            "an over-cap wire form must be refused by the AnalyzerVersion constructor"
+        );
         Ok(())
     }
 

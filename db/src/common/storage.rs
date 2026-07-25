@@ -793,7 +793,7 @@ mod tests {
     fn commit_json_round_trips_minimal_commit_form() -> TestResult {
         let commit = StoredCommit {
             commit_id: CommitId::parse("0f".repeat(32))?,
-            author: CommitAuthor::User(UserId::new("user-7")),
+            author: CommitAuthor::User(UserId::new("user-7")?),
             recorded_at: DateTime::<Utc>::UNIX_EPOCH,
             fact_ids: vec![FactId::new(0), FactId::new(7)],
         };

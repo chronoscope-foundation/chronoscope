@@ -448,7 +448,7 @@ mod tests {
         };
 
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: chrono::Utc::now(),
             entities: Vec::new(),
             events: Vec::new(),

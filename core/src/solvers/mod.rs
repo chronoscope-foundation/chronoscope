@@ -705,7 +705,7 @@ mod tests {
     async fn existence_witness_before_construction_start_is_a_temporal_conflict() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -767,7 +767,7 @@ mod tests {
     async fn existence_witness_after_construction_start_yields_no_conflict() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -791,7 +791,7 @@ mod tests {
     async fn existence_witness_without_construction_start_yields_no_conflict() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -814,7 +814,7 @@ mod tests {
     async fn event_before_construction_start_is_a_temporal_conflict() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: vec![Decl::Local],
@@ -875,7 +875,7 @@ mod tests {
     async fn existence_witness_after_demolition_is_a_temporal_conflict() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -934,7 +934,7 @@ mod tests {
     async fn existence_witness_within_lifetime_window_yields_no_conflict() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -967,7 +967,7 @@ mod tests {
         facts.insert(construction_started(1100)?);
         facts.extend(modified_span(1050, 1055)?);
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: vec![Decl::Local],
@@ -998,7 +998,7 @@ mod tests {
     async fn witness_before_every_disputed_construction_start_is_one_conflict() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -1092,7 +1092,7 @@ mod tests {
     async fn empty_construction_gains_inferred_built_by_from_existence_witness() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -1181,7 +1181,7 @@ mod tests {
     async fn interior_event_date_infers_built_by_bound() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: vec![Decl::Local],
@@ -1226,7 +1226,7 @@ mod tests {
     async fn asserted_construction_start_blocks_inference() -> TestResult {
         let store = MemoryFactStore::new();
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),
@@ -1281,7 +1281,7 @@ mod tests {
         facts.insert(existence_at(81)?);
         facts.extend(point_event_at(81)?);
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: vec![Decl::Local],
@@ -1328,7 +1328,7 @@ mod tests {
             citation: citation("https://example.com/precise-witness")?,
         };
         let commit = Commit::<MemoryIds> {
-            author: CommitAuthor::User(UserId::new("test")),
+            author: CommitAuthor::User(UserId::new("test")?),
             recorded_at: fixed_time()?,
             entities: vec![Decl::Local],
             events: Vec::new(),

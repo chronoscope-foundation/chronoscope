@@ -73,7 +73,7 @@ fn sample_citation() -> Result<FactualCitation, Box<dyn std::error::Error>> {
 
 fn judgment_source() -> Result<JudgmentSource<ImageIdx>, Box<dyn std::error::Error>> {
     Ok(JudgmentSource::PersonalKnowledge {
-        user: UserId::new("alice"),
+        user: UserId::new("alice")?,
         justification: Justification::new("these two are the same entity")?,
     })
 }
@@ -236,7 +236,7 @@ async fn submit(
     facts: Vec<SubmitFact>,
 ) -> Result<crate::submit::SubmitResult<MemoryIds>, Box<dyn std::error::Error>> {
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: (0..entities).map(|_| Decl::Local).collect(),
         events: Vec::new(),
@@ -530,7 +530,7 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
         .ok_or("Old name fact not found")?;
 
     let retract_bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time() + chrono::Duration::seconds(1),
         entities: Vec::new(),
         events: Vec::new(),
@@ -541,7 +541,7 @@ async fn retraction_drops_a_fact_from_the_view() -> TestResult {
                 reason: RetractionReason::FactualError,
             },
             citation: MetaSource::PersonalKnowledge {
-                user: UserId::new("alice"),
+                user: UserId::new("alice")?,
                 justification: Justification::new("the old name was wrong")?,
             },
         }]
@@ -976,7 +976,7 @@ async fn entity_projects_has_event_linked_event() -> TestResult {
 
     let store = MemoryFactStore::new();
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: vec![Decl::Local],
         events: vec![Decl::Local],
@@ -1653,7 +1653,7 @@ fn factual_at(url: &str) -> Result<FactualCitation, Box<dyn std::error::Error>> 
 /// A judgment source for a stored depiction / composite fact.
 fn stored_judgment_src() -> Result<JudgmentSource<MemImgId>, Box<dyn std::error::Error>> {
     Ok(JudgmentSource::PersonalKnowledge {
-        user: UserId::new("alice"),
+        user: UserId::new("alice")?,
         justification: Justification::new("an image judgment")?,
     })
 }
@@ -1974,7 +1974,7 @@ async fn project_image_drains_class_and_folds_facts() -> TestResult {
     let store = MemoryFactStore::new();
     let url = "https://example.com/sheet.jpg";
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: Vec::new(),
         events: Vec::new(),
@@ -2033,7 +2033,7 @@ async fn project_image_drains_class_and_folds_facts() -> TestResult {
 async fn project_image_records_same_artifact_glue() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: Vec::new(),
         events: Vec::new(),
@@ -2085,7 +2085,7 @@ async fn project_image_folds_subject_date() -> TestResult {
     let store = MemoryFactStore::new();
     let subject = year_date(1850)?;
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: Vec::new(),
         events: Vec::new(),
@@ -2132,7 +2132,7 @@ async fn subject_date_propagates_across_same_artifact() -> TestResult {
     let store = MemoryFactStore::new();
     let subject = year_date(1850)?;
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: Vec::new(),
         events: Vec::new(),
@@ -2188,7 +2188,7 @@ async fn multi_interval_subject_date_is_rejected() -> TestResult {
         "the test needs a real disjunction"
     );
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: Vec::new(),
         events: Vec::new(),
@@ -2235,7 +2235,7 @@ async fn project_drains_depiction_and_subimage_edges() -> TestResult {
     let geometry = ImageGeometry::bbox(0.1, 0.2, 0.4, 0.5)?;
     let region = SubimageRegion::rect(0.0, 0.0, 0.5, 1.0)?;
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: vec![Decl::Local],
         events: Vec::new(),
@@ -2347,7 +2347,7 @@ async fn project_drains_depiction_and_subimage_edges() -> TestResult {
 async fn observed_image_does_not_leak_a_foreign_depiction() -> TestResult {
     let store = MemoryFactStore::new();
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: vec![Decl::Local, Decl::Local],
         events: Vec::new(),
@@ -2381,7 +2381,7 @@ async fn observed_image_does_not_leak_a_foreign_depiction() -> TestResult {
                     image: ImageIdx(0),
                     region: None,
                     observer: Observer::User {
-                        user: UserId::new("alice"),
+                        user: UserId::new("alice")?,
                         justification: None,
                     },
                 },
@@ -2458,7 +2458,7 @@ async fn project_entity_images_assembles_a_tile_per_depicted_image() -> TestResu
     // depicted by a third. The walk is entity-scoped, so entity 0's page carries
     // its two images only.
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: vec![Decl::Local, Decl::Local],
         events: Vec::new(),
@@ -2511,7 +2511,7 @@ async fn project_entity_images_walks_every_image_once_across_pages() -> TestResu
     // Two images depict one entity; limit=1 forces one image per page, so the
     // resume cursor must thread each image in exactly once and then terminate.
     let bundle: SubmitBundle<MemoryIds> = SubmitBundle {
-        author: CommitAuthor::User(UserId::new("alice")),
+        author: CommitAuthor::User(UserId::new("alice")?),
         recorded_at: fixed_time(),
         entities: vec![Decl::Local],
         events: Vec::new(),
