@@ -625,9 +625,10 @@ async fn test_chioggia_existence_after_demolition_conflict() -> TestResult {
     web_test(async |t| {
         t.goto_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1, 14.0)
             .await?;
-        // Demolished in 1623, so it is absent from the present-day map. Rewind
-        // into the disputed era — after the demolition, at the 1633 witness —
-        // where the cathedral is exactly the contested pin this test is about.
+        // Rewind into the disputed era — after the demolition, at the 1633
+        // witness — where the cathedral is exactly the contested pin this test is
+        // about. (The 1633 refounding refutes the 1623 demolition, so the pin
+        // draws contested at every later instant, the present day included.)
         t.set_time_slider_year(1633.0).await?;
         t.click_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1)
             .await?;

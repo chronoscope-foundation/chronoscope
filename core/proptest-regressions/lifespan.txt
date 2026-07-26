@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 0533b3abfcf7c9dfc923a6f8a202b8794fa187b5f06473bdb7e950ef55c9305d # shrinks to (demolition, sighting) = (UncertainDate(CanonicalRanges([TimeRange { earliest: Some(DateBound { date: 0001-01-01, precision: Year }), latest: Some(DateBound { date: 0001-01-01, precision: Year }) }])), UncertainDate(CanonicalRanges([TimeRange { earliest: Some(DateBound { date: 0002-01-01, precision: Year }), latest: None }]))), at = 0002-01-02
+cc 8fd7dc21dc54ad3a019e8ed83b6e9cb04be77505629c234f809a0922cb9c02ee # shrinks to ls = Lifespan { hull: Hull { lo: Some(0001-01-01), hi: Some(1642-12-31) }, live: LiveEdge(Some(1642-12-31)), birth: Floored(0001-01-01), death: Capped(0001-12-31) }, at = 1643-01-01
