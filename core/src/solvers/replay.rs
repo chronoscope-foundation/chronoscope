@@ -8,11 +8,11 @@
 //! law — and the rebuild when a cached entry is evicted.
 //!
 //! Callers are limited to that role: the homomorphism proptest, cache rebuild and
-//! eviction repair, a background consistency auditor, and the entity-detail
-//! endpoint, accepted for now because it reads one entity per request and moves to
-//! the maintained read when that lands. Anything else routing through `replay::`
-//! is a whole fan-in scan on a live request, so nothing here is re-exported into
-//! `solvers` — the explicit path is the signal.
+//! eviction repair, and a background consistency auditor. Today the tests are the
+//! whole list — every served verdict comes from the maintained projection, with
+//! the partial answer [`lifespan`] describes. Anything else routing through
+//! `replay::` is a whole fan-in scan on a live request, so nothing here is
+//! re-exported into `solvers` — the explicit path is the signal.
 
 use std::collections::BTreeSet;
 
@@ -35,6 +35,14 @@ use super::CitedEntity;
 /// that slot — which sees one entity's facts — can never reach it. Reaching it
 /// means walking the entity's whole depiction fan-in and projecting each
 /// artifact, which is what puts this fold here rather than on the read path.
+///
+/// This is therefore the complete existence answer and the slot is a partial
+/// one, which every read is served from today. Where a depiction outlives a
+/// claimed demolition the difference is a wrong verdict, not a narrower one:
+/// this fold refutes the claim and reads contested, while a marker reads absent
+/// from the claimed removal onward — reporting a building definitely gone while
+/// holding a photograph taken after it supposedly came down. Wiring the
+/// depiction fan-in into the maintained read is what fixes it.
 pub async fn lifespan<S, V>(
     entity: &CitedEntity<S::Ids>,
     view: &mut V,

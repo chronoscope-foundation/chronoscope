@@ -202,6 +202,13 @@ where
 /// construction starts each deny their own past, and the later one wins the
 /// floor. That distinction is gone by the time the claims have merged into a
 /// bracket, which is why this rides the raw fact.
+///
+/// So a claim whose slot consensus came out empty still folds here, with full
+/// force — including the existence it guarantees, which can refute a demolition.
+/// Rivals are alternatives under this reading, not a joint claim to be
+/// reconciled: a disputed sighting is still a source saying the entity stood,
+/// and the render says so by contesting the instant rather than by deciding it.
+/// Dropping the losing side would be the fold quietly picking a winner.
 fn lifespan_contribution<R: IdScheme>(assertion: &FactualAssertion<R>) -> Lifespan {
     match assertion {
         FactualAssertion::Construction { fact } => match fact {

@@ -329,6 +329,48 @@ impl TimeRange {
     }
 }
 
+/// A non-empty closed range of days — the window a timed query asks about,
+/// with an instant its degenerate `[T, T]` case ([`DayRange::at`]).
+///
+/// Certainly-dated, unlike [`TimeRange`]: a query names the days it wants,
+/// where a claim's endpoints carry precision and may be open. Non-empty by
+/// construction, which is what makes "does anything fall in this range"
+/// answerable — an inverted pair holds no instant, so every answer to it is
+/// vacuous, and callers that build one have a bug the boundary should surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DayRange {
+    start: NaiveDate,
+    end: NaiveDate,
+}
+
+impl DayRange {
+    /// The range `[start, end]`, both inclusive. Rejects an inverted pair.
+    pub fn new(start: NaiveDate, end: NaiveDate) -> Result<Self, DateError> {
+        if start > end {
+            return Err(DateError::InvertedRange);
+        }
+        Ok(Self { start, end })
+    }
+
+    /// The one-day range — asking a range question about an instant.
+    pub fn at(day: NaiveDate) -> Self {
+        Self {
+            start: day,
+            end: day,
+        }
+    }
+
+    /// The first day of the range.
+    pub fn start(self) -> NaiveDate {
+        self.start
+    }
+
+    /// The last day of the range, inclusive.
+    pub fn end(self) -> NaiveDate {
+        self.end
+    }
+}
+
 /// A date with uncertainty: a canonical union of disjoint [`TimeRange`]
 /// intervals, each interpreted as "an unknown instant in time lies somewhere
 /// in this interval".
@@ -1031,6 +1073,19 @@ mod tests {
             ),
             Err(DateError::InvertedRange),
         );
+        Ok(())
+    }
+
+    /// An inverted pair of days names no instant, so a query range built from
+    /// one can only give a vacuous answer. Rejecting it at the constructor is
+    /// what lets range predicates skip the emptiness case entirely.
+    #[test]
+    fn day_range_rejects_an_inverted_pair() -> TestResult {
+        assert_eq!(
+            DayRange::new(d(1940, 1, 1)?, d(1910, 1, 1)?),
+            Err(DateError::InvertedRange),
+        );
+        assert_eq!(DayRange::at(d(1940, 1, 1)?).end(), d(1940, 1, 1)?);
         Ok(())
     }
 

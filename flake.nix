@@ -50,7 +50,10 @@
         craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
 
         # Source filtering: Cargo sources + .proto (protobuf) + .sql (migrations)
-        # + .json (test fixtures, schemas) + .html/.css (web frontend).
+        # + .json (test fixtures, schemas) + .html/.css (web frontend)
+        # + proptest-regressions/*.txt. The last are the counterexamples proptest
+        # pins when a property fails; left out, the shrunk case that motivated a
+        # fix is replayed on every developer's machine and never in the gate.
         srcFilterBase =
           path: type:
           (craneLib.filterCargoSources path type)
@@ -58,7 +61,8 @@
           || (lib.hasSuffix ".sql" path)
           || (lib.hasSuffix ".json" path)
           || (lib.hasSuffix ".html" path)
-          || (lib.hasSuffix ".css" path);
+          || (lib.hasSuffix ".css" path)
+          || (lib.hasInfix "/proptest-regressions/" path && lib.hasSuffix ".txt" path);
 
         src = lib.cleanSourceWith {
           src = craneLib.path ./.;
