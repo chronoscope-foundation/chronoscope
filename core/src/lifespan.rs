@@ -24,26 +24,27 @@
 //! and no evidence reaches past it, so it keeps the tail off however late the
 //! record runs. Both travel together, since a source can name one while another
 //! names the other. Refuting is deliberately hard to earn. Evidence counts at the
-//! instant it *guarantees*, the earliest its date could name, so a vague claim
-//! testifies to no moment it merely might describe; it has to clear *every*
+//! instant it certainly *reaches*, the earliest its date could name, so a vague
+//! claim testifies to no moment it merely might describe; it has to clear *every*
 //! completion claimed, since a rival account of the removal that fits the record
 //! is still an account of it; and a completion never refutes another, because
 //! rival completions are alternatives and one must not discredit another.
 //!
 //! `Lifespan` is an opaque commutative-monoid lattice element: a downstream cache
 //! folds it through [`combine`](crate::algebra::monoid::CommutativeMonoid::combine)
-//! without reading its internals. The four axes are private; the trait surface is
-//! the whole contract. Each axis is its own bounded join, and no value reachable
-//! through that surface is incoherent: the sum types carry a date only where one
-//! exists, and the two conditions spanning axes — a guarantee inside the hull that
-//! affirms it, an ordered cap envelope — are enforced where a byte string enters.
+//! without reading its internals. The three axes are private; the trait surface is
+//! the whole contract. Every edge is an [`Edge`] — one boundary instant of a
+//! claim, at that claim's own precision — lifted into a sum whose fold identity
+//! is a variant rather than an absent date, so each axis's ±∞ is spelled rather
+//! than conventional. What is left to enforce where a byte string enters is the
+//! two orderings: the forward triple's, and the cap envelope's.
 
 use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::algebra::monoid::CommutativeMonoid;
-use crate::date::{DayRange, UncertainDate};
+use crate::date::{DayRange, Edge, UncertainDate};
 
 /// The existence verdict our assertions support at one instant — total and
 /// mutually exclusive over the timeline.
@@ -81,26 +82,89 @@ pub enum ExistenceState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SupportWindow {
-    /// No instant is supported. Nothing dates the entity, or its only evidence is
-    /// an open ray anchoring no forward edge — either way it can answer no
-    /// question about a moment, so it matches no timed query.
+    /// No instant is supported: nothing dates the entity, its evidence anchors
+    /// no forward edge, or the edges it does anchor name no stretch holding an
+    /// instant. However it arises, the entity can answer no question about a
+    /// moment, so it matches no timed query.
     Empty,
     /// The one stretch of instants the sources place the entity at.
     Span(SupportSpan),
 }
 
-/// A non-empty supported stretch: from [`SupportSpan::from`] through
-/// [`SupportSpan::through`], both inclusive. `through` absent runs forward
-/// without bound — the closed-world presumption that a built thing stands while
-/// no record of its removal stands unrefuted.
+/// Where a supported stretch begins: at a claim's own edge, or strictly past one
+/// on the forward presumption's tail.
 ///
-/// Ordered by construction. An inverted span would claim support over a stretch
-/// holding no instant, and the range predicates below — which read the two edges
-/// independently — would answer it as if it held every instant between them.
+/// The tail names the hull edge it runs past rather than that edge's successor.
+/// A successor is a day, so taking one would drop the precision the hull edge
+/// carries, and it need not exist at all — a hull ending 1 BCE-12-31 has no
+/// representable bound one day later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanStart {
+    /// Supported from this instant onward, inclusive.
+    AtOrAfter(Edge),
+    /// Supported from strictly after this instant — the presumption picking up
+    /// where the affirmed hull leaves off.
+    After(Edge),
+}
+
+impl SpanStart {
+    /// The first instant the stretch holds, absent when it begins past the last
+    /// day the calendar can name.
+    fn first(self) -> Option<NaiveDate> {
+        match self {
+            SpanStart::AtOrAfter(edge) => Some(edge.resolve()),
+            SpanStart::After(edge) => edge.resolve().succ_opt(),
+        }
+    }
+
+    /// Whether the stretch has begun by `at`.
+    fn begun_by(self, at: NaiveDate) -> bool {
+        self.first().is_some_and(|first| first <= at)
+    }
+}
+
+/// How far a [`SupportSpan`] reaches, and whether it holds the edge it runs from.
+///
+/// The presumption's tail is one variant rather than an exclusive start beside
+/// an absent end. The presumption is what makes the tail unbounded, so a tail
+/// that also ended would be a value no producer means; stating the two together
+/// leaves it unwritable and unspellable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum Extent {
+    /// Through this instant, inclusive — a removal on record ends the stretch.
+    Through(Edge),
+    /// Forward without bound, holding the edge it runs from.
+    Onward,
+    /// Forward without bound from strictly past that edge — the presumption
+    /// alone, where the hull it runs from affirms nothing.
+    OnwardPast,
+}
+
+/// A supported stretch: from one claim's edge — or from strictly past it, where
+/// the forward presumption picks up — to wherever the record ends it.
+///
+/// Non-empty by construction. The range predicates below read the two edges
+/// independently, so a stretch that ended before it began would answer as if it
+/// held every instant between them, and a tail beginning past the last
+/// representable day would have a caller emit a row for a span nothing matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct SupportSpan {
-    from: NaiveDate,
-    through: Option<NaiveDate>,
+    from: Edge,
+    extent: Extent,
+}
+
+/// Why an edge and an extent name no supported stretch. The two are kept apart
+/// because they are different statements about the value, and a reader that
+/// could not tell them apart could not tell either from a shape error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum SpanError {
+    /// The stretch ends before it begins.
+    #[error("a support span through {} ends before it starts at {}", .through.resolve(), .from.resolve())]
+    Inverted { from: Edge, through: Edge },
+    /// A presumed tail begins past the last day the calendar can name.
+    #[error("a support span beginning past {} runs off the end of the calendar", .from.resolve())]
+    PastTheCalendar { from: Edge },
 }
 
 impl<'de> Deserialize<'de> for SupportSpan {
@@ -111,41 +175,62 @@ impl<'de> Deserialize<'de> for SupportSpan {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Raw {
-            from: NaiveDate,
-            through: Option<NaiveDate>,
+            from: Edge,
+            extent: Extent,
         }
         let raw = Raw::deserialize(deserializer)?;
-        SupportSpan::new(raw.from, raw.through).ok_or_else(|| {
-            serde::de::Error::custom("support span ends before it starts, so it holds no instant")
-        })
+        SupportSpan::new(raw.from, raw.extent).map_err(serde::de::Error::custom)
     }
 }
 
 impl SupportSpan {
-    /// The span `[from, through]`, or `None` when the two are inverted.
-    fn new(from: NaiveDate, through: Option<NaiveDate>) -> Option<Self> {
-        through
-            .is_none_or(|t| from <= t)
-            .then_some(Self { from, through })
+    /// The stretch `from` and `extent` name, or the reason they name none —
+    /// each shape carrying its own way of holding no instant.
+    fn new(from: Edge, extent: Extent) -> Result<Self, SpanError> {
+        match extent {
+            Extent::Through(through) if from.resolve() > through.resolve() => {
+                Err(SpanError::Inverted { from, through })
+            }
+            Extent::OnwardPast if from.resolve().succ_opt().is_none() => {
+                Err(SpanError::PastTheCalendar { from })
+            }
+            _ => Ok(Self { from, extent }),
+        }
     }
 
-    /// The first supported instant.
-    pub fn from(self) -> NaiveDate {
-        self.from
+    /// Where support begins.
+    pub fn from(self) -> SpanStart {
+        match self.extent {
+            Extent::OnwardPast => SpanStart::After(self.from),
+            Extent::Through(_) | Extent::Onward => SpanStart::AtOrAfter(self.from),
+        }
     }
 
     /// The last supported instant, or `None` for the unbounded forward tail.
-    pub fn through(self) -> Option<NaiveDate> {
-        self.through
+    pub fn through(self) -> Option<Edge> {
+        match self.extent {
+            Extent::Through(through) => Some(through),
+            Extent::Onward | Extent::OnwardPast => None,
+        }
     }
 }
 
 impl SupportWindow {
-    /// Whether the sources place the entity at `at`.
+    /// The window `from` and `extent` name — [`Empty`](Self::Empty) when the two
+    /// hold no instant between them, which is what the classifier says there too.
+    fn spanning(from: Edge, extent: Extent) -> Self {
+        SupportSpan::new(from, extent).map_or(SupportWindow::Empty, SupportWindow::Span)
+    }
+
+    /// Whether the sources place the entity at `at`. A query names days, where a
+    /// claim carries precision, so the span's edges are compared at the days
+    /// they resolve to.
     pub fn contains(self, at: NaiveDate) -> bool {
         match self {
             SupportWindow::Empty => false,
-            SupportWindow::Span(span) => span.from <= at && span.through.is_none_or(|t| at <= t),
+            SupportWindow::Span(span) => {
+                span.from().begun_by(at) && span.through().is_none_or(|t| at <= t.resolve())
+            }
         }
     }
 
@@ -155,44 +240,279 @@ impl SupportWindow {
         match self {
             SupportWindow::Empty => false,
             SupportWindow::Span(span) => {
-                span.from <= range.end() && span.through.is_none_or(|t| range.start() <= t)
+                span.from().begun_by(range.end())
+                    && span.through().is_none_or(|t| range.start() <= t.resolve())
             }
         }
     }
 }
 
-/// The affirmed hull — the convex span every assertion vouches for. `None` on an
-/// edge is that side's fold identity (a bound the fold never anchored), so an
-/// un-anchored side yields to any present one under `combine`.
+/// The affirmed hull's lower edge — the earliest instant any assertion vouches
+/// for. This value's one min-join: `Unanchored` reads +∞, so a claim anchoring
+/// no lower edge yields to every claim that does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Hull {
-    lo: Option<NaiveDate>,
-    hi: Option<NaiveDate>,
+#[serde(rename_all = "snake_case")]
+enum EarliestEdge {
+    Unanchored,
+    At(Edge),
 }
 
-/// The deny-before axis: a construction's earliest possible start. `Floored(d)`
-/// denies every instant before `d`; `Open` (an un-anchored or absent start) denies
-/// nothing. `Open ⊑ Floored`, and joining two floors keeps the later — the rival
-/// claiming the latest start denies the most past.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum BirthBound {
-    Open,
-    Floored(NaiveDate),
+impl EarliestEdge {
+    /// Join: keep the earlier edge, since the hull spans every claim.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (EarliestEdge::Unanchored, edge) | (edge, EarliestEdge::Unanchored) => edge,
+            (EarliestEdge::At(a), EarliestEdge::At(b)) => EarliestEdge::At(a.earlier(b)),
+        }
+    }
+
+    /// The anchored edge, absent at the identity.
+    fn anchor(self) -> Option<Edge> {
+        match self {
+            EarliestEdge::At(edge) => Some(edge),
+            EarliestEdge::Unanchored => None,
+        }
+    }
 }
 
-/// The envelope of the dated completions on record — the earliest and the latest
-/// instant any of them places the removal at, equal when there is only one.
+/// An edge the fold pushes forward: `Unreached` reads −∞, so a claim reaching no
+/// instant yields to every claim that does, and two claims keep the later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ForwardEdge {
+    Unreached,
+    At(Edge),
+}
+
+impl ForwardEdge {
+    /// Join: keep the later edge.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (ForwardEdge::Unreached, edge) | (edge, ForwardEdge::Unreached) => edge,
+            (ForwardEdge::At(a), ForwardEdge::At(b)) => ForwardEdge::At(a.later(b)),
+        }
+    }
+
+    /// The anchored edge, absent at the identity.
+    fn anchor(self) -> Option<Edge> {
+        match self {
+            ForwardEdge::At(edge) => Some(edge),
+            ForwardEdge::Unreached => None,
+        }
+    }
+
+    /// Whether the edge reaches strictly past `cap` — a moment the claim ending
+    /// at `cap` cannot account for.
+    fn outlives(self, cap: NaiveDate) -> bool {
+        self.anchor().is_some_and(|edge| edge.resolve() > cap)
+    }
+}
+
+/// The three forward edges, ordered `floor ≤ reached ≤ affirmed` on the days
+/// they name.
+///
+/// They travel together because the ordering is a statement about all three at
+/// once, and every builder below emits them ordered from one date with no
+/// comparison. Componentwise max preserves that — max is monotone, and the
+/// tie-break chooses only among equal days — so the fold needs no check either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct Forward {
+    /// The deny-before edge: a construction's latest claimed start, which denies
+    /// every instant before it. The rival claiming the latest start denies the
+    /// most past.
+    floor: ForwardEdge,
+    /// The latest instant some assertion's moment is certainly at or after.
+    ///
+    /// An assertion's true moment lies somewhere in its date's range, so the
+    /// range's **earliest** edge is the one the moment certainly reaches —
+    /// everything past that is only where it *might* fall. A sighting in the
+    /// 1890s puts existence beyond doubt at no particular instant; what it
+    /// settles is that the entity was seen no earlier than 1890. A "before Y"
+    /// reaches nothing at all, its moment lying arbitrarily far back.
+    ///
+    /// This is the yardstick a demolition claim is measured against: an
+    /// assertion whose moment is certainly past every instant a completion is
+    /// claimed at refutes them and stops suppressing the presumption.
+    /// `demolition.completed` is the one slot held out of it — completions are
+    /// rivals, and one rival must never discredit another.
+    reached: ForwardEdge,
+    /// The affirmed hull's upper edge, and the anchor the forward presumption
+    /// runs from.
+    affirmed: ForwardEdge,
+}
+
+/// Which link of the forward chain a triple breaks, and the edges that break it.
+/// The two links are separate statements — a construction floors the past no
+/// later than its own evidence reaches, and evidence reaches no further than the
+/// hull it affirms — so a rejected value says which one it got wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum ForwardError {
+    /// A construction floors the past where no assertion reaches.
+    #[error("a construction floor at {} stands where no assertion reaches", .floor.resolve())]
+    FloorWithoutReach { floor: Edge },
+    /// A construction floors the past later than its own evidence reaches.
+    #[error("a construction floor at {} sits past the reached edge at {}", .floor.resolve(), .reached.resolve())]
+    FloorPastReach { floor: Edge, reached: Edge },
+    /// Evidence reaches an instant where the hull affirms nothing.
+    #[error("a reached edge at {} stands where the hull affirms nothing", .reached.resolve())]
+    ReachWithoutHull { reached: Edge },
+    /// Evidence reaches past the hull's upper edge.
+    #[error("a reached edge at {} sits past the affirmed hull's upper edge at {}", .reached.resolve(), .affirmed.resolve())]
+    ReachPastHull { reached: Edge, affirmed: Edge },
+}
+
+impl<'de> Deserialize<'de> for Forward {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            floor: ForwardEdge,
+            reached: ForwardEdge,
+            affirmed: ForwardEdge,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Forward::new(raw.floor, raw.reached, raw.affirmed).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Forward {
+    /// Nothing floored, reached or affirmed — the join identity.
+    const EMPTY: Forward = Forward {
+        floor: ForwardEdge::Unreached,
+        reached: ForwardEdge::Unreached,
+        affirmed: ForwardEdge::Unreached,
+    };
+
+    /// The triple, or the link that breaks on the days its edges name.
+    ///
+    /// The comparison is on `resolve()` days rather than on the sort key. An
+    /// assertion's lower bound may be finer than its upper one —
+    /// `[2000-12-31 (day), 2000 (year)]` is a legal date — and a witness of it
+    /// reaches an edge that ranks *above* the edge it sits under while naming
+    /// the same day. The chain is a claim about instants; the tie-break decides
+    /// only which tag survives a join.
+    fn new(
+        floor: ForwardEdge,
+        reached: ForwardEdge,
+        affirmed: ForwardEdge,
+    ) -> Result<Self, ForwardError> {
+        // −∞ sits under everything, itself included, so an unanchored lower edge
+        // clears its link whatever stands above it.
+        match (floor.anchor(), reached.anchor()) {
+            (Some(floor), None) => return Err(ForwardError::FloorWithoutReach { floor }),
+            (Some(floor), Some(reached)) if floor.resolve() > reached.resolve() => {
+                return Err(ForwardError::FloorPastReach { floor, reached });
+            }
+            _ => {}
+        }
+        match (reached.anchor(), affirmed.anchor()) {
+            (Some(reached), None) => {
+                return Err(ForwardError::ReachWithoutHull { reached });
+            }
+            (Some(reached), Some(affirmed)) if reached.resolve() > affirmed.resolve() => {
+                return Err(ForwardError::ReachPastHull { reached, affirmed });
+            }
+            _ => {}
+        }
+        Ok(Forward {
+            floor,
+            reached,
+            affirmed,
+        })
+    }
+
+    /// Join each edge on its own.
+    fn combine(self, other: Self) -> Self {
+        Forward {
+            floor: self.floor.combine(other.floor),
+            reached: self.reached.combine(other.reached),
+            affirmed: self.affirmed.combine(other.affirmed),
+        }
+    }
+}
+
+/// The earliest instant any completion on record places the removal at, past
+/// which existence is denied. Denying takes any one rival, so the earliest cap
+/// rules: it denies the most future. `Never` is +∞ — a removal named at no
+/// instant denies nothing — and the min-join's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DeniesAfter {
+    Never,
+    At(Edge),
+}
+
+impl DeniesAfter {
+    /// Join: keep the earlier cap.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (DeniesAfter::Never, cap) | (cap, DeniesAfter::Never) => cap,
+            (DeniesAfter::At(a), DeniesAfter::At(b)) => DeniesAfter::At(a.earlier(b)),
+        }
+    }
+
+    /// A dated completion denies every instant strictly after it.
+    fn denies(self, at: NaiveDate) -> bool {
+        matches!(self, DeniesAfter::At(cap) if at > cap.resolve())
+    }
+
+    /// The dated cap, absent at +∞.
+    fn anchor(self) -> Option<Edge> {
+        match self {
+            DeniesAfter::At(cap) => Some(cap),
+            DeniesAfter::Never => None,
+        }
+    }
+}
+
+/// The latest instant any completion on record places the removal at — the
+/// threshold our evidence has to reach past to refute the record. Refuting takes
+/// every rival at once, so the latest cap rules: evidence outliving only the
+/// earliest leaves the later claim an intact account of the removal. `Unbounded`
+/// is +∞ — a removal named at no instant is the latest completion there can be —
+/// and the max-join's annihilator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClaimedThrough {
+    Unbounded,
+    At(Edge),
+}
+
+impl ClaimedThrough {
+    /// Join: keep the later cap, and +∞ absorbs.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (ClaimedThrough::Unbounded, _) | (_, ClaimedThrough::Unbounded) => {
+                ClaimedThrough::Unbounded
+            }
+            (ClaimedThrough::At(a), ClaimedThrough::At(b)) => ClaimedThrough::At(a.later(b)),
+        }
+    }
+
+    /// The dated cap, absent at +∞.
+    fn anchor(self) -> Option<Edge> {
+        match self {
+            ClaimedThrough::At(cap) => Some(cap),
+            ClaimedThrough::Unbounded => None,
+        }
+    }
+}
+
+/// The deny-after axis, which also gates the forward presumption: the envelope
+/// of the completions on record, from the earliest instant one places the
+/// removal at to the latest.
 ///
 /// The two edges answer different questions because rival completions are
-/// *alternatives*, not joint claims. Denying takes any one of them, so the
-/// earliest cap rules: it denies the most future. Refuting takes all of them at
-/// once, so the latest cap rules: evidence that outlives only the earliest still
-/// leaves the later claim standing.
+/// *alternatives*, not joint claims, and they read +∞ oppositely — it never wins
+/// the earliest and always wins the latest. Ranked into one scalar, whichever
+/// end lost would take its question's answer with it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct CapEnvelope {
-    denies_after: NaiveDate,
-    claimed_through: NaiveDate,
+    denies_after: DeniesAfter,
+    claimed_through: ClaimedThrough,
 }
 
 impl<'de> Deserialize<'de> for CapEnvelope {
@@ -203,11 +523,20 @@ impl<'de> Deserialize<'de> for CapEnvelope {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Raw {
-            denies_after: NaiveDate,
-            claimed_through: NaiveDate,
+            denies_after: DeniesAfter,
+            claimed_through: ClaimedThrough,
         }
         let raw = Raw::deserialize(deserializer)?;
-        if raw.denies_after > raw.claimed_through {
+        let ordered = match (raw.denies_after.anchor(), raw.claimed_through.anchor()) {
+            // Both at +∞: the removal claimed at no nameable instant.
+            (None, None) => true,
+            // An earliest cap at +∞ beside a dated latest says nothing is dated
+            // and names the latest dated claim in the same breath.
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+            (Some(earliest), Some(latest)) => earliest.resolve() <= latest.resolve(),
+        };
+        if !ordered {
             return Err(serde::de::Error::custom(
                 "demolition cap envelope inverted: the earliest completion claimed is after the latest",
             ));
@@ -220,281 +549,141 @@ impl<'de> Deserialize<'de> for CapEnvelope {
 }
 
 impl CapEnvelope {
-    /// The envelope one completion claim spans on its own.
-    fn at(day: NaiveDate) -> Self {
-        Self {
-            denies_after: day,
-            claimed_through: day,
+    /// A removal claimed at no nameable instant — a start, a completion dated
+    /// only "after Y". It denies nothing and nothing outlives it.
+    const UNBOUNDED: CapEnvelope = CapEnvelope {
+        denies_after: DeniesAfter::Never,
+        claimed_through: ClaimedThrough::Unbounded,
+    };
+
+    /// The envelope one dated completion spans on its own.
+    fn at(cap: Edge) -> Self {
+        CapEnvelope {
+            denies_after: DeniesAfter::At(cap),
+            claimed_through: ClaimedThrough::At(cap),
         }
     }
 
     /// Join: widen to hold both claims, each edge keeping the rival that rules it.
     fn join(self, other: Self) -> Self {
-        Self {
-            denies_after: self.denies_after.min(other.denies_after),
-            claimed_through: self.claimed_through.max(other.claimed_through),
+        CapEnvelope {
+            denies_after: self.denies_after.combine(other.denies_after),
+            claimed_through: self.claimed_through.combine(other.claimed_through),
         }
     }
 }
 
-/// The deny-after axis, which also gates the forward presumption: the removals
-/// on record, split by whether they name an instant to be measured against.
+/// What the record holds about the entity's removal — the third join axis.
 ///
-/// A removal named at no instant — a start, a completion dated only "after Y" —
-/// is a completion at +∞. That is why the two channels stand side by side
-/// instead of in a chain: denying takes the *earliest* completion claimed, where
-/// +∞ never wins, and refuting has to clear the *latest*, where +∞ always does.
-/// Ranked into one scalar, whichever end lost would take its question's answer
-/// with it.
+/// Absence is a variant rather than an absent field. "No removal on record" is
+/// the reading that lets the presumption run forward without bound, and a stored
+/// value that simply left the axis out would be read as making that claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeathBound {
-    /// A removal claimed at +∞, which nothing our evidence guarantees is past.
-    unrefutable: bool,
-    /// The envelope of the dated completions, absent when none is on record.
-    caps: Option<CapEnvelope>,
+#[serde(rename_all = "snake_case")]
+enum Death {
+    /// Nothing on record claims a removal.
+    Unclaimed,
+    /// The removals on record, as one envelope.
+    Claimed(CapEnvelope),
 }
 
-/// The forward edge of *guaranteed* existence: the latest instant an assertion
-/// puts the entity beyond doubt at, `None` its −∞ fold identity.
-///
-/// An assertion's true moment lies somewhere in its date's range, so the range's
-/// **earliest** edge is the one it guarantees — everything past that is only where
-/// the moment *might* fall. A "before Y" guarantees nothing at all, since its
-/// moment may lie arbitrarily far back.
-///
-/// This is the yardstick a demolition claim is measured against: evidence
-/// guaranteed past every instant a completion is claimed at refutes them and stops
-/// suppressing the presumption. `demolition.completed` is the one slot held out of
-/// it — completions are rivals, and one rival must never discredit another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-struct LiveEdge(Option<NaiveDate>);
+impl Death {
+    /// Join: nothing claimed is the identity, and two records widen to hold both.
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Death::Unclaimed, death) | (death, Death::Unclaimed) => death,
+            (Death::Claimed(a), Death::Claimed(b)) => Death::Claimed(a.join(b)),
+        }
+    }
 
-/// The existence accumulator over four independent join axes: the affirmed `Hull`,
-/// the guaranteed-existence `LiveEdge`, the deny-before `BirthBound`, and the
-/// deny-after / presumption-gate `DeathBound`. Each axis is an idempotent
-/// semilattice, so `combine` is a commutative, associative, idempotent monoid
-/// operation and the whole value is a state-CRDT a cache can warm-start.
+    /// The envelope, absent while nothing claims a removal.
+    fn envelope(self) -> Option<CapEnvelope> {
+        match self {
+            Death::Claimed(caps) => Some(caps),
+            Death::Unclaimed => None,
+        }
+    }
+}
+
+/// The existence accumulator over three independent join axes: the affirmed
+/// hull's lower `EarliestEdge`, the ordered `Forward` triple, and the `Death`
+/// record that both denies the future and gates the presumption. Each axis is an
+/// idempotent semilattice, so `combine` is a commutative, associative, idempotent
+/// monoid operation and the whole value is a state-CRDT a cache can warm-start.
 ///
 /// The axes are the entire private state; the public contract is the trait surface
 /// ([`CommutativeMonoid`], `Serialize`/`Deserialize`, `Eq`) plus
 /// [`classify`](Self::classify). A caller reads existence through `classify`, not
 /// through the axes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Lifespan {
-    hull: Hull,
-    live: LiveEdge,
-    birth: BirthBound,
-    death: DeathBound,
-}
-
-impl<'de> Deserialize<'de> for Lifespan {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Raw {
-            hull: Hull,
-            live: LiveEdge,
-            birth: BirthBound,
-            death: DeathBound,
-        }
-        let raw = Raw::deserialize(deserializer)?;
-        // A guarantee is the earliest instant its date could name, and a
-        // construction's floor is the earliest instant of the range that same
-        // assertion affirms, so the fold lifts neither past `hull.hi`. Crossing
-        // either on the wire hands a denied instant a verdict the record does
-        // not carry: a guarantee past the hull reads presumed where a demolition
-        // denies, and a floor past it reads the entity's own affirmed years as a
-        // source disagreement.
-        let hull_hi = raw.hull.hi();
-        let within_affirmed_hull = |edge: Option<NaiveDate>| match (edge, hull_hi) {
-            (None, _) => true,
-            (Some(edge), Some(hi)) => edge <= hi,
-            (Some(_), None) => false,
-        };
-        if !within_affirmed_hull(raw.live.0) {
-            return Err(serde::de::Error::custom(
-                "lifespan guarantees existence past the hull it affirms",
-            ));
-        }
-        if !within_affirmed_hull(raw.birth.floor()) {
-            return Err(serde::de::Error::custom(
-                "lifespan floors its construction past the hull it affirms",
-            ));
-        }
-        Ok(Lifespan {
-            hull: raw.hull,
-            live: raw.live,
-            birth: raw.birth,
-            death: raw.death,
-        })
-    }
-}
-
-impl Hull {
-    /// The empty hull — both edges at their fold identity, so it defers to every
-    /// assertion and contains no instant on its own.
-    const EMPTY: Hull = Hull { lo: None, hi: None };
-
-    /// The affirmed hull an assertion contributes, direction-aware.
-    fn spanning(date: &UncertainDate) -> Hull {
-        let (lo, hi) = hull_edges(date);
-        Hull { lo, hi }
-    }
-
-    /// Join two hulls edge-wise. `None` is the fold identity on each side, but the
-    /// sides read it oppositely: `lo`'s `None` is +∞ (a min-fold), `hi`'s is −∞ (a
-    /// max-fold), so an unseen edge always yields to a present one.
-    fn combine(self, other: Self) -> Self {
-        Hull {
-            lo: min_bound(self.lo, other.lo),
-            hi: max_bound(self.hi, other.hi),
-        }
-    }
-
-    /// Whether `at` lies inside the affirmed span. A hull crossed by `combine`
-    /// (`lo > hi`) contains nothing, which is how a same-direction pair of open
-    /// claims reads as empty.
-    fn contains(self, at: NaiveDate) -> bool {
-        matches!((self.lo, self.hi), (Some(l), Some(h)) if l <= at && at <= h)
-    }
-
-    /// The upper edge — the forward-presumption anchor.
-    fn hi(self) -> Option<NaiveDate> {
-        self.hi
-    }
-
-    /// The lower edge — the earliest instant any assertion vouches for.
-    fn lo(self) -> Option<NaiveDate> {
-        self.lo
-    }
-}
-
-impl BirthBound {
-    /// Join: `Open` is the identity, and two floors keep the later start, which
-    /// denies the most past.
-    fn combine(self, other: Self) -> Self {
-        match (self, other) {
-            (BirthBound::Open, b) | (b, BirthBound::Open) => b,
-            (BirthBound::Floored(a), BirthBound::Floored(b)) => BirthBound::Floored(a.max(b)),
-        }
-    }
-
-    /// The floored start, absent when no construction anchored one.
-    fn floor(self) -> Option<NaiveDate> {
-        match self {
-            BirthBound::Floored(day) => Some(day),
-            BirthBound::Open => None,
-        }
-    }
-
-    /// A floored start denies every instant strictly before it.
-    fn denies(self, at: NaiveDate) -> bool {
-        matches!(self, BirthBound::Floored(d) if at < d)
-    }
-}
-
-impl DeathBound {
-    /// No removal on record — the join identity.
-    const OPEN: DeathBound = DeathBound {
-        unrefutable: false,
-        caps: None,
-    };
-
-    /// A removal claimed at no nameable instant.
-    const UNREFUTABLE: DeathBound = DeathBound {
-        unrefutable: true,
-        caps: None,
-    };
-
-    /// A completion claimed at `day`.
-    fn capped(day: NaiveDate) -> Self {
-        DeathBound {
-            unrefutable: false,
-            caps: Some(CapEnvelope::at(day)),
-        }
-    }
-
-    /// Join each channel on its own, so a dated completion arriving beside an
-    /// open-ended one leaves both on the record.
-    fn combine(self, other: Self) -> Self {
-        DeathBound {
-            unrefutable: self.unrefutable || other.unrefutable,
-            caps: match (self.caps, other.caps) {
-                (None, caps) | (caps, None) => caps,
-                (Some(a), Some(b)) => Some(a.join(b)),
-            },
-        }
-    }
-
-    /// A dated completion denies every instant strictly after it — the earliest
-    /// claimed, since one source ruling the instant out is enough.
-    fn denies(self, at: NaiveDate) -> bool {
-        self.caps.is_some_and(|caps| at > caps.denies_after)
-    }
-}
-
-impl LiveEdge {
-    /// The −∞ identity: nothing guarantees existence at any instant.
-    const NONE: LiveEdge = LiveEdge(None);
-
-    /// The edge an assertion guarantees — the earliest instant its date could
-    /// name. Its moment lies at or after that, so existence there is beyond
-    /// doubt, where the later edges of its range are only where the moment might
-    /// have fallen. An open-below date ("before Y") guarantees nothing.
-    fn guaranteed_by(date: &UncertainDate) -> Self {
-        LiveEdge(date.earliest())
-    }
-
-    /// Join: keep the later edge, since the furthest guarantee is the one a
-    /// demolition has to survive.
-    fn combine(self, other: Self) -> Self {
-        LiveEdge(max_bound(self.0, other.0))
-    }
-
-    /// Whether our evidence guarantees existence past `cap` — a moment the
-    /// demolition claiming to end at `cap` cannot account for.
-    fn outlives(self, cap: NaiveDate) -> bool {
-        self.0.is_some_and(|edge| edge > cap)
-    }
+    earliest: EarliestEdge,
+    forward: Forward,
+    death: Death,
 }
 
 impl Lifespan {
-    /// The empty accumulator: empty hull, no evidence edge, no start floor, no
-    /// demolition. Also the monoid identity.
+    /// The empty accumulator: nothing affirmed, nothing reached, no start
+    /// floor, no removal. Also the monoid identity.
     const EMPTY: Lifespan = Lifespan {
-        hull: Hull::EMPTY,
-        live: LiveEdge::NONE,
-        birth: BirthBound::Open,
-        death: DeathBound::OPEN,
+        earliest: EarliestEdge::Unanchored,
+        forward: Forward::EMPTY,
+        death: Death::Unclaimed,
     };
 
-    /// What any assertion contributes before its slot's own powers: it affirms
-    /// across its hull, and guarantees existence at that date's earliest edge.
-    /// Both read the one date the same way for every slot, so both are anchored
-    /// here and each slot below adds only what makes it that slot.
+    /// What any assertion contributes before its slot's own powers: the edges
+    /// its date alone supports, ordered by construction and with no comparison
+    /// taken. Every slot reads its date this way, so each one below adds only
+    /// what makes it that slot.
+    ///
+    /// The hull is direction-aware: a closed claim anchors both edges; a
+    /// backward-open "before Y" anchors only the lower (its closed edge `Y`); a
+    /// forward-open "after Y" only the upper. An un-anchored side stays at its
+    /// fold identity, so a lone or same-direction open leaves the hull empty for
+    /// free.
+    ///
+    /// The reach is the date's own earliest edge — the moment lies at or after
+    /// that, where the later edges of its range are only where it might have
+    /// fallen. That puts it at or below the affirmed edge in every shape:
+    /// [`crate::date::TimeRange`] orders a closed claim's two bounds, an
+    /// "after Y" collapses the two onto one edge, and a "before Y" reaches
+    /// nothing at all.
     fn asserting(date: &UncertainDate) -> Self {
+        let lo = date.earliest_bound().map(|bound| Edge::start(*bound));
+        let hi = date.latest_bound().map(|bound| Edge::end(*bound));
+        let (earliest, affirmed) = match (lo, hi) {
+            (Some(lo), Some(hi)) => (EarliestEdge::At(lo), ForwardEdge::At(hi)),
+            // "before Y": the closed upper edge anchors the lower hull.
+            (None, Some(hi)) => (EarliestEdge::At(hi), ForwardEdge::Unreached),
+            // "after Y": the closed lower edge anchors the upper hull.
+            (Some(lo), None) => (EarliestEdge::Unanchored, ForwardEdge::At(lo)),
+            (None, None) => (EarliestEdge::Unanchored, ForwardEdge::Unreached),
+        };
         Self {
-            hull: Hull::spanning(date),
-            live: LiveEdge::guaranteed_by(date),
-            birth: BirthBound::Open,
-            death: DeathBound::OPEN,
+            earliest,
+            forward: Forward {
+                floor: ForwardEdge::Unreached,
+                reached: lo.map_or(ForwardEdge::Unreached, ForwardEdge::At),
+                affirmed,
+            },
+            death: Death::Unclaimed,
         }
     }
 
     /// A `construction.started` assertion. Floors the deniable past at its earliest
     /// possible start; an open-lower start ("built before Y") floors nothing.
+    ///
+    /// The floor *is* the reach: both are the earliest instant this one date
+    /// could name, which is what keeps the triple ordered without a comparison.
     pub fn construction_started(date: UncertainDate) -> Self {
-        let birth = match date.earliest() {
-            Some(start) => BirthBound::Floored(start),
-            None => BirthBound::Open,
-        };
+        let asserted = Self::asserting(&date);
         Self {
-            birth,
-            ..Self::asserting(&date)
+            forward: Forward {
+                floor: asserted.forward.reached,
+                ..asserted.forward
+            },
+            ..asserted
         }
     }
 
@@ -511,7 +700,7 @@ impl Lifespan {
     /// across the years between the two.
     pub fn demolition_started(date: UncertainDate) -> Self {
         Self {
-            death: DeathBound::UNREFUTABLE,
+            death: Death::Claimed(CapEnvelope::UNBOUNDED),
             ..Self::asserting(&date)
         }
     }
@@ -520,19 +709,23 @@ impl Lifespan {
     /// possible completion; a completion dated only "after Y" names no instant to
     /// cap at, and is the removal at +∞ a start also claims.
     ///
-    /// The one slot that guarantees nothing: completions are rival hypotheses
-    /// about the same terminal event, so letting one guarantee existence at its
-    /// own date would let the later claim refute the earlier — two sources
-    /// agreeing the entity is gone, read as evidence that it survived.
+    /// The one slot that reaches nothing: completions are rival hypotheses
+    /// about the same terminal event, so letting one reach its own date would
+    /// let the later claim refute the earlier — two sources agreeing the entity
+    /// is gone, read as evidence that it survived.
     pub fn demolition_completed(date: UncertainDate) -> Self {
-        let death = match date.latest() {
-            Some(end) => DeathBound::capped(end),
-            None => DeathBound::UNREFUTABLE,
+        let death = match date.latest_bound() {
+            Some(bound) => CapEnvelope::at(Edge::end(*bound)),
+            None => CapEnvelope::UNBOUNDED,
         };
+        let asserted = Self::asserting(&date);
         Self {
-            live: LiveEdge::NONE,
-            death,
-            ..Self::asserting(&date)
+            forward: Forward {
+                reached: ForwardEdge::Unreached,
+                ..asserted.forward
+            },
+            death: Death::Claimed(death),
+            ..asserted
         }
     }
 
@@ -546,35 +739,56 @@ impl Lifespan {
     /// form of [`classify`](Self::classify)'s supported verdicts, for a caller
     /// that needs to *filter* by time rather than explain a single moment.
     ///
-    /// Contiguous by construction: the affirmed hull runs to `hull.hi` and the
-    /// presumption picks up immediately after it, so the two never leave a gap.
+    /// Contiguous by construction: the affirmed hull runs to its upper edge and
+    /// the presumption picks up immediately past it, so the two never leave a gap.
     /// An entity with no forward anchor supports nothing at all — that is the
     /// undated entity, and the reason a timed query cannot return one.
     pub fn support(&self) -> SupportWindow {
         // No forward anchor: neither the hull nor the presumption reaches an
         // instant, whatever the lower edge says.
-        let Some(hi) = self.hull.hi() else {
+        let Some(hi) = self.forward.affirmed.anchor() else {
             return SupportWindow::Empty;
         };
-        let presumes = self.presumes();
-        let span = match self.hull.lo() {
-            // A hull that contains something: supported from its lower edge, and
-            // onward without bound while the presumption runs.
-            Some(lo) if lo <= hi => SupportSpan::new(lo, (!presumes).then_some(hi)),
-            // The hull affirms nothing — unanchored below, or crossed by a
-            // same-direction pair of open claims — so only the forward
-            // presumption can support anything, and only past `hi`.
-            _ if presumes => hi.succ_opt().and_then(|from| SupportSpan::new(from, None)),
-            _ => None,
-        };
-        span.map_or(SupportWindow::Empty, SupportWindow::Span)
+        match (self.earliest.anchor(), self.presumes()) {
+            // A hull that contains something, running on without bound while the
+            // presumption does.
+            (Some(lo), true) if lo.resolve() <= hi.resolve() => {
+                SupportWindow::spanning(lo, Extent::Onward)
+            }
+            // A hull the record caps. Crossed by a same-direction pair of open
+            // claims it holds no instant, and nothing presumes past it.
+            (Some(lo), false) => SupportWindow::spanning(lo, Extent::Through(hi)),
+            // The hull affirms nothing — unanchored below, or crossed — so only
+            // the forward presumption can support anything, and only past `hi`.
+            (_, true) => SupportWindow::spanning(hi, Extent::OnwardPast),
+            (None, false) => SupportWindow::Empty,
+        }
+    }
+
+    /// Whether the affirmed hull vouches for `at`. A hull crossed by `combine` —
+    /// its lower edge past its upper — vouches for nothing, which is how a
+    /// same-direction pair of open claims reads as empty.
+    fn affirms(&self, at: NaiveDate) -> bool {
+        matches!(
+            (self.earliest.anchor(), self.forward.affirmed.anchor()),
+            (Some(lo), Some(hi)) if lo.resolve() <= at && at <= hi.resolve()
+        )
     }
 
     /// Whether an assertion rules existence at `at` impossible — the deny channel,
     /// which only a construction's earliest start and a demolition's latest
     /// completion feed.
     fn denies(&self, at: NaiveDate) -> bool {
-        self.birth.denies(at) || self.death.denies(at)
+        let before_every_start = self
+            .forward
+            .floor
+            .anchor()
+            .is_some_and(|floor| at < floor.resolve());
+        before_every_start
+            || self
+                .death
+                .envelope()
+                .is_some_and(|caps| caps.denies_after.denies(at))
     }
 
     /// Whether the forward closed-world presumption runs past the affirmed hull.
@@ -594,22 +808,29 @@ impl Lifespan {
     /// "after Y" — is the latest completion there can be, so a sighting however
     /// late is consistent with it and it suppresses whatever else the record holds.
     fn presumes(&self) -> bool {
-        !self.death.unrefutable
-            && self
-                .death
-                .caps
-                .is_none_or(|caps| self.live.outlives(caps.claimed_through))
+        match self.death {
+            Death::Unclaimed => true,
+            Death::Claimed(caps) => match caps.claimed_through {
+                ClaimedThrough::Unbounded => false,
+                ClaimedThrough::At(cap) => self.forward.reached.outlives(cap.resolve()),
+            },
+        }
     }
 
-    /// The existence verdict at `at`, derived from the four axes.
+    /// The existence verdict at `at`, derived from the three axes.
     pub fn classify(&self, at: NaiveDate) -> ExistenceState {
         let denied = self.denies(at);
-        let affirmed = self.hull.contains(at);
+        let affirmed = self.affirms(at);
         // Forward closed-world tail: with no standing demolition, existence
-        // persists past the last forward-anchoring evidence. The `Some(h)` guard
+        // persists past the last forward-anchoring evidence. The anchor guard
         // withholds a tail from a before-only or empty hull, which has no finite
         // forward anchor.
-        let presumed_reach = self.presumes() && self.hull.hi().is_some_and(|h| at > h);
+        let presumed_reach = self.presumes()
+            && self
+                .forward
+                .affirmed
+                .anchor()
+                .is_some_and(|hi| at > hi.resolve());
         let supported = affirmed || presumed_reach;
         // Partition on (denied, supported), then split the supported side by
         // whether the instant sits inside the affirmed hull.
@@ -631,52 +852,10 @@ impl CommutativeMonoid for Lifespan {
 
     fn combine(self, other: Self) -> Self {
         Self {
-            hull: self.hull.combine(other.hull),
-            live: self.live.combine(other.live),
-            birth: self.birth.combine(other.birth),
+            earliest: self.earliest.combine(other.earliest),
+            forward: self.forward.combine(other.forward),
             death: self.death.combine(other.death),
         }
-    }
-}
-
-/// The affirmed-hull edges an assertion contributes, direction-aware. A closed
-/// claim anchors both edges; a backward-open "before Y" anchors only the lower edge
-/// (its closed edge `Y`); a forward-open "after Y" only the upper. An un-anchored
-/// side stays `None` (its fold identity), so a lone or same-direction open leaves
-/// the hull empty for free.
-fn hull_edges(date: &UncertainDate) -> (Option<NaiveDate>, Option<NaiveDate>) {
-    let lo = date.earliest();
-    let hi = date.latest();
-    let hull_lo = match (lo, hi) {
-        // Forward-open or fully open: no lower anchor.
-        (_, None) => None,
-        (Some(l), Some(_)) => Some(l),
-        // "before Y": the closed upper edge anchors the lower hull.
-        (None, Some(h)) => Some(h),
-    };
-    let hull_hi = match (lo, hi) {
-        // Backward-open or fully open: no upper anchor.
-        (None, _) => None,
-        (Some(_), Some(h)) => Some(h),
-        // "after Y": the closed lower edge anchors the upper hull.
-        (Some(l), None) => Some(l),
-    };
-    (hull_lo, hull_hi)
-}
-
-/// Min of two lower bounds, `None` (+∞) the identity — the lower-hull join.
-fn min_bound(a: Option<NaiveDate>, b: Option<NaiveDate>) -> Option<NaiveDate> {
-    match (a, b) {
-        (None, x) | (x, None) => x,
-        (Some(a), Some(b)) => Some(a.min(b)),
-    }
-}
-
-/// Max of two upper bounds, `None` (−∞) the identity — the upper-hull join.
-fn max_bound(a: Option<NaiveDate>, b: Option<NaiveDate>) -> Option<NaiveDate> {
-    match (a, b) {
-        (None, x) | (x, None) => x,
-        (Some(a), Some(b)) => Some(a.max(b)),
     }
 }
 
@@ -751,6 +930,13 @@ mod tests {
             .fold(Lifespan::identity(), Lifespan::combine)
     }
 
+    /// The first day a span supports — its own edge, or the day after it for a
+    /// presumption tail. For the example tests, which are about the days a
+    /// record covers rather than the claims covering them.
+    fn supported_from(span: SupportSpan) -> Option<NaiveDate> {
+        span.from().first()
+    }
+
     // --- Matrix rows: the model's oracle across the state space ---
 
     #[test]
@@ -814,7 +1000,7 @@ mod tests {
         let SupportWindow::Span(span) = ls.support() else {
             return Err("the refuted pair supports the span it affirms".into());
         };
-        assert_eq!(span.from(), nd(1885, 1, 1)?);
+        assert_eq!(supported_from(span), Some(nd(1885, 1, 1)?));
         assert_eq!(span.through(), None);
         Ok(())
     }
@@ -860,7 +1046,7 @@ mod tests {
         Ok(())
     }
 
-    /// A vague date guarantees existence only at its earliest edge. "Built in the
+    /// A vague date reaches only its earliest edge. "Built in the
     /// 17th century" is consistent with a building finished in 1610 and gone by
     /// 1650, so it is no evidence against the demolition — reading the claim at
     /// the latest instant it could name would refute a demolition nothing
@@ -908,12 +1094,12 @@ mod tests {
         let SupportWindow::Span(span) = ls.support() else {
             return Err("the pair supports the span between the two claims".into());
         };
-        assert_eq!(span.through(), Some(nd(1980, 12, 31)?));
+        assert_eq!(span.through().map(Edge::resolve), Some(nd(1980, 12, 31)?));
         Ok(())
     }
 
     /// "Demolished sometime after 2000" names no instant to cap the future at, so
-    /// nothing our evidence guarantees is past it. A 1950 photograph is exactly
+    /// nothing our evidence reaches is past it. A 1950 photograph is exactly
     /// what that claim describes — a building still standing well before the
     /// removal — so it refutes nothing, and the 1940 rival's tail stands.
     #[test]
@@ -1032,6 +1218,22 @@ mod tests {
         assert_eq!(ls.classify(nd(1900, 1, 1)?), Absent);
         // No construction to deny the past, so before the demolition is unknown.
         assert_eq!(ls.classify(nd(1889, 12, 31)?), Unknown);
+        Ok(())
+    }
+
+    /// The 1890s reach a caller as the 1890s. A fold that resolved its edges to
+    /// days would answer "1899-12-31" to a reader asking whether the record says
+    /// the end of the decade or that exact date — the uncertainty-is-data
+    /// violation this accumulator sits at the centre of.
+    #[test]
+    fn a_vague_demolition_keeps_its_precision_on_the_support_edge() -> Res {
+        let ls = fold([Lifespan::demolition_completed(decade(1890)?)]);
+        let SupportWindow::Span(span) = ls.support() else {
+            return Err("a dated demolition supports the decade it affirms".into());
+        };
+        let through = span.through().ok_or("the removal caps the span")?;
+        assert_eq!(through.resolve(), nd(1899, 12, 31)?);
+        assert_eq!(through.bound().precision(), DatePrecision::Decade);
         Ok(())
     }
 
@@ -1246,25 +1448,51 @@ mod tests {
 
     // --- What a byte string may say ---
 
-    /// The wire form round-trips, and cannot say what the fold cannot reach. An
-    /// assertion guarantees existence no later than the hull edge it affirms to,
-    /// so a value claiming otherwise would answer "presumed" — a clean
-    /// soft-extant verdict — at instants a demolition denies.
-    #[test]
-    fn a_guarantee_past_the_affirmed_hull_is_rejected_on_the_wire() -> Res {
+    /// A bracketed lifespan, plus its wire form with one `forward` edge replaced.
+    /// Every rejection below is asserted by *reason*: a stale or misspelled key
+    /// trips `deny_unknown_fields` and leaves an `is_err()` assertion passing for
+    /// nothing.
+    fn forward_edge_replaced(
+        field: &str,
+        edge: ForwardEdge,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let ls = fold([
             Lifespan::construction_started(year(1900)?),
             Lifespan::demolition_completed(year(1950)?),
         ]);
-        let wire = serde_json::to_value(&ls)?;
+        let mut wire = serde_json::to_value(&ls)?;
         assert_eq!(serde_json::from_value::<Lifespan>(wire.clone())?, ls);
 
-        let mut crossed = wire;
-        let fields = crossed
-            .as_object_mut()
-            .ok_or("a lifespan serializes as an object")?;
-        fields.insert("live".into(), serde_json::to_value(nd(2000, 1, 1)?)?);
-        assert!(serde_json::from_value::<Lifespan>(crossed).is_err());
+        let forward = wire
+            .get_mut("forward")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or("a lifespan's forward triple serializes as an object")?;
+        forward.insert(field.into(), serde_json::to_value(edge)?);
+        Ok(wire)
+    }
+
+    fn year_edge(y: i32) -> Result<Edge, Box<dyn std::error::Error>> {
+        Ok(Edge::start(DateBound::new(
+            nd(y, 1, 1)?,
+            DatePrecision::Year,
+        )?))
+    }
+
+    /// The wire form round-trips, and cannot say what the fold cannot reach. An
+    /// assertion reaches no later than the hull edge it affirms to, so a value
+    /// claiming otherwise would answer "presumed" — a clean soft-extant verdict
+    /// — at instants a demolition denies.
+    #[test]
+    fn a_reach_past_the_affirmed_hull_is_rejected_on_the_wire() -> Res {
+        let crossed = forward_edge_replaced("reached", ForwardEdge::At(year_edge(2000)?))?;
+        let err = serde_json::from_value::<Lifespan>(crossed)
+            .err()
+            .ok_or("a reach past the affirmed hull is not a reachable fold")?;
+        assert!(
+            err.to_string()
+                .contains("sits past the affirmed hull's upper edge"),
+            "{err}"
+        );
         Ok(())
     }
 
@@ -1274,30 +1502,74 @@ mod tests {
     /// source disagreement with only one source in it.
     #[test]
     fn a_construction_floor_past_the_affirmed_hull_is_rejected_on_the_wire() -> Res {
-        let ls = fold([
-            Lifespan::construction_started(year(1900)?),
-            Lifespan::demolition_completed(year(1950)?),
-        ]);
-        let wire = serde_json::to_value(&ls)?;
-        assert_eq!(serde_json::from_value::<Lifespan>(wire.clone())?, ls);
+        let crossed = forward_edge_replaced("floor", ForwardEdge::At(year_edge(2000)?))?;
+        let err = serde_json::from_value::<Lifespan>(crossed)
+            .err()
+            .ok_or("a floor past the affirmed hull is not a reachable fold")?;
+        assert!(
+            err.to_string().contains("sits past the reached edge"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// A stored lifespan has to say what the record holds about the entity's
+    /// removal. Read as absent, a missing axis says "no removal on record" — the
+    /// reading under which `classify` presumes the entity standing past every
+    /// completion claimed and `support` runs its tail without bound.
+    #[test]
+    fn a_lifespan_missing_its_removal_axis_is_rejected_on_the_wire() -> Res {
+        let ls = fold([Lifespan::demolition_completed(year(1950)?)]);
+        let mut wire = serde_json::to_value(&ls)?;
+        let fields = wire
+            .as_object_mut()
+            .ok_or("a lifespan serializes as an object")?;
+        fields
+            .remove("death")
+            .ok_or("a lifespan records what the sources say about its removal")?;
+        let err = serde_json::from_value::<Lifespan>(wire)
+            .err()
+            .ok_or("a lifespan without a removal axis says nothing about its removal")?;
+        assert!(err.to_string().contains("missing field `death`"), "{err}");
+        Ok(())
+    }
+
+    /// The cap envelope's own corner: an earliest completion at +∞ beside a dated
+    /// latest one says nothing is dated and names the latest dated claim in the
+    /// same breath. Reachable only on the wire, and the guard that catches it is
+    /// what pays for `denies_after` and `claimed_through` reading +∞ oppositely.
+    #[test]
+    fn an_undated_cap_beside_a_dated_one_is_rejected_on_the_wire() -> Res {
+        let envelope = CapEnvelope::at(year_edge(1950)?);
+        let wire = serde_json::to_value(envelope)?;
+        assert_eq!(
+            serde_json::from_value::<CapEnvelope>(wire.clone())?,
+            envelope
+        );
 
         let mut crossed = wire;
         let fields = crossed
             .as_object_mut()
-            .ok_or("a lifespan serializes as an object")?;
+            .ok_or("a cap envelope serializes as an object")?;
         fields.insert(
-            "birth".into(),
-            serde_json::to_value(BirthBound::Floored(nd(2000, 1, 1)?))?,
+            "denies_after".into(),
+            serde_json::to_value(DeniesAfter::Never)?,
         );
-        assert!(serde_json::from_value::<Lifespan>(crossed).is_err());
+        let err = serde_json::from_value::<CapEnvelope>(crossed)
+            .err()
+            .ok_or("an undated earliest cap beside a dated latest is not a reachable fold")?;
+        assert!(err.to_string().contains("envelope inverted"), "{err}");
         Ok(())
     }
 
     /// A support window that ended before it began would report every instant
     /// between its two edges as supported, since the range predicates read the
-    /// edges independently.
+    /// edges independently. A tail beginning past the last day the calendar can
+    /// name is the other way a span holds nothing: no instant follows its edge,
+    /// so a reader branching on the variant would emit a row for a stretch
+    /// nothing can match.
     #[test]
-    fn an_inverted_support_span_is_rejected_on_the_wire() -> Res {
+    fn a_support_span_that_holds_no_instant_is_rejected_on_the_wire() -> Res {
         let window = fold([
             Lifespan::construction_started(year(1900)?),
             Lifespan::demolition_completed(year(1950)?),
@@ -1306,7 +1578,11 @@ mod tests {
         let wire = serde_json::to_value(window)?;
         assert_eq!(
             wire,
-            serde_json::json!({"kind": "span", "from": "1900-01-01", "through": "1950-12-31"}),
+            serde_json::json!({
+                "kind": "span",
+                "from": {"at": "1900-01-01", "precision": "year"},
+                "extent": {"through": {"at": "1950-12-31", "precision": "year"}},
+            }),
             "the span's edges sit beside the tag, not nested under it"
         );
         assert_eq!(
@@ -1314,12 +1590,47 @@ mod tests {
             window
         );
 
-        let mut inverted = wire;
-        let fields = inverted
+        let mut inverted = wire.clone();
+        inverted
             .as_object_mut()
-            .ok_or("a support window serializes as an object")?;
-        fields.insert("from".into(), serde_json::to_value(nd(1980, 1, 1)?)?);
-        assert!(serde_json::from_value::<SupportWindow>(inverted).is_err());
+            .ok_or("a support window serializes as an object")?
+            .insert("from".into(), serde_json::to_value(year_edge(1980)?)?);
+        let err = serde_json::from_value::<SupportWindow>(inverted)
+            .err()
+            .ok_or("an inverted span holds no instant")?;
+        assert!(err.to_string().contains("ends before it starts"), "{err}");
+
+        let last_day = Edge::start(DateBound::new(NaiveDate::MAX, DatePrecision::Day)?);
+        let past_the_calendar = serde_json::json!({
+            "kind": "span",
+            "from": serde_json::to_value(last_day)?,
+            "extent": "onward_past",
+        });
+        let err = serde_json::from_value::<SupportWindow>(past_the_calendar)
+            .err()
+            .ok_or("no instant follows the last day the calendar can name")?;
+        assert!(
+            err.to_string().contains("off the end of the calendar"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// The classifier presumes nothing past the last day the calendar can name,
+    /// and `support` agrees by answering with the variant that matches no timed
+    /// query. Handing back a span there would have a caller emit a row for a
+    /// stretch holding no instant, on a value whose own predicates say "no".
+    #[test]
+    fn a_tail_past_the_end_of_the_calendar_supports_nothing() -> Res {
+        let last_day = DateBound::new(NaiveDate::MAX, DatePrecision::Day)?;
+        // "After the last representable day" anchors only the upper hull, so
+        // nothing is affirmed and only the presumption could support anything.
+        let ls = fold([Lifespan::witness(UncertainDate::bounded(
+            Some(last_day),
+            None,
+        )?)]);
+        assert_eq!(ls.classify(NaiveDate::MAX), Unknown);
+        assert_eq!(ls.support(), SupportWindow::Empty);
         Ok(())
     }
 
@@ -1345,8 +1656,9 @@ mod tests {
     // at come out of one narrow window, drawn once per case. Sampled
     // independently over three millennia the instant sits far outside every
     // hull, where each law holds for the trivial reason and the edges the laws
-    // are actually about — `at == hull.hi`, `at == cap`, one day either side —
-    // are never reached at all. The window makes those collisions possible;
+    // are actually about — an instant on the affirmed hull's upper edge, on a
+    // demolition cap, one day either side — are never reached at all. The
+    // window makes those collisions possible;
     // `arb_instant_for`, which reads candidate days off the lifespan itself,
     // makes them routine.
     //
@@ -1517,10 +1829,10 @@ mod tests {
     }
 
     impl Slot {
-        /// Whether the slot vouches for existence at its own date — all of them
-        /// but the completion, held out so one rival account of a removal cannot
-        /// discredit another.
-        fn guarantees_existence(self) -> bool {
+        /// Whether the slot's moment is certainly at or after its own date's
+        /// earliest edge — all of them but the completion, held out so one rival
+        /// account of a removal cannot discredit another.
+        fn advances_the_reach(self) -> bool {
             match self {
                 Slot::ConstructionStarted
                 | Slot::ConstructionCompleted
@@ -1550,12 +1862,12 @@ mod tests {
             }
         }
 
-        /// Whether this slot's guarantee can refute a dated completion. It takes
-        /// vouching for existence *and* leaving a presumption for that evidence
-        /// to hand back: a started removal vouches while claiming a completion at
-        /// no instant, so its own evidence has nothing left to resume.
+        /// Whether this slot's reach can refute a dated completion. It takes
+        /// advancing the reach *and* leaving a presumption for that evidence to
+        /// hand back: a started removal reaches its own date while claiming a
+        /// completion at no instant, so it has nothing left to resume.
         fn can_refute(self) -> bool {
-            self.guarantees_existence() && !self.claims_a_removal()
+            self.advances_the_reach() && !self.claims_a_removal()
         }
 
         /// How often the chaotic generator draws this slot. `demolition.completed`
@@ -1712,8 +2024,8 @@ mod tests {
 
     /// What one assertion says on its own, before anything is joined: the span it
     /// vouches for, the two ways its own date can rule an instant out, whether it
-    /// claims a removal at no nameable instant, and the moment it puts existence
-    /// beyond doubt at.
+    /// claims a removal at no nameable instant, and the instant its own moment is
+    /// certainly at or after.
     ///
     /// Every question below is answered by joining one of these fields across the
     /// bag, each in the direction its own question wants — which is what keeps a
@@ -1727,14 +2039,14 @@ mod tests {
         cap: Option<NaiveDate>,
         /// A removal claimed past every instant, which no evidence can outlive.
         removal_at_no_instant: bool,
-        /// Existence here is beyond doubt.
+        /// This assertion's moment is certainly at or after here.
         guarantees: Option<NaiveDate>,
     }
 
     /// The model read off one assertion. A construction's start floors the past,
     /// a completion caps the future at the latest instant it could name, a removal
-    /// under way names no instant at all, and every slot but the completion
-    /// vouches for existence at the earliest moment its date could name.
+    /// under way names no instant at all, and every slot but the completion puts
+    /// its own moment at or after the earliest instant its date could name.
     fn contribution(assertion: &Assertion) -> Contribution {
         let date = &assertion.date;
         // What every slot contributes on the strength of its date alone.
@@ -1769,8 +2081,8 @@ mod tests {
     }
 
     /// Whether the forward presumption runs: a removal claimed at no instant holds
-    /// it off outright, and a dated completion holds it off until some assertion
-    /// guarantees existence past every instant one is claimed at — a completion the
+    /// it off outright, and a dated completion holds it off until some assertion's
+    /// moment is certainly past every instant one is claimed at — a completion the
     /// evidence does not reach is still an intact account of the removal.
     fn spec_presumes(parts: &[Contribution]) -> bool {
         if parts.iter().any(|p| p.removal_at_no_instant) {
@@ -1833,11 +2145,20 @@ mod tests {
                 days.extend(day.succ_opt());
             }
         };
-        push(ls.hull.lo());
-        push(ls.hull.hi());
-        push(ls.birth.floor());
-        push(ls.death.caps.map(|c| c.denies_after));
-        push(ls.death.caps.map(|c| c.claimed_through));
+        let mut push_edge = |edge: Option<Edge>| push(edge.map(Edge::resolve));
+        push_edge(ls.earliest.anchor());
+        push_edge(ls.forward.affirmed.anchor());
+        push_edge(ls.forward.floor.anchor());
+        push_edge(
+            ls.death
+                .envelope()
+                .and_then(|caps| caps.denies_after.anchor()),
+        );
+        push_edge(
+            ls.death
+                .envelope()
+                .and_then(|caps| caps.claimed_through.anchor()),
+        );
         days
     }
 
@@ -1849,15 +2170,15 @@ mod tests {
     fn affirmed_contested_days(ls: &Lifespan) -> Vec<NaiveDate> {
         boundary_days(ls)
             .into_iter()
-            .filter(|day| ls.hull.contains(*day) && ls.classify(*day) == Contested)
+            .filter(|day| ls.affirms(*day) && ls.classify(*day) == Contested)
             .collect()
     }
 
     /// An instant to read `ls` at: half from the shared window, half off `ls`'s
     /// own boundaries. The window alone makes a boundary collision *possible* —
     /// a bound's period end is one of ~20 years × 365 days — where reading the
-    /// day off the value makes it routine, which is what an assertion about
-    /// `at == hull.hi` needs to be worth writing.
+    /// day off the value makes it routine, which is what an assertion about the
+    /// instant sitting exactly on the hull's upper edge needs to be worth writing.
     fn arb_instant_for(base: i32, ls: &Lifespan) -> BoxedStrategy<NaiveDate> {
         let days = boundary_days(ls);
         if days.is_empty() {
@@ -1910,7 +2231,7 @@ mod tests {
         (arb_lifespan(), past_the_edge, ahead).prop_filter_map(
             "two representable instants past the affirmed hull",
             |(ls, past_the_edge, ahead)| {
-                let hi = ls.hull.hi()?;
+                let hi = ls.forward.affirmed.anchor()?.resolve();
                 let earlier = hi.checked_add_days(chrono::Days::new(past_the_edge))?;
                 let later = earlier.checked_add_days(chrono::Days::new(ahead))?;
                 Some((ls, earlier, later))
@@ -1995,15 +2316,15 @@ mod tests {
                     "the refuter's period begins past the demolition's",
                     |(mut days, precision, slot, open_below, open_above)| {
                         days.sort_unstable();
-                        let [from, capped, guaranteed, until] = days;
+                        let [from, capped, reached, until] = days;
                         let cap = DateBound::new(capped, precision).ok()?;
-                        let edge = DateBound::new(guaranteed, precision).ok()?;
+                        let edge = DateBound::new(reached, precision).ok()?;
                         if edge.period_start() <= cap.period_end() {
                             return None;
                         }
                         // A "before Y" demolition caps the future where a closed
-                        // one does and an "after Y" refuter guarantees what a
-                        // closed one guarantees, so both shapes belong here.
+                        // one does and an "after Y" refuter reaches what a closed
+                        // one reaches, so both shapes belong here.
                         let demolition = if open_below {
                             UncertainDate::bounded(None, Some(cap)).ok()?
                         } else {
@@ -2012,7 +2333,7 @@ mod tests {
                         let refuter = if open_above {
                             UncertainDate::bounded(Some(edge), None).ok()?
                         } else {
-                            closed_at(guaranteed, until, precision)?
+                            closed_at(reached, until, precision)?
                         };
                         Some((demolition, Assertion::new(slot, refuter)))
                     },
@@ -2026,6 +2347,40 @@ mod tests {
                     (Just(demolition), Just(refuter), at)
                 })
         })
+    }
+
+    /// The forward triple's ordering check reads resolved days, not the sort
+    /// key. `[2000-12-31 (day), 2000 (year)]` is a legal date — `TimeRange`
+    /// orders the lower bound's period *start* against the upper's period *end*
+    /// — and a witness of it reaches 2000-12-31 at day precision beneath a hull
+    /// edge naming that same day at year precision, so the key ranks the reach
+    /// above the edge it must sit under. `arb_udate_in` orders its closed-span
+    /// arm by period start and can never draw this shape, so the generated law
+    /// is blind to it.
+    #[test]
+    fn a_reach_finer_than_the_edge_above_it_stays_ordered() -> Res {
+        let date = UncertainDate::bounded(
+            Some(DateBound::new(nd(2000, 12, 31)?, DatePrecision::Day)?),
+            Some(DateBound::new(nd(2000, 1, 1)?, DatePrecision::Year)?),
+        )?;
+        let forward = Lifespan::witness(date).forward;
+        let reached = forward
+            .reached
+            .anchor()
+            .ok_or("a witness reaches its date's earliest instant")?;
+        let affirmed = forward
+            .affirmed
+            .anchor()
+            .ok_or("a closed witness affirms to its date's latest instant")?;
+
+        assert_eq!(reached.resolve(), affirmed.resolve());
+        assert_eq!(reached.bound().precision(), DatePrecision::Day);
+        assert_eq!(affirmed.bound().precision(), DatePrecision::Year);
+        // The key ranks the reach above the edge it sits under — the comparison
+        // a tightened check would use, and the value it would reject.
+        assert_eq!(reached.later(affirmed), reached);
+        assert!(Forward::new(forward.floor, forward.reached, forward.affirmed).is_ok());
+        Ok(())
     }
 
     // Structural associativity / commutativity / identity / idempotence of the
@@ -2063,63 +2418,84 @@ mod tests {
             prop_assert_eq!(Some(fold_bag(&bag).classify(at)), expected);
         }
 
-        /// A `demolition.completed` never advances the guaranteed edge. Rival
+        /// A `demolition.completed` never advances the reached edge. Rival
         /// completions are alternative accounts of one removal, so letting a
-        /// completion vouch for existence at its own date would let the later
+        /// completion's moment count as evidence of existence would let the later
         /// claim refute the earlier — two sources agreeing the entity is gone,
         /// read as evidence that it survived.
         #[test]
-        fn a_claimed_completion_never_advances_the_guaranteed_edge(
+        fn a_claimed_completion_never_advances_the_reached_edge(
             (ls, date, _) in arb_lifespan_date_and_instant(),
         ) {
             let folded = ls.clone().combine(Lifespan::demolition_completed(date));
-            prop_assert_eq!(folded.live, ls.live);
+            prop_assert_eq!(folded.forward.reached, ls.forward.reached);
         }
 
-        /// Every other slot advances the guaranteed edge to exactly the earliest
-        /// instant its date could name — the one instant the assertion puts
-        /// existence beyond doubt at or after. Reading a later edge would have a
-        /// claim vouch for a moment it only *might* describe: "built in the 17th
-        /// century" would testify to the year 1700.
+        /// Every other slot advances the reached edge to exactly the earliest
+        /// instant its date could name — the latest instant its moment is
+        /// certainly at or after. Reading a later edge would have a claim vouch
+        /// for a moment it only *might* describe: "built in the 17th century"
+        /// would testify to the year 1700.
+        ///
+        /// Compared as edges rather than as days, so it also pins which claim's
+        /// precision survives when the two name the same instant.
         #[test]
-        fn a_standing_assertion_guarantees_its_earliest_instant(
+        fn a_standing_assertion_reaches_its_earliest_instant(
             (ls, date, _) in arb_lifespan_date_and_instant(),
         ) {
-            let expected = match (ls.live.0, date.earliest()) {
+            let arriving = date.earliest_bound().map(|bound| Edge::start(*bound));
+            let expected = match (ls.forward.reached.anchor(), arriving) {
                 (edge, None) | (None, edge) => edge,
-                (Some(held), Some(arriving)) => Some(held.max(arriving)),
+                (Some(held), Some(arriving)) => Some(held.later(arriving)),
             };
-            for slot in slots(Slot::guarantees_existence) {
+            for slot in slots(Slot::advances_the_reach) {
                 let folded = ls
                     .clone()
                     .combine(Assertion::new(slot, date.clone()).fold_in());
-                prop_assert_eq!(folded.live.0, expected, "{:?}", slot);
+                prop_assert_eq!(folded.forward.reached.anchor(), expected, "{:?}", slot);
             }
         }
 
-        /// A `demolition.started` guarantees existence at its own date, and no
-        /// verdict can tell. The guaranteed edge is read in one place — against
-        /// the completions a record dates — and a start in the bag has already
-        /// withdrawn the presumption before that reading happens, so the two
-        /// folds, one where a started removal vouches for its date and one where
-        /// it vouches for nothing, classify and support every instant alike.
+        /// A `demolition.started` advances the reach to its own date's earliest
+        /// edge, and no verdict can tell. The reached edge is read in one place —
+        /// against the completions a record dates — and a start in the bag has
+        /// already withdrawn the presumption before that reading happens, so the
+        /// two folds, one where a started removal advances the reach and one
+        /// where it advances nothing, classify and support every instant alike.
         ///
         /// The edge is kept because it is what the slot means: a removal beginning
         /// in 1980 places the entity standing in 1980. That reading is what
-        /// `a_standing_assertion_guarantees_its_earliest_instant` pins, and the two
+        /// `a_standing_assertion_reaches_its_earliest_instant` pins, and the two
         /// folds are distinguishable by `==` and on the wire — this law is about
         /// the verdicts alone.
         #[test]
-        fn a_started_removals_guarantee_reaches_no_verdict(
+        fn a_started_removals_reach_changes_no_verdict(
             (bag, at) in arb_bag_and_instant(),
         ) {
-            let muted = fold(bag.iter().map(|assertion| match assertion.slot {
-                Slot::DemolitionStarted => Lifespan {
-                    live: LiveEdge::NONE,
-                    ..assertion.fold_in()
-                },
-                _ => assertion.fold_in(),
-            }));
+            let muted = bag
+                .iter()
+                .map(|assertion| {
+                    let ls = assertion.fold_in();
+                    match assertion.slot {
+                        // Only a construction floors, so a started removal's
+                        // floor is already at the identity and the muted triple
+                        // stays ordered.
+                        Slot::DemolitionStarted => Forward::new(
+                            ls.forward.floor,
+                            ForwardEdge::Unreached,
+                            ls.forward.affirmed,
+                        )
+                        .map(|forward| Lifespan { forward, ..ls }),
+                        _ => Ok(ls),
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    TestCaseError::fail(format!(
+                        "muting a started removal's reach keeps the triple ordered: {e}"
+                    ))
+                })?;
+            let muted = fold(muted);
             let folded = fold_bag(&bag);
             prop_assert_eq!(folded.classify(at), muted.classify(at));
             prop_assert_eq!(folded.support(), muted.support());
@@ -2127,15 +2503,15 @@ mod tests {
 
         /// The presumption survives a demolition exactly when every removal on
         /// record names an instant and some assertion outside the completion slot
-        /// guarantees existence strictly past all of them. Each clause answers a
-        /// way the rule goes wrong: measured against the *earliest* cap, a sighting
-        /// between two disputed demolition years strips suppression the later claim
-        /// still accounts for; read off an assertion's *latest* edge, a vague
+        /// reaches strictly past all of them. Each clause answers a way the rule
+        /// goes wrong: measured against the *earliest* cap, a sighting between two
+        /// disputed demolition years strips suppression the later claim still
+        /// accounts for; read off an assertion's *latest* edge, a vague
         /// construction refutes a demolition falling inside its own range; ranked
         /// against the dated caps, a removal claimed at no instant is refuted by
         /// the very evidence it describes.
         #[test]
-        fn refutation_takes_a_guarantee_past_every_claimed_completion(
+        fn refutation_takes_a_reach_past_every_claimed_completion(
             (bag, _) in arb_bag_and_instant(),
         ) {
             prop_assert_eq!(fold_bag(&bag).presumes(), spec_presumes(&contributions(&bag)));
@@ -2197,9 +2573,9 @@ mod tests {
         #[test]
         fn affirmation_is_monotone_under_combine(
             (a, b, at) in arb_two_lifespans_and_instant()
-                .prop_filter("the hull affirms the instant", |(a, _, at)| a.hull.contains(*at)),
+                .prop_filter("the hull affirms the instant", |(a, _, at)| a.affirms(*at)),
         ) {
-            prop_assert!(a.combine(b).hull.contains(at));
+            prop_assert!(a.combine(b).affirms(at));
         }
 
         /// A denial never withdraws: a source that rules an instant out keeps
@@ -2223,7 +2599,7 @@ mod tests {
         /// `a_later_demolition_claim_settles_a_refuted_tail`. A contested instant
         /// past the hull rests on a *refuted* demolition, and refutation is not
         /// monotone: a completion claimed later than anything our evidence
-        /// guarantees accounts for the whole record instead of contradicting it,
+        /// reaches accounts for the whole record instead of contradicting it,
         /// and the tail becomes a verdict again.
         #[test]
         fn contested_is_absorbing_where_the_hull_affirms(
@@ -2309,12 +2685,43 @@ mod tests {
                 Lifespan::demolition_completed(demolition),
                 refuter.fold_in(),
             ]);
-            let below_the_refuters_floor =
-                refuter.slot.floors_the_past() && ls.hull.lo().is_some_and(|lo| at < lo);
+            let below_the_refuters_floor = refuter.slot.floors_the_past()
+                && ls.earliest.anchor().is_some_and(|lo| at < lo.resolve());
             prop_assert_eq!(ls.classify(at) == Absent, below_the_refuters_floor);
-            if ls.hull.hi().is_some_and(|hi| at > hi) {
+            if ls.forward.affirmed.anchor().is_some_and(|hi| at > hi.resolve()) {
                 prop_assert_eq!(ls.classify(at), Contested);
             }
+        }
+
+        /// Every slot emits an ordered forward triple, from one date, with no
+        /// comparison taken. That is what lets the builders skip the checked
+        /// constructor: a fallible constructor on an infallible path would
+        /// manufacture an error case the input cannot produce, so the ordering
+        /// is a claim about the builders rather than about the one path that
+        /// checks.
+        #[test]
+        fn every_slot_emits_an_ordered_forward_triple(date in windowed(arb_udate_in)) {
+            for slot in Slot::iter() {
+                let forward = Assertion::new(slot, date.clone()).fold_in().forward;
+                prop_assert!(
+                    Forward::new(forward.floor, forward.reached, forward.affirmed).is_ok(),
+                    "{:?} {:?}", slot, forward,
+                );
+            }
+        }
+
+        /// A folded lifespan survives the round trip. The two hand-built wire
+        /// tests below check one value each; with three validated leaves standing
+        /// between the fold and the wire, the failure mode is a value the fold
+        /// can build and the reader rejects, and only a property over the
+        /// generator finds it.
+        #[test]
+        fn a_folded_lifespan_round_trips_on_the_wire(ls in arb_lifespan()) {
+            let wire = serde_json::to_value(&ls)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let read: Lifespan = serde_json::from_value(wire)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            prop_assert_eq!(read, ls);
         }
 
         /// Order- and duplicate-independence: the fold is the same under any

@@ -69,7 +69,18 @@ pub enum DateError {
 /// Determines the granularity of a [`DateBound`]. A bound with `Year` precision
 /// represents a boundary at year granularity: "1927" spans Jan 1 – Dec 31.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DatePrecision {
@@ -119,11 +130,18 @@ impl DateBound {
         if date.year() == 0 {
             return Err(DateError::Year0);
         }
-        let snapped = snap_to_precision_start(date, precision);
-        Ok(Self {
-            date: snapped,
+        Ok(Self::snapped(date, precision))
+    }
+
+    /// The period `date` falls in, taking the year on trust. [`Edge`] holds a
+    /// day the year-0 check has already passed, so reconstructing its bound
+    /// through the checked constructor would carry a `Result` no caller can act
+    /// on.
+    fn snapped(date: NaiveDate, precision: DatePrecision) -> Self {
+        Self {
+            date: snap_to_precision_start(date, precision),
             precision,
-        })
+        }
     }
 
     /// The first day of this bound's precision period.
@@ -757,6 +775,125 @@ fn finest_high(
     (day, std::cmp::Reverse(precision))
 }
 
+/// One instant, at the granularity of the claim that names it — which is what
+/// keeps "the 1890s" distinguishable from 31 December 1899 all the way to the
+/// reader.
+///
+/// This is [`DateBound`] without the snapping, and the two stay apart because
+/// they denote different things. A `DateBound` denotes a *period* — "the year
+/// 2000" — snapped to that period's start, which is what makes same-precision
+/// bounds partition the timeline. An `Edge` denotes a single instant: one
+/// boundary of such a period, taken as a comparison point. Snapping an `Edge`
+/// would erase which end of its claim it names, and that is the whole of what
+/// it carries; standing in for a `DateBound` the other way would need a runtime
+/// guard turning away end-edges at every site that means a period.
+///
+/// `at` is a boundary of its own precision's period and nothing in between, so
+/// a day-precision claim — whose period begins and ends on one day — is one
+/// value rather than two spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+pub struct Edge {
+    at: NaiveDate,
+    precision: DatePrecision,
+}
+
+/// Why a day and a precision name no [`Edge`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+enum EdgeError {
+    /// The day sits inside its period, so it bounds no claim.
+    #[error("{at} is neither end of its {precision:?} period")]
+    MidPeriod {
+        /// The day, as supplied.
+        at: NaiveDate,
+        /// The precision it was claimed at.
+        precision: DatePrecision,
+    },
+    /// The day falls in a period no [`DateBound`] can name.
+    #[error(transparent)]
+    Period(#[from] DateError),
+}
+
+impl<'de> Deserialize<'de> for Edge {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            at: NaiveDate,
+            precision: DatePrecision,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Edge::new(raw.at, raw.precision).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Edge {
+    /// The edge `at` names at `precision`, or the reason it names none — the
+    /// check a byte string has to pass, where [`start`](Self::start) and
+    /// [`end`](Self::end) read their day straight off period arithmetic.
+    fn new(at: NaiveDate, precision: DatePrecision) -> Result<Self, EdgeError> {
+        let period = DateBound::new(at, precision)?;
+        if at != period.period_start() && at != period.period_end() {
+            return Err(EdgeError::MidPeriod { at, precision });
+        }
+        Ok(Self { at, precision })
+    }
+
+    /// The instant `bound`'s period begins at.
+    pub fn start(bound: DateBound) -> Self {
+        Edge {
+            at: bound.period_start(),
+            precision: bound.precision(),
+        }
+    }
+
+    /// The instant `bound`'s period ends at.
+    pub fn end(bound: DateBound) -> Self {
+        Edge {
+            at: bound.period_end(),
+            precision: bound.precision(),
+        }
+    }
+
+    /// The claim this edge bounds. Period arithmetic is 1-based on both sides
+    /// of the era seam, so neither end ever lands in year 0 and the snap back
+    /// cannot fail.
+    pub fn bound(self) -> DateBound {
+        DateBound::snapped(self.at, self.precision)
+    }
+
+    /// The day this edge names.
+    pub fn resolve(self) -> NaiveDate {
+        self.at
+    }
+
+    /// The later of two edges, the finest precision winning an equal day, so a
+    /// max-fold keeps the sharpest tag on the instant it selects.
+    pub fn later(self, other: Self) -> Self {
+        *std::cmp::max_by_key(&self, &other, |edge| finest_high(edge.key()))
+    }
+
+    /// The earlier of two edges. `Day` is the smallest [`DatePrecision`], so the
+    /// min keeps the finest tag on an equal day for free.
+    pub fn earlier(self, other: Self) -> Self {
+        *std::cmp::min_by_key(&self, &other, |edge| edge.key())
+    }
+
+    /// The key both selections above rank on: the day named, then the precision
+    /// it was claimed at. [`earlier`](Self::earlier) takes it as it stands and
+    /// [`later`](Self::later) reverses the precision, which is how the finest
+    /// precision wins an equal day in both directions.
+    ///
+    /// It is the value's own two fields, so no two edges share one — which is
+    /// what keeps both selections commutative under structural equality, since
+    /// each returns a fixed argument on a tie.
+    fn key(self) -> (NaiveDate, DatePrecision) {
+        (self.at, self.precision)
+    }
+}
+
 /// Tighten (for meet): `Some` wins over `None`. Picks the more restrictive bound.
 fn tighten_earliest(a: &Option<DateBound>, b: &Option<DateBound>) -> Option<DateBound> {
     match (a, b) {
@@ -888,6 +1025,7 @@ mod tests {
     use super::*;
     use crate::algebra::lattice::{JoinSemilattice, MeetSemilattice};
     use proptest::prelude::*;
+    use strum::IntoEnumIterator;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -1651,6 +1789,86 @@ mod tests {
         )?;
         assert_ne!(year_form, day_form);
         assert!(date_denotes_same(&year_form, &day_form));
+        Ok(())
+    }
+
+    // --- Edge ---
+
+    /// Both ends of every precision's period, over five millennia and across the
+    /// era seam. Two claims about the arithmetic ride on this, and neither is
+    /// local enough to settle at a single date: no period end lands in year 0,
+    /// which is what lets [`Edge::bound`] snap without a check, and the snap
+    /// back lands on the bound the edge bounds.
+    #[test]
+    fn a_periods_two_ends_snap_back_to_their_own_bound() -> TestResult {
+        for year in (-2500..=2500).filter(|y| *y != 0) {
+            for precision in DatePrecision::iter() {
+                let bound = DateBound::new(d(year, 6, 15)?, precision)?;
+                for edge in [Edge::start(bound), Edge::end(bound)] {
+                    assert_ne!(edge.resolve().year(), 0, "{bound:?}");
+                    assert_eq!(edge.bound(), bound, "{bound:?}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A day period begins and ends on one day, so its two constructors
+    /// converge on one value — the collapse that keeps a day-precision claim
+    /// from having two spellings, and with it the injectivity both edge
+    /// selections rest on. Every coarser period spans more than a day and keeps
+    /// its ends apart.
+    #[test]
+    fn only_a_day_precision_claim_has_a_single_edge() -> TestResult {
+        for precision in DatePrecision::iter() {
+            let bound = DateBound::new(d(1927, 6, 15)?, precision)?;
+            assert_eq!(
+                Edge::start(bound) == Edge::end(bound),
+                precision == DatePrecision::Day,
+                "{precision:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Two plain fields, which is what lets the schema be derived; an end edge
+    /// names the last day of its period.
+    #[test]
+    fn an_edge_is_a_day_and_a_precision_on_the_wire() -> TestResult {
+        let edge = Edge::end(DateBound::new(d(1890, 1, 1)?, DatePrecision::Decade)?);
+        let wire = serde_json::to_value(edge)?;
+        assert_eq!(
+            wire,
+            serde_json::json!({"at": "1899-12-31", "precision": "decade"})
+        );
+        assert_eq!(serde_json::from_value::<Edge>(wire)?, edge);
+        Ok(())
+    }
+
+    /// An edge is one *boundary* of a claim, so a day in the period's interior
+    /// bounds nothing. Only the wire can say it, and a value that did would have
+    /// [`Edge::bound`] hand back a period the day is not an end of.
+    #[test]
+    fn a_day_inside_its_period_is_rejected_on_the_wire() -> TestResult {
+        let err = serde_json::from_str::<Edge>(r#"{"at":"1927-06-15","precision":"year"}"#)
+            .err()
+            .ok_or("a mid-period day bounds no claim")?;
+        assert!(
+            err.to_string().contains("neither end of its Year period"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    /// Year 0 is the other way the wire could hand [`Edge::bound`] a period no
+    /// [`DateBound`] can name, and the reason the checked constructor goes
+    /// through [`DateBound::new`].
+    #[test]
+    fn an_edge_in_year_0_is_rejected_on_the_wire() -> TestResult {
+        let err = serde_json::from_str::<Edge>(r#"{"at":"0000-01-01","precision":"year"}"#)
+            .err()
+            .ok_or("year 0 names no period")?;
+        assert!(err.to_string().contains("year 0 does not exist"), "{err}");
         Ok(())
     }
 
