@@ -129,7 +129,8 @@
             src
             ;
           # Native (non-wasm) crane bits for the host-target `web-native-test`
-          # check — the wasm pipeline can't run the crate's plain #[test]s.
+          # and `web-native-clippy` checks, which run and lint the crate's plain
+          # #[test]s. The wasm pipeline covers only what ships.
           rustCommonArgs = rust.commonArgs;
         };
 

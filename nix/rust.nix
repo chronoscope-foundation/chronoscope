@@ -53,10 +53,14 @@ let
     cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { CARGO_PROFILE = "test"; });
   };
 
+  # `browser-tests` gates `dev/tests/web.rs` into existence, so lint coverage of
+  # that target has to opt in the same way the `web-test` run does. The feature
+  # adds no dependencies, so it costs one more test target to lint, not a wider
+  # dependency graph.
   clippy = craneLib.cargoClippy (
     checkArgs
     // {
-      cargoClippyExtraArgs = "--all-targets -- -D warnings";
+      cargoClippyExtraArgs = "--all-targets --features chronoscope-dev/browser-tests -- -D warnings";
     }
   );
 

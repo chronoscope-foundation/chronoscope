@@ -119,6 +119,7 @@ check target="all":
                 ".#checks.$SYS.web-test-build" \
                 ".#checks.$SYS.web-clippy" \
                 ".#checks.$SYS.web-native-test" \
+                ".#checks.$SYS.web-native-clippy" \
                 --no-link
             ;;
         triton)
@@ -229,17 +230,27 @@ clippy target="all":
     {{ _nix_reexec_for_target }}
     _ensure_nix
     _nix_reexec_for_target clippy "{{ target }}"
+    # Two passes over chronoscope-web, mirroring the `web-clippy` and
+    # `web-native-clippy` flake checks: wasm32 covers what ships, and the host
+    # pass is where `--all-targets` reaches the crate's test code.
+    # `chronoscope-dev/browser-tests` gates `dev/tests/web.rs` into existence,
+    # so clippy only sees that target with the feature on.
     case "{{ target }}" in
         all)
-            cargo clippy --all-targets -- -D warnings
+            cargo clippy --all-targets --features chronoscope-dev/browser-tests -- -D warnings
             cargo clippy -p chronoscope-web --target wasm32-unknown-unknown -- -D warnings
+            cargo clippy -p chronoscope-web --all-targets -- -D warnings
             (cd analysis/triton && ruff check .)
             ;;
         rust)
-            cargo clippy --all-targets -- -D warnings
+            cargo clippy --all-targets --features chronoscope-dev/browser-tests -- -D warnings
             ;;
         web)
             cargo clippy -p chronoscope-web --target wasm32-unknown-unknown -- -D warnings
+            cargo clippy -p chronoscope-web --all-targets -- -D warnings
+            ;;
+        dev)
+            cargo clippy -p chronoscope-dev --all-targets --features browser-tests -- -D warnings
             ;;
         triton)
             cd analysis/triton && ruff check .

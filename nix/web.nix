@@ -156,9 +156,11 @@ let
     wasmBuild = wasmBuildTest;
   };
 
-  # Clippy against the wasm32 target with -D warnings. The workspace-level
-  # `clippy` check uses default-members, which excludes chronoscope-web.
-  # Without this, web-side lint regressions slip past `nix flake check`.
+  # Clippy against the wasm32 target with -D warnings, covering the code that
+  # ships in the bundle. The workspace-level `clippy` check uses
+  # default-members, which excludes chronoscope-web. Without this, web-side lint
+  # regressions slip past `nix flake check`. `webNativeClippy` below picks up the
+  # crate's test targets.
   webClippy = wasmCraneLib.cargoClippy (
     commonArgs
     // {
@@ -194,6 +196,22 @@ let
     }
   );
 
+  # `--all-targets` over the host build, so the crate's `#[cfg(test)]` code is
+  # held to the workspace lint denials (`unwrap_used`, `panic`, …) as well. The
+  # host is where those targets build at all, which `web-native-test` already
+  # establishes; this shares its dependency artifacts.
+  webNativeClippy = craneLib.cargoClippy (
+    rustCommonArgs
+    // {
+      src = webSrc;
+      pname = "chronoscope-web-native-clippy";
+      CARGO_PROFILE = "test";
+      cargoArtifacts = webNativeTestDeps;
+      cargoExtraArgs = "-p chronoscope-web";
+      cargoClippyExtraArgs = "--all-targets -- -D warnings";
+    }
+  );
+
 in
 {
   packages = {
@@ -206,5 +224,6 @@ in
     web-test-build = webTest;
     web-clippy = webClippy;
     web-native-test = webNativeTest;
+    web-native-clippy = webNativeClippy;
   };
 }
