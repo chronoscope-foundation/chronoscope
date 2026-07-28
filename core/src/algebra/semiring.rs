@@ -151,6 +151,14 @@ pub trait Support {
     type Atom;
 
     /// The atoms across every environment, deduplicated.
+    ///
+    /// This answers what did contribute, never what would change the value. A
+    /// container records the atoms present when it was built, so a question about
+    /// an atom that does not exist yet has no answer here, and one about removing
+    /// an atom is a counterfactual the record cannot settle: a producer gated on
+    /// an empty slot fires *because* of a retraction, repopulating the value the
+    /// retraction was meant to remove. Anything asking what could change reads the
+    /// collections a value was drawn from, not the atoms it drew.
     fn atoms(&self) -> impl Iterator<Item = &Self::Atom>;
 
     /// Whether this is the additive-identity container — nothing contributed.

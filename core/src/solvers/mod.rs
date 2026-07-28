@@ -179,6 +179,12 @@ pub struct WitnessScan {
 /// repeated fact sets collapse exactly as the oracle does. The homomorphism
 /// `conflicts_via_index(E, T) == temporal_conflicts(project_entity_at(E, T))` as
 /// sets, at every snapshot, is the proptest that guards the two paths from drift.
+///
+/// The law has teeth because the two sides are independently written. Derive
+/// either from the other — an index read generated from the same machinery as the
+/// projection, say — and it compares a value against itself: still green, and
+/// guarding nothing. A law that cannot fail looks exactly like one that holds, so
+/// the independence is the thing to preserve rather than the assertion.
 pub fn conflicts_via_index(scan: &WitnessScan) -> Vec<TemporalConflict> {
     let floor = witness_floor(&scan.construction_starts);
     let ceiling = witness_ceiling(&scan.demolition_completions);
