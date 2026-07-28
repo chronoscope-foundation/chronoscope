@@ -50,6 +50,10 @@ Absolutely. Chronoscope is built to complement existing research, not replace it
 
 Yes! Chronoscope is open source under the MIT license. The codebase includes the API server, analysis pipeline, iOS app, and this web frontend, all sharing types and contracts via OpenAPI.
 
+## Who runs Chronoscope, and how is it funded?
+
+Chronoscope is a project of the Chronoscope Foundation, formed to keep the project independent and accessible. {{foundation_status}} The code is MIT-licensed and the knowledge graph is released under Creative Commons Attribution 4.0, so the work stays usable regardless of what becomes of any one organization. The Foundation will be funded by donations and grants.
+
 ## How can I contribute?
 
 We're working on the first release of the full site, which will let you contribute directly to the knowledge graph: linking photos to locations, adding historical context, and resolving conflicts in the data. In the meantime, code contributions are welcome. Check out the [GitHub repository](https://github.com/copumpkin/chronoscope) for the codebase, data ingestion pipelines, and discussion in Issues.

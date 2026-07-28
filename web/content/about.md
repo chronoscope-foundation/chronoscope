@@ -24,4 +24,6 @@ The Chronoscope codebase is open source under the MIT license. The knowledge gra
 
 The codebase includes the API server, analysis pipeline, iOS app, and this web frontend. Code contributions, ingestion pipelines, and research methodology improvements are all welcome.
 
-Chronoscope is built by [Dan Peebles](https://github.com/copumpkin), and is in the process of becoming a US-based non-profit to keep the project independent and accessible. The non-profit will accept donations. You'll be able to contribute the usual way, of course, but we're also cooking up some more creative ways to support the project. Stay tuned.
+Chronoscope is built by [Dan Peebles](https://github.com/copumpkin) and stewarded by the Chronoscope Foundation, formed to keep the project independent and accessible. The Foundation will accept donations. You'll be able to contribute the usual way, of course, but we're also cooking up some more creative ways to support the project. Stay tuned.
+
+{{foundation_status}}

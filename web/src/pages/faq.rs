@@ -4,6 +4,8 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_location;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
 
+use crate::markdown::expand_snippets;
+
 const FAQ_MARKDOWN: &str = include_str!("../../content/faq.md");
 
 /// Stem for a heading with no alphanumerics at all, so every entry has a
@@ -271,7 +273,8 @@ fn FaqItem(question: String, slug: String, answer_html: String) -> impl IntoView
 
 #[component]
 pub fn Faq() -> impl IntoView {
-    let categories = parse_faq(FAQ_MARKDOWN);
+    let expanded = expand_snippets(FAQ_MARKDOWN);
+    let categories = parse_faq(&expanded);
 
     view! {
         <section class="px-6 py-12 max-w-3xl mx-auto">
@@ -470,9 +473,10 @@ mod tests {
     /// not the FAQ heading the link names, and not the link itself.
     #[test]
     fn every_faq_deep_link_on_the_about_page_names_a_real_anchor() {
-        let cats = parse_faq(FAQ_MARKDOWN);
+        // Both sides expanded, so the check sees the pages as a reader does.
+        let cats = parse_faq(&expand_snippets(FAQ_MARKDOWN));
         let slugs = all_slugs(&cats);
-        let fragments = faq_link_fragments(ABOUT_MARKDOWN);
+        let fragments = faq_link_fragments(&expand_snippets(ABOUT_MARKDOWN));
         // Without a link to check, the loop below asserts nothing at all.
         assert!(
             !fragments.is_empty(),
