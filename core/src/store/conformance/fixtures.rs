@@ -53,7 +53,7 @@ pub const PAGE_100: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(1
 };
 
 /// Drain an entity class walk over `stream` to its rows at the given page
-/// limit, threading the exclusive view through [`paginate`]'s walk state.
+/// limit, threading the exclusive view through `paginate`'s walk state.
 pub async fn drain_entity_classes<S, V>(
     view: &mut V,
     stream: &EntityStream<'_>,
@@ -92,7 +92,7 @@ where
 }
 
 /// Drain an entity's depiction walk to its rows at the given page limit,
-/// threading the exclusive view through [`paginate`]'s walk state. Each row is
+/// threading the exclusive view through `paginate`'s walk state. Each row is
 /// a raw depiction fact under its depicted-image `SameArtifact` rep.
 pub async fn drain_entity_depictions<S, V>(
     view: &mut V,

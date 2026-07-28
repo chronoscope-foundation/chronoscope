@@ -135,7 +135,7 @@ pub fn register_base() {
     let obj = js_sys::Reflect::get(&window, &"__test".into())
         .ok()
         .and_then(|v| v.dyn_into::<js_sys::Object>().ok())
-        .unwrap_or_else(js_sys::Object::new);
+        .unwrap_or_default();
 
     register_hooks!(&obj, [
         // DOM interaction (waits internally — safer than the raw primitives)
@@ -188,7 +188,7 @@ pub fn register_map_hooks(
     let obj = js_sys::Reflect::get(&window, &"__test".into())
         .ok()
         .and_then(|v| v.dyn_into::<js_sys::Object>().ok())
-        .unwrap_or_else(js_sys::Object::new);
+        .unwrap_or_default();
 
     // Map hooks. `map_query` handles the `let h = clone; move || with_map(&h,
     // …).unwrap_or(default)` boilerplate for the no-arg query family. The
@@ -288,7 +288,7 @@ pub fn register_map_hooks(
 
 // ==================== Registration helper ====================
 
-/// Register a wasm_bindgen Closure on a JS object.
+/// Register a `wasm_bindgen` Closure on a JS object.
 ///
 /// The closure is stored in `REGISTERED_HOOKS` keyed by `name`. Re-registering
 /// the same name drops the prior closure (deterministically severing its
@@ -419,7 +419,7 @@ fn click_visible(selector: String) -> js_sys::Promise {
     })
 }
 
-/// Dispatch a `chronoscope-error` CustomEvent on the window.
+/// Dispatch a `chronoscope-error` `CustomEvent` on the window.
 fn dispatch_error(msg: String) {
     if let Some(window) = web_sys::window() {
         let init = web_sys::CustomEventInit::new();
@@ -1166,10 +1166,10 @@ fn fire_canvas_mousemove(map: &maplibre::Map, lng: f64, lat: f64) {
         .unwrap_or(0.0)
         + rect.top();
 
-    let mut init = web_sys::MouseEventInit::new();
-    init.client_x(client_x as i32);
-    init.client_y(client_y as i32);
-    init.bubbles(true);
+    let init = web_sys::MouseEventInit::new();
+    init.set_client_x(client_x as i32);
+    init.set_client_y(client_y as i32);
+    init.set_bubbles(true);
 
     if let Ok(event) = web_sys::MouseEvent::new_with_mouse_event_init_dict("mousemove", &init) {
         let _ = canvas.dispatch_event(&event);

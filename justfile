@@ -222,6 +222,11 @@ test target="all":
 
 # Run clippy (cargo direct, fast incremental). Use `just check` for the
 # hermetic version.
+#
+# `--all-features` matches the gate's clippy. Without it the inner loop can't
+# lint anything behind a feature — which is why `db`'s postgres backend went
+# unlinted for its whole life, with no way to notice short of a hand-rolled
+# cargo invocation.
 clippy target="all":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -237,26 +242,26 @@ clippy target="all":
     # so clippy only sees that target with the feature on.
     case "{{ target }}" in
         all)
-            cargo clippy --all-targets --features chronoscope-dev/browser-tests -- -D warnings
-            cargo clippy -p chronoscope-web --target wasm32-unknown-unknown -- -D warnings
-            cargo clippy -p chronoscope-web --all-targets -- -D warnings
+            cargo clippy --all-targets --all-features -- -D warnings
+            cargo clippy -p chronoscope-web --target wasm32-unknown-unknown --all-features -- -D warnings
+            cargo clippy -p chronoscope-web --all-targets --all-features -- -D warnings
             (cd analysis/triton && ruff check .)
             ;;
         rust)
-            cargo clippy --all-targets --features chronoscope-dev/browser-tests -- -D warnings
+            cargo clippy --all-targets --all-features -- -D warnings
             ;;
         web)
-            cargo clippy -p chronoscope-web --target wasm32-unknown-unknown -- -D warnings
-            cargo clippy -p chronoscope-web --all-targets -- -D warnings
+            cargo clippy -p chronoscope-web --target wasm32-unknown-unknown --all-features -- -D warnings
+            cargo clippy -p chronoscope-web --all-targets --all-features -- -D warnings
             ;;
         dev)
-            cargo clippy -p chronoscope-dev --all-targets --features browser-tests -- -D warnings
+            cargo clippy -p chronoscope-dev --all-targets --all-features -- -D warnings
             ;;
         triton)
             cd analysis/triton && ruff check .
             ;;
         *)
-            cargo clippy -p chronoscope-{{ target }} --all-targets -- -D warnings
+            cargo clippy -p chronoscope-{{ target }} --all-targets --all-features -- -D warnings
             ;;
     esac
 

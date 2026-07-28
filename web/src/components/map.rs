@@ -88,13 +88,13 @@ pub(crate) const MAP_READY_EVENT: &str = "chronoscope-map-ready";
 #[cfg(feature = "test-hooks")]
 pub(crate) const FETCH_COMPLETE_EVENT: &str = "chronoscope-fetch-complete";
 
-/// Monotonic count of fetches that have *settled* (returned a result, success
-/// or failure). Aborted fetches do not bump it because the future is dropped
-/// before the settle point. Tests sample this counter before triggering an
-/// action, then wait for it to advance — that's how "wait for the fetch
-/// that follows my action" is expressed without a generation race.
 #[cfg(feature = "test-hooks")]
 thread_local! {
+    /// Monotonic count of fetches that have *settled* (returned a result, success
+    /// or failure). Aborted fetches do not bump it because the future is dropped
+    /// before the settle point. Tests sample this counter before triggering an
+    /// action, then wait for it to advance — that's how "wait for the fetch
+    /// that follows my action" is expressed without a generation race.
     static FETCH_SETTLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -147,12 +147,12 @@ pub(crate) const ENTITY_THUMBNAILS_LAYER: &str = "entity-thumbnails";
 #[cfg(feature = "test-hooks")]
 pub(crate) const THUMBNAILS_LOADED_EVENT: &str = "chronoscope-thumbnails-loaded";
 
-/// Counter mirroring `FETCH_SETTLED` for thumbnails-loaded events. Lets tests
-/// sample-then-await: `prev = currentThumbnailsLoaded(); pan(); waitForThumbnailsLoadedAfter(prev)`.
-/// Closes the listener-attach race that any one-shot "wait for next event"
-/// hook would have.
 #[cfg(feature = "test-hooks")]
 thread_local! {
+    /// Counter mirroring `FETCH_SETTLED` for thumbnails-loaded events. Lets tests
+    /// sample-then-await: `prev = currentThumbnailsLoaded(); pan(); waitForThumbnailsLoadedAfter(prev)`.
+    /// Closes the listener-attach race that any one-shot "wait for next event"
+    /// hook would have.
     static THUMBNAILS_LOADED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 

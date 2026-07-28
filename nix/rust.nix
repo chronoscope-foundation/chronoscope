@@ -53,20 +53,27 @@ let
     cargoArtifacts = craneLib.buildDepsOnly (commonArgs // { CARGO_PROFILE = "test"; });
   };
 
-  # `browser-tests` gates `dev/tests/web.rs` into existence, so lint coverage of
-  # that target has to opt in the same way the `web-test` run does. The feature
-  # adds no dependencies, so it costs one more test target to lint, not a wider
-  # dependency graph.
+  # `--all-features` rather than a list of features to lint: the compile-time
+  # gates cover everything by default, so a feature added later is linted
+  # without anyone remembering to add it here. Opting features in one at a time
+  # is how `db`'s postgres backend went unlinted from its first commit — a bare
+  # `unwrap()` in it passed this check clean, because the module never compiled
+  # under clippy at all, and how `browser-tests` (which gates `dev/tests/web.rs`
+  # into existence) had to be named explicitly to lint that target at all.
   clippy = craneLib.cargoClippy (
     checkArgs
     // {
-      cargoClippyExtraArgs = "--all-targets --features chronoscope-dev/browser-tests -- -D warnings";
+      cargoClippyExtraArgs = "--all-targets --all-features -- -D warnings";
     }
   );
 
   # Doctests get their own check because `cargo llvm-cov` (stable) skips them.
   # They guard real invariants — e.g. the `compile_fail` grammar-macro examples
   # in `chronoscope-macros` and `core/facts`.
+  #
+  # Default features for the same reason as llvm-cov below: this one runs what
+  # it finds. A doctest behind a feature belongs to whichever check already
+  # supplies that feature's resources.
   doctest = craneLib.cargoTest (
     checkArgs
     // testExtraEnv
@@ -87,7 +94,7 @@ let
     // {
       pname = "chronoscope-doc";
       src = docSrc;
-      cargoDocExtraArgs = "--no-deps --workspace";
+      cargoDocExtraArgs = "--no-deps --workspace --all-features";
       RUSTDOCFLAGS = "-D warnings";
     }
   );
@@ -98,6 +105,12 @@ let
   # `chronoscope-dev::tests/web.rs` target is gated behind `browser-tests` in
   # `dev/Cargo.toml`, so it's skipped here; the dedicated `web-test` check runs
   # the Chrome-driven tests with capped parallelism.
+  #
+  # Default features, deliberately — do not harmonize this with clippy's
+  # `--all-features`. Three features gate suites that must not run here:
+  # `browser-tests` needs the box to itself, `corpus-test` needs the fetched
+  # corpus, and `record-fixtures` hits the real network. Linting everything is
+  # free; running everything is not.
   #
   # crane's cargoLlvmCov sets installPhaseCommand="" and expects the command to
   # write $out; --output-path $out puts the LCOV report there.

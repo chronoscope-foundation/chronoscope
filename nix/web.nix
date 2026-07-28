@@ -165,7 +165,7 @@ let
     commonArgs
     // {
       inherit cargoArtifacts;
-      cargoClippyExtraArgs = "-- -D warnings";
+      cargoClippyExtraArgs = "--all-features -- -D warnings";
     }
   );
 
