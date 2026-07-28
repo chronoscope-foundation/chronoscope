@@ -6,18 +6,22 @@
 
 use super::*;
 
+use crate::conflicts::fact_lineage;
 use crate::geo::GeoPoint;
 use crate::grammar::attribute::NameText;
 use crate::grammar::citations::Language;
+use crate::lifespan::{ExistenceState, SupportWindow};
 use crate::listing;
 use crate::projection::{member_lineage, project_entity};
+use crate::solvers::replay;
 use crate::store::SubmitCommitError;
 use crate::store::conformance::fixtures::{
     PAGE_100, commit_name, commit_result, commit_retract, construction_at,
-    construction_location_in, fixed_time, has_event_fact, local_bundle, moved_kind, moved_to,
-    name_fact, same_entity_fact, sample_viewport, submit_batch, user_author,
+    construction_location_in, construction_started_in, demolition_completed_in, depiction_fact,
+    fixed_time, has_event_fact, local_bundle, moved_kind, moved_to, name_fact, same_entity_fact,
+    sample_viewport, subject_date_in, submit_batch, user_author,
 };
-use crate::store::conformance::{TestResult, UnmintedIds};
+use crate::store::conformance::{TestError, TestResult, UnmintedIds};
 use crate::submit::{Commit as SubmitBundle, Decl, EntityIdx, SubmitError, commit_facts};
 
 type TestBundle = SubmitBundle<MemoryIds>;
@@ -867,6 +871,130 @@ async fn summaries_in_viewport_pins_snapshot() -> TestResult {
     assert_eq!(
         page.snapshot, snapshot,
         "the page reports the snapshot it read at, the one its resume cursor pins"
+    );
+    Ok(())
+}
+
+// --- served existence over the depiction fan-in ---
+
+fn day(y: i32, m: u32, d: u32) -> Result<chrono::NaiveDate, TestError> {
+    chrono::NaiveDate::from_ymd_opt(y, m, d).ok_or_else(|| "invalid date".into())
+}
+
+/// A photograph outliving a claimed demolition contests it, and a listing says
+/// so.
+///
+/// A `SubjectDate` witnesses the entity standing at the moment portrayed, but it
+/// is a fact about the *image*, so no fold over the entity's own facts can reach
+/// it — a served verdict has to walk the depiction fan-in to see it at all. Two
+/// buildings, both claimed demolished in 1950, both photographed: the one
+/// photographed in 1960 has a sighting past the claimed removal, so 1955 is
+/// affirmed by the sighting's hull and denied by the demolition — a source
+/// disagreement. The one photographed in 1940 has a sighting the removal
+/// accounts for, so 1955 is denied and nothing affirms it. The subject-date is
+/// the only difference between them.
+#[tokio::test]
+async fn a_subject_date_past_a_demolition_contests_the_served_existence() -> TestResult {
+    let store = MemoryFactStore::new();
+    let committed = commit_result(
+        &store,
+        local_bundle(
+            2,
+            0,
+            2,
+            0,
+            vec![
+                construction_at(0, 40.5, -73.5)?,
+                demolition_completed_in(0, 1950)?,
+                subject_date_in(0, 1960)?,
+                depiction_fact(0, 0)?,
+                construction_at(1, 40.6, -73.6)?,
+                demolition_completed_in(1, 1950)?,
+                subject_date_in(1, 1940)?,
+                depiction_fact(1, 1)?,
+            ],
+        )?,
+    )
+    .await?;
+    let seen_after = committed.entities.get(&EntityIdx(0)).ok_or("entity 0")?.id;
+    let seen_before = committed.entities.get(&EntityIdx(1)).ok_or("entity 1")?.id;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let page = listing::summaries_in_viewport::<MemoryFactStore, _>(
+        &mut view,
+        &sample_viewport()?,
+        None,
+        PAGE_100,
+        day(1955, 6, 1)?,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    let served = |id| {
+        page.summaries
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.existence)
+    };
+
+    assert_eq!(
+        served(seen_after),
+        Some(ExistenceState::Contested),
+        "a 1960 sighting refutes the 1950 removal, so 1955 is both affirmed and denied"
+    );
+    assert_eq!(
+        served(seen_before),
+        Some(ExistenceState::Absent),
+        "a 1940 sighting sits inside the claimed lifetime, so 1955 stays denied"
+    );
+    Ok(())
+}
+
+/// An undated image dates its subjects against each other. It portrays Y, and a
+/// depiction cannot predate its subject's existence, so the subject-moment is at
+/// or after Y's 1900 construction start; it portrays X too, so X stood at that
+/// same moment. X is therefore attested at some instant from 1900 onward even
+/// though nothing in X's own facts dates it and the image carries no date.
+///
+/// No pass performs this inference, so X supports no instant at all today. The
+/// assertion is the coarse one that survives however the five states are
+/// tuned — some stretch of the timeline answers for X — because what the
+/// inference owes is that the co-subject's date reaches X, and only which
+/// verdict each instant reads is up for tuning.
+#[tokio::test]
+#[ignore = "dating an entity through an undated image's co-subject is not implemented"]
+async fn undated_image_dates_an_undated_subject_from_its_co_subject() -> TestResult {
+    let store = MemoryFactStore::new();
+    let committed = commit_result(
+        &store,
+        local_bundle(
+            2,
+            0,
+            1,
+            0,
+            vec![
+                construction_started_in(1, 1900)?,
+                depiction_fact(0, 0)?,
+                depiction_fact(1, 0)?,
+            ],
+        )?,
+    )
+    .await?;
+    let undated = committed.entities.get(&EntityIdx(0)).ok_or("entity 0")?.id;
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let (_, projected) = project_entity::<MemoryFactStore, _, _>(&mut view, undated, fact_lineage)
+        .await
+        .map_err(|e| format!("{e:?}"))?
+        .ok_or("the committed entity must project")?;
+    let span = replay::lifespan::<MemoryFactStore, _, _>(&projected, &mut view)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+
+    assert_ne!(
+        span.support(),
+        SupportWindow::Empty,
+        "the co-subject's 1900 construction reaches X, so some stretch of the \
+         timeline answers for it"
     );
     Ok(())
 }

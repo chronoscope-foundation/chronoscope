@@ -614,7 +614,7 @@ async fn project_pin<V>(
     as_of: NaiveDate,
 ) -> Result<Pin, HttpError>
 where
-    V: EntityView<ServerFactStore> + EventView<ServerFactStore> + Sync,
+    V: EntityView<ServerFactStore> + EventView<ServerFactStore> + ImageView<ServerFactStore> + Sync,
 {
     let Some((class, projected)) =
         project_entity::<ServerFactStore, _, _>(&mut *view, representative, member_lineage)
@@ -624,10 +624,13 @@ where
         return Ok(Pin::default());
     };
     let entity = typed::Entity::parse(&projected, &class);
+    let existence = solvers::replay::lifespan::<ServerFactStore, _, _>(&projected, &mut *view)
+        .await
+        .map_err(fact_store_err)?;
     Ok(Pin {
         name: entity_types::negotiate_name_for_prefixes(&entity.names, prefixes),
         thumbnail: representative_image(&projected.depictions),
-        existence: Some(projected.lifespan.classify(as_of)),
+        existence: Some(existence.classify(as_of)),
     })
 }
 
@@ -704,9 +707,13 @@ where
                     let member_name =
                         entity_types::negotiate_name_for_prefixes(&entity.names, lang_prefixes);
                     let earliest = timeline_span(entity.timeline.events()).0;
+                    let existence =
+                        solvers::replay::lifespan::<ServerFactStore, _, _>(&projected, &mut *view)
+                            .await
+                            .map_err(fact_store_err)?;
                     // The shared pin shows while any member may have stood, so it
                     // takes the most present verdict (`Ord` is presence-ascending).
-                    pin.existence = pin.existence.max(Some(projected.lifespan.classify(as_of)));
+                    pin.existence = pin.existence.max(Some(existence.classify(as_of)));
                     if member == representative {
                         pin.name = member_name.clone();
                         pin.thumbnail = representative_image(&projected.depictions);

@@ -676,44 +676,17 @@ mod tests {
         )
     }
 
-    /// A minimal empty event record — every slot untouched.
-    fn empty_event() -> Result<projection::Event<FactLin>, Box<dyn std::error::Error>> {
-        Ok(projection::Event {
-            kind: untouched(),
-            started_at: untouched(),
-            completed_at: untouched(),
-            occurred_at: untouched(),
-            location: untouched(),
-            cause: untouched(),
-            method: untouched(),
-            usages: untouched(),
-            designation: untouched(),
-            descriptions: FactMap::new(),
-        })
+    /// An event record with every slot untouched — the per-test base to
+    /// populate. The fold identity is that record, fieldwise, so the monoid
+    /// spells it.
+    fn empty_event() -> projection::Event<FactLin> {
+        CommutativeMonoid::identity()
     }
 
-    fn empty_bookend() -> Bookend<FactLin> {
-        Bookend {
-            started_at: untouched(),
-            completed_at: untouched(),
-            location: untouched(),
-        }
-    }
-
-    /// An entity with empty everything — the per-test base to populate.
+    /// The `empty_event` treatment one level up: an entity with empty
+    /// everything.
     fn empty_entity() -> projection::Entity<EntId, EvtId, ImgId, FactLin> {
-        projection::Entity {
-            names: FactMap::new(),
-            relations: FactMap::new(),
-            refs: FactMap::new(),
-            construction: empty_bookend(),
-            demolition: empty_bookend(),
-            existence: FactMap::new(),
-            events: FactMap::new(),
-            depictions: FactMap::new(),
-            sameness: FactMap::new(),
-            lifespan: CommutativeMonoid::identity(),
-        }
+        CommutativeMonoid::identity()
     }
 
     /// The singleton class of one id — every entity's own subject is a member.
@@ -728,7 +701,7 @@ mod tests {
 
     #[test]
     fn settled_kind_parses_to_typed_variant() -> TestResult {
-        let mut record = empty_event()?;
+        let mut record = empty_event();
         record.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Damaged,
@@ -762,7 +735,7 @@ mod tests {
         // A Damaged event whose record also carries a `method` claim — a slot
         // Damaged never reads. Submit forbids this; the typed projection must route it to
         // Ambiguous so the stray claim stays visible instead of being dropped.
-        let mut record = empty_event()?;
+        let mut record = empty_event();
         record.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Damaged,
@@ -811,7 +784,7 @@ mod tests {
 
     #[test]
     fn conflicting_kind_routes_to_ambiguous_with_candidates() -> TestResult {
-        let mut record = empty_event()?;
+        let mut record = empty_event();
         // Two sources disagree on the kind: the meet empties, the extent keeps
         // both rivals.
         record.kind = date_kind(
@@ -851,7 +824,7 @@ mod tests {
 
     #[test]
     fn any_kind_routes_to_ambiguous() -> TestResult {
-        let mut record = empty_event()?;
+        let mut record = empty_event();
         record.kind = claim(Claimed::Any, fact_lin(1, "https://a")?);
         let (kind, _sources) = interior_event(&record, &1u64);
         let InteriorEvent::Ambiguous { candidates, .. } = kind else {
@@ -866,7 +839,7 @@ mod tests {
         // An event whose only fact is its kind — a dateless `Modified` — keeps
         // its attribution through the entry's `sources`, not just `Ambiguous`.
         let mut entity = empty_entity();
-        let mut record = empty_event()?;
+        let mut record = empty_event();
         record.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Modified,
@@ -947,7 +920,7 @@ mod tests {
         let moved_to = resolved_point(45.0, 9.0)?;
         entity.construction.location = claim(built.clone(), fact_lin(1, "https://built")?);
 
-        let mut moved = empty_event()?;
+        let mut moved = empty_event();
         moved.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
@@ -984,7 +957,7 @@ mod tests {
         let early = resolved_point(45.0, 9.0)?;
         let late = resolved_point(48.0, 2.0)?;
 
-        let mut move_early = empty_event()?;
+        let mut move_early = empty_event();
         move_early.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
@@ -997,7 +970,7 @@ mod tests {
             .events
             .insert(10, cited(move_early, fact_lin(1, "https://e")?));
 
-        let mut move_late = empty_event()?;
+        let mut move_late = empty_event();
         move_late.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
@@ -1024,7 +997,7 @@ mod tests {
         let dated = resolved_point(45.0, 9.0)?;
         let undated = resolved_point(48.0, 2.0)?;
 
-        let mut move_dated = empty_event()?;
+        let mut move_dated = empty_event();
         move_dated.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
@@ -1037,7 +1010,7 @@ mod tests {
             .events
             .insert(10, cited(move_dated, fact_lin(1, "https://d")?));
 
-        let mut move_undated = empty_event()?;
+        let mut move_undated = empty_event();
         move_undated.kind = date_kind(
             LifetimeEventKind::Durational {
                 kind: DurationalKind::Moved,
@@ -1063,7 +1036,7 @@ mod tests {
     fn designated_event(
         year_opt: Option<i32>,
     ) -> Result<projection::Event<FactLin>, Box<dyn std::error::Error>> {
-        let mut record = empty_event()?;
+        let mut record = empty_event();
         record.kind = date_kind(
             LifetimeEventKind::Point {
                 kind: PointKind::Designated,

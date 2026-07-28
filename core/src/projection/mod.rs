@@ -16,6 +16,7 @@ mod bracket;
 pub mod claimed;
 mod merge;
 mod provenance;
+pub(crate) mod replay;
 mod slot;
 mod types;
 

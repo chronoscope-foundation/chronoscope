@@ -473,6 +473,34 @@ pub fn map_medium_fact(image_idx: usize) -> Result<SubmitFact, TestError> {
     })
 }
 
+/// An image-touching `SubjectDate` fact carrying `bound` as the moment the
+/// image portrays its subject at.
+fn subject_date_with(image_idx: usize, bound: UncertainDate) -> Result<SubmitFact, TestError> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Image {
+            fact: crate::grammar::image::Fact::SubjectDate {
+                image: ImageIdx(image_idx),
+                bound,
+            },
+        },
+        citation: sample_citation()?,
+    })
+}
+
+/// An image-touching `SubjectDate` fact: the image portrays its subject as
+/// standing in `year`.
+pub fn subject_date_in(image_idx: usize, year: i32) -> Result<SubmitFact, TestError> {
+    subject_date_with(image_idx, year_date(year)?)
+}
+
+/// An image-touching `SubjectDate` fact dated only "before `year`" — the
+/// open-lower shape a caption takes when it places the picture no later than a
+/// year and names no earlier edge.
+pub fn subject_date_before(image_idx: usize, year: i32) -> Result<SubmitFact, TestError> {
+    let bound = UncertainDate::bounded(None, year_date(year)?.latest_bound().copied())?;
+    subject_date_with(image_idx, bound)
+}
+
 /// An image-touching `CapturedDate` fact for the given image index.
 pub fn captured_date_fact(image_idx: usize) -> Result<SubmitFact, TestError> {
     let bound = UncertainDate::with_precision(
@@ -679,6 +707,17 @@ pub fn same_entity_fact(a: usize, b: usize) -> Result<SubmitFact, TestError> {
     Ok(SubmitFact::Judgment {
         assertion: JudgmentAssertion::Identity {
             fact: identity::Fact::same_entity(EntityIdx(a), EntityIdx(b))?,
+        },
+        citation: judgment_citation()?,
+    })
+}
+
+/// A `SameArtifact` judgment between two image indices — two scans of the one
+/// picture.
+pub fn same_artifact_fact(a: usize, b: usize) -> Result<SubmitFact, TestError> {
+    Ok(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Identity {
+            fact: identity::Fact::same_artifact(ImageIdx(a), ImageIdx(b))?,
         },
         citation: judgment_citation()?,
     })

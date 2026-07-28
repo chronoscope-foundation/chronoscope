@@ -26,8 +26,9 @@ use crate::lifespan::ExistenceState;
 use crate::projection::{
     Bracket, Claimed, DepictionRecord, FactMap, MemberLineage, member_lineage, project_entity,
 };
+use crate::solvers::replay;
 use crate::store::schema::EntityStream;
-use crate::store::{EntityIdOf, EntityView, EventView, FactStore, ImageIdOf};
+use crate::store::{EntityIdOf, EntityView, EventView, FactStore, ImageIdOf, ImageView};
 use crate::typed;
 
 /// The one point an entity pins down on the map, or `None` when its location is
@@ -155,6 +156,10 @@ pub enum ListError<E> {
 /// pinned state the first page read. The `next` cursor carries that snapshot
 /// forward. A fresh listing passes `None`.
 ///
+/// A kept summary's existence verdict comes from [`replay::lifespan`], which is
+/// what the [`ImageView`] is for — and what makes a page cost every listed
+/// entity's depiction fan-in.
+///
 /// `as_of` is the domain instant each summary's existence verdict answers for —
 /// the map slider's position. It is orthogonal to the snapshot, which fixes
 /// *which facts* are read rather than *when they speak about*. A caller with no
@@ -172,7 +177,7 @@ pub async fn summaries_in_viewport<S, V>(
 >
 where
     S: FactStore,
-    V: EntityView<S> + EventView<S> + Sync,
+    V: EntityView<S> + EventView<S> + ImageView<S> + Sync,
 {
     let snapshot = view.snapshot().await.map_err(ListError::Backend)?;
     let mut after = cursor.map(|c| c.walk);
@@ -215,6 +220,9 @@ where
                 // class; both ids resolve to the same image through that class, so
                 // the marker thumbnail still loads.
                 let thumbnail = representative_image(&projected.depictions);
+                let existence = replay::lifespan::<S, _, _>(&projected, &mut *view)
+                    .await
+                    .map_err(ListError::Backend)?;
                 summaries.push(EntitySummary {
                     id: entity.id,
                     names: entity.names,
@@ -222,7 +230,7 @@ where
                     earliest,
                     latest,
                     thumbnail,
-                    existence: projected.lifespan.classify(as_of),
+                    existence: existence.classify(as_of),
                 });
             }
         }

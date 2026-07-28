@@ -526,17 +526,15 @@ mod tests {
     use crate::typed;
     use crate::typed::SupportAtom;
 
-    // The `pub(super)` fixtures are shared with the `replay` folds' tests, which
-    // build the same commits to exercise their oracle path.
-    pub(super) type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    pub(super) fn fixed_time() -> Result<DateTime<Utc>, &'static str> {
+    fn fixed_time() -> Result<DateTime<Utc>, &'static str> {
         Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0)
             .single()
             .ok_or("fixed timestamp is unambiguous")
     }
 
-    pub(super) fn citation(url: &str) -> Result<FactualCitation, Box<dyn std::error::Error>> {
+    fn citation(url: &str) -> Result<FactualCitation, Box<dyn std::error::Error>> {
         let source = ExternalSource::Url {
             url: url::Url::parse(url)?,
             published: None,
@@ -544,7 +542,7 @@ mod tests {
         Ok(FactualCitation::new(source, vec![Excerpt::new("source")?])?)
     }
 
-    pub(super) fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+    fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
         Ok(UncertainDate::with_precision(
             chrono::NaiveDate::from_ymd_opt(y, 1, 1).ok_or("valid year")?,
             DatePrecision::Year,
@@ -570,7 +568,7 @@ mod tests {
     }
 
     /// A construction start fact for entity 0, dated `y`.
-    pub(super) fn construction_started(y: i32) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    fn construction_started(y: i32) -> Result<SubmitFact, Box<dyn std::error::Error>> {
         Ok(SubmitFact::Factual {
             assertion: FactualAssertion::Construction {
                 fact: ConstructionFact::Started {
@@ -1050,7 +1048,7 @@ mod tests {
 
     /// A `UsageChanged` point event on entity 0 / event 0, dated `y` — an
     /// interior event whose date is an existence witness (the Colosseum opening).
-    pub(super) fn point_event_at(y: i32) -> Result<Vec<SubmitFact>, Box<dyn std::error::Error>> {
+    fn point_event_at(y: i32) -> Result<Vec<SubmitFact>, Box<dyn std::error::Error>> {
         Ok(vec![
             SubmitFact::Factual {
                 assertion: FactualAssertion::Event {
@@ -1078,7 +1076,7 @@ mod tests {
 
     /// The one-sided "before `y`" bound the producer derives from a year-`y`
     /// witness — construction ≤ end of `y`, preserving the witness's precision.
-    pub(super) fn before(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+    fn before(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
         Ok(UncertainDate::bounded(
             None,
             year(y)?.latest_bound().copied(),

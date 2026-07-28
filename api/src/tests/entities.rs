@@ -208,6 +208,101 @@ async fn commit_demolished_entity_at(
     commit_single_entity(facts, commit).await
 }
 
+/// Commit a placeable entity built, later claimed demolished, and depicted by
+/// one image whose `SubjectDate` portrays it standing in `portrayed`.
+///
+/// The sighting is asserted about the *image*, so a served verdict reaches it
+/// only by walking the entity's depiction fan-in. Portraying the entity past the
+/// claimed removal refutes the claim and reads contested there.
+async fn commit_photographed_demolished_entity_at(
+    facts: &ServerFactStore,
+    name: &str,
+    lat: f64,
+    lon: f64,
+    built: i32,
+    demolished: i32,
+    portrayed: i32,
+) -> Result<ServerEntityId, Box<dyn std::error::Error + Send + Sync>> {
+    let commit = Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("test")?),
+        recorded_at: fixed_time()?,
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: [
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Attribute {
+                    fact: attribute::Fact::Name {
+                        entity: EntityIdx(0),
+                        name: NameText::new(name)?,
+                        language: Language::new("en")?,
+                        name_type: NameType::Common,
+                        valid_from: None,
+                        valid_to: None,
+                    },
+                },
+                citation: citation("https://example.com/name")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Location {
+                        entity: EntityIdx(0),
+                        location: resolved_point(lat, lon)?,
+                    },
+                },
+                citation: citation("https://example.com/location")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Construction {
+                    fact: ConstructionFact::Started {
+                        entity: EntityIdx(0),
+                        bound: year(built)?,
+                    },
+                },
+                citation: citation("https://example.com/built")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Demolition {
+                    fact: DemolitionFact::Completed {
+                        entity: EntityIdx(0),
+                        bound: year(demolished)?,
+                    },
+                },
+                citation: citation("https://example.com/demolished")?,
+            },
+            SubmitFact::Factual {
+                assertion: FactualAssertion::Image {
+                    fact: image::Fact::SubjectDate {
+                        image: ImageIdx(0),
+                        bound: year(portrayed)?,
+                    },
+                },
+                citation: citation("https://example.com/portrayed")?,
+            },
+            SubmitFact::Judgment {
+                assertion: JudgmentAssertion::Depiction {
+                    fact: depiction::Fact {
+                        entity: EntityIdx(0),
+                        image: ImageIdx(0),
+                        localization: None,
+                        perspective: Some(Perspective::Exterior),
+                    },
+                },
+                citation: JudgmentSource::External {
+                    source: ExternalSource::Url {
+                        url: url::Url::parse("https://example.com/depiction")?,
+                        published: None,
+                    },
+                },
+            },
+        ]
+        .into_iter()
+        .collect(),
+    };
+
+    commit_single_entity(facts, commit).await
+}
+
 /// Commit a placeable entity carrying one name per `(language, text)` pair, so a
 /// read can exercise `Accept-Language` negotiation between them.
 async fn commit_entity_with_names_at(
@@ -1880,6 +1975,105 @@ async fn get_tile_reports_a_colocated_pin_by_its_most_present_member() -> TestRe
         Some(ExistenceState::Uncontested),
         "the successor stood in 1900, so the shared pin reads uncontested \
          even though its predecessor was gone by then"
+    );
+    Ok(())
+}
+
+/// A singleton pin reports the whole evidence set: a photograph portraying the
+/// hall in 1960 refutes the 1950 removal, so 1955 reads contested.
+///
+/// The sighting lives on the depicting image, so the pin only sees it by walking
+/// the depiction fan-in. A pin folding the entity's own facts alone puts 1955
+/// past the removal and reads absent.
+#[tokio::test]
+async fn get_tile_contests_a_pin_whose_photograph_outlives_its_demolition() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let (lat, lon) = (48.8566, 2.3522);
+    commit_photographed_demolished_entity_at(
+        &ctx.app_state.facts,
+        "Vanished Hall",
+        lat,
+        lon,
+        1900,
+        1950,
+        1960,
+    )
+    .await?;
+    let (x, y) = container_tile(lat, lon, 14);
+
+    let response: TileResponse<EntityId> = ctx
+        .client
+        .fetch_tile(
+            14,
+            x,
+            y,
+            None,
+            Some(NaiveDate::from_ymd_opt(1955, 6, 1).ok_or("date")?),
+        )
+        .await?;
+
+    assert_eq!(
+        response.markers.first().and_then(|m| m.existence),
+        Some(ExistenceState::Contested),
+        "the 1960 photograph and the 1950 removal disagree over 1955"
+    );
+    Ok(())
+}
+
+/// A shared pin takes its co-located members' most present verdict, and each
+/// member's verdict carries its own photographs: the twin portrayed in 1960
+/// refutes its 1950 removal and reads contested, which outranks its neighbour's
+/// absent, so the shared pin reads contested in 1955.
+///
+/// Both members are demolished in 1950, so the two `max` inputs differ only by
+/// what their depictions witness — a member fold reading its own facts alone
+/// leaves the pin absent.
+#[tokio::test]
+async fn get_tile_contests_a_colocated_pin_from_the_photographed_member() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let (lat, lon) = (52.52, 13.405);
+    commit_photographed_demolished_entity_at(
+        &ctx.app_state.facts,
+        "Seen After",
+        lat,
+        lon,
+        1900,
+        1950,
+        1960,
+    )
+    .await?;
+    commit_photographed_demolished_entity_at(
+        &ctx.app_state.facts,
+        "Seen Before",
+        lat,
+        lon,
+        1900,
+        1950,
+        1940,
+    )
+    .await?;
+    let (x, y) = container_tile(lat, lon, 14);
+
+    let response: TileResponse<EntityId> = ctx
+        .client
+        .fetch_tile(
+            14,
+            x,
+            y,
+            None,
+            Some(NaiveDate::from_ymd_opt(1955, 6, 1).ok_or("date")?),
+        )
+        .await?;
+
+    assert_eq!(response.markers.len(), 1, "the two share a point");
+    match &response.markers[0].click_action {
+        ClickAction::Disambiguate { .. } => {}
+        other => return Err(format!("expected Disambiguate, got {other:?}").into()),
+    }
+    assert_eq!(
+        response.markers[0].existence,
+        Some(ExistenceState::Contested),
+        "the member photographed in 1960 contests 1955, and the shared pin takes it"
     );
     Ok(())
 }

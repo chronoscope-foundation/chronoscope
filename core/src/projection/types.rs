@@ -219,13 +219,18 @@ pub struct Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T> {
     /// The class's `SameEntity` glue: each judgment's endpoint pair and support.
     /// The root summary and the per-field connecting edges derive from it.
     pub sameness: Sameness<EntId, T>,
-    /// The existence classifier the map slider reads, accumulated per fact.
+    /// The existence accumulator over the entity's *own* facts.
     ///
     /// It rides beside the slots its facts also feed rather than deriving from
     /// them: the deny channel quantifies over *assertions* (the rival claiming
     /// the latest start denies the most past), which a merged bracket has
     /// already collapsed. Folding at inject time keeps each claim separate.
-    pub lifespan: Lifespan,
+    ///
+    /// Sealed to the projection: [`replay::lifespan`](super::replay::lifespan)
+    /// is the one exit, completing it with the subject-dates the entity's
+    /// depictions carry and documenting that evidence and its cost. An accessor
+    /// added here hands out a lifespan the depiction fan-in has yet to reach.
+    pub(in crate::projection) lifespan: Lifespan,
 }
 
 derive_slot!(Entity<EntId: Ord, EvtId: Ord, ImgId: Ord, T: Semiring>, {
