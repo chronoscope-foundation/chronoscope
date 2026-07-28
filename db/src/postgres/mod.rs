@@ -1,6 +1,7 @@
 //! Postgres [`FactStore`] backend. Retraction lands (the recursive CTEs
-//! rewritten to a single self-reference each — see the `queries` module); the
-//! `PostGIS` spatial reads remain a later unit.
+//! rewritten to a single self-reference each — see the `queries` module), as
+//! does tiled clustering (a Morton-range scan on the `quadkey` facet, no
+//! `PostGIS` involved); the `PostGIS` spatial reads remain a later unit.
 //!
 //! One writable database, no base/overlay union: every read names its tables
 //! directly and every query is a plain constant (see the `queries` module). The
@@ -28,14 +29,15 @@
 //! Representatives and classes read the append-only `subject_reps`
 //! log; the class-stream `ByName` / `ByExternalReference` / `BySourceUrl` / `All`
 //! walks combine the facet indexes with that resolution, and depictions combine
-//! it with the subject backlinks.
+//! it with the subject backlinks. Tiled clustering scans the `quadkey` facet by
+//! Morton range and folds each range through core's shared cell fold.
 //!
 //! ## Deferred (later units)
 //!
 //! The `PostGIS` spatial reads/writes and the temporal-conflict witness *reads*
-//! are later units; here the spatial insert is skipped, the `InViewport` /
-//! `InTimeRange` streams answer empty pages, and the witness tables are written
-//! but not yet read.
+//! are later units; here the `facts_spatial` insert is skipped, the `InViewport`
+//! / `InTimeRange` streams answer empty pages, and the witness tables are
+//! written but not yet read.
 
 mod error;
 mod harness;
@@ -418,23 +420,22 @@ impl<C: AsConn> EntityView<PostgresFactStore> for PostgresHandle<C> {
         }
     }
 
-    /// Tiled clustering is a spatial read; it rides the same deferral as the
-    /// `InViewport` streams (the pg spatial unit), answering empty until then.
     async fn cluster_entities_in_viewport<'b>(
         &'b mut self,
-        _viewport: &'b Viewport,
-        _level: QuadLevel,
-        _rank: RankKey,
+        viewport: &'b Viewport,
+        level: QuadLevel,
+        rank: RankKey,
     ) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
-        Ok(Vec::new())
+        read::cluster_entities_in_viewport(self.conn.conn(), self.bound, viewport, level, rank)
+            .await
     }
 
     async fn cluster_tile_cells(
         &mut self,
-        _tile: TileId,
-        _rank: RankKey,
+        tile: TileId,
+        rank: RankKey,
     ) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
-        Ok(Vec::new())
+        read::cluster_tile_cells(self.conn.conn(), self.bound, tile, rank).await
     }
 
     async fn all_facts_about_entity(
@@ -635,6 +636,8 @@ impl<C: WriteConn> FactWrite<PostgresFactStore> for PostgresHandle<C> {
             .bind(facets.lat)
             .bind(facets.lon)
             .bind(facets.radius_m)
+            .bind(facets.cluster.map(|cluster| cluster.quadkey))
+            .bind(facets.cluster.map(|cluster| cluster.subject_kind))
             .bind(facets.edge_kind)
             .bind(facets.edge_a)
             .bind(facets.edge_b)
@@ -653,7 +656,7 @@ impl<C: WriteConn> FactWrite<PostgresFactStore> for PostgresHandle<C> {
                 .await
                 .map_err(sql("inserting fact subject row"))?;
         }
-        // The spatial insert (facts_spatial) is a later unit; witness,
+        // The facts_spatial insert is a later unit; witness,
         // representative-log, and retraction maintenance run on the same
         // connection as the staging, so a rejected submit's savepoint unwinds
         // their rows with its fact rows. record_retraction runs last, after the

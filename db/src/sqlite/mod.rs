@@ -75,7 +75,7 @@ use std::sync::Arc;
 use sqlx::sqlite::SqlitePool;
 use sqlx::{Acquire, Sqlite, SqliteConnection, Transaction};
 
-use chronoscope_core::geo::{QuadLevel, TileId, Viewport, quadkey_of_location};
+use chronoscope_core::geo::{QuadLevel, TileId, Viewport};
 use chronoscope_core::grammar::ids::{CommitId, FactId, SubjectKind};
 use chronoscope_core::store::schema::{
     ClassPage, ClusterCell, EntityStream, EquivClass, ImageStream, RankKey, normalize_name,
@@ -992,17 +992,11 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
         let conn = self.conn.conn();
         let facets = facet_columns(&fact)?;
         let subjects = subject_rows(&fact);
-        let located = fact.located_subject();
-        let spatial = located
+        // A region location writes a facts_spatial envelope, though it carries no
+        // clustering key.
+        let spatial = fact
+            .located_subject()
             .map(|(location, subject)| (location.bounding_rects(), kind_tag(subject.kind())));
-        // The clustering facet on the `facts` row: a Morton key and its subject
-        // kind, set together only when the location pins a point (a resolved
-        // circle). quadkey_of_location's None short-circuits both, so the
-        // migration's `(quadkey IS NULL) = (subject_kind IS NULL)` CHECK holds.
-        // A region location still writes a facts_spatial envelope but no quadkey.
-        let cluster_facet = located.and_then(|(location, subject)| {
-            quadkey_of_location(location).map(|quadkey| (quadkey, kind_tag(subject.kind())))
-        });
         let witness = witness_row(&fact);
         let fact_json = fact_to_json(fact)?;
         // A RetractCommit facet stores the target's surrogate seq; an
@@ -1025,8 +1019,8 @@ impl<C: WriteConn> FactWrite<SqliteFactStore> for SqliteHandle<C> {
             .bind(facets.lat)
             .bind(facets.lon)
             .bind(facets.radius_m)
-            .bind(cluster_facet.map(|(quadkey, _)| quadkey))
-            .bind(cluster_facet.map(|(_, subject_kind)| subject_kind))
+            .bind(facets.cluster.map(|cluster| cluster.quadkey))
+            .bind(facets.cluster.map(|cluster| cluster.subject_kind))
             .bind(facets.edge_kind)
             .bind(facets.edge_a)
             .bind(facets.edge_b)

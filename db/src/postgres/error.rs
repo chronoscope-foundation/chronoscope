@@ -9,6 +9,8 @@
 //! shape — the two share the codec arm and diverge only in the SQL-dialect
 //! wording.
 
+use chronoscope_core::geo::ViewportTilesError;
+
 use crate::common::convert::IdConvertError;
 use crate::common::error::CodecError;
 
@@ -37,6 +39,11 @@ pub enum PostgresFactStoreError {
     /// column, or commit-row assembly.
     #[error(transparent)]
     Codec(#[from] CodecError),
+    /// A clustering read's viewport spanned too many tiles at the requested
+    /// level, tripping the shared `viewport_tiles` guard or the clustering cap.
+    /// Both mean the level is too fine for the viewport.
+    #[error("clustering viewport spans too many tiles: {0}")]
+    ClusterTiles(#[from] ViewportTilesError),
 }
 
 /// thiserror's `#[from] CodecError` won't chain an `IdConvertError` in one hop,

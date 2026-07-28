@@ -573,7 +573,10 @@ pub trait EntityView<S: FactStore>: FactView<S> {
     /// as a singleton, a splittable cluster, or a co-located group.
     ///
     /// Unpaginated — the viewport is tile-count-bounded ([`CLUSTER_TILE_CAP`]),
-    /// so the whole cell set returns at once.
+    /// so the whole cell set returns at once. A viewport spanning more tiles
+    /// than that at `level` is refused with an error, so the caller hears "the
+    /// level is too fine for this span" rather than reading an empty cell list
+    /// as "nothing is here".
     ///
     /// [`CLUSTER_TILE_N`]: crate::store::schema::CLUSTER_TILE_N
     /// [`CLUSTER_TILE_CAP`]: crate::store::schema::CLUSTER_TILE_CAP

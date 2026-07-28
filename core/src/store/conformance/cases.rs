@@ -23,7 +23,8 @@ use crate::grammar::ids::{CommitId, FactId, UserId};
 use crate::grammar::text::Text;
 use crate::location::{Location, LocationReference, UnresolvedLocation};
 use crate::store::schema::{
-    CELL_DEPTH, CLUSTER_TILE_N, CellKind, ClassRow, ClusterCell, EntityStream, ImageStream, RankKey,
+    CELL_DEPTH, CLUSTER_TILE_CAP, CLUSTER_TILE_N, CellKind, ClassRow, ClusterCell, EntityStream,
+    ImageStream, RankKey,
 };
 use crate::store::{
     EntityIdOf, EntityView, EventView, FactPlacement, FactStore, FactView, FactWrite, ImageIdOf,
@@ -50,7 +51,7 @@ use super::fixtures::{
     same_entity_fact, same_event_fact, sample_citation, sample_viewport, started_with_date,
     subimage_fact, submit_batch, supersede_fact, user_author, year_date,
 };
-use super::{TestError, TestResult, UnmintedIds};
+use super::{RefusalKinds, TestError, TestResult, UnmintedIds};
 
 // --- roundtrip & resolution ---
 
@@ -5404,6 +5405,215 @@ pub async fn cluster_colocated_becomes_singleton_when_a_member_is_retracted<S: F
             kind: CellKind::Singleton,
         }],
         "retracting B ({b_id:?}) leaves A ({a_id:?}) as a singleton; got {cells_after:?}"
+    );
+    Ok(())
+}
+
+/// An entity positioned by a `MovedToLocation` event clusters under the entity,
+/// through the event's `HasEvent` owner: the located fact's subject is the
+/// *event*, so a read that folds located facts by their own subject attributes
+/// the cell to nothing. A is built far outside the viewport and moved inside, so
+/// the move is the only fact that can produce a cell here — and it must produce
+/// one whose representative is A.
+pub async fn cluster_entities_in_viewport_places_a_moved_entity_under_its_owner<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let level = QuadLevel::new(14)?;
+
+    let (built_lat, built_lon) = (10.0, 10.0);
+    let (moved_lat, moved_lon) = (40.021, -73.981);
+
+    let a = commit_result(
+        &store,
+        local_bundle(
+            1,
+            1,
+            0,
+            0,
+            vec![
+                construction_at(0, built_lat, built_lon)?,
+                has_event_fact(0, 0, moved_kind())?,
+                moved_to(0, moved_lat, moved_lon)?,
+            ],
+        )?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+
+    // Preconditions: the construction sits outside every tile the viewport
+    // spans, the move inside one of them — so the move alone decides the answer.
+    let built_pt = GeoPoint::new(built_lat, built_lon)?;
+    let moved_pt = GeoPoint::new(moved_lat, moved_lon)?;
+    let ranges = viewport_tiles(&viewport, level)?;
+    let in_viewport_tile = |p: &GeoPoint| {
+        let q = quadkey(p);
+        ranges.iter().any(|r| r.lo <= q && q <= r.hi)
+    };
+    assert!(
+        !in_viewport_tile(&built_pt),
+        "A's construction must fall outside the viewport's tiles"
+    );
+    assert!(
+        in_viewport_tile(&moved_pt),
+        "A's move must land inside a viewport tile"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let got = view
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        got,
+        vec![ClusterCell {
+            representative: a_id.clone(),
+            point: moved_pt,
+            kind: CellKind::Singleton,
+        }],
+        "the move must place A ({a_id:?}) at the moved-to point via its HasEvent owner; got {got:?}"
+    );
+    Ok(())
+}
+
+/// A viewport spanning more than [`CLUSTER_TILE_CAP`] tiles at the requested
+/// level is refused — the level is too fine for the span, and the caller needs
+/// to hear that rather than read an empty answer as "nothing is here". The same
+/// entity and viewport cluster fine one level coarser, so the refusal is the
+/// cap's doing and not a clustering read that fails on everything.
+pub async fn cluster_entities_in_viewport_refuses_a_level_too_fine_for_the_span<
+    S: FactStore + RefusalKinds,
+>(
+    store: S,
+) -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let too_fine = QuadLevel::new(17)?;
+    let within_cap = QuadLevel::new(14)?;
+
+    let (a_lat, a_lon) = (40.021, -73.981);
+    let a = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, a_lat, a_lon)?])?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+
+    // The refusal has to come from the clustering cap, not the shared
+    // `viewport_tiles` guard above it: enumerating the tiles succeeds, and there
+    // are more of them than one clustering read may enumerate.
+    let spanned = viewport_tiles(&viewport, too_fine)?.len();
+    assert!(
+        spanned > CLUSTER_TILE_CAP,
+        "the level must span more tiles ({spanned}) than the clustering cap \
+         ({CLUSTER_TILE_CAP}) for this case to test the cap"
+    );
+    assert!(
+        viewport_tiles(&viewport, within_cap)?.len() <= CLUSTER_TILE_CAP,
+        "the coarser level must stay inside the cap for its read to answer"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let refused = view
+        .cluster_entities_in_viewport(&viewport, too_fine, RankKey::Unranked)
+        .await;
+    let Err(error) = refused else {
+        return Err(format!(
+            "a viewport spanning {spanned} tiles at level {} must be refused, never answered with \
+             a cell list; got {refused:?}",
+            too_fine.get()
+        )
+        .into());
+    };
+    assert!(
+        S::is_cluster_tile_cap_refusal(&error),
+        "the refusal must be the tile-cap refusal, not some other backend failure; got {error:?}"
+    );
+
+    // The same viewport at a level inside the cap answers with A's cell: the
+    // refusal above is the cap talking, and the entity is really there to find.
+    let a_pt = GeoPoint::new(a_lat, a_lon)?;
+    let got = view
+        .cluster_entities_in_viewport(&viewport, within_cap, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        got,
+        vec![ClusterCell {
+            representative: a_id.clone(),
+            point: a_pt,
+            kind: CellKind::Singleton,
+        }],
+        "at a level inside the cap the same viewport must cluster A ({a_id:?}); got {got:?}"
+    );
+    Ok(())
+}
+
+/// A capture location never spends an entity's share of a tile's candidate
+/// budget. A full budget of them sorts ahead of the one entity sharing their
+/// tile, so a read that let image subjects into the candidate cut would spend
+/// the whole budget on them, drop the entity, and answer with nothing there.
+pub async fn cluster_entities_in_viewport_excludes_image_capture_locations<S: FactStore>(
+    store: S,
+) -> TestResult {
+    let viewport = Viewport::new(GeoPoint::new(40.0, -74.0)?, GeoPoint::new(40.1, -73.9)?)?;
+    let level = QuadLevel::new(14)?;
+
+    let (image_lat, image_lon) = (40.021, -73.981);
+    let (entity_lat, entity_lon) = (40.020, -73.980);
+
+    // A whole tile budget of capture locations, committed first so their fact
+    // ids sort first too.
+    let crowd = (0..CLUSTER_TILE_N)
+        .map(|idx| captured_location_at(idx, image_lat, image_lon, 0.0))
+        .collect::<Result<Vec<_>, TestError>>()?;
+    commit_result(&store, local_bundle(0, 0, CLUSTER_TILE_N, 0, crowd)?).await?;
+
+    let a = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            20,
+            vec![construction_at(0, entity_lat, entity_lon)?],
+        )?,
+    )
+    .await?;
+    let a_id = a.entities.get(&EntityIdx(0)).ok_or("missing a")?.id.clone();
+
+    // Preconditions: the crowd shares the entity's tile and sorts ahead of it,
+    // so it would exhaust the budget.
+    let image_pt = GeoPoint::new(image_lat, image_lon)?;
+    let entity_pt = GeoPoint::new(entity_lat, entity_lon)?;
+    let ranges = viewport_tiles(&viewport, level)?;
+    let tile_of = |p: &GeoPoint| -> Option<usize> {
+        let q = quadkey(p);
+        ranges.iter().position(|r| r.lo <= q && q <= r.hi)
+    };
+    let entity_tile = tile_of(&entity_pt).ok_or("the entity must fall in a viewport tile")?;
+    assert_eq!(
+        Some(entity_tile),
+        tile_of(&image_pt),
+        "the capture crowd must share the entity's tile"
+    );
+    assert!(
+        quadkey(&image_pt) < quadkey(&entity_pt),
+        "the capture crowd must sort ahead of the entity to contest its budget"
+    );
+
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let got = view
+        .cluster_entities_in_viewport(&viewport, level, RankKey::Unranked)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(
+        got,
+        vec![ClusterCell {
+            representative: a_id.clone(),
+            point: entity_pt,
+            kind: CellKind::Singleton,
+        }],
+        "capture locations must not crowd out A ({a_id:?}); got {got:?}"
     );
     Ok(())
 }

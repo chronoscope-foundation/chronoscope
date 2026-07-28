@@ -2,19 +2,18 @@
 //! against [`PostgresFactStore`] over the ephemeral-cluster harness, plus a
 //! `PostGIS` smoke check.
 //!
-//! The ignore list is exactly the spatial-touching cases — the `PostGIS`
-//! `InViewport` reads and tiled clustering, deferred to their own unit.
-//! Retraction now lands (the recursive `RETRACTOR_CLOSURE` fixpoint +
-//! `record_retraction`), so every retraction case runs GREEN. Anything the
-//! spatial stubs break fails *loudly* (a red assertion, never a false green), so
-//! a missed ignore surfaces on the first run.
+//! The ignore list is exactly the `PostGIS` `InViewport` reads, deferred to
+//! their own unit. Retraction and tiled clustering both land — clustering is a
+//! Morton-range scan on the `quadkey` facet and never touches `PostGIS` — so
+//! their cases run GREEN. Anything the spatial stubs break fails *loudly* (a red
+//! assertion, never a false green), so a missed ignore surfaces on the first run.
 
-use super::PostgresFactStore;
 use super::harness::{fresh_pg_store, fresh_pg_store_at_default_isolation};
+use super::{PostgresFactStore, PostgresFactStoreError};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlImageId};
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::store::FactStore;
-use chronoscope_core::store::conformance::{TestResult, UnmintedIds};
+use chronoscope_core::store::conformance::{RefusalKinds, TestResult, UnmintedIds};
 
 /// Counters mint dense from zero, so `i64::MAX` is never assigned.
 impl UnmintedIds for PostgresFactStore {
@@ -26,6 +25,12 @@ impl UnmintedIds for PostgresFactStore {
     }
     fn unminted_image() -> SqlImageId {
         SqlImageId(i64::MAX)
+    }
+}
+
+impl RefusalKinds for PostgresFactStore {
+    fn is_cluster_tile_cap_refusal(error: &PostgresFactStoreError) -> bool {
+        matches!(error, PostgresFactStoreError::ClusterTiles(_))
     }
 }
 
@@ -41,22 +46,6 @@ chronoscope_core::fact_store_conformance!(
             "PostGIS spatial reads deferred to a later unit",
         walk_image_classes_in_viewport_surfaces_captured_locations:
             "PostGIS spatial reads deferred to a later unit",
-        // --- tiled clustering (spatial read; the clustering read, not
-        //     retraction, is what these still wait on) ---
-        cluster_tile_cells_match_the_same_tile_inside_a_viewport:
-            "tiled clustering (spatial read) deferred to the pg spatial unit",
-        cluster_tile_cells_keep_high_sub_tiles_under_a_dense_low_corner:
-            "tiled clustering (spatial read) deferred to the pg spatial unit",
-        cluster_entities_in_viewport_buckets_by_tile:
-            "tiled clustering (spatial read) deferred to the pg spatial unit",
-        cluster_entities_in_viewport_respects_snapshot:
-            "tiled clustering (spatial read) deferred to the pg spatial unit",
-        cluster_entities_in_viewport_groups_colocated_entities:
-            "tiled clustering (spatial read) deferred to the pg spatial unit",
-        cluster_cluster_becomes_singleton_when_a_member_is_retracted:
-            "tiled clustering (spatial read) deferred to the pg spatial unit",
-        cluster_colocated_becomes_singleton_when_a_member_is_retracted:
-            "tiled clustering (spatial read) deferred to the pg spatial unit",
     )
 );
 

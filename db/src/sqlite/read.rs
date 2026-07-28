@@ -22,7 +22,7 @@ use sqlx::SqliteConnection;
 
 use chronoscope_core::algebra::lattice::JoinSemilattice;
 use chronoscope_core::date::UncertainDate;
-use chronoscope_core::geo::{GeoPoint, QuadLevel, QuadTileRange, TileId, Viewport};
+use chronoscope_core::geo::{QuadLevel, QuadTileRange, TileId, Viewport};
 use chronoscope_core::grammar::event;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::solvers::WitnessScan;
@@ -31,12 +31,15 @@ use chronoscope_core::store::pagination;
 use chronoscope_core::store::retraction::{RetractionEdges, effective_retractor};
 use chronoscope_core::store::schema::{
     CELL_DEPTH, CLUSTER_TILE_N, ClassPage, ClassRow, ClusterCell, DepictionPage, EquivClass,
-    FactPage, PageItem, RankKey, cluster_tile_ranges, fold_cluster_cell,
+    FactPage, PageItem, RankKey, cluster_tile_ranges,
 };
 use chronoscope_core::submit::{FactLookup, LocatedSubject, StoredFact, SubmitResult};
 
 use super::error::{SqliteFactStoreError, sql};
 use super::queries::{self, FactQueries};
+use crate::common::cluster::{
+    LocatedSubjects, OwnerCandidates, OwnerRow, place_candidates, resolve_entities,
+};
 use crate::common::convert::{i64_to_u64, seed_ids, u64_to_i64};
 use crate::common::error::json;
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
@@ -704,23 +707,24 @@ async fn located_in_viewport(
     Ok(located)
 }
 
-/// The owning entity of each of `events` at the snapshot — memory's
-/// `event_entity_map` scoped to the events one walk needs. One batched
+/// The owning entity of each of `events` at the snapshot. One batched
 /// [`EVENT_OWNERS`](super::queries::EVENT_OWNERS) fetch (an indexed probe per
 /// event) reads owners off the `event_owner` facet without decoding a fact,
-/// then one batched retractor closure gates them. Ascending fact-id
-/// insertion makes the latest active owner win, and a retracted `HasEvent`
-/// is no owner edge, matching the memory map exactly.
+/// then one batched retractor closure feeds the shared live-owner rule
+/// ([`OwnerCandidates`]).
 async fn event_owners(
     conn: &mut SqliteConnection,
     bound: ReadBound,
-    events: &std::collections::BTreeSet<SqlEventId>,
-) -> Result<std::collections::BTreeMap<SqlEventId, SqlEntityId>, SqliteFactStoreError> {
+    events: &BTreeSet<SqlEventId>,
+) -> Result<BTreeMap<SqlEventId, SqlEntityId>, SqliteFactStoreError> {
     if events.is_empty() {
-        return Ok(std::collections::BTreeMap::new());
+        return Ok(BTreeMap::new());
     }
     let event_ids: Vec<i64> = events.iter().map(|event| event.raw()).collect();
     let event_json = serde_json::to_string(&event_ids).map_err(json("encoding event id list"))?;
+    // `SELECT fact_subjects.fact_id, fact_subjects.subject_id, facts.event_owner`
+    // — named into `OwnerRow` right here, since the seam has no other tie to this
+    // statement's column order.
     let rows: Vec<(i64, i64, i64)> = sqlx::query_as(queries::EVENT_OWNERS.sql)
         .bind(&event_json)
         .bind(kind_tag(SqlEventId::KIND))
@@ -728,22 +732,16 @@ async fn event_owners(
         .fetch_all(&mut *conn)
         .await
         .map_err(sql("fetching event owners"))?;
-    // Keyed by fact id so the winner scan below runs ascending regardless of
-    // fetch order.
-    let candidates: std::collections::BTreeMap<i64, (i64, i64)> = rows
-        .into_iter()
-        .map(|(fid, event, owner)| (fid, (event, owner)))
-        .collect();
-    let seeds = seed_ids(candidates.keys(), "has-event fact id")?;
-    let retraction = retraction_edges(conn, bound, &seeds).await?;
-    let mut owners = std::collections::BTreeMap::new();
-    for ((_, (event, owner)), fid) in candidates.iter().zip(&seeds) {
-        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
-            continue;
-        }
-        owners.insert(SqlEventId::from_raw(*event), SqlEntityId::from_raw(*owner));
-    }
-    Ok(owners)
+    let candidates =
+        OwnerCandidates::from_rows(rows.into_iter().map(|(fact_id, subject_id, owner)| {
+            OwnerRow {
+                fact_id,
+                event: SqlEventId::from_raw(subject_id),
+                owner: SqlEntityId::from_raw(owner),
+            }
+        }))?;
+    let retraction = retraction_edges(conn, bound, &candidates.seeds()).await?;
+    Ok(candidates.live(bound.fact_id(), &retraction))
 }
 
 /// One page of the entity `InViewport` class walk: [`located_in_viewport`] facts of
@@ -761,24 +759,9 @@ pub(super) async fn spatial_entity_page(
 ) -> Result<ClassPage<SqlEntityId, (SqlEntityId, FactId)>, SqliteFactStoreError> {
     let kinds = (kind_tag(SqlEntityId::KIND), kind_tag(SqlEventId::KIND));
     let located = located_in_viewport(conn, bound, fq, viewport, kinds).await?;
-    let mut subjects: Vec<(SqlEntityId, FactId)> = Vec::new();
-    let mut moved: Vec<(SqlEventId, FactId)> = Vec::new();
-    for (fid, fact) in &located {
-        match fact.located_subject() {
-            Some((_, LocatedSubject::Entity(entity))) => subjects.push((*entity, *fid)),
-            Some((_, LocatedSubject::Event(event))) => moved.push((*event, *fid)),
-            Some((_, LocatedSubject::Image(_))) | None => {}
-        }
-    }
-    let events: std::collections::BTreeSet<SqlEventId> =
-        moved.iter().map(|(event, _)| *event).collect();
-    let owners = event_owners(conn, bound, &events).await?;
-    for (event, fid) in moved {
-        if let Some(entity) = owners.get(&event) {
-            subjects.push((*entity, fid));
-        }
-    }
-    rep_class_page(conn, bound, fq, subjects, after, limit).await
+    let split = LocatedSubjects::partition(&located);
+    let owners = event_owners(conn, bound, &split.events()).await?;
+    rep_class_page(conn, bound, fq, split.attribute(&owners), after, limit).await
 }
 
 /// One page of the image `InViewport` class walk: [`located_in_viewport`] facts of
@@ -803,54 +786,26 @@ pub(super) async fn spatial_image_page(
     rep_class_page(conn, bound, fq, subjects, after, limit).await
 }
 
-/// Attribute a batch of location-bearing facts to their entity
-/// representatives: construction bookends to their own entity, `MovedToLocation`
-/// facts to their [`event_owners`] entity (an orphaned move attributes to
-/// nothing), each resolved to its `SameEntity` representative — one batched
-/// `event_owners` fetch, one cached log seek per distinct subject. The clustering
-/// read's resolve tail.
-///
-/// Quadkey-free by design: the caller keeps whatever tile/point key it needs and
-/// joins it back by `fact_id`. The return reorders (entity facts, then the
-/// attributed moves), so the cluster fold keys off its own `(quadkey, fact_id)`,
-/// never the position here.
+/// Attribute a batch of located facts to their entity representatives through
+/// the shared [`resolve_entities`] sequence, driving it with this backend's two
+/// batched fetches: [`event_owners`] and [`representatives`].
 async fn resolve_located_entities(
     conn: &mut SqliteConnection,
     bound: ReadBound,
     fq: &FactQueries,
-    located: Vec<(FactId, StoredFact<SqlIds>)>,
+    located: LocatedSubjects,
 ) -> Result<Vec<(SqlEntityId, FactId)>, SqliteFactStoreError> {
-    let mut subjects: Vec<(SqlEntityId, FactId)> = Vec::new();
-    let mut moved: Vec<(SqlEventId, FactId)> = Vec::new();
-    for (fid, fact) in &located {
-        match fact.located_subject() {
-            Some((_, LocatedSubject::Entity(entity))) => subjects.push((*entity, *fid)),
-            Some((_, LocatedSubject::Event(event))) => moved.push((*event, *fid)),
-            Some((_, LocatedSubject::Image(_))) | None => {}
-        }
-    }
-    let events: BTreeSet<SqlEventId> = moved.iter().map(|(event, _)| *event).collect();
-    let owners = event_owners(conn, bound, &events).await?;
-    for (event, fid) in moved {
-        if let Some(entity) = owners.get(&event) {
-            subjects.push((*entity, fid));
-        }
-    }
-    let mut reps: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
-    let mut resolved: Vec<(SqlEntityId, FactId)> = Vec::with_capacity(subjects.len());
-    for (subject, fid) in subjects {
-        let rep = resolve_rep_cached(
-            conn,
-            bound,
-            fq,
-            kind_tag(SqlEntityId::KIND),
-            subject.raw(),
-            &mut reps,
-        )
-        .await?;
-        resolved.push((SqlEntityId::from_raw(rep), fid));
-    }
-    Ok(resolved)
+    resolve_entities(
+        located,
+        conn,
+        async |conn: &mut SqliteConnection, events: &BTreeSet<SqlEventId>| {
+            event_owners(conn, bound, events).await
+        },
+        async |conn: &mut SqliteConnection, members: &[SqlEntityId]| {
+            representatives(conn, bound, fq, members).await
+        },
+    )
+    .await
 }
 
 /// The bounded core under both clustering reads: fetch each of `ranges` for its
@@ -865,19 +820,16 @@ async fn resolve_located_entities(
 /// fact_id)`-lowest [`CLUSTER_TILE_N`] before retraction — the same cut the
 /// memory oracle applies and the same one the single-table `LIMIT` gives, since
 /// the per-layer id spaces are disjoint (base-top-N ∪ overlay-top-N ⊇
-/// global-top-N). Feeding [`fold_cluster_cell`] the un-truncated ≤2N rows would
-/// misread the cell's kind, members, or split level, so the cut must precede the
-/// fold. The overlay-only path holds ≤N per bucket, so the truncate is a no-op
-/// there.
+/// global-top-N). Feeding the fold the un-truncated ≤2N rows would misread the
+/// cell's kind, members, or split level, so the cut must precede the fold. The
+/// overlay-only path holds ≤N per bucket, so the truncate is a no-op there.
 ///
-/// The batch then drops retracted facts (one closure), attributes survivors to
-/// entity representatives via [`resolve_located_entities`], and folds each range:
-/// the `(quadkey, fact_id)`-minimal survivor gives the cell's representative and
-/// center. The resolve reorders its rows, so each survivor is rejoined to its
-/// range, quadkey, and point by fact id. `cluster_entities_in_viewport` passes
-/// the viewport's tiles and `cluster_tile_cells` the container's child tiles, so
-/// a stand-alone tile and the same tile inside a viewport fold to byte-identical
-/// cells.
+/// The batch then goes through the shared tail — one retractor closure into
+/// [`place_candidates`], [`resolve_located_entities`], and the placement's fold
+/// — which the Postgres backend runs on its own fetch, so the two answer
+/// identical cells. `cluster_entities_in_viewport` passes the viewport's tiles
+/// and `cluster_tile_cells` the container's child tiles, so a stand-alone tile
+/// and the same tile inside a viewport fold to byte-identical cells.
 ///
 /// `ranges` is consumed by value as an [`IntoIterator`], so the per-tile read
 /// streams its lazy [`TileId::child_ranges`] iterator without ever collecting it,
@@ -926,38 +878,9 @@ async fn cluster_ranges(
 
     let seeds: Vec<FactId> = candidates.iter().map(|(_, fid, _, _)| *fid).collect();
     let retraction = retraction_edges(conn, bound, &seeds).await?;
-    let mut placed: BTreeMap<FactId, (usize, i64, GeoPoint)> = BTreeMap::new();
-    let mut located: Vec<(FactId, StoredFact<SqlIds>)> = Vec::new();
-    for (bucket, fact_id, quadkey, fact) in candidates {
-        if effective_retractor(fact_id, bound.fact_id(), &retraction).is_some() {
-            continue;
-        }
-        let Some((location, _)) = fact.located_subject() else {
-            continue;
-        };
-        let Some(center) = location.point() else {
-            continue;
-        };
-        placed.insert(fact_id, (bucket, quadkey, *center));
-        located.push((fact_id, fact));
-    }
-
-    let mut folded: BTreeMap<usize, Vec<(i64, FactId, SqlEntityId, GeoPoint)>> = BTreeMap::new();
-    for (rep, fid) in resolve_located_entities(conn, bound, fq, located).await? {
-        if let Some((bucket, quadkey, point)) = placed.get(&fid) {
-            folded
-                .entry(*bucket)
-                .or_default()
-                .push((*quadkey, fid, rep, *point));
-        }
-    }
-    let mut cells = Vec::new();
-    for survivors in folded.into_values() {
-        if let Some(cell) = fold_cluster_cell(&survivors) {
-            cells.push(cell);
-        }
-    }
-    Ok(cells)
+    let placed = place_candidates(candidates, bound.fact_id(), &retraction);
+    let resolved = resolve_located_entities(conn, bound, fq, placed.subjects()).await?;
+    Ok(placed.fold(resolved))
 }
 
 /// One [`ClusterCell`] per non-empty tile of `viewport` at `level`, ranked by

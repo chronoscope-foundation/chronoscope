@@ -61,7 +61,7 @@ use async_lock::{Mutex, MutexGuard};
 
 use schemars::JsonSchema;
 
-use crate::geo::{QuadLevel, TileId, Viewport};
+use crate::geo::{QuadLevel, TileId, Viewport, ViewportTilesError};
 use crate::grammar::assertions::MetaAssertion;
 use crate::grammar::event;
 use crate::grammar::ids::{CommitId, FactId, IdScheme};
@@ -131,11 +131,21 @@ impl IdScheme for MemoryIds {
 /// [`SubmitCommitError::Submit`](crate::store::SubmitCommitError::Submit)
 /// instead.
 ///
-/// Holds the rendered message as a `String`; each construction site supplies
-/// its context, and the type stays value-comparable for tests.
+/// [`Backend`](Self::Backend) holds the rendered message as a `String`; each
+/// construction site supplies its context, and the type stays value-comparable
+/// for tests. The clustering refusal keeps its cause typed instead, so a caller
+/// can tell "the level is too fine for this viewport" from any other failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct MemoryError(String);
+pub enum MemoryError {
+    /// A backend failure, rendered with the context its site knew.
+    #[error("{0}")]
+    Backend(String),
+    /// A clustering read's viewport spanned too many tiles at the requested
+    /// level, tripping the shared `viewport_tiles` guard or the clustering cap.
+    /// Both mean the level is too fine for the viewport.
+    #[error("clustering viewport spans too many tiles: {0}")]
+    ClusterTiles(#[from] ViewportTilesError),
+}
 
 // Aliases to keep the spellings short.
 type MemStoredFact = StoredFact<MemoryIds>;
@@ -675,7 +685,9 @@ impl Pending {
     /// apply step with; `Ok` while healthy.
     fn poison_check(&self) -> Result<(), MemoryError> {
         match &self.poisoned {
-            Some(cause) => Err(MemoryError(format!("transaction poisoned: {cause}"))),
+            Some(cause) => Err(MemoryError::Backend(format!(
+                "transaction poisoned: {cause}"
+            ))),
             None => Ok(()),
         }
     }
@@ -1023,7 +1035,7 @@ impl<Src: CoreSource + Send + Sync> EntityView<MemoryFactStore> for Src {
     ) -> Result<Vec<ClusterCell<MemoryEntityId>>, MemoryError> {
         self.with_core(move |core| core.cluster_entities(viewport, level, rank))
             .await
-            .map_err(|e| MemoryError(format!("clustering viewport: {e}")))
+            .map_err(MemoryError::ClusterTiles)
     }
 
     async fn cluster_tile_cells(
@@ -1251,14 +1263,14 @@ fn apply_pending(inner: &mut Inner, pending: Pending) -> Result<(), MemoryError>
                 .and_then(|off| usize::try_from(off).ok())
                 .and_then(|off| owners.get_mut(off));
             let Some(slot) = slot else {
-                return Err(MemoryError(format!(
+                return Err(MemoryError::Backend(format!(
                     "recorded commit {:?} names fact id {} outside this transaction's staged range",
                     commit.commit_id,
                     fid.get(),
                 )));
             };
             if let Some(prior) = slot {
-                return Err(MemoryError(format!(
+                return Err(MemoryError::Backend(format!(
                     "recorded commits {:?} and {:?} both claim fact id {}",
                     prior,
                     commit.commit_id,
@@ -1273,7 +1285,7 @@ fn apply_pending(inner: &mut Inner, pending: Pending) -> Result<(), MemoryError>
         .enumerate()
         .map(|(off, owner)| {
             owner.ok_or_else(|| {
-                MemoryError(format!(
+                MemoryError::Backend(format!(
                     "staged fact at offset {off} has no recorded commit; \
                      a rejected submit's staging cannot be committed"
                 ))

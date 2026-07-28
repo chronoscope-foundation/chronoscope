@@ -17,20 +17,27 @@
 //! equal to the live-edge components at every snapshot by the write path
 //! ([`super::maintain`]), so no read walks identity edges.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use sqlx::PgConnection;
 
+use chronoscope_core::geo::{QuadLevel, QuadTileRange, TileId, Viewport};
 use chronoscope_core::grammar::event;
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::store::FactPlacement;
 use chronoscope_core::store::pagination;
 use chronoscope_core::store::retraction::{RetractionEdges, effective_retractor};
 use chronoscope_core::store::schema::{
-    ClassPage, ClassRow, DepictionPage, EquivClass, FactPage, PageItem,
+    CELL_DEPTH, ClassPage, ClassRow, ClusterCell, DepictionPage, EquivClass, FactPage, PageItem,
+    RankKey, cluster_tile_ranges,
 };
 use chronoscope_core::submit::{FactLookup, StoredFact, SubmitResult};
 
 use super::error::{PostgresFactStoreError as Error, sql};
 use super::queries;
+use crate::common::cluster::{
+    LocatedSubjects, OwnerCandidates, OwnerRow, place_candidates, resolve_entities,
+};
 use crate::common::convert::{i64_to_u64, seed_ids, u64_to_i64};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
 use crate::common::storage::{
@@ -596,6 +603,181 @@ pub(super) async fn depiction_page(
         rows: page,
         next_class,
     })
+}
+
+/// The owning entity of each of `events` at the snapshot. One batched
+/// [`EVENT_OWNERS`](super::queries::EVENT_OWNERS) fetch (an indexed probe per
+/// event) reads owners off the `event_owner` facet without decoding a fact, then
+/// one batched retractor closure feeds the shared live-owner rule
+/// ([`OwnerCandidates`]).
+async fn event_owners(
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    events: &BTreeSet<SqlEventId>,
+) -> Result<BTreeMap<SqlEventId, SqlEntityId>, Error> {
+    if events.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let event_ids: Vec<i64> = events.iter().map(|event| event.raw()).collect();
+    // `SELECT s.fact_id, s.subject_id, f.event_owner` — named into `OwnerRow` right
+    // here, since the seam has no other tie to this statement's column order.
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(queries::EVENT_OWNERS)
+        .bind(event_ids)
+        .bind(kind_tag(SqlEventId::KIND))
+        .bind(bound.bind())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("fetching event owners"))?;
+    let candidates =
+        OwnerCandidates::from_rows(rows.into_iter().map(|(fact_id, subject_id, owner)| {
+            OwnerRow {
+                fact_id,
+                event: SqlEventId::from_raw(subject_id),
+                owner: SqlEntityId::from_raw(owner),
+            }
+        }))?;
+    let retraction = retraction_edges(conn, bound, &candidates.seeds()).await?;
+    Ok(candidates.live(bound.fact_id(), &retraction))
+}
+
+/// Attribute a batch of located facts to their entity representatives through
+/// the shared [`resolve_entities`] sequence, driving it with this backend's two
+/// batched fetches: [`event_owners`] and [`representatives`].
+async fn resolve_located_entities(
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    located: LocatedSubjects,
+) -> Result<Vec<(SqlEntityId, FactId)>, Error> {
+    resolve_entities(
+        located,
+        conn,
+        async |conn: &mut PgConnection, events: &BTreeSet<SqlEventId>| {
+            event_owners(conn, bound, events).await
+        },
+        async |conn: &mut PgConnection, members: &[SqlEntityId]| {
+            representatives(conn, bound, members).await
+        },
+    )
+    .await
+}
+
+/// Which range a cluster candidate folds under: its position in the bound arrays,
+/// as `WITH ORDINALITY` numbers it. Distinct from the quadkey and fact id it
+/// travels beside, all three of which are `bigint` on the wire — a transposition
+/// would merge two cells into one or explode one into many, so it costs a type
+/// rather than a runtime check.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Bucket(i64);
+
+/// The bounded core under both clustering reads: fetch each of `ranges` for its
+/// `(quadkey, fact_id)`-lowest
+/// [`CLUSTER_TILE_N`](chronoscope_core::store::schema::CLUSTER_TILE_N)
+/// entity/event candidates, then fold each range to at most one [`ClusterCell`].
+/// The range's position in the bound arrays is the fold's [`Bucket`], so ranges
+/// never bleed together.
+///
+/// The whole fan-out is one statement
+/// ([`CLUSTER_TILE`](super::queries::CLUSTER_TILE)): the ranges bind as parallel
+/// arrays and a LATERAL applies the top-N scan per range, so 64 sub-tiles or 256
+/// viewport tiles cost one round trip while each range keeps its own budget. The
+/// `WITH ORDINALITY` bucket rides back on every row, since the fold is
+/// per-bucket and order-independent — a lost bucket would silently merge two
+/// cells into one rather than fail. Binding arrays means `ranges` is collected
+/// here, which the caps keep small.
+///
+/// The batch then goes through the shared tail — one retractor closure into
+/// [`place_candidates`], [`resolve_located_entities`], and the placement's fold
+/// — which the SQLite backend runs on its own fetch, so the two answer identical
+/// cells. `cluster_entities_in_viewport` passes the viewport's tiles and
+/// `cluster_tile_cells` the container's child tiles, so a stand-alone tile and
+/// the same tile inside a viewport fold to byte-identical cells.
+async fn cluster_ranges(
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    ranges: impl IntoIterator<Item = QuadTileRange>,
+) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
+    let (los, his): (Vec<i64>, Vec<i64>) =
+        ranges.into_iter().map(|range| (range.lo, range.hi)).unzip();
+    if los.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(i64, i64, String, i64)> = sqlx::query_as(queries::CLUSTER_TILE.as_str())
+        .bind(los)
+        .bind(his)
+        .bind(bound.bind())
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(sql("fetching cluster tile candidates"))?;
+
+    let mut candidates: Vec<(Bucket, FactId, i64, StoredFact<SqlIds>)> =
+        Vec::with_capacity(rows.len());
+    for (bucket, fid, fact_json, quadkey) in rows {
+        candidates.push((
+            Bucket(bucket),
+            FactId::new(i64_to_u64(fid, "cluster candidate fact id")?),
+            quadkey,
+            fact_from_json(&fact_json)?,
+        ));
+    }
+
+    let seeds: Vec<FactId> = candidates.iter().map(|(_, fid, _, _)| *fid).collect();
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    let placed = place_candidates(candidates, bound.fact_id(), &retraction);
+    let resolved = resolve_located_entities(conn, bound, placed.subjects()).await?;
+    Ok(placed.fold(resolved))
+}
+
+/// One [`ClusterCell`] per non-empty tile of `viewport` at `level`, ranked by
+/// `rank` (`Unranked` = `(quadkey, fact_id)`).
+///
+/// [`cluster_tile_ranges`] gives the viewport's tiles — the coarse indexed
+/// pre-filter ranges — and [`cluster_ranges`] fetches each tile's bounded top-N
+/// and folds it. The fold is viewport-free, so a fringe tile the viewport only
+/// partly covers still yields a cell; empty tiles yield nothing.
+///
+/// A viewport spanning too many tiles at the level is refused by
+/// [`cluster_tile_ranges`] — a level too fine for the span.
+pub(super) async fn cluster_entities_in_viewport(
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    viewport: &Viewport,
+    level: QuadLevel,
+    rank: RankKey,
+) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
+    // The sole rank; its `(quadkey, fact_id)` order is the fetch order and the
+    // per-tile min in the fold.
+    match rank {
+        RankKey::Unranked => {}
+    }
+    let tiles = cluster_tile_ranges(viewport, level)?;
+    cluster_ranges(conn, bound, tiles).await
+}
+
+/// One [`ClusterCell`] per non-empty sub-tile of container `tile` at
+/// `level + CELL_DEPTH` — the viewport-free per-tile fold whose cell geometry is
+/// keyed by `(snapshot, level, x, y)`.
+///
+/// [`TileId::child_ranges`] enumerates the container's children `CELL_DEPTH`
+/// levels finer — at most `4^CELL_DEPTH` ranges, since the depth folds against
+/// the finest level. The children partition the container's Morton block, so each
+/// is one sub-tile bucket; folding each through the shared [`cluster_ranges`]
+/// applies the **per-sub-tile**
+/// top-[`CLUSTER_TILE_N`](chronoscope_core::store::schema::CLUSTER_TILE_N) cut,
+/// keeping a dense low-Morton corner from starving the container's other
+/// sub-tiles. That shared tail matches the viewport read, so a stand-alone tile
+/// and the same tile inside a viewport fold to byte-identical cells.
+pub(super) async fn cluster_tile_cells(
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    tile: TileId,
+    rank: RankKey,
+) -> Result<Vec<ClusterCell<SqlEntityId>>, Error> {
+    // The sole rank; its `(quadkey, fact_id)` order is the fetch order and the
+    // per-sub-tile min in the fold.
+    match rank {
+        RankKey::Unranked => {}
+    }
+    cluster_ranges(conn, bound, tile.child_ranges(CELL_DEPTH)).await
 }
 
 /// The `(rep, fact_id)` SQL binds for an All-walk cursor. `None` opens the walk

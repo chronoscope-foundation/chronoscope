@@ -20,7 +20,7 @@ use chronoscope_core::store::conformance::fixtures::{
     commit_err, commit_name, commit_result, construction_at, construction_started_fact, fixed_time,
     local_bundle, name_fact, retract_fact, same_entity_fact, sample_viewport, user_author,
 };
-use chronoscope_core::store::conformance::{TestError, TestResult, UnmintedIds};
+use chronoscope_core::store::conformance::{RefusalKinds, TestError, TestResult, UnmintedIds};
 use chronoscope_core::store::schema::{
     CELL_DEPTH, CLUSTER_TILE_N, CellKind, ClusterCell, EntityStream, RankKey,
 };
@@ -42,6 +42,12 @@ impl UnmintedIds for SqliteFactStore {
     }
     fn unminted_image() -> SqlImageId {
         SqlImageId(i64::MAX)
+    }
+}
+
+impl RefusalKinds for SqliteFactStore {
+    fn is_cluster_tile_cap_refusal(error: &SqliteFactStoreError) -> bool {
+        matches!(error, SqliteFactStoreError::ClusterTiles(_))
     }
 }
 

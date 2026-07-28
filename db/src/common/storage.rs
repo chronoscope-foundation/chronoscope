@@ -17,6 +17,7 @@ use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 use chronoscope_core::date::UncertainDate;
+use chronoscope_core::geo::quadkey_of_location;
 use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion, MetaAssertion};
 use chronoscope_core::grammar::citations::{
     ExternalReference, FactualCitation, JudgmentSource, MetaSource,
@@ -424,6 +425,16 @@ pub(crate) fn result_from_json(json: &str) -> Result<SubmitResult<SqlIds>, Codec
 // Facet columns
 // ============================================================================
 
+/// The clustering key of a fact whose location pins a point, beside the kind of
+/// subject it places. One value for both columns, so the pairing the schema's
+/// `(quadkey IS NULL) = (subject_kind IS NULL)` CHECK asserts holds by
+/// construction.
+#[derive(Clone, Copy)]
+pub(crate) struct ClusterFacet {
+    pub quadkey: i64,
+    pub subject_kind: &'static str,
+}
+
 /// The nullable facet columns of one `facts` row. Every field mirrors a
 /// column; [`facet_columns`] is the single extraction site.
 #[derive(Default)]
@@ -437,6 +448,7 @@ pub(crate) struct Facets {
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub radius_m: Option<f64>,
+    pub cluster: Option<ClusterFacet>,
     pub edge_kind: Option<&'static str>,
     pub edge_a: Option<i64>,
     pub edge_b: Option<i64>,
@@ -489,8 +501,24 @@ pub(crate) fn external_ref_key(reference: &ExternalReference) -> Result<String, 
     serde_json::to_string(reference).map_err(super::error::json("encoding external_ref key"))
 }
 
-/// Project a stored fact's single-valued facet columns.
+/// Project a stored fact's single-valued facet columns, so a backend's insert
+/// only binds them.
 pub(crate) fn facet_columns(fact: &StoredFact<SqlIds>) -> Result<Facets, CodecError> {
+    let mut facets = assertion_facets(fact)?;
+    // Orthogonal to the assertion's shape: every location-bearing kind clusters
+    // the same way, through the one seam that decides which locations cluster
+    // and where.
+    facets.cluster = fact.located_subject().and_then(|(location, subject)| {
+        quadkey_of_location(location).map(|quadkey| ClusterFacet {
+            quadkey,
+            subject_kind: kind_tag(subject.kind()),
+        })
+    });
+    Ok(facets)
+}
+
+/// The facet columns an assertion's own shape carries.
+fn assertion_facets(fact: &StoredFact<SqlIds>) -> Result<Facets, CodecError> {
     match fact {
         StoredFact::Factual(StoredFactualFact { assertion, .. }) => match assertion {
             FactualAssertion::Attribute { fact } => match fact {

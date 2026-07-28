@@ -21,7 +21,7 @@ use crate::store::conformance::fixtures::{
     fixed_time, has_event_fact, local_bundle, moved_kind, moved_to, name_fact, same_entity_fact,
     sample_viewport, subject_date_in, submit_batch, user_author,
 };
-use crate::store::conformance::{TestError, TestResult, UnmintedIds};
+use crate::store::conformance::{RefusalKinds, TestError, TestResult, UnmintedIds};
 use crate::submit::{Commit as SubmitBundle, Decl, EntityIdx, SubmitError, commit_facts};
 
 type TestBundle = SubmitBundle<MemoryIds>;
@@ -36,6 +36,12 @@ impl UnmintedIds for MemoryFactStore {
     }
     fn unminted_image() -> MemoryImageId {
         MemoryImageId(u64::MAX)
+    }
+}
+
+impl RefusalKinds for MemoryFactStore {
+    fn is_cluster_tile_cap_refusal(error: &MemoryError) -> bool {
+        matches!(error, MemoryError::ClusterTiles(_))
     }
 }
 

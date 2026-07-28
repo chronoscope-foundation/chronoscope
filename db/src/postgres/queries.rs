@@ -1,8 +1,9 @@
 //! Postgres fact-store query definitions.
 //!
 //! Postgres is one writable database — no base/overlay union, so every query is
-//! a plain `&str` constant (the SQLite backend's `has_base`-parameterized
-//! builders have no analogue here). The json columns are `JSONB`: writes bind
+//! fixed text (the SQLite backend's `has_base`-parameterized builders have no
+//! analogue here); the one non-`const` is [`CLUSTER_TILE`], which splices the
+//! shared per-range cut into its SQL. The json columns are `JSONB`: writes bind
 //! the codec's JSON string with a `$N::jsonb` cast (sqlx sends the parameter as
 //! `text`, and the explicit cast turns it into `jsonb`), and reads project
 //! `col::text` so the [`crate::common::storage`] string codecs decode unchanged.
@@ -13,9 +14,11 @@
 //! The recursive retraction CTEs (retractor closure, equivalence component,
 //! identity targets) are rewritten to a single self-reference each, since
 //! Postgres forbids SQLite's doubled recursive references (see their constants
-//! below). The spatial reads live in a later unit; the query-plan validator
-//! (seed + ANALYZE + bound-constant EXPLAIN) is a later unit too, so these
-//! strings are not plan-gated yet.
+//! below). The `PostGIS` spatial reads live in a later unit; the query-plan
+//! validator (seed + ANALYZE + bound-constant EXPLAIN) is a later unit too, so
+//! these strings are not plan-gated yet.
+
+use chronoscope_core::store::schema::CLUSTER_TILE_N;
 
 // ---- Mints ----
 //
@@ -57,16 +60,18 @@ pub(super) const INSERT_SUBJECT: &str =
     "INSERT INTO fact_subjects (fact_id, kind, subject_id) VALUES ($1, $2, $3)";
 
 // The pre-minted fact id binds as $1; fact_json binds as $2 (a JSON string cast
-// to jsonb). $3..$17 are the facet columns.
+// to jsonb). $3..$19 are the facet columns.
 pub(super) const INSERT_FACT: &str = "\
     INSERT INTO facts (
         fact_id, fact_json,
         name_norm, name_language, external_ref, source_url,
         date_earliest, date_latest, lat, lon, radius_m,
+        quadkey, subject_kind,
         edge_kind, edge_a, edge_b, event_owner,
         retracts_fact_id, retracts_commit_seq
     ) VALUES (
-        $1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+        $1, $2::jsonb, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+        $18, $19
     )";
 
 // The pre-minted commit seq binds as $1; commit_json / result_json as jsonb.
@@ -187,6 +192,53 @@ pub(super) const CLASS_CANDIDATES_BY_EXTREF: &str = "\
 pub(super) const CLASS_CANDIDATES_BY_SRCURL: &str = "\
     SELECT fact_id, fact_json::text FROM facts \
      WHERE source_url = $1 AND fact_id < $2";
+
+// ---- Event ownership ----
+
+// The active-or-retracted HasEvent rows of a batch of events: $1 a bigint[] of
+// event ids, $2 the event kind tag, $3 the exclusive snapshot. Each event costs
+// one indexed fact_subjects probe; the owner comes off the event_owner facet, so
+// nothing decodes fact_json. Retraction filtering happens in Rust over the
+// batched closure.
+pub(super) const EVENT_OWNERS: &str = "\
+    SELECT s.fact_id, s.subject_id, f.event_owner \
+     FROM fact_subjects s JOIN facts f ON f.fact_id = s.fact_id \
+     WHERE s.kind = $2 AND s.subject_id = ANY($1::bigint[]) \
+       AND s.fact_id < $3 AND f.event_owner IS NOT NULL";
+
+// ---- Viewport clustering ----
+
+// The clustering candidates of a batch of Morton ranges, one statement for the
+// whole fan-out: $1/$2 are the ranges' parallel lo/hi bigint[]s and $3 the
+// exclusive snapshot. `WITH ORDINALITY` names each range's position, and the
+// LATERAL runs the top-N scan once per range — so the bound is per range,
+// exactly as a range-at-a-time loop would give, and each row comes back carrying
+// the bucket its cell folds under.
+//
+// Two values sit in the text rather than in binds, both to keep
+// idx_facts_quadkey's ordered early-stopping scan. `subject_kind IN ('entity',
+// 'event')` matches the index's partial predicate, which the planner proves by
+// clause implication — a bound `= ANY($n::text[])` is unprovable at plan time.
+// And a generic plan cannot see through a bound LIMIT, so it loses the
+// early-stop preference that makes the ordered index scan cheaper than a sort;
+// the per-range cut is spliced from `CLUSTER_TILE_N` instead. Retraction and the
+// tile fold run in Rust.
+pub(super) static CLUSTER_TILE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "
+    SELECT r.bucket, t.fact_id, t.fact_json::text, t.quadkey
+    FROM unnest($1::bigint[], $2::bigint[]) WITH ORDINALITY AS r(lo, hi, bucket)
+    CROSS JOIN LATERAL (
+        SELECT fact_id, fact_json, quadkey FROM facts
+         WHERE quadkey BETWEEN r.lo AND r.hi
+           AND fact_id < $3
+           AND subject_kind IN ('entity', 'event')
+         ORDER BY quadkey, fact_id
+         LIMIT {CLUSTER_TILE_N}
+    ) t
+"
+    )
+});
 
 // ---- Temporal-conflict witness inserts ----
 //

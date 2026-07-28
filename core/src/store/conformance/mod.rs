@@ -17,16 +17,17 @@
 //!   suite as `#[tokio::test]` functions in the instantiating crate, one per
 //!   case, individually named and reportable.
 //!
-//! Instantiating a backend takes three things: a store-builder expression (a
+//! Instantiating a backend takes four things: a store-builder expression (a
 //! future resolving to `Result<(S, Cx), E>`, evaluated fresh per test — `Cx`
 //! is backend context held alive for the test's duration, `()` when the
-//! store needs none), an [`UnmintedIds`] impl for the store, and `tokio`
-//! (`macros` + `rt`) available where the macro expands.
+//! store needs none), an [`UnmintedIds`] and a [`RefusalKinds`] impl for the
+//! store, and `tokio` (`macros` + `rt`) available where the macro expands.
 //!
 //! ```ignore
-//! use chronoscope_core::store::conformance::UnmintedIds;
+//! use chronoscope_core::store::conformance::{RefusalKinds, UnmintedIds};
 //!
 //! impl UnmintedIds for MyFactStore { /* ids outside the mintable space */ }
+//! impl RefusalKinds for MyFactStore { /* which error means which refusal */ }
 //!
 //! chronoscope_core::fact_store_conformance!(async {
 //!     Ok::<_, MyError>((MyFactStore::fresh().await?, ()))
@@ -62,6 +63,18 @@ pub trait UnmintedIds: FactStore {
     fn unminted_image() -> ImageIdOf<Self>;
 }
 
+/// Recognition of the refusals a case asserts *by identity*. `S::Error` is
+/// backend-shaped, so a generic case can only tell "it failed"; a mis-ordered
+/// bind or a malformed statement would satisfy that just as well as the refusal
+/// under test. Each backend answers for its own error type here, and the case
+/// pins the failure it means.
+pub trait RefusalKinds: FactStore {
+    /// Whether `error` is the clustering read's refusal of a viewport spanning
+    /// more tiles than one read may enumerate — the level being too fine for the
+    /// span, as opposed to any other backend failure.
+    fn is_cluster_tile_cap_refusal(error: &Self::Error) -> bool;
+}
+
 /// Stamp the fact-store conformance suite against one backend.
 ///
 /// `$build_store` is an expression evaluating to a future of
@@ -69,7 +82,8 @@ pub trait UnmintedIds: FactStore {
 /// store per test, re-evaluated for each. `Cx` is backend context the test
 /// holds alive alongside the store (a file-backed store's tempdir); pass
 /// `()` when the store needs none. The store must implement
-/// [`UnmintedIds`](crate::store::conformance::UnmintedIds), and `tokio`
+/// [`UnmintedIds`](crate::store::conformance::UnmintedIds) and
+/// [`RefusalKinds`](crate::store::conformance::RefusalKinds), and `tokio`
 /// (`macros` + `rt`) must be available where the macro expands.
 ///
 /// Each case becomes its own `#[tokio::test]`, so a backend's failures
@@ -250,6 +264,9 @@ macro_rules! fact_store_conformance {
             cluster_entities_in_viewport_groups_colocated_entities,
             cluster_cluster_becomes_singleton_when_a_member_is_retracted,
             cluster_colocated_becomes_singleton_when_a_member_is_retracted,
+            cluster_entities_in_viewport_places_a_moved_entity_under_its_owner,
+            cluster_entities_in_viewport_refuses_a_level_too_fine_for_the_span,
+            cluster_entities_in_viewport_excludes_image_capture_locations,
         }
     };
     (@cases => $($(#[$attr:meta])* $case:ident,)+) => {
