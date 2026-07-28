@@ -454,6 +454,62 @@ async fn test_faq_accordion() -> TestResult {
     .await
 }
 
+/// The FAQ anchor the About page deep-links to. A native test in
+/// `web/src/pages/faq.rs` ties this fragment to both pages' markdown, so a
+/// rename shows up there as a clear failure before it reaches the browser.
+const DEEP_LINKED_FAQ_ANCHOR: &str = "how-does-chronoscope-work";
+
+/// Whether the deep-linked FAQ item is expanded, waiting for it to render first.
+async fn deep_linked_faq_item_is_expanded(
+    t: &WebTest,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let expanded = t
+        .attr(
+            &format!("#{DEEP_LINKED_FAQ_ANCHOR} button[aria-expanded]"),
+            "aria-expanded",
+        )
+        .await?;
+    Ok(expanded.as_deref() == Some("true"))
+}
+
+/// Following the About page's deep link expands the FAQ item it names.
+///
+/// An in-app navigation publishes the router's URL before it moves
+/// `window.location`, so an item that reads its initial state from the browser
+/// hash sees the previous page's empty fragment and renders collapsed. A
+/// client-side click is the only way to reproduce that ordering.
+#[tokio::test]
+async fn test_faq_deep_link_followed_from_the_about_page_arrives_expanded() -> TestResult {
+    web_test(async |t| {
+        t.goto("/about").await?;
+
+        t.click(&format!(
+            "#main-content a[href='/faq#{DEEP_LINKED_FAQ_ANCHOR}']"
+        ))
+        .await?;
+
+        check(
+            deep_linked_faq_item_is_expanded(t).await?,
+            "the FAQ item named by the About page's deep link should be expanded on arrival",
+        )
+    })
+    .await
+}
+
+/// The same deep link pasted into the address bar expands the item it names.
+#[tokio::test]
+async fn test_faq_deep_link_loaded_directly_arrives_expanded() -> TestResult {
+    web_test(async |t| {
+        t.goto(&format!("/faq#{DEEP_LINKED_FAQ_ANCHOR}")).await?;
+
+        check(
+            deep_linked_faq_item_is_expanded(t).await?,
+            "the FAQ item named by the loaded fragment should be expanded on arrival",
+        )
+    })
+    .await
+}
+
 // ==================== Map & Entity Tests ====================
 
 #[tokio::test]

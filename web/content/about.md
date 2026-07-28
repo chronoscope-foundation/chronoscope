@@ -10,6 +10,8 @@ Chronoscope doesn't host the images and records itself. Instead, it connects and
 
 Chronoscope handles the messy reality of historical data. A date can be "circa 1920s" or "between 1914 and 1918." A location can be "somewhere in the Latin Quarter." Instead of forcing precision that isn't there, Chronoscope works with what it has and narrows things down as more evidence arrives.
 
+Claims build on each other. An undated photograph of two unrecognized buildings tells you only that both were standing at the same moment, but that fact is worth keeping. When someone later identifies one of the buildings, the photograph inherits a date range from it, and the second building inherits part of its history in turn, without anyone having asserted anything about it directly. The same machinery that propagates knowledge this way is what notices when two sources can't both be right, and it re-runs over everything each time new evidence arrives. The [FAQ](/faq#how-does-chronoscope-work) walks through a worked example.
+
 AI models analyze images in a pipeline of focused steps: first isolating individual buildings in each photo, then finding the same building across photos from different eras, then analyzing what it sees and linking it to other sources on the web. Each step can be checked independently, and every AI-generated conclusion is grounded in the specific evidence it came from.
 
 Every claim in the system requires a citation. Citations are verified both by checking that the source actually says what's claimed, and by a separate AI model that evaluates whether the evidence supports the conclusion. This makes it hard for mistakes, misinformation, or deliberate disinformation to spread.
