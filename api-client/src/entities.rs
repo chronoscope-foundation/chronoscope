@@ -99,6 +99,7 @@ pub fn image_caption(perspective: Option<Perspective>, medium: Option<ImageMediu
     let noun = match medium {
         Some(ImageMedium::Picture) => ("picture", "Picture"),
         Some(ImageMedium::Map) => ("map", "Map"),
+        Some(ImageMedium::Plan) => ("plan", "Plan"),
         Some(ImageMedium::PictorialMap) => ("pictorial map", "Pictorial map"),
         None => ("image", "Image"),
     };
@@ -327,12 +328,28 @@ mod tests {
             Some(Perspective::Exterior),
             Some(Perspective::Interior),
         ];
+        // `media` is written out by hand, so a new `ImageMedium` would other-
+        // wise slip past this test still passing. This match fails to compile
+        // until the variant is listed, which is the nudge to add it below.
+        fn every_medium_is_covered(medium: ImageMedium) {
+            match medium {
+                ImageMedium::Picture
+                | ImageMedium::Map
+                | ImageMedium::Plan
+                | ImageMedium::PictorialMap => {}
+            }
+        }
         let media = [
             None,
             Some(ImageMedium::Picture),
             Some(ImageMedium::Map),
+            Some(ImageMedium::Plan),
             Some(ImageMedium::PictorialMap),
         ];
+        media
+            .into_iter()
+            .flatten()
+            .for_each(every_medium_is_covered);
         for perspective in perspectives {
             for medium in media {
                 let caption = image_caption(perspective, medium);

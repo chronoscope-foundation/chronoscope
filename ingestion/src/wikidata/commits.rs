@@ -473,13 +473,13 @@ fn push_image_facts(
 }
 
 /// The medium and depiction perspective an image property carries: photos
-/// (P18/P3451) are exterior pictures, P5775 interiors, P3311 plans are maps with
-/// no perspective. `None` for non-image properties.
+/// (P18/P3451) are exterior pictures, P5775 interiors, P3311 ("plan view image")
+/// plans with no perspective. `None` for non-image properties.
 fn image_medium_perspective(property: &str) -> Option<(ImageMedium, Option<Perspective>)> {
     match property {
         "P18" | "P3451" => Some((ImageMedium::Picture, Some(Perspective::Exterior))),
         "P5775" => Some((ImageMedium::Picture, Some(Perspective::Interior))),
-        "P3311" => Some((ImageMedium::Map, None)),
+        "P3311" => Some((ImageMedium::Plan, None)),
         _ => None,
     }
 }

@@ -66,8 +66,13 @@ use crate::location::UnresolvedLocation;
 pub enum ImageMedium {
     /// A photograph, painting, drawing, print, or other figurative depiction.
     Picture,
-    /// A cartographic representation — a Sanborn sheet, a street map, a plan.
+    /// A cartographic representation — a Sanborn sheet, a street map.
     Map,
+    /// An orthographic plan view of a structure: a floor plan, a ground plan, a
+    /// site plan. Distinct from [`Self::Map`] because it depicts one building's
+    /// own layout rather than a piece of terrain, and reads wrong when captioned
+    /// as a map.
+    Plan,
     /// A pictorial map: genuinely both at once, asserted as one value.
     PictorialMap,
 }

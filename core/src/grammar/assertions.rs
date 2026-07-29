@@ -284,12 +284,27 @@ mod traversal_props {
         })
     }
 
-    /// A random [`image::ImageMedium`] across all three values, so the `Medium`
-    /// arm exercises picture, map, and pictorial-map rather than one fixed kind.
+    /// A random [`image::ImageMedium`] across every value, so the `Medium` arm
+    /// exercises each kind rather than one fixed one.
+    ///
+    /// The list is written out by hand, so a new variant would otherwise narrow
+    /// this generator silently and the property suite would stop constructing
+    /// the very value that was just added. The match below fails to compile
+    /// until the variant is listed here too.
     fn arb_image_medium() -> impl Strategy<Value = image::ImageMedium> {
+        fn every_medium_is_generated(medium: image::ImageMedium) {
+            match medium {
+                image::ImageMedium::Picture
+                | image::ImageMedium::Map
+                | image::ImageMedium::Plan
+                | image::ImageMedium::PictorialMap => {}
+            }
+        }
+        let _ = every_medium_is_generated;
         prop_oneof![
             Just(image::ImageMedium::Picture),
             Just(image::ImageMedium::Map),
+            Just(image::ImageMedium::Plan),
             Just(image::ImageMedium::PictorialMap),
         ]
     }
