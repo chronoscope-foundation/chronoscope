@@ -152,6 +152,10 @@ pub fn register_base() {
         is_visible,
         is_active_inside,
         count: |sel: String| f64::from(count_matching(&sel)),
+        element_rect: |sel: String| element_rect(&sel),
+        is_hittable,
+        sample_animation_at,
+        slow_animations,
         // Plural: returns the attribute for every match. Used by accessibility
         // tests that need to verify a property over all matches.
         attributes: |sel: String, attr: String| element_attributes(&sel, &attr),
@@ -165,6 +169,7 @@ pub fn register_base() {
         wait_for_selector,
         wait_for_selector_removal,
         wait_for_body_text,
+        wait_for_fonts,
 
         // Fetch-settled counter — sample then await (closes listener race).
         // f64 across the FFI: integer counters fit losslessly under 2^53.
@@ -346,8 +351,8 @@ fn map_query<R: Clone + 'static>(
 /// Click the first visible element matching a selector. Returns a Promise
 /// that resolves after the click and any resulting CSS transition.
 ///
-/// Uses `offsetParent` to skip hidden elements (e.g., desktop sidebar links
-/// at mobile viewport) and a 250ms fallback timeout to handle clicks that
+/// Uses `offsetParent` to skip elements the layout has removed (a `display:
+/// none` responsive variant) and a 250ms fallback timeout to handle clicks that
 /// don't trigger CSS transitions.
 fn click_visible(selector: String) -> js_sys::Promise {
     let mut selector = Some(selector);
@@ -509,6 +514,26 @@ fn wait_for_counter_after(
         listener_fn.set(Some(func));
         cb.forget();
     })
+}
+
+/// Resolves once every webfont has loaded and the page has stopped reflowing
+/// around them.
+///
+/// Any assertion about geometry is meaningless before this: the page first
+/// renders in a fallback face and reflows when the real one arrives, so a
+/// measurement taken either side of that swap disagrees with itself. The nav
+/// trigger's wordmark moves ~15 px between the two.
+fn wait_for_fonts() -> js_sys::Promise {
+    let ready = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| js_sys::Reflect::get(&d, &"fonts".into()).ok())
+        .and_then(|fonts| js_sys::Reflect::get(&fonts, &"ready".into()).ok())
+        .and_then(|ready| ready.dyn_into::<js_sys::Promise>().ok());
+    match ready {
+        Some(promise) => promise,
+        // No FontFaceSet to wait on: nothing will swap, so nothing to wait for.
+        None => js_sys::Promise::resolve(&JsValue::NULL),
+    }
 }
 
 /// Resolves once an element matching `selector` exists in the DOM.
@@ -838,13 +863,19 @@ fn click(selector: String) -> js_sys::Promise {
     })
 }
 
-/// `offsetParent !== null` visibility check on the first matching element.
+/// Whether the first matching element is rendered.
+///
+/// `offsetParent` alone is not enough: it is `null` for `position: fixed`
+/// elements as well as for hidden ones, so a fixed overlay reads as invisible
+/// while plainly on screen. The width fallback separates the two, and matches
+/// the rule [`click_visible`] already used — the two helpers answering the same
+/// question differently is how a test ends up asserting something false.
 fn is_visible(selector: String) -> bool {
     web_sys::window()
         .and_then(|w| w.document())
         .and_then(|d| d.query_selector(&selector).ok().flatten())
         .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
-        .is_some_and(|el| el.offset_parent().is_some())
+        .is_some_and(|el| el.offset_parent().is_some() || el.offset_width() > 0)
 }
 
 /// `document.querySelectorAll(selector).length`.
@@ -881,6 +912,153 @@ fn element_attributes(selector: &str, attr: &str) -> JsValue {
         arr.push(&value);
     }
     arr.into()
+}
+
+/// Stretch every animation on the page to `ms`, so entry animations are still
+/// live when [`sample_animation_at`] seeks them.
+///
+/// A finished CSS animation drops out of `getAnimations()`, so a sample that
+/// arrived after a real 150 ms run would find nothing, read the settled state,
+/// and pass whatever the animation did in between. Stretching first removes that
+/// race; the seek then makes each sample exact rather than "whenever we looked".
+fn slow_animations(ms: f64) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Ok(style) = document.create_element("style") else {
+        return;
+    };
+    style.set_text_content(Some(&format!(
+        "*, *::before, *::after {{ animation-duration: {ms}ms !important; }}"
+    )));
+    if let Some(head) = document.head() {
+        let _ = head.append_child(&style);
+    }
+}
+
+/// Hold the first match's entry animation at `progress` (0.0..=1.0) and read it
+/// there, returning `[animation_count, opacity, x, y, width, height]`. Empty
+/// when nothing matches.
+///
+/// `animation_count` is first so a caller can refuse to draw conclusions from a
+/// sample that found nothing to seek — otherwise this reads the settled element
+/// and reports success no matter what happened mid-flight.
+///
+/// A transition's endpoints can both be correct while a frame between them is
+/// not: an overlay card that fades up from transparent leaves its chip's area
+/// unpainted for a frame, and one that scales flattens its own rounded ends
+/// mid-flight. Neither is visible to a before/after assertion.
+///
+/// Seeks via the Web Animations API rather than sleeping, so the sample is
+/// exact rather than "whatever had rendered by the time we looked" — a timing
+/// race here would be a flaky test, which is worse than no test. Animations on
+/// descendants are seeked too, since the surface and its contents animate
+/// separately.
+fn sample_animation_at(selector: String, progress: f64) -> JsValue {
+    let arr = js_sys::Array::new();
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return arr.into();
+    };
+    let Some(element) = document.query_selector(&selector).ok().flatten() else {
+        return arr.into();
+    };
+
+    // `getAnimations({subtree: true})` — reached through Reflect because web-sys
+    // doesn't bind the options form.
+    let opts = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&opts, &"subtree".into(), &JsValue::TRUE);
+    let animations = js_sys::Reflect::get(&element, &"getAnimations".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .and_then(|f| f.call1(&element, &opts).ok())
+        .and_then(|v| v.dyn_into::<js_sys::Array>().ok())
+        .unwrap_or_else(js_sys::Array::new);
+
+    for animation in animations.iter() {
+        let duration = js_sys::Reflect::get(&animation, &"effect".into())
+            .ok()
+            .and_then(|effect| {
+                js_sys::Reflect::get(&effect, &"getTiming".into())
+                    .ok()
+                    .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                    .and_then(|f| f.call0(&effect).ok())
+            })
+            .and_then(|timing| js_sys::Reflect::get(&timing, &"duration".into()).ok())
+            .and_then(|d| d.as_f64())
+            .unwrap_or(0.0);
+        let _ = js_sys::Reflect::set(
+            &animation,
+            &"currentTime".into(),
+            &(duration * progress).into(),
+        );
+    }
+
+    let opacity = web_sys::window()
+        .and_then(|w| w.get_computed_style(&element).ok().flatten())
+        .and_then(|style| style.get_property_value("opacity").ok())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    let rect = element.get_bounding_client_rect();
+    for value in [
+        f64::from(animations.length()),
+        opacity,
+        rect.x(),
+        rect.y(),
+        rect.width(),
+        rect.height(),
+    ] {
+        arr.push(&value.into());
+    }
+    arr.into()
+}
+
+/// `getBoundingClientRect()` of the first match as `[x, y, width, height]`,
+/// empty when nothing matches.
+///
+/// Sub-pixel values pass through unrounded. The overlay toggles' invariant is
+/// that this rect is *identical* either side of a collapse, and the drift that
+/// breaks it is small — a content-sized chip that drops its border between
+/// states moves its contents by a single pixel.
+fn element_rect(selector: &str) -> JsValue {
+    let arr = js_sys::Array::new();
+    let Some(element) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(selector).ok().flatten())
+    else {
+        return arr.into();
+    };
+    let rect = element.get_bounding_client_rect();
+    for value in [rect.x(), rect.y(), rect.width(), rect.height()] {
+        arr.push(&value.into());
+    }
+    arr.into()
+}
+
+/// Whether the first element matching `selector` actually receives a click at
+/// its own centre — i.e. it is the topmost thing painted there.
+///
+/// `element_rect` proves a control is *where* it should be; this proves it is
+/// *reachable*. The two failures that motivated it were both invisible to
+/// geometry: a chip rendered under a fixed bar, and a trigger buried by the
+/// panel it opens. Both had a perfect rect and swallowed every click.
+///
+/// A descendant counts as a hit — the point usually lands on an inner glyph or
+/// label, and the event bubbles to the control regardless.
+fn is_hittable(selector: String) -> bool {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    let Some(element) = document.query_selector(&selector).ok().flatten() else {
+        return false;
+    };
+    let rect = element.get_bounding_client_rect();
+    let Some(topmost) = document.element_from_point(
+        (rect.left() + rect.width() / 2.0) as f32,
+        (rect.top() + rect.height() / 2.0) as f32,
+    ) else {
+        return false;
+    };
+    topmost == element || element.contains(Some(topmost.as_ref()))
 }
 
 /// Whether `document.activeElement` is the element matching `selector` or

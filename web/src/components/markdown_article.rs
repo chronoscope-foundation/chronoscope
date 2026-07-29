@@ -11,7 +11,9 @@ pub fn MarkdownArticle(title: &'static str, markdown: &'static str) -> impl Into
     let html_content = md_to_html(&expand_snippets(markdown));
 
     view! {
-        <article class="px-6 py-12 max-w-3xl mx-auto prose-chronoscope">
+        // `pt-20` clears the floating nav trigger, which overlays the page at
+        // `top-3` and stands 44 px tall.
+        <article class="px-6 pt-20 pb-12 max-w-3xl mx-auto prose-chronoscope">
             <h1 class="text-3xl font-bold mb-8">{title}</h1>
             <div inner_html=html_content></div>
         </article>

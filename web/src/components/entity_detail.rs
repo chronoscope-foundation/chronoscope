@@ -9,6 +9,7 @@ use wasm_bindgen::JsCast;
 use crate::api;
 use crate::components::dismiss_button::DismissButton;
 use crate::components::map::{EntityPickerEntry, EntitySelection, SelectedEntity};
+use crate::components::motion::SLIDE;
 
 /// Content currently displayed in the lightbox overlay.
 #[derive(Clone, Debug)]
@@ -21,8 +22,9 @@ pub struct LightboxContent {
     pub source_url: String,
 }
 
-/// Lightbox state provided via context so the overlay can render
-/// outside the sidebar's CSS transform (which breaks `position: fixed`).
+/// Lightbox state provided via context so the overlay can render outside this
+/// panel's slide transform, which would otherwise anchor its `position: fixed`
+/// to the panel instead of the viewport.
 ///
 /// A single `Option<LightboxContent>` signal avoids partial-update races
 /// that would occur with separate signals for `url`/`alt`/`source_url`.
@@ -83,10 +85,12 @@ pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::Client>>>) -> impl I
             tabindex="-1"
             // Mobile bottom sheet, desktop side sheet with slide transitions
             class=move || {
-                let base = "fixed bg-parchment/95 backdrop-blur-sm shadow-lg z-10 overflow-y-auto pointer-events-auto \
-                            outline-none transition-transform duration-200 \
-                            bottom-0 left-0 right-0 h-2/3 rounded-t-xl \
-                            md:top-0 md:right-0 md:bottom-0 md:left-auto md:h-full md:w-96 md:rounded-none";
+                let base = format!(
+                    "fixed bg-parchment/95 backdrop-blur-sm shadow-lg z-10 overflow-y-auto \
+                     pointer-events-auto outline-none {SLIDE} \
+                     bottom-0 left-0 right-0 h-2/3 rounded-t-xl \
+                     md:top-0 md:right-0 md:bottom-0 md:left-auto md:h-full md:w-96 md:rounded-none"
+                );
                 if selected.get().is_some() {
                     format!("{base} translate-y-0 md:translate-y-0 md:translate-x-0")
                 } else {
@@ -105,10 +109,17 @@ pub fn EntityDetailPanel(api_client: Rc<RefCell<Option<api::Client>>>) -> impl I
                     };
                     view! {
                         <div class="p-5">
-                            <div class="flex justify-between items-start mb-4">
-                                <h2 class="text-lg font-semibold font-sans text-ink">{title}</h2>
-                                <DismissButton on_click=dismiss extra_class="ml-4"/>
+                            // Out of the flow, like the map cards' toggles: a
+                            // 44 px touch target sitting beside a 28 px heading
+                            // inflates the row and opens a gap under the title.
+                            // Positioned by a wrapper rather than by the button:
+                            // the button owns `relative` so its hit area anchors
+                            // to itself, and two `position` classes on one
+                            // element would be settled by stylesheet order.
+                            <div class="absolute top-2 right-2">
+                                <DismissButton on_click=dismiss/>
                             </div>
+                            <h2 class="text-lg font-semibold font-sans text-ink mb-4 pr-12">{title}</h2>
                             {match selection {
                                 EntitySelection::Single { detail: id, back: back_entries, .. } => view! {
                                     <div>

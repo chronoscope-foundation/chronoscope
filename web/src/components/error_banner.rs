@@ -152,7 +152,13 @@ pub fn ErrorBanner() -> impl IntoView {
     };
 
     view! {
-        <div class="fixed top-0 left-0 right-0 z-50 pointer-events-none">
+        // Below the nav trigger, not under it. The trigger is `fixed` chrome in
+        // the top-left corner at every width, and at `top-0` this strip's first
+        // words sat behind an opaque pill — unreadable, which for an error
+        // message is the whole point of it. Raising the strip's z-index instead
+        // would have hidden the trigger and made the nav unreachable while any
+        // error showed.
+        <div class="fixed top-14 left-0 right-0 z-50 pointer-events-none">
             {move || {
                 errors.get().into_iter().map(|(id, msg)| {
                     let dismiss_this = move |_| dismiss(id);

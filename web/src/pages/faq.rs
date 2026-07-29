@@ -277,7 +277,8 @@ pub fn Faq() -> impl IntoView {
     let categories = parse_faq(&expanded);
 
     view! {
-        <section class="px-6 py-12 max-w-3xl mx-auto">
+        // `pt-20` clears the floating nav trigger, matching `MarkdownArticle`.
+        <section class="px-6 pt-20 pb-12 max-w-3xl mx-auto">
             <h1 class="text-3xl font-bold mb-10">"Frequently Asked Questions"</h1>
 
             {categories.into_iter().map(|cat| view! {

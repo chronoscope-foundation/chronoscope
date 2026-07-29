@@ -5,9 +5,11 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::api::Client;
-use crate::components::dismiss_button::DismissButton;
 use crate::components::entity_detail::{EntityDetailPanel, LightboxState};
+use crate::components::focus_trap::contain_tab;
 use crate::components::map::{MapStatus, MapView, SelectedEntity};
+use crate::components::map_card::{Corner, MapCard};
+use crate::components::motion::REVEAL;
 use crate::components::time_slider::TimeSlider;
 
 const INFO_DISMISSED_KEY: &str = "chronoscope-info-dismissed";
@@ -31,18 +33,6 @@ fn set_info_dismissed(dismissed: bool) {
 
 #[component]
 pub fn Landing() -> impl IntoView {
-    let (info_open, set_info_open) = signal(!is_info_dismissed());
-
-    let dismiss = move |_| {
-        set_info_open.set(false);
-        set_info_dismissed(true);
-    };
-
-    let restore = move |_| {
-        set_info_open.set(true);
-        set_info_dismissed(false);
-    };
-
     // API client handle — lazily initialized on first fetch, shared between
     // the map (entity list) and the detail panel (entity detail).
     let api_client: Rc<RefCell<Option<Client>>> = Rc::new(RefCell::new(None));
@@ -57,17 +47,19 @@ pub fn Landing() -> impl IntoView {
     #[cfg(feature = "test-hooks")]
     crate::test_hooks::register_map_hooks(map_handle.clone(), api_client.clone());
 
-    // Lightbox state — provided via context so the overlay renders here
-    // (outside the sidebar's CSS transform, which breaks `position: fixed`).
+    // Lightbox state — provided via context so the overlay renders here, clear
+    // of the detail panel's slide transform, which would otherwise anchor its
+    // `position: fixed` to the panel instead of the viewport.
     let (lightbox_content, set_lightbox_content) =
         signal(None::<crate::components::entity_detail::LightboxContent>);
     let lightbox = LightboxState(lightbox_content, set_lightbox_content);
     provide_context(lightbox.clone());
 
     view! {
-        // Map fills the entire main area — no scrolling.
-        // Mobile: subtract the 3.5rem top bar. Desktop: full viewport (sidebar is flex, not stacked).
-        <div class="h-[calc(100vh-3.5rem)] md:h-screen relative">
+        // Map fills the viewport — no scrolling, and no chrome to subtract now
+        // that the nav floats over it. `dvh` rather than `vh` so mobile browser
+        // toolbars shrink the map instead of pushing its bottom off-screen.
+        <div class="h-dvh relative">
             <MapView api_client=api_client.clone() map_handle=map_handle/>
 
             // Entity detail panel (slides in from right on marker click)
@@ -80,54 +72,78 @@ pub fn Landing() -> impl IntoView {
             <TimeSlider/>
 
             // Dismissible info card — collapsible "about" overlay for new visitors.
-            // Dismissal persists in localStorage so returning users get a clean map.
-            <div class="absolute top-3 right-3 left-3 md:left-auto">
-                {move || if info_open.get() {
-                    view! {
-                        <div class="bg-parchment/95 backdrop-blur-sm rounded-lg shadow-md p-5 w-full md:w-[30rem] pointer-events-auto"
-                            style="text-wrap: pretty"
-                        >
-                            <div class="flex justify-between items-start mb-3">
-                                <h2 class="text-sm font-semibold font-sans text-copper">"About Chronoscope"</h2>
-                                <DismissButton on_click=dismiss extra_class="ml-4"/>
-                            </div>
-                            <p class="text-sm text-sepia leading-relaxed mb-2">
-                                "Every place has layers. Chronoscope lets you peel them back: pull up "
-                                "historical photos of the street you\u{2019}re on, see a demolished "
-                                "building as it once stood, or identify the ruins you just stumbled across."
-                            </p>
-                            <p class="text-sm text-sepia leading-relaxed mb-4">
-                                "Chronoscope gets better the more people use it. Link a photo to a location, "
-                                "help resolve conflicting dates, or chase down a mystery nobody\u{2019}s solved yet."
-                            </p>
-                            <div class="space-y-1.5 text-xs text-sepia/80">
-                                <p><span class="text-copper font-semibold">"Explicit uncertainty"</span>
-                                    " \u{2014} \u{201c}built circa 1920s\u{201d} narrows as more evidence arrives. No false precision."</p>
-                                <p><span class="text-copper font-semibold">"Pervasive citations"</span>
-                                    " \u{2014} every assertion is grounded in a specific photo, map, or record."</p>
-                                <p><span class="text-copper font-semibold">"Transparent contributions"</span>
-                                    " \u{2014} every change, human or AI, gets versioned and reviewed."</p>
-                            </div>
-                        </div>
-                    }.into_any()
-                } else {
-                    view! {
-                        <button
-                            class="bg-parchment/95 backdrop-blur-sm rounded-full w-8 h-8 flex items-center justify-center shadow-md text-sepia hover:text-ink cursor-pointer pointer-events-auto font-sans text-sm font-semibold"
-                            on:click=restore
-                            aria-label="About Chronoscope"
-                        >
-                            "?"
-                        </button>
-                    }.into_any()
-                }}
-            </div>
+            <AboutCard/>
 
-            // Image lightbox overlay — rendered outside the sidebar so
-            // `position: fixed` is relative to the viewport, not the
-            // sidebar's CSS transform.
+            // Image lightbox overlay — rendered here, outside the detail panel,
+            // so `position: fixed` resolves against the viewport rather than
+            // the panel's transform.
             <ImageLightbox lightbox=lightbox/>
         </div>
+    }
+}
+
+/// The dismissible "about" overlay for new visitors.
+///
+/// Steps aside while an entity is selected. On desktop the detail panel is a
+/// right-hand sheet whose own close button lands in this same corner, and this
+/// card draws later, so it would cover the panel's dismiss. The map status chips
+/// yield to the panel for the same reason.
+///
+/// A component rather than markup in `Landing` because `SelectedEntity` is
+/// provided by `MapView`: only something rendered after it can read the context.
+#[component]
+fn AboutCard() -> impl IntoView {
+    // Mirrored to localStorage so a returning visitor keeps the clean map they
+    // left. `MapCard` owns no persistence — this is the one caller that wants any.
+    let info_open = RwSignal::new(!is_info_dismissed());
+    Effect::new(move |_| set_info_dismissed(!info_open.get()));
+
+    let SelectedEntity(selected, _) = expect_context::<SelectedEntity>();
+
+    view! {
+        <Show when=move || selected.get().is_none()>
+            <MapCard
+                corner=Corner::TopRight
+                open=info_open
+                chip_class="rounded-full w-8 h-8 text-sm font-semibold"
+                expand_label="About Chronoscope"
+                collapse_label="Hide the About panel"
+                body_id="about-card"
+                body_radius="rounded-xl"
+                chip=move || view! {
+                    {move || if info_open.get() { "\u{2715}" } else { "?" }}
+                }
+            >
+                // `pr-12` keeps the heading clear of the toggle, which sits over
+                // the card's top-right corner rather than in this flow.
+                //
+                // No `text-wrap` override. `pretty` measured line-for-line
+                // identical to the default here, and `balance` equalises within
+                // a block but lets each block settle on its own width, so the
+                // paragraphs and bullets stopped sharing a right margin.
+                <div class="p-5 pr-12 w-[calc(100vw-1.5rem)] md:w-[30rem]">
+                    <h2 class="text-sm font-semibold font-sans text-copper mb-3">"About Chronoscope"</h2>
+                    <p class="text-sm text-sepia leading-relaxed mb-2">
+                        "Pull up historical photographs of the street you\u{2019}re on, see a "
+                        "demolished building as it once stood, or work out what that ruin on the "
+                        "hillside used to be. Chronoscope connects the built world to the "
+                        "photographs, maps, and records that document it, through time."
+                    </p>
+                    <p class="text-sm text-sepia leading-relaxed mb-4">
+                        "This is an early technical preview. Much of the planned functionality "
+                        "isn\u{2019}t wired up yet, but you\u{2019}re welcome to look around."
+                    </p>
+                    <div class="space-y-1.5 text-xs text-sepia/80">
+                        <p><span class="text-copper font-semibold">"Explicit uncertainty"</span>
+                            ": a date like \u{201c}circa 1920s\u{201d} stays vague until evidence narrows it. No false precision."</p>
+                        <p><span class="text-copper font-semibold">"Pervasive citations"</span>
+                            ": every assertion points back to the photograph, map, or record behind it."</p>
+                        <p><span class="text-copper font-semibold">"Evidence compounds"</span>
+                            ": one dated photograph bounds everything else in it. Claims that can\u{2019}t hold simultaneously are flagged for review."</p>
+                    </div>
+                </div>
+            </MapCard>
+        </Show>
     }
 }
 
@@ -136,49 +152,17 @@ pub fn Landing() -> impl IntoView {
 fn ImageLightbox(lightbox: LightboxState) -> impl IntoView {
     let set_content = lightbox.1;
     let close = move |_: leptos::ev::MouseEvent| set_content.set(None);
-    let close_key = move |ev: leptos::ev::KeyboardEvent| {
-        match ev.key().as_str() {
-            "Escape" => set_content.set(None),
-            "Tab" => {
-                // Trap focus within the dialog (close button + open-original link).
-                if let Some(dialog) = ev
-                    .current_target()
-                    .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
-                    && let Ok(focusables) = dialog.query_selector_all("button, a[href]")
-                {
-                    let len = focusables.length();
-                    if len > 0 {
-                        let active = web_sys::window()
-                            .and_then(|w| w.document())
-                            .and_then(|d| d.active_element());
-                        let first = focusables
-                            .item(0)
-                            .and_then(|n| n.dyn_into::<web_sys::Element>().ok());
-                        let last = focusables
-                            .item(len - 1)
-                            .and_then(|n| n.dyn_into::<web_sys::Element>().ok());
-                        if ev.shift_key() {
-                            if active == first {
-                                ev.prevent_default();
-                                if let Some(el) =
-                                    last.and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
-                                {
-                                    let _ = el.focus();
-                                }
-                            }
-                        } else if active == last {
-                            ev.prevent_default();
-                            if let Some(el) =
-                                first.and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
-                            {
-                                let _ = el.focus();
-                            }
-                        }
-                    }
-                }
+    let close_key = move |ev: leptos::ev::KeyboardEvent| match ev.key().as_str() {
+        "Escape" => set_content.set(None),
+        "Tab" => {
+            if let Some(dialog) = ev
+                .current_target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                contain_tab(&ev, &[&dialog]);
             }
-            _ => {}
         }
+        _ => {}
     };
     let content = lightbox.0;
 
@@ -193,8 +177,8 @@ fn ImageLightbox(lightbox: LightboxState) -> impl IntoView {
             view! {
                 <div
                     node_ref=backdrop_ref
-                    class="fixed inset-0 z-[100] bg-ink/90 flex items-center justify-center p-8 \
-                           animate-[fadeIn_150ms_ease-out]"
+                    class=format!("fixed inset-0 z-[100] bg-ink/90 flex items-center \
+                                   justify-center p-8 {REVEAL}")
                     on:click=close
                     on:keydown=close_key
                     tabindex="-1"
@@ -208,19 +192,21 @@ fn ImageLightbox(lightbox: LightboxState) -> impl IntoView {
                                ring-1 ring-parchment/20"
                         on:click=|ev: leptos::ev::MouseEvent| ev.stop_propagation()
                     />
+                    // Close sits top-right, where every other close in the app
+                    // lives; the source link takes the opposite corner.
                     <button
-                        class="absolute top-4 left-4 text-parchment/80 hover:text-parchment text-xl font-sans \
-                               bg-ink/60 rounded-full w-8 h-8 flex items-center justify-center cursor-pointer"
+                        class="absolute top-4 right-4 text-parchment/80 hover:text-parchment text-xl font-sans \
+                               bg-ink/60 rounded-full w-11 h-11 flex items-center justify-center cursor-pointer"
                         on:click=close
                         aria-label="Close preview"
                     >
-                        "\u{00d7}"
+                        "\u{2715}"
                     </button>
                     <a
                         href=c.source_url.clone()
                         target="_blank"
                         rel="noopener noreferrer"
-                        class="absolute top-4 right-4 text-parchment/80 hover:text-parchment text-sm font-sans \
+                        class="absolute top-4 left-4 text-parchment/80 hover:text-parchment text-sm font-sans \
                                bg-ink/60 rounded px-2 py-1"
                         on:click=|ev: leptos::ev::MouseEvent| ev.stop_propagation()
                     >
@@ -266,7 +252,7 @@ fn MapStatusOverlay() -> impl IntoView {
         <div aria-live="polite">
             // Loading indicator (hidden when detail panel is open)
             {move || (loading.get() && !panel_open()).then(|| view! {
-                <div class="absolute bottom-3 left-3 pointer-events-none">
+                <div class="absolute bottom-14 left-3 pointer-events-none">
                     <span class="text-xs text-sepia/70 bg-parchment/90 backdrop-blur-sm rounded px-2 py-1 font-sans animate-pulse">
                         "Loading..."
                     </span>
@@ -275,7 +261,7 @@ fn MapStatusOverlay() -> impl IntoView {
 
             // Empty state (hidden when detail panel is open)
             {move || (!loading.get() && empty.get() && !panel_open()).then(|| view! {
-                <div class="absolute bottom-3 left-3 pointer-events-none">
+                <div class="absolute bottom-14 left-3 pointer-events-none">
                     <span class="text-xs text-sepia/70 bg-parchment/90 backdrop-blur-sm rounded px-2 py-1 font-sans">
                         "No entities in this area"
                     </span>
@@ -291,7 +277,7 @@ fn MapStatusOverlay() -> impl IntoView {
             {move || if panel_open() { None } else { fetch_error.get() }.map(|msg| {
                 let on_retry = move |_| retry.set(true);
                 view! {
-                    <div class="absolute bottom-3 left-3 pointer-events-auto">
+                    <div class="absolute bottom-14 left-3 pointer-events-auto">
                         <div class="bg-red-600/90 text-white rounded px-3 py-2 text-xs font-sans flex items-center gap-2">
                             <span class="truncate max-w-xs md:max-w-md">{msg}</span>
                             <button

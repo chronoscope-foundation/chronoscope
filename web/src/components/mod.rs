@@ -1,7 +1,11 @@
+pub mod controls;
 pub mod dismiss_button;
 pub mod entity_detail;
 pub mod error_banner;
+pub mod focus_trap;
 pub mod map;
+pub mod map_card;
 pub mod markdown_article;
+pub mod motion;
 pub mod nav;
 pub mod time_slider;

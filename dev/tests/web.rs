@@ -11,7 +11,6 @@ mod harness;
 
 use harness::{TestResult, WebTest, check, web_test, web_test_seeded};
 
-use chrono::Datelike;
 use chronoscope_api::state::ServerIds;
 use chronoscope_core::date::{DatePrecision, UncertainDate};
 use chronoscope_core::geo::{GeoPoint, Meters};
@@ -230,27 +229,75 @@ async fn test_time_slider_reveals_a_demolished_entity() -> TestResult {
             "returning to 1750 must reveal the entity again",
         )?;
 
-        // The reset lands on the present, where the entity is long gone: the
-        // marker must disappear, and the slider must read the current year.
-        t.click_and_wait_for_fetch("button[aria-label*=\"present day\"]")
-            .await?;
+        // Scrubbing to the right edge lands on the present, where the entity is
+        // long gone: the marker must disappear, and the readout must show that
+        // year. This is the gesture that replaced a "Now" button — the button did
+        // nothing the track's own end doesn't.
+        //
+        // The target comes from the track's own `max`, not from `Utc::now()`.
+        // The component derives its maximum from the *browser's local* date, so
+        // across a UTC/local year boundary a UTC-derived year exceeds `max`, the
+        // input silently clamps, and the assertion fails on the wall clock —
+        // inside the commit gate, which is exactly where that is disqualifying.
+        let max_year: i32 = t
+            .attr("#time-slider", "max")
+            .await?
+            .unwrap_or_default()
+            .parse()
+            .map_err(|e| format!("the slider should carry a numeric max: {e}"))?;
+        let this_year = max_year;
+        t.set_time_slider_year(f64::from(this_year)).await?;
         check(
             rendered_features(t).await?.is_empty(),
-            "the reset must return the map to the present, where the entity is absent",
+            "scrubbing to the present must show the map as it is today, where the entity is absent",
         )?;
-        let this_year = chrono::Utc::now().year().to_string();
         let shown_year = t.text("#time-slider-year").await?;
         check(
-            shown_year.trim() == this_year,
-            format!("after the reset the slider must read {this_year}, got: {shown_year:?}"),
+            shown_year.trim() == this_year.to_string(),
+            format!(
+                "at the track's right edge the slider must read {this_year}, got: {shown_year:?}"
+            ),
         )?;
         Ok(())
     })
     .await
 }
 
-/// Assert the three sidebar/nav links (Explore, About, FAQ) are present.
+/// Every disclosure widget on the page, found by what one already is rather
+/// than by a hand-kept list, so a new overlay inherits its coverage.
+const DISCLOSURE: &str = "[aria-expanded][aria-controls]";
+
+/// The image lightbox, named specifically.
+///
+/// The nav drawer is also a `role="dialog"` and stays mounted so its slide has
+/// something to animate, so a bare `[role='dialog']` matches it too — and a
+/// removal wait on that selector can never be satisfied.
+const LIGHTBOX: &str = "[role='dialog'][aria-label='Image preview']";
+
+/// Open the nav drawer and assert its links are present.
+///
+/// The links live only in the drawer now, at every viewport, so reaching them
+/// means opening it first — there is no always-visible copy to read.
 async fn check_nav_links(t: &WebTest) -> TestResult {
+    t.click("button[aria-label='Toggle menu']").await?;
+
+    // The drawer stays mounted so its slide can animate, so its links read fine
+    // through `translateX(-100%)` and every assertion below would pass with a
+    // toggle that does nothing at all. Reachability is what distinguishes an
+    // open drawer from a closed one: a link that is off-screen or `inert` is not
+    // the topmost thing at its own centre.
+    check(
+        t.attr("button[aria-label='Toggle menu']", "aria-expanded")
+            .await?
+            .as_deref()
+            == Some("true"),
+        "the toggle should report itself expanded after being clicked",
+    )?;
+    check(
+        t.is_hittable("nav a[href='/about']").await?,
+        "the drawer's links should be reachable once it is open, not merely present in the DOM",
+    )?;
+
     let explore = t.text("nav a[href='/']").await?;
     check(
         explore.contains("Explore"),
@@ -265,6 +312,17 @@ async fn check_nav_links(t: &WebTest) -> TestResult {
     check(
         faq.contains("FAQ"),
         format!("Nav should show FAQ, got: {faq}"),
+    )?;
+
+    // Escape closes the drawer, so the assertions leave the page as they found
+    // it and a caller can keep testing the map underneath.
+    t.press_key("#site-nav-drawer", "Escape").await?;
+    check(
+        t.attr("button[aria-label='Toggle menu']", "aria-expanded")
+            .await?
+            .as_deref()
+            == Some("false"),
+        "Escape should close the nav drawer",
     )
 }
 
@@ -281,15 +339,14 @@ async fn test_landing_page_renders() -> TestResult {
             "main-content should exist",
         )?;
 
-        // Info card with "About Chronoscope" should be visible on first load
-        t.wait_for_body_text("About Chronoscope").await?;
+        // The About card is expanded on a first visit.
+        t.wait_for_selector("#about-card").await?;
 
-        // Sidebar navigation links
+        // Nav drawer links
         check_nav_links(t).await?;
 
-        // Wordmark in sidebar
+        // Wordmark
         t.wait_for_body_text("Chronoscope").await?;
-        t.wait_for_body_text("Explore places through time").await?;
 
         Ok(())
     })
@@ -938,7 +995,7 @@ async fn test_dense_group_and_lone_entity_render_badge_plus_pin() -> TestResult 
     // reliance on the client merging across a tile boundary. The wild sits 0.0412°
     // east — a distinct sub-tile (its own Select cell) and ~120 px away at zoom 11,
     // well past the 50 px fold radius. The map is centered between them so each
-    // lands ~60 px from center, comfortably inside the sidebar-narrowed canvas.
+    // lands ~60 px from center, comfortably inside the canvas.
     let seeds = vec![
         seed_entity_at("Village A", 20.0000, -30.0000)?,
         seed_entity_at("Village B", 20.0003, -30.0002)?,
@@ -1158,22 +1215,206 @@ async fn test_failed_pan_keeps_last_good_render() -> TestResult {
 
 // ==================== UI Chrome & Error Recovery Tests ====================
 
+/// Every disclosure widget holds its toggle still and keeps it reachable.
+///
+/// Enumerated from the markup rather than named one at a time, so a new overlay
+/// is covered the moment it declares itself — `aria-expanded` + `aria-controls`
+/// is what a disclosure widget already *is*, so there is nothing extra to
+/// remember.
+///
+/// **Position.** Each of these used to render its collapsed and expanded states
+/// as separate buttons, so the control jumped out from under the pointer on
+/// every use: 26 px for the About card, 293 px for the time slider, and a
+/// resize for the nav's wordmark. Sub-pixel exact, because the drift that
+/// breaks it is small — a content-sized chip that drops a 1 px border between
+/// states moves its contents by one pixel.
+///
+/// **Reachability.** A control can sit at a perfect rect and still be buried
+/// under something painted after it, which geometry alone cannot see. That is
+/// how the map's "?" chip ended up under the mobile bar (tapping it toggled the
+/// menu, so a dismissed About card could never be restored on a phone) and how
+/// the nav trigger ended up under the drawer it opens.
+#[tokio::test]
+async fn test_disclosure_toggles_hold_position_and_stay_reachable() -> TestResult {
+    web_test(async |t| {
+        t.goto("/").await?;
+        t.wait_for_selector(DISCLOSURE).await?;
+        // Geometry is only meaningful once the webfonts have stopped
+        // reflowing the page around them.
+        t.wait_for_fonts().await?;
+
+        let ids: Vec<String> = t
+            .attributes(DISCLOSURE, "aria-controls")
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        check(
+            !ids.is_empty(),
+            "no disclosure widgets found to check — the enumeration, not the page, is probably wrong",
+        )?;
+
+        for id in ids {
+            let toggle = format!("[aria-controls='{id}']");
+
+            let before = t.element_rect(&toggle).await?;
+            check(
+                !before.is_empty(),
+                format!("{id}: toggle should exist before toggling"),
+            )?;
+            check(
+                t.is_hittable(&toggle).await?,
+                format!("{id}: toggle is covered by something else in its initial state"),
+            )?;
+
+            // Each widget is opened and closed again within its own iteration,
+            // so the page is back at its baseline before the next one — an open
+            // nav drawer, for instance, scrims every other overlay on the page.
+            t.click(&toggle).await?;
+            let toggled = t.element_rect(&toggle).await?;
+            check(
+                toggled == before,
+                format!("{id}: toggle moved when toggled: {before:?} -> {toggled:?}"),
+            )?;
+            check(
+                t.is_hittable(&toggle).await?,
+                format!("{id}: toggle is covered by something else once toggled"),
+            )?;
+
+            t.click(&toggle).await?;
+            let restored = t.element_rect(&toggle).await?;
+            check(
+                restored == before,
+                format!("{id}: toggle moved on the way back: {before:?} -> {restored:?}"),
+            )?;
+        }
+
+        Ok(())
+    })
+    .await
+}
+
+/// The time slider is one bar, not a chip sitting on a taller card.
+///
+/// Its chip *is* the bar's left end, so the two share a height — and a border
+/// gets counted two different ways across that seam: an element with an
+/// explicit height keeps its border inside that height under
+/// `box-sizing: border-box`, while one sized by its content has the border
+/// added on top. Same 1 px, and the bar grew 2 px taller than the chip it
+/// expanded from.
+///
+/// Not part of the battery above because it doesn't generalise: the About
+/// card's chip is a small circle on a tall panel and shares no dimension with
+/// it.
+#[tokio::test]
+async fn test_time_slider_bar_matches_its_chip_height() -> TestResult {
+    web_test(async |t| {
+        t.goto("/").await?;
+        let toggle = "[aria-controls='time-slider-panel']";
+        t.wait_for_selector(toggle).await?;
+        // Geometry is only meaningful once the webfonts have stopped
+        // reflowing the page around them.
+        t.wait_for_fonts().await?;
+
+        let expanded_bar = t.element_rect("#time-slider-panel").await?;
+        let chip = t.element_rect(toggle).await?;
+        check(
+            expanded_bar.len() == 4 && chip.len() == 4,
+            "expected rects for both the slider bar and its chip",
+        )?;
+        check(
+            expanded_bar[3] == chip[3],
+            format!(
+                "the expanded bar and its chip must be the same height, got bar {} vs chip {}",
+                expanded_bar[3], chip[3]
+            ),
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// An overlay card's surface is opaque and its geometry constant *throughout*
+/// opening, not merely once it has settled.
+///
+/// Both ways this broke had correct endpoints and a wrong frame in between, so
+/// a before/after assertion saw nothing. The chip hands its background to the
+/// card the instant it expands: a card fading up from transparent leaves the
+/// chip's own area unpainted, and the pill visibly blinks out before fading
+/// back. A card that scales instead flattens — these are stadiums, so a scale
+/// shrinks the height and the cap radius with it.
+///
+/// Sampled by seeking the animation rather than sleeping, so each reading is
+/// exact rather than whatever had rendered by the time the test looked.
+#[tokio::test]
+async fn test_overlay_card_surface_holds_through_the_opening_animation() -> TestResult {
+    web_test(async |t| {
+        t.goto("/").await?;
+        let toggle = "[aria-controls='time-slider-panel']";
+        t.wait_for_selector(toggle).await?;
+        // Geometry is only meaningful once the webfonts have stopped
+        // reflowing the page around them.
+        t.wait_for_fonts().await?;
+
+        let settled = t.element_rect("#time-slider-panel").await?;
+        check(settled.len() == 4, "expected a rect for the expanded bar")?;
+
+        // Stretch the animation so it is still running when the samples land;
+        // the seek below is what makes each sample exact.
+        t.slow_animations(4000.0).await?;
+        t.click(toggle).await?; // collapse
+        t.click(toggle).await?; // and open again, now in slow motion
+
+        for progress in [0.0, 0.25, 0.5, 0.75] {
+            let sample = t.sample_animation_at("#time-slider-panel", progress).await?;
+            check(
+                sample.len() == 6,
+                format!("expected a sample at progress {progress}"),
+            )?;
+            let (animations, opacity, height) = (sample[0], sample[1], sample[5]);
+
+            // Without this the test would read a settled card and pass no
+            // matter what the animation did.
+            check(
+                animations > 0.0,
+                format!("no live animation to sample at progress {progress}"),
+            )?;
+            check(
+                opacity == 1.0,
+                format!("the card's surface was {opacity} opaque at progress {progress}; it must never fade, or the chip's area goes unpainted"),
+            )?;
+            check(
+                height == settled[3],
+                format!(
+                    "the card was {height} tall at progress {progress} but {} when settled; a transform on a stadium distorts its ends",
+                    settled[3]
+                ),
+            )?;
+        }
+
+        Ok(())
+    })
+    .await
+}
+
+/// The About card's dismissal sticks across a reload, and the chip brings it
+/// back.
+///
+/// Disclosure state is read from `#about-card`, the body the toggle's
+/// `aria-controls` names, rather than from a phrase in the copy. The card's
+/// wording is expected to keep changing; whether it is open is the behaviour
+/// under test.
 #[tokio::test]
 async fn test_info_card_dismiss_restore() -> TestResult {
     web_test(async |t| {
         t.goto("/").await?;
+        t.wait_for_selector("#about-card").await?;
 
-        // Info card should be visible
-        t.wait_for_body_text("Every place has layers").await?;
-
-        // Find and click the dismiss button (DismissButton defaults to aria-label="Close")
-        t.click("button[aria-label='Close']").await?;
-
-        // Info card text should be gone
-        check(
-            !t.has_text("Every place has layers").await?,
-            "Info card should be dismissed",
-        )?;
+        // The card's toggle is one button that stays put; only its label and
+        // glyph change with state.
+        t.click("button[aria-label='Hide the About panel']").await?;
+        t.wait_for_selector_removal("#about-card").await?;
 
         // The "?" restore button should appear (aria-label="About Chronoscope")
         check(
@@ -1185,19 +1426,15 @@ async fn test_info_card_dismiss_restore() -> TestResult {
 
         // Reload and check persistence
         t.goto("/").await?;
-
-        // Should still be dismissed (localStorage)
         check(
-            !t.has_text("Every place has layers").await?,
+            !t.exists("#about-card").await?,
             "Info card should remain dismissed after reload",
         )?;
 
         // Click restore button via WASM test hook (Leptos event handlers may
         // not fire via CDP's native click)
         t.click("button[aria-label='About Chronoscope']").await?;
-
-        // Info card should reappear with its content
-        t.wait_for_body_text("Every place has layers").await?;
+        t.wait_for_selector("#about-card").await?;
 
         Ok(())
     })
@@ -1305,9 +1542,9 @@ async fn test_mobile_layout() -> TestResult {
         t.set_viewport(375, 667).await?;
         t.goto("/").await?;
 
-        // Mobile top bar should be visible — check for the hamburger toggle
+        // The floating nav trigger replaces the old fixed top bar.
         let has_toggle = t.exists("button[aria-label='Toggle menu']").await?;
-        check(has_toggle, "Mobile hamburger should be visible")?;
+        check(has_toggle, "Nav trigger should be visible")?;
 
         // Check initial state: menu closed
         let expanded = t
@@ -1331,7 +1568,6 @@ async fn test_mobile_layout() -> TestResult {
 
         t.screenshot("test_mobile_layout_drawer_open").await?;
 
-        // Click a visible nav link (the drawer's, not the hidden desktop sidebar's)
         t.click("a[href='/about']").await?;
 
         let expanded = t
@@ -1354,19 +1590,17 @@ async fn test_desktop_layout() -> TestResult {
         t.set_viewport(1280, 800).await?;
         t.goto("/").await?;
 
-        // Sidebar navigation links
+        // The drawer's links, reached the same way at every viewport.
         check_nav_links(t).await?;
 
-        // Wordmark and tagline
+        // Wordmark
         t.wait_for_body_text("Chronoscope").await?;
-        t.wait_for_body_text("Explore places through time").await?;
 
-        // Desktop sidebar should NOT have a hamburger toggle visible
-        // (it exists in DOM but is hidden via md:hidden)
-        let toggle_visible = t.is_visible("button[aria-label='Toggle menu']").await?;
+        // The trigger is the nav at every width now — there is no permanent
+        // sidebar for desktop to fall back to, so it must be visible here.
         check(
-            !toggle_visible,
-            "Hamburger toggle should be hidden on desktop",
+            t.is_visible("button[aria-label='Toggle menu']").await?,
+            "Nav trigger should be visible on desktop",
         )?;
 
         Ok(())
@@ -1609,14 +1843,14 @@ async fn test_lightbox_dismiss_escape() -> TestResult {
 
         t.click("[role='complementary'] ul[role='list'] li button")
             .await?;
-        t.wait_for_selector("[role='dialog']").await?;
+        t.wait_for_selector(LIGHTBOX).await?;
 
-        t.press_key("[role=dialog]", "Escape").await?;
+        t.press_key(LIGHTBOX, "Escape").await?;
         // Wait for the dialog to disappear (reactive update after signal change).
-        t.wait_for_selector_removal("[role='dialog']").await?;
+        t.wait_for_selector_removal(LIGHTBOX).await?;
 
         check(
-            !t.exists("[role='dialog']").await?,
+            !t.exists(LIGHTBOX).await?,
             "Lightbox should close on Escape",
         )?;
 
@@ -1634,15 +1868,15 @@ async fn test_lightbox_dismiss_close_button() -> TestResult {
 
         t.click("[role='complementary'] ul[role='list'] li button")
             .await?;
-        t.wait_for_selector("[role='dialog']").await?;
+        t.wait_for_selector(LIGHTBOX).await?;
 
         t.click("[role='dialog'] button[aria-label='Close preview']")
             .await?;
         // Wait for the dialog to disappear (reactive update after signal change).
-        t.wait_for_selector_removal("[role='dialog']").await?;
+        t.wait_for_selector_removal(LIGHTBOX).await?;
 
         check(
-            !t.exists("[role='dialog']").await?,
+            !t.exists(LIGHTBOX).await?,
             "Lightbox should close on close button click",
         )?;
 

@@ -1,98 +1,224 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 
+use crate::components::controls::{FOCUS_RING, SURFACE};
+use crate::components::focus_trap::contain_tab;
+use crate::components::motion::{SCRIM, SLIDE};
+
 const NAV_LINK_CLASS: &str = "block px-3 py-2 rounded-md text-sm font-sans font-medium text-sepia hover:text-ink hover:bg-ink/5 transition-colors";
 
+/// The site's navigation: a floating trigger and the drawer it opens.
+///
+/// One drawer at every width. The permanent sidebar this replaces spent 240 px
+/// of every screen on three links, over a map that wants the room, and the
+/// second copy it rendered for narrow screens was a whole parallel nav to keep
+/// in step.
 #[component]
-pub fn Sidebar() -> impl IntoView {
-    let (mobile_open, set_mobile_open) = signal(false);
+pub fn Nav() -> impl IntoView {
+    let open = RwSignal::new(false);
+    let drawer_ref = NodeRef::<leptos::html::Aside>::new();
+    let trigger_ref = NodeRef::<leptos::html::Button>::new();
+    // The masthead holds both the toggle and the home link, so the focus cycle
+    // spans it rather than the toggle alone.
+    let masthead_ref = NodeRef::<leptos::html::Div>::new();
+    let close = move |_| open.set(false);
 
-    let close_mobile = move |_| set_mobile_open.set(false);
+    // Whether the wordmark's destination is the page already showing.
+    let path = leptos_router::hooks::use_location().pathname;
+    let on_home = Signal::derive(move || path.get() == "/");
 
-    let nav_content = move || {
-        view! {
-            <div class="flex flex-col h-full">
-                // Wordmark
-                <div class="px-5 pt-6 pb-3 text-center">
-                    <A href="/" attr:class="font-display text-xl font-bold tracking-[0.12em] text-ink uppercase" on:click=close_mobile>
-                        "Chronoscope"
-                    </A>
-                    <p class="text-sepia/50 text-[0.625rem] mt-1 font-sans tracking-[0.12em]">"Explore places through time"</p>
-                </div>
-
-                <p class="text-center text-sepia/15 text-[0.5rem] mb-3 tracking-[0.3em]">"\u{2014}\u{00a0}\u{25c6}\u{00a0}\u{2014}"</p>
-
-                // Navigation links
-                <nav class="flex-1 px-3">
-                    <A href="/" attr:class=NAV_LINK_CLASS on:click=close_mobile>"Explore"</A>
-                    <A href="/about" attr:class=NAV_LINK_CLASS on:click=close_mobile>"About"</A>
-                    <A href="/faq" attr:class=NAV_LINK_CLASS on:click=close_mobile>"FAQ"</A>
-                </nav>
-
-                // Footer area
-                <div class="px-5 py-4 border-t border-sepia/15">
-                    <a
-                        href="https://github.com/copumpkin/chronoscope"
-                        class="text-sepia/60 hover:text-ink text-xs font-sans transition-colors"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                    >
-                        "GitHub"
-                    </a>
-                    <span class="text-sepia/30 text-xs font-sans">" \u{00b7} "</span>
-                    <span class="text-sepia/40 text-xs font-sans">"MIT License"</span>
-                </div>
-            </div>
+    // Focus follows the drawer: into it on open, back to the trigger on close,
+    // so a keyboard user is never left on a panel that slid off-screen. The
+    // effect's return value is the previous `open`, which is how the close arm
+    // knows not to steal focus on first render.
+    Effect::new(move |was_open: Option<bool>| {
+        let is_open = open.get();
+        if is_open && let Some(el) = drawer_ref.get() {
+            let _ = el.focus();
+        } else if was_open == Some(true)
+            && let Some(el) = trigger_ref.get()
+        {
+            let _ = el.focus();
         }
+        is_open
+    });
+
+    let on_keydown = move |ev: leptos::ev::KeyboardEvent| match ev.key().as_str() {
+        "Escape" => open.set(false),
+        // The masthead is part of the cycle, not outside it: it holds this
+        // dialog's only close control, so a trap spanning the drawer alone would
+        // confine a screen-reader user with no way out but unannounced Escape.
+        "Tab" => {
+            if let (Some(masthead), Some(drawer)) = (masthead_ref.get(), drawer_ref.get()) {
+                contain_tab(&ev, &[masthead.as_ref(), drawer.as_ref()]);
+            }
+        }
+        _ => {}
     };
 
     view! {
-        // Desktop sidebar
-        <aside class="hidden md:block w-60 bg-parchment border-r border-sepia/15 shrink-0">
-            {nav_content()}
-        </aside>
-
-        // Mobile: top bar + slide-out drawer.
-        // Both desktop sidebar and mobile top bar exist in the DOM; Tailwind's
-        // responsive prefixes (md:hidden / hidden md:block) use CSS media queries
-        // at 768px to show one and hide the other. No JS breakpoint detection.
-        <div class="md:hidden fixed top-0 left-0 right-0 z-50 bg-parchment/95 backdrop-blur-sm border-b border-sepia/20 h-14 flex items-center px-4">
+        // Two controls in one surface, with a rule between them saying so. The
+        // burger opens the drawer; the wordmark goes home, which is the
+        // convention every site has and which a `<span>` inside a button was
+        // swallowing. One pill silently doing both would mean the same pixels
+        // acting differently depending on state the reader cannot see.
+        //
+        // Neither zone moves between states, which is the point: the surface
+        // withdraws over the open drawer, where it would otherwise draw a second
+        // background across the drawer's own corner, but the boxes do not shift.
+        <div
+            node_ref=masthead_ref
+            class=move || {
+                let surface = if open.get() { "" } else { SURFACE };
+                format!("fixed top-3 left-3 z-50 flex items-stretch h-9 \
+                         rounded-full text-ink {surface}")
+            }
+        >
             <button
-                class="p-2 cursor-pointer"
-                on:click=move |_| set_mobile_open.update(|v| *v = !*v)
+                node_ref=trigger_ref
+                type="button"
+                class=format!("flex items-center px-3.5 rounded-l-full cursor-pointer \
+                               hover:bg-ink/5 {FOCUS_RING}")
                 aria-label="Toggle menu"
-                aria-expanded=move || mobile_open.get().to_string()
+                aria-expanded=move || open.get().to_string()
+                aria-controls="site-nav-drawer"
+                on:click=move |_| open.update(|shown| *shown = !*shown)
             >
-                <span class="text-xl">
-                    {move || if mobile_open.get() { "\u{2715}" } else { "\u{2630}" }}
-                </span>
+                // An SVG rather than the ☰ glyph: a text icon's box comes from
+                // whatever the font says about that codepoint, so it cannot be
+                // centred against the wordmark reliably. The 16 px box inside
+                // this 44x36 button is the whole hit target, so it needs no
+                // pseudo-element and cannot leak one to the wrong ancestor.
+                //
+                // The bars stay drawn while the drawer is open. Hiding them left
+                // this zone blank, so hovering it lit an empty lozenge, and the
+                // rule beside it appeared to divide the name from nothing. A
+                // close mark instead would read as negative on a menu that is
+                // merely standing open.
+                <svg
+                    aria-hidden="true"
+                    class="w-4 h-4 shrink-0"
+                    viewBox="0 0 16 16"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                >
+                    <path d="M2 4.5h12M2 8h12M2 11.5h12"/>
+                </svg>
             </button>
-            <A href="/" attr:class="ml-2 font-display text-lg font-bold tracking-[0.15em] text-ink uppercase">
+
+            // The rule is what makes the split legible. Decorative, so it is
+            // hidden from the accessibility tree, where the two controls already
+            // announce themselves separately.
+            <span aria-hidden="true" class="self-center w-px h-4 bg-sepia/25"></span>
+
+            // On the map itself this leads where the reader already is, so it
+            // offers no hover and no pointer: a highlight that lights up and
+            // then does nothing when clicked is a promise the link cannot keep.
+            // `aria-current` says the same thing to a screen reader.
+            <A
+                href="/"
+                attr:class=move || {
+                    let affordance = if on_home.get() {
+                        "cursor-default"
+                    } else {
+                        "cursor-pointer hover:bg-ink/5"
+                    };
+                    format!("flex items-center px-4 rounded-r-full font-display \
+                             text-sm font-bold tracking-[0.12em] uppercase \
+                             {affordance} {FOCUS_RING}")
+                }
+                attr:aria-current=move || on_home.get().then_some("page")
+                on:click=close
+            >
                 "Chronoscope"
             </A>
         </div>
 
-        // Mobile drawer overlay
+        // Scrim + drawer. Both stay mounted so the slide animates in and out;
+        // `pointer-events-none` keeps the closed overlay from eating map clicks.
         <div
-            class="md:hidden fixed inset-0 z-40 transition-opacity duration-200"
-            class:pointer-events-none=move || !mobile_open.get()
-            style=move || if mobile_open.get() { "opacity: 1" } else { "opacity: 0" }
+            class=format!("fixed inset-0 z-40 {SCRIM}")
+            class:pointer-events-none=move || !open.get()
+            style=move || if open.get() { "opacity: 1" } else { "opacity: 0" }
         >
-            // Backdrop
-            <div
-                class="absolute inset-0 bg-ink/20"
-                on:click=close_mobile
-            ></div>
-            // Drawer
+            <div class="absolute inset-0 bg-ink/20" on:click=close></div>
             <aside
-                class="absolute top-0 left-0 bottom-0 w-60 bg-parchment shadow-lg transition-transform duration-200"
-                style=move || if mobile_open.get() { "transform: translateX(0)" } else { "transform: translateX(-100%)" }
+                node_ref=drawer_ref
+                id="site-nav-drawer"
+                tabindex="-1"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Site navigation"
+                // Mounted even when closed, so the slide has something to
+                // animate. Without `inert` that leaves a permanent
+                // `aria-modal` dialog in the accessibility tree and four
+                // off-screen links in the tab order: `opacity: 0` hides an
+                // element from the eye, not from the keyboard.
+                inert=move || !open.get()
+                class=format!("absolute top-0 left-0 bottom-0 w-60 bg-parchment shadow-lg \
+                       outline-none {SLIDE}")
+                style=move || if open.get() {
+                    "transform: translateX(0)"
+                } else {
+                    "transform: translateX(-100%)"
+                }
+                on:keydown=on_keydown
             >
-                {nav_content()}
+                // `pt-12` clears the trigger, which overlays this panel's top
+                // corner and serves as its masthead. The drawer carries no
+                // wordmark of its own: a second copy at a different size would
+                // make the brand appear to jump on open.
+                <div class="flex flex-col h-full pt-12">
+                    // Inset to the wordmark's own span rather than the drawer's,
+                    // so the ornament centres under the name instead of off to
+                    // one side. The left inset adds up the masthead ahead of the
+                    // text: `left-3` (12), the burger's 44, the 1 px rule, and
+                    // the link's `px-4` (16). The right inset is the only figure
+                    // that depends on how wide the name renders, which is
+                    // tolerable for an ornament and nothing else.
+                    // `leading-none` so the line box is the glyph, not the glyph
+                    // plus half a line of air above and below it — that leading
+                    // is what made the ornament read as a menu row. The margin
+                    // below is in `em`, so it stays proportional to the ornament
+                    // if its size is ever changed.
+                    //
+                    // Decorative: hidden from the accessibility tree, where it
+                    // would otherwise be announced as stray punctuation, and
+                    // unselectable, since dragging across the menu catching a
+                    // stray "— ❧ —" is just untidy.
+                    <p
+                        aria-hidden="true"
+                        class="text-center text-sepia/40 text-base leading-none mb-[0.75em] \
+                               tracking-[0.35em] pl-[4.5625rem] pr-[2.8rem] select-none"
+                    >
+                        "\u{2014}\u{00a0}\u{2767}\u{00a0}\u{2014}"
+                    </p>
+
+                    // Navigation links
+                    <nav class="flex-1 px-3">
+                        <A href="/" attr:class=NAV_LINK_CLASS on:click=close>"Explore"</A>
+                        <A href="/about" attr:class=NAV_LINK_CLASS on:click=close>"About"</A>
+                        <A href="/faq" attr:class=NAV_LINK_CLASS on:click=close>"FAQ"</A>
+                        <A href="/related-work" attr:class=NAV_LINK_CLASS on:click=close>"Related work"</A>
+                    </nav>
+
+                    // Footer area
+                    <div class="px-5 py-4 border-t border-sepia/15">
+                        <a
+                            href="https://github.com/copumpkin/chronoscope"
+                            class="text-sepia/60 hover:text-ink text-xs font-sans transition-colors"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                        >
+                            "GitHub"
+                        </a>
+                        <span class="text-sepia/30 text-xs font-sans">" \u{00b7} "</span>
+                        <span class="text-sepia/40 text-xs font-sans">"MIT code \u{00b7} CC BY 4.0 data"</span>
+                    </div>
+                </div>
             </aside>
         </div>
-
-        // Mobile spacer for fixed top bar
-        <div class="md:hidden h-14 shrink-0"></div>
     }
 }

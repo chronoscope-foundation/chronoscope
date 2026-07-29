@@ -56,6 +56,17 @@
   margin-bottom: 1rem;
 }
 
+/* Subsections under an h2. Without this they inherit the body's size, weight,
+   and colour, which makes a heading read as a stray first line of the
+   paragraph under it. */
+.prose-chronoscope h3 {
+  color: var(--color-body);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  margin-top: 1.75rem;
+  margin-bottom: 0.5rem;
+}
+
 .prose-chronoscope ul {
   list-style: disc;
   padding-left: 1.5rem;
@@ -81,11 +92,14 @@
   color: var(--color-body);
 }
 
-/* Lightbox fade-in animation */
+/* Entry animations for the transition language (see components/motion.rs).
+   Transitions live in Tailwind classes; these are the two mount-time
+   animations, which need keyframes because the element has no prior state. */
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }
 }
+
 
 /* Outbound link indicator: added inline in Leptos templates as
    <span aria-hidden="true"> so screen readers don't announce the arrow. */

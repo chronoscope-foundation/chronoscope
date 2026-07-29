@@ -553,11 +553,25 @@ impl WebTest {
         pub wait wait_for_selector(selector: &str);
         pub wait wait_for_selector_removal(selector: &str);
         pub wait wait_for_body_text(needle: &str);
+        // Webfonts loaded and the reflow around them finished. Required before
+        // any geometry assertion, which otherwise straddles the font swap.
+        pub wait wait_for_fonts();
 
         // DOM queries (compositions: wait then read, where natural).
         pub query text(selector: &str) -> String;
         pub query attr(selector: &str, attribute: &str) -> Option<String>;
         pub query is_visible(selector: &str) -> bool;
+        // `[x, y, width, height]`, unrounded. Empty when nothing matches.
+        pub query element_rect(selector: &str) -> Vec<f64>;
+        // Whether a click at the element's own centre would reach it, rather
+        // than something painted over it.
+        pub query is_hittable(selector: &str) -> bool;
+        // Hold the element's entry animation at `progress` (0.0..=1.0) and read
+        // `[animation_count, opacity, x, y, width, height]` there.
+        pub query sample_animation_at(selector: &str, progress: f64) -> Vec<f64>;
+        // Stretch every animation, so entry animations stay live long enough to
+        // be seeked rather than finishing before the sample arrives.
+        pub action slow_animations(ms: f64);
         pub query is_active_inside(selector: &str) -> bool;
         pub query active_element_attribute(attribute: &str) -> Option<String>;
         pub query press_key(selector: &str, key: &str) -> bool;
