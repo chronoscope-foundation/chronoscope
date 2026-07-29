@@ -255,6 +255,7 @@ macro_rules! fact_store_conformance {
             walk_entity_classes_in_viewport_surfaces_located_and_moved_in_entities,
             walk_entity_classes_in_viewport_surfaces_cap_overlapping_viewport_edge,
             walk_entity_classes_in_viewport_surfaces_conjunction_with_unresolved_member,
+            walk_entity_classes_in_viewport_crossing_the_antimeridian_surfaces_both_sides,
             walk_image_classes_in_viewport_surfaces_captured_locations,
             class_walk_next_class_cursor_skips_to_the_next_representative,
             cluster_tile_cells_match_the_same_tile_inside_a_viewport,

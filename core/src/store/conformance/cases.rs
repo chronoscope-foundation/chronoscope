@@ -4582,6 +4582,86 @@ pub async fn walk_entity_classes_in_viewport_surfaces_conjunction_with_unresolve
     Ok(())
 }
 
+/// A viewport crossing the ±180° seam is two rects, and a cap straddling the
+/// seam is two stored rects, so the walk queries both halves and can meet one
+/// fact several times. A location only the eastern half reaches proves the
+/// second half is queried at all; the straddling cap, which every half and every
+/// stored rect matches, proves the candidate union is deduped by fact.
+pub async fn walk_entity_classes_in_viewport_crossing_the_antimeridian_surfaces_both_sides<
+    S: FactStore,
+>(
+    store: S,
+) -> TestResult {
+    // Longitude runs 179° east to -179°: the westward span is the wrap
+    // convention, and its halves are [179, 180] and [-180, -179].
+    let viewport = Viewport::new(GeoPoint::new(0.0, 179.0)?, GeoPoint::new(1.0, -179.0)?)?;
+
+    // A: a 2 km circle centered just east of the seam, so its covering rects
+    // land on both sides of ±180.
+    let straddling = commit_result(
+        &store,
+        local_bundle(
+            1,
+            0,
+            0,
+            0,
+            vec![construction_circle_at(0, 0.5, -179.995, 2_000.0)?],
+        )?,
+    )
+    .await?;
+    let straddling_id = straddling
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing straddling entity")?
+        .id
+        .clone();
+
+    // B: a point on the seam's eastern side, reachable only through the
+    // viewport's second half.
+    let far_side = commit_result(
+        &store,
+        local_bundle(1, 0, 0, 10, vec![construction_at(0, 0.5, -179.5)?])?,
+    )
+    .await?;
+    let far_side_id = far_side
+        .entities
+        .get(&EntityIdx(0))
+        .ok_or("missing far-side entity")?
+        .id
+        .clone();
+
+    // C: the same latitude, ~1000 km west of the box.
+    commit_result(
+        &store,
+        local_bundle(1, 0, 0, 20, vec![construction_at(0, 0.5, 170.0)?])?,
+    )
+    .await?;
+
+    let stream = EntityStream::InViewport(&viewport);
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let rows: Vec<ClassRow<EntityIdOf<S>>> =
+        drain_entity_classes::<S, _>(&mut view, &stream, PAGE_100)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+
+    let reps: BTreeSet<EntityIdOf<S>> = rows.iter().map(|r| r.representative.clone()).collect();
+    let want: BTreeSet<EntityIdOf<S>> = [straddling_id.clone(), far_side_id.clone()]
+        .into_iter()
+        .collect();
+    assert_eq!(
+        reps, want,
+        "the seam-crossing viewport surfaces the straddling cap ({straddling_id:?}) and the \
+         entity past the seam ({far_side_id:?}), excluding the western one; got {rows:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "each entity is placed by one fact, so each answers one row however many halves and \
+         stored rects matched it; got {rows:?}"
+    );
+    Ok(())
+}
+
 /// Two entities, each with two construction bookends, walked over the `All`
 /// stream one row at a time. `next` walks every row (each representative
 /// twice); `next_class` skips the emitted representative's remaining rows, so

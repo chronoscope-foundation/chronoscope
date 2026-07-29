@@ -31,7 +31,7 @@ use chronoscope_core::store::schema::{
     CELL_DEPTH, ClassPage, ClassRow, ClusterCell, DepictionPage, EquivClass, FactPage, PageItem,
     RankKey, cluster_tile_ranges,
 };
-use chronoscope_core::submit::{FactLookup, StoredFact, SubmitResult};
+use chronoscope_core::submit::{FactLookup, LocatedSubject, StoredFact, SubmitResult};
 
 use super::error::{PostgresFactStoreError as Error, sql};
 use super::queries;
@@ -40,6 +40,7 @@ use crate::common::cluster::{
 };
 use crate::common::convert::{i64_to_u64, seed_ids, u64_to_i64};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
+use crate::common::spatial::{dedup_by_fact, refine_in_viewport};
 use crate::common::storage::{
     SubjectColumn, depiction_subjects, fact_from_json, kind_tag, result_from_json,
 };
@@ -638,6 +639,87 @@ async fn event_owners(
         }))?;
     let retraction = retraction_edges(conn, bound, &candidates.seeds()).await?;
     Ok(candidates.live(bound.fact_id(), &retraction))
+}
+
+/// The active location-bearing facts of the stream's subject kinds whose region
+/// can meet `viewport`: one `GiST` `&&` fetch per viewport half (the core-owned
+/// seam split, [`halves`]) narrowed to `kinds` in SQL, one batched retractor
+/// closure, then the shared [`refine_in_viewport`] membership decision, which
+/// the SQLite backend runs on its own fetch, so the two cannot disagree on who
+/// is in the box.
+///
+/// [`halves`]: chronoscope_core::geo::Viewport::halves
+async fn located_in_viewport(
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    viewport: &Viewport,
+    kinds: (&str, &str),
+) -> Result<Vec<(FactId, StoredFact<SqlIds>)>, Error> {
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for half in viewport.halves() {
+        // ST_MakeEnvelope reads (xmin, ymin, xmax, ymax): longitude on x.
+        let fetched: Vec<(i64, String)> = sqlx::query_as(queries::SPATIAL_CANDIDATES)
+            .bind(half.min_lon)
+            .bind(half.min_lat)
+            .bind(half.max_lon)
+            .bind(half.max_lat)
+            .bind(bound.bind())
+            .bind(kinds.0)
+            .bind(kinds.1)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(sql("fetching spatial candidates"))?;
+        rows.extend(fetched);
+    }
+    let candidates = dedup_by_fact(rows, "spatial candidate fact id")?;
+    let seeds: Vec<FactId> = candidates.iter().map(|(fid, _)| *fid).collect();
+    let retraction = retraction_edges(conn, bound, &seeds).await?;
+    Ok(refine_in_viewport(
+        &candidates,
+        bound.fact_id(),
+        &retraction,
+        viewport,
+    )?)
+}
+
+/// One page of the entity `InViewport` class walk: [`located_in_viewport`] facts
+/// of the entity and event kinds, construction bookends attributed to their own
+/// entity and `MovedToLocation` facts to their [`event_owners`] entity (an
+/// orphaned move attributes to nothing), then the shared [`rep_class_page`]
+/// tail, which resolves representatives itself.
+pub(super) async fn spatial_entity_page(
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    viewport: &Viewport,
+    after: Option<(SqlEntityId, FactId)>,
+    limit: std::num::NonZeroUsize,
+) -> Result<ClassPage<SqlEntityId, (SqlEntityId, FactId)>, Error> {
+    let kinds = (kind_tag(SqlEntityId::KIND), kind_tag(SqlEventId::KIND));
+    let located = located_in_viewport(conn, bound, viewport, kinds).await?;
+    let split = LocatedSubjects::partition(&located);
+    let owners = event_owners(conn, bound, &split.events()).await?;
+    rep_class_page(conn, bound, split.attribute(&owners), after, limit).await
+}
+
+/// One page of the image `InViewport` class walk: [`located_in_viewport`] facts
+/// of the image kind (`CapturedLocation`), then the shared [`rep_class_page`]
+/// tail.
+pub(super) async fn spatial_image_page(
+    conn: &mut PgConnection,
+    bound: ReadBound,
+    viewport: &Viewport,
+    after: Option<(SqlImageId, FactId)>,
+    limit: std::num::NonZeroUsize,
+) -> Result<ClassPage<SqlImageId, (SqlImageId, FactId)>, Error> {
+    let kind = kind_tag(SqlImageId::KIND);
+    let located = located_in_viewport(conn, bound, viewport, (kind, kind)).await?;
+    let mut subjects: Vec<(SqlImageId, FactId)> = Vec::new();
+    for (fid, fact) in &located {
+        if let Some((_, LocatedSubject::Image(image))) = fact.located_subject() {
+            subjects.push((*image, *fid));
+        }
+    }
+    rep_class_page(conn, bound, subjects, after, limit).await
 }
 
 /// Attribute a batch of located facts to their entity representatives through

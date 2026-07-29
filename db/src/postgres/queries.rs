@@ -14,9 +14,10 @@
 //! The recursive retraction CTEs (retractor closure, equivalence component,
 //! identity targets) are rewritten to a single self-reference each, since
 //! Postgres forbids SQLite's doubled recursive references (see their constants
-//! below). The `PostGIS` spatial reads live in a later unit; the query-plan
-//! validator (seed + ANALYZE + bound-constant EXPLAIN) is a later unit too, so
-//! these strings are not plan-gated yet.
+//! below). The `PostGIS` statements take `ST_MakeEnvelope`'s argument order,
+//! `(xmin, ymin, xmax, ymax, srid)`, which is `(lon, lat, lon, lat)` at every
+//! site. The query-plan validator (seed + ANALYZE + bound-constant EXPLAIN)
+//! does not exist yet, so these strings are not plan-gated.
 
 use chronoscope_core::store::schema::CLUSTER_TILE_N;
 
@@ -81,6 +82,19 @@ pub(super) const INSERT_COMMIT: &str = "\
 
 pub(super) const INSERT_REP: &str =
     "INSERT INTO subject_reps (kind, member, as_of, rep) VALUES ($1, $2, $3, $4)";
+
+// One `facts_spatial` row per covering rect of a located fact's region: $1 the
+// fact id, $2 the located subject's kind tag, $3..$6 the rects as parallel
+// float8 arrays. A location can cover many rects (one per `OneOf` member, a
+// pair either side of the +/-180 seam), and this runs with the counters-row
+// lock held through COMMIT, so the arrays unnest into rows inside one round
+// trip rather than one per rect.
+pub(super) const INSERT_SPATIAL: &str = "\
+    INSERT INTO facts_spatial (fact_id, subject_kind, region) \
+    SELECT $1::bigint, $2::text, \
+           ST_MakeEnvelope(r.lonmin, r.latmin, r.lonmax, r.latmax, 4326) \
+      FROM unnest($3::float8[], $4::float8[], $5::float8[], $6::float8[]) \
+        AS r(lonmin, latmin, lonmax, latmax)";
 
 // ---- Claim / audit ----
 
@@ -205,6 +219,33 @@ pub(super) const EVENT_OWNERS: &str = "\
      FROM fact_subjects s JOIN facts f ON f.fact_id = s.fact_id \
      WHERE s.kind = $2 AND s.subject_id = ANY($1::bigint[]) \
        AND s.fact_id < $3 AND f.event_owner IS NOT NULL";
+
+// ---- Viewport spatial reads ----
+
+// The `InViewport` candidates meeting one non-wrapping viewport half: $1..$4 the
+// half's (lon, lat, lon, lat) corners, $5 the exclusive snapshot, $6/$7 the
+// stream's two subject-kind tags. The GiST-indexed `&&` is a bounding-box
+// overlap against the stored covering rects, which core builds as a guaranteed
+// superset of the region, so this is already a conservative pre-filter and the
+// Rust refine decides membership.
+//
+// No distance test belongs here. PostGIS has no 3-argument geometry
+// ST_Distance, and a geography cast bows the envelope's edges into great
+// circles that curve poleward, dropping locations just outside a viewport's
+// equator-facing edge: a false negative no spatial fixture would catch, since
+// they all clear their viewports by kilometers.
+//
+// subject_kind must be read off `s`: `facts.subject_kind` is the clustering
+// facet, non-NULL only where the location pins a point, so an `f.` here would
+// silently drop every compound location. The kinds bind rather than inline
+// (unlike CLUSTER_TILE's literals) because facts_spatial.subject_kind carries no
+// index at all — it is a heap filter either way.
+pub(super) const SPATIAL_CANDIDATES: &str = "\
+    SELECT s.fact_id, f.fact_json::text \
+      FROM facts_spatial s JOIN facts f ON f.fact_id = s.fact_id \
+     WHERE s.region && ST_MakeEnvelope($1, $2, $3, $4, 4326) \
+       AND f.fact_id < $5 \
+       AND s.subject_kind IN ($6, $7)";
 
 // ---- Viewport clustering ----
 

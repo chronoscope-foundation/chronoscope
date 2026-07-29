@@ -43,6 +43,7 @@ use crate::common::cluster::{
 use crate::common::convert::{i64_to_u64, seed_ids, u64_to_i64};
 use crate::common::error::json;
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
+use crate::common::spatial::{dedup_by_fact, refine_in_viewport};
 use crate::common::storage::{
     SubjectColumn, day_number, depiction_subjects, fact_from_json, kind_tag, result_from_json,
 };
@@ -655,14 +656,12 @@ pub(super) async fn depiction_page(
 
 /// The active location-bearing facts of the stream's subject kinds whose
 /// region can meet `viewport`: rtree candidates per viewport half (the
-/// core-owned seam split, [`halves`] — deduped by fact id, since a
-/// seam-split location matches through both rect rows) narrowed to `kinds`
-/// in SQL, one batched retractor closure, then the exact refine through the
-/// shared predicate — the same [`known_geometry_intersects`] code the memory
-/// backend refines with, so the backends cannot disagree on membership.
+/// core-owned seam split, [`halves`]) narrowed to `kinds` in SQL, one batched
+/// retractor closure, then the shared [`refine_in_viewport`] membership
+/// decision, which the Postgres backend runs on its own fetch, so the two
+/// cannot disagree on who is in the box.
 ///
 /// [`halves`]: chronoscope_core::geo::Viewport::halves
-/// [`known_geometry_intersects`]: chronoscope_core::location::UnresolvedLocation::known_geometry_intersects
 async fn located_in_viewport(
     conn: &mut SqliteConnection,
     bound: ReadBound,
@@ -673,9 +672,9 @@ async fn located_in_viewport(
     // The spatial read can't span layers through a temp view (an rtree drives
     // its index only when named directly), so the candidate SQL unions the base
     // and overlay rtree branches explicitly when a base is mounted.
-    let mut candidates: std::collections::BTreeMap<i64, String> = std::collections::BTreeMap::new();
+    let mut rows: Vec<(i64, String)> = Vec::new();
     for half in viewport.halves() {
-        let rows: Vec<(i64, String)> = sqlx::query_as(&fq.spatial_candidates)
+        let fetched: Vec<(i64, String)> = sqlx::query_as(&fq.spatial_candidates)
             .bind(half.min_lat)
             .bind(half.max_lat)
             .bind(half.min_lon)
@@ -686,25 +685,17 @@ async fn located_in_viewport(
             .fetch_all(&mut *conn)
             .await
             .map_err(sql("fetching spatial candidates"))?;
-        candidates.extend(rows);
+        rows.extend(fetched);
     }
-    let seeds = seed_ids(candidates.keys(), "spatial candidate fact id")?;
+    let candidates = dedup_by_fact(rows, "spatial candidate fact id")?;
+    let seeds: Vec<FactId> = candidates.iter().map(|(fid, _)| *fid).collect();
     let retraction = retraction_edges(conn, bound, &seeds).await?;
-    let mut located = Vec::new();
-    for ((_, fact_json), fid) in candidates.iter().zip(&seeds) {
-        if effective_retractor(*fid, bound.fact_id(), &retraction).is_some() {
-            continue;
-        }
-        let fact = fact_from_json(fact_json)?;
-        let Some((location, _)) = fact.located_subject() else {
-            continue;
-        };
-        if !location.known_geometry_intersects(viewport) {
-            continue;
-        }
-        located.push((*fid, fact));
-    }
-    Ok(located)
+    Ok(refine_in_viewport(
+        &candidates,
+        bound.fact_id(),
+        &retraction,
+        viewport,
+    )?)
 }
 
 /// The owning entity of each of `events` at the snapshot. One batched

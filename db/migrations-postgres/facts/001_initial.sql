@@ -14,8 +14,8 @@
 --     not a rowid alias.
 --   * `INTEGER`→`BIGINT`, `REAL`→`DOUBLE PRECISION`, no `WITHOUT ROWID`.
 --   * PostGIS `geometry(Geometry, 4326)` + GiST replaces the SpatiaLite
---     `facts_spatial` shadow rtree. The column and index exist so the schema is
---     whole; its reads/writes are a later unit.
+--     `facts_spatial` shadow rtree; the viewport pre-filter is a `&&`
+--     bounding-box overlap rather than a shadow-rtree join.
 --
 -- ==================== Fact store ====================
 

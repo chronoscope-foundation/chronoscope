@@ -1,18 +1,18 @@
 //! Postgres fact-store tests: the backend-agnostic conformance suite stamped
-//! against [`PostgresFactStore`] over the ephemeral-cluster harness, plus a
-//! `PostGIS` smoke check.
+//! against [`PostgresFactStore`] over the ephemeral-cluster harness, plus what
+//! is genuinely backend-local: `PostGIS` availability, the isolation levels the
+//! submit serializer and the read views rest on, and the axis order of the
+//! stored geometry.
 //!
-//! The ignore list is exactly the `PostGIS` `InViewport` reads, deferred to
-//! their own unit. Retraction and tiled clustering both land — clustering is a
-//! Morton-range scan on the `quadkey` facet and never touches `PostGIS` — so
-//! their cases run GREEN. Anything the spatial stubs break fails *loudly* (a red
-//! assertion, never a false green), so a missed ignore surfaces on the first run.
+//! Nothing is ignored here beyond the suite-wide `SameEvent` cases the macro
+//! bakes in.
 
 use super::harness::{fresh_pg_store, fresh_pg_store_at_default_isolation};
 use super::{PostgresFactStore, PostgresFactStoreError};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlImageId};
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::store::FactStore;
+use chronoscope_core::store::conformance::fixtures::{commit_ok, construction_at, local_bundle};
 use chronoscope_core::store::conformance::{RefusalKinds, TestResult, UnmintedIds};
 
 /// Counters mint dense from zero, so `i64::MAX` is never assigned.
@@ -34,20 +34,7 @@ impl RefusalKinds for PostgresFactStore {
     }
 }
 
-chronoscope_core::fact_store_conformance!(
-    fresh_pg_store(),
-    ignore(
-        // --- `PostGIS` spatial reads (InViewport streams) ---
-        walk_entity_classes_in_viewport_surfaces_located_and_moved_in_entities:
-            "PostGIS spatial reads deferred to a later unit",
-        walk_entity_classes_in_viewport_surfaces_cap_overlapping_viewport_edge:
-            "PostGIS spatial reads deferred to a later unit",
-        walk_entity_classes_in_viewport_surfaces_conjunction_with_unresolved_member:
-            "PostGIS spatial reads deferred to a later unit",
-        walk_image_classes_in_viewport_surfaces_captured_locations:
-            "PostGIS spatial reads deferred to a later unit",
-    )
-);
+chronoscope_core::fact_store_conformance!(fresh_pg_store());
 
 /// `PostGIS` loaded in a fresh store's database (via the template's
 /// `CREATE EXTENSION postgis`), reachable over the cluster's unix socket.
@@ -60,6 +47,46 @@ async fn postgis_extension_loads_in_a_fresh_store() -> TestResult {
     assert!(
         !version.trim().is_empty(),
         "postgis_lib_version() returned empty"
+    );
+    Ok(())
+}
+
+/// `ST_MakeEnvelope` takes `(xmin, ymin, xmax, ymax)`, so a stored region holds
+/// longitude on x and latitude on y. Transposing *both* the insert and the read
+/// is invisible to conformance: `&&` is then the same interval test with the
+/// axes renamed, every case stays green, and the geometry column quietly holds
+/// latitude in x until something geodesic touches it. Pinning the stored corner
+/// against the submitted coordinates is what catches that.
+#[tokio::test]
+async fn stored_regions_carry_longitude_on_the_x_axis() -> TestResult {
+    let (lat, lon) = (40.5, -73.25);
+    let (store, _cx) = fresh_pg_store().await?;
+    commit_ok(
+        &store,
+        local_bundle(1, 0, 0, 0, vec![construction_at(0, lat, lon)?])?,
+    )
+    .await?;
+
+    // Assert the one-row expectation rather than assume it: `fetch_one` returns
+    // the first of however many arrive, so a second located fact would quietly
+    // move this assertion onto an arbitrary row.
+    let rows: Vec<(f64, f64)> =
+        sqlx::query_as("SELECT ST_XMin(region), ST_YMin(region) FROM facts_spatial")
+            .fetch_all(store.pool())
+            .await?;
+    let [(xmin, ymin)] = rows.as_slice() else {
+        return Err(format!(
+            "one located fact must write one spatial row, got {}",
+            rows.len()
+        )
+        .into());
+    };
+    // A point's covering rect is padded only by the cap's millimeter rim
+    // tolerance, well inside this margin.
+    let tolerance = 1e-6;
+    assert!(
+        (xmin - lon).abs() < tolerance && (ymin - lat).abs() < tolerance,
+        "stored region corner ({xmin}, {ymin}) must be (lon, lat) = ({lon}, {lat})"
     );
     Ok(())
 }

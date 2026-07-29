@@ -1,7 +1,7 @@
-//! Postgres [`FactStore`] backend. Retraction lands (the recursive CTEs
-//! rewritten to a single self-reference each — see the `queries` module), as
-//! does tiled clustering (a Morton-range scan on the `quadkey` facet, no
-//! `PostGIS` involved); the `PostGIS` spatial reads remain a later unit.
+//! Postgres [`FactStore`] backend. Retraction rides recursive CTEs rewritten to
+//! a single self-reference each (see the `queries` module), tiled clustering is
+//! a Morton-range scan on the `quadkey` facet, and the `InViewport` reads are a
+//! `PostGIS` `GiST` bounding-box pre-filter refined in Rust.
 //!
 //! One writable database, no base/overlay union: every read names its tables
 //! directly and every query is a plain constant (see the `queries` module). The
@@ -30,14 +30,17 @@
 //! log; the class-stream `ByName` / `ByExternalReference` / `BySourceUrl` / `All`
 //! walks combine the facet indexes with that resolution, and depictions combine
 //! it with the subject backlinks. Tiled clustering scans the `quadkey` facet by
-//! Morton range and folds each range through core's shared cell fold.
+//! Morton range and folds each range through core's shared cell fold. The
+//! `InViewport` walks query `facts_spatial`'s `GiST` index once per viewport half
+//! and hand the candidates to the shared membership decision
+//! ([`crate::common::spatial`]).
 //!
-//! ## Deferred (later units)
+//! ## Not implemented
 //!
-//! The `PostGIS` spatial reads/writes and the temporal-conflict witness *reads*
-//! are later units; here the `facts_spatial` insert is skipped, the `InViewport`
-//! / `InTimeRange` streams answer empty pages, and the witness tables are
-//! written but not yet read.
+//! The temporal-conflict witness *reads* have no Postgres implementation yet, so
+//! the witness tables are written but never read. The `InTimeRange` /
+//! `InViewportAndTimeRange` streams answer empty pages, a gap shared with the
+//! other backends.
 
 mod error;
 mod harness;
@@ -71,8 +74,8 @@ pub(crate) use self::error::PostgresFactStoreError;
 use crate::common::convert::{i64_to_u64, u64_to_i64};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
 use crate::common::storage::{
-    commit_to_json, external_ref_key, facet_columns, fact_to_json, named_entity, referenced_entity,
-    result_to_json, sourced_image, subject_rows, witness_row,
+    commit_to_json, external_ref_key, facet_columns, fact_to_json, kind_tag, named_entity,
+    referenced_entity, result_to_json, sourced_image, subject_rows, witness_row,
 };
 
 use self::error::sql;
@@ -389,10 +392,10 @@ impl<C: AsConn> EntityView<PostgresFactStore> for PostgresHandle<C> {
         read::equiv_class(self.conn.conn(), self.bound, *member).await
     }
 
-    /// The spatial (`InViewport`) and temporal (`InTimeRange`) streams answer
-    /// empty pages until their later units land; the empty page is the
-    /// contract's nothing-found answer and must stay quiet, since the submit
-    /// matcher drains keyed walks on every submit with `Local` decls.
+    /// The temporal (`InTimeRange`) streams answer empty pages, a gap shared
+    /// with the other backends; the empty page is the contract's nothing-found
+    /// answer and must stay quiet, since the submit matcher drains keyed walks
+    /// on every submit with `Local` decls.
     async fn walk_entity_classes<'b>(
         &'b mut self,
         stream: &'b EntityStream<'b>,
@@ -414,9 +417,12 @@ impl<C: AsConn> EntityView<PostgresFactStore> for PostgresHandle<C> {
                 read::keyed_class_page(conn, bound, key, referenced_entity, after, limit).await
             }
             EntityStream::All => read::all_class_page(conn, bound, after, limit).await,
-            EntityStream::InViewport(_)
-            | EntityStream::InTimeRange(_)
-            | EntityStream::InViewportAndTimeRange { .. } => Ok(empty_class_page()),
+            EntityStream::InViewport(viewport) => {
+                read::spatial_entity_page(conn, bound, viewport, after, limit).await
+            }
+            EntityStream::InTimeRange(_) | EntityStream::InViewportAndTimeRange { .. } => {
+                Ok(empty_class_page())
+            }
         }
     }
 
@@ -511,9 +517,12 @@ impl<C: AsConn> ImageView<PostgresFactStore> for PostgresHandle<C> {
                 read::keyed_class_page(conn, bound, key, sourced_image, after, limit).await
             }
             ImageStream::All => read::all_class_page(conn, bound, after, limit).await,
-            ImageStream::InViewport(_)
-            | ImageStream::InTimeRange(_)
-            | ImageStream::InViewportAndTimeRange { .. } => Ok(empty_class_page()),
+            ImageStream::InViewport(viewport) => {
+                read::spatial_image_page(conn, bound, viewport, after, limit).await
+            }
+            ImageStream::InTimeRange(_) | ImageStream::InViewportAndTimeRange { .. } => {
+                Ok(empty_class_page())
+            }
         }
     }
 
@@ -612,6 +621,11 @@ impl<C: WriteConn> FactWrite<PostgresFactStore> for PostgresHandle<C> {
         let conn = self.conn.conn();
         let facets = facet_columns(&fact)?;
         let subjects = subject_rows(&fact);
+        // A region location writes a facts_spatial envelope, though it carries
+        // no clustering key. Read before fact_to_json, which consumes the fact.
+        let spatial = fact
+            .located_subject()
+            .map(|(location, subject)| (location.bounding_rects(), kind_tag(subject.kind())));
         let witness = witness_row(&fact);
         let fact_json = fact_to_json(fact)?;
         // A RetractCommit facet stores the target's surrogate seq; an unrecorded
@@ -656,12 +670,37 @@ impl<C: WriteConn> FactWrite<PostgresFactStore> for PostgresHandle<C> {
                 .await
                 .map_err(sql("inserting fact subject row"))?;
         }
-        // The facts_spatial insert is a later unit; witness,
-        // representative-log, and retraction maintenance run on the same
-        // connection as the staging, so a rejected submit's savepoint unwinds
-        // their rows with its fact rows. record_retraction runs last, after the
-        // fact + facets + subjects are visible, so its own component recompute
-        // (at the union bound) sees the staged retraction fact.
+        // A `Reference` / `Empty` / `Unbounded` location covers no rect, so a
+        // located fact with nothing to index writes no spatial row.
+        if let Some((rects, subject_kind)) = &spatial
+            && !rects.is_empty()
+        {
+            let mut lonmin: Vec<f64> = Vec::with_capacity(rects.len());
+            let mut latmin: Vec<f64> = Vec::with_capacity(rects.len());
+            let mut lonmax: Vec<f64> = Vec::with_capacity(rects.len());
+            let mut latmax: Vec<f64> = Vec::with_capacity(rects.len());
+            for rect in rects {
+                lonmin.push(rect.min_lon);
+                latmin.push(rect.min_lat);
+                lonmax.push(rect.max_lon);
+                latmax.push(rect.max_lat);
+            }
+            sqlx::query(queries::INSERT_SPATIAL)
+                .bind(fid_raw)
+                .bind(*subject_kind)
+                .bind(lonmin)
+                .bind(latmin)
+                .bind(lonmax)
+                .bind(latmax)
+                .execute(&mut *conn)
+                .await
+                .map_err(sql("inserting spatial envelope rows"))?;
+        }
+        // Witness, representative-log, and retraction maintenance run on the
+        // same connection as the staging, so a rejected submit's savepoint
+        // unwinds their rows with its fact rows. record_retraction runs last,
+        // after the fact + facets + subjects are visible, so its own component
+        // recompute (at the union bound) sees the staged retraction fact.
         if let Some(witness) = witness {
             maintain::record_witness(&mut *conn, fid_raw, witness).await?;
         }
