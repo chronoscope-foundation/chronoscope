@@ -87,6 +87,22 @@ impl<X: Ord + Clone> Label<X> {
         }
     }
 
+    /// Rewrite every atom through `f`, re-minimizing the result.
+    ///
+    /// The map can send two atoms to one, which can make an environment a subset
+    /// of another, so the antichain is rebuilt rather than carried over. A
+    /// producer retagging the atoms it consumed is the one caller.
+    pub(crate) fn map_atoms<Y: Ord + Clone>(self, f: impl Fn(X) -> Y) -> Label<Y> {
+        let envs: Vec<Environment<Y>> = self
+            .environments
+            .into_iter()
+            .map(|env| Environment(env.0.into_iter().map(&f).collect()))
+            .collect();
+        Label {
+            environments: minimize_environments(envs),
+        }
+    }
+
     /// Cross-union: each environment of `self` unioned with each of `other`,
     /// minimized back to an antichain. The multiplicative op — joint support.
     fn cross_union(&self, other: &Self) -> Self {

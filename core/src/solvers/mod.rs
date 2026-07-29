@@ -20,7 +20,6 @@ use chrono::NaiveDate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::algebra::lattice::JoinSemilattice;
 use crate::algebra::monoid::CommutativeMonoid;
 use crate::algebra::semiring::{Label, Semiring, Support};
 use crate::conflicts::{FactAtom, FactLineage, fact_date, is_construction_start};
@@ -29,7 +28,9 @@ use crate::grammar::assertions::FactualAssertion;
 use crate::grammar::bookend::DemolitionFact;
 use crate::grammar::ids::{FactId, IdScheme};
 use crate::nonempty::NonEmptyVec;
-use crate::projection::{self, Bracket, DerivationRule, Event, Premise, derived};
+use crate::projection::{
+    self, Bracket, DerivationRule, Event, Premise, derived, envelope, envelope_satisfies,
+};
 use crate::submit::StoredFact;
 
 /// An entity-level temporal contradiction: facts that can't jointly hold.
@@ -212,7 +213,7 @@ fn witness_floor(starts: &[(FactId, UncertainDate)]) -> Option<LifetimeBound> {
     if starts.is_empty() {
         return None;
     }
-    let envelope = UncertainDate::join_all(starts.iter().map(|(_, date)| date.clone()));
+    let envelope = envelope(starts.iter().map(|(_, date)| date));
     let instant = envelope.earliest()?;
     Some(LifetimeBound {
         instant,
@@ -228,7 +229,7 @@ fn witness_ceiling(completions: &[(FactId, UncertainDate)]) -> Option<LifetimeBo
     if completions.is_empty() {
         return None;
     }
-    let envelope = UncertainDate::join_all(completions.iter().map(|(_, date)| date.clone()));
+    let envelope = envelope(completions.iter().map(|(_, date)| date));
     let instant = envelope.latest()?;
     Some(LifetimeBound {
         instant,
@@ -318,15 +319,6 @@ fn event_endpoint_dates<R: IdScheme>(
         .into_iter()
         .flat_map(|slot| fact_atoms(&slot.extent.support))
         .filter_map(|atom| fact_date(&atom.fact).map(|date| (atom, date)))
-}
-
-/// ∃-satisfiability of a derived date constraint against a slot's asserted
-/// envelope: `derived ⊓ envelope ≠ ⊥`. Some hypothesis of the envelope can still
-/// hold under `derived`. Its unsatisfiable face (`!envelope_satisfies`) is a
-/// relational conflict — a witness that no bookend hypothesis admits; its
-/// satisfiable face is what an inference producer injects.
-fn envelope_satisfies(derived: &UncertainDate, envelope: &UncertainDate) -> bool {
-    derived.overlaps(envelope)
 }
 
 /// One end of the entity's lifetime window: the bounding instant, the asserted
@@ -684,6 +676,15 @@ mod tests {
     /// and waits for the narrowing rules that make the distinction observable.
     fn rules_in(support: &FactLineage<MemoryIds>) -> BTreeSet<DerivationRule> {
         support.atoms().filter_map(SupportAtom::rule).collect()
+    }
+
+    /// The facts a slot's rules read to reach its value — the evidence side of
+    /// the same support, which the claims a source made here sit apart from.
+    fn consumed_in(support: &FactLineage<MemoryIds>) -> BTreeSet<FactId> {
+        support
+            .atoms()
+            .filter_map(|atom| Some(Premise::consumed(atom)?.1.id))
+            .collect()
     }
 
     /// The fact id behind the projection's lone interior event's own date — the
@@ -1128,13 +1129,15 @@ mod tests {
             before(81)?,
             "the empty slot gains construction ≤ 81"
         );
-        let atoms: BTreeSet<FactId> = fact_atoms(&started.extent.support)
-            .map(|atom| atom.id)
-            .collect();
         assert_eq!(
-            atoms,
+            consumed_in(&started.extent.support),
             BTreeSet::from([witness]),
             "the derived bound rests on the witness fact alone"
+        );
+        assert_eq!(
+            fact_atoms(&started.extent.support).count(),
+            0,
+            "and on no claim about the start itself — no source made one"
         );
         assert_eq!(
             rules_in(&started.extent.support),
@@ -1154,27 +1157,27 @@ mod tests {
                 _ => None,
             })
             .ok_or("a constructed row")?;
+        let typed::Derivation::Inferred { rules, evidence } = &period.started.derivation else {
+            return Err("the inferred start is marked derived".into());
+        };
         assert_eq!(
-            period.started.derivation,
-            typed::Derivation::Inferred {
-                rules: NonEmptyVec::singleton(DerivationRule::ExistenceWitness)
-            },
+            rules.iter().copied().collect::<Vec<_>>(),
+            vec![DerivationRule::ExistenceWitness],
             "the inferred start is marked derived by the existence-witness rule"
+        );
+        assert_eq!(
+            evidence.len(),
+            1,
+            "the derivation cites the witness source it read"
         );
         assert_eq!(
             period.started.possible,
             before(81)?,
             "the inferred row carries the before-81 bound"
         );
-        assert_eq!(
-            period.started.facts,
-            vec![witness],
-            "the inferred row names the witness fact"
-        );
-        assert_eq!(
-            period.started.sources.len(),
-            1,
-            "the inferred row cites the witness source"
+        assert!(
+            period.started.facts.is_empty() && period.started.sources.is_empty(),
+            "no source claimed a start, so the row attributes none of its own"
         );
         Ok(())
     }
@@ -1204,11 +1207,8 @@ mod tests {
             before(81)?,
             "the event date floors the built-by bound"
         );
-        let atoms: BTreeSet<FactId> = fact_atoms(&started.extent.support)
-            .map(|atom| atom.id)
-            .collect();
         assert_eq!(
-            atoms,
+            consumed_in(&started.extent.support),
             BTreeSet::from([event_date]),
             "the bound rests on the event's date fact"
         );
@@ -1300,9 +1300,8 @@ mod tests {
         inject_derived_bounds::<MemoryIds>(&mut entity);
 
         let support = &entity.construction.started_at.extent.support;
-        let atoms: BTreeSet<FactId> = fact_atoms(support).map(|atom| atom.id).collect();
         assert_eq!(
-            atoms,
+            consumed_in(support),
             BTreeSet::from([witness, event_date]),
             "both witnesses tied at 81 bind the inferred bound"
         );

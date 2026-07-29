@@ -615,14 +615,20 @@ enum DateCell {
         value: UncertainDate,
         rivals: Vec<CiteEntry>,
     },
-    /// A bound no source asserted — one or more solver rules reached past what
-    /// the sources stated. The value reads inline in the muted sage tone; the
-    /// rules that reached it and the facts they consumed ride alongside for the
-    /// marker's popover, which phrases the claim from the rules themselves.
+    /// A bound one or more solver rules reached past what the sources stated.
+    /// The value reads inline in the muted sage tone; the rules and the evidence
+    /// they read ride alongside for the marker's popover, which phrases the claim
+    /// from the rules themselves.
+    ///
+    /// `sources` is what a source claimed about *this* row, which a rule that
+    /// narrowed an asserted bound leaves standing — so the row keeps its own
+    /// citation bullet beside the marker, and the marker's lines stay the
+    /// evidence the rule read about something else.
     Inferred {
         value: UncertainDate,
         rules: NonEmptyVec<DerivationRule>,
-        witnesses: Vec<CiteEntry>,
+        evidence: Vec<CiteEntry>,
+        sources: Vec<CiteEntry>,
     },
 }
 
@@ -871,34 +877,14 @@ fn date_display(bounded: Option<&Bounded<UncertainDate, ImageId>>) -> DateCell {
     let Some(b) = bounded else {
         return DateCell::Unknown;
     };
-    // An inferred bound outranks the consensus read: its value reaches past what
-    // any source stated, and the inferred marker owns the witnesses behind it, so
-    // the row shows no separate citation bullet.
-    if let Derivation::Inferred { rules } = &b.derivation {
-        // The witness lines cite the attested year `W` the source states; the
-        // bound itself rides on the cell's value, formatted at render.
-        let witnessed = b
-            .possible
-            .latest_bound()
-            .map(format_date_bound)
-            .unwrap_or_else(|| format_uncertain_date(&b.possible));
-        return DateCell::Inferred {
-            value: b.possible.clone(),
-            rules: rules.clone(),
-            witnesses: cite_entries(&witnessed, &b.sources),
-        };
-    }
-    match &b.consensus {
-        Consensus::Absent => DateCell::Unknown,
-        Consensus::Reached { .. } => DateCell::Settled {
-            value: b.possible.clone(),
-            sources: cite_entries(&format_uncertain_date(&b.possible), &b.sources),
-        },
-        Consensus::Pending { .. } => DateCell::Pending {
-            value: b.possible.clone(),
-            sources: cite_entries(&format_uncertain_date(&b.possible), &b.sources),
-        },
-        Consensus::Conflict { fighting } => {
+    // A conflict outranks an inferred bound, because a slot can now be both: a
+    // rule narrows one rival while the claim beside it stands, and the rivals'
+    // disagreement is the louder thing to say about the row. Reading the
+    // derivation first would render a live over-determination as a tidy derived
+    // value.
+    match (&b.consensus, &b.derivation) {
+        (Consensus::Absent, _) => DateCell::Unknown,
+        (Consensus::Conflict { fighting }, _) => {
             let rivals = distinct_rivals(fighting)
                 .into_iter()
                 .map(|rival| CiteEntry {
@@ -912,6 +898,22 @@ fn date_display(bounded: Option<&Bounded<UncertainDate, ImageId>>) -> DateCell {
                 rivals,
             }
         }
+        (_, Derivation::Inferred { rules, evidence }) => DateCell::Inferred {
+            value: b.possible.clone(),
+            rules: rules.clone(),
+            // The evidence lines cite the instant the rule bound at; the bound
+            // itself rides on the cell's value, formatted at render.
+            evidence: cite_entries(&inferred_edge(rules, &b.possible), evidence),
+            sources: cite_entries(&format_uncertain_date(&b.possible), &b.sources),
+        },
+        (Consensus::Pending { .. }, Derivation::Asserted) => DateCell::Pending {
+            value: b.possible.clone(),
+            sources: cite_entries(&format_uncertain_date(&b.possible), &b.sources),
+        },
+        (Consensus::Reached { .. }, Derivation::Asserted) => DateCell::Settled {
+            value: b.possible.clone(),
+            sources: cite_entries(&format_uncertain_date(&b.possible), &b.sources),
+        },
     }
 }
 
@@ -1228,28 +1230,31 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
     let existence = row.role == TransitionRole::KnownToExist;
     let inferred = matches!(&row.date, DateCell::Inferred { .. });
     // The bullet's meaning is the variant: agreeing sources (when any) read
-    // neutral, contested rivals read disputed; an inferred bound wears the marker
-    // instead, an unknown date carries nothing.
+    // neutral, contested rivals read disputed; an unknown date carries nothing.
+    // A narrowed bound wears the marker *and* keeps its bullet, since a source
+    // still dated it — a slot an inference filled outright has no sources and so
+    // shows the marker alone.
     let bullet = match &row.date {
-        DateCell::Settled { sources, .. } | DateCell::Pending { sources, .. } => {
-            (!sources.is_empty()).then(|| {
-                let lines = CitationLines::Sources(sources.clone());
-                view! { <CitationMarker lines=lines/> }
-            })
-        }
+        DateCell::Settled { sources, .. }
+        | DateCell::Pending { sources, .. }
+        | DateCell::Inferred { sources, .. } => (!sources.is_empty()).then(|| {
+            let lines = CitationLines::Sources(sources.clone());
+            view! { <CitationMarker lines=lines/> }
+        }),
         DateCell::Disputed { rivals, .. } => {
             let lines = CitationLines::Rivals(rivals.clone());
             Some(view! { <CitationMarker lines=lines/> })
         }
-        DateCell::Inferred { .. } | DateCell::Unknown => None,
+        DateCell::Unknown => None,
     };
     let inferred_marker = match &row.date {
         DateCell::Inferred {
             value,
             rules,
-            witnesses,
+            evidence,
+            ..
         } => Some(view! {
-            <InferredMarker value=value.clone() rules=rules.clone() witnesses=witnesses.clone()/>
+            <InferredMarker value=value.clone() rules=rules.clone() evidence=evidence.clone()/>
         }),
         _ => None,
     };
@@ -1949,14 +1954,14 @@ fn conflict_glyph_class(open: bool) -> String {
 /// An inferred marker: a solid sage disc beside the citation bullet on a row whose
 /// date one or more solver rules reached past what the sources stated. Tapping it
 /// opens a sage-toned [`Popover`] naming the claim those rules make, the reason
-/// they give for it, and the citations of the facts they consumed.
+/// they give for it, and the citations of the facts they read.
 #[component]
 fn InferredMarker(
     value: UncertainDate,
     rules: NonEmptyVec<DerivationRule>,
-    witnesses: Vec<CiteEntry>,
+    evidence: Vec<CiteEntry>,
 ) -> impl IntoView {
-    let (claim, reason) = inferred_text(&rules, &value);
+    let (claim, reasons) = inferred_text(&rules, &value);
     let aria_label = format!("inferred date, {claim}");
     let heading = format!("Inferred \u{00b7} {claim}");
 
@@ -1976,17 +1981,22 @@ fn InferredMarker(
                 // Clone the popover data into this reactive `Fn` body so it only
                 // borrows the captured values, rebuilding on each portal mount.
                 let heading = heading.clone();
-                let reason = reason.clone();
-                let witnesses = witnesses.clone();
+                let reasons = reasons.clone();
+                let evidence = evidence.clone();
                 view! {
                     <div class=header_class(PopoverTone::Inferred)>
                         <span>{heading}</span>
                     </div>
-                    <p class="px-3 py-2 font-serif text-sm text-body border-b border-sepia/15">
-                        {reason}
-                    </p>
+                    <div class="px-3 py-2 border-b border-sepia/15">
+                        {reasons
+                            .into_iter()
+                            .map(|reason| view! {
+                                <p class="font-serif text-sm text-body">{reason}</p>
+                            })
+                            .collect::<Vec<_>>()}
+                    </div>
                     <ul class="py-1 max-h-64 overflow-y-auto">
-                        {citation_entry_views(witnesses)}
+                        {citation_entry_views(evidence)}
                     </ul>
                 }
             }
@@ -1994,22 +2004,71 @@ fn InferredMarker(
     }
 }
 
-/// The claim a derived bound asserts and the evidence behind it, both phrased
-/// from the structured [`DerivationRule`]s and the bound's own value — a future
-/// locale layer swaps only these templates, and a new rule brings its own words.
+/// The edge a derived bound's lead rule moved, formatted — a cap reads the
+/// value's upper bound, a floor its lower one. It is the instant the claim and
+/// the evidence are both phrased against, so both read it from here.
 ///
-/// The lead rule names the claim; a chain of them wants a line each, which the
-/// panel can grow into once more than one rule exists.
-fn inferred_text(rules: &NonEmptyVec<DerivationRule>, value: &UncertainDate) -> (String, String) {
-    match rules.first() {
-        DerivationRule::ExistenceWitness => {
-            let w = value
-                .latest_bound()
-                .map(format_date_bound)
-                .unwrap_or_else(|| format_uncertain_date(value));
-            (format!("built by {w}"), format!("Recorded existing in {w}"))
+/// Only the rules that *set* the edge reach a slot's derivation, so the lead
+/// rule is one of them and the value's edge on its side is where it bound. A
+/// slot whose rivals disagree renders as contested instead, which is what keeps
+/// the joined extent's edge from standing in for a rule's.
+fn inferred_edge(rules: &NonEmptyVec<DerivationRule>, value: &UncertainDate) -> String {
+    let bound = match rules.first() {
+        DerivationRule::ExistenceWitness | DerivationRule::ConstructionBeforeDemolition => {
+            value.latest_bound()
         }
+        DerivationRule::DemolitionAfterWitness | DerivationRule::DemolitionAfterConstruction => {
+            value.earliest_bound()
+        }
+    };
+    bound
+        .map(format_date_bound)
+        .unwrap_or_else(|| format_uncertain_date(value))
+}
+
+/// What one rule claims about the bound it moved, and the reason it gives —
+/// both phrased from the structured [`DerivationRule`] and the edge it bound at,
+/// so a future locale layer swaps only these templates and a new rule brings its
+/// own words.
+fn rule_text(rule: DerivationRule, edge: &str) -> (String, String) {
+    match rule {
+        DerivationRule::ExistenceWitness => (
+            format!("built by {edge}"),
+            format!("Recorded existing in {edge}"),
+        ),
+        DerivationRule::DemolitionAfterWitness => (
+            format!("still standing in {edge}"),
+            format!("Recorded existing in {edge}"),
+        ),
+        DerivationRule::ConstructionBeforeDemolition => (
+            format!("built by {edge}"),
+            format!("Recorded removed by {edge}"),
+        ),
+        DerivationRule::DemolitionAfterConstruction => (
+            format!("still standing in {edge}"),
+            format!("Recorded built from {edge}"),
+        ),
     }
+}
+
+/// The claim a derived bound asserts, and a reason from each rule that reached
+/// it.
+///
+/// Only rules that *set* the bound reach a slot, and two of them land on the
+/// same instant, so they make one claim between them and each brings its own
+/// evidence sentence. Taking a single lead rule would leave the other's
+/// citations in the list with nothing accounting for them.
+fn inferred_text(
+    rules: &NonEmptyVec<DerivationRule>,
+    value: &UncertainDate,
+) -> (String, Vec<String>) {
+    let edge = inferred_edge(rules, value);
+    let (claim, _) = rule_text(*rules.first(), &edge);
+    let reasons = rules
+        .iter()
+        .map(|rule| rule_text(*rule, &edge).1)
+        .collect::<Vec<_>>();
+    (claim, reasons)
 }
 
 /// A one-sided derived bound as a compact inline value — "≤ W" when open below,
@@ -2129,7 +2188,107 @@ fn source_label(reference: &ExternalReference) -> Option<String> {
 mod tests {
     use chrono::Datelike;
 
-    use super::{ConflictPoint, ConflictRole, NaiveDate, conflict_brackets};
+    use chronoscope_core::grammar::citations::{Excerpt, FactualCitation};
+    use chronoscope_core::grammar::text::Text;
+    use chronoscope_core::nonempty::NonEmptyVec;
+    use chronoscope_core::typed::Attributed;
+
+    use super::{
+        Bounded, Citation, ConflictPoint, ConflictRole, Consensus, DateBound, DateCell,
+        DatePrecision, Derivation, DerivationRule, ExternalSource, NaiveDate, UncertainDate,
+        conflict_brackets, date_display,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// A citation distinguished by its source title, which is also the label a
+    /// popover line shows — so an assertion names what a reader would read.
+    fn cite(title: &str) -> Result<Citation<super::ImageId>, Box<dyn std::error::Error>> {
+        Ok(Citation::Factual {
+            citation: FactualCitation::new(
+                ExternalSource::Book {
+                    title: Text::new(title)?,
+                    isbn: None,
+                    page: None,
+                    published: None,
+                },
+                vec![Excerpt::new("source-text")?],
+            )?,
+        })
+    }
+
+    fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+        let bound = DateBound::new(
+            NaiveDate::from_ymd_opt(y, 1, 1).ok_or("valid date")?,
+            DatePrecision::Year,
+        )?;
+        Ok(UncertainDate::bounded(Some(bound), Some(bound))?)
+    }
+
+    /// A slot a rule narrowed and rival sources also over-determined. Both can
+    /// hold at once — a rule tightens one rival while its neighbour stands — so
+    /// the cell has to choose, and the disagreement is the louder fact.
+    #[test]
+    fn a_narrowed_slot_that_rivals_dispute_reads_disputed() -> TestResult {
+        let cell = date_display(Some(&Bounded {
+            possible: year(1940)?.join(&year(1900)?),
+            sources: vec![cite("A History of the Building")?],
+            facts: Vec::new(),
+            consensus: Consensus::Conflict {
+                fighting: vec![NonEmptyVec::singleton(Attributed {
+                    value: year(1900)?,
+                    sources: vec![cite("An Earlier Account")?],
+                })],
+            },
+            derivation: Derivation::Inferred {
+                rules: NonEmptyVec::singleton(DerivationRule::ConstructionBeforeDemolition),
+                evidence: vec![cite("The Demolition Register")?],
+            },
+        }));
+        assert!(
+            matches!(cell, DateCell::Disputed { .. }),
+            "an over-determined slot reads contested however it was narrowed, got {cell:?}"
+        );
+        Ok(())
+    }
+
+    /// A narrowed bound's two attributions land in two places: the rule's
+    /// evidence in the marker that phrases the rule's claim, the row's own source
+    /// in the ordinary citation bullet. Pooling them shows the removal's source
+    /// attesting a construction date it never gave.
+    #[test]
+    fn a_narrowed_bound_cites_its_evidence_apart_from_its_own_source() -> TestResult {
+        let cell = date_display(Some(&Bounded {
+            possible: year(1947)?,
+            sources: vec![cite("A History of the Building")?],
+            facts: Vec::new(),
+            consensus: Consensus::Reached { value: year(1947)? },
+            derivation: Derivation::Inferred {
+                rules: NonEmptyVec::singleton(DerivationRule::ConstructionBeforeDemolition),
+                evidence: vec![cite("The Demolition Register")?],
+            },
+        }));
+        let DateCell::Inferred {
+            evidence, sources, ..
+        } = &cell
+        else {
+            return Err(format!("a narrowed bound reads inferred, got {cell:?}").into());
+        };
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|e| e.source.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("The Demolition Register".to_string())],
+            "the marker names the removal the rule read, and nothing else"
+        );
+        assert_eq!(
+            sources.iter().map(|e| e.source.clone()).collect::<Vec<_>>(),
+            vec![Some("A History of the Building".to_string())],
+            "and the bullet keeps the source that dated the row"
+        );
+        Ok(())
+    }
 
     fn point(label: &str, ymd: (i32, u32, u32), role: ConflictRole) -> Option<ConflictPoint> {
         Some(ConflictPoint {

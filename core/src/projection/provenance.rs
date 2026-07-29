@@ -51,40 +51,77 @@ pub enum Citation<ImgId> {
 pub enum DerivationRule {
     /// `construction ≤ W`, because the entity was witnessed existing at `W`.
     ExistenceWitness,
+    /// `demolition ≥ W`, because the entity was witnessed existing at `W`.
+    DemolitionAfterWitness,
+    /// `construction ≤ D`, because a thing is built before it is removed.
+    ConstructionBeforeDemolition,
+    /// `demolition ≥ C`, because a thing is removed after it is built.
+    DemolitionAfterConstruction,
 }
 
-/// One reason a value holds: evidence a source supplied, or an inference step
-/// that participated in producing it.
+/// One reason a value holds: a source's claim on the value itself, an inference
+/// step that participated in producing it, or a fact that step consumed.
 ///
 /// A rule shares its environment with the facts it consumed, so "which rule used
 /// which evidence" is structural rather than a parallel field that can drift.
+/// [`Consumed`](Premise::Consumed) is what keeps that sharing readable: a rule
+/// bounding a construction against a removal leaves the removal's fact in the
+/// construction slot's support, and the atom says in which capacity it is there.
+/// Every reader that asks "what did a source claim *here*" — the fighting-rival
+/// reconstruction, the slot's citations and fact ids, the date a bookend fact
+/// contributes — reads [`Fact`](Premise::Fact), and the provenance read reaches
+/// for the rest.
 ///
 /// Erase for truth, read for provenance. A rule atom is an always-true
 /// indeterminate, not a retractable assumption: it can never be the retraction
 /// that repairs a contradiction. So anything reasoning about *what could be
 /// false* — nogoods, minimal fighting sets, which fact to blame — filters to
 /// [`Premise::Fact`] first, and only the provenance read looks at the rules.
+/// Retracting a consumed fact loosens the bound back to what the source stated
+/// rather than withdrawing a claim, so it too sits outside that filter.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Premise<F> {
-    /// A source's own claim.
+    /// A source's own claim on the value this supports.
     Fact(F),
     /// An inference step that participated.
     Rule(DerivationRule),
+    /// A fact an inference step consumed, riding the value its rule moved.
+    Consumed {
+        /// The rule that read it.
+        rule: DerivationRule,
+        /// The source's claim, about some other value.
+        fact: F,
+    },
 }
 
 impl<F> Premise<F> {
-    /// The evidence this premise carries, when it is evidence — the erasure a
-    /// truth-facing pass applies before reasoning about what could be false.
+    /// The claim this premise makes on the value it supports, when it makes one
+    /// — the erasure a truth-facing pass applies before reasoning about what
+    /// could be false.
     pub fn fact(&self) -> Option<&F> {
         match self {
             Premise::Fact(f) => Some(f),
-            Premise::Rule(_) => None,
+            Premise::Rule(_) | Premise::Consumed { .. } => None,
+        }
+    }
+
+    /// The evidence this premise carries and the rule that read it, when it is a
+    /// consumed fact.
+    pub fn consumed(&self) -> Option<(DerivationRule, &F)> {
+        match self {
+            Premise::Consumed { rule, fact } => Some((*rule, fact)),
+            Premise::Fact(_) | Premise::Rule(_) => None,
         }
     }
 }
 
 /// The support an inference emits: its rule joined with the evidence it
 /// consumed, in one environment.
+///
+/// The evidence is retagged [`Premise::Consumed`] on the way in. It rides the
+/// value the rule moved, which may be a slot a source also claimed into, and the
+/// tag is what tells the two apart there — so a removal that capped a
+/// construction cannot be read back as a rival construction date.
 ///
 /// A rule stamped onto evidence carrying no atoms yields the semiring zero, so a
 /// marker backed by nothing is unrepresentable here rather than left to producer
@@ -102,7 +139,33 @@ pub fn derived<F: Ord + Clone>(
     if evidence.atoms().next().is_none() {
         return Label::empty();
     }
-    Label::premise(Premise::Rule(rule)).times(evidence)
+    let consumed = evidence.map_atoms(|premise| match premise {
+        Premise::Fact(fact) => Premise::Consumed { rule, fact },
+        // A rule reading another rule's output keeps the inner attribution: the
+        // atom already says which step first read the source.
+        already @ (Premise::Rule(_) | Premise::Consumed { .. }) => already,
+    });
+    Label::premise(Premise::Rule(rule)).times(consumed)
+}
+
+/// Emitting a rule's stamp from a fold that is generic over its provenance.
+///
+/// The merge folds one entity over any `T: Semiring`, and the bounds propagation
+/// runs inside it, so a rule marker has to be reachable through the carrier
+/// rather than through a concrete label type.
+///
+/// Non-defaulting by design: a semiring that cannot name a rule says so by not
+/// implementing this. A default returning `one()` would let a producer stamp
+/// into a carrier that silently drops the marker.
+pub trait Stamp: Semiring {
+    /// This carrier's [`derived`] — the rule joined with the evidence it used.
+    fn stamp(rule: DerivationRule, evidence: Self) -> Self;
+}
+
+impl<F: Ord + Clone> Stamp for Label<Premise<F>> {
+    fn stamp(rule: DerivationRule, evidence: Self) -> Self {
+        derived(rule, evidence)
+    }
 }
 
 /// The member-aware lineage: a [`Label`] over citation atoms, each atom
@@ -142,7 +205,8 @@ mod tests {
     }
 
     /// The stamp joins the rule to the evidence in one environment, so both ride
-    /// the support the flatten reads.
+    /// the support the flatten reads — the evidence tagged as consumed, which is
+    /// what stops a slot's own reader from taking it for a claim made here.
     #[test]
     fn a_stamped_rule_rides_alongside_its_evidence() {
         let stamped = derived(
@@ -153,10 +217,17 @@ mod tests {
         assert_eq!(
             atoms,
             BTreeSet::from([
-                &Premise::Fact(7u8),
+                &Premise::Consumed {
+                    rule: DerivationRule::ExistenceWitness,
+                    fact: 7u8
+                },
                 &Premise::Rule(DerivationRule::ExistenceWitness),
             ]),
             "the support names the evidence and the rule that used it"
+        );
+        assert!(
+            stamped.atoms().all(|atom| atom.fact().is_none()),
+            "no atom here claims anything about the value the rule moved"
         );
     }
 }

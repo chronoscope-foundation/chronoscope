@@ -104,8 +104,11 @@ pub(crate) fn date_for_role<R: IdScheme>(
 /// bottomed out, not which facts' intervals are mutually disjoint.
 ///
 /// Reading it side-blind (started vs completed) is sound because the projection
-/// already sorts the facts by side — each routes to its own endpoint slot, so a
-/// slot's support holds one side only, and the caller is always inside one slot.
+/// sorts the facts by side — each claim routes to its own endpoint slot — and a
+/// fact an inference read about another slot arrives as
+/// [`Premise::Consumed`](crate::projection::Premise::Consumed), which the caller's
+/// [`date_premise`](crate::typed::SupportAtom::date_premise) never reaches. So a
+/// slot's support offers one side only, and the caller is always inside one slot.
 pub(crate) fn fact_date<R: IdScheme>(fact: &StoredFact<R>) -> Option<UncertainDate> {
     date_for_role(fact, |role| {
         matches!(role, DateRole::BookendBound | DateRole::EventDate)

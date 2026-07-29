@@ -12,6 +12,7 @@
 //! Conflict is read off the same structure: a restrictive field's consensus
 //! collapses to ⊥ under over-determination, surfaced through [`Slot::conflict`].
 
+mod bounds;
 mod bracket;
 pub mod claimed;
 mod merge;
@@ -20,10 +21,11 @@ pub(crate) mod replay;
 mod slot;
 mod types;
 
+pub(crate) use bounds::{envelope, envelope_satisfies};
 pub use bracket::{Bracket, ConsensusConflict, MAX_PROJECTED_LOCATION_CIRCLES};
 pub use claimed::Claimed;
 pub(crate) use merge::citation_of;
-pub use provenance::{Citation, Cited, DerivationRule, MemberLineage, Premise, derived};
+pub use provenance::{Citation, Cited, DerivationRule, MemberLineage, Premise, Stamp, derived};
 pub use slot::{FactMap, FactSet, Slot};
 pub use types::{
     Bookend, DepictionRecord, Entity, Event, GlueEdge, Image, NameKey, NameRecord, RegionRecord,
@@ -144,7 +146,7 @@ pub async fn project_entity<S, V, T>(
 where
     S: FactStore,
     V: EntityView<S> + EventView<S> + Sync,
-    T: Semiring + Clone,
+    T: Semiring + Clone + Stamp,
 {
     let class = view.entity_class(&entity_id).await?;
 

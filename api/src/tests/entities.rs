@@ -30,7 +30,6 @@ use chronoscope_core::grammar::image::{self, ImageMedium};
 use chronoscope_core::grammar::lifecycle::{LifetimeEventKind, PointKind};
 use chronoscope_core::lifespan::ExistenceState;
 use chronoscope_core::location::{Location, UnresolvedLocation};
-use chronoscope_core::nonempty::NonEmptyVec;
 use chronoscope_core::projection::DerivationRule;
 use chronoscope_core::solvers::TemporalConflictKind;
 use chronoscope_core::submit::{
@@ -866,14 +865,21 @@ async fn get_entity_infers_a_built_by_bound_from_an_existence_witness() -> TestR
         })
         .ok_or("expected an inferred construction entry in the timeline")?;
 
-    assert_eq!(
-        construction.started.derivation,
-        Derivation::Inferred {
-            rules: NonEmptyVec::singleton(DerivationRule::ExistenceWitness)
-        },
-        "the inferred start is marked derived, got {:?}",
-        construction.started.derivation
-    );
+    match &construction.started.derivation {
+        Derivation::Inferred { rules, evidence } => {
+            assert_eq!(
+                rules.iter().copied().collect::<Vec<_>>(),
+                vec![DerivationRule::ExistenceWitness],
+                "the inferred start is marked derived"
+            );
+            assert_eq!(
+                evidence.len(),
+                1,
+                "and cites the witness it read, over the wire"
+            );
+        }
+        other => return Err(format!("expected an inferred start, got {other:?}").into()),
+    }
     // "before 81": open below, topping out at the end of the witnessed year, so
     // the one-sided bound round-trips through the client.
     assert_eq!(
@@ -886,10 +892,9 @@ async fn get_entity_infers_a_built_by_bound_from_an_existence_witness() -> TestR
         NaiveDate::from_ymd_opt(81, 12, 31),
         "the built-by bound tops out at the end of the witnessed year"
     );
-    assert_eq!(
-        construction.started.facts.len(),
-        1,
-        "the inferred row names the witness fact"
+    assert!(
+        construction.started.facts.is_empty(),
+        "and names no fact of its own — no source claimed a construction start"
     );
     assert!(
         detail.temporal_conflicts.is_empty(),

@@ -33,8 +33,9 @@ use crate::lifespan::Lifespan;
 use crate::projection::Claimed;
 use crate::submit::StoredFact;
 
+use super::bounds::{self, Chain};
 use super::bracket::Bracket;
-use super::provenance::{Citation, Cited};
+use super::provenance::{Citation, Cited, Stamp};
 use super::types::{
     Bookend, DepictionRecord, Entity, Event, Image, NameKey, NameRecord, RegionRecord,
 };
@@ -89,6 +90,12 @@ pub(crate) fn event_reachers<R: IdScheme>(
 /// endpoint is a member (see [`same_space_target`]) — so a relationship drained
 /// through its target's backlinks lands on the source's projection, not as a
 /// self-loop on the target.
+///
+/// A [pre-pass](bounds::chain) over the same bag computes the class's ordering
+/// constraints first, and each bookend claim is narrowed against them on the way
+/// in. It runs here rather than over the projection because rivals are
+/// alternatives: by the time a slot has merged them, the per-assertion
+/// distinction a narrowing turns on is gone.
 pub(crate) fn project_facts<R: IdScheme, T>(
     facts: &BTreeMap<FactId, StoredFact<R>>,
     members: &BTreeSet<R::Entity>,
@@ -96,11 +103,12 @@ pub(crate) fn project_facts<R: IdScheme, T>(
     provenance: impl Fn(&FactId, &R::Entity, &StoredFact<R>) -> T,
 ) -> Entity<R::Entity, R::Event, R::Image, T>
 where
-    T: Semiring + Clone,
+    T: Semiring + Clone + Stamp,
 {
+    let chain = bounds::chain(facts, reachers, &provenance);
     facts
         .iter()
-        .map(|(fact_id, fact)| inject(fact_id, fact, members, reachers, &provenance))
+        .map(|(fact_id, fact)| inject(fact_id, fact, members, reachers, &chain, &provenance))
         .fold(
             <Entity<R::Entity, R::Event, R::Image, T> as CommutativeMonoid>::identity(),
             CommutativeMonoid::combine,
@@ -117,15 +125,22 @@ fn inject<R: IdScheme, T>(
     fact: &StoredFact<R>,
     members: &BTreeSet<R::Entity>,
     reachers: &BTreeMap<R::Event, R::Entity>,
+    chain: &Chain<T>,
     provenance: &impl Fn(&FactId, &R::Entity, &StoredFact<R>) -> T,
 ) -> Entity<R::Entity, R::Event, R::Image, T>
 where
-    T: Semiring + Clone,
+    T: Semiring + Clone + Stamp,
 {
     match fact {
-        StoredFact::Factual(f) => {
-            inject_factual(fact_id, &f.assertion, fact, members, reachers, provenance)
-        }
+        StoredFact::Factual(f) => inject_factual(
+            fact_id,
+            &f.assertion,
+            fact,
+            members,
+            reachers,
+            chain,
+            provenance,
+        ),
         StoredFact::Judgment(j) => {
             inject_judgment(fact_id, &j.assertion, fact, members, provenance)
         }
@@ -136,16 +151,23 @@ where
 /// A factual assertion's contribution. The source id is the fact's own subject
 /// entity for entity-level claims; for an interior event it is the one entity
 /// whose `HasEvent` owns the event.
+///
+/// A bookend claim meets the class's ordering constraints here, above both of
+/// its readers. The claim feeds the slot's [`Bracket`], which a bound is
+/// displayed from, and [`Lifespan`], which the served existence verdict folds;
+/// narrowing above the split is what keeps a tightened bound and a tightened
+/// render from disagreeing.
 fn inject_factual<R: IdScheme, T>(
     fact_id: &FactId,
     assertion: &FactualAssertion<R>,
     stored: &StoredFact<R>,
     members: &BTreeSet<R::Entity>,
     reachers: &BTreeMap<R::Event, R::Entity>,
+    chain: &Chain<T>,
     provenance: &impl Fn(&FactId, &R::Entity, &StoredFact<R>) -> T,
 ) -> Entity<R::Entity, R::Event, R::Image, T>
 where
-    T: Semiring + Clone,
+    T: Semiring + Clone + Stamp,
 {
     match assertion {
         FactualAssertion::Attribute { fact } => {
@@ -156,16 +178,26 @@ where
         }
         FactualAssertion::Construction { fact } => {
             let support = provenance(fact_id, fact.subject(), stored);
+            let narrowing = bounds::narrow_construction(chain, fact);
+            let (fact, support) = match narrowing.as_ref() {
+                Some((narrowed, stamp)) => (narrowed, support.times(stamp.clone())),
+                None => (fact, support),
+            };
             let mut entity = Entity::identity();
             inject_construction(fact, support, &mut entity.construction);
-            entity.lifespan = lifespan_contribution(assertion);
+            entity.lifespan = construction_lifespan(fact);
             entity
         }
         FactualAssertion::Demolition { fact } => {
             let support = provenance(fact_id, fact.subject(), stored);
+            let narrowing = bounds::narrow_demolition(chain, fact);
+            let (fact, support) = match narrowing.as_ref() {
+                Some((narrowed, stamp)) => (narrowed, support.times(stamp.clone())),
+                None => (fact, support),
+            };
             let mut entity = Entity::identity();
             inject_demolition(fact, support, &mut entity.demolition);
-            entity.lifespan = lifespan_contribution(assertion);
+            entity.lifespan = demolition_lifespan(fact);
             entity
         }
         FactualAssertion::Existence { fact } => {
@@ -174,7 +206,7 @@ where
             entity
                 .existence
                 .insert(fact.at.clone(), Cited { value: (), support });
-            entity.lifespan = lifespan_contribution(assertion);
+            entity.lifespan = Lifespan::witness(fact.at.clone());
             entity
         }
         FactualAssertion::Event { fact } => inject_event_fact(
@@ -183,7 +215,7 @@ where
             stored,
             reachers,
             provenance,
-            lifespan_contribution(assertion),
+            event_lifespan(fact),
         ),
         // A gap is an ordering relationship, not a single subject's field.
         FactualAssertion::Gap { .. } => Entity::identity(),
@@ -192,61 +224,71 @@ where
     }
 }
 
-/// The existence claim one factual assertion makes, as a singleton for the
-/// `lifespan` fold. The four bookend endpoints carry their own deny and affirm
-/// powers; an existence attestation and an interior event's date are pure
-/// witnesses. Every other assertion is silent about existence, so it folds as
-/// the identity.
-///
-/// Quantification is per *assertion*: two sources claiming different
-/// construction starts each deny their own past, and the later one wins the
-/// floor. That distinction is gone by the time the claims have merged into a
-/// bracket, which is why this rides the raw fact.
-///
-/// So a claim whose slot consensus came out empty still folds here, with full
-/// force — including the existence it guarantees, which can refute a demolition.
-/// Rivals are alternatives under this reading, not a joint claim to be
-/// reconciled: a disputed sighting is still a source saying the entity stood,
-/// and the render says so by contesting the instant rather than by deciding it.
-/// Dropping the losing side would be the fold quietly picking a winner.
-fn lifespan_contribution<R: IdScheme>(assertion: &FactualAssertion<R>) -> Lifespan {
-    match assertion {
-        FactualAssertion::Construction { fact } => match fact {
-            bookend::ConstructionFact::Started { bound, .. } => {
-                Lifespan::construction_started(bound.clone())
-            }
-            bookend::ConstructionFact::Completed { bound, .. } => {
-                Lifespan::construction_completed(bound.clone())
-            }
-            // Kept as a nested exhaustive match rather than one outer match with a
-            // trailing wildcard: a new dated fact variant is then a compile error
-            // here, not a silent fall-through to the identity.
-            bookend::ConstructionFact::Location { .. } => Lifespan::identity(),
-        },
-        FactualAssertion::Demolition { fact } => match fact {
-            bookend::DemolitionFact::Started { bound, .. } => {
-                Lifespan::demolition_started(bound.clone())
-            }
-            bookend::DemolitionFact::Completed { bound, .. } => {
-                Lifespan::demolition_completed(bound.clone())
-            }
-        },
-        FactualAssertion::Existence { fact } => Lifespan::witness(fact.at.clone()),
-        FactualAssertion::Event { fact } => match fact {
-            event::Fact::DurationalDate { bound, .. } | event::Fact::PointDate { bound, .. } => {
-                Lifespan::witness(bound.clone())
-            }
-            event::Fact::HasEvent { .. }
-            | event::Fact::MovedToLocation { .. }
-            | event::Fact::DamageCause { .. }
-            | event::Fact::MoveMethod { .. }
-            | event::Fact::UsageChange { .. }
-            | event::Fact::Designation { .. }
-            | event::Fact::Description { .. } => Lifespan::identity(),
-        },
-        FactualAssertion::Attribute { .. }
-        | FactualAssertion::Gap { .. }
-        | FactualAssertion::Image { .. } => Lifespan::identity(),
+// ============================================================================
+// Existence contributions
+//
+// The existence claim one factual assertion makes, as a singleton for the
+// `lifespan` fold. The four bookend endpoints carry their own deny and affirm
+// powers; an existence attestation and an interior event's date are pure
+// witnesses. Every other assertion is silent about existence, so it folds as the
+// identity — which the caller's own exhaustive match spells, so a new assertion
+// cluster is a compile error there.
+//
+// Quantification is per *assertion*: two sources claiming different construction
+// starts each deny their own past, and the later one wins the floor. That
+// distinction is gone by the time the claims have merged into a bracket, which
+// is why this rides the single fact.
+//
+// So a claim whose slot consensus came out empty still folds here, with full
+// force — including the existence it guarantees, which can refute a demolition.
+// Rivals are alternatives under this reading, not a joint claim to be
+// reconciled: a disputed sighting is still a source saying the entity stood, and
+// the render says so by contesting the instant rather than by deciding it.
+// Dropping the losing side would be the fold quietly picking a winner.
+// ============================================================================
+
+/// A construction endpoint's existence claim.
+fn construction_lifespan<R: IdScheme>(fact: &bookend::ConstructionFact<R>) -> Lifespan {
+    match fact {
+        bookend::ConstructionFact::Started { bound, .. } => {
+            Lifespan::construction_started(bound.clone())
+        }
+        bookend::ConstructionFact::Completed { bound, .. } => {
+            Lifespan::construction_completed(bound.clone())
+        }
+        // Kept as an exhaustive match rather than a trailing wildcard: a new
+        // dated fact variant is then a compile error here, not a silent
+        // fall-through to the identity.
+        bookend::ConstructionFact::Location { .. } => Lifespan::identity(),
+    }
+}
+
+/// A demolition endpoint's existence claim.
+fn demolition_lifespan<R: IdScheme>(fact: &bookend::DemolitionFact<R>) -> Lifespan {
+    match fact {
+        bookend::DemolitionFact::Started { bound, .. } => {
+            Lifespan::demolition_started(bound.clone())
+        }
+        bookend::DemolitionFact::Completed { bound, .. } => {
+            Lifespan::demolition_completed(bound.clone())
+        }
+    }
+}
+
+/// An interior event's existence claim — its date is a witness, since an event
+/// implies the entity was there for it.
+fn event_lifespan<R: IdScheme>(fact: &event::Fact<R>) -> Lifespan {
+    match fact {
+        event::Fact::DurationalDate { bound, .. } | event::Fact::PointDate { bound, .. } => {
+            Lifespan::witness(bound.clone())
+        }
+        event::Fact::HasEvent { .. }
+        | event::Fact::MovedToLocation { .. }
+        | event::Fact::DamageCause { .. }
+        | event::Fact::MoveMethod { .. }
+        | event::Fact::UsageChange { .. }
+        | event::Fact::Designation { .. }
+        | event::Fact::Description { .. } => Lifespan::identity(),
     }
 }
 

@@ -768,7 +768,11 @@ impl Lifespan {
     /// Whether the affirmed hull vouches for `at`. A hull crossed by `combine` —
     /// its lower edge past its upper — vouches for nothing, which is how a
     /// same-direction pair of open claims reads as empty.
-    fn affirms(&self, at: NaiveDate) -> bool {
+    ///
+    /// Visible to the crate because the bounds propagation's laws are stated
+    /// against these two channels directly: a narrowing may shrink what a claim
+    /// affirms and must leave what it denies alone.
+    pub(crate) fn affirms(&self, at: NaiveDate) -> bool {
         matches!(
             (self.earliest.anchor(), self.forward.affirmed.anchor()),
             (Some(lo), Some(hi)) if lo.resolve() <= at && at <= hi.resolve()
@@ -778,7 +782,7 @@ impl Lifespan {
     /// Whether an assertion rules existence at `at` impossible — the deny channel,
     /// which only a construction's earliest start and a demolition's latest
     /// completion feed.
-    fn denies(&self, at: NaiveDate) -> bool {
+    pub(crate) fn denies(&self, at: NaiveDate) -> bool {
         let before_every_start = self
             .forward
             .floor

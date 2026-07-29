@@ -7,7 +7,7 @@ use url::Url;
 
 use super::*;
 use crate::algebra::semiring::Support;
-use crate::date::{DatePrecision, UncertainDate};
+use crate::date::{DateBound, DatePrecision, UncertainDate};
 use crate::grammar::assertions::{
     FactualAssertion, JudgmentAssertion, MetaAssertion, RetractionReason,
 };
@@ -2563,6 +2563,499 @@ async fn project_entity_images_walks_every_image_once_across_pages() -> TestResu
         seen,
         BTreeSet::from([img0, img1]),
         "the cursor walk covers every depicting image exactly once"
+    );
+    Ok(())
+}
+
+// ------------------------------------------------------------------
+// Bounds propagation — the ordering chain, narrowed above both readers
+//
+// These are the plumbing cases, not the mechanism. What a narrowing may and may
+// not do to a claim is stated as laws over generated claim sets in
+// `projection::bounds`; what reaches which reader is not visible from there and
+// is asserted here, over real committed facts.
+//
+// The three readers each get their own case, because each is a separate wire
+// and any one of them can be left unconnected: `Lifespan` feeds the served
+// existence verdict, the bracket feeds the displayed bound and its derivation,
+// and the fact ids and citations feed the row's attribution and its conflict
+// matching.
+// ------------------------------------------------------------------
+
+/// A whole decade, e.g. "the 1940s".
+fn decade_date(year: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+    Ok(UncertainDate::with_precision(
+        chrono::NaiveDate::from_ymd_opt(year, 1, 1).ok_or("date")?,
+        DatePrecision::Decade,
+    )?)
+}
+
+/// A year-precision bound, for building a claim's edges by hand.
+fn year_bound(year: i32) -> Result<DateBound, Box<dyn std::error::Error>> {
+    Ok(DateBound::new(
+        chrono::NaiveDate::from_ymd_opt(year, 1, 1).ok_or("date")?,
+        DatePrecision::Year,
+    )?)
+}
+
+/// A closed year span `[lo, hi]` — a circa-tightened claim like "~1945".
+fn span_date(lo: i32, hi: i32) -> Result<UncertainDate, Box<dyn std::error::Error>> {
+    Ok(UncertainDate::bounded(
+        Some(year_bound(lo)?),
+        Some(year_bound(hi)?),
+    )?)
+}
+
+/// The bookend builders take their source url, so a narrowed slot's own
+/// attribution and the evidence its rule read stay distinguishable in the
+/// flatten — with one shared citation they collapse and the two would compare
+/// equal whichever way the reader partitioned them.
+fn construction_started_over(
+    entity_idx: usize,
+    bound: UncertainDate,
+    source: &str,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: bookend::ConstructionFact::Started {
+                entity: EntityIdx(entity_idx),
+                bound,
+            },
+        },
+        citation: factual_at(source)?,
+    })
+}
+
+fn demolition_completed_over(
+    entity_idx: usize,
+    bound: UncertainDate,
+    source: &str,
+) -> Result<SubmitFact, Box<dyn std::error::Error>> {
+    Ok(SubmitFact::Factual {
+        assertion: FactualAssertion::Demolition {
+            fact: bookend::DemolitionFact::Completed {
+                entity: EntityIdx(entity_idx),
+                bound,
+            },
+        },
+        citation: factual_at(source)?,
+    })
+}
+
+/// Commit `facts` about a single entity and project it over `fact_lineage` —
+/// the citation-level projection a displayed bound and the conflict passes read.
+async fn cited_projection(
+    facts: Vec<SubmitFact>,
+) -> Result<
+    (
+        EquivClass<MemEntId>,
+        Entity<MemEntId, MemEvtId, MemImgId, crate::conflicts::FactLineage<MemoryIds>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let store = MemoryFactStore::new();
+    let result = submit(&store, 1, facts).await?;
+    let id = result.entities.get(&EntityIdx(0)).ok_or("entity 0")?.id;
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    Ok(
+        project_entity::<MemoryFactStore, _, _>(&mut view, id, crate::conflicts::fact_lineage)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .ok_or("known id should project")?,
+    )
+}
+
+/// The flattened construction period — where a displayed start bound and its
+/// derivation are read from.
+fn constructed_period(
+    typed: &crate::typed::Entity<MemEntId, MemEvtId, MemImgId>,
+) -> Option<&crate::typed::Period<MemImgId>> {
+    typed
+        .timeline
+        .events()
+        .iter()
+        .find_map(|event| match &event.detail {
+            crate::typed::EventDetail::Constructed { period, .. } => Some(period),
+            _ => None,
+        })
+}
+
+/// The flattened demolition period.
+fn demolished_period(
+    typed: &crate::typed::Entity<MemEntId, MemEvtId, MemImgId>,
+) -> Option<&crate::typed::Period<MemImgId>> {
+    typed
+        .timeline
+        .events()
+        .iter()
+        .find_map(|event| match &event.detail {
+            crate::typed::EventDetail::Demolished { period } => Some(period),
+            _ => None,
+        })
+}
+
+/// The rules and evidence citations a flattened slot's derivation records.
+type InferredBy = (Vec<DerivationRule>, Vec<Citation<MemImgId>>);
+
+fn inferred_by(
+    bound: &crate::typed::Bounded<UncertainDate, MemImgId>,
+) -> Result<InferredBy, Box<dyn std::error::Error>> {
+    match &bound.derivation {
+        crate::typed::Derivation::Inferred { rules, evidence } => {
+            Ok((rules.iter().copied().collect(), evidence.clone()))
+        }
+        crate::typed::Derivation::Asserted => Err("the slot reads asserted".into()),
+    }
+}
+
+/// Row 9: overlapping circa dates leave no overrun fringe. The raw "1940s"
+/// reaches 1949, three years past the latest completion anyone claims, so the
+/// hull affirms a stretch the demolition denies and the render shows a contested
+/// tail nothing in the record disputes. Capping the construction at the removal
+/// closes it, and P12 — circa overlap is solid green — becomes assertable
+/// end to end for the first time.
+///
+/// The narrowing has to reach the served verdict, not only the displayed bound:
+/// it is applied above the split, and this is the reader that would miss it.
+#[tokio::test]
+async fn a_construction_overrunning_its_demolition_is_capped_at_the_removal() -> TestResult {
+    let lifespan = lifespan_of(vec![
+        construction_started_over(0, decade_date(1940)?, "https://example.com/built")?,
+        demolition_completed_over(0, span_date(1943, 1947)?, "https://example.com/razed")?,
+    ])
+    .await?;
+
+    assert_eq!(
+        lifespan.classify(day(1945, 6, 1)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(
+        lifespan.classify(day(1947, 12, 31)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(
+        lifespan.classify(day(1948, 1, 1)?),
+        ExistenceState::Absent,
+        "the capped construction no longer affirms past the removal"
+    );
+    assert_eq!(
+        lifespan.classify(day(1949, 12, 31)?),
+        ExistenceState::Absent,
+        "the raw decade's tail is gone, fringe and all"
+    );
+    assert_eq!(
+        lifespan.classify(day(1939, 12, 31)?),
+        ExistenceState::Absent
+    );
+    Ok(())
+}
+
+/// The narrowed slot carries the mark on the display side: the construction
+/// bound reads inferred, names the rule that moved it, and keeps each edge at
+/// the precision of the claim that set it — the decade's own lower edge, the
+/// completion's year on top.
+///
+/// A narrowing folded in alongside the asserted claim rather than replacing it
+/// would join the two extents back to the raw decade and lose the stamp with it.
+///
+/// The slot's own attribution and the rule's evidence are asserted apart. Both
+/// facts ride this support, and conflating them shows the removal's source
+/// attesting a construction date it never gave, and hands the removal's fact id
+/// to a row that is not the removal's.
+#[tokio::test]
+async fn a_capped_construction_reads_inferred_and_cites_the_two_sides_apart() -> TestResult {
+    let (class, entity) = cited_projection(vec![
+        construction_started_over(0, decade_date(1940)?, "https://example.com/built")?,
+        demolition_completed_over(0, span_date(1943, 1947)?, "https://example.com/razed")?,
+    ])
+    .await?;
+
+    let capped = UncertainDate::bounded(
+        Some(DateBound::new(
+            chrono::NaiveDate::from_ymd_opt(1940, 1, 1).ok_or("date")?,
+            DatePrecision::Decade,
+        )?),
+        Some(year_bound(1947)?),
+    )?;
+    assert_eq!(
+        entity.construction.started_at.extent.value, capped,
+        "the start is capped at the removal, each edge at its own claim's precision"
+    );
+
+    let typed = crate::typed::Entity::parse(&entity, &class);
+    let period = constructed_period(&typed).ok_or("a constructed row")?;
+    let (rules, evidence) = inferred_by(&period.started)?;
+    assert_eq!(
+        rules,
+        vec![DerivationRule::ConstructionBeforeDemolition],
+        "the capped start is marked derived by the ordering rule"
+    );
+    assert_eq!(
+        evidence,
+        vec![Citation::Factual {
+            citation: factual_at("https://example.com/razed")?
+        }],
+        "and names the removal it read, and nothing else"
+    );
+    assert_eq!(
+        period.started.sources,
+        vec![Citation::Factual {
+            citation: factual_at("https://example.com/built")?
+        }],
+        "the row's own attribution stays the source that dated the construction"
+    );
+
+    let demolished = demolished_period(&typed).ok_or("a demolished row")?;
+    let shared: Vec<&FactId> = period
+        .started
+        .facts
+        .iter()
+        .filter(|id| demolished.completed.facts.contains(id))
+        .collect();
+    assert!(
+        shared.is_empty(),
+        "and its fact ids stay its own, so a conflict on the removal cannot \
+         reach this row: {shared:?}"
+    );
+    Ok(())
+}
+
+/// The cap reads the *latest* completion claimed, not the earliest. Rival
+/// removals at 1950 and 1960 deny from 1950 — denial takes any one rival — but a
+/// construction reaching 1955 contradicts neither on its own, and capping it at
+/// the deny ceiling would assert an ordering no single source supports.
+#[tokio::test]
+async fn the_cap_reads_the_latest_completion_claimed_not_the_deny_ceiling() -> TestResult {
+    let (class, entity) = cited_projection(vec![
+        construction_started_over(0, span_date(1940, 1955)?, "https://example.com/built")?,
+        demolition_completed_fact(0, 1950)?,
+        demolition_completed_over(0, year_date(1960)?, "https://example.com/razed-late")?,
+    ])
+    .await?;
+
+    assert_eq!(
+        entity.construction.started_at.extent.value,
+        span_date(1940, 1955)?,
+        "the construction sits inside the rivals' envelope, so nothing caps it"
+    );
+    let typed = crate::typed::Entity::parse(&entity, &class);
+    let period = constructed_period(&typed).ok_or("a constructed row")?;
+    assert_eq!(
+        period.started.derivation,
+        crate::typed::Derivation::Asserted,
+        "reading the deny ceiling instead would cap the start at 1950 and mark it inferred"
+    );
+    Ok(())
+}
+
+/// A sighting floors the removal, and the render moves with it. "Demolished in
+/// the 1890s" affirms from 1890 on its own, so a 1895 photograph leaves 1892
+/// reading as confirmed existence off the back of a removal claim that was never
+/// that precise. Flooring the removal at the sighting hands 1892 back to
+/// "no evidence", which is what the record actually says.
+#[tokio::test]
+async fn a_sighting_floors_the_removal_and_moves_the_render() -> TestResult {
+    let lifespan = lifespan_of(vec![
+        demolition_completed_over(0, decade_date(1890)?, "https://example.com/razed")?,
+        existence_fact(0, 1895)?,
+    ])
+    .await?;
+
+    assert_eq!(
+        lifespan.classify(day(1892, 6, 1)?),
+        ExistenceState::Unknown,
+        "the removal no longer affirms the years before the sighting"
+    );
+    assert_eq!(
+        lifespan.classify(day(1895, 6, 1)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(
+        lifespan.classify(day(1899, 12, 31)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(lifespan.classify(day(1900, 1, 1)?), ExistenceState::Absent);
+    Ok(())
+}
+
+/// The floored removal carries its own mark on the display side, and cites the
+/// sighting as the evidence rather than as a claim about the removal's date.
+#[tokio::test]
+async fn a_floored_removal_reads_inferred_and_cites_the_sighting_as_evidence() -> TestResult {
+    let (class, entity) = cited_projection(vec![
+        demolition_completed_over(0, decade_date(1890)?, "https://example.com/razed")?,
+        existence_fact(0, 1895)?,
+    ])
+    .await?;
+
+    let floored = UncertainDate::bounded(
+        Some(year_bound(1895)?),
+        Some(DateBound::new(
+            chrono::NaiveDate::from_ymd_opt(1890, 1, 1).ok_or("date")?,
+            DatePrecision::Decade,
+        )?),
+    )?;
+    assert_eq!(
+        entity.demolition.completed_at.extent.value, floored,
+        "the sighting raises the removal's lower edge and leaves its upper one alone"
+    );
+
+    let typed = crate::typed::Entity::parse(&entity, &class);
+    let period = demolished_period(&typed).ok_or("a demolished row")?;
+    let (rules, evidence) = inferred_by(&period.completed)?;
+    assert_eq!(
+        rules,
+        vec![DerivationRule::DemolitionAfterWitness],
+        "the floored completion is marked derived by the witness rule"
+    );
+    assert_eq!(
+        evidence,
+        vec![Citation::Factual {
+            citation: sample_citation()?
+        }],
+        "the sighting is what the rule read"
+    );
+    assert_eq!(
+        period.completed.sources,
+        vec![Citation::Factual {
+            citation: factual_at("https://example.com/razed")?
+        }],
+        "and the row still attributes its date to the source that claimed it"
+    );
+    Ok(())
+}
+
+/// The death-side dual of the overrun fringe: a removal whose range dips below
+/// the construction floor affirms years the construction denies, and no detector
+/// of any kind reports it. Flooring the removal at the construction closes it.
+#[tokio::test]
+async fn a_removal_dipping_below_the_construction_is_floored_at_it() -> TestResult {
+    let lifespan = lifespan_of(vec![
+        construction_started_fact(0, 1946)?,
+        demolition_completed_over(0, span_date(1940, 1950)?, "https://example.com/razed")?,
+    ])
+    .await?;
+
+    assert_eq!(
+        lifespan.classify(day(1943, 6, 1)?),
+        ExistenceState::Absent,
+        "the removal no longer affirms the years before the entity was built"
+    );
+    assert_eq!(
+        lifespan.classify(day(1946, 6, 1)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(
+        lifespan.classify(day(1950, 12, 31)?),
+        ExistenceState::Uncontested
+    );
+    assert_eq!(lifespan.classify(day(1951, 1, 1)?), ExistenceState::Absent);
+    Ok(())
+}
+
+/// Row 4 — a photograph outliving the removal it contradicts. The derived
+/// "removed no earlier than 2019" inverts a completion claimed for 1950, and
+/// propagating it would empty that claim: an emptied completion names no instant,
+/// so it denies nothing and nothing can outlive it. The contested era, the
+/// refuted tail and the conflict would all go at once, which is why this asserts
+/// all three and runs every rule together.
+#[tokio::test]
+async fn a_sighting_past_a_removal_keeps_its_era_its_tail_and_its_conflict() -> TestResult {
+    let (_, entity) = cited_projection(vec![
+        construction_started_fact(0, 1900)?,
+        demolition_completed_fact(0, 1950)?,
+        existence_fact(0, 2019)?,
+    ])
+    .await?;
+
+    assert_eq!(
+        entity.demolition.completed_at.extent.value,
+        year_date(1950)?,
+        "the unsatisfiable face is left to the conflict channel, not propagated"
+    );
+    assert_eq!(
+        entity.lifespan.classify(day(1975, 1, 1)?),
+        ExistenceState::Contested,
+        "the era between the removal and the photograph stays a live disagreement"
+    );
+    assert_eq!(
+        entity.lifespan.classify(day(2500, 1, 1)?),
+        ExistenceState::Contested,
+        "the photograph still refutes the removal, so the tail never settles to absent"
+    );
+    assert_eq!(
+        crate::solvers::temporal_conflicts::<MemoryIds>(&entity).len(),
+        1,
+        "the witness-past-removal contradiction still surfaces"
+    );
+    Ok(())
+}
+
+/// Rival removals are alternatives, so a sighting between them narrows each one
+/// on its own terms: the later claim is floored at the sighting, and the earlier
+/// one — which the sighting contradicts outright — is left for the conflict
+/// channel. Flooring the slot instead would empty that rival, taking the removal
+/// it claims off the record along with the disputed era the two claims mark out.
+#[tokio::test]
+async fn a_sighting_between_rival_removals_narrows_each_one_on_its_own() -> TestResult {
+    let (_, entity) = cited_projection(vec![
+        demolition_completed_over(0, span_date(1940, 1950)?, "https://example.com/razed-early")?,
+        demolition_completed_over(0, span_date(1953, 1965)?, "https://example.com/razed-late")?,
+        existence_fact(0, 1955)?,
+    ])
+    .await?;
+
+    assert_eq!(
+        entity.demolition.completed_at.extent.value,
+        span_date(1940, 1950)?.join(&span_date(1955, 1965)?),
+        "the reachable rival is floored at the sighting, the contradicted one stands"
+    );
+    assert_eq!(
+        entity.lifespan.classify(day(1945, 6, 1)?),
+        ExistenceState::Uncontested,
+        "the contradicted rival still affirms the years it claims"
+    );
+    assert_eq!(
+        entity.lifespan.classify(day(1955, 6, 1)?),
+        ExistenceState::Contested,
+        "the disputed era between the two claims survives"
+    );
+    assert_eq!(
+        entity.lifespan.classify(day(1966, 1, 1)?),
+        ExistenceState::Absent,
+        "the later rival accounts for the sighting, so nothing is refuted"
+    );
+    Ok(())
+}
+
+/// A narrowed slot's rivals are the claims sources made about it. Two
+/// construction starts that cannot both hold — 1900 and "the 1940s" — fight each
+/// other; the removal that caps the decade rides the same support as the
+/// evidence behind that cap, and reading it as a third rival would put a removal
+/// date on a construction row's disagreement.
+#[tokio::test]
+async fn a_capped_construction_disputes_only_the_starts_claimed_for_it() -> TestResult {
+    let (class, entity) = cited_projection(vec![
+        construction_started_over(0, decade_date(1940)?, "https://example.com/built-late")?,
+        construction_started_over(0, year_date(1900)?, "https://example.com/built-early")?,
+        demolition_completed_over(0, span_date(1943, 1947)?, "https://example.com/razed")?,
+    ])
+    .await?;
+
+    let typed = crate::typed::Entity::parse(&entity, &class);
+    let period = constructed_period(&typed).ok_or("a constructed row")?;
+    let crate::typed::Consensus::Conflict { fighting } = &period.started.consensus else {
+        return Err("the two starts over-determine the slot".into());
+    };
+    let rivals: Vec<UncertainDate> = crate::typed::distinct_rivals(fighting)
+        .into_iter()
+        .map(|rival| rival.value.clone())
+        .collect();
+    assert_eq!(
+        rivals,
+        vec![year_date(1900)?, decade_date(1940)?],
+        "the two starts are the whole disagreement — the removal is evidence a \
+         rule read, not a claim about when the building went up"
     );
     Ok(())
 }

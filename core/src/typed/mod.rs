@@ -49,15 +49,27 @@ pub struct Attributed<V, ImgId> {
 /// How a value came to hold. Every value is derived; a source's own claim is
 /// derived by the trivial step [`Asserted`](Derivation::Asserted) names, and
 /// anything reaching past what a source stated names the rules that took it
-/// there. The rules' witnesses ride in the slot's own `sources`/`facts`/value, so
-/// the variants stay lean and don't duplicate them.
+/// there.
+///
+/// A rule reads facts about *other* values — a removal, to bound a construction
+/// — so its evidence rides here rather than in the slot's own
+/// `sources`/`facts`, which stay what sources claimed about this value. A slot
+/// an inference filled outright has evidence and no sources; one an inference
+/// narrowed has both, and a reader that conflated them would show a source
+/// attesting a claim it never made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Derivation {
+#[serde(bound(deserialize = "ImgId: ::serde::de::DeserializeOwned"))]
+pub enum Derivation<ImgId> {
     /// Every premise behind this value is a source's own claim.
     Asserted,
     /// One or more inference rules participated in producing it.
-    Inferred { rules: NonEmptyVec<DerivationRule> },
+    Inferred {
+        /// The rules that set the value, each on its own account.
+        rules: NonEmptyVec<DerivationRule>,
+        /// The citations of the facts those rules read.
+        evidence: Vec<Citation<ImgId>>,
+    },
 }
 
 /// The `T`-flattened mirror of the projection's [`Bracket`], for any lattice
@@ -70,21 +82,24 @@ pub enum Derivation {
 pub struct Bounded<V, ImgId> {
     /// The extent (join) — what any source allows, in the field's own lattice.
     pub possible: V,
+    /// The citations of the claims sources made about this value. Evidence an
+    /// inference read about some *other* value rides `derivation` instead.
     pub sources: Vec<Citation<ImgId>>,
-    /// The fact ids backing the extent — the provenance-by-id complement to
+    /// The fact ids of those claims — the provenance-by-id complement to
     /// `sources`. A consumer correlates a slot across fields by shared id: a
     /// timeline row matches an entity-level
     /// [`TemporalConflict`](crate::solvers::TemporalConflict) when a fact id here
-    /// rides its `facts`. Empty when the support carries no fact ids (a
-    /// member-lineage read).
+    /// rides its `facts`, which is why an inference's evidence stays out of it —
+    /// a removal that capped a construction would otherwise mark the
+    /// construction row with the removal's conflicts. Empty when the support
+    /// carries no fact ids (a member-lineage read).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub facts: Vec<FactId>,
     pub consensus: Consensus<V, ImgId>,
     /// How the value above came to hold — a source's own claim, or the inference
-    /// rules that reached past one. The value, citations, and facts are the
-    /// derivation's witnesses; a reader shows the bound inline and tags an
-    /// inferred one.
-    pub derivation: Derivation,
+    /// rules that reached past one, carrying the evidence they read. A reader
+    /// shows the bound inline and tags an inferred one.
+    pub derivation: Derivation<ImgId>,
 }
 
 impl<X: Ord, ImgId> Bounded<Claimed<X>, ImgId> {
@@ -214,7 +229,14 @@ pub struct Depiction<OtherId, ImgId> {
 pub trait SupportAtom {
     /// The image id the atom's citation references.
     type Img;
+    /// The citation this atom attributes to a claim about the value it supports.
     fn citation(&self) -> Option<Citation<Self::Img>>;
+
+    /// The citation this atom attributes to evidence an inference read about
+    /// some other value. Absent for every atom that is a claim about this one.
+    fn evidence(&self) -> Option<Citation<Self::Img>> {
+        None
+    }
 
     /// The fact id this atom names, when it carries one. Absent for an atom that
     /// rode only a member id.
@@ -242,12 +264,17 @@ impl<EntId, ImgId: Clone> SupportAtom for (EntId, Citation<ImgId>) {
     }
 }
 
-/// A premise reads as whatever it wraps: evidence delegates to the fact atom, a
-/// rule warrants no citation and names no fact — it records only itself.
+/// A premise reads as whatever it wraps: a claim delegates to the fact atom, a
+/// rule warrants no citation and names no fact — it records only itself — and a
+/// consumed fact answers only the evidence question, so nothing a rule read
+/// about another value is taken for a claim about this one.
 impl<F: SupportAtom> SupportAtom for Premise<F> {
     type Img = F::Img;
     fn citation(&self) -> Option<Citation<Self::Img>> {
         self.fact()?.citation()
+    }
+    fn evidence(&self) -> Option<Citation<Self::Img>> {
+        self.consumed()?.1.citation()
     }
     fn fact_id(&self) -> Option<FactId> {
         self.fact()?.fact_id()
@@ -257,7 +284,7 @@ impl<F: SupportAtom> SupportAtom for Premise<F> {
     }
     fn rule(&self) -> Option<DerivationRule> {
         match self {
-            Premise::Fact(_) => None,
+            Premise::Fact(_) | Premise::Consumed { .. } => None,
             Premise::Rule(r) => Some(*r),
         }
     }
@@ -300,8 +327,8 @@ pub(super) struct Provenance<ImgId> {
     /// The fact ids the atoms name, deduped and ordered — the provenance-by-id
     /// mirror of `sources`. Empty for a member-lineage support.
     facts: Vec<FactId>,
-    /// How the value came to hold: the rules the atoms record, or
-    /// [`Derivation::Asserted`] when none do.
+    /// How the value came to hold: the rules the atoms record and the evidence
+    /// they read, or [`Derivation::Asserted`] when no rule participated.
     ///
     /// The read is existential — *any* rule atom means inferred — which is sound
     /// because a rule stamps itself only when it created or changed the claim. A
@@ -309,7 +336,7 @@ pub(super) struct Provenance<ImgId> {
     /// since the narrowed claim is the one setting the extent's edge. Zero
     /// support carries no atoms, so an untouched slot reads asserted without a
     /// special case.
-    derivation: Derivation,
+    derivation: Derivation<ImgId>,
 }
 
 /// The three provenance readings of one support, taken in a single walk of its
@@ -328,13 +355,18 @@ where
     let mut sources: BTreeSet<Citation<X::Img>> = BTreeSet::new();
     let mut facts: BTreeSet<FactId> = BTreeSet::new();
     let mut rules: BTreeSet<DerivationRule> = BTreeSet::new();
+    let mut evidence: BTreeSet<Citation<X::Img>> = BTreeSet::new();
     for atom in support.atoms() {
         sources.extend(atom.citation());
         facts.extend(atom.fact_id());
         rules.extend(atom.rule());
+        evidence.extend(atom.evidence());
     }
     let derivation = match NonEmptyVec::try_from_vec(rules.into_iter().collect()) {
-        Ok(rules) => Derivation::Inferred { rules },
+        Ok(rules) => Derivation::Inferred {
+            rules,
+            evidence: evidence.into_iter().collect(),
+        },
         Err(_) => Derivation::Asserted,
     };
     Provenance {
@@ -384,9 +416,10 @@ where
     } = provenance(&b.extent.support);
 
     // Producer-only invariants the bracket types leave loose: a present field
-    // cites at least one fact, and a settled consensus sits below the extent.
+    // rests on a cited fact — its own sources, or the evidence an inference read
+    // to fill it — and a settled consensus sits below the extent.
     debug_assert!(
-        !sources.is_empty(),
+        !sources.is_empty() || matches!(derivation, Derivation::Inferred { .. }),
         "a present field's extent support must cite a fact"
     );
     if let Consensus::Reached { value } = &consensus {
@@ -962,22 +995,27 @@ mod tests {
                 year(1947)?,
                 derived(DerivationRule::ExistenceWitness, evidence),
             )
-            .combine(sibling),
+            .combine(sibling.clone()),
         );
         assert_eq!(
             stamped.derivation,
             Derivation::Inferred {
-                rules: NonEmptyVec::singleton(DerivationRule::ExistenceWitness)
+                rules: NonEmptyVec::singleton(DerivationRule::ExistenceWitness),
+                evidence: vec![factual("https://a")?],
             },
-            "a rule on one claim marks the slot, though the sibling names none"
+            "a rule on one claim marks the slot and names what it read, though \
+             the sibling names none"
         );
         assert_eq!(
-            stamped.facts, plain.facts,
-            "the rule atom adds no fact to the slot's provenance"
+            stamped.facts,
+            bracket(&sibling).facts,
+            "the slot's own facts are the sibling's claim alone — the fact the \
+             rule read is evidence about another value"
         );
         assert_eq!(
-            stamped.sources, plain.sources,
-            "the rule atom warrants no citation of its own"
+            stamped.sources,
+            bracket(&sibling).sources,
+            "and its citations likewise, so no source is shown attesting this value"
         );
         Ok(())
     }
