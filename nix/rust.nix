@@ -137,9 +137,14 @@ let
   # path — but a short pname is cheap insurance.
   postgres-smoke = craneLib.cargoTest (
     checkArgs
+    // testExtraEnv
     // {
       pname = "pg-smoke";
-      cargoTestExtraArgs = "-p chronoscope-db --features postgres postgres::";
+      # No name filter: a `postgres::` prefix would silently exclude any future
+      # feature-gated test placed outside that module path. Running the crate's
+      # whole suite under the feature costs the sqlite cases a second run and
+      # needs nobody to remember a convention.
+      cargoTestExtraArgs = "-p chronoscope-db --features postgres";
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ postgresWithPostgis ];
     }
   );
