@@ -333,6 +333,32 @@ pub(crate) async fn fresh_pg_store() -> Result<(PostgresFactStore, ()), Box<dyn 
     fresh_pg_store_with(None).await
 }
 
+/// A connection URL for a fresh database in the shared cluster that no migration
+/// has ever run against. The template clone is skipped on purpose: this is the
+/// shape of a database somebody pointed the fact store at by mistake, and it
+/// exercises the constructors the way a deployment reaches them, through a
+/// connection string rather than a handed-over pool.
+pub(crate) async fn fresh_unmigrated_database_url() -> Result<String, Box<dyn std::error::Error>> {
+    let cluster = shared_cluster().await?;
+    let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dbname = format!("cf_bare_{n}");
+    let mut admin = connect_one(&cluster.socket_path, "postgres").await?;
+    sqlx::query(&format!("CREATE DATABASE \"{dbname}\""))
+        .execute(&mut admin)
+        .await
+        .map_err(|source| PgHarnessError::Sqlx {
+            context: "creating an unmigrated database",
+            source,
+        })?;
+    close(admin).await;
+    // The socket directory goes in the `host` query parameter, sqlx's spelling
+    // for a unix-socket connection; a leading `/` is what makes it a socket path.
+    Ok(format!(
+        "postgres:///?dbname={dbname}&host={}&user=postgres",
+        cluster.socket_path.display()
+    ))
+}
+
 /// Like [`fresh_pg_store`], but the per-test database carries a session default
 /// `default_transaction_isolation` of `iso`, so every connection the pool opens
 /// begins its transactions there unless a statement overrides them. Lets a test

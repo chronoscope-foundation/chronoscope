@@ -6,6 +6,12 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Lets `build-db` load a live Postgres fact store as well as a SQLite artifact.
+# Off by default: the nix facts-DB builds produce SQLite artifacts, and enabling
+# this pulls sqlx's postgres driver in.
+postgres = ["chronoscope-db/postgres"]
+
 [dependencies]
 chronoscope-core = { path = "../core" }
 chronoscope-integrations = { path = "../integrations" }

@@ -218,6 +218,11 @@ async fn open_facts(source: &FactsDbSource) -> chronoscope_db::DbResult<ServerFa
 /// which doubles as the way to point the dev server at a real database and
 /// reproduce something production-shaped; base+overlay layering is a SQLite
 /// construction, so a mounted source fails with a message saying as much.
+///
+/// A writable source migrates, matching the SQLite twin, whose scratch overlay
+/// is created and migrated on open: the dev server is handed a scratch database
+/// it owns, and requiring a separate loader run before it could serve would be
+/// friction with nothing to protect.
 #[cfg(feature = "postgres")]
 async fn open_facts(source: &FactsDbSource) -> chronoscope_db::DbResult<ServerFactStore> {
     match source {
@@ -225,7 +230,7 @@ async fn open_facts(source: &FactsDbSource) -> chronoscope_db::DbResult<ServerFa
             "the Postgres fact store connects to a URL, so the mounted SQLite artifact at \
              {base} has no meaning here; pass FactsDbSource::Writable with a connection URL"
         ))),
-        FactsDbSource::Writable(url) => ServerFactStore::open(url).await,
+        FactsDbSource::Writable(url) => ServerFactStore::connect_and_migrate(url).await,
     }
 }
 

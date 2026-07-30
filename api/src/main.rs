@@ -59,9 +59,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ))
     .await?;
     // Postgres: one writable database, so the configured location is a
-    // connection URL and `open` migrates it on the way up.
+    // connection URL. `connect` requires a schema `ingest build-db` already
+    // migrated, so a location naming the wrong database fails at boot instead of
+    // growing a fact schema there.
     #[cfg(feature = "postgres")]
-    let facts = ServerFactStore::open(config.facts_database.as_str()).await?;
+    let facts = ServerFactStore::connect(config.facts_database.as_str()).await?;
     let image_media = Arc::new(std::collections::HashMap::new());
 
     // Keep a handle to the fact store for graceful shutdown; the copy handed to

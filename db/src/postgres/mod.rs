@@ -108,7 +108,7 @@ pub struct PostgresFactStore {
 /// views, not concurrent queries: an in-flight HTTP read holds its connection
 /// until the handler returns. The number is a headroom judgment, not a measured
 /// one. Postgres ships `max_connections = 100`, so 32 leaves room for a second
-/// instance, the migration advisory lock, and admin sessions. Lifting the
+/// instance, a concurrent loader's migration, and admin sessions. Lifting the
 /// ceiling for real means making reads stateless so a view stops pinning a
 /// connection.
 const POOL_MAX_CONNECTIONS: u32 = 32;
@@ -119,35 +119,57 @@ const POOL_MAX_CONNECTIONS: u32 = 32;
 /// operator can read while sqlx's 30s default outlives most client timeouts.
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The fact schema's migrations, embedded at compile time. One source for both
+/// constructors below: the loader applies them, the server checks them.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations-postgres/facts");
+
 impl PostgresFactStore {
     /// Wrap a pool over an already-migrated fact-store database. Crate-internal
-    /// because the migration precondition is unenforced; [`Self::open`]
-    /// establishes it.
+    /// because the migration precondition is unenforced; [`Self::connect`] and
+    /// [`Self::connect_and_migrate`] establish it.
     pub(crate) fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    /// Connect to the fact-store database at `url`, migrate it, and hand back
-    /// the store over the new pool.
+    /// Connect to a fact-store database that already carries the schema, and
+    /// hand back the store over the new pool.
     ///
-    /// Migrating at open keeps the schema with the code that reads it. sqlx
-    /// wraps the run in a Postgres advisory lock, so instances booting at once
-    /// serialize on it and exactly one applies each migration. The first
+    /// The serving path. Creating the schema is a deliberate act
+    /// ([`Self::connect_and_migrate`]) because a fact-store location is one
+    /// mistyped environment variable away from the app database, which is also a
+    /// Postgres URL: connecting must never leave the fact tables and the
+    /// `PostGIS` extension behind in whatever database it named.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Config`](crate::DbError::Config) if the database
+    /// carries no fact schema or one older than this binary's migrations, and
+    /// [`DbError`](crate::DbError) if the connection fails.
+    pub async fn connect(url: &str) -> crate::DbResult<Self> {
+        let pool = connect_pool(url).await?;
+        if let Err(absent) = require_migrated(&pool).await {
+            // Drop the pool inside the caller's runtime, so its connections end
+            // their server sessions before the refusal propagates.
+            pool.close().await;
+            return Err(absent);
+        }
+        Ok(Self::new(pool))
+    }
+
+    /// Connect to the fact-store database at `url`, apply the fact schema's
+    /// migrations, and hand back the store over the new pool.
+    ///
+    /// The loading path, and the only place the fact schema comes into
+    /// existence. sqlx wraps the run in a Postgres advisory lock, so concurrent
+    /// loaders serialize on it and exactly one applies each migration. The first
     /// application creates the `PostGIS` extension, which needs a role
     /// privileged to do so.
     ///
     /// # Errors
     /// Returns [`DbError`](crate::DbError) if the connection or a migration
     /// fails.
-    pub async fn open(url: &str) -> crate::DbResult<Self> {
-        let pool = PgPoolOptions::new()
-            .max_connections(POOL_MAX_CONNECTIONS)
-            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-            .connect(url)
-            .await?;
-        sqlx::migrate!("./migrations-postgres/facts")
-            .run(&pool)
-            .await?;
+    pub async fn connect_and_migrate(url: &str) -> crate::DbResult<Self> {
+        let pool = connect_pool(url).await?;
+        MIGRATOR.run(&pool).await?;
         Ok(Self::new(pool))
     }
 
@@ -162,6 +184,58 @@ impl PostgresFactStore {
     pub async fn close(&self) {
         self.pool.close().await;
     }
+}
+
+/// The fact-store pool, shared by both constructors so a store's connection
+/// budget doesn't depend on which one built it.
+async fn connect_pool(url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(POOL_MAX_CONNECTIONS)
+        .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        .connect(url)
+        .await
+}
+
+/// Refuse a database that this binary's migrations have not all been applied to.
+///
+/// The two refusals read differently on purpose: an absent ledger means the
+/// location is not a fact store at all (a typo, or the app database), while a
+/// partial one means the schema is behind the code about to query it.
+async fn require_migrated(pool: &PgPool) -> crate::DbResult<()> {
+    // to_regclass answers NULL for an absent relation, where a regclass cast
+    // would raise, so the "never migrated" case stays a value rather than an
+    // error to pattern-match. Unqualified, so it resolves down the same
+    // search_path the migrator writes through.
+    let (ledger,): (bool,) = sqlx::query_as("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(pool)
+        .await?;
+    if !ledger {
+        return Err(crate::DbError::Config(
+            "the fact-store database carries no schema. The server connects to a \
+             fact store that has already been migrated; create the schema with \
+             `ingest build-db`, and check the configured location names the \
+             fact-store database rather than the app one"
+                .to_owned(),
+        ));
+    }
+    let applied: Vec<(i64,)> = sqlx::query_as("SELECT version FROM _sqlx_migrations WHERE success")
+        .fetch_all(pool)
+        .await?;
+    let applied: std::collections::BTreeSet<i64> = applied.into_iter().map(|(v,)| v).collect();
+    let missing: Vec<String> = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .filter(|version| !applied.contains(version))
+        .map(|version| version.to_string())
+        .collect();
+    if !missing.is_empty() {
+        return Err(crate::DbError::Config(format!(
+            "the fact-store database's schema is older than this binary: migrations {} \
+             are unapplied. Run `ingest build-db` against it to bring the schema forward",
+            missing.join(", "),
+        )));
+    }
+    Ok(())
 }
 
 // ============================================================================

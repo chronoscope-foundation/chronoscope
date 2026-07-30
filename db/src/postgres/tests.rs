@@ -7,7 +7,9 @@
 //! Nothing is ignored here beyond the suite-wide `SameEvent` cases the macro
 //! bakes in.
 
-use super::harness::{fresh_pg_store, fresh_pg_store_at_default_isolation};
+use super::harness::{
+    fresh_pg_store, fresh_pg_store_at_default_isolation, fresh_unmigrated_database_url,
+};
 use super::{PostgresFactStore, PostgresFactStoreError};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlImageId};
 use chronoscope_core::grammar::ids::FactId;
@@ -35,6 +37,56 @@ impl RefusalKinds for PostgresFactStore {
 }
 
 chronoscope_core::fact_store_conformance!(fresh_pg_store());
+
+/// The serving constructor must refuse a database with no fact schema and leave
+/// it untouched. A fact-store location is one mistyped environment variable away
+/// from another database — the app one, also a Postgres URL — and the cost of
+/// getting this wrong is a whole fact schema plus `PostGIS` created inside it.
+#[tokio::test]
+async fn connect_refuses_an_unmigrated_database_and_creates_nothing_in_it() -> TestResult {
+    use sqlx::Connection;
+
+    let url = fresh_unmigrated_database_url().await?;
+    let refusal = match PostgresFactStore::connect(&url).await {
+        Err(crate::DbError::Config(message)) => message,
+        Err(other) => return Err(format!("expected a schema refusal, got: {other}").into()),
+        Ok(store) => {
+            store.close().await;
+            return Err("connect must refuse a database carrying no fact schema".into());
+        }
+    };
+    assert!(
+        refusal.contains("no schema"),
+        "the refusal must say the schema is absent, got: {refusal}"
+    );
+
+    let mut conn = sqlx::PgConnection::connect(&url).await?;
+    let (created,): (bool,) = sqlx::query_as(
+        "SELECT to_regclass('facts') IS NOT NULL \
+          OR EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'postgis')",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    conn.close().await?;
+    assert!(
+        !created,
+        "a refused connect must leave no fact tables and no PostGIS extension behind"
+    );
+    Ok(())
+}
+
+/// The pair closes: what the loader's migrating constructor prepares is exactly
+/// what the serving one accepts, so the split costs a deployment nothing beyond
+/// running the loader first.
+#[tokio::test]
+async fn connect_accepts_a_database_the_migrating_constructor_prepared() -> TestResult {
+    let url = fresh_unmigrated_database_url().await?;
+    let loader = PostgresFactStore::connect_and_migrate(&url).await?;
+    loader.close().await;
+    let server = PostgresFactStore::connect(&url).await?;
+    server.close().await;
+    Ok(())
+}
 
 /// `PostGIS` loaded in a fresh store's database (via the template's
 /// `CREATE EXTENSION postgis`), reachable over the cluster's unix socket.

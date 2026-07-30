@@ -1,13 +1,15 @@
 //! Chronoscope ingestion CLI.
 //!
-//! `build-db`: load a filtered Wikidata entities JSONL dump into a SQLite fact
-//! store. The dump-filter tooling (`fetch`, `resolve-types`, `filter`) lives in
+//! `build-db`: load a filtered Wikidata entities JSONL dump into a fact store —
+//! a SQLite artifact, or (with the `postgres` feature) a live Postgres database.
+//! The dump-filter tooling (`fetch`, `resolve-types`, `filter`) lives in
 //! `chronoscope-integrations`' `wikidata-dump` binary, which stays free of
 //! core/db.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chronoscope_core::grammar::ids::IngesterRunId;
 use chronoscope_core::store::FactStore;
 use chronoscope_ingestion::wikidata::commits::IngestStats;
 
@@ -27,17 +29,19 @@ fn parse_recorded_at(s: &str) -> std::result::Result<chrono::DateTime<chrono::Ut
 
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Load a Wikidata entities JSONL dump into a SQLite fact store.
+    /// Load a Wikidata entities JSONL dump into a fact store.
     ///
-    /// Streams the input in batches, submitting one commit per entity to the
-    /// on-disk store under a single ingester run.
+    /// Streams the input in batches, submitting one commit per entity under a
+    /// single ingester run. A `postgres://` URL loads a live database, creating
+    /// the fact schema if it isn't there yet; anything else builds a SQLite
+    /// artifact and stamps it once the load succeeds.
     BuildDb {
         /// Input entities JSONL, one entity per line
         #[arg(short, long)]
         input: PathBuf,
 
-        /// Fact-store database URL for the persistent artifact (e.g.
-        /// `sqlite:facts.db`)
+        /// Where the facts go: `sqlite:facts.db` for a SQLite artifact, or
+        /// `postgres://...` for a live Postgres fact store
         #[arg(long)]
         database_url: String,
 
@@ -87,7 +91,26 @@ async fn run(cli: Cli) -> Result<()> {
 // BUILD DB
 // =============================================================================
 
-/// Stream a Wikidata entities JSONL dump into a SQLite fact store.
+/// Which fact store `--database-url` names. Parsed once, here at the CLI
+/// boundary, so the backend is a decided thing everywhere below.
+enum Backend {
+    /// A SQLite facts artifact — a path, or a `sqlite:` URL.
+    Sqlite,
+    /// A live Postgres database, under either libpq URL spelling.
+    Postgres,
+}
+
+impl Backend {
+    fn of(database_url: &str) -> Self {
+        if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
+            Self::Postgres
+        } else {
+            Self::Sqlite
+        }
+    }
+}
+
+/// Stream a Wikidata entities JSONL dump into the fact store the URL names.
 ///
 /// The dump is millions of entities, so it's read line by line and submitted
 /// in batches rather than materialized into one `Vec`. Every commit carries the
@@ -99,24 +122,20 @@ async fn cmd_build_db(
     recorded_at: chrono::DateTime<chrono::Utc>,
     limit: Option<u64>,
 ) -> Result<()> {
-    use chronoscope_core::grammar::ids::IngesterRunId;
-    use chronoscope_db::FactStoreLocations;
-
-    // `open` creates+migrates the facts file (the artifact), then attaches it
-    // as `ovl` for the ingest writes — the two-file layout, with a throwaway
-    // in-memory `main` since the ingest touches no app tables. The codec
-    // stamp comes AFTER a successful ingest (`build_and_stamp`), so an
-    // interrupted build leaves the file unstamped and consumers reject it.
-    let store = chronoscope_db::SqliteFactStore::open(FactStoreLocations::standalone(database_url))
-        .await
-        .with_context(|| format!("opening fact store at {database_url}"))?;
     let run = IngesterRunId::new("wikidata-dump")?;
-
-    // Tear the pool down inside the runtime whatever the outcome, so
-    // SpatiaLite's dlclose stays off the process-exit path even on error.
-    let result = build_and_stamp(&store, input, &run, recorded_at, limit).await;
-    store.close().await;
-    let stats = result?;
+    let stats = match Backend::of(database_url) {
+        Backend::Sqlite => {
+            build_sqlite_artifact(input, database_url, &run, recorded_at, limit).await?
+        }
+        #[cfg(feature = "postgres")]
+        Backend::Postgres => load_postgres(input, database_url, &run, recorded_at, limit).await?,
+        #[cfg(not(feature = "postgres"))]
+        Backend::Postgres => bail!(
+            "this `ingest` was built without the `postgres` feature, so it can only write a \
+             SQLite facts artifact; rebuild it with `--features postgres` to load a Postgres \
+             fact store"
+        ),
+    };
 
     eprintln!(
         "Ingested {} entities across {} commits ({} facts, {} skipped, {} failed, {} issues)",
@@ -125,29 +144,93 @@ async fn cmd_build_db(
     Ok(())
 }
 
-/// Ingest the dump, then stamp the finished artifact with the facts codec
-/// version — the certificate of a completed build that `validate_facts_file`
-/// and the dev mount require. Stamping only on success means an interrupted
-/// or failed ingest leaves an unstamped partial DB that both reject.
+/// Build the SQLite artifact: ingest the dump into the facts file, then stamp
+/// the finished file with the facts codec version — the certificate of a
+/// completed build that `validate_facts_file` and the dev mount require.
 ///
-/// A run that dropped records is such a failure: [`DumpTally::into_stats`]
-/// refuses before the stamp, so an under-ingested DB never passes for a
-/// finished one.
-async fn build_and_stamp(
-    store: &chronoscope_db::SqliteFactStore,
+/// `open` creates+migrates the facts file, then attaches it as `ovl` for the
+/// ingest writes — the two-file layout, with a throwaway in-memory `main` since
+/// the ingest touches no app tables. Stamping only on success means an
+/// interrupted or failed ingest leaves an unstamped partial file that consumers
+/// reject; a run that dropped records is such a failure, since [`ingest_dump`]
+/// refuses before the stamp.
+async fn build_sqlite_artifact(
     input: &Path,
-    run: &chronoscope_core::grammar::ids::IngesterRunId,
+    database_url: &str,
+    run: &IngesterRunId,
     recorded_at: chrono::DateTime<chrono::Utc>,
     limit: Option<u64>,
 ) -> Result<IngestStats> {
-    let stats = ingest_jsonl(store, input, run, recorded_at, limit)
-        .await?
-        .into_stats()?;
+    let store = chronoscope_db::SqliteFactStore::open(
+        chronoscope_db::FactStoreLocations::standalone(database_url),
+    )
+    .await
+    .with_context(|| format!("opening fact store at {database_url}"))?;
+
+    // Tear the pool down inside the runtime whatever the outcome, so
+    // SpatiaLite's dlclose stays off the process-exit path even on error.
+    let result = ingest_and_stamp(&store, input, run, recorded_at, limit).await;
+    store.close().await;
+    result
+}
+
+/// The stamped half of the SQLite build, split out so the store closes on the
+/// error path too.
+async fn ingest_and_stamp(
+    store: &chronoscope_db::SqliteFactStore,
+    input: &Path,
+    run: &IngesterRunId,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+    limit: Option<u64>,
+) -> Result<IngestStats> {
+    let stats = ingest_dump(store, input, run, recorded_at, limit).await?;
     store
         .stamp_codec_version()
         .await
         .context("stamping facts codec version")?;
     Ok(stats)
+}
+
+/// Load the dump into a live Postgres fact store, migrating the schema into
+/// place — the deliberate creating step the server's connect-only path leaves to
+/// this loader.
+///
+/// No codec stamp: it certifies a finished immutable artifact, and a database
+/// goes on taking writes. Nothing certifies a Postgres load either, because
+/// nothing has to: a partial load is a smaller corpus rather than a broken one,
+/// and re-running resumes it — commits content-address, so a second pass at the
+/// same `recorded_at` finds every commit it already made.
+#[cfg(feature = "postgres")]
+async fn load_postgres(
+    input: &Path,
+    database_url: &str,
+    run: &IngesterRunId,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+    limit: Option<u64>,
+) -> Result<IngestStats> {
+    // A Postgres URL can carry a password, so the context names the store rather
+    // than the location.
+    let store = chronoscope_db::PostgresFactStore::connect_and_migrate(database_url)
+        .await
+        .context("opening the Postgres fact store")?;
+    let result = ingest_dump(&store, input, run, recorded_at, limit).await;
+    store.close().await;
+    result
+}
+
+/// Stream the dump into `store` and yield the tally of a load worth keeping.
+/// Generic over the backend, so what differs between them is only what a caller
+/// does with a finished load.
+async fn ingest_dump<S: FactStore>(
+    store: &S,
+    input: &Path,
+    run: &IngesterRunId,
+    recorded_at: chrono::DateTime<chrono::Utc>,
+    limit: Option<u64>,
+) -> Result<IngestStats> {
+    ingest_jsonl(store, input, run, recorded_at, limit)
+        .await?
+        .into_stats()
 }
 
 /// What one pass over the dump produced: the entity-level tally, plus the lines
@@ -163,9 +246,10 @@ struct DumpTally {
 impl DumpTally {
     /// The tally of a build worth keeping, or an error naming what was lost.
     ///
-    /// The only way to the stats, so a run that dropped records can't reach the
-    /// codec stamp: downstream, an under-ingested DB is indistinguishable from
-    /// a complete one, and these builds run where nobody is watching stdout.
+    /// The only way to the stats, so a run that dropped records reaches neither
+    /// the codec stamp nor a zero exit: downstream, an under-ingested store is
+    /// indistinguishable from a complete one, and these loads run where nobody
+    /// is watching stdout.
     ///
     /// What it gates on is dump integrity. A value the fact store can't hold
     /// costs its own image or reference and is tallied as an issue, so it
@@ -174,9 +258,10 @@ impl DumpTally {
     fn into_stats(self) -> Result<IngestStats> {
         if self.malformed_lines > 0 || self.entities.failed > 0 {
             bail!(
-                "run completed but the build is not valid — unparseable dump lines: {}, \
+                "run completed but the load is not valid — unparseable dump lines: {}, \
                  entities that failed to build: {}. Each was logged above with its line \
-                 number or QID; the artifact is left unstamped, so fix them and rebuild.",
+                 number or QID; fix them and re-run. A SQLite artifact from this run stays \
+                 unstamped, so its consumers reject it.",
                 self.malformed_lines,
                 self.entities.failed,
             );
@@ -186,8 +271,6 @@ impl DumpTally {
 }
 
 /// Stream the JSONL dump into `store` in batches, stopping at `limit` entities.
-/// Split out from `cmd_build_db` so the caller can close the store on any
-/// error path, not just success.
 ///
 /// Per-record failures accumulate into the returned tally instead of ending the
 /// pass: aborting on the first bad line means an hour of ingest per record
@@ -196,7 +279,7 @@ impl DumpTally {
 async fn ingest_jsonl<S: FactStore>(
     store: &S,
     input: &Path,
-    run: &chronoscope_core::grammar::ids::IngesterRunId,
+    run: &IngesterRunId,
     recorded_at: chrono::DateTime<chrono::Utc>,
     limit: Option<u64>,
 ) -> Result<DumpTally> {
@@ -264,10 +347,10 @@ async fn ingest_jsonl<S: FactStore>(
 /// per-batch tally into the running total.
 async fn ingest_batch<S: FactStore>(
     store: &S,
-    run: &chronoscope_core::grammar::ids::IngesterRunId,
+    run: &IngesterRunId,
     recorded_at: chrono::DateTime<chrono::Utc>,
     batch: &mut Vec<chronoscope_integrations::wikidata::WikidataEntity>,
-    stats: &mut chronoscope_ingestion::wikidata::commits::IngestStats,
+    stats: &mut IngestStats,
 ) -> Result<()> {
     use chronoscope_ingestion::wikidata::commits::ingest_entities;
 

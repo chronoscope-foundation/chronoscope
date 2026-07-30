@@ -155,7 +155,8 @@ pub struct Config {
     /// and read by whichever backend [`ServerFactStore`] names: SQLite pins it
     /// as the frozen read-only base (a completed, codec-stamped build) beneath
     /// a fresh writable overlay, so it is validated rather than created or
-    /// migrated; Postgres connects to it as a URL and migrates on open.
+    /// migrated; Postgres connects to it as a URL whose schema `ingest build-db`
+    /// has already migrated.
     pub facts_database: FactsDatabase,
 
     /// `WebAuthn` Relying Party ID (e.g., "chronoscope.io")
