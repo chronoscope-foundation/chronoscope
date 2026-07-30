@@ -27,6 +27,11 @@ default = []
 # Enable to record VCR fixtures instead of reading from cache
 record-fixtures = []
 browser-tests = []
+# Follow the api server onto the Postgres fact-store backend. The dev server
+# runs SQLite in practice; this exists because cargo unifies features across a
+# workspace build, so `dev` has to keep compiling when something else turns the
+# api crate's `postgres` on.
+postgres = ["chronoscope-api/postgres"]
 
 [dependencies]
 # API crate (provides AppState, Config, JwtConfig, register_api)

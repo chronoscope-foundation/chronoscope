@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
-use chronoscope_api::state::{AppState, Config, ServerFactStore, ServerIds};
+use chronoscope_api::state::{AppState, Config, FactsDatabase, ServerFactStore, ServerIds};
 use chronoscope_core::submit::{Commit, commit_facts};
+#[cfg(not(feature = "postgres"))]
 use chronoscope_db::FactStoreLocations;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId};
@@ -193,6 +194,39 @@ pub enum FactsDbSource {
     /// URL-fetch harness's empty scratch file. Nothing stages facts into it; it
     /// only has to exist and carry the fact schema.
     Writable(String),
+}
+
+/// Open the dev server's fact store from its configured source. The store owns
+/// its pool (a throwaway in-memory `main` plus the fact-store layers): a
+/// mounted source pins the base read-only+immutable beneath a fresh writable
+/// overlay scratch, and a writable source is that overlay alone, created and
+/// migrated if absent.
+#[cfg(not(feature = "postgres"))]
+async fn open_facts(source: &FactsDbSource) -> chronoscope_db::DbResult<ServerFactStore> {
+    match source {
+        FactsDbSource::Mounted { base, overlay } => {
+            ServerFactStore::open(FactStoreLocations::mounted(base.clone(), overlay.clone())).await
+        }
+        FactsDbSource::Writable(url) => {
+            ServerFactStore::open(FactStoreLocations::standalone(url.clone())).await
+        }
+    }
+}
+
+/// The Postgres twin, compiled when a workspace build unifies the api crate's
+/// `postgres` feature on. [`FactsDbSource::Writable`] carries a connection URL,
+/// which doubles as the way to point the dev server at a real database and
+/// reproduce something production-shaped; base+overlay layering is a SQLite
+/// construction, so a mounted source fails with a message saying as much.
+#[cfg(feature = "postgres")]
+async fn open_facts(source: &FactsDbSource) -> chronoscope_db::DbResult<ServerFactStore> {
+    match source {
+        FactsDbSource::Mounted { base, .. } => Err(chronoscope_db::DbError::Config(format!(
+            "the Postgres fact store connects to a URL, so the mounted SQLite artifact at \
+             {base} has no meaning here; pass FactsDbSource::Writable with a connection URL"
+        ))),
+        FactsDbSource::Writable(url) => ServerFactStore::open(url).await,
+    }
 }
 
 /// Configuration for starting the dev server.
@@ -500,7 +534,8 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         // The fact store is built below from `config.facts` (a `FactsDbSource`)
         // and handed to `AppState` directly, so this app `Config` field goes
         // unused here.
-        facts_database: "sqlite::memory:".to_string(),
+        facts_database: FactsDatabase::new("sqlite::memory:")
+            .map_err(|e| DevServerError(format!("{e}")))?,
         rp_id,
         rp_origin,
         bind_addr: format!("127.0.0.1:{port}")
@@ -540,19 +575,10 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         ..Default::default()
     };
 
-    // The fact store owns its pool (throwaway in-memory `main` + the fact-store
-    // layers). A mounted source pins the base read-only+immutable beneath a
-    // fresh writable overlay scratch; a writable source is one overlay,
-    // created+migrated if absent. No boot-time ingest either way.
-    let facts = match &config.facts {
-        FactsDbSource::Mounted { base, overlay } => {
-            ServerFactStore::open(FactStoreLocations::mounted(base.clone(), overlay.clone())).await
-        }
-        FactsDbSource::Writable(url) => {
-            ServerFactStore::open(FactStoreLocations::standalone(url.clone())).await
-        }
-    }
-    .map_err(|e| format!("opening fact store: {e}"))?;
+    // No boot-time ingest: whatever the source names is served as it stands.
+    let facts = open_facts(&config.facts)
+        .await
+        .map_err(|e| format!("opening fact store: {e}"))?;
 
     // Write any test-provided seed commits before serving, so seeded entities
     // read back through the same projection as the mounted store and their

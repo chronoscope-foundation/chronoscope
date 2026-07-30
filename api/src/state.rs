@@ -4,9 +4,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chronoscope_core::store::{EntityIdOf, EventIdOf, FactStore, ImageIdOf};
+use chronoscope_db::Database;
+#[cfg(feature = "postgres")]
+use chronoscope_db::PostgresFactStore as PickedFactStore;
+#[cfg(not(feature = "postgres"))]
+use chronoscope_db::SqliteFactStore as PickedFactStore;
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::MediaStore;
-use chronoscope_db::{Database, SqliteFactStore};
 use dropshot::HttpError;
 use hickory_resolver::Resolver;
 use hickory_resolver::name_server::TokioConnectionProvider;
@@ -21,10 +25,16 @@ use crate::jwt::JwtConfig;
 /// The one place the server's fact-store backend is picked. Everything below
 /// the endpoint boundary is generic over `S: FactStore` (core listing /
 /// projection, ingestion, the api helpers); the handlers and [`AppState`]
-/// instantiate at this alias, so re-backending the whole server is this line
-/// plus the test fixtures. Runtime backend selection waits until a second
-/// production backend exists.
-pub type ServerFactStore = SqliteFactStore;
+/// instantiate at this alias.
+///
+/// The `postgres` feature picks the backend at compile time: on for the
+/// production entry point, off for dev and the tests, which run SQLite. Only
+/// construction differs between the two, since Postgres connects to a URL where
+/// SQLite mounts a base and an overlay, so the cfg reaches just this alias, the
+/// entry point's two `open` call sites, and the two test fixtures that stand a
+/// store up (`tests::fresh_fact_store` and `entities::tests::empty_fact_store`).
+/// Every other module, test code included, compiles under both.
+pub type ServerFactStore = PickedFactStore;
 
 /// The picked backend's id scheme — what the stored commit types instantiate at.
 pub type ServerIds = <ServerFactStore as FactStore>::Ids;
@@ -70,6 +80,70 @@ impl DnsResolver for TokioResolver {
 
 // ==================== Configuration ====================
 
+/// Where a rejected fact-store location carried its password. Both forms reach
+/// sqlx's connect options, so both have to be refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialForm {
+    /// `postgres://user:secret@host/db`
+    Userinfo,
+    /// `postgres://user@host/db?password=secret`
+    QueryParameter,
+}
+
+impl std::fmt::Display for CredentialForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Userinfo => "a password in the URL's userinfo",
+            Self::QueryParameter => "a \"password\" query parameter",
+        })
+    }
+}
+
+/// Where the fact store lives: a facts-database path under the SQLite backend,
+/// a connection URL under the Postgres one. Holds no secret, because
+/// [`new`](Self::new) refuses a location that carries one, so the value stays
+/// printable wherever it is useful (startup logs, error context).
+#[derive(Debug, Clone)]
+pub struct FactsDatabase(String);
+
+impl FactsDatabase {
+    /// Wrap a configured location.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::FactsDbCredentials`] if the location is a URL
+    /// carrying a password, whether in the userinfo or as a `password` query
+    /// parameter.
+    pub fn new(raw: impl Into<String>) -> Result<Self, ConfigError> {
+        let raw = raw.into();
+        // A filesystem path (the SQLite case) is not a URL and has nowhere to
+        // put a credential, so it passes straight through.
+        if let Ok(url) = Url::parse(&raw) {
+            if url.password().is_some() {
+                return Err(ConfigError::FactsDbCredentials {
+                    form: CredentialForm::Userinfo,
+                });
+            }
+            if url.query_pairs().any(|(name, _)| name == "password") {
+                return Err(ConfigError::FactsDbCredentials {
+                    form: CredentialForm::QueryParameter,
+                });
+            }
+        }
+        Ok(Self(raw))
+    }
+
+    /// The raw location, for the backend that connects with it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FactsDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Configuration for the application
 pub struct Config {
     /// App database URL (e.g., "sqlite:chronoscope.db" or "`sqlite::memory`:").
@@ -77,11 +151,12 @@ pub struct Config {
     /// the separate [`facts_database`](Self::facts_database).
     pub database_url: String,
 
-    /// The facts database — a `sqlite:` URL (or bare path), holding the fact
-    /// tables. Required, set via `CHRONOSCOPE_FACTS_DB`; the server pins it as
-    /// the frozen read-only base (a completed, codec-stamped build) beneath a
-    /// fresh writable overlay, so it is validated, never created or migrated.
-    pub facts_database: String,
+    /// Where the fact tables live. Required, set via `CHRONOSCOPE_FACTS_DB`,
+    /// and read by whichever backend [`ServerFactStore`] names: SQLite pins it
+    /// as the frozen read-only base (a completed, codec-stamped build) beneath
+    /// a fresh writable overlay, so it is validated rather than created or
+    /// migrated; Postgres connects to it as a URL and migrates on open.
+    pub facts_database: FactsDatabase,
 
     /// `WebAuthn` Relying Party ID (e.g., "chronoscope.io")
     pub rp_id: String,
@@ -105,18 +180,19 @@ impl Config {
     ///
     /// # Errors
     /// Returns `ConfigError::MissingFactsDb` if `CHRONOSCOPE_FACTS_DB` is
-    /// unset, `ConfigError::InvalidBindAddr` if the bind address is invalid,
-    /// or `ConfigError::InvalidCdnUrl` if `CDN_BASE_URL` is not a valid base
-    /// URL.
+    /// unset, `ConfigError::FactsDbCredentials` if it carries a password,
+    /// `ConfigError::InvalidBindAddr` if the bind address is invalid, or
+    /// `ConfigError::InvalidCdnUrl` if `CDN_BASE_URL` is not a valid base URL.
     pub fn from_env() -> Result<Self, ConfigError> {
         let database_url =
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:chronoscope.db".to_string());
 
-        // The facts database is the completed, codec-stamped artifact built by
-        // `ingest build-db` that the server pins as its frozen read-only base.
-        // Its path is a required, explicit input so the mount is deterministic.
-        let facts_database =
+        // A required, explicit input so the fact store's source is never
+        // inferred. Parsed here, at the edge where it is read, so the
+        // credential rule holds for everything downstream.
+        let facts_location =
             std::env::var("CHRONOSCOPE_FACTS_DB").map_err(|_| ConfigError::MissingFactsDb)?;
+        let facts_database = FactsDatabase::new(facts_location)?;
 
         let rp_id = std::env::var("RP_ID").unwrap_or_else(|_| "localhost".to_string());
 
@@ -187,10 +263,21 @@ pub enum ConfigError {
     InvalidCdnUrl(String),
 
     #[error(
-        "CHRONOSCOPE_FACTS_DB must be set to the facts database path \
-         (built by `ingest build-db`)"
+        "CHRONOSCOPE_FACTS_DB must be set to the fact store's location: with the \
+         SQLite backend, the path of a facts database built by `ingest build-db`; \
+         with the Postgres backend, a connection URL"
     )]
     MissingFactsDb,
+
+    #[error(
+        "CHRONOSCOPE_FACTS_DB carries {form}. The fact store's location is \
+         logged at startup and quoted in errors, so it must hold no \
+         secret: put the password in PGPASSWORD (sqlx reads the standard libpq \
+         environment: PGPASSWORD, PGHOST, PGUSER, PGDATABASE), or use IAM \
+         database authentication, which replaces the password with a \
+         short-lived token"
+    )]
+    FactsDbCredentials { form: CredentialForm },
 }
 
 #[derive(Error, Debug)]
@@ -258,8 +345,8 @@ pub struct AppState {
     #[cfg(feature = "embedded-media")]
     pub media_store: Arc<dyn MediaStore>,
     /// The fact store of submitted entity and image facts — the
-    /// [`ServerFactStore`] backend over its own pool (the frozen base and
-    /// writable overlay, separate from the app `db` above).
+    /// [`ServerFactStore`] backend over its own pool, a separate database from
+    /// the app `db` above.
     pub facts: ServerFactStore,
     /// Resolved media keys for every fact-store image, keyed by image id. The
     /// entity read path serves thumbnails and detail images from these keys; an
@@ -302,5 +389,58 @@ impl AppState {
             facts,
             image_media,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigError, CredentialForm, FactsDatabase};
+
+    fn rejection_form(raw: &str) -> Result<CredentialForm, String> {
+        match FactsDatabase::new(raw) {
+            Err(ConfigError::FactsDbCredentials { form }) => Ok(form),
+            Err(other) => Err(format!("expected a credential rejection, got {other}")),
+            Ok(accepted) => Err(format!("expected a rejection, got {accepted}")),
+        }
+    }
+
+    fn accepted(raw: &str) -> Result<FactsDatabase, String> {
+        FactsDatabase::new(raw).map_err(|e| format!("expected acceptance, got {e}"))
+    }
+
+    /// The startup log prints this value, so a location that hands sqlx a
+    /// password has to fail at boot instead of reaching the log.
+    #[test]
+    fn a_password_in_the_userinfo_is_rejected() -> Result<(), String> {
+        let form = rejection_form("postgres://facts:hunter2@db.internal:5432/facts")?;
+        assert_eq!(form, CredentialForm::Userinfo);
+        Ok(())
+    }
+
+    /// sqlx honors `?password=` exactly as it honors the userinfo form, so this
+    /// spelling is a credential too.
+    #[test]
+    fn a_password_query_parameter_is_rejected() -> Result<(), String> {
+        let form = rejection_form("postgres://facts@db.internal:5432/facts?password=hunter2")?;
+        assert_eq!(form, CredentialForm::QueryParameter);
+        Ok(())
+    }
+
+    /// A facts-file path is not a URL at all, and the operator needs to see
+    /// which artifact booted.
+    #[test]
+    fn a_facts_file_path_renders_verbatim() -> Result<(), String> {
+        const PATH: &str = "/nix/store/abcdef-facts-db/facts.db";
+        assert_eq!(accepted(PATH)?.to_string(), PATH);
+        Ok(())
+    }
+
+    /// The shape the Postgres deployment is expected to configure: host, user,
+    /// and TLS mode legible, authentication supplied out of band.
+    #[test]
+    fn a_credential_free_postgres_url_renders_verbatim() -> Result<(), String> {
+        const URL: &str = "postgres://facts@db.internal:5432/facts?sslmode=require";
+        assert_eq!(accepted(URL)?.to_string(), URL);
+        Ok(())
     }
 }

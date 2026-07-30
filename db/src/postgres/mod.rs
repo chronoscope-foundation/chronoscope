@@ -58,8 +58,9 @@ mod tests;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::time::Duration;
 
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Acquire, PgConnection, Postgres, Transaction};
 
 use chronoscope_core::geo::{QuadLevel, TileId, Viewport};
@@ -102,10 +103,52 @@ pub struct PostgresFactStore {
     pool: PgPool,
 }
 
+/// Connections the fact-store pool holds. A read view owns one for its whole
+/// lifetime (a single read transaction), so what this caps is concurrent read
+/// views, not concurrent queries: an in-flight HTTP read holds its connection
+/// until the handler returns. The number is a headroom judgment, not a measured
+/// one. Postgres ships `max_connections = 100`, so 32 leaves room for a second
+/// instance, the migration advisory lock, and admin sessions. Lifting the
+/// ceiling for real means making reads stateless so a view stops pinning a
+/// connection.
+const POOL_MAX_CONNECTIONS: u32 = 32;
+
+/// How long a caller waits for a pooled connection. Under the cap above,
+/// exhaustion means concurrent views outnumber connections, a queue that will
+/// not drain inside one request, so a short wait turns it into an error an
+/// operator can read while sqlx's 30s default outlives most client timeouts.
+const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl PostgresFactStore {
-    /// Wrap a pool over an already-migrated fact-store database.
-    pub fn new(pool: PgPool) -> Self {
+    /// Wrap a pool over an already-migrated fact-store database. Crate-internal
+    /// because the migration precondition is unenforced; [`Self::open`]
+    /// establishes it.
+    pub(crate) fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Connect to the fact-store database at `url`, migrate it, and hand back
+    /// the store over the new pool.
+    ///
+    /// Migrating at open keeps the schema with the code that reads it. sqlx
+    /// wraps the run in a Postgres advisory lock, so instances booting at once
+    /// serialize on it and exactly one applies each migration. The first
+    /// application creates the `PostGIS` extension, which needs a role
+    /// privileged to do so.
+    ///
+    /// # Errors
+    /// Returns [`DbError`](crate::DbError) if the connection or a migration
+    /// fails.
+    pub async fn open(url: &str) -> crate::DbResult<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(POOL_MAX_CONNECTIONS)
+            .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+            .connect(url)
+            .await?;
+        sqlx::migrate!("./migrations-postgres/facts")
+            .run(&pool)
+            .await?;
+        Ok(Self::new(pool))
     }
 
     /// The underlying pool, for the harness smoke test.

@@ -14,6 +14,12 @@ default = []
 # Enable embedded media serving at /media/{key}
 # Used by dev binary to serve media without a separate CDN server
 embedded-media = []
+# Back the server's fact store with Postgres instead of SQLite. Compile-time
+# selection: the dev entry points build SQLite, the production one builds
+# Postgres, and `ServerFactStore` follows. The api integration tests only stand
+# up SQLite, so their store fixture errors here; the suite still compiles and
+# lints under this feature (see `tests::fresh_fact_store`).
+postgres = ["chronoscope-db/postgres"]
 
 [dependencies]
 # Web framework

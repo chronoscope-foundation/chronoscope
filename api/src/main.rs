@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config, ServerFactStore, default_dns_resolver};
-use chronoscope_db::{Database, FactStoreLocations};
+use chronoscope_db::Database;
+#[cfg(not(feature = "postgres"))]
+use chronoscope_db::FactStoreLocations;
 use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,
 };
@@ -19,8 +21,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Load configuration
     let config = Config::from_env()?;
 
+    // `facts` prints verbatim: config rejects a location carrying a password,
+    // so the value the operator needs to see holds nothing to keep out of a log.
     info!(log, "Starting Chronoscope API server";
         "database" => &config.database_url,
+        "facts" => %config.facts_database,
         "rp_id" => &config.rp_id,
         "rp_origin" => &config.rp_origin,
         "bind_addr" => %config.bind_addr,
@@ -32,16 +37,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let jwt = JwtConfig::from_env()?;
     let dns_resolver = default_dns_resolver()?;
 
-    // The fact store owns its own pool: a throwaway in-memory `main` with the
-    // fact-store layers attached. The configured facts DB pins as the frozen
-    // read-only `base` — `open` validates it (exists, SQLite, current codec
-    // stamp) rather than fabricating an empty one, so a missing, partial, or
-    // stale file fails loud at boot — beneath a fresh writable overlay scratch
-    // that takes submissions. No boot-time resolver runs here, so the media map
-    // starts empty. The scratch dir lives for the server's lifetime.
+    // The fact store owns its own pool. No boot-time resolver runs here, so the
+    // media map starts empty either way.
+    //
+    // SQLite: a throwaway in-memory `main` with the fact-store layers attached.
+    // The configured facts DB pins as the frozen read-only `base` — `open`
+    // validates it (exists, SQLite, current codec stamp) rather than fabricating
+    // an empty one, so a missing, partial, or stale file fails loud at boot —
+    // beneath a fresh writable overlay scratch that takes submissions. The
+    // scratch dir lives for the server's lifetime.
+    #[cfg(not(feature = "postgres"))]
     let facts_overlay_dir = tempfile::TempDir::with_prefix("chronoscope-facts-overlay-")?;
+    #[cfg(not(feature = "postgres"))]
     let facts = ServerFactStore::open(FactStoreLocations::mounted(
-        config.facts_database.clone(),
+        config.facts_database.as_str().to_owned(),
         facts_overlay_dir
             .path()
             .join("overlay.db")
@@ -49,6 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .to_string(),
     ))
     .await?;
+    // Postgres: one writable database, so the configured location is a
+    // connection URL and `open` migrates it on the way up.
+    #[cfg(feature = "postgres")]
+    let facts = ServerFactStore::open(config.facts_database.as_str()).await?;
     let image_media = Arc::new(std::collections::HashMap::new());
 
     // Keep a handle to the fact store for graceful shutdown; the copy handed to

@@ -858,6 +858,31 @@ pub async fn get_tile(
 mod tests {
     use super::*;
 
+    /// An empty store through the server's backend alias, plus the tempdir
+    /// holding it. A file-backed overlay so `open` can create and attach it.
+    ///
+    /// The module's whole backend dependence, cfg'd here so the tests around it
+    /// compile and lint under both cells.
+    #[cfg(not(feature = "postgres"))]
+    async fn empty_fact_store() -> Result<(ServerFactStore, tempfile::TempDir), String> {
+        let dir = tempfile::tempdir().map_err(|e| format!("{e:?}"))?;
+        let locations =
+            chronoscope_db::FactStoreLocations::standalone_at(&dir.path().join("facts.sqlite3"))
+                .map_err(|e| format!("{e:?}"))?;
+        let facts = ServerFactStore::open(locations)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        Ok((facts, dir))
+    }
+
+    /// The Postgres cell can't build one, for the reason spelled out at
+    /// `crate::tests::fresh_fact_store`: the harness that stands a cluster up is
+    /// `cfg(test)` inside `chronoscope-db`.
+    #[cfg(feature = "postgres")]
+    async fn empty_fact_store() -> Result<(ServerFactStore, tempfile::TempDir), String> {
+        Err("the api suite runs against SQLite; no Postgres store can be built here".to_string())
+    }
+
     /// A rejected cursor is client-supplied input, so it must surface as a
     /// browser-readable 400 rather than a panic or a 500.
     fn assert_rejected_400<T>(result: Result<T, HttpError>) -> Result<(), String> {
@@ -957,15 +982,7 @@ mod tests {
         // so a future value would yield a view that silently grows as writes
         // land — the loud 400 stops that. Runs only on the standalone-snapshot
         // branch (no cursor).
-        // An empty store through the server's backend alias — a file-backed
-        // overlay so `open` can create+attach it.
-        let dir = tempfile::tempdir().map_err(|e| format!("{e:?}"))?;
-        let locations =
-            chronoscope_db::FactStoreLocations::standalone_at(&dir.path().join("facts.sqlite3"))
-                .map_err(|e| format!("{e:?}"))?;
-        let facts = ServerFactStore::open(locations)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+        let (facts, _dir) = empty_fact_store().await?;
         let future = encode_snapshot(FactId::new(1)).map_err(|e| format!("{e:?}"))?;
         let result = open_read_view(&facts, Some(future), None).await;
         assert_rejected_400(result.map(|_| ()))

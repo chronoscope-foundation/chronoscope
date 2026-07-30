@@ -44,14 +44,18 @@ use crate::jwt::JwtConfig;
 use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
 use crate::research_types::{FollowedUrlSummary, ResearchUrlDossier, ResearchUrlSummary};
 use crate::state::{
-    AppState, Config, DnsResolver, ResolvedImageMedia, SAFE_PUBLIC_IP, ServerFactStore,
-    ServerImageId,
+    AppState, Config, DnsResolver, FactsDatabase, ResolvedImageMedia, SAFE_PUBLIC_IP,
+    ServerFactStore, ServerImageId,
 };
 
 /// A fresh fact store per test, plus the tempdir holding its overlay facts
 /// file. Views hold read transactions on the overlay (WAL) for their
 /// lifetime, and only a file-backed overlay gives WAL's reader/writer
 /// independence — an in-memory overlay would serialize them at table locks.
+///
+/// This is the whole of the suite's backend dependence, so the cfg stops here
+/// and every test around it compiles and lints under both cells.
+#[cfg(not(feature = "postgres"))]
 async fn fresh_fact_store()
 -> Result<(ServerFactStore, tempfile::TempDir), Box<dyn std::error::Error + Send + Sync>> {
     let dir = tempfile::tempdir()?;
@@ -60,6 +64,18 @@ async fn fresh_fact_store()
     )?)
     .await?;
     Ok((store, dir))
+}
+
+/// The Postgres cell has no store to hand back: the only thing in the tree that
+/// stands a Postgres database up is the `cfg(test)` harness inside
+/// `chronoscope-db`, out of reach from another crate's tests. The suite still
+/// compiles and lints here, which is what keeps it inside the workspace deny
+/// lints; it *runs* in the SQLite cell, and the db crate's conformance suite is
+/// what shows the two backends answer alike.
+#[cfg(feature = "postgres")]
+async fn fresh_fact_store()
+-> Result<(ServerFactStore, tempfile::TempDir), Box<dyn std::error::Error + Send + Sync>> {
+    Err("the api suite runs against SQLite; no Postgres store can be built here".into())
 }
 
 // ==================== Test Utilities ====================
@@ -250,7 +266,7 @@ impl TestContext {
             database_url: "sqlite::memory:".to_string(),
             // The fact store under test is the standalone `facts` built above
             // (its own overlay), so this app-side facts path goes unused.
-            facts_database: "sqlite::memory:".to_string(),
+            facts_database: FactsDatabase::new("sqlite::memory:")?,
             rp_id: "localhost".to_string(),
             rp_origin: format!("http://localhost:{}", addr.port()),
             bind_addr: addr,
