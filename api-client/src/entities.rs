@@ -316,6 +316,8 @@ pub struct TileResponse<E> {
 
 #[cfg(test)]
 mod tests {
+    use strum::IntoEnumIterator;
+
     use super::*;
 
     #[test]
@@ -328,30 +330,14 @@ mod tests {
             Some(Perspective::Exterior),
             Some(Perspective::Interior),
         ];
-        // `media` is written out by hand, so a new `ImageMedium` would other-
-        // wise slip past this test still passing. This match fails to compile
-        // until the variant is listed, which is the nudge to add it below.
-        fn every_medium_is_covered(medium: ImageMedium) {
-            match medium {
-                ImageMedium::Picture
-                | ImageMedium::Map
-                | ImageMedium::Plan
-                | ImageMedium::PictorialMap => {}
-            }
-        }
-        let media = [
-            None,
-            Some(ImageMedium::Picture),
-            Some(ImageMedium::Map),
-            Some(ImageMedium::Plan),
-            Some(ImageMedium::PictorialMap),
-        ];
-        media
-            .into_iter()
-            .flatten()
-            .for_each(every_medium_is_covered);
+        // Taken from the enum's own iterator, so a new medium joins the matrix
+        // the moment it is declared. `None` is the captionless case the wire
+        // also carries.
+        let media: Vec<Option<ImageMedium>> = std::iter::once(None)
+            .chain(ImageMedium::iter().map(Some))
+            .collect();
         for perspective in perspectives {
-            for medium in media {
+            for medium in media.iter().copied() {
                 let caption = image_caption(perspective, medium);
                 assert!(
                     !caption.is_empty(),

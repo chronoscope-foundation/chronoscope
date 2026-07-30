@@ -67,7 +67,8 @@ pub fn MapCard(
     expand_label: &'static str,
     /// Accessible name for the toggle while expanded.
     collapse_label: &'static str,
-    /// Ties the toggle to the body it discloses, for `aria-controls`.
+    /// Names the body the toggle discloses: `aria-controls` while that body is
+    /// mounted, and the stem of the toggle's own id.
     body_id: &'static str,
     /// The body's corner radius. A tall panel and a single-row bar want
     /// different curves, and the bar's has to match its chip's to read as one
@@ -95,6 +96,10 @@ pub fn MapCard(
         format!("{toggle_base} {surface}")
     };
     let body_class = format!("{SURFACE} {body_radius}");
+    // The control's own name, alongside the body's, so the toggle stays
+    // addressable in both states: the browser tests follow one across a collapse
+    // by it.
+    let toggle_id = format!("{body_id}-toggle");
 
     view! {
         <div class=corner.anchor()>
@@ -115,9 +120,13 @@ pub fn MapCard(
             </Show>
             <button
                 type="button"
+                id=toggle_id
                 class=toggle_class
                 aria-expanded=move || if open.get() { "true" } else { "false" }
-                aria-controls=body_id
+                // Only while the body is there to point at: a reader follows
+                // this reference from the collapsed chip, which is exactly when
+                // the body has left the DOM.
+                aria-controls=move || open.get().then_some(body_id)
                 aria-label=move || if open.get() { collapse_label } else { expand_label }
                 on:click=move |_| open.update(|shown| *shown = !*shown)
             >

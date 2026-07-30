@@ -158,7 +158,14 @@ pub fn ErrorBanner() -> impl IntoView {
         // message is the whole point of it. Raising the strip's z-index instead
         // would have hidden the trigger and made the nav unreachable while any
         // error showed.
-        <div class="fixed top-14 left-0 right-0 z-50 pointer-events-none">
+        //
+        // The right inset is the same bargain at the other corner: below `md`
+        // the About card's toggle sits at this exact height, and an opaque strip
+        // across it left the card stuck open or shut for as long as any error
+        // showed. 56 px clears the toggle's 32 px box, its 12 px inset from the
+        // edge, and the 6 px its pointer area reaches past itself. From `md` up
+        // the card rides higher than this strip, so the corner is free.
+        <div class="fixed top-14 left-0 right-14 md:right-0 z-50 pointer-events-none">
             {move || {
                 errors.get().into_iter().map(|(id, msg)| {
                     let dismiss_this = move |_| dismiss(id);

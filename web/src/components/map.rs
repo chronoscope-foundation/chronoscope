@@ -2482,8 +2482,12 @@ pub fn MapView(
             />
             {move || {
                 map_error.get().map(|msg| view! {
+                    // Stacked above the time slider's bar, on the same 12 px
+                    // inset and the same `bottom-14` the map's status chips
+                    // take. The bar is an opaque later sibling in this corner,
+                    // so an alert level with it is simply covered.
                     <div
-                        class="absolute bottom-2 left-2 right-2 bg-red-900/90 text-white text-xs px-3 py-2 rounded shadow"
+                        class="absolute bottom-14 left-3 right-3 bg-red-900/90 text-white text-xs px-3 py-2 rounded shadow"
                         role="alert"
                     >
                         {msg}

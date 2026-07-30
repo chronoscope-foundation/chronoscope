@@ -12,7 +12,7 @@
 use chrono::{Datelike, NaiveDate};
 use leptos::prelude::*;
 
-use crate::components::map::TimeControl;
+use crate::components::map::{SelectedEntity, TimeControl};
 use crate::components::map_card::{Corner, MapCard};
 use crate::time_scale::{TimeScale, TrackUnit, era_label};
 
@@ -78,12 +78,17 @@ fn mark_offset(unit: TrackUnit, total: TrackUnit) -> String {
 ///
 /// There is no "now" button. Scrubbing to the right edge is the same gesture
 /// and the track's far end is never more than one drag away.
+///
+/// Steps aside while an entity is selected, as the About card and the map's
+/// status chips do: on a phone the detail sheet covers this corner, and the bar
+/// draws after it, so it would take the sheet's taps.
 #[component]
 pub fn TimeSlider() -> impl IntoView {
     let Some(control) = use_context::<TimeControl>() else {
         // The map provides the control; without it there is no instant to drive.
         return ().into_any();
     };
+    let SelectedEntity(selected, _) = expect_context::<SelectedEntity>();
 
     // The map's single sample, not a fresh one: a second `today()` could straddle
     // midnight and put the track's right edge on a different day than the map's.
@@ -109,98 +114,100 @@ pub fn TimeSlider() -> impl IntoView {
     };
 
     view! {
-        // The status and fetch-error chips share this corner and stack above the
-        // bar, so an opaque panel here can neither hide an error nor swallow the
-        // clicks on its Retry button.
-        <MapCard
-            corner=Corner::BottomLeft
-            open=expanded
-            chip_class=CHIP_BOX
-            expand_label="Show the time slider"
-            collapse_label="Hide the time slider"
-            body_id="time-slider-panel"
-            body_radius="rounded-full"
-            chip=move || view! {
-                <span id="time-slider-year" class="tabular-nums">
-                    {move || era_label(year.get())}
-                </span>
-                // Points the way the bar moves: right to open, left to close.
-                // Drawn rather than set as a glyph, for the same reason as the
-                // nav's icon — a text chevron is tiny and faint at this size.
-                <svg
-                    aria-hidden="true"
-                    class=move || format!(
-                        "w-3 h-3 shrink-0 text-sepia/70 transition-transform duration-150 {}",
-                        if expanded.get() { "rotate-180" } else { "" }
-                    )
-                    viewBox="0 0 12 12"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.75"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                >
-                    <path d="M4.5 2.5L8 6l-3.5 3.5"/>
-                </svg>
-            }
-        >
-            // One row, so the bar is mostly track. The left inset clears the
-            // chip, which sits over this bar's left end rather than in this
-            // flow — and clears its widened pointer area too, which reaches 6 px
-            // past the chip's own width. An inset merely equal to that width
-            // leaves the overhang over the track's first pixels, where a click
-            // collapses the card instead of scrubbing to the earliest year.
-            <div class="h-9 flex items-center pl-32 pr-4 w-[min(90vw,24rem)]">
-                // Spans the track exactly, so the marks below can be placed
-                // against the same box the thumb travels.
-                <div class="relative h-9 flex items-center w-full">
-                    // Before the input, so the thumb paints over the dividers it
-                    // passes.
-                    <div aria-hidden="true" class="absolute inset-0 pointer-events-none">
-                        {move || scale.boundaries().into_iter().map(|boundary| {
-                            let offset = mark_offset(boundary.unit, total);
-                            view! {
-                                // Taller than the 6 px track it crosses, so it
-                                // reads as a divider between two bands rather
-                                // than a notch in the bar.
-                                <span
-                                    class="absolute top-[12px] h-3 w-px bg-sepia/50"
-                                    style=offset.clone()
-                                ></span>
-                                <span
-                                    class="absolute top-[26px] text-[10px] leading-none \
-                                           tabular-nums text-sepia/70"
-                                    style=offset
-                                >
-                                    {era_label(boundary.year)}
-                                </span>
+        <Show when=move || selected.get().is_none()>
+            // The status and fetch-error chips share this corner and stack above the
+            // bar, so an opaque panel here can neither hide an error nor swallow the
+            // clicks on its Retry button.
+            <MapCard
+                corner=Corner::BottomLeft
+                open=expanded
+                chip_class=CHIP_BOX
+                expand_label="Show the time slider"
+                collapse_label="Hide the time slider"
+                body_id="time-slider-panel"
+                body_radius="rounded-full"
+                chip=move || view! {
+                    <span id="time-slider-year" class="tabular-nums">
+                        {move || era_label(year.get())}
+                    </span>
+                    // Points the way the bar moves: right to open, left to close.
+                    // Drawn rather than set as a glyph, for the same reason as the
+                    // nav's icon — a text chevron is tiny and faint at this size.
+                    <svg
+                        aria-hidden="true"
+                        class=move || format!(
+                            "w-3 h-3 shrink-0 text-sepia/70 transition-transform duration-150 {}",
+                            if expanded.get() { "rotate-180" } else { "" }
+                        )
+                        viewBox="0 0 12 12"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.75"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                    >
+                        <path d="M4.5 2.5L8 6l-3.5 3.5"/>
+                    </svg>
+                }
+            >
+                // One row, so the bar is mostly track. The left inset clears the
+                // chip, which sits over this bar's left end rather than in this
+                // flow — and clears its widened pointer area too, which reaches 6 px
+                // past the chip's own width. An inset merely equal to that width
+                // leaves the overhang over the track's first pixels, where a click
+                // collapses the card instead of scrubbing to the earliest year.
+                <div class="h-9 flex items-center pl-32 pr-4 w-[min(90vw,24rem)]">
+                    // Spans the track exactly, so the marks below can be placed
+                    // against the same box the thumb travels.
+                    <div class="relative h-9 flex items-center w-full">
+                        // Before the input, so the thumb paints over the dividers it
+                        // passes.
+                        <div aria-hidden="true" class="absolute inset-0 pointer-events-none">
+                            {move || scale.boundaries().into_iter().map(|boundary| {
+                                let offset = mark_offset(boundary.unit, total);
+                                view! {
+                                    // Taller than the 6 px track it crosses, so it
+                                    // reads as a divider between two bands rather
+                                    // than a notch in the bar.
+                                    <span
+                                        class="absolute top-[12px] h-3 w-px bg-sepia/50"
+                                        style=offset.clone()
+                                    ></span>
+                                    <span
+                                        class="absolute top-[26px] text-[10px] leading-none \
+                                               tabular-nums text-sepia/70"
+                                        style=offset
+                                    >
+                                        {era_label(boundary.year)}
+                                    </span>
+                                }
+                            }).collect::<Vec<_>>()}
+                        </div>
+                        <input
+                            id="time-slider"
+                            type="range"
+                            class=format!("relative w-full cursor-pointer {TRACK_AND_THUMB}")
+                            min="0"
+                            max=total.0.to_string()
+                            step="1"
+                            prop:value=move || scale.position(year.get()).0.to_string()
+                            aria-label="Year to show the map as of"
+                            // A screen reader reads the value, which is a track unit,
+                            // so the year it announces has to come from here.
+                            aria-valuetext=move || era_label(year.get())
+                            // The browser's own year, so a test can build the same
+                            // axis without a clock of its own.
+                            data-max-year=max_year.to_string()
+                            on:input=move |ev| {
+                                if let Ok(value) = event_target_value(&ev).parse::<u32>() {
+                                    set_unit(value);
+                                }
                             }
-                        }).collect::<Vec<_>>()}
+                        />
                     </div>
-                    <input
-                        id="time-slider"
-                        type="range"
-                        class=format!("relative w-full cursor-pointer {TRACK_AND_THUMB}")
-                        min="0"
-                        max=total.0.to_string()
-                        step="1"
-                        prop:value=move || scale.position(year.get()).0.to_string()
-                        aria-label="Year to show the map as of"
-                        // A screen reader reads the value, which is a track unit,
-                        // so the year it announces has to come from here.
-                        aria-valuetext=move || era_label(year.get())
-                        // The browser's own year, so a test can build the same
-                        // axis without a clock of its own.
-                        data-max-year=max_year.to_string()
-                        on:input=move |ev| {
-                            if let Ok(value) = event_target_value(&ev).parse::<u32>() {
-                                set_unit(value);
-                            }
-                        }
-                    />
                 </div>
-            </div>
-        </MapCard>
+            </MapCard>
+        </Show>
     }
     .into_any()
 }

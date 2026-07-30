@@ -1,5 +1,11 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use leptos::prelude::*;
 use leptos_router::components::A;
+use send_wrapper::SendWrapper;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::Closure;
 
 use crate::components::controls::{FOCUS_RING, SURFACE};
 use crate::components::focus_trap::contain_tab;
@@ -16,6 +22,10 @@ use crate::components::motion::{SCRIM, SLIDE};
 pub const NAV_CLEARANCE: &str = "pt-20";
 
 const NAV_LINK_CLASS: &str = "block px-3 py-2 rounded-md text-sm font-sans font-medium text-sepia hover:text-ink hover:bg-ink/5 transition-colors";
+
+/// The document keydown handler, held for as long as it is registered: JS keeps
+/// only a borrowed reference to it, so dropping it here unhooks the listener.
+type KeyListener = Rc<RefCell<Option<Closure<dyn Fn(web_sys::KeyboardEvent)>>>>;
 
 /// The site's navigation: a floating trigger and the drawer it opens.
 ///
@@ -66,6 +76,40 @@ pub fn Nav() -> impl IntoView {
         _ => {}
     };
 
+    // The keys are watched on the document for as long as the drawer is open,
+    // because the cycle spans the masthead and the masthead is the panel's
+    // sibling: a listener on the panel hears nothing once Tab wraps onto the
+    // trigger, which is where Shift+Tab walked out of the dialog and Escape went
+    // quiet. Registered only while open, so the page behind the scrim keeps its
+    // own keys the rest of the time.
+    let key_listener: KeyListener = Rc::new(RefCell::new(None));
+    let listener_for_effect = Rc::clone(&key_listener);
+    Effect::new(move |_| {
+        let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+            return;
+        };
+        if let Some(previous) = listener_for_effect.borrow_mut().take() {
+            let _ = document
+                .remove_event_listener_with_callback("keydown", previous.as_ref().unchecked_ref());
+        }
+        if open.get() {
+            let handler = Closure::<dyn Fn(web_sys::KeyboardEvent)>::new(on_keydown);
+            let _ = document
+                .add_event_listener_with_callback("keydown", handler.as_ref().unchecked_ref());
+            *listener_for_effect.borrow_mut() = Some(handler);
+        }
+    });
+
+    let listener_for_cleanup = SendWrapper::new(key_listener);
+    on_cleanup(move || {
+        if let Some(handler) = listener_for_cleanup.borrow_mut().take()
+            && let Some(document) = web_sys::window().and_then(|w| w.document())
+        {
+            let _ = document
+                .remove_event_listener_with_callback("keydown", handler.as_ref().unchecked_ref());
+        }
+    });
+
     view! {
         // Two controls in one surface, with a rule between them saying so. The
         // burger opens the drawer; the wordmark goes home, which is the
@@ -86,6 +130,7 @@ pub fn Nav() -> impl IntoView {
         >
             <button
                 node_ref=trigger_ref
+                id="site-nav-toggle"
                 type="button"
                 class=format!("flex items-center px-3.5 rounded-l-full cursor-pointer \
                                hover:bg-ink/5 {FOCUS_RING}")
@@ -174,7 +219,6 @@ pub fn Nav() -> impl IntoView {
                 } else {
                     "transform: translateX(-100%)"
                 }
-                on:keydown=on_keydown
             >
                 // `pt-12` clears the trigger, which overlays this panel's top
                 // corner and serves as its masthead. The drawer carries no

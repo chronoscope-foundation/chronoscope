@@ -10,7 +10,26 @@ use wasm_bindgen::JsCast;
 /// What a keyboard user can land on inside an overlay. Deliberately narrow —
 /// these overlays hold links and buttons, and a broad selector would sweep in
 /// elements the browser will not actually focus.
-const FOCUSABLE: &str = "button, a[href], input, [tabindex]:not([tabindex='-1'])";
+///
+/// `disabled` and `inert` are part of that: the browser skips such a control,
+/// so one at either end of the cycle makes Tab call `prevent_default` and then
+/// focus nothing, swallowing the key. [`is_rendered`] covers the rest, which
+/// CSS cannot ask about.
+const FOCUSABLE: &str = ":is(button, a[href], input, [tabindex]:not([tabindex='-1']))\
+                         :not([disabled]):not([inert])";
+
+/// Whether an element is laid out, and so can take focus at all.
+///
+/// `offsetParent` alone is not enough: it is `null` for `position: fixed`
+/// elements as well as for hidden ones, so a fixed overlay reads as invisible
+/// while plainly on screen. The width fallback separates the two.
+///
+/// The browser tests' own visibility hooks answer this question with this
+/// function, so what the trap will focus and what a test calls visible cannot
+/// drift apart.
+pub fn is_rendered(el: &web_sys::HtmlElement) -> bool {
+    el.offset_parent().is_some() || el.offset_width() > 0
+}
 
 /// Wrap Tab across `roots`, in the order given.
 ///
@@ -26,7 +45,7 @@ pub fn contain_tab(ev: &leptos::ev::KeyboardEvent, roots: &[&web_sys::HtmlElemen
     for root in roots {
         // A root can be focusable itself (the trigger is a button), and its own
         // descendants come after it, which is the order Tab would visit them in.
-        if root.matches(FOCUSABLE).unwrap_or(false) {
+        if root.matches(FOCUSABLE).unwrap_or(false) && is_rendered(root) {
             focusables.push((*root).clone());
         }
         if let Ok(found) = root.query_selector_all(FOCUSABLE) {
@@ -34,6 +53,7 @@ pub fn contain_tab(ev: &leptos::ev::KeyboardEvent, roots: &[&web_sys::HtmlElemen
                 if let Some(el) = found
                     .item(i)
                     .and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
+                    .filter(is_rendered)
                 {
                     focusables.push(el);
                 }

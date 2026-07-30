@@ -59,8 +59,22 @@ use crate::location::UnresolvedLocation;
 /// asserts directly, one value rather than a coexisting `Picture` + `Map` pair.
 /// Serialized `snake_case`, the same leaf-value-enum shape as
 /// [`crate::grammar::depiction::Perspective`].
+///
+/// `EnumIter` is what lets a generator or a test matrix cover the medium space
+/// from the definition instead of a list beside it.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    strum::EnumIter,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ImageMedium {

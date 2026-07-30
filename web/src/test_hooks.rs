@@ -27,6 +27,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 
 use crate::api::Client;
+use crate::components::focus_trap::is_rendered;
 use crate::components::map::{FETCH_COMPLETE_EVENT, MAP_READY_EVENT, current_fetch_settled};
 use crate::maplibre;
 use crate::time_scale::{TimeScale, era_label};
@@ -352,7 +353,7 @@ fn map_query<R: Clone + 'static>(
 /// Click the first visible element matching a selector. Returns a Promise
 /// that resolves after the click and any resulting CSS transition.
 ///
-/// Uses `offsetParent` to skip elements the layout has removed (a `display:
+/// Uses [`is_rendered`] to skip elements the layout has removed (a `display:
 /// none` responsive variant) and a 250ms fallback timeout to handle clicks that
 /// don't trigger CSS transitions.
 fn click_visible(selector: String) -> js_sys::Promise {
@@ -368,7 +369,7 @@ fn click_visible(selector: String) -> js_sys::Promise {
             let nodes = doc.query_selector_all(&selector).ok()?;
             for i in 0..nodes.length() {
                 let el: web_sys::HtmlElement = nodes.item(i)?.dyn_into().ok()?;
-                if el.offset_parent().is_some() || el.offset_width() > 0 {
+                if is_rendered(&el) {
                     el.click();
                     return Some(el);
                 }
@@ -893,17 +894,15 @@ fn click(selector: String) -> js_sys::Promise {
 
 /// Whether the first matching element is rendered.
 ///
-/// `offsetParent` alone is not enough: it is `null` for `position: fixed`
-/// elements as well as for hidden ones, so a fixed overlay reads as invisible
-/// while plainly on screen. The width fallback separates the two, and matches
-/// the rule [`click_visible`] already used — the two helpers answering the same
-/// question differently is how a test ends up asserting something false.
+/// The rule comes from [`is_rendered`], which the focus trap uses to decide
+/// what it may focus. The two answering the same question differently is how a
+/// test ends up asserting something false.
 fn is_visible(selector: String) -> bool {
     web_sys::window()
         .and_then(|w| w.document())
         .and_then(|d| d.query_selector(&selector).ok().flatten())
         .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
-        .is_some_and(|el| el.offset_parent().is_some() || el.offset_width() > 0)
+        .is_some_and(|el| is_rendered(&el))
 }
 
 /// `document.querySelectorAll(selector).length`.
@@ -982,13 +981,19 @@ fn slow_animations(ms: f64) {
 /// race here would be a flaky test, which is worse than no test. Animations on
 /// descendants are seeked too, since the surface and its contents animate
 /// separately.
-fn sample_animation_at(selector: String, progress: f64) -> JsValue {
+///
+/// Throws when an effect's duration reads back as anything but a number, which
+/// is how `getTiming()` reports `"auto"`. Treating that as zero would seek every
+/// requested progress to the first frame and report the readings as if they
+/// spanned the animation. `getComputedTiming()` is no help: it resolves `"auto"`
+/// to 0, which is the same silence with a number on it.
+fn sample_animation_at(selector: String, progress: f64) -> Result<JsValue, JsValue> {
     let arr = js_sys::Array::new();
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
-        return arr.into();
+        return Ok(arr.into());
     };
     let Some(element) = document.query_selector(&selector).ok().flatten() else {
-        return arr.into();
+        return Ok(arr.into());
     };
 
     // `getAnimations({subtree: true})` — reached through Reflect because web-sys
@@ -1012,13 +1017,14 @@ fn sample_animation_at(selector: String, progress: f64) -> JsValue {
                     .and_then(|f| f.call0(&effect).ok())
             })
             .and_then(|timing| js_sys::Reflect::get(&timing, &"duration".into()).ok())
-            .and_then(|d| d.as_f64())
-            .unwrap_or(0.0);
-        let _ = js_sys::Reflect::set(
-            &animation,
-            &"currentTime".into(),
-            &(duration * progress).into(),
-        );
+            .unwrap_or(JsValue::UNDEFINED);
+        let Some(ms) = duration.as_f64() else {
+            return Err(JsValue::from_str(&format!(
+                "sample_animation_at({selector:?}): an effect's duration read back as \
+                 {duration:?}, so there is no time axis to seek along"
+            )));
+        };
+        let _ = js_sys::Reflect::set(&animation, &"currentTime".into(), &(ms * progress).into());
     }
 
     let opacity = web_sys::window()
@@ -1037,7 +1043,7 @@ fn sample_animation_at(selector: String, progress: f64) -> JsValue {
     ] {
         arr.push(&value.into());
     }
-    arr.into()
+    Ok(arr.into())
 }
 
 /// `getBoundingClientRect()` of the first match as `[x, y, width, height]`,

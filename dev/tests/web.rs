@@ -276,7 +276,11 @@ async fn test_time_slider_reveals_a_demolished_entity() -> TestResult {
 
 /// Every disclosure widget on the page, found by what one already is rather
 /// than by a hand-kept list, so a new overlay inherits its coverage.
-const DISCLOSURE: &str = "[aria-expanded][aria-controls]";
+///
+/// `aria-controls` names a body that is only in the DOM while expanded, so it
+/// disappears under a test that toggles the widget. Each toggle carries an `id`
+/// for that reason, and the battery below fails on one that doesn't.
+const DISCLOSURE: &str = "[aria-expanded]";
 
 /// The image lightbox, named specifically.
 ///
@@ -325,9 +329,26 @@ async fn check_nav_links(t: &WebTest) -> TestResult {
         format!("Nav should show FAQ, got: {faq}"),
     )?;
 
+    // Tab at the end of the cycle wraps back into it instead of walking onto the
+    // page behind the scrim. A synthetic key moves focus only if the trap acts
+    // on it, which makes this the one live exercise of the selector the trap
+    // gathers focusable elements with: an empty match surfaces right here.
+    let last_in_cycle = "#site-nav-drawer a[target='_blank']";
+    t.focus_element(last_in_cycle).await?;
+    t.press_key(last_in_cycle, "Tab").await?;
+    check(
+        t.active_element_attribute("id").await?.as_deref() == Some("site-nav-toggle"),
+        "Tab at the end of the drawer should wrap to the trigger, not out to the page",
+    )?;
+
     // Escape closes the drawer, so the assertions leave the page as they found
     // it and a caller can keep testing the map underneath.
-    t.press_key("#site-nav-drawer", "Escape").await?;
+    //
+    // Pressed at the trigger rather than in the panel, because that is where the
+    // trap's own wrap puts focus: the trigger is the drawer's close control and
+    // sits outside the panel, so a key handler bound to the panel never hears
+    // this one and the dialog cannot be dismissed from the place it sends you.
+    t.press_key("#site-nav-toggle", "Escape").await?;
     check(
         t.attr("button[aria-label='Toggle menu']", "aria-expanded")
             .await?
@@ -682,6 +703,14 @@ async fn test_entity_click_opens_detail() -> TestResult {
                 || panel_text.contains("Wikidata")
                 || panel_text.contains("wikidata"),
             format!("Panel should show external links section, got: {panel_text}"),
+        )?;
+
+        // The map's bottom-left overlays yield to the panel, which on a phone is
+        // a sheet across that whole corner. The time slider draws after the
+        // panel, so one left standing takes the sheet's taps.
+        check(
+            !t.exists("#time-slider-panel-toggle").await?,
+            "the time slider should step aside while the detail panel is open",
         )?;
 
         Ok(())
@@ -1230,9 +1259,9 @@ async fn test_failed_pan_keeps_last_good_render() -> TestResult {
 /// Every disclosure widget holds its toggle still and keeps it reachable.
 ///
 /// Enumerated from the markup rather than named one at a time, so a new overlay
-/// is covered the moment it declares itself — `aria-expanded` + `aria-controls`
-/// is what a disclosure widget already *is*, so there is nothing extra to
-/// remember.
+/// is covered the moment it declares itself: `aria-expanded` is what a
+/// disclosure widget already *is*. The one thing a toggle owes this battery is
+/// an `id`, and a toggle without one fails it by name.
 ///
 /// **Position.** Each of these used to render its collapsed and expanded states
 /// as separate buttons, so the control jumped out from under the pointer on
@@ -1255,19 +1284,18 @@ async fn test_disclosure_toggles_hold_position_and_stay_reachable() -> TestResul
         // reflowing the page around them.
         t.wait_for_fonts().await?;
 
-        let ids: Vec<String> = t
-            .attributes(DISCLOSURE, "aria-controls")
-            .await?
-            .into_iter()
-            .flatten()
-            .collect();
+        let ids = t.attributes(DISCLOSURE, "id").await?;
         check(
             !ids.is_empty(),
             "no disclosure widgets found to check — the enumeration, not the page, is probably wrong",
         )?;
+        check(
+            ids.iter().all(Option::is_some),
+            format!("every disclosure toggle needs an id to be followed across a state change, got {ids:?}"),
+        )?;
 
-        for id in ids {
-            let toggle = format!("[aria-controls='{id}']");
+        for id in ids.into_iter().flatten() {
+            let toggle = format!("#{id}");
 
             let before = t.element_rect(&toggle).await?;
             check(
@@ -1322,7 +1350,7 @@ async fn test_disclosure_toggles_hold_position_and_stay_reachable() -> TestResul
 async fn test_time_slider_bar_matches_its_chip_height() -> TestResult {
     web_test(async |t| {
         t.goto("/").await?;
-        let toggle = "[aria-controls='time-slider-panel']";
+        let toggle = "#time-slider-panel-toggle";
         t.wait_for_selector(toggle).await?;
         // Geometry is only meaningful once the webfonts have stopped
         // reflowing the page around them.
@@ -1363,7 +1391,7 @@ async fn test_time_slider_bar_matches_its_chip_height() -> TestResult {
 async fn test_overlay_card_surface_holds_through_the_opening_animation() -> TestResult {
     web_test(async |t| {
         t.goto("/").await?;
-        let toggle = "[aria-controls='time-slider-panel']";
+        let toggle = "#time-slider-panel-toggle";
         t.wait_for_selector(toggle).await?;
         // Geometry is only meaningful once the webfonts have stopped
         // reflowing the page around them.
@@ -1423,10 +1451,27 @@ async fn test_info_card_dismiss_restore() -> TestResult {
         t.goto("/").await?;
         t.wait_for_selector("#about-card").await?;
 
+        check(
+            t.attr("#about-card-toggle", "aria-controls")
+                .await?
+                .as_deref()
+                == Some("about-card"),
+            "the toggle should point at the body while it is on screen",
+        )?;
+
         // The card's toggle is one button that stays put; only its label and
         // glyph change with state.
         t.click("button[aria-label='Hide the About panel']").await?;
         t.wait_for_selector_removal("#about-card").await?;
+
+        // The body left the DOM, so the reference to it has to go too: an IDREF
+        // to nothing is exactly what a screen reader would try to follow here.
+        check(
+            t.attr("#about-card-toggle", "aria-controls")
+                .await?
+                .is_none(),
+            "the collapsed toggle should not name a body that has left the DOM",
+        )?;
 
         // The "?" restore button should appear (aria-label="About Chronoscope")
         check(
@@ -1477,6 +1522,33 @@ async fn test_error_banner_custom_event() -> TestResult {
         check(
             !t.has_text("Test error message from browser test").await?,
             "Error should be dismissed",
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// An error strip still leaves the About card's toggle usable on a phone.
+///
+/// Both sit at `top-14` below `md`: the strip spans the width at `z-50` and the
+/// toggle is in the corner beneath it, so while any error showed the card could
+/// be neither collapsed nor restored. Reachability is the only assertion that
+/// sees it: the toggle keeps its rect and its place in the DOM either way.
+#[tokio::test]
+async fn test_error_strip_leaves_the_about_toggle_reachable_on_a_phone() -> TestResult {
+    web_test(async |t| {
+        t.set_viewport(375, 667).await?;
+        t.goto("/").await?;
+        t.wait_for_selector("#about-card-toggle").await?;
+
+        t.dispatch_error("Something the reader needs to see")
+            .await?;
+        t.wait_for_selector("[role='alert']").await?;
+
+        check(
+            t.is_hittable("#about-card-toggle").await?,
+            "the About card's toggle should stay reachable while an error strip shows",
         )?;
 
         Ok(())
@@ -1817,23 +1889,22 @@ async fn test_lightbox_opens_and_shows_content() -> TestResult {
         t.click_map_at(lng, lat).await?;
         t.click("[role='complementary'] ul[role='list'] li button")
             .await?;
-        t.wait_for_selector("[role='dialog'][aria-label='Image preview']")
-            .await?;
+        t.wait_for_selector(LIGHTBOX).await?;
 
         let img_src = t
-            .attr("[role=dialog] img", "src")
+            .attr(&format!("{LIGHTBOX} img"), "src")
             .await?
             .unwrap_or_default();
         check(!img_src.is_empty(), "Lightbox image should have a src")?;
 
         check(
-            t.exists("[role='dialog'] button[aria-label='Close preview']")
+            t.exists(&format!("{LIGHTBOX} button[aria-label='Close preview']"))
                 .await?,
             "Lightbox should have a close button",
         )?;
 
         let original_href = t
-            .attr("[role=dialog] a[target=_blank]", "href")
+            .attr(&format!("{LIGHTBOX} a[target=_blank]"), "href")
             .await?
             .unwrap_or_default();
         check(
@@ -1882,7 +1953,7 @@ async fn test_lightbox_dismiss_close_button() -> TestResult {
             .await?;
         t.wait_for_selector(LIGHTBOX).await?;
 
-        t.click("[role='dialog'] button[aria-label='Close preview']")
+        t.click(&format!("{LIGHTBOX} button[aria-label='Close preview']"))
             .await?;
         // Wait for the dialog to disappear (reactive update after signal change).
         t.wait_for_selector_removal(LIGHTBOX).await?;
