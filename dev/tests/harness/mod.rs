@@ -31,7 +31,7 @@ use chronoscope_dev::{
 };
 use chronoscope_workers::RetryConfig;
 use dropshot::ConfigLogging;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::sync::Mutex;
 
 pub type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -67,6 +67,55 @@ fn screenshot_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>>
     })
     .clone()
     .map_err(Into::into)
+}
+
+/// How many orphaned browser processes were already running when this suite
+/// started, sampled once.
+///
+/// A `Timeout` from a wait hook says nothing about *why* the page stalled, and
+/// the usual why is contention: browsers stranded by an earlier run compete for
+/// the CPU and starve the headless event loop. That has cost real diagnosis time
+/// more than once (see `chronoscope-learnings/web-test-timeout-flakes-*.md`), so
+/// the count rides along in every timeout message.
+///
+/// Counted by reparenting, not by name alone: a browser whose parent is `init`
+/// has outlived whatever launched it, while a browser this run started has a
+/// live parent. That distinction is what makes the sample race-free against the
+/// suite's own concurrent tests, which launch a browser each.
+fn orphaned_browsers() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-axo", "ppid=,command="])
+            .output()
+        else {
+            return 0;
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| {
+                let mut parts = line.trim().splitn(2, char::is_whitespace);
+                let orphaned = parts.next().is_some_and(|ppid| ppid.trim() == "1");
+                // The harness launches "Google Chrome for Testing"; a developer's
+                // own Chrome or Chromium does not carry that suffix, so this
+                // cannot mistake an ordinary browser window for a leak.
+                orphaned && parts.next().is_some_and(|cmd| cmd.contains("for Testing"))
+            })
+            .count()
+    })
+}
+
+/// Appended to every timeout so a stall names its most likely cause instead of
+/// leaving the reader to guess.
+fn contention_note() -> String {
+    match orphaned_browsers() {
+        0 => String::new(),
+        n => format!(
+            " ({n} orphaned browser process(es) were already running when this \
+             suite started, which starves the headless event loop \u{2014} \
+             `pkill -f \"for Testing\"` and re-run before suspecting the code)"
+        ),
+    }
 }
 
 /// Launch a headless Chrome browser for a single test.
@@ -506,7 +555,12 @@ impl WebTest {
         let expr = hook_expr(hook, args)?;
         tokio::time::timeout(TIMEOUT, async { self.page.evaluate(expr.as_str()).await })
             .await
-            .map_err(|_| format!("Timeout after {TIMEOUT:?} waiting for hook: {hook}"))?
+            .map_err(|_| {
+                format!(
+                    "Timeout after {TIMEOUT:?} waiting for hook: {hook}{}",
+                    contention_note()
+                )
+            })?
             .map_err(|e| format!("JS error in hook {hook}: {e}"))?;
         Ok(())
     }
@@ -528,7 +582,12 @@ impl WebTest {
             self.page.evaluate(WAIT_FOR_WASM_BOOT_JS).await
         })
         .await
-        .map_err(|_| format!("Timeout after {TIMEOUT:?} waiting for WASM boot"))?
+        .map_err(|_| {
+            format!(
+                "Timeout after {TIMEOUT:?} waiting for WASM boot{}",
+                contention_note()
+            )
+        })?
         .map_err(|e| format!("WASM boot wait failed: {e}"))?;
         Ok(())
     }
@@ -770,9 +829,12 @@ impl WebTest {
                 }
             }
         };
-        tokio::time::timeout(TIMEOUT, poll)
-            .await
-            .map_err(|_| format!("no entity markers rendered within {TIMEOUT:?}"))?
+        tokio::time::timeout(TIMEOUT, poll).await.map_err(|_| {
+            format!(
+                "no entity markers rendered within {TIMEOUT:?}{}",
+                contention_note()
+            )
+        })?
     }
 }
 
@@ -802,7 +864,29 @@ async fn run_web_test(
     test: impl AsyncFnOnce(&WebTest) -> TestResult,
 ) -> TestResult {
     let t = WebTest::new(seed_commits).await?;
-    let result = test(&t).await;
+
+    // A panicking test must still reach the graceful `close()` below, so the
+    // panic is caught and turned into an ordinary failure.
+    //
+    // Without this the unwind skips `close()`, and chromiumoxide's fallback is
+    // tokio's `kill_on_drop` — a SIGKILL to Chrome's top-level process. Chrome
+    // reaps its own renderers when asked to shut down and cannot when it is
+    // killed outright, so every panicking test used to strand a handful of
+    // renderer processes. They accumulate across runs, and a later gate
+    // competing with them starves the headless event loop until a wait times
+    // out, which reads as a flaky browser test rather than as a leak.
+    let result = match std::panic::AssertUnwindSafe(test(&t)).catch_unwind().await {
+        Ok(result) => result,
+        Err(panic) => {
+            // `Box<dyn Any>`: the message is behind one of two concrete types.
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic with a non-string payload".to_string());
+            Err(format!("test panicked: {message}").into())
+        }
+    };
 
     // Capture diagnostics before closing if the test failed
     if result.is_err() {

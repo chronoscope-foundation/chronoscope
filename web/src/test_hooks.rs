@@ -972,7 +972,7 @@ fn sample_animation_at(selector: String, progress: f64) -> JsValue {
         .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
         .and_then(|f| f.call1(&element, &opts).ok())
         .and_then(|v| v.dyn_into::<js_sys::Array>().ok())
-        .unwrap_or_else(js_sys::Array::new);
+        .unwrap_or_default();
 
     for animation in animations.iter() {
         let duration = js_sys::Reflect::get(&animation, &"effect".into())
