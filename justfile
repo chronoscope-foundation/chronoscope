@@ -93,6 +93,11 @@ check target="all":
     {{ _ensure_nix }}
     _ensure_nix
     SYS=$(nix eval --impure --expr 'builtins.currentSystem' --raw)
+    # Hashed before the checks read the tree, not after. The marker asserts
+    # "this exact tree passed", and hashing at the end would let an edit made
+    # during a run — normal enough on a gate this long — be certified by checks
+    # that never saw it.
+    CHECKED_HASH=$(.claude/hooks/tree-hash.sh)
     case "{{ target }}" in
         all)
             nix flake check
@@ -138,10 +143,14 @@ check target="all":
             ;;
     esac
     mkdir -p .claude
-    HASH=$(.claude/hooks/tree-hash.sh)
+    if [[ "$CHECKED_HASH" != "$(.claude/hooks/tree-hash.sh)" ]]; then
+        echo "note: the tree changed while the checks ran." >&2
+        echo "      the marker records the tree that was actually checked, so the" >&2
+        echo "      pre-commit hook will prompt until you re-run against this one." >&2
+    fi
     cat > .claude/last-check.json <<EOF
     {
-      "hash": "$HASH",
+      "hash": "$CHECKED_HASH",
       "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
       "target": "{{ target }}"
     }
