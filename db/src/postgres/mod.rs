@@ -5,8 +5,8 @@
 //!
 //! One writable database, no base/overlay union: every read names its tables
 //! directly and every query is a plain constant (see the `queries` module). The
-//! json columns are `JSONB`; the shared [`crate::common::storage`] string codecs
-//! bind through a `$N::jsonb` cast and read back through `col::text`.
+//! json columns are `JSONB`; the shared `common::storage` string codecs bind
+//! through a `$N::jsonb` cast and read back through `col::text`.
 //!
 //! ## Transactions
 //!
@@ -33,7 +33,7 @@
 //! Morton range and folds each range through core's shared cell fold. The
 //! `InViewport` walks query `facts_spatial`'s `GiST` index once per viewport half
 //! and hand the candidates to the shared membership decision
-//! ([`crate::common::spatial`]).
+//! (`common::spatial`).
 //!
 //! ## Not implemented
 //!
@@ -43,10 +43,14 @@
 //! other backends.
 
 mod error;
-mod harness;
 mod maintain;
 mod queries;
 mod read;
+
+// Stands up a throwaway cluster by shelling out to initdb/pg_ctl, so it belongs
+// to the test build alone.
+#[cfg(test)]
+mod harness;
 
 #[cfg(test)]
 mod tests;
@@ -69,7 +73,7 @@ use chronoscope_core::store::{
 };
 use chronoscope_core::submit::{FactLookup, StoredCommit, StoredFact, SubmitResult};
 
-pub(crate) use self::error::PostgresFactStoreError;
+pub use self::error::PostgresFactStoreError;
 
 use crate::common::convert::{i64_to_u64, u64_to_i64};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
@@ -94,13 +98,13 @@ type Error = PostgresFactStoreError;
 /// Postgres implementation of [`FactStore`] over one writable database. The pool
 /// is `Arc`-backed (sqlx), so cloning the store is cheap.
 #[derive(Debug, Clone)]
-pub(crate) struct PostgresFactStore {
+pub struct PostgresFactStore {
     pool: PgPool,
 }
 
 impl PostgresFactStore {
     /// Wrap a pool over an already-migrated fact-store database.
-    pub(crate) fn new(pool: PgPool) -> Self {
+    pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
@@ -108,6 +112,12 @@ impl PostgresFactStore {
     #[cfg(test)]
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Close the pool, awaiting each connection's teardown so every session
+    /// terminates cleanly on the server before the process exits.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 }
 
@@ -117,28 +127,28 @@ impl PostgresFactStore {
 
 /// A committed read view's connection: an owned read transaction, rolled back
 /// (returning its connection to the pool) on drop.
-pub(crate) struct ViewTx(Transaction<'static, Postgres>);
+pub struct ViewTx(Transaction<'static, Postgres>);
 
 /// The `with_tx` write handle's connection, borrowed from the transaction the
 /// frame owns and must recover to commit. `'t` is [`PostgresTx`]'s brand; the
 /// marker pins this handle type's own invariance in it as defense in depth,
 /// with the cross-store mechanism documented in [`chronoscope_core::store`].
-pub(crate) struct FrameConn<'t>(&'t mut PgConnection, PhantomData<fn(&'t ()) -> &'t ()>);
+pub struct FrameConn<'t>(&'t mut PgConnection, PhantomData<fn(&'t ()) -> &'t ()>);
 
 /// A submit scope's connection: an owned savepoint transaction nested in the
 /// write transaction.
-pub(crate) struct ScopeTx<'n>(Transaction<'n, Postgres>);
+pub struct ScopeTx<'n>(Transaction<'n, Postgres>);
 
 /// The connection behind a handle. Transactions are connection-scoped, so a
 /// handle is one connection for its lifetime either way; the three forms differ
 /// only in ownership.
-pub(crate) trait AsConn: conn_sealed::Sealed + Send + Sync {
+pub trait AsConn: conn_sealed::Sealed + Send + Sync {
     fn conn(&mut self) -> &mut PgConnection;
 }
 
 /// The connection forms carrying the write surface: [`FactWrite`] exists only
 /// over these, so a read view lacks the write methods at compile time.
-pub(crate) trait WriteConn: AsConn {}
+pub trait WriteConn: AsConn {}
 
 mod conn_sealed {
     pub trait Sealed {}
@@ -177,7 +187,7 @@ impl WriteConn for ScopeTx<'_> {}
 /// trait (orphan rule); this one concrete type carries each view-trait impl once
 /// for every connection form, and keeps its fields private so handles come only
 /// from the store.
-pub(crate) struct PostgresHandle<C> {
+pub struct PostgresHandle<C> {
     conn: C,
     /// The read scope — the snapshot bound.
     bound: ReadBound,
@@ -185,11 +195,11 @@ pub(crate) struct PostgresHandle<C> {
 
 /// Snapshot-scoped read view: an owned read transaction plus the pinned
 /// exclusive upper bound.
-pub(crate) type PostgresFactView = PostgresHandle<ViewTx>;
+pub type PostgresFactView = PostgresHandle<ViewTx>;
 
 /// Branded transaction handle for [`PostgresFactStore`] — the [`FactWrite`]
 /// surface over one open transaction.
-pub(crate) type PostgresTx<'brand> = PostgresHandle<FrameConn<'brand>>;
+pub type PostgresTx<'brand> = PostgresHandle<FrameConn<'brand>>;
 
 /// Refuse the transaction if any visible `facts` row is unclaimed — committed
 /// state never holds one, so a hit is this transaction's own staging that no

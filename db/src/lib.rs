@@ -7,11 +7,8 @@ mod common;
 pub mod error;
 pub mod media_store;
 pub mod models;
-// Postgres fact-store backend. Nothing wires it into production yet (that is a
-// later milestone), so it is exercised only by its own conformance suite and
-// stays test-only behind the `postgres` feature until a consumer needs it.
-#[cfg(all(test, feature = "postgres"))]
-mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 pub mod queries;
 pub mod queue;
 pub(crate) mod row;
@@ -37,6 +34,8 @@ pub use models::{
     FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
     ResolvedContent, ResolvedTarget, User,
 };
+#[cfg(feature = "postgres")]
+pub use postgres::{PostgresFactStore, PostgresFactStoreError};
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use sqlite::{
     FACTS_CODEC_VERSION, FactStoreLocations, FactsFileError, SqliteFactStore, SqliteFactStoreError,

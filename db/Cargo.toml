@@ -17,9 +17,8 @@ workspace = true
 # depending on it.
 test-support = []
 
-# Postgres backend. Currently only powers the ephemeral-cluster smoke test
-# (an infra de-risking spike); the production backend rides on top later.
-# Off by default — the SQLite backend is the only one wired into `Database`.
+# Postgres fact-store backend. Off by default — the SQLite backend is the only
+# one wired into `Database`, and enabling this pulls sqlx's postgres driver in.
 postgres = ["sqlx/postgres"]
 
 [dependencies]
