@@ -138,7 +138,7 @@ fn AboutCard() -> impl IntoView {
                             ": a date like \u{201c}circa 1920s\u{201d} stays vague until evidence narrows it. No false precision."</p>
                         <p><span class="text-copper font-semibold">"Pervasive citations"</span>
                             ": every assertion points back to the photograph, map, or record behind it."</p>
-                        <p><span class="text-copper font-semibold">"Evidence compounds"</span>
+                        <p><span class="text-copper font-semibold">"Compounding evidence"</span>
                             ": one dated photograph bounds everything else in it. Claims that can\u{2019}t hold simultaneously are flagged for review."</p>
                     </div>
                 </div>
