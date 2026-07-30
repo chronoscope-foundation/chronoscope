@@ -1953,6 +1953,54 @@ async fn get_tile_reports_existence_at_the_requested_instant() -> TestResult {
     Ok(())
 }
 
+/// `NaiveDate`'s `Display` writes a negative year as `-0400-07-01`, and the
+/// time slider reaches back to 2000 BCE, so its whole ancient band depends on
+/// that form surviving the client's query string and the server's serde parse.
+///
+/// Two probes either side of the demolition. A param that never arrived, whether
+/// dropped or rejected and defaulted, reads as today, which is also absent, so
+/// only the pair pins the instant that actually landed.
+#[tokio::test]
+async fn get_tile_reports_existence_at_a_bce_instant() -> TestResult {
+    let ctx = TestContext::new().await?;
+    let (lat, lon) = (37.9715, 23.7257);
+    commit_demolished_entity_at(&ctx.app_state.facts, "Old Temple", lat, lon, -500, -200).await?;
+    let (x, y) = container_tile(lat, lon, 10);
+
+    let during: TileResponse<EntityId> = ctx
+        .client
+        .fetch_tile(
+            10,
+            x,
+            y,
+            None,
+            Some(NaiveDate::from_ymd_opt(-400, 7, 1).ok_or("date")?),
+        )
+        .await?;
+    assert_eq!(
+        during.markers.first().and_then(|m| m.existence),
+        Some(ExistenceState::Uncontested),
+        "the temple stood in 400 BCE, and no source denies it"
+    );
+
+    let after: TileResponse<EntityId> = ctx
+        .client
+        .fetch_tile(
+            10,
+            x,
+            y,
+            None,
+            Some(NaiveDate::from_ymd_opt(-100, 7, 1).ok_or("date")?),
+        )
+        .await?;
+    assert_eq!(
+        after.markers.first().and_then(|m| m.existence),
+        Some(ExistenceState::Absent),
+        "the 200 BCE demolition denies existence in 100 BCE"
+    );
+    Ok(())
+}
+
 /// A shared pin shows while any co-located member may have stood, so it reports
 /// the most present member's verdict.
 #[tokio::test]

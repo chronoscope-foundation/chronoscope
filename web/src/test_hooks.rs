@@ -29,6 +29,7 @@ use wasm_bindgen::prelude::*;
 use crate::api::Client;
 use crate::components::map::{FETCH_COMPLETE_EVENT, MAP_READY_EVENT, current_fetch_settled};
 use crate::maplibre;
+use crate::time_scale::{TimeScale, era_label};
 
 // ==================== Hook storage ====================
 //
@@ -776,7 +777,9 @@ fn click_and_wait_for_fetch(selector: String) -> js_sys::Promise {
 ///
 /// Sets the range input's value and dispatches the `input` event the component
 /// listens for, so the test exercises the same path a user's drag does rather
-/// than poking the signal behind it.
+/// than poking the signal behind it. The input carries track units, so the year
+/// goes through the same scale the component uses, built from the axis's own
+/// `data-max-year`.
 fn set_time_slider_year(year: f64) -> js_sys::Promise {
     wasm_bindgen_futures::future_to_promise(async move {
         let prev = current_fetch_settled();
@@ -788,14 +791,39 @@ fn set_time_slider_year(year: f64) -> js_sys::Promise {
         let Some(input) = input else {
             return Err(JsValue::from_str("time slider input not found"));
         };
+        let max_year = input
+            .get_attribute("data-max-year")
+            .and_then(|attr| attr.parse::<i32>().ok());
+        let Some(max_year) = max_year else {
+            return Err(JsValue::from_str(
+                "set_time_slider_year: the slider carries no numeric data-max-year to build its scale from",
+            ));
+        };
+        let scale = TimeScale::new(max_year);
+        let requested = year as i32;
+        let unit = scale.position(requested);
+        let landed = scale.year(unit);
+        // Only the photographic band resolves to the year; before it the axis
+        // steps 2 years, and before 1500, 20. A test that named a year off that
+        // grid would assert about an instant the map never showed, and would
+        // report the year it asked for rather than the one it got. Refuse it
+        // here, where the year is still in hand, and name the one to use.
+        if landed != requested {
+            return Err(JsValue::from_str(&format!(
+                "set_time_slider_year: the axis has no position for {}, whose band steps to {}",
+                era_label(requested),
+                era_label(landed)
+            )));
+        }
+        let target = unit.0.to_string();
         // A year the slider already holds arms no refetch, so awaiting the
         // settled counter would hang until timeout instead of returning. Report
         // it as an error the test can read rather than a mysterious stall.
-        let target = (year as i64).to_string();
         if input.value() == target {
-            return Err(JsValue::from_str(
-                "set_time_slider_year: the slider is already at that year, so no refetch would follow",
-            ));
+            return Err(JsValue::from_str(&format!(
+                "set_time_slider_year: the slider is already at {}, so no refetch would follow",
+                era_label(landed)
+            )));
         }
         input.set_value(&target);
         // Dispatched on the input itself, which is where Leptos attached the

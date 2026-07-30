@@ -6,6 +6,7 @@ mod markdown;
 mod pages;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
+mod time_scale;
 
 use leptos::mount::mount_to_body;
 

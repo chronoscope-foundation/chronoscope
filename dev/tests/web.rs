@@ -220,6 +220,16 @@ async fn test_time_slider_reveals_a_demolished_entity() -> TestResult {
             "rewinding past the construction date must hide it again",
         )?;
 
+        // Deep into the ancient band, where a track unit is 20 years: the readout
+        // must name the era, since a bare "500" reads as 500 CE. Units to year to
+        // label, end to end.
+        t.set_time_slider_year(-500.0).await?;
+        let ancient = t.text("#time-slider-year").await?;
+        check(
+            ancient.trim() == "500 BCE",
+            format!("scrubbing to 500 BCE must read as '500 BCE', got: {ancient:?}"),
+        )?;
+
         // Back into its life, so the reset below has something to take away —
         // asserting emptiness from an already-empty view would pass no matter
         // where the reset landed.
@@ -234,28 +244,29 @@ async fn test_time_slider_reveals_a_demolished_entity() -> TestResult {
         // year. This is the gesture that replaced a "Now" button — the button did
         // nothing the track's own end doesn't.
         //
-        // The target comes from the track's own `max`, not from `Utc::now()`.
-        // The component derives its maximum from the *browser's local* date, so
-        // across a UTC/local year boundary a UTC-derived year exceeds `max`, the
-        // input silently clamps, and the assertion fails on the wall clock —
-        // inside the commit gate, which is exactly where that is disqualifying.
+        // The target comes from the axis's own `data-max-year`, not from
+        // `Utc::now()`. The component derives its right edge from the *browser's
+        // local* date, so across a UTC/local year boundary a UTC-derived year
+        // exceeds the axis, the scale clamps it, and the assertion fails on the
+        // wall clock — inside the commit gate, which is exactly where that is
+        // disqualifying. `max` counts track units now, so the year has an
+        // attribute of its own.
         let max_year: i32 = t
-            .attr("#time-slider", "max")
+            .attr("#time-slider", "data-max-year")
             .await?
             .unwrap_or_default()
             .parse()
-            .map_err(|e| format!("the slider should carry a numeric max: {e}"))?;
-        let this_year = max_year;
-        t.set_time_slider_year(f64::from(this_year)).await?;
+            .map_err(|e| format!("the slider should carry a numeric data-max-year: {e}"))?;
+        t.set_time_slider_year(f64::from(max_year)).await?;
         check(
             rendered_features(t).await?.is_empty(),
             "scrubbing to the present must show the map as it is today, where the entity is absent",
         )?;
         let shown_year = t.text("#time-slider-year").await?;
         check(
-            shown_year.trim() == this_year.to_string(),
+            shown_year.trim() == max_year.to_string(),
             format!(
-                "at the track's right edge the slider must read {this_year}, got: {shown_year:?}"
+                "at the track's right edge the slider must read {max_year}, got: {shown_year:?}"
             ),
         )?;
         Ok(())
@@ -738,11 +749,12 @@ async fn test_chioggia_existence_after_demolition_conflict() -> TestResult {
     web_test(async |t| {
         t.goto_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1, 14.0)
             .await?;
-        // Rewind into the disputed era — after the demolition, at the 1633
-        // witness — where the cathedral is exactly the contested pin this test is
+        // Rewind into the disputed era — after the demolition, onto the grid year
+        // beside the 1633 witness, since the early modern band steps two years at
+        // a time — where the cathedral is exactly the contested pin this test is
         // about. (The 1633 refounding refutes the 1623 demolition, so the pin
         // draws contested at every later instant, the present day included.)
-        t.set_time_slider_year(1633.0).await?;
+        t.set_time_slider_year(1634.0).await?;
         t.click_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1)
             .await?;
         t.wait_for_selector("[role='complementary']").await?;
