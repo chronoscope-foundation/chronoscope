@@ -4,6 +4,7 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_location;
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd, html};
 
+use crate::components::nav::NAV_CLEARANCE;
 use crate::markdown::expand_snippets;
 
 const FAQ_MARKDOWN: &str = include_str!("../../content/faq.md");
@@ -277,8 +278,7 @@ pub fn Faq() -> impl IntoView {
     let categories = parse_faq(&expanded);
 
     view! {
-        // `pt-20` clears the floating nav trigger, matching `MarkdownArticle`.
-        <section class="px-6 pt-20 pb-12 max-w-3xl mx-auto">
+        <section class=format!("px-6 pb-12 max-w-3xl mx-auto {NAV_CLEARANCE}")>
             <h1 class="text-3xl font-bold mb-10">"Frequently Asked Questions"</h1>
 
             {categories.into_iter().map(|cat| view! {

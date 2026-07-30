@@ -3,7 +3,7 @@ use leptos_router::components::*;
 use leptos_router::path;
 
 use crate::components::error_banner::ErrorBanner;
-use crate::components::nav::Nav;
+use crate::components::nav::{NAV_CLEARANCE, Nav};
 use crate::pages::about::About;
 use crate::pages::faq::Faq;
 use crate::pages::landing::Landing;
@@ -28,7 +28,7 @@ pub fn App() -> impl IntoView {
                 // text node here rendered underneath it, leaving a mistyped URL
                 // looking like a blank page.
                 <Routes fallback=|| view! {
-                    <p class="px-6 pt-20 text-sepia font-sans">"Not found."</p>
+                    <p class=format!("px-6 text-sepia font-sans {NAV_CLEARANCE}")>"Not found."</p>
                 }>
                     <Route path=path!("/") view=Landing/>
                     <Route path=path!("/about") view=About/>

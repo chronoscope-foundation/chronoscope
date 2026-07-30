@@ -7,13 +7,23 @@
     <meta name="description" content="Connecting places through time. A spatiotemporal knowledge graph that tracks how buildings and places change across history, with evidence-backed assertions and full provenance." />
     <!-- TODO: Add favicon once logo is designed -->
 
-    <!-- Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Cormorant:wght@600;700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&display=swap"
-      rel="stylesheet"
-    />
+    <!-- Fonts, self-hosted. Built, subsetted and converted to woff2 by
+         nix/web.nix, which also generates fonts.css with the per-range
+         @font-face rules. Serving them same-origin keeps a third-party request
+         off the critical path, keeps visitors' IPs out of Google's logs, and
+         lets the browser tests measure the same layout a reader gets.
+
+         The dev server gets these from a Trunk post_build hook and the
+         production dist straight from nix; neither keeps a copy in the repo.
+
+         Only the latin subsets are preloaded; latin-ext is fetched on demand,
+         which is what the per-range split is for. The preloads matter: without
+         them the first paint uses a fallback face and the page reflows when the
+         real one lands (~15 px on the wordmark). -->
+    <link rel="stylesheet" href="fonts/fonts.css" />
+    <link rel="preload" href="fonts/source-serif-4-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="fonts/dm-sans-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="fonts/cormorant-latin.woff2" as="font" type="font/woff2" crossorigin />
 
     <!-- MapLibre GL JS -->
     <script src="https://unpkg.com/maplibre-gl@5.1.0/dist/maplibre-gl.js"

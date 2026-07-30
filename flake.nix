@@ -254,6 +254,9 @@
 
         webEnv = {
           WEB_DIST = web.packages.web-test;
+          # Trunk's pre_build hook stages these into web/fonts so the dev server
+          # serves exactly what the production dist does.
+          CHRONOSCOPE_WEB_FONTS = web.packages.web-fonts;
           # chromiumoxide picks up CHROME as the executable path.
           CHROME = chromeHeadlessBin;
           # The read-only facts DB the dev servers and browser tests mount (a

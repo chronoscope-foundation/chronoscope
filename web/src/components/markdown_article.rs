@@ -2,6 +2,7 @@
 
 use leptos::prelude::*;
 
+use crate::components::nav::NAV_CLEARANCE;
 use crate::markdown::{expand_snippets, md_to_html};
 
 /// The article shell the static content pages share: a centered prose column
@@ -11,9 +12,7 @@ pub fn MarkdownArticle(title: &'static str, markdown: &'static str) -> impl Into
     let html_content = md_to_html(&expand_snippets(markdown));
 
     view! {
-        // `pt-20` clears the floating nav trigger, which overlays the page at
-        // `top-3` and stands 44 px tall.
-        <article class="px-6 pt-20 pb-12 max-w-3xl mx-auto prose-chronoscope">
+        <article class=format!("px-6 pb-12 max-w-3xl mx-auto prose-chronoscope {NAV_CLEARANCE}")>
             <h1 class="text-3xl font-bold mb-8">{title}</h1>
             <div inner_html=html_content></div>
         </article>

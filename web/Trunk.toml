@@ -13,3 +13,19 @@ dist = "../target/web-dist"
 stage = "pre_build"
 command = "tailwindcss"
 command_arguments = ["-i", "input.css", "-o", "tailwind.css"]
+
+# Copy the nix-built fonts into the build output. Staged rather than copied into
+# the source tree: `copy-dir` would read from `web/`, which means keeping a copy
+# of the fonts in the repo that can disagree with what nix built. This way both
+# the dev server and the production dist read the same store path.
+#
+# Fails loudly if the variable is unset, which means trunk ran outside the nix
+# shell. The staging directory is fresh per build, so there is nothing stale to
+# clear first.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = [
+  "-c",
+  "mkdir -p \"$TRUNK_STAGING_DIR/fonts\" && cp \"$CHRONOSCOPE_WEB_FONTS\"/* \"$TRUNK_STAGING_DIR/fonts/\"",
+]

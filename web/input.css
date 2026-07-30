@@ -14,6 +14,10 @@
   --color-amber-deep: #8c4a13;
 
   --font-serif: "Source Serif 4", Georgia, serif;
+  /* One glyph, U+2767, subsetted out of Noto Sans Symbols 2 by nix/web.nix.
+     Source Serif carries no such mark, so without this the ornament falls back
+     to whatever the platform provides and looks different on every OS. */
+  --font-ornament: "Chronoscope Ornaments", serif;
   --font-sans: "DM Sans", system-ui, sans-serif;
   --font-display: "Cormorant", Georgia, serif;
 }

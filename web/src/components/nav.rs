@@ -5,6 +5,16 @@ use crate::components::controls::{FOCUS_RING, SURFACE};
 use crate::components::focus_trap::contain_tab;
 use crate::components::motion::{SCRIM, SLIDE};
 
+/// Top padding a scrolling page needs to clear the floating nav trigger.
+///
+/// Exported because the trigger is `fixed`: it reserves no space, so every route
+/// that renders content at the top of the viewport has to leave room for it by
+/// hand. Naming it here — where the trigger's own geometry lives — is what keeps
+/// the next route from forgetting. Two of the three existing sites had already
+/// been missed once, which is how a mistyped URL ended up rendering "Not found."
+/// underneath an opaque pill.
+pub const NAV_CLEARANCE: &str = "pt-20";
+
 const NAV_LINK_CLASS: &str = "block px-3 py-2 rounded-md text-sm font-sans font-medium text-sepia hover:text-ink hover:bg-ink/5 transition-colors";
 
 /// The site's navigation: a floating trigger and the drawer it opens.
@@ -191,7 +201,8 @@ pub fn Nav() -> impl IntoView {
                     <p
                         aria-hidden="true"
                         class="text-center text-sepia/40 text-base leading-none mb-[0.75em] \
-                               tracking-[0.35em] pl-[4.5625rem] pr-[2.8rem] select-none"
+                               tracking-[0.35em] pl-[4.5625rem] pr-[2.8rem] select-none \
+                               font-ornament"
                     >
                         "\u{2014}\u{00a0}\u{2767}\u{00a0}\u{2014}"
                     </p>
