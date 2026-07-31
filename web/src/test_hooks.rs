@@ -266,6 +266,7 @@ pub fn register_map_hooks(
             let (inner, outer) = crate::components::map::unevidenced_ring_band();
             JsValue::from(js_sys::Array::of2(&inner.into(), &outer.into()))
         },
+        thumbnail_dot_drop: crate::components::map::screen_thumbnail_dot_drop,
         offset_lnglat: {
             let h = map_handle.clone();
             move |lng: f64, lat: f64, dx: f64, dy: f64| {

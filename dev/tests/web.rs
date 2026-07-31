@@ -152,6 +152,56 @@ fn seed_entity_at(name: &str, lat: f64, lon: f64) -> SeedResult {
     })
 }
 
+/// The facts that hang a photograph on the entity at `EntityIdx(0)`: a source
+/// for the image, and the judgment that it depicts the entity. A commit carrying
+/// them declares `images: vec![Decl::Local]`.
+///
+/// The photo's bytes are never fetched: the harness resolves every fact-store
+/// image to a placeholder, which is what puts a thumbnail on the marker.
+fn photograph_facts() -> Result<Vec<SubmitFact>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(vec![
+        SubmitFact::Factual {
+            assertion: FactualAssertion::Image {
+                fact: image::Fact::Source {
+                    image: ImageIdx(0),
+                    url: url::Url::parse("https://example.com/seed-photo.jpg")?,
+                },
+            },
+            citation: seed_citation("https://example.com/seed-photo")?,
+        },
+        SubmitFact::Judgment {
+            assertion: JudgmentAssertion::Depiction {
+                fact: depiction::Fact {
+                    entity: EntityIdx(0),
+                    image: ImageIdx(0),
+                    localization: None,
+                    perspective: Some(Perspective::Exterior),
+                },
+            },
+            citation: JudgmentSource::External {
+                source: ExternalSource::Url {
+                    url: url::Url::parse("https://example.com/seed-photo")?,
+                    published: None,
+                },
+            },
+        },
+    ])
+}
+
+/// A commit placing one named, photographed entity at `(lat, lon)`.
+fn seed_photographed_entity_at(name: &str, lat: f64, lon: f64) -> SeedResult {
+    let mut facts = name_and_location_facts(name, lat, lon)?;
+    facts.extend(photograph_facts()?);
+    Ok(Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("seed")?),
+        recorded_at: chrono::Utc::now(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: facts.into_iter().collect(),
+    })
+}
+
 /// A commit placing one named, photographed entity at `(lat, lon)` whose
 /// sources disagree about whether it still stands: a demolition, and a witness
 /// that saw it afterwards.
@@ -185,34 +235,7 @@ fn seed_disputed_photographed_entity_at(
         },
         citation: seed_citation("https://example.com/seed-witness")?,
     });
-    // The photo's bytes are never fetched: the harness resolves every
-    // fact-store image to a placeholder, which is what puts a thumbnail on the
-    // marker.
-    facts.push(SubmitFact::Factual {
-        assertion: FactualAssertion::Image {
-            fact: image::Fact::Source {
-                image: ImageIdx(0),
-                url: url::Url::parse("https://example.com/seed-photo.jpg")?,
-            },
-        },
-        citation: seed_citation("https://example.com/seed-photo")?,
-    });
-    facts.push(SubmitFact::Judgment {
-        assertion: JudgmentAssertion::Depiction {
-            fact: depiction::Fact {
-                entity: EntityIdx(0),
-                image: ImageIdx(0),
-                localization: None,
-                perspective: Some(Perspective::Exterior),
-            },
-        },
-        citation: JudgmentSource::External {
-            source: ExternalSource::Url {
-                url: url::Url::parse("https://example.com/seed-photo")?,
-                published: None,
-            },
-        },
-    });
+    facts.extend(photograph_facts()?);
     Ok(Commit::<ServerIds> {
         author: CommitAuthor::User(UserId::new("seed")?),
         recorded_at: chrono::Utc::now(),
@@ -747,6 +770,11 @@ async fn test_map_loads_entities() -> TestResult {
     .await
 }
 
+/// The symbol layer thumbnail rasters draw on. It is also the only layer a
+/// photographed marker is hit-tested by, since the circle layers filter
+/// thumbnails out.
+const ENTITY_THUMBNAILS_LAYER: &str = "entity-thumbnails";
+
 /// Locks in the entity-thumbnails layer being drawn above entity-labels.
 /// Without this ordering, label text from one cluster occludes the
 /// thumbnail of an adjacent cluster (visually broken). The fix is in
@@ -765,12 +793,12 @@ async fn test_thumbnails_layer_above_labels() -> TestResult {
             .ok_or("entity-labels layer not found")?;
         let thumbs_idx = layers
             .iter()
-            .position(|l| l == "entity-thumbnails")
+            .position(|l| l == ENTITY_THUMBNAILS_LAYER)
             .ok_or("entity-thumbnails layer not found")?;
         check(
             thumbs_idx > labels_idx,
             format!(
-                "entity-thumbnails ({thumbs_idx}) must be drawn above entity-labels \
+                "{ENTITY_THUMBNAILS_LAYER} ({thumbs_idx}) must be drawn above entity-labels \
                  ({labels_idx}); layer order: {layers:?}"
             ),
         )?;
@@ -2626,6 +2654,76 @@ async fn test_map_shows_thumbnail_markers() -> TestResult {
         )?;
 
         t.screenshot("test_map_shows_thumbnail_markers").await?;
+        Ok(())
+    })
+    .await
+}
+
+/// A thumbnail's location dot sits on the coordinate it marks.
+///
+/// The raster's canvas runs on past the dot to hold its drop shadow, so the
+/// bottom anchor alone stands that padding on the point and floats the dot above
+/// the place it stands for.
+///
+/// Where the raster landed is only visible in the pixels it answers a hit test
+/// for: the feature's geometry projects to the coordinate however the icon is
+/// placed, so a screen position read off a marker descriptor passes either way.
+#[tokio::test]
+async fn test_a_thumbnails_location_dot_sits_on_its_coordinate() -> TestResult {
+    let seeds = vec![seed_photographed_entity_at("Harbour Light", 25.0, -40.0)?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_with_thumbnails(-40.0, 25.0, 12.0).await?;
+
+        // The premise: this marker is a photograph. A bare dot draws on the
+        // circle layers, which sit on the coordinate to begin with, and the
+        // assertion below would say nothing about a raster's placement.
+        let markers = t.marker_properties().await?;
+        let marker = markers
+            .iter()
+            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some("Harbour Light"))
+            .ok_or_else(|| format!("the seeded light must render a marker, got {markers:?}"))?;
+        check(
+            marker.get("thumbnail").is_some(),
+            format!("the seeded light must render as a thumbnail, got {marker:?}"),
+        )?;
+
+        // Half the raster's reach below the coordinate: the lower half of the
+        // dot once the drop lands it on the point, and clear of the raster
+        // altogether while the canvas foot is standing there.
+        let dot_drop = t.thumbnail_dot_drop().await?;
+        check(
+            dot_drop > 0.0,
+            format!("the canvas below the dot is what the drop corrects, got {dot_drop}"),
+        )?;
+        let point = t.offset_lnglat(-40.0, 25.0, 0.0, dot_drop / 2.0).await?;
+        let (lng, lat) = (
+            *point.first().ok_or("offset coordinate missing lng")?,
+            *point.get(1).ok_or("offset coordinate missing lat")?,
+        );
+
+        let layers = t.marker_layers_at(lng, lat).await?;
+        check(
+            layers.iter().any(|l| l == ENTITY_THUMBNAILS_LAYER),
+            format!(
+                "{}px below the coordinate must be the photograph's own dot, got {layers:?}",
+                dot_drop / 2.0
+            ),
+        )?;
+
+        // The far side of the same edge. Probing at a fraction of the drop moves
+        // with the drop, so a drop of any size passes that test alone; this one
+        // holds the raster's foot to the size the geometry says it is.
+        let past = dot_drop * 1.5;
+        let point = t.offset_lnglat(-40.0, 25.0, 0.0, past).await?;
+        let (lng, lat) = (
+            *point.first().ok_or("offset coordinate missing lng")?,
+            *point.get(1).ok_or("offset coordinate missing lat")?,
+        );
+        let layers = t.marker_layers_at(lng, lat).await?;
+        check(
+            !layers.iter().any(|l| l == ENTITY_THUMBNAILS_LAYER),
+            format!("{past}px below the coordinate is past the raster's foot, got {layers:?}"),
+        )?;
         Ok(())
     })
     .await

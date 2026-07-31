@@ -752,6 +752,9 @@ impl WebTest {
         // band its verdict ring has to itself, read off the radii the renderer
         // draws it from.
         pub query unevidenced_ring_band() -> Vec<f64>;
+        // How far past its coordinate a thumbnail's raster reaches, in CSS
+        // pixels: the drop that lands the location dot on the point.
+        pub query thumbnail_dot_drop() -> f64;
         // The coordinate `dx`/`dy` CSS pixels from the given one, so a test can
         // aim past a marker's disc and onto its ring.
         pub query offset_lnglat(lng: f64, lat: f64, dx: f64, dy: f64) -> Vec<f64>;

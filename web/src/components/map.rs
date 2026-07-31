@@ -589,19 +589,53 @@ fn ring_icon_image(size: RingSize) -> serde_json::Value {
     })
 }
 
+/// `icon-size` on the marker symbol layers, and the divisor an offset in screen
+/// pixels has to carry: MapLibre multiplies `icon-offset` by the icon's size, so
+/// an offset written for the screen divides it back out.
+const MARKER_ICON_SIZE: f64 = 1.0;
+
+/// An `icon-offset` moving the icon `y` CSS pixels down the screen, negative
+/// being up, as MapLibre reads the axis.
+fn icon_offset_y(y: f64) -> serde_json::Value {
+    // A bare array reads as an expression, so the offset has to be quoted.
+    json!(["literal", [0.0, y / MARKER_ICON_SIZE]])
+}
+
 /// Where a ring sits relative to the feature's anchor, in CSS pixels. A dot
-/// rings the coordinate itself; a thumbnail's disc floats above it, since
-/// `icon-anchor: bottom` stands the raster's foot on the point.
+/// rings the coordinate itself; a thumbnail's disc rides at the top of the stem,
+/// over the location dot the coordinate sits under.
 fn ring_offset(size: RingSize, dpr: f64) -> serde_json::Value {
     let y = match size {
         RingSize::Dot => 0.0,
         RingSize::Thumbnail => {
             let g = thumbnail_geometry(dpr);
-            -(f64::from(g.canvas_h) - g.thumb_cy) / dpr
+            -(g.dot_cy - g.thumb_cy) / dpr
         }
     };
-    // A bare array reads as an expression, so the offset has to be quoted.
-    json!(["literal", [0.0, y]])
+    icon_offset_y(y)
+}
+
+/// How far down (CSS pixels) the thumbnails layer slides a raster whose foot is
+/// standing on the coordinate, to put the location dot's centre there instead.
+///
+/// The canvas runs on past the dot to hold its drop shadow, so the foot is that
+/// much lower than the point the dot exists to mark.
+fn thumbnail_dot_drop(dpr: f64) -> f64 {
+    let g = thumbnail_geometry(dpr);
+    (f64::from(g.canvas_h) - g.dot_cy) / dpr
+}
+
+/// How far past its coordinate a thumbnail's pixels reach, in CSS pixels. The
+/// only way a test can see where a raster landed, since the feature's geometry
+/// projects to the coordinate whatever the icon does with it.
+///
+/// Read at the screen's current pixel ratio, where the layer baked the ratio it
+/// found at map init. The two agree for as long as the sprites themselves are
+/// good, since those are baked at init too and a window dragged to a display of
+/// another density is already drawing rasters built for the old one.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn screen_thumbnail_dot_drop() -> f64 {
+    thumbnail_dot_drop(device_pixel_ratio())
 }
 
 /// Every verdict ring a layer can name, at both marker sizes.
@@ -1029,7 +1063,7 @@ impl EntityLayer {
                         ["has", "thumbnail"], ring_offset(RingSize::Thumbnail, ctx.dpr),
                         ring_offset(RingSize::Dot, ctx.dpr)
                     ],
-                    "icon-size": 1.0,
+                    "icon-size": MARKER_ICON_SIZE,
                     "icon-allow-overlap": true,
                     "icon-ignore-placement": true
                 }
@@ -1058,10 +1092,14 @@ impl EntityLayer {
                 "filter": ["all", ["has", "thumbnail"], ctx.not_cluster],
                 "layout": {
                     "icon-image": ["get", "thumbnail"],
-                    "icon-size": 1.0,
+                    "icon-size": MARKER_ICON_SIZE,
                     "icon-allow-overlap": true,
                     "icon-ignore-placement": true,
-                    "icon-anchor": "bottom"
+                    "icon-anchor": "bottom",
+                    // The anchor stands the raster's foot on the point, which is
+                    // a shadow's depth below the dot; the drop puts the dot's
+                    // centre back on the coordinate.
+                    "icon-offset": icon_offset_y(thumbnail_dot_drop(ctx.dpr))
                 },
                 "paint": {
                     // A thumbnailed marker fades on the same scale as a bare
@@ -1591,8 +1629,8 @@ async fn refresh_tiles_for_viewport(
 //
 // The canvas drawing below prepares the image data (circular photo + stem +
 // location dot) as a single raster icon. This is analogous to a sprite sheet
-// entry. An alternative would be to register just the circular photo, use
-// `icon-offset` to shift it up, and let the existing circle layer render the
+// entry. An alternative would be to register just the circular photo, offset it
+// up clear of the coordinate, and let the existing circle layer render the
 // location dot underneath. That would reduce canvas drawing and lean more on
 // MapLibre's compositing, but requires coordinating multiple layers and
 // doesn't give us the connecting stem.
@@ -1635,8 +1673,9 @@ struct ThumbnailGeometry {
     cx: f64,
     /// Vertical center of the thumbnail circle.
     thumb_cy: f64,
-    /// Gap between the circle bottom and the location dot.
-    stem_len: f64,
+    /// Vertical center of the location dot, a stem's length below the circle.
+    /// The coordinate the marker stands for sits here.
+    dot_cy: f64,
     /// Location dot radius.
     dot_r: f64,
 }
@@ -1646,6 +1685,8 @@ fn thumbnail_geometry(dpr: f64) -> ThumbnailGeometry {
     let border = DISC_EDGE.width * dpr;
     let stem_len = STEM_LENGTH * dpr;
     let dot_r = DOT_RADIUS * dpr;
+    let thumb_cy = thumb_r;
+    let dot_cy = thumb_cy + thumb_r + stem_len + dot_r;
     // Use ceil() so non-integer device pixel ratios (1.5/1.75/2.625 on some
     // Windows and Android devices) don't clip the bottom row of the drop shadow.
     let canvas_w = (f64::from(THUMBNAIL_SIZE) * dpr).ceil() as u32;
@@ -1654,16 +1695,15 @@ fn thumbnail_geometry(dpr: f64) -> ThumbnailGeometry {
     let shadow_blur = 4.0 * dpr;
     let shadow_offset_y = 2.0 * dpr;
     let bottom_pad = dot_r.max(shadow_blur + shadow_offset_y);
-    let canvas_h =
-        (f64::from(THUMBNAIL_SIZE) * dpr + stem_len + dot_r * 2.0 + bottom_pad).ceil() as u32;
+    let canvas_h = (dot_cy + dot_r + bottom_pad).ceil() as u32;
     ThumbnailGeometry {
         canvas_w,
         canvas_h,
         thumb_r,
         border,
         cx: f64::from(canvas_w) / 2.0,
-        thumb_cy: thumb_r,
-        stem_len,
+        thumb_cy,
+        dot_cy,
         dot_r,
     }
 }
@@ -1947,20 +1987,17 @@ fn draw_thumbnail_placeholder(dpr: f64) -> Result<web_sys::ImageData, String> {
     )?;
 
     // Stem line down to the location dot.
-    let stem_top = g.thumb_cy + g.thumb_r;
-    let stem_bottom = stem_top + g.stem_len;
     ctx.set_stroke_style_str(STANDING.fill);
     ctx.set_line_width(g.border);
     ctx.begin_path();
-    ctx.move_to(g.cx, stem_top);
-    ctx.line_to(g.cx, stem_bottom);
+    ctx.move_to(g.cx, g.thumb_cy + g.thumb_r);
+    ctx.line_to(g.cx, g.dot_cy - g.dot_r);
     ctx.stroke();
 
     // Location dot marking the geographic point.
-    let dot_cy = stem_bottom + g.dot_r;
     ctx.set_fill_style_str(STANDING.fill);
     ctx.begin_path();
-    ctx.arc(g.cx, dot_cy, g.dot_r, 0.0, std::f64::consts::TAU)
+    ctx.arc(g.cx, g.dot_cy, g.dot_r, 0.0, std::f64::consts::TAU)
         .map_err(|e| format!("arc failed: {e:?}"))?;
     ctx.fill();
     ctx.set_stroke_style_str(DISC_EDGE.color);
@@ -1974,8 +2011,10 @@ fn draw_thumbnail_placeholder(dpr: f64) -> Result<web_sys::ImageData, String> {
 /// Draw a thumbnail "pin": a circular photo on top, a short stem, and a small
 /// dot at the bottom marking the actual geographic location.
 ///
-/// The canvas is sized so the dot sits at the bottom center — use
-/// `icon-anchor: "bottom"` in MapLibre so the dot aligns with the coordinate.
+/// The canvas keeps a shadow's worth of room below the dot, so the thumbnails
+/// layer stands the raster's foot on the point with `icon-anchor: "bottom"` and
+/// slides it back down by [`thumbnail_dot_drop`] to land the dot on the
+/// coordinate.
 fn draw_circular_thumbnail(
     img: &web_sys::HtmlImageElement,
     dpr: f64,
@@ -1990,7 +2029,7 @@ fn draw_circular_thumbnail(
         border,
         cx,
         thumb_cy,
-        stem_len,
+        dot_cy,
         dot_r,
     } = g;
 
@@ -2026,17 +2065,14 @@ fn draw_circular_thumbnail(
     stroke_ring(&ctx, DISC_EDGE, (cx, thumb_cy), thumb_r - border / 2.0, dpr)?;
 
     // --- Stem line ---
-    let stem_top = thumb_cy + thumb_r;
-    let stem_bottom = stem_top + stem_len;
     ctx.set_stroke_style_str(STANDING.fill);
     ctx.set_line_width(border);
     ctx.begin_path();
-    ctx.move_to(cx, stem_top);
-    ctx.line_to(cx, stem_bottom);
+    ctx.move_to(cx, thumb_cy + thumb_r);
+    ctx.line_to(cx, dot_cy - dot_r);
     ctx.stroke();
 
     // --- Drop shadow (soft circle behind the dot, offset down) ---
-    let dot_cy = stem_bottom + dot_r;
     ctx.save();
     ctx.set_shadow_color("rgba(0, 0, 0, 0.4)");
     ctx.set_shadow_blur(4.0 * dpr);
@@ -3253,5 +3289,47 @@ pub fn MapView(
                 })
             }}
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DOT_RADIUS, thumbnail_dot_drop, thumbnail_geometry};
+
+    /// Device pixel ratios real displays report, including the fractional ones
+    /// Windows and Android use, where a drop that forgot to divide by the ratio
+    /// still looks right at 1.0.
+    const RATIOS: [f64; 5] = [1.0, 1.5, 2.0, 2.625, 3.0];
+
+    /// Applying the drop has to leave the location dot's centre on the
+    /// coordinate. `icon-anchor: bottom` puts the canvas foot there, and the
+    /// canvas runs past the dot by the room the drop shadow needs, so the drop
+    /// is what carries the dot back down onto the point it marks.
+    #[test]
+    fn the_drop_lands_the_dot_on_the_coordinate() {
+        for dpr in RATIOS {
+            let g = thumbnail_geometry(dpr);
+            let coordinate_at = f64::from(g.canvas_h) - thumbnail_dot_drop(dpr) * dpr;
+            assert!(
+                (coordinate_at - g.dot_cy).abs() < 1e-9,
+                "at dpr {dpr} the coordinate lands {coordinate_at} device px down the canvas, \
+                 where the dot's centre is {}",
+                g.dot_cy
+            );
+        }
+    }
+
+    /// The shadow's room below the dot is the dot's own radius at every ratio it
+    /// is asked for, which is what makes the drop a flat 14 CSS px rather than a
+    /// number that wanders with the display.
+    #[test]
+    fn the_drop_is_the_dots_diameter_at_every_ratio() {
+        for dpr in RATIOS {
+            assert!(
+                (thumbnail_dot_drop(dpr) - DOT_RADIUS * 2.0).abs() < 0.5,
+                "at dpr {dpr} the drop is {}, not the dot's {DOT_RADIUS}px radius twice over",
+                thumbnail_dot_drop(dpr)
+            );
+        }
     }
 }
