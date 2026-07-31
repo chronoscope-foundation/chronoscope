@@ -452,7 +452,10 @@ infra-apply:
         echo "and applies everything here with the digest the push reported." >&2
         exit 1
     fi
-    tofu -chdir=.infra apply
+    # Read the confirmation off the terminal rather than inherited stdin. A
+    # build earlier in the recipe can leave stdin at EOF, and tofu reads that
+    # as a refusal, so a cold run fails at the prompt while a warm one works.
+    tofu -chdir=.infra apply < /dev/tty
 
 # ---------------------------------------------------------------------------
 # Deployment to Cloud Run.
@@ -550,7 +553,10 @@ deploy:
     # there. It prints its plan and waits for a typed confirmation first.
     export TF_VAR_image="$ref@$digest"
     _infra_sync
-    tofu -chdir=.infra apply
+    # From the terminal, not inherited stdin: the image build above leaves
+    # stdin at EOF, which tofu reads as a refusal. That is why a first deploy
+    # failed at the prompt and the cached re-run did not.
+    tofu -chdir=.infra apply < /dev/tty
 
 # ---------------------------------------------------------------------------
 # Data fetches. Each is a thin wrapper around `nix build` + GC root pinning.

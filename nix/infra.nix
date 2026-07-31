@@ -29,6 +29,7 @@ let
   # a line here and the `depends_on` that names it.
   googleApis = {
     artifactregistry = "artifactregistry.googleapis.com";
+    orgpolicy = "orgpolicy.googleapis.com";
     run = "run.googleapis.com";
     secretmanager = "secretmanager.googleapis.com";
   };
@@ -148,6 +149,13 @@ let
         name = settings.cloudRunService;
         location = settings.region;
 
+        # The provider defaults this on, which guards a service whose loss
+        # would cost something. This one holds no state: the image digest and
+        # the config below describe it completely, and its filesystem dies with
+        # each instance regardless. Left on, it only blocks the recreate that
+        # follows a failed create, which is how the first deploy here wedged.
+        deletion_protection = false;
+
         template = {
           service_account = "\${google_service_account.api.email}";
 
@@ -208,12 +216,30 @@ let
 
       # A public API: every reader is anonymous, and authentication is the
       # server's own passkey flow rather than Google's.
+      # Cloud Identity turns on domain-restricted sharing for the whole
+      # organization, which refuses any IAM member outside the customer and so
+      # refuses `allUsers`. Overridden for this project alone rather than at the
+      # organization, so a project that has no business being world-readable
+      # keeps the inherited default.
+      #
+      # This makes the run.app hostname reachable without Cloudflare in front
+      # of it, which is a posture worth revisiting: cache, WAF and rate limiting
+      # all live at the edge, and an origin anyone can address goes around them.
+      google_org_policy_policy.public_iam_members = {
+        name = "projects/${settings.project}/policies/iam.allowedPolicyMemberDomains";
+        parent = "projects/${settings.project}";
+        spec.rules = [ { allow_all = "TRUE"; } ];
+        depends_on = [ "google_project_service.orgpolicy" ];
+      };
+
       google_cloud_run_v2_service_iam_member.public = {
         inherit (settings) project;
         location = settings.region;
         name = "\${google_cloud_run_v2_service.api.name}";
         role = "roles/run.invoker";
         member = "allUsers";
+        # The binding is rejected outright until the override above is live.
+        depends_on = [ "google_org_policy_policy.public_iam_members" ];
       };
     };
   };
