@@ -1861,7 +1861,7 @@ async fn test_the_time_card_carries_the_marker_legend() -> TestResult {
 
         let legend = t.text("#time-slider-panel").await?;
         check(
-            legend.contains("Undated, so we can't say"),
+            legend.contains("Known where, not when"),
             format!("the card must say what an unevidenced marker means, got: {legend}"),
         )?;
 

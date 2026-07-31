@@ -28,7 +28,7 @@ pub const EXISTENCE_STATES_ANCHOR: &str = "existence-states";
 const ROWS: [(MarkerLook, &str); 4] = [
     (MarkerLook::Standing, "Presumed to exist"),
     (MarkerLook::Disputed, "Sources disagree"),
-    (MarkerLook::Unevidenced, "Undated, so we can't say"),
+    (MarkerLook::Unevidenced, "Known where, not when"),
     (MarkerLook::Badge, "A cluster; zoom in to split it"),
 ];
 

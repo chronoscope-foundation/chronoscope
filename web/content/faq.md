@@ -26,7 +26,7 @@ A **solid marker** means we presume it stood. Either a source documents the plac
 
 An **orange ring** means the sources disagree. A record says the building came down in 1896; a dated photograph shows it standing in 1902. Both can't be right, so we mark the place as contested and leave the question open. Open the entity to see which claims collide.
 
-A **dashed ring** means the place is undated. We know where it is and that it stood at some point, but nothing puts it standing or gone in the year you're looking at. A plain marker goes hollow inside the ring; one carrying a photograph fades behind it.
+A **dashed ring** means we know where the place is but not when it stood. Nothing on record puts it standing or gone in the year you're looking at, so it stays on the map as a possibility. Evidence carries forward and not back: a building sighted in 1900 is presumed to stand ever after, and is simply unknown before it. Give that same building a construction date and scrubbing past it takes the marker away instead. A plain marker goes hollow inside the ring; one carrying a photograph fades behind it.
 
 **Nothing at all** means the sources put its demolition before that year, or its construction after. Scrub back and the demolished ones reappear.
 
