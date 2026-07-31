@@ -31,7 +31,7 @@ async fn test_registration_invalid_challenge_token() -> TestResult {
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
     let credential = authenticator
-        .do_registration(ctx.origin()?, ccr)
+        .do_registration(ctx.origin(), ccr)
         .map_err(|e| format!("Registration failed: {e:?}"))?;
 
     // Try to finish with an invalid challenge token
@@ -90,7 +90,7 @@ async fn test_register_mid_flow_username_conflict() -> TestResult {
     let ccr_a: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp_a.options)?)?;
     let credential_a = auth_a
-        .do_registration(ctx.origin()?, ccr_a)
+        .do_registration(ctx.origin(), ccr_a)
         .map_err(|e| format!("Registration A failed: {e:?}"))?;
 
     // User B swoops in and completes registration with the same username
@@ -152,7 +152,7 @@ async fn test_register_duplicate_email_rejected() -> TestResult {
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
     let credential = auth
-        .do_registration(ctx.origin()?, ccr)
+        .do_registration(ctx.origin(), ccr)
         .map_err(|e| format!("Registration failed: {e:?}"))?;
 
     ctx.client
@@ -230,7 +230,7 @@ async fn test_login_invalid_challenge_token() -> TestResult {
     let rcr: webauthn_rs::prelude::RequestChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
     let auth_credential = authenticator
-        .do_authentication(ctx.origin()?, rcr)
+        .do_authentication(ctx.origin(), rcr)
         .map_err(|e| format!("Authentication failed: {e:?}"))?;
 
     // Try to finish with invalid token
@@ -313,7 +313,7 @@ async fn test_challenge_purpose_mismatch_register_for_login() -> TestResult {
     let rcr: webauthn_rs::prelude::RequestChallengeResponse =
         serde_json::from_value(serde_json::to_value(&login_resp.options)?)?;
     let auth_credential = authenticator
-        .do_authentication(ctx.origin()?, rcr)
+        .do_authentication(ctx.origin(), rcr)
         .map_err(|e| format!("Authentication failed: {e:?}"))?;
 
     // Try to use the Register challenge token for login - should fail
@@ -361,7 +361,7 @@ async fn test_challenge_purpose_mismatch_login_for_register() -> TestResult {
     // Create a new authenticator for registration (can't reuse same passkey)
     let mut new_authenticator = TestContext::new_authenticator();
     let reg_credential = new_authenticator
-        .do_registration(ctx.origin()?, ccr)
+        .do_registration(ctx.origin(), ccr)
         .map_err(|e| format!("Registration failed: {e:?}"))?;
 
     // Try to use the Login challenge token for registration - should fail
@@ -396,7 +396,7 @@ async fn test_challenge_token_tampering() -> TestResult {
     let ccr: webauthn_rs::prelude::CreationChallengeResponse =
         serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
     let credential = authenticator
-        .do_registration(ctx.origin()?, ccr)
+        .do_registration(ctx.origin(), ccr)
         .map_err(|e| format!("Registration failed: {e:?}"))?;
 
     // Tamper with the JWT - flip a character in the payload section
@@ -510,7 +510,7 @@ async fn test_clone_detection_rejects_stale_counter() -> TestResult {
         serde_json::from_value(serde_json::to_value(&start_resp.options)?)?;
 
     let auth_credential = authenticator
-        .do_authentication(ctx.origin()?, rcr)
+        .do_authentication(ctx.origin(), rcr)
         .map_err(|e| format!("Authentication failed: {e:?}"))?;
 
     // This should fail with a 400 because webauthn-rs detects the counter regression

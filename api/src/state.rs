@@ -165,7 +165,8 @@ pub struct Config {
     /// `WebAuthn` Relying Party Origin (e.g., "<https://api.chronoscope.io>")
     pub rp_origin: String,
 
-    /// Server bind address
+    /// Server bind address. `PORT` (what Cloud Run injects) wins when set and
+    /// binds every interface; `BIND_ADDR` carries the full address otherwise.
     pub bind_addr: std::net::SocketAddr,
 
     /// iOS app identifier for AASA (e.g., "ABCD1234.com.example.app")
@@ -200,10 +201,17 @@ impl Config {
         let rp_origin =
             std::env::var("RP_ORIGIN").unwrap_or_else(|_| "http://localhost:3000".to_string());
 
-        let bind_addr = std::env::var("BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:8080".to_string())
+        // Cloud Run injects PORT and routes to whatever it names, so reading it
+        // makes the image correct on its own rather than through a deploy that
+        // passes a matching `--port`. BIND_ADDR stays the knob for every other
+        // runtime, where the interface matters as much as the port.
+        let bind_addr_raw = match std::env::var("PORT") {
+            Ok(port) => format!("0.0.0.0:{port}"),
+            Err(_) => std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
+        };
+        let bind_addr = bind_addr_raw
             .parse()
-            .map_err(|e| ConfigError::InvalidBindAddr(format!("{e}")))?;
+            .map_err(|e| ConfigError::InvalidBindAddr(format!("{bind_addr_raw}: {e}")))?;
 
         let ios_app_id = std::env::var("IOS_APP_ID").ok();
 

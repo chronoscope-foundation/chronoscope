@@ -6,6 +6,7 @@ pub mod auth;
 pub mod cdn;
 pub mod entities;
 pub mod entity_types;
+pub mod health;
 pub mod jwt;
 pub mod limits;
 #[cfg(feature = "embedded-media")]
@@ -54,6 +55,9 @@ pub fn register_api(
 
     // Well-known endpoints
     api.register(well_known::apple_app_site_association)?;
+
+    // Readiness probe
+    api.register(health::health)?;
 
     // Media endpoint (embedded CDN for development)
     #[cfg(feature = "embedded-media")]

@@ -96,6 +96,16 @@ pub fn facts_db_subset() -> String {
     std::env::var("CHRONOSCOPE_FACTS_DB_SUBSET").unwrap_or_else(|_| "curated".to_owned())
 }
 
+/// How long workers get to notice the shutdown signal before the pools close
+/// without them.
+///
+/// The runner observes shutdown between batches, so a worker wedged inside one
+/// holds this join open for as long as that batch takes. Waiting it out forever
+/// costs the pool closes, which are the reason [`RunningDevServer::shutdown`]
+/// exists; naming whoever is still running turns a wedge into something a test
+/// log can point at.
+const WORKER_STOP_DEADLINE: Duration = Duration::from_secs(10);
+
 /// Error type for dev server setup.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -105,6 +115,13 @@ impl From<String> for DevServerError {
     fn from(s: String) -> Self {
         Self(s)
     }
+}
+
+/// A spawned worker task alongside the id it logs under, so a shutdown that
+/// runs out of patience can say which worker is still going.
+struct WorkerTask {
+    worker_id: String,
+    handle: JoinHandle<()>,
 }
 
 /// Handle to a running development server.
@@ -134,7 +151,11 @@ pub struct RunningDevServer {
     shutdown_tx: watch::Sender<bool>,
 
     /// Handles to spawned worker tasks for graceful shutdown
-    worker_handles: Vec<JoinHandle<()>>,
+    worker_handles: Vec<WorkerTask>,
+
+    /// The server's logger, kept so shutdown can report workers that overran
+    /// [`WORKER_STOP_DEADLINE`].
+    log: slog::Logger,
 }
 
 impl RunningDevServer {
@@ -148,15 +169,34 @@ impl RunningDevServer {
     }
 
     /// Gracefully shut down the server and wait for all workers to stop.
+    ///
+    /// The wait is bounded; workers still running when it expires are named in
+    /// a warning and left detached, exactly as a plain drop leaves them.
     pub async fn shutdown(mut self) {
         // Signal workers to stop
         let _ = self.shutdown_tx.send(true);
 
         // Take ownership of handles (leaving empty vec) so we can await them
         // despite implementing Drop
-        let handles = std::mem::take(&mut self.worker_handles);
-        for handle in handles {
-            let _ = handle.await;
+        let workers = std::mem::take(&mut self.worker_handles);
+        // One deadline across the whole join, so a worker that hogs it can't
+        // hand the next one a fresh budget. `timeout_at` polls the handle
+        // before the deadline, so a worker that already finished still reports
+        // as stopped once the budget is spent.
+        let deadline = tokio::time::Instant::now() + WORKER_STOP_DEADLINE;
+        let mut still_running = Vec::new();
+        for worker in workers {
+            if tokio::time::timeout_at(deadline, worker.handle)
+                .await
+                .is_err()
+            {
+                still_running.push(worker.worker_id);
+            }
+        }
+        if !still_running.is_empty() {
+            slog::warn!(self.log, "workers did not stop before the deadline; closing pools anyway";
+                "workers" => still_running.join(", "),
+                "deadline_secs" => WORKER_STOP_DEADLINE.as_secs());
         }
 
         // Close both SpatiaLite-loaded pools — the app pool and the fact
@@ -343,7 +383,7 @@ fn spawn_url_fetcher_worker(
     name: &str,
     affinity: Option<IntegrationName>,
     ctx: &WorkerContext,
-) -> JoinHandle<()> {
+) -> WorkerTask {
     use chronoscope_workers::url_fetcher::FetchContext;
 
     let worker_id = name.to_string();
@@ -373,21 +413,25 @@ fn spawn_url_fetcher_worker(
     let shutdown_rx = ctx.shutdown_rx.clone();
     let log = ctx.log.clone();
 
-    tokio::spawn(async move {
-        info!(log, "Starting worker"; "worker_id" => &worker_id);
-        if let Err(e) = run(
-            queue,
-            worker,
-            enqueuer,
-            worker_config,
-            retry_config,
-            shutdown_rx,
-        )
-        .await
-        {
-            slog::error!(log, "Worker error"; "worker_id" => &worker_id, "error" => %e);
+    let handle = tokio::spawn({
+        let worker_id = worker_id.clone();
+        async move {
+            info!(log, "Starting worker"; "worker_id" => &worker_id);
+            if let Err(e) = run(
+                queue,
+                worker,
+                enqueuer,
+                worker_config,
+                retry_config,
+                shutdown_rx,
+            )
+            .await
+            {
+                slog::error!(log, "Worker error"; "worker_id" => &worker_id, "error" => %e);
+            }
         }
-    })
+    });
+    WorkerTask { worker_id, handle }
 }
 
 /// Spawn an analysis worker in a background task.
@@ -395,7 +439,7 @@ fn spawn_analysis_worker(
     worker_id: &str,
     triton: Arc<dyn TritonService>,
     ctx: &WorkerContext,
-) -> JoinHandle<()> {
+) -> WorkerTask {
     let worker_id = worker_id.to_string();
     let queue = ctx.db.analysis_queue.clone();
     let worker = AnalysisWorker::new(triton, ctx.db.clone(), ctx.media_store.clone());
@@ -412,21 +456,25 @@ fn spawn_analysis_worker(
     let shutdown_rx = ctx.shutdown_rx.clone();
     let log = ctx.log.clone();
 
-    tokio::spawn(async move {
-        info!(log, "Starting analysis worker"; "worker_id" => &worker_id);
-        if let Err(e) = run(
-            queue,
-            worker,
-            enqueuer,
-            worker_config,
-            retry_config,
-            shutdown_rx,
-        )
-        .await
-        {
-            slog::error!(log, "Analysis worker error"; "worker_id" => &worker_id, "error" => %e);
+    let handle = tokio::spawn({
+        let worker_id = worker_id.clone();
+        async move {
+            info!(log, "Starting analysis worker"; "worker_id" => &worker_id);
+            if let Err(e) = run(
+                queue,
+                worker,
+                enqueuer,
+                worker_config,
+                retry_config,
+                shutdown_rx,
+            )
+            .await
+            {
+                slog::error!(log, "Analysis worker error"; "worker_id" => &worker_id, "error" => %e);
+            }
         }
-    })
+    });
+    WorkerTask { worker_id, handle }
 }
 
 /// Start the development server with the given configuration.
@@ -656,5 +704,6 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         facts: facts_for_shutdown,
         shutdown_tx,
         worker_handles,
+        log: log.clone(),
     })
 }

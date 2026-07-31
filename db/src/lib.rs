@@ -88,6 +88,22 @@ impl Database {
         &self.pool
     }
 
+    /// Check a connection out of the pool and hand it straight back, so a
+    /// caller can tell a live database from a dead one.
+    ///
+    /// sqlx tests a connection before handing it over, which makes the checkout
+    /// itself the liveness evidence: a closed pool or a database that stopped
+    /// answering fails here. A pool that is merely full instead *blocks* for
+    /// sqlx's acquire timeout (thirty seconds by default), so a caller that
+    /// needs to tell "busy" from "dead" has to impose its own deadline.
+    ///
+    /// # Errors
+    /// Returns `DbError::Sqlx` if no usable connection can be checked out.
+    pub async fn ping(&self) -> DbResult<()> {
+        self.pool.acquire().await?;
+        Ok(())
+    }
+
     /// Close the connection pool, awaiting each connection's teardown.
     ///
     /// sqlx runs every SQLite connection on a detached OS thread whose

@@ -5,6 +5,7 @@
 
 mod auth;
 mod entities;
+mod health;
 #[cfg(feature = "embedded-media")]
 mod media;
 mod research;
@@ -145,6 +146,9 @@ type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 struct TestContext {
     client: chronoscope_api_client::Client,
     app_state: Arc<AppState>,
+    /// The origin the simulated authenticator signs over. Same value the
+    /// server was configured with, so the two cannot drift apart.
+    webauthn_origin: Url,
     /// Kept alive to maintain the server running for the duration of the test.
     /// The server runs in a background task and is dropped when `TestContext` is dropped.
     #[allow(dead_code)]
@@ -262,13 +266,20 @@ impl TestContext {
         let addr = listener.local_addr()?;
         drop(listener);
 
+        // WebAuthn names its relying party by domain, and webauthn-rs rejects an
+        // IP-address origin outright, so the passkey side keeps the `localhost`
+        // name. Nothing resolves it: it is compared as a string against what the
+        // authenticator signs.
+        let rp_origin = format!("http://localhost:{}", addr.port());
+        let webauthn_origin = Url::parse(&rp_origin)?;
+
         let config = Config {
             database_url: "sqlite::memory:".to_string(),
             // The fact store under test is the standalone `facts` built above
             // (its own overlay), so this app-side facts path goes unused.
             facts_database: FactsDatabase::new("sqlite::memory:")?,
             rp_id: "localhost".to_string(),
-            rp_origin: format!("http://localhost:{}", addr.port()),
+            rp_origin,
             bind_addr: addr,
             ios_app_id,
             cdn_base_url: Url::parse(crate::cdn::tests::TEST_CDN_BASE_URL)?,
@@ -314,19 +325,23 @@ impl TestContext {
         let server =
             HttpServerStarter::new(&config_dropshot, api, Arc::clone(&app_state), &log)?.start();
 
-        let base_url = format!("http://localhost:{}", addr.port());
+        // Dial the address the server bound rather than a name: the build
+        // sandbox ships no /etc/hosts, and a name that resolves to ::1 first
+        // misses an IPv4-only listener.
+        let base_url = format!("http://{addr}");
         let client = chronoscope_api_client::Client::new(base_url);
 
         Ok(Self {
             client,
             app_state,
+            webauthn_origin,
             server,
             _facts_dir: facts_dir,
         })
     }
 
-    fn origin(&self) -> Result<Url, url::ParseError> {
-        Url::parse(self.client.base_url())
+    fn origin(&self) -> Url {
+        self.webauthn_origin.clone()
     }
 
     /// Direct access to the database for testing DB layer error paths.
@@ -400,7 +415,7 @@ impl TestContext {
         username: &str,
     ) -> Result<AuthClient, Box<dyn std::error::Error + Send + Sync>> {
         let email = Email::new(format!("{username}@test.example.com"));
-        let origin = self.origin()?;
+        let origin = self.origin();
         let auth = chronoscope_api_client::register(
             &self.client,
             username,
@@ -434,7 +449,7 @@ impl TestContext {
         identifier: &str,
         authenticator: &mut Authenticator,
     ) -> Result<AuthClient, Box<dyn std::error::Error + Send + Sync>> {
-        let origin = self.origin()?;
+        let origin = self.origin();
         let auth = chronoscope_api_client::login(&self.client, identifier, |options| async move {
             let rcr: webauthn_rs::prelude::RequestChallengeResponse =
                 serde_json::from_value(serde_json::to_value(&options)?)?;

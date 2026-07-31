@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{AppState, Config, ServerFactStore, default_dns_resolver};
@@ -6,9 +7,45 @@ use chronoscope_db::Database;
 #[cfg(not(feature = "postgres"))]
 use chronoscope_db::FactStoreLocations;
 use dropshot::{
-    ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServerStarter,
+    ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServer,
+    HttpServerStarter,
 };
-use slog::info;
+use slog::{Logger, info, warn};
+use tokio::signal::unix::{SignalKind, signal};
+
+/// How long in-flight requests get to finish once shutdown is asked for.
+///
+/// Cloud Run SIGKILLs about ten seconds after its SIGTERM, and handlers run
+/// detached with no timeout of their own, so an unbounded drain bets the whole
+/// shutdown on every handler returning first. Losing that bet costs the pool
+/// closes, which are the reason this path exists; and since handling a signal
+/// replaces its default disposition for the life of the process, no second
+/// SIGTERM can force the issue. Yielding early leaves room for both closes
+/// inside the grace period.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(6);
+
+/// Stop the server and wait out its in-flight handlers, giving up at
+/// [`DRAIN_DEADLINE`].
+///
+/// The drain runs on its own task because [`HttpServer::close`] panics when the
+/// accept loop has already ended, which is what a SIGTERM arriving alongside a
+/// server that is stopping on its own looks like. Isolating it, and bounding
+/// it, is what makes the caller's pool closes reachable on every path.
+async fn drain(server: HttpServer<Arc<AppState>>, log: &Logger) -> Result<(), String> {
+    let draining = tokio::spawn(async move { server.close().await });
+    match tokio::time::timeout(DRAIN_DEADLINE, draining).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            warn!(log, "shutdown task ended abnormally"; "error" => %e);
+            Ok(())
+        }
+        Err(_elapsed) => {
+            warn!(log, "drain deadline expired; closing pools with requests in flight";
+                "deadline_secs" => DRAIN_DEADLINE.as_secs());
+            Ok(())
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -106,10 +143,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Start server
     let server = HttpServerStarter::new(&config_dropshot, api, app_state, &log)?.start();
-    let result = server.await;
-    // Close both SpatiaLite-loaded pools — the app pool and the fact store's
-    // own — inside the live runtime, so each connection's dlclose completes
-    // before process exit rather than on an ungraceful drop.
+
+    // SIGTERM is how a container runtime asks for shutdown, and its default
+    // disposition kills the process where it stands. Handling it routes that
+    // request into the drain the server already knows how to do, so in-flight
+    // requests finish and the pool closes below run inside the live runtime.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut shutdown = server.wait_for_shutdown();
+    let result = tokio::select! {
+        result = &mut shutdown => result,
+        _ = sigterm.recv() => {
+            info!(log, "SIGTERM received; draining in-flight requests");
+            drain(server, &log).await
+        }
+    };
+
+    // Close both SpatiaLite-loaded pools (the app pool and the fact store's
+    // own) inside the live runtime, so each connection's dlclose completes
+    // before process exit rather than on an ungraceful drop. Nothing above
+    // short-circuits, so both run whichever way the server ended.
     db.close().await;
     facts_for_shutdown.close().await;
     result.map_err(Into::into)
