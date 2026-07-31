@@ -298,6 +298,7 @@ pub fn Faq() -> impl IntoView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::existence_legend::EXISTENCE_STATES_ANCHOR;
 
     const ABOUT_MARKDOWN: &str = include_str!("../../content/about.md");
 
@@ -489,5 +490,22 @@ mod tests {
                 "the About page links to /faq#{fragment}, which no FAQ heading anchors; anchors: {slugs:?}"
             );
         }
+    }
+
+    /// The map legend's deep link into the FAQ, checked against the anchors the
+    /// FAQ assigns.
+    ///
+    /// Its own test rather than an entry in the guard above: that one reads the
+    /// About markdown, and the legend's link is a Rust `view!` that no markdown
+    /// parse can see. Both sides go through `EXISTENCE_STATES_ANCHOR`, so a
+    /// renamed heading fails here rather than shipping a link to nowhere.
+    #[test]
+    fn the_map_legends_faq_link_names_a_real_anchor() {
+        let cats = parse_faq(&expand_snippets(FAQ_MARKDOWN));
+        let slugs = all_slugs(&cats);
+        assert!(
+            slugs.contains(&EXISTENCE_STATES_ANCHOR),
+            "the map legend links to /faq#{EXISTENCE_STATES_ANCHOR}, which no FAQ heading anchors; anchors: {slugs:?}"
+        );
     }
 }

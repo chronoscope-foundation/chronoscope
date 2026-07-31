@@ -18,6 +18,7 @@ use chronoscope_core::lifespan::ExistenceState;
 
 use crate::api;
 use crate::api::Snapshot;
+use crate::components::controls::OVERLAY_ALERT;
 use crate::maplibre;
 
 /// Serialize a value to a JS object using JSON-compatible mode.
@@ -80,6 +81,69 @@ pub(crate) const ENTITY_CIRCLES_LAYER: &str = "entity-circles";
 /// Name of the badge layer — the only layer a cluster draws on, covering both
 /// MapLibre proximity clusters and lone server `Expand` cells.
 pub(crate) const ENTITY_BADGE_LAYER: &str = "entity-badge";
+
+/// Name of the symbol layer carrying the verdict rings.
+pub(crate) const ENTITY_RING_LAYER: &str = "entity-rings";
+
+/// Name of the transparent circle layer a bare marker is hit-tested by.
+///
+/// A circle layer answers a query by radius, so this is the one shape that
+/// covers a marker's ink and nothing beside it.
+const ENTITY_HIT_LAYER: &str = "entity-hit";
+
+/// Name of the symbol layer carrying entity names.
+const ENTITY_LABELS_LAYER: &str = "entity-labels";
+
+/// Every layer the entity source paints on.
+///
+/// One list drives two things that must never disagree: what
+/// [`init_source_and_layers`] adds, and what a click is hit-tested against.
+/// `queryRenderedFeatures` answers a call naming a layer the style lacks with
+/// nothing at all, so a hit-test set naming a layer nobody added would turn
+/// every click on the map into a deselect. Nothing can join that set except by
+/// being a variant here, and the variants are all added before any handler that
+/// reads it exists.
+#[derive(Clone, Copy)]
+enum EntityLayer {
+    /// Bare marker dots.
+    Circles,
+    /// The transparent disc giving a bare marker its round hit region.
+    Hit,
+    /// Cluster badges.
+    Badge,
+    /// Verdict rings. Below the labels, since a dot's ring reaches 17 px out,
+    /// past the label's first glyph line (`text-offset` 0.8 at size 12 puts it
+    /// 9.6 px below the point).
+    Ring,
+    /// Entity names.
+    Labels,
+    /// Thumbnail rasters, over everything, so a neighbour's label cannot cover
+    /// a photograph.
+    Thumbnails,
+}
+
+/// The layers, bottom to top.
+const ENTITY_LAYERS: [EntityLayer; 6] = [
+    EntityLayer::Circles,
+    EntityLayer::Hit,
+    EntityLayer::Badge,
+    EntityLayer::Ring,
+    EntityLayer::Labels,
+    EntityLayer::Thumbnails,
+];
+
+/// Every layer a click on a marker can land in.
+///
+/// The background-click handler hit-tests exactly this set and deselects when it
+/// matches nothing, so a layer left out of it puts marker pixels outside every
+/// hit test: a click there falls through and clears the selection the user was
+/// aiming at.
+pub(crate) fn marker_layers() -> impl Iterator<Item = &'static str> {
+    ENTITY_LAYERS
+        .into_iter()
+        .filter(|layer| layer.hit_tested())
+        .map(EntityLayer::id)
+}
 
 /// DOM event name signaling map mount completion (used by test hooks).
 #[cfg(feature = "test-hooks")]
@@ -170,6 +234,418 @@ fn record_thumbnails_loaded() {
 // TODO: Revisit for mobile — 96px may be too large on small screens.
 // Consider scaling down to ~64px based on viewport width.
 const THUMBNAIL_SIZE: u32 = 96;
+
+/// Radius (CSS px) of a bare marker dot, excluding its edge.
+const MARKER_RADIUS: f64 = 10.0;
+
+/// Radius (CSS px) of a cluster badge, excluding its edge.
+const BADGE_RADIUS: f64 = 18.0;
+
+// ==================== Marker appearance ====================
+
+/// A ring stroked around a marker's disc.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct Ring {
+    /// Stroke colour.
+    pub(crate) color: &'static str,
+    /// Stroke width in CSS pixels.
+    pub(crate) width: f64,
+    /// Whether the stroke is broken into dashes.
+    pub(crate) dashed: bool,
+}
+
+/// The parchment edge a standing marker's disc wears, cutting it out of the
+/// basemap.
+pub(crate) const DISC_EDGE: Ring = Ring {
+    color: "#F5F0E8",
+    width: 2.0,
+    dashed: false,
+};
+
+/// The edge a selected marker wears in place of its own, and the widest a disc
+/// ever gets. A verdict ring is stroked clear of this radius, since the ring
+/// layer paints above the discs and would otherwise cover half the halo on the
+/// markers a reader is investigating.
+const SELECTED_EDGE: Ring = Ring {
+    color: "#FFFFFF",
+    width: 4.0,
+    dashed: false,
+};
+
+/// How one marker paints: the disc, its edge, and the ring its verdict adds.
+///
+/// One opacity for the whole marker. Two fades a tenth apart are two states
+/// nobody can tell apart on sight, so a verdict that has to be distinguished
+/// gets a shape.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) struct MarkerAppearance {
+    /// Radius (CSS px) of the disc's fill. Its edge is stroked outside this,
+    /// the way MapLibre reads `circle-radius`.
+    pub(crate) radius: f64,
+    /// Disc fill.
+    pub(crate) fill: &'static str,
+    /// Opacity of the fill, and of a photograph standing in for it. The edge
+    /// and the ring stay opaque, since they are what the verdict is read off.
+    pub(crate) opacity: f64,
+    /// The disc's own edge, stroked inside its outer radius.
+    pub(crate) edge: Ring,
+    /// The verdict's ring, stroked outside the disc's edge. `None` where the
+    /// disc alone says it.
+    pub(crate) ring: Option<Ring>,
+}
+
+/// Known to exist, or presumed to still exist.
+///
+/// `Presumed` deliberately reads exactly like `Uncontested`. We never hold
+/// positive evidence that something stood at a given instant — only events we
+/// infer it from — so presumption is the ordinary way a standing building
+/// reads. A palace sighted once in 1343 and never since is presumed every day
+/// after, and fading that would fade most of the map.
+pub(crate) const STANDING: MarkerAppearance = MarkerAppearance {
+    radius: MARKER_RADIUS,
+    fill: "#8B5E3C",
+    opacity: 0.9,
+    edge: DISC_EDGE,
+    ring: None,
+};
+
+/// Sources disagree about whether it stood, in a colour nothing else on the map
+/// uses, so a disagreement is visible without opening the entity.
+///
+/// The disc's own rim carries that colour as well as the ring. The ring is a
+/// canvas sprite and a sprite can fail to register; the rim is a paint
+/// expression and cannot, so the verdict survives a browser that gives us no
+/// sprites at all.
+pub(crate) const DISPUTED: MarkerAppearance = MarkerAppearance {
+    radius: MARKER_RADIUS,
+    fill: "#8B5E3C",
+    opacity: 0.9,
+    edge: Ring {
+        color: "#C2410C",
+        width: 2.0,
+        dashed: false,
+    },
+    ring: Some(Ring {
+        color: "#C2410C",
+        width: 3.0,
+        dashed: false,
+    }),
+};
+
+/// Undated at the slider's instant.
+///
+/// Hollow, so the marker reads as a form nobody has filled in: a parchment wash
+/// that lets the basemap through where the others carry a solid fill, inside a
+/// full-strength sepia rim and under a dashed ring of the same sepia. The rim is
+/// what makes it findable on a near-white basemap, and what a browser that
+/// registers no sprites is left with. A photograph cannot be hollow, so a
+/// thumbnailed marker in this state fades and the dash carries the verdict.
+pub(crate) const UNEVIDENCED: MarkerAppearance = MarkerAppearance {
+    radius: MARKER_RADIUS,
+    fill: "#F5F0E8",
+    opacity: 0.6,
+    edge: Ring {
+        color: "#6B5840",
+        width: 2.0,
+        dashed: false,
+    },
+    ring: Some(Ring {
+        color: "#6B5840",
+        width: 3.0,
+        dashed: true,
+    }),
+};
+
+/// Several entities at one place, standing for all of them and so carrying no
+/// verdict of its own. Bigger than a pin, with a heavier edge, so it reads as
+/// the larger thing at a glance.
+pub(crate) const BADGE: MarkerAppearance = MarkerAppearance {
+    radius: BADGE_RADIUS,
+    fill: "#6B4A2F",
+    opacity: 0.9,
+    edge: Ring {
+        color: DISC_EDGE.color,
+        width: 3.0,
+        dashed: false,
+    },
+    ring: None,
+};
+
+impl MarkerAppearance {
+    /// Radius (CSS px) out to the far side of the disc's edge, which is how big
+    /// the disc reads.
+    pub(crate) fn outer_radius(self) -> f64 {
+        self.radius + self.edge.width
+    }
+
+    /// Radius (CSS px) the verdict ring is stroked outside of: clear of the
+    /// widest edge the disc can wear, which is the selection halo.
+    pub(crate) fn ring_radius(self) -> f64 {
+        self.radius + self.edge.width.max(SELECTED_EDGE.width)
+    }
+
+    /// Radius (CSS px) of everything the marker can draw, its selection halo
+    /// included. The hit region is a circle of exactly this, so the boundary a
+    /// pointer crosses is where the ink stops.
+    ///
+    /// The widest reading rather than the current one, so a selected marker's
+    /// halo stays clickable. Clicking the halo of the marker you just opened
+    /// would otherwise close it.
+    pub(crate) fn hit_radius(self) -> f64 {
+        match self.ring {
+            Some(ring) => self.ring_radius() + ring.width,
+            None => self.ring_radius(),
+        }
+    }
+}
+
+/// What the map draws for one marker at the slider's instant.
+///
+/// Keyed on the drawn look rather than on [`ExistenceState`], which doesn't
+/// determine it: `Uncontested` and `Presumed` read the same, and a cluster pin
+/// carries no verdict at all ([`MapMarker::existence`] is `None` for one).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum MarkerLook {
+    /// Known to exist, or presumed to still exist.
+    Standing,
+    /// Sources disagree.
+    Disputed,
+    /// Undated at the slider's instant.
+    Unevidenced,
+    /// A cluster of places.
+    Badge,
+    /// Gone, or not yet built, so drawn nowhere.
+    Hidden,
+}
+
+/// What stands inside a marker's disc.
+///
+/// The map draws every verdict both ways, and the two read differently enough
+/// that a legend showing one of them describes half the map: an unevidenced pin
+/// goes hollow, while a photograph can only fade behind the same dashed ring.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkerFill {
+    /// The appearance's own colour.
+    Colour,
+    /// The photograph a depicted entity carries.
+    Photograph,
+}
+
+impl MarkerLook {
+    /// The look for what the server reported at the slider's instant. `None` is
+    /// a cluster pin.
+    pub(crate) fn of(existence: Option<ExistenceState>) -> Self {
+        match existence {
+            None => Self::Badge,
+            Some(ExistenceState::Uncontested | ExistenceState::Presumed) => Self::Standing,
+            Some(ExistenceState::Contested) => Self::Disputed,
+            Some(ExistenceState::Unknown) => Self::Unevidenced,
+            Some(ExistenceState::Absent) => Self::Hidden,
+        }
+    }
+
+    /// How this look paints.
+    pub(crate) fn appearance(self) -> Option<MarkerAppearance> {
+        match self {
+            Self::Standing => Some(STANDING),
+            Self::Disputed => Some(DISPUTED),
+            Self::Unevidenced => Some(UNEVIDENCED),
+            Self::Badge => Some(BADGE),
+            Self::Hidden => None,
+        }
+    }
+
+    /// What can stand inside this look's disc. A cluster badge speaks for many
+    /// entities, so no single photograph belongs to it.
+    pub(crate) fn fills(self) -> &'static [MarkerFill] {
+        match self {
+            Self::Standing | Self::Disputed | Self::Unevidenced => {
+                &[MarkerFill::Colour, MarkerFill::Photograph]
+            }
+            Self::Badge | Self::Hidden => &[MarkerFill::Colour],
+        }
+    }
+}
+
+/// The disc a verdict ring is stroked around.
+///
+/// One sprite per size rather than one scaled: a dot's disc is about a fifth of
+/// a thumbnail's, and a dash authored for either resamples to a blur at the
+/// other.
+#[derive(Clone, Copy)]
+enum RingSize {
+    Dot,
+    Thumbnail,
+}
+
+impl RingSize {
+    /// Radius (CSS px) the ring is stroked outside of. A bare dot's comes from
+    /// the appearance, which knows how wide its disc can grow; a photograph's is
+    /// the raster, whatever verdict it carries.
+    fn ring_radius(self, appearance: MarkerAppearance) -> f64 {
+        match self {
+            Self::Dot => appearance.ring_radius(),
+            Self::Thumbnail => f64::from(THUMBNAIL_SIZE) / 2.0,
+        }
+    }
+
+    /// Distinguishes the two sizes' sprite ids.
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Dot => "dot",
+            Self::Thumbnail => "thumb",
+        }
+    }
+}
+
+/// One verdict ring, as a sprite the layer can name.
+#[derive(Clone, Copy)]
+struct RingSprite {
+    /// The existence verdict whose features name this sprite.
+    state: ExistenceState,
+    /// How the ring is stroked.
+    ring: Ring,
+    /// The marker size it was authored for.
+    size: RingSize,
+    /// Radius (CSS px) it is stroked outside of.
+    ring_radius: f64,
+}
+
+/// The existence states a drawn marker can carry.
+///
+/// The paint expressions and the ring sprites are generated by walking this, so
+/// a marker's fill, its fade, and its ring stay one source. `Absent` is missing
+/// because [`is_drawn`] drops those markers before they reach the source.
+const DRAWN_STATES: [ExistenceState; 4] = [
+    ExistenceState::Uncontested,
+    ExistenceState::Presumed,
+    ExistenceState::Contested,
+    ExistenceState::Unknown,
+];
+
+/// The GeoJSON property value each existence verdict renders under. The layer
+/// paint expressions match on these strings, so the mapping lives here alone.
+fn existence_property(state: ExistenceState) -> &'static str {
+    match state {
+        ExistenceState::Uncontested => "uncontested",
+        ExistenceState::Contested => "contested",
+        ExistenceState::Presumed => "presumed",
+        ExistenceState::Unknown => "unknown",
+        ExistenceState::Absent => "absent",
+    }
+}
+
+/// The `existence` property read every layer matches on.
+///
+/// Coalesced like the other property reads: a marker whose representative
+/// failed to project carries no verdict, and a bare `get` would feed `match` a
+/// null. No evidence is exactly `unknown`, so that is the honest default.
+fn existence_input() -> serde_json::Value {
+    json!([
+        "coalesce",
+        ["get", "existence"],
+        existence_property(ExistenceState::Unknown)
+    ])
+}
+
+/// A MapLibre `match` giving `value`'s reading of each drawn state's
+/// appearance, with the unevidenced reading as the default arm.
+///
+/// Generating the paint from the appearance table is what keeps them one
+/// source: hand-written `json!` leaves a disc's fill and fade behind whenever
+/// the table moves, and the legend then becomes a second implementation of the
+/// marker's look.
+fn existence_match(
+    value: impl Fn(ExistenceState, MarkerAppearance) -> serde_json::Value,
+) -> serde_json::Value {
+    let mut arms = vec![json!("match"), existence_input()];
+    for state in DRAWN_STATES {
+        if let Some(appearance) = MarkerLook::of(Some(state)).appearance() {
+            arms.push(json!(existence_property(state)));
+            arms.push(value(state, appearance));
+        }
+    }
+    arms.push(value(ExistenceState::Unknown, UNEVIDENCED));
+    json!(arms)
+}
+
+/// The style-image id a verdict ring registers under. Keyed on the state the
+/// layer matches, so `icon-image` and `addImage` derive it the same way.
+fn ring_image_id(state: ExistenceState, size: RingSize) -> String {
+    format!("ring-{}-{}", existence_property(state), size.tag())
+}
+
+/// The sprite each drawn state's ring is named by at `size`. A ringless state
+/// names the empty image; the ring layer's filter keeps those features out, so
+/// that arm is never read.
+fn ring_icon_image(size: RingSize) -> serde_json::Value {
+    existence_match(|state, appearance| {
+        json!(
+            appearance
+                .ring
+                .map(|_| ring_image_id(state, size))
+                .unwrap_or_default()
+        )
+    })
+}
+
+/// Where a ring sits relative to the feature's anchor, in CSS pixels. A dot
+/// rings the coordinate itself; a thumbnail's disc floats above it, since
+/// `icon-anchor: bottom` stands the raster's foot on the point.
+fn ring_offset(size: RingSize, dpr: f64) -> serde_json::Value {
+    let y = match size {
+        RingSize::Dot => 0.0,
+        RingSize::Thumbnail => {
+            let g = thumbnail_geometry(dpr);
+            -(f64::from(g.canvas_h) - g.thumb_cy) / dpr
+        }
+    };
+    // A bare array reads as an expression, so the offset has to be quoted.
+    json!(["literal", [0.0, y]])
+}
+
+/// Every verdict ring a layer can name, at both marker sizes.
+fn ring_sprites() -> impl Iterator<Item = RingSprite> {
+    DRAWN_STATES.into_iter().flat_map(|state| {
+        MarkerLook::of(Some(state))
+            .appearance()
+            .into_iter()
+            .flat_map(move |appearance| {
+                appearance.ring.into_iter().flat_map(move |ring| {
+                    [RingSize::Dot, RingSize::Thumbnail]
+                        .into_iter()
+                        .map(move |size| RingSprite {
+                            state,
+                            ring,
+                            size,
+                            ring_radius: size.ring_radius(appearance),
+                        })
+                })
+            })
+    })
+}
+
+/// Whether every verdict-ring sprite the layers name is registered on the map.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn ring_sprites_registered(map: &maplibre::Map) -> bool {
+    ring_sprites().all(|sprite| map.has_image(&ring_image_id(sprite.state, sprite.size)))
+}
+
+/// The band, in CSS pixels from an undated marker's coordinate, that its verdict
+/// ring has to itself: from the widest its disc ever gets out to the far side of
+/// the ring.
+///
+/// A test proving a ring is clickable has to land inside this band and nowhere
+/// else, and the band moves with every radius and stroke width the marker is
+/// built from, so it is read off them rather than restated.
+///
+/// The near edge is the disc at its widest, which is a selected one. The ring
+/// clears that, so an aim past it is past the disc whether or not the marker is
+/// selected.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn unevidenced_ring_band() -> (f64, f64) {
+    (UNEVIDENCED.ring_radius(), UNEVIDENCED.hit_radius())
+}
 
 // ==================== Public types ====================
 
@@ -286,18 +762,6 @@ fn thumbnail_image_id(marker_id: &str) -> String {
     format!("thumb-{marker_id}")
 }
 
-/// The GeoJSON property value each existence verdict renders under. The layer
-/// paint expressions match on these strings, so the mapping lives here alone.
-fn existence_property(state: ExistenceState) -> &'static str {
-    match state {
-        ExistenceState::Uncontested => "uncontested",
-        ExistenceState::Contested => "contested",
-        ExistenceState::Presumed => "presumed",
-        ExistenceState::Unknown => "unknown",
-        ExistenceState::Absent => "absent",
-    }
-}
-
 /// Whether a marker is drawn at the slider's instant. An entity the sources
 /// place as gone (or not yet built) is dropped entirely rather than styled away.
 ///
@@ -306,10 +770,8 @@ fn existence_property(state: ExistenceState) -> &'static str {
 /// registry, and the GeoJSON all read the same markers. Filtering at
 /// serialization instead left every other consumer counting entities nobody can
 /// see.
-///
-/// A cluster pin has no verdict and always draws.
 fn is_drawn(marker: &MapMarker) -> bool {
-    marker.existence != Some(ExistenceState::Absent)
+    MarkerLook::of(marker.existence).appearance().is_some()
 }
 
 /// Build a GeoJSON `FeatureCollection` from a list of map markers.
@@ -415,162 +877,215 @@ struct GeoJsonSourceSpec {
     cluster_max_zoom: u8,
 }
 
-/// Initialize empty GeoJSON source and layers on the map.
-///
-/// Must be called synchronously in the map load callback (before any async
-/// work). Use `update_source_data` to populate with real data.
-fn init_source_and_layers(map: &maplibre::Map) {
-    let source = GeoJsonSourceSpec {
-        r#type: "geojson",
-        data: json!({"type": "FeatureCollection", "features": []}),
-        promote_id: "feature_id",
-        cluster: true,
-        cluster_radius: CLUSTER_RADIUS,
-        cluster_max_zoom: MAX_ZOOM,
-    };
-    let Ok(source_js) = to_js(&source) else {
-        web_sys::console::error_1(&"Failed to serialize GeoJSON source spec".into());
-        return;
-    };
-    if let Err(e) = map.add_source(ENTITY_SOURCE_ID, &source_js) {
-        web_sys::console::error_1(&format!("Failed to add GeoJSON source: {e:?}").into());
-        return;
-    }
+/// The expressions every layer spec is built against.
+struct LayerContext {
+    /// Device pixels per CSS pixel, which the ring sprites were drawn at.
+    dpr: f64,
+    /// Matches a feature that is not a cluster of any kind: neither a MapLibre
+    /// proximity cluster (`point_count`) nor a lone server `Expand` cell
+    /// (`kind == "cluster"`), both of which belong to the badge layer.
+    not_cluster: serde_json::Value,
+    /// Reads the selection feature-state.
+    ///
+    /// Coalesced, as the property reads are: MapLibre evaluates paint
+    /// expressions during source initialization too, where the state is still
+    /// null and a bare read is a type error.
+    get_selected: serde_json::Value,
+}
 
-    // Coalesce expressions: MapLibre evaluates paint expressions even
-    // during source initialization when properties/feature-state may be
-    // null. Wrap in ["coalesce", ..., default] to avoid type errors.
-    let get_selected = json!(["coalesce", ["feature-state", "selected"], false]);
-
-    // A bare pin excludes clustered features: a MapLibre proximity cluster
-    // (`point_count`) and a lone server `Expand` cell (`kind == "cluster"`)
-    // both belong to the badge layer, not here.
-    let not_cluster = json!([
-        "all",
-        ["!", ["has", "point_count"]],
-        ["!=", ["get", "kind"], "cluster"]
-    ]);
-
-    // How the drawn existence states read (absent markers are dropped upstream,
-    // in `build_markers_geojson`). A cluster carries no verdict and falls through
-    // to the default arm.
-    //
-    // `presumed` deliberately renders exactly like `uncontested`. We never hold
-    // positive evidence that something stood at a given instant — only events we
-    // infer it from — so presumption is the ordinary way a standing building
-    // reads, not a degraded one. A palace sighted once in 1343 and never since is
-    // presumed every day after, and fading that would fade most of the map.
-    //
-    // What the render does distinguish is having *no* evidence (`unknown`, washed
-    // out) and sources *disagreeing* (`contested`, ringed).
-    // Coalesced like the other property reads: a marker whose representative
-    // failed to project carries no verdict, and a bare `get` would feed `match` a
-    // null. No evidence is exactly `unknown`, so that is the honest default.
-    let existence = json!(["coalesce", ["get", "existence"], "unknown"]);
-    let fill_opacity = json!(["match", existence.clone(), "unknown", 0.25, 0.85]);
-    let fill_color = json!(["match", existence.clone(), "unknown", "#9A9A9A", "#8B5E3C"]);
-    // A contested marker gets a heavier ring in a colour nothing else uses, so a
-    // source disagreement is visible without opening the entity.
-    let stroke_color = json!([
-        "case",
-        get_selected,
-        "#FFFFFF",
-        ["==", existence.clone(), "contested"],
-        "#C2410C",
-        ["==", existence.clone(), "unknown"],
-        "#B8B8B8",
-        "#F5F0E8"
-    ]);
-    let stroke_width = json!([
-        "case",
-        get_selected,
-        4,
-        ["==", existence.clone(), "contested"],
-        3,
-        2
-    ]);
-
-    // Circle layer for the bare marker dots. A thumbnailed marker carries a
-    // `thumbnail` id from t=0 and so renders in the symbol layer instead —
-    // this filter excludes it, and the symbol layer's `styleimagemissing`
-    // path shows a placeholder pin until the raster loads.
-    let circle = json!({
-        "id": ENTITY_CIRCLES_LAYER,
-        "type": "circle",
-        "source": ENTITY_SOURCE_ID,
-        "filter": ["all", ["!", ["has", "thumbnail"]], not_cluster.clone()],
-        "paint": {
-            "circle-radius": 10,
-            "circle-color": fill_color,
-            "circle-stroke-width": stroke_width,
-            "circle-stroke-color": stroke_color,
-            "circle-opacity": fill_opacity
+impl EntityLayer {
+    /// The style-layer id.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Circles => ENTITY_CIRCLES_LAYER,
+            Self::Hit => ENTITY_HIT_LAYER,
+            Self::Badge => ENTITY_BADGE_LAYER,
+            Self::Ring => ENTITY_RING_LAYER,
+            Self::Labels => ENTITY_LABELS_LAYER,
+            Self::Thumbnails => ENTITY_THUMBNAILS_LAYER,
         }
-    });
-    let Ok(circle_js) = to_js(&circle) else {
-        web_sys::console::error_1(&"Failed to serialize circle layer spec".into());
-        return;
-    };
-    if let Err(e) = map.add_layer(&circle_js) {
-        web_sys::console::error_1(&format!("Failed to add circle layer: {e:?}").into());
-        return;
     }
 
-    // Badge layer for clusters — a larger, darker disc, visually distinct from
-    // a bare pin. It matches a MapLibre proximity cluster (`point_count`) or a
-    // lone server `Expand` cell (`kind == "cluster"`). No count text (the
-    // undercount of an approximate rollup stays invisible by design).
-    let badge = json!({
-        "id": ENTITY_BADGE_LAYER,
-        "type": "circle",
-        "source": ENTITY_SOURCE_ID,
-        "filter": ["any", ["has", "point_count"], ["==", ["get", "kind"], "cluster"]],
-        "paint": {
-            "circle-radius": 18,
-            "circle-color": "#6B4A2F",
-            "circle-stroke-width": 3,
-            "circle-stroke-color": "#F5F0E8",
-            "circle-opacity": 0.9
+    /// Whether a click on a marker can land in this layer.
+    ///
+    /// The rings are out. A symbol layer answers a query by the sprite's whole
+    /// square, which for a dot reaches 22.6 px into the basemap at the corners
+    /// while the ink stops at 17, so hit-testing there would take clicks meant
+    /// for the map. [`EntityLayer::Hit`] covers the same ink, round.
+    ///
+    /// A label is out because a name is not the marker.
+    fn hit_tested(self) -> bool {
+        match self {
+            Self::Circles | Self::Hit | Self::Badge | Self::Thumbnails => true,
+            Self::Ring | Self::Labels => false,
         }
-    });
-    let Ok(badge_js) = to_js(&badge) else {
-        web_sys::console::error_1(&"Failed to serialize badge layer spec".into());
-        return;
-    };
-    if let Err(e) = map.add_layer(&badge_js) {
-        web_sys::console::error_1(&format!("Failed to add badge layer: {e:?}").into());
-        return;
     }
 
-    // Symbol layer for marker labels — added BEFORE thumbnails so thumbnails
-    // render on top and aren't occluded by neighboring labels.
-    // Read label styling from the basemap's city label layer so our markers
-    // match the basemap visually, regardless of which style is loaded.
+    /// The layer's `addLayer` spec.
+    fn spec(self, map: &maplibre::Map, ctx: &LayerContext) -> Result<JsValue, String> {
+        let spec = match self {
+            // The disc, read off the appearance table. The verdict's own ring
+            // rides the ring layer, where one sprite serves a dot and a
+            // thumbnail alike.
+            //
+            // `circle-opacity` fades the fill alone; the edge keeps MapLibre's
+            // own `circle-stroke-opacity` default of 1. That is what lets an
+            // unevidenced pin read as an outline: a parchment wash inside a
+            // full-strength rim.
+            //
+            // A thumbnailed marker carries a `thumbnail` id from t=0 and renders
+            // in the symbol layer instead, so the filter excludes it, and that
+            // layer's `styleimagemissing` path shows a placeholder pin until the
+            // raster loads.
+            Self::Circles => json!({
+                "id": self.id(),
+                "type": "circle",
+                "source": ENTITY_SOURCE_ID,
+                "filter": ["all", ["!", ["has", "thumbnail"]], ctx.not_cluster],
+                "paint": {
+                    "circle-radius": existence_match(|_, a| json!(a.radius)),
+                    "circle-color": existence_match(|_, a| json!(a.fill)),
+                    "circle-stroke-width": json!([
+                        "case",
+                        ctx.get_selected,
+                        SELECTED_EDGE.width,
+                        existence_match(|_, a| json!(a.edge.width))
+                    ]),
+                    "circle-stroke-color": json!([
+                        "case",
+                        ctx.get_selected,
+                        SELECTED_EDGE.color,
+                        existence_match(|_, a| json!(a.edge.color))
+                    ]),
+                    "circle-opacity": existence_match(|_, a| json!(a.opacity))
+                }
+            }),
+
+            // A bare dot's hit region: a transparent disc out to the far edge of
+            // everything it draws, ring included.
+            //
+            // It stands in for the circle layer's hover and click handlers
+            // rather than joining them. Two nested registered layers would clear
+            // the cursor at the inner boundary, dropping the pointer affordance
+            // over pixels the click still works on.
+            Self::Hit => json!({
+                "id": self.id(),
+                "type": "circle",
+                "source": ENTITY_SOURCE_ID,
+                "filter": ["all", ["!", ["has", "thumbnail"]], ctx.not_cluster],
+                "paint": {
+                    "circle-radius": existence_match(|_, a| json!(a.hit_radius())),
+                    "circle-opacity": 0.0
+                }
+            }),
+
+            // A larger, darker disc, so a cluster reads as the bigger thing at a
+            // glance. No count text: the undercount of an approximate rollup
+            // stays invisible by design.
+            Self::Badge => json!({
+                "id": self.id(),
+                "type": "circle",
+                "source": ENTITY_SOURCE_ID,
+                "filter": ["any", ["has", "point_count"], ["==", ["get", "kind"], "cluster"]],
+                "paint": {
+                    "circle-radius": BADGE.radius,
+                    "circle-color": BADGE.fill,
+                    "circle-stroke-width": BADGE.edge.width,
+                    "circle-stroke-color": BADGE.edge.color,
+                    "circle-opacity": BADGE.opacity
+                }
+            }),
+
+            // One sprite serving a bare dot and a photographed marker alike.
+            //
+            // Overlap and placement match the thumbnails layer. At the defaults
+            // the rings join the collision index, where they get culled by zoom
+            // and pan and start blocking the names beside them.
+            //
+            // The filter admits exactly the states the appearance table gives a
+            // ring, so `icon-image` resolves to a registered sprite wherever it
+            // is read.
+            //
+            // The ring paints at full strength, with no `icon-opacity` of its
+            // own: it carries the verdict, and the disc beneath it is the part
+            // that fades.
+            Self::Ring => json!({
+                "id": self.id(),
+                "type": "symbol",
+                "source": ENTITY_SOURCE_ID,
+                "filter": [
+                    "all",
+                    ctx.not_cluster,
+                    existence_match(|_, a| json!(a.ring.is_some()))
+                ],
+                "layout": {
+                    "icon-image": [
+                        "case",
+                        ["has", "thumbnail"], ring_icon_image(RingSize::Thumbnail),
+                        ring_icon_image(RingSize::Dot)
+                    ],
+                    "icon-offset": [
+                        "case",
+                        ["has", "thumbnail"], ring_offset(RingSize::Thumbnail, ctx.dpr),
+                        ring_offset(RingSize::Dot, ctx.dpr)
+                    ],
+                    "icon-size": 1.0,
+                    "icon-allow-overlap": true,
+                    "icon-ignore-placement": true
+                }
+            }),
+
+            Self::Labels => json!({
+                "id": self.id(),
+                "type": "symbol",
+                "source": ENTITY_SOURCE_ID,
+                "filter": ["all", ["has", "name"], ctx.not_cluster],
+                "layout": {
+                    "text-field": ["get", "name"],
+                    "text-size": 12,
+                    "text-anchor": "top",
+                    "text-offset": [0, 0.8],
+                    "text-allow-overlap": false,
+                    "text-ignore-placement": false,
+                    "text-max-width": 8
+                }
+            }),
+
+            Self::Thumbnails => json!({
+                "id": self.id(),
+                "type": "symbol",
+                "source": ENTITY_SOURCE_ID,
+                "filter": ["all", ["has", "thumbnail"], ctx.not_cluster],
+                "layout": {
+                    "icon-image": ["get", "thumbnail"],
+                    "icon-size": 1.0,
+                    "icon-allow-overlap": true,
+                    "icon-ignore-placement": true,
+                    "icon-anchor": "bottom"
+                },
+                "paint": {
+                    // A thumbnailed marker fades on the same scale as a bare
+                    // dot, so a photographed entity and an unphotographed one
+                    // read the same confidence at a given instant.
+                    "icon-opacity": existence_match(|_, a| json!(a.opacity))
+                }
+            }),
+        };
+        let js = to_js(&spec)
+            .map_err(|e| format!("failed to serialize the {} layer spec: {e}", self.id()))?;
+        if matches!(self, Self::Labels) {
+            copy_basemap_label_style(map, &js)?;
+        }
+        Ok(js)
+    }
+}
+
+/// Take the label layer's font and text paint from the basemap's own city
+/// labels, so entity names match whichever style is loaded.
+fn copy_basemap_label_style(map: &maplibre::Map, spec: &JsValue) -> Result<(), String> {
     let basemap = "label_city";
-    let labels = json!({
-        "id": "entity-labels",
-        "type": "symbol",
-        "source": ENTITY_SOURCE_ID,
-        "filter": ["all", ["has", "name"], not_cluster.clone()],
-        "layout": {
-            "text-field": ["get", "name"],
-            "text-size": 12,
-            "text-anchor": "top",
-            "text-offset": [0, 0.8],
-            "text-allow-overlap": false,
-            "text-ignore-placement": false,
-            "text-max-width": 8
-        }
-    });
-    let Ok(labels_js) = to_js(&labels) else {
-        web_sys::console::error_1(&"Failed to serialize labels layer spec".into());
-        return;
-    };
-    // Copy font and paint properties from the basemap label layer.
-    let Ok(layout) = js_sys::Reflect::get(&labels_js, &"layout".into()) else {
-        web_sys::console::error_1(&"Failed to read layout from labels spec".into());
-        return;
-    };
+    let layout = js_sys::Reflect::get(spec, &"layout".into())
+        .map_err(|e| format!("failed to read layout from the labels spec: {e:?}"))?;
     let font = map.get_layout_property(basemap, "text-font");
     if !font.is_undefined() {
         let _ = js_sys::Reflect::set(&layout, &"text-font".into(), &font);
@@ -587,43 +1102,57 @@ fn init_source_and_layers(map: &maplibre::Map) {
             let _ = js_sys::Reflect::set(&paint, &(*prop).into(), &val);
         }
     }
-    let _ = js_sys::Reflect::set(&labels_js, &"paint".into(), &paint);
-    if let Err(e) = map.add_layer(&labels_js) {
-        web_sys::console::error_1(&format!("Failed to add labels layer: {e:?}").into());
-    }
+    let _ = js_sys::Reflect::set(spec, &"paint".into(), &paint);
+    Ok(())
+}
 
-    // Symbol layer for thumbnail images — added LAST so thumbnails render on
-    // top of all other marker layers (circles and labels).
-    let thumbnails = json!({
-        "id": ENTITY_THUMBNAILS_LAYER,
-        "type": "symbol",
-        "source": ENTITY_SOURCE_ID,
-        "filter": ["all", ["has", "thumbnail"], not_cluster],
-        "layout": {
-            "icon-image": ["get", "thumbnail"],
-            "icon-size": 1.0,
-            "icon-allow-overlap": true,
-            "icon-ignore-placement": true,
-            "icon-anchor": "bottom"
-        },
-        "paint": {
-            // A thumbnailed marker fades on the same scale as a bare dot, so a
-            // photographed entity and an unphotographed one read the same
-            // confidence at a given instant.
-            "icon-opacity": [
-                "match", ["coalesce", ["get", "existence"], "unknown"],
-                "unknown", 0.35,
-                0.95
-            ]
-        }
-    });
-    let Ok(thumbnails_js) = to_js(&thumbnails) else {
-        web_sys::console::error_1(&"Failed to serialize thumbnails layer spec".into());
-        return;
+/// Initialize empty GeoJSON source and layers on the map.
+///
+/// Must be called synchronously in the map load callback (before any async
+/// work). Use `update_source_data` to populate with real data.
+///
+/// All or nothing, and the caller registers no click handlers unless it
+/// succeeded, so no handler can ever hit-test against a stack this left
+/// half-built.
+fn init_source_and_layers(map: &maplibre::Map) -> Result<(), String> {
+    let dpr = device_pixel_ratio();
+    let source = GeoJsonSourceSpec {
+        r#type: "geojson",
+        data: json!({"type": "FeatureCollection", "features": []}),
+        promote_id: "feature_id",
+        cluster: true,
+        cluster_radius: CLUSTER_RADIUS,
+        cluster_max_zoom: MAX_ZOOM,
     };
-    if let Err(e) = map.add_layer(&thumbnails_js) {
-        web_sys::console::error_1(&format!("Failed to add thumbnails layer: {e:?}").into());
+    let source_js =
+        to_js(&source).map_err(|e| format!("failed to serialize the GeoJSON source spec: {e}"))?;
+    map.add_source(ENTITY_SOURCE_ID, &source_js)
+        .map_err(|e| format!("failed to add the GeoJSON source: {e:?}"))?;
+
+    // Ahead of the ring layer, and never through `styleimagemissing`: that
+    // handler returns early for ids it doesn't own, so a ring id the layer names
+    // before its `addImage` would draw nothing for the session's life. A sprite
+    // that fails is warned about and skipped, since returning here would take
+    // out every layer below.
+    register_ring_sprites(map, dpr);
+
+    let ctx = LayerContext {
+        dpr,
+        not_cluster: json!([
+            "all",
+            ["!", ["has", "point_count"]],
+            ["!=", ["get", "kind"], "cluster"]
+        ]),
+        get_selected: json!(["coalesce", ["feature-state", "selected"], false]),
+    };
+
+    // Appended in order, so the list *is* the stack.
+    for layer in ENTITY_LAYERS {
+        let spec = layer.spec(map, &ctx)?;
+        map.add_layer(&spec)
+            .map_err(|e| format!("failed to add the {} layer: {e:?}", layer.id()))?;
     }
+    Ok(())
 }
 
 /// Update an existing GeoJSON source with new data.
@@ -1114,7 +1643,7 @@ struct ThumbnailGeometry {
 
 fn thumbnail_geometry(dpr: f64) -> ThumbnailGeometry {
     let thumb_r = f64::from(THUMBNAIL_SIZE) / 2.0 * dpr;
-    let border = 2.0 * dpr;
+    let border = DISC_EDGE.width * dpr;
     let stem_len = STEM_LENGTH * dpr;
     let dot_r = DOT_RADIUS * dpr;
     // Use ceil() so non-integer device pixel ratios (1.5/1.75/2.625 on some
@@ -1139,11 +1668,12 @@ fn thumbnail_geometry(dpr: f64) -> ThumbnailGeometry {
     }
 }
 
-/// Create an offscreen canvas of the given geometry and return its 2D context.
+/// Create an offscreen canvas of `width` × `height` device pixels and return
+/// its 2D context.
 ///
 /// The `<canvas>` DOM node is kept alive by the returned context, so callers
 /// only need the context to draw and read back pixels.
-fn thumbnail_canvas(g: &ThumbnailGeometry) -> Result<web_sys::CanvasRenderingContext2d, String> {
+fn offscreen_canvas(width: u32, height: u32) -> Result<web_sys::CanvasRenderingContext2d, String> {
     let document = web_sys::window()
         .and_then(|w| w.document())
         .ok_or("no document")?;
@@ -1152,8 +1682,15 @@ fn thumbnail_canvas(g: &ThumbnailGeometry) -> Result<web_sys::CanvasRenderingCon
         .map_err(|e| format!("create_element failed: {e:?}"))?
         .dyn_into::<web_sys::HtmlCanvasElement>()
         .map_err(|_| "cast to HtmlCanvasElement failed")?;
-    canvas.set_width(g.canvas_w);
-    canvas.set_height(g.canvas_h);
+    canvas.set_width(width);
+    canvas.set_height(height);
+    canvas_context(&canvas)
+}
+
+/// The 2D drawing context of an existing canvas.
+fn canvas_context(
+    canvas: &web_sys::HtmlCanvasElement,
+) -> Result<web_sys::CanvasRenderingContext2d, String> {
     canvas
         .get_context("2d")
         .map_err(|e| format!("getContext failed: {e:?}"))?
@@ -1162,45 +1699,257 @@ fn thumbnail_canvas(g: &ThumbnailGeometry) -> Result<web_sys::CanvasRenderingCon
         .map_err(|_| "cast to CanvasRenderingContext2d failed".to_string())
 }
 
+/// Length (CSS px) of one dash plus the gap after it on a dashed ring.
+///
+/// Held as a length, so a thumbnail's ring and a bare dot's wear the same
+/// rhythm at five times the radius. Long enough to give a bare dot half a dozen
+/// clear strokes, which is the count at which a ring reads as deliberately
+/// dashed instead of dotted.
+const RING_DASH_PERIOD: f64 = 15.0;
+
+/// Share of a dash period the stroke covers.
+const RING_DASH_DUTY: f64 = 0.6;
+
+/// Stroke `ring` with its centreline at `radius`, at `scale` device pixels per
+/// CSS pixel.
+fn stroke_ring(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    ring: Ring,
+    center: (f64, f64),
+    radius: f64,
+    scale: f64,
+) -> Result<(), String> {
+    ctx.save();
+    ctx.set_stroke_style_str(ring.color);
+    ctx.set_line_width(ring.width * scale);
+    if ring.dashed {
+        // A whole number of periods, so the pattern closes where it started
+        // rather than leaving one short dash butted against the first.
+        let turn = std::f64::consts::TAU * radius;
+        let periods = (turn / (RING_DASH_PERIOD * scale)).round().max(1.0);
+        let period = turn / periods;
+        let dash = period * RING_DASH_DUTY;
+        let segments = js_sys::Array::of2(&dash.into(), &(period - dash).into());
+        ctx.set_line_dash(segments.as_ref())
+            .map_err(|e| format!("setLineDash failed: {e:?}"))?;
+    }
+    ctx.begin_path();
+    ctx.arc(center.0, center.1, radius, 0.0, std::f64::consts::TAU)
+        .map_err(|e| format!("arc failed: {e:?}"))?;
+    ctx.stroke();
+    ctx.restore();
+    Ok(())
+}
+
+/// The tones a stand-in photograph is painted from: a wash, the ground under it,
+/// and whatever is standing on it.
+///
+/// Warm and low-contrast, so the disc reads as an old photograph at a glance
+/// without pulling the eye off the ring, which is where the verdict is.
+const PHOTO_SKY: &str = "#E0D3BC";
+const PHOTO_GROUND: &str = "#8A745A";
+const PHOTO_SUBJECT: &str = "#4A3B29";
+
+/// Fill a disc with a photograph's worth of shapes, for the places that show
+/// what a photographed marker looks like without having a photograph to hand.
+fn fill_stand_in_photograph(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    center: (f64, f64),
+    radius: f64,
+) -> Result<(), String> {
+    let (cx, cy) = center;
+    ctx.save();
+    ctx.begin_path();
+    ctx.arc(cx, cy, radius, 0.0, std::f64::consts::TAU)
+        .map_err(|e| format!("arc failed: {e:?}"))?;
+    ctx.clip();
+
+    ctx.set_fill_style_str(PHOTO_SKY);
+    ctx.fill_rect(cx - radius, cy - radius, radius * 2.0, radius * 2.0);
+
+    // A low horizon, so the subject on it has sky to stand against at the size
+    // a pin is drawn.
+    let horizon = cy + radius * 0.35;
+    ctx.set_fill_style_str(PHOTO_GROUND);
+    ctx.fill_rect(cx - radius, horizon, radius * 2.0, cy + radius - horizon);
+
+    // A roofed block: the least that still reads as a building.
+    let half_width = radius * 0.4;
+    let eaves = cy - radius * 0.3;
+    ctx.set_fill_style_str(PHOTO_SUBJECT);
+    ctx.fill_rect(cx - half_width, eaves, half_width * 2.0, horizon - eaves);
+    ctx.begin_path();
+    ctx.move_to(cx - half_width * 1.5, eaves);
+    ctx.line_to(cx, eaves - radius * 0.45);
+    ctx.line_to(cx + half_width * 1.5, eaves);
+    ctx.close_path();
+    ctx.fill();
+
+    ctx.restore();
+    Ok(())
+}
+
+/// Draw a marker's disc of `radius` device pixels: its interior at `opacity`,
+/// with its edge stroked inside that radius.
+///
+/// The one place a marker's disc becomes pixels. The thumbnail placeholder and
+/// the legend's swatch both come through here, so what the map draws and what
+/// the legend claims it means stay one drawing. The verdict ring is drawn apart
+/// from the disc here as it is on the map, where the two are separate layers.
+///
+/// The fade lands on the interior alone, matching how the layers paint it: the
+/// edge is what a reader picks the verdict off, so it stays opaque.
+pub(crate) fn draw_marker_disc(
+    ctx: &web_sys::CanvasRenderingContext2d,
+    appearance: MarkerAppearance,
+    fill: MarkerFill,
+    opacity: f64,
+    center: (f64, f64),
+    radius: f64,
+    scale: f64,
+) -> Result<(), String> {
+    let edge = appearance.edge.width * scale;
+    ctx.save();
+    ctx.set_global_alpha(opacity);
+    match fill {
+        MarkerFill::Colour => {
+            ctx.set_fill_style_str(appearance.fill);
+            ctx.begin_path();
+            ctx.arc(
+                center.0,
+                center.1,
+                radius - edge,
+                0.0,
+                std::f64::consts::TAU,
+            )
+            .map_err(|e| format!("arc failed: {e:?}"))?;
+            ctx.fill();
+        }
+        MarkerFill::Photograph => fill_stand_in_photograph(ctx, center, radius - edge)?,
+    }
+    ctx.restore();
+    stroke_ring(ctx, appearance.edge, center, radius - edge / 2.0, scale)
+}
+
+/// Side (CSS px) of a legend swatch, sized to hold the largest marker the map
+/// draws: a cluster badge, whose disc is wider than a pin's ring reaches.
+pub(crate) const SWATCH_SIZE: f64 = 44.0;
+
+/// Draw `look` filled `fill`'s way into `canvas`, at the radius the map draws
+/// that marker, so the legend is a sample of the map rather than a picture of
+/// one.
+///
+/// Every swatch shares this box and draws from its centre, so the three pin
+/// verdicts land on one disc and one centre line and only a ring reaches past
+/// them. A badge keeps its own wider radius, which is the thing it says.
+///
+/// Sizes the canvas as a side effect: its backing store is in device pixels and
+/// its CSS box in [`SWATCH_SIZE`], which is the pair that keeps the drawing
+/// crisp on a retina screen.
+pub(crate) fn draw_swatch(
+    canvas: &web_sys::HtmlCanvasElement,
+    look: MarkerLook,
+    fill: MarkerFill,
+) -> Result<(), String> {
+    let Some(appearance) = look.appearance() else {
+        return Ok(());
+    };
+    let dpr = device_pixel_ratio();
+    let side = (SWATCH_SIZE * dpr).ceil();
+    canvas.set_width(side as u32);
+    canvas.set_height(side as u32);
+    let ctx = canvas_context(canvas)?;
+    let center = (side / 2.0, side / 2.0);
+    draw_marker_disc(
+        &ctx,
+        appearance,
+        fill,
+        appearance.opacity,
+        center,
+        appearance.outer_radius() * dpr,
+        dpr,
+    )?;
+    match appearance.ring {
+        // Off the same radius the map's ring sprite uses, so the gap the legend
+        // shows between disc and ring is the gap on the map.
+        Some(ring) => stroke_ring(
+            &ctx,
+            ring,
+            center,
+            (appearance.ring_radius() + ring.width / 2.0) * dpr,
+            dpr,
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Draw one verdict ring as a standalone sprite: a transparent square with the
+/// ring centred, so the layer places it by offset alone.
+fn draw_ring_sprite(sprite: RingSprite, dpr: f64) -> Result<web_sys::ImageData, String> {
+    // A CSS pixel of slack past the outer edge keeps the antialiased rim off the
+    // sprite's boundary.
+    let extent = (sprite.ring_radius + sprite.ring.width + 1.0) * dpr;
+    let side = (extent * 2.0).ceil() as u32;
+    let ctx = offscreen_canvas(side, side)?;
+    let center = (f64::from(side) / 2.0, f64::from(side) / 2.0);
+    let radius = (sprite.ring_radius + sprite.ring.width / 2.0) * dpr;
+    stroke_ring(&ctx, sprite.ring, center, radius, dpr)?;
+    ctx.get_image_data(0.0, 0.0, f64::from(side), f64::from(side))
+        .map_err(|e| format!("getImageData failed: {e:?}"))
+}
+
+/// Register a sprite for every verdict ring, at both marker sizes.
+fn register_ring_sprites(map: &maplibre::Map, dpr: f64) {
+    for sprite in ring_sprites() {
+        let id = ring_image_id(sprite.state, sprite.size);
+        if map.has_image(&id) {
+            continue;
+        }
+        let image = match draw_ring_sprite(sprite, dpr) {
+            Ok(image) => image,
+            Err(e) => {
+                web_sys::console::warn_1(&format!("ring sprite draw failed for {id}: {e}").into());
+                continue;
+            }
+        };
+        let opts = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&opts, &"pixelRatio".into(), &dpr.into());
+        if let Err(e) = map.add_image_with_options(&id, image.as_ref(), &opts) {
+            web_sys::console::warn_1(
+                &format!("ring sprite add_image failed for {id}: {e:?}").into(),
+            );
+        }
+    }
+}
+
 /// Draw the copper "pin" placeholder shown while a thumbnail loads.
 ///
 /// Sized via [`thumbnail_geometry`] so `map.updateImage` can swap in the real
 /// raster in place without a dimension-mismatch throw. Drawn as the pin's stem
 /// and location dot with a solid copper disc where the photo will land, so the
 /// swap to the loaded raster doesn't shift the pin.
+///
+/// Drawn at full alpha: the layer's `icon-opacity` applies the verdict's fade,
+/// which the slider can move without redrawing a raster.
 fn draw_thumbnail_placeholder(dpr: f64) -> Result<web_sys::ImageData, String> {
     let g = thumbnail_geometry(dpr);
-    let ctx = thumbnail_canvas(&g)?;
+    let ctx = offscreen_canvas(g.canvas_w, g.canvas_h)?;
 
-    // Copper disc where the photo will land, with the parchment border.
-    ctx.set_fill_style_str("#8B5E3C");
-    ctx.begin_path();
-    ctx.arc(
-        g.cx,
-        g.thumb_cy,
-        g.thumb_r - g.border,
-        0.0,
-        std::f64::consts::TAU,
-    )
-    .map_err(|e| format!("arc failed: {e:?}"))?;
-    ctx.fill();
-    ctx.set_stroke_style_str("#F5F0E8");
-    ctx.set_line_width(g.border);
-    ctx.begin_path();
-    ctx.arc(
-        g.cx,
-        g.thumb_cy,
-        g.thumb_r - g.border / 2.0,
-        0.0,
-        std::f64::consts::TAU,
-    )
-    .map_err(|e| format!("arc failed: {e:?}"))?;
-    ctx.stroke();
+    // Copper disc where the photo will land.
+    draw_marker_disc(
+        &ctx,
+        STANDING,
+        MarkerFill::Colour,
+        1.0,
+        (g.cx, g.thumb_cy),
+        g.thumb_r,
+        dpr,
+    )?;
 
     // Stem line down to the location dot.
     let stem_top = g.thumb_cy + g.thumb_r;
     let stem_bottom = stem_top + g.stem_len;
-    ctx.set_stroke_style_str("#8B5E3C");
+    ctx.set_stroke_style_str(STANDING.fill);
     ctx.set_line_width(g.border);
     ctx.begin_path();
     ctx.move_to(g.cx, stem_top);
@@ -1209,12 +1958,12 @@ fn draw_thumbnail_placeholder(dpr: f64) -> Result<web_sys::ImageData, String> {
 
     // Location dot marking the geographic point.
     let dot_cy = stem_bottom + g.dot_r;
-    ctx.set_fill_style_str("#8B5E3C");
+    ctx.set_fill_style_str(STANDING.fill);
     ctx.begin_path();
     ctx.arc(g.cx, dot_cy, g.dot_r, 0.0, std::f64::consts::TAU)
         .map_err(|e| format!("arc failed: {e:?}"))?;
     ctx.fill();
-    ctx.set_stroke_style_str("#F5F0E8");
+    ctx.set_stroke_style_str(DISC_EDGE.color);
     ctx.set_line_width(g.border);
     ctx.stroke();
 
@@ -1232,7 +1981,7 @@ fn draw_circular_thumbnail(
     dpr: f64,
 ) -> Result<web_sys::ImageData, String> {
     let g = thumbnail_geometry(dpr);
-    let ctx = thumbnail_canvas(&g)?;
+    let ctx = offscreen_canvas(g.canvas_w, g.canvas_h)?;
 
     let ThumbnailGeometry {
         canvas_w,
@@ -1271,25 +2020,16 @@ fn draw_circular_thumbnail(
     .map_err(|e| format!("drawImage failed: {e:?}"))?;
     ctx.restore();
 
-    // Thumbnail border
-    ctx.set_stroke_style_str("#F5F0E8");
-    ctx.set_line_width(border);
-    ctx.begin_path();
-    ctx.arc(
-        cx,
-        thumb_cy,
-        thumb_r - border / 2.0,
-        0.0,
-        std::f64::consts::TAU,
-    )
-    .map_err(|e| format!("arc failed: {e:?}"))?;
-    ctx.stroke();
+    // The disc's parchment edge, cutting the photo out of the basemap. The
+    // verdict's ring rides the ring layer, which the slider can restyle without
+    // redrawing every raster.
+    stroke_ring(&ctx, DISC_EDGE, (cx, thumb_cy), thumb_r - border / 2.0, dpr)?;
 
     // --- Stem line ---
     let stem_top = thumb_cy + thumb_r;
     let stem_bottom = stem_top + stem_len;
-    ctx.set_stroke_style_str("#8B5E3C"); // copper
-    ctx.set_line_width(2.0 * dpr);
+    ctx.set_stroke_style_str(STANDING.fill);
+    ctx.set_line_width(border);
     ctx.begin_path();
     ctx.move_to(cx, stem_top);
     ctx.line_to(cx, stem_bottom);
@@ -1303,15 +2043,15 @@ fn draw_circular_thumbnail(
     ctx.set_shadow_offset_y(2.0 * dpr);
 
     // --- Location dot (matches circle marker style) ---
-    ctx.set_fill_style_str("#8B5E3C"); // copper fill
+    ctx.set_fill_style_str(STANDING.fill);
     ctx.begin_path();
     ctx.arc(cx, dot_cy, dot_r, 0.0, std::f64::consts::TAU)
         .map_err(|e| format!("arc failed: {e:?}"))?;
     ctx.fill();
     // Restore before stroke so the shadow only applies to the fill, not the border
     ctx.restore();
-    ctx.set_stroke_style_str("#F5F0E8"); // parchment stroke
-    ctx.set_line_width(2.0 * dpr);
+    ctx.set_stroke_style_str(DISC_EDGE.color);
+    ctx.set_line_width(border);
     ctx.stroke();
 
     ctx.get_image_data(0.0, 0.0, f64::from(canvas_w), f64::from(canvas_h))
@@ -1699,11 +2439,10 @@ fn handle_background_click(
     let point = js_sys::Reflect::get(&event, &"point".into()).ok();
     if let Some(point) = point {
         let opts = js_sys::Object::new();
-        let layers = js_sys::Array::of3(
-            &JsValue::from_str(ENTITY_CIRCLES_LAYER),
-            &JsValue::from_str(ENTITY_THUMBNAILS_LAYER),
-            &JsValue::from_str(ENTITY_BADGE_LAYER),
-        );
+        let layers = js_sys::Array::new();
+        for layer in marker_layers() {
+            layers.push(&JsValue::from_str(layer));
+        }
         let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
         let features = map.query_rendered_features(&point, &opts);
         if features.length() > 0 {
@@ -1794,7 +2533,10 @@ fn register_layer_handlers(
 ) -> Vec<Box<dyn std::any::Any>> {
     let mut closures: Vec<Box<dyn std::any::Any>> = Vec::new();
 
-    register_marker_layer(map, ENTITY_CIRCLES_LAYER, set_selected, &mut closures);
+    // The bare dot goes through its hit region rather than its disc: a verdict
+    // ring reaches past the disc, and a pointer that crossed out of the disc
+    // into the ring would lose its cursor over pixels the click still works on.
+    register_marker_layer(map, ENTITY_HIT_LAYER, set_selected, &mut closures);
     register_marker_layer(map, ENTITY_THUMBNAILS_LAYER, set_selected, &mut closures);
     register_badge_layer(map, set_selected, source_generation, &mut closures);
 
@@ -2061,7 +2803,14 @@ fn initialize_map(
         let map_ref = map_for_load.clone();
         let st2 = st.clone();
 
-        init_source_and_layers(&map_ref);
+        // A map missing a layer cannot be clicked at all, so this is surfaced
+        // rather than logged: the alert strip is the only sign the reader gets
+        // that the markers in front of them are inert.
+        if let Err(e) = init_source_and_layers(&map_ref) {
+            web_sys::console::error_1(&e.clone().into());
+            signals.set_map_error.set(Some(e));
+            return;
+        }
         st.source_initialized.set(true);
 
         let handler_closures =
@@ -2482,12 +3231,21 @@ pub fn MapView(
             />
             {move || {
                 map_error.get().map(|msg| view! {
-                    // Stacked above the time slider's bar, on the same 12 px
-                    // inset and the same `bottom-14` the map's status chips
-                    // take. The bar is an opaque later sibling in this corner,
-                    // so an alert level with it is simply covered.
+                    // The one occupant of this corner that isn't in the
+                    // bottom-left column. It reports on the map rather than on a
+                    // selection, so it shows while the column's own contents
+                    // have all yielded to the detail panel, and it is bounded
+                    // left and right because a MapLibre message can be long
+                    // enough to run off a left-anchored column.
+                    //
+                    // On the alert rung, above that column: the column grows
+                    // upward by however much the time card is holding, and an
+                    // alert a tall card can cover is an alert nobody reads.
                     <div
-                        class="absolute bottom-14 left-3 right-3 bg-red-900/90 text-white text-xs px-3 py-2 rounded shadow"
+                        class=format!(
+                            "absolute bottom-14 left-3 right-3 {OVERLAY_ALERT} bg-red-900/90 \
+                             text-white text-xs px-3 py-2 rounded shadow"
+                        )
                         role="alert"
                     >
                         {msg}

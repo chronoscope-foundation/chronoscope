@@ -5,6 +5,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::api::Client;
+use crate::components::controls::OVERLAY_CONTROL;
 use crate::components::entity_detail::{EntityDetailPanel, LightboxState};
 use crate::components::focus_trap::contain_tab;
 use crate::components::map::{MapStatus, MapView, SelectedEntity};
@@ -65,11 +66,32 @@ pub fn Landing() -> impl IntoView {
             // Entity detail panel (slides in from right on marker click)
             <EntityDetailPanel api_client=api_client.clone()/>
 
-            // Map status overlays (loading, empty)
-            <MapStatusOverlay/>
+            // One column owns the map's bottom-left corner, on the same 12 px
+            // inset every other floating gizmo uses. The time card and the
+            // status chips are flow children of it, so the chips ride whatever
+            // height the card takes rather than being told a number that a
+            // taller card silently invalidates.
+            //
+            // Spacing belongs to the chips rather than to a `gap` here: the
+            // status overlay is always mounted for its live region, and a gap
+            // would stand as a stripe of nothing above the card whenever there
+            // is nothing to announce.
+            //
+            // Clicks pass through to the map, and each occupant that wants them
+            // takes them back. The column is as wide as its widest row, so
+            // otherwise the space beside a short chip would swallow map drags.
+            //
+            // On the controls rung: the time card is what the reader is working,
+            // and on a phone it grows tall enough to meet the About card.
+            <div class=format!(
+                "absolute bottom-3 left-3 {OVERLAY_CONTROL} flex flex-col \
+                 items-start pointer-events-none"
+            )>
+                <MapStatusOverlay/>
 
-            // The time control — rewinds the map to a historical moment.
-            <TimeSlider/>
+                // The time control — rewinds the map to a historical moment.
+                <TimeSlider/>
+            </div>
 
             // Dismissible info card — collapsible "about" overlay for new visitors.
             <AboutCard/>
@@ -248,24 +270,21 @@ fn MapStatusOverlay() -> impl IntoView {
         prev_loading.set(is_loading);
     });
 
+    // Each chip carries its own bottom margin, so an overlay with nothing to
+    // say takes no room in the column it sits in.
+    let chip = "mb-2 text-xs text-sepia/70 bg-parchment/90 backdrop-blur-sm \
+                rounded px-2 py-1 font-sans";
+
     view! {
         <div aria-live="polite">
             // Loading indicator (hidden when detail panel is open)
             {move || (loading.get() && !panel_open()).then(|| view! {
-                <div class="absolute bottom-14 left-3 pointer-events-none">
-                    <span class="text-xs text-sepia/70 bg-parchment/90 backdrop-blur-sm rounded px-2 py-1 font-sans animate-pulse">
-                        "Loading..."
-                    </span>
-                </div>
+                <div class=format!("{chip} animate-pulse")>"Loading..."</div>
             })}
 
             // Empty state (hidden when detail panel is open)
             {move || (!loading.get() && empty.get() && !panel_open()).then(|| view! {
-                <div class="absolute bottom-14 left-3 pointer-events-none">
-                    <span class="text-xs text-sepia/70 bg-parchment/90 backdrop-blur-sm rounded px-2 py-1 font-sans">
-                        "No entities in this area"
-                    </span>
-                </div>
+                <div class=chip>"No entities in this area"</div>
             })}
 
             // Announce entity availability to screen readers
@@ -277,17 +296,19 @@ fn MapStatusOverlay() -> impl IntoView {
             {move || if panel_open() { None } else { fetch_error.get() }.map(|msg| {
                 let on_retry = move |_| retry.set(true);
                 view! {
-                    <div class="absolute bottom-14 left-3 pointer-events-auto">
-                        <div class="bg-red-600/90 text-white rounded px-3 py-2 text-xs font-sans flex items-center gap-2">
-                            <span class="truncate max-w-xs md:max-w-md">{msg}</span>
-                            <button
-                                class="bg-white/20 hover:bg-white/30 rounded px-2 py-1 cursor-pointer shrink-0"
-                                on:click=on_retry
-                                aria-label="Retry loading entities"
-                            >
-                                "Retry"
-                            </button>
-                        </div>
+                    // Takes its clicks back from the column, which waves them
+                    // through to the map: the Retry button is the one thing in
+                    // here anybody presses.
+                    <div class="mb-2 pointer-events-auto bg-red-600/90 text-white rounded \
+                                px-3 py-2 text-xs font-sans flex items-center gap-2">
+                        <span class="truncate max-w-xs md:max-w-md">{msg}</span>
+                        <button
+                            class="bg-white/20 hover:bg-white/30 rounded px-2 py-1 cursor-pointer shrink-0"
+                            on:click=on_retry
+                            aria-label="Retry loading entities"
+                        >
+                            "Retry"
+                        </button>
                     </div>
                 }
             })}

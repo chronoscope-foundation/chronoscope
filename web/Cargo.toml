@@ -8,7 +8,11 @@ default = []
 # Compile test hooks into the WASM binary. These register helper functions
 # on window.__test that browser tests call via CDP evaluate. Only enabled
 # for `just web-test` builds — production builds exclude them entirely.
-test-hooks = []
+#
+# `MediaQueryList` rides along: a resize lands asynchronously, and the media
+# query the stylesheet branches on is the one predicate a test can wait for. The
+# app itself branches in CSS and never reads one, so the binding stays here.
+test-hooks = ["web-sys/MediaQueryList"]
 
 [lints]
 workspace = true

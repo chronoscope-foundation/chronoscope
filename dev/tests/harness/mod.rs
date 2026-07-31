@@ -615,6 +615,10 @@ impl WebTest {
         // Webfonts loaded and the reflow around them finished. Required before
         // any geometry assertion, which otherwise straddles the font swap.
         pub wait wait_for_fonts();
+        // A media query reads `expected`. `set_viewport` returns before the
+        // renderer has resized and recalculated style, so a responsive
+        // assertion has to wait for the predicate the stylesheet branches on.
+        pub wait wait_for_media_query(query: &str, expected: bool);
 
         // DOM queries (compositions: wait then read, where natural).
         pub query text(selector: &str) -> String;
@@ -739,6 +743,21 @@ impl WebTest {
         // Cluster-badge descriptors (proximity clusters + lone server
         // `Expand` cells) — the complement of `marker_properties`.
         pub query badge_properties() -> Vec<serde_json::Value>;
+        // Verdict-ring descriptors. Its own hook because a ring carries its
+        // marker's feature id, which `marker_properties` dedupes against.
+        pub query ring_properties() -> Vec<serde_json::Value>;
+        // Whether every verdict-ring sprite the layers name is registered.
+        pub query ring_sprites_registered() -> bool;
+        // `[inner, outer]` CSS pixels from an undated marker's coordinate: the
+        // band its verdict ring has to itself, read off the radii the renderer
+        // draws it from.
+        pub query unevidenced_ring_band() -> Vec<f64>;
+        // The coordinate `dx`/`dy` CSS pixels from the given one, so a test can
+        // aim past a marker's disc and onto its ring.
+        pub query offset_lnglat(lng: f64, lat: f64, dx: f64, dy: f64) -> Vec<f64>;
+        // Which marker layers own the pixel at a coordinate — the set a click
+        // there hit-tests against.
+        pub query marker_layers_at(lng: f64, lat: f64) -> Vec<String>;
         pub query layer_order() -> Vec<String>;
         // Current map zoom — for asserting a cluster click zooms the map in.
         pub query zoom() -> f64;

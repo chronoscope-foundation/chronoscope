@@ -7,20 +7,23 @@
 //! from under the pointer every time you used it.
 //!
 //! Two properties keep the toggle still, and both are needed. It is one button
-//! that never unmounts, so the states cannot be styled apart. And it is
-//! positioned against the corner-anchored container rather than laid out by the
-//! body, so its box cannot depend on whether the body is there or how big it
-//! is. A toggle sitting in the body's flow satisfies the first and still moves.
+//! that never unmounts, so the states cannot be styled apart. And it is aligned
+//! to a corner of the container rather than laid out by the body, so its box
+//! cannot depend on whether the body is there or how big it is. A toggle
+//! sitting in the body's flow satisfies the first and still moves.
+//!
+//! The two share one grid cell, which is what makes the card's own box honest:
+//! it measures the larger of the chip and the body, so a collapsed card laid
+//! into a column takes exactly the chip's room. Stacking them by absolute
+//! positioning instead left the container measuring zero whenever the body was
+//! away, and everything above it in that column dropped onto the chip.
 
 use leptos::prelude::*;
 
-use crate::components::controls::{FOCUS_RING, HIT_AREA, SURFACE};
+use crate::components::controls::{FOCUS_RING, HIT_AREA, OVERLAY_INFO, SURFACE};
 use crate::components::motion::REVEAL;
 
 /// The map corner a card pins to.
-///
-/// Only the two edges the corner names are set, so the card sizes to its body
-/// and grows away from the corner while the corner itself stays put.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Corner {
     TopRight,
@@ -28,26 +31,42 @@ pub enum Corner {
 }
 
 impl Corner {
-    /// Pins the container to the map.
-    const fn anchor(self) -> &'static str {
+    /// Places the container, and positions it either way.
+    ///
+    /// A component applying [`HIT_AREA`] cannot let the `::before` escape to
+    /// whatever positioned ancestor it lands under (see `controls.rs`), and in
+    /// flow that ancestor is the full-map wrapper, which turns the toggle into a
+    /// map-sized click target that swallows every marker click.
+    ///
+    /// It takes its own pointer events back either way too. A card is the
+    /// interactive thing in a corner otherwise full of read-only status, so it
+    /// has to survive an ancestor that waves clicks through to the map.
+    fn anchor(self) -> String {
         match self {
-            // Clears the entity detail panel, which slides in below it. Sits
-            // lower on narrow screens, where the card spans nearly the full
+            // Only the two edges the corner names are set, so the card sizes to
+            // its body and grows away from the corner while the corner stays
+            // put. Clears the entity detail panel, which slides in below it.
+            // Sits lower on narrow screens, where the card spans nearly the full
             // width and would otherwise run under the nav trigger — the trigger
             // is opaque and would cover the card's own heading.
-            Corner::TopRight => "absolute top-14 right-3 md:top-3 z-10",
-            // Flush to the corner, on the same 12 px inset every other floating
-            // gizmo uses. The map's status chips share this corner and now stack
-            // above it, rather than the bar being pushed up to clear them.
-            Corner::BottomLeft => "absolute bottom-3 left-3 z-10",
+            //
+            // The card in this corner is the app's one purely explanatory
+            // overlay, which is the rung it takes.
+            Corner::TopRight => {
+                format!("absolute top-14 right-3 md:top-3 {OVERLAY_INFO} pointer-events-auto")
+            }
+            // A flow child of the column that owns the map's bottom-left corner,
+            // so the chips above it move for whatever height this card takes
+            // rather than being told a number. The column carries the rung.
+            Corner::BottomLeft => "relative pointer-events-auto".to_string(),
         }
     }
 
-    /// Pins the toggle to that same corner inside the container.
+    /// Sits the toggle in that same corner of the shared grid cell.
     const fn toggle_anchor(self) -> &'static str {
         match self {
-            Corner::TopRight => "absolute top-0 right-0",
-            Corner::BottomLeft => "absolute bottom-0 left-0",
+            Corner::TopRight => "self-start justify-self-end",
+            Corner::BottomLeft => "self-end justify-self-start",
         }
     }
 }
@@ -70,9 +89,9 @@ pub fn MapCard(
     /// Names the body the toggle discloses: `aria-controls` while that body is
     /// mounted, and the stem of the toggle's own id.
     body_id: &'static str,
-    /// The body's corner radius. A tall panel and a single-row bar want
-    /// different curves, and the bar's has to match its chip's to read as one
-    /// shape rather than a chip sitting on a card.
+    /// The body's corner radius. The chip sits over one corner of it, so the
+    /// two curves meet there and the caller is the one that can see whether
+    /// they should match.
     body_radius: &'static str,
     /// The toggle's content. Free to change with `open`; its box is not.
     #[prop(into)]
@@ -85,8 +104,13 @@ pub fn MapCard(
     // Collapsed, the chip *is* the card and carries the surface. Expanded, it is
     // a control sitting inside one, so a second background and ring there would
     // draw a seam across the card's own corner.
+    //
+    // `relative` for the same reason `DismissButton` carries it: [`HIT_AREA`]
+    // emits an absolutely positioned pseudo-element, and a control that hands
+    // that anchoring to whatever happens to be positioned above it gets a hit
+    // area somewhere else entirely.
     let toggle_base = format!(
-        "{} {FOCUS_RING} {HIT_AREA} {chip_class} \
+        "{} col-start-1 row-start-1 relative {FOCUS_RING} {HIT_AREA} {chip_class} \
          flex items-center justify-center gap-1 cursor-pointer \
          text-sepia hover:text-ink font-sans",
         corner.toggle_anchor()
@@ -95,14 +119,16 @@ pub fn MapCard(
         let surface = if open.get() { "" } else { SURFACE };
         format!("{toggle_base} {surface}")
     };
-    let body_class = format!("{SURFACE} {body_radius}");
+    // Shares the toggle's cell, so the card measures the larger of the two and
+    // the toggle rides the corner of whichever that is.
+    let body_class = format!("col-start-1 row-start-1 {SURFACE} {body_radius}");
     // The control's own name, alongside the body's, so the toggle stays
     // addressable in both states: the browser tests follow one across a collapse
     // by it.
     let toggle_id = format!("{body_id}-toggle");
 
     view! {
-        <div class=corner.anchor()>
+        <div class=format!("grid {}", corner.anchor())>
             <Show when=move || open.get()>
                 {
                     // `Show` takes a reactive `Fn` children, so the closure may

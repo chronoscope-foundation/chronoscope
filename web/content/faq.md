@@ -16,7 +16,21 @@ This is also what makes automated research safe to build on. A vision model show
 
 ## How does Chronoscope handle dates and locations that aren't precise?
 
-Many historical sources give approximate information: "circa 1920s," "somewhere near the waterfront," "between 1914 and 1918." Rather than force a false exact date or coordinate, Chronoscope stores the vagueness as given. "Sometime in the 1920s" is a real value in its own right, not a placeholder waiting for someone to supply the year, and it stays that way until evidence genuinely narrows it.
+Many historical sources give approximate information: "circa 1920s," "somewhere near the waterfront," "between 1914 and 1918." Chronoscope stores that vagueness as given and reasons over it directly: "sometime in the 1920s" is a real value in its own right, and two vague dates can still contradict each other, or combine into something sharper than either alone. A value narrows when evidence genuinely narrows it.
+
+## What do the markers on the map mean? {#existence-states}
+
+The map always shows a particular year, and every marker answers one question: did the sources say this place stood then?
+
+A **solid marker** means we presume it stood. Either a source documents the place that year, or it was built earlier and nothing records its demolition. Almost nothing is documented continuously, so a palace recorded once in 1343 is presumed to stand every day after until something says otherwise. Treating that as doubt would put the whole map in doubt.
+
+An **orange ring** means the sources disagree. A record says the building came down in 1896; a dated photograph shows it standing in 1902. Both can't be right, so we mark the place as contested and leave the question open. Open the entity to see which claims collide.
+
+A **dashed ring** means the place is undated. We know where it is and that it stood at some point, but nothing puts it standing or gone in the year you're looking at. A plain marker goes hollow inside the ring; one carrying a photograph fades behind it.
+
+**Nothing at all** means the sources put its demolition before that year, or its construction after. Scrub back and the demolished ones reappear.
+
+A **badge** is a cluster: several places too close together to draw separately at this zoom. It stands for a group and carries no answer of its own. Zoom in and it splits into individual markers, each with one.
 
 ## How does the automated image analysis work?
 

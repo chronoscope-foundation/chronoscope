@@ -83,6 +83,7 @@ impl_register_fn!();
 impl_register_fn!(A);
 impl_register_fn!(A, B);
 impl_register_fn!(A, B, C);
+impl_register_fn!(A, B, C, D);
 
 // ==================== Hook registration macro ====================
 
@@ -172,6 +173,7 @@ pub fn register_base() {
         wait_for_selector_removal,
         wait_for_body_text,
         wait_for_fonts,
+        wait_for_media_query,
 
         // Fetch-settled counter — sample then await (closes listener race).
         // f64 across the FFI: integer counters fit losslessly under 2^53.
@@ -245,6 +247,34 @@ pub fn register_map_hooks(
         badge_properties: {
             let h = map_handle.clone();
             move || descriptors_settled(h.clone(), badge_properties)
+        },
+        ring_properties: {
+            let h = map_handle.clone();
+            move || descriptors_settled(h.clone(), ring_properties)
+        },
+        ring_sprites_registered: map_query(
+            &map_handle,
+            false,
+            crate::components::map::ring_sprites_registered,
+        ),
+
+        // Aiming helpers. A verdict ring reaches past its marker's disc, so a
+        // test that wants to land on one has to read the band it occupies, turn
+        // that into a screen offset, and ask which layer owns the pixel it
+        // reached.
+        unevidenced_ring_band: || {
+            let (inner, outer) = crate::components::map::unevidenced_ring_band();
+            JsValue::from(js_sys::Array::of2(&inner.into(), &outer.into()))
+        },
+        offset_lnglat: {
+            let h = map_handle.clone();
+            move |lng: f64, lat: f64, dx: f64, dy: f64| {
+                with_map(&h, |m| offset_lnglat(m, lng, lat, dx, dy)).unwrap_or(JsValue::NULL)
+            }
+        },
+        marker_layers_at: {
+            let h = map_handle.clone();
+            move |lng: f64, lat: f64| marker_layers_at(h.clone(), lng, lat)
         },
 
         // Composed map actions (settled-wait baked).
@@ -554,6 +584,55 @@ fn wait_for_body_text(needle: String) -> js_sys::Promise {
     observe_until(needle, ObserveMode::BodyTextContains)
 }
 
+/// Resolves once `query` evaluates to `expected`.
+///
+/// Resizing the viewport is asynchronous in a way nothing in the DOM announces:
+/// the CDP call returns before the renderer has resized and recalculated style,
+/// so a responsive assertion taken straight afterwards can read the layout the
+/// page had before. A media query is the same predicate the stylesheet is
+/// branching on, so waiting for it to flip is waiting for exactly the recalc the
+/// assertion depends on.
+fn wait_for_media_query(query: String, expected: bool) -> js_sys::Promise {
+    js_sys::Promise::new(&mut |resolve, _reject| {
+        let Some(list) = web_sys::window().and_then(|w| w.match_media(&query).ok().flatten())
+        else {
+            let _ = resolve.call0(&JsValue::NULL);
+            return;
+        };
+        if list.matches() == expected {
+            let _ = resolve.call0(&JsValue::NULL);
+            return;
+        }
+        // Same shape as `observe_until`: the listener is owned by JS via
+        // `forget`, and detaching it inside the callback severs the only
+        // reference, so it becomes collectable once the predicate has fired.
+        let resolve_cell: Rc<Cell<Option<js_sys::Function>>> = Rc::new(Cell::new(Some(resolve)));
+        let listener_cell: Rc<Cell<Option<js_sys::Function>>> = Rc::new(Cell::new(None));
+        let listener_cb = listener_cell.clone();
+        let list_cb = list.clone();
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            if list_cb.matches() != expected {
+                return;
+            }
+            if let Some(listener) = listener_cb.take() {
+                let _ = list_cb.remove_event_listener_with_callback("change", &listener);
+            }
+            if let Some(resolve_fn) = resolve_cell.take() {
+                let _ = resolve_fn.call0(&JsValue::NULL);
+            }
+        });
+        let listener: js_sys::Function = cb.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        cb.forget();
+        if list
+            .add_event_listener_with_callback("change", &listener)
+            .is_err()
+        {
+            return;
+        }
+        listener_cell.set(Some(listener));
+    })
+}
+
 #[derive(Clone, Copy)]
 enum ObserveMode {
     AppearsMatching,
@@ -732,6 +811,27 @@ fn click_map_at(handle: Rc<RefCell<Option<maplibre::Map>>>, lng: f64, lat: f64) 
             fire_map_click(map, lng, lat);
         }
         Ok(JsValue::NULL)
+    })
+}
+
+/// Waits for map-settled, then reports which marker layers are under
+/// `lng`/`lat`, deduplicated in query order.
+///
+/// The settled-wait is baked for the same reason as [`marker_properties`]:
+/// `query_rendered_features` needs the feature index queryable.
+fn marker_layers_at(
+    handle: Rc<RefCell<Option<maplibre::Map>>>,
+    lng: f64,
+    lat: f64,
+) -> js_sys::Promise {
+    let settled = wait_for_map_settled(&handle);
+    wasm_bindgen_futures::future_to_promise(async move {
+        wasm_bindgen_futures::JsFuture::from(settled).await?;
+        Ok(handle
+            .borrow()
+            .as_ref()
+            .map(|map| layers_at(map, lng, lat))
+            .unwrap_or(JsValue::NULL))
     })
 }
 
@@ -1216,6 +1316,17 @@ fn badge_properties(map: &maplibre::Map) -> JsValue {
     layer_descriptors(map, &[ENTITY_BADGE_LAYER])
 }
 
+/// Descriptors for the verdict-ring layer alone.
+///
+/// Its own hook because a ring shares its marker's feature id, and
+/// [`layer_descriptors`] keeps the first hit per id: folded in beside the circle
+/// and thumbnail layers, a ring would be deduped away and an assertion aimed at
+/// it would read its marker's disc instead.
+fn ring_properties(map: &maplibre::Map) -> JsValue {
+    use crate::components::map::ENTITY_RING_LAYER;
+    layer_descriptors(map, &[ENTITY_RING_LAYER])
+}
+
 /// Deduplicated descriptors for every feature rendered across `layers`.
 ///
 /// Each descriptor is the feature's flat `properties`, plus `_lng`/`_lat` from
@@ -1291,6 +1402,55 @@ fn layer_descriptors(map: &maplibre::Map, layers: &[&str]) -> JsValue {
         result.push(&descriptor);
     }
     result.into()
+}
+
+/// The marker layers rendering something at `lng`/`lat`, as a JS array of layer
+/// ids. Which layer owns a pixel is what decides whether a click there selects
+/// the marker or falls through to the background handler.
+fn layers_at(map: &maplibre::Map, lng: f64, lat: f64) -> JsValue {
+    let point = project_lnglat(map, lng, lat);
+    let opts = js_sys::Object::new();
+    let layers = js_sys::Array::new();
+    for layer in crate::components::map::marker_layers() {
+        layers.push(&layer.into());
+    }
+    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
+    let features = map.query_rendered_features(&point, &opts);
+
+    let seen = js_sys::Set::new(&JsValue::UNDEFINED);
+    let result = js_sys::Array::new();
+    for i in 0..features.length() {
+        let Ok(id) = js_sys::Reflect::get(&features.get(i), &"layer".into())
+            .and_then(|layer| js_sys::Reflect::get(&layer, &"id".into()))
+        else {
+            continue;
+        };
+        if !seen.has(&id) {
+            seen.add(&id);
+            result.push(&id);
+        }
+    }
+    result.into()
+}
+
+/// The coordinate `dx`/`dy` CSS pixels from `lng`/`lat` on screen, as
+/// `[lng, lat]`.
+fn offset_lnglat(map: &maplibre::Map, lng: f64, lat: f64, dx: f64, dy: f64) -> JsValue {
+    let point = project_lnglat(map, lng, lat);
+    let read = |key: &str, source: &JsValue| {
+        js_sys::Reflect::get(source, &key.into())
+            .ok()
+            .and_then(|v| v.as_f64())
+    };
+    let (Some(x), Some(y)) = (read("x", &point), read("y", &point)) else {
+        return JsValue::NULL;
+    };
+    let shifted = js_sys::Array::of2(&(x + dx).into(), &(y + dy).into());
+    let lnglat = map.unproject(shifted.as_ref());
+    let (Some(lng), Some(lat)) = (read("lng", &lnglat), read("lat", &lnglat)) else {
+        return JsValue::NULL;
+    };
+    js_sys::Array::of2(&lng.into(), &lat.into()).into()
 }
 
 /// Return a JS array of layer IDs in the order MapLibre will draw them
@@ -1400,6 +1560,9 @@ extern "C" {
 
     #[wasm_bindgen(method, js_class = "Map")]
     fn project(this: &maplibre::Map, lnglat: &JsValue) -> JsValue;
+
+    #[wasm_bindgen(method, js_class = "Map")]
+    fn unproject(this: &maplibre::Map, point: &JsValue) -> JsValue;
 
     #[wasm_bindgen(method, js_class = "Map")]
     fn fire(this: &maplibre::Map, event_type: &str, data: &JsValue) -> JsValue;

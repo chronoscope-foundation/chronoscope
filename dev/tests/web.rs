@@ -14,13 +14,17 @@ use harness::{TestResult, WebTest, check, web_test, web_test_seeded};
 use chronoscope_api::state::ServerIds;
 use chronoscope_core::date::{DatePrecision, UncertainDate};
 use chronoscope_core::geo::{GeoPoint, Meters};
-use chronoscope_core::grammar::assertions::FactualAssertion;
+use chronoscope_core::grammar::assertions::{FactualAssertion, JudgmentAssertion};
 use chronoscope_core::grammar::attribute::{self, NameText, NameType};
 use chronoscope_core::grammar::bookend::{ConstructionFact, DemolitionFact};
-use chronoscope_core::grammar::citations::{Excerpt, ExternalSource, FactualCitation, Language};
+use chronoscope_core::grammar::citations::{
+    Excerpt, ExternalSource, FactualCitation, JudgmentSource, Language,
+};
+use chronoscope_core::grammar::depiction::{self, Perspective};
 use chronoscope_core::grammar::ids::UserId;
+use chronoscope_core::grammar::{existence, image};
 use chronoscope_core::location::{Location, UnresolvedLocation};
-use chronoscope_core::submit::{Commit, CommitAuthor, Decl, EntityIdx, SubmitFact};
+use chronoscope_core::submit::{Commit, CommitAuthor, Decl, EntityIdx, ImageIdx, SubmitFact};
 
 type SeedResult = Result<Commit<ServerIds>, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -86,6 +90,15 @@ fn name_and_location_facts(
     ])
 }
 
+/// A whole year as an uncertain date, the precision a bookend or a witness read
+/// off a source usually carries.
+fn year(y: i32) -> Result<UncertainDate, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(UncertainDate::with_precision(
+        chrono::NaiveDate::from_ymd_opt(y, 1, 1).ok_or("valid year")?,
+        DatePrecision::Year,
+    )?)
+}
+
 /// A commit placing one named entity at `(lat, lon)` that was built in `built`
 /// and demolished in `demolished` — so it exists at instants between them and
 /// nowhere else.
@@ -96,12 +109,6 @@ fn seed_demolished_entity_at(
     built: i32,
     demolished: i32,
 ) -> SeedResult {
-    let year = |y: i32| -> Result<UncertainDate, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(UncertainDate::with_precision(
-            chrono::NaiveDate::from_ymd_opt(y, 1, 1).ok_or("valid year")?,
-            DatePrecision::Year,
-        )?)
-    };
     let mut facts = name_and_location_facts(name, lat, lon)?;
     facts.push(SubmitFact::Factual {
         assertion: FactualAssertion::Construction {
@@ -142,6 +149,77 @@ fn seed_entity_at(name: &str, lat: f64, lon: f64) -> SeedResult {
         facts: name_and_location_facts(name, lat, lon)?
             .into_iter()
             .collect(),
+    })
+}
+
+/// A commit placing one named, photographed entity at `(lat, lon)` whose
+/// sources disagree about whether it still stands: a demolition, and a witness
+/// that saw it afterwards.
+///
+/// The sighting refutes the demolition without erasing it, so the dispute runs
+/// forward from the demolition — the entity reads contested at every later
+/// instant, the present included, and no scrub is needed to reach it.
+fn seed_disputed_photographed_entity_at(
+    name: &str,
+    lat: f64,
+    lon: f64,
+    demolished: i32,
+    witnessed: i32,
+) -> SeedResult {
+    let mut facts = name_and_location_facts(name, lat, lon)?;
+    facts.push(SubmitFact::Factual {
+        assertion: FactualAssertion::Demolition {
+            fact: DemolitionFact::Completed {
+                entity: EntityIdx(0),
+                bound: year(demolished)?,
+            },
+        },
+        citation: seed_citation("https://example.com/seed-demolished")?,
+    });
+    facts.push(SubmitFact::Factual {
+        assertion: FactualAssertion::Existence {
+            fact: existence::Fact {
+                entity: EntityIdx(0),
+                at: year(witnessed)?,
+            },
+        },
+        citation: seed_citation("https://example.com/seed-witness")?,
+    });
+    // The photo's bytes are never fetched: the harness resolves every
+    // fact-store image to a placeholder, which is what puts a thumbnail on the
+    // marker.
+    facts.push(SubmitFact::Factual {
+        assertion: FactualAssertion::Image {
+            fact: image::Fact::Source {
+                image: ImageIdx(0),
+                url: url::Url::parse("https://example.com/seed-photo.jpg")?,
+            },
+        },
+        citation: seed_citation("https://example.com/seed-photo")?,
+    });
+    facts.push(SubmitFact::Judgment {
+        assertion: JudgmentAssertion::Depiction {
+            fact: depiction::Fact {
+                entity: EntityIdx(0),
+                image: ImageIdx(0),
+                localization: None,
+                perspective: Some(Perspective::Exterior),
+            },
+        },
+        citation: JudgmentSource::External {
+            source: ExternalSource::Url {
+                url: url::Url::parse("https://example.com/seed-photo")?,
+                published: None,
+            },
+        },
+    });
+    Ok(Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("seed")?),
+        recorded_at: chrono::Utc::now(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: vec![Decl::Local],
+        facts: facts.into_iter().collect(),
     })
 }
 
@@ -237,6 +315,13 @@ async fn test_time_slider_reveals_a_demolished_entity() -> TestResult {
         check(
             !rendered_features(t).await?.is_empty(),
             "returning to 1750 must reveal the entity again",
+        )?;
+        // Past the ancient band the axis is CE the whole way, so the era is
+        // understood and the readout is the bare number.
+        let modern = t.text("#time-slider-year").await?;
+        check(
+            modern.trim() == "1750",
+            format!("scrubbing to 1750 must read as '1750', got: {modern:?}"),
         )?;
 
         // Scrubbing to the right edge lands on the present, where the entity is
@@ -705,14 +790,6 @@ async fn test_entity_click_opens_detail() -> TestResult {
             format!("Panel should show external links section, got: {panel_text}"),
         )?;
 
-        // The map's bottom-left overlays yield to the panel, which on a phone is
-        // a sheet across that whole corner. The time slider draws after the
-        // panel, so one left standing takes the sheet's taps.
-        check(
-            !t.exists("#time-slider-panel-toggle").await?,
-            "the time slider should step aside while the detail panel is open",
-        )?;
-
         Ok(())
     })
     .await
@@ -869,6 +946,272 @@ async fn test_map_hover_cursor() -> TestResult {
         let cursor = t.map_cursor().await?;
         check(cursor != "pointer", "Cursor should reset after moving away")?;
 
+        Ok(())
+    })
+    .await
+}
+
+// ==================== Verdict ring tests ====================
+//
+// The ring is what makes a verdict legible without opening the entity: orange
+// where sources disagree, dashed where nothing dates the place. It is
+// one symbol layer keyed on the existence property, so a bare dot and a
+// photographed marker wear the same ring, and its pixels reach past the disc.
+//
+// Observed through `ring_properties`, which queries that layer alone.
+// `marker_properties` covers the circle and thumbnail layers and dedupes by
+// feature id, so a ring — which carries its marker's id — never surfaces there.
+
+/// The layer a bare marker's disc paints on. Named here because the ring-click
+/// test's whole premise is that it aimed somewhere this layer does not reach.
+const ENTITY_CIRCLES_LAYER: &str = "entity-circles";
+
+/// The verdict-ring descriptor for the marker named `name`.
+async fn ring_for(
+    t: &WebTest,
+    name: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+    let rings = t.ring_properties().await?;
+    rings
+        .iter()
+        .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name))
+        .cloned()
+        .ok_or_else(|| format!("no verdict ring rendered for {name}, got {rings:?}").into())
+}
+
+/// A photographed entity whose sources disagree wears the ring too.
+///
+/// This is the bug the one-ring layer fixes: the orange used to live only in the
+/// circle layer's stroke, which a thumbnailed marker never draws, while the
+/// raster's own border was hardcoded parchment — so a contested entity with a
+/// photograph showed no orange anywhere on the map.
+#[tokio::test]
+async fn test_a_photographed_contested_entity_wears_the_verdict_ring() -> TestResult {
+    let seeds = vec![seed_disputed_photographed_entity_at(
+        "Drowned Chapel",
+        25.0,
+        -40.0,
+        1885,
+        1887,
+    )?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_with_thumbnails(-40.0, 25.0, 12.0).await?;
+
+        // The premise: one marker, contested at the present instant, carrying a
+        // thumbnail. Without all three the ring assertion below proves nothing.
+        let markers = t.marker_properties().await?;
+        let marker = markers
+            .iter()
+            .find(|m| m.get("name").and_then(|n| n.as_str()) == Some("Drowned Chapel"))
+            .ok_or_else(|| format!("the seeded chapel must render a marker, got {markers:?}"))?;
+        check(
+            marker.get("existence").and_then(|e| e.as_str()) == Some("contested"),
+            format!("a sighting past a demolition must read contested, got {marker:?}"),
+        )?;
+        check(
+            marker.get("thumbnail").is_some(),
+            format!("the seeded chapel must render as a thumbnail, got {marker:?}"),
+        )?;
+
+        let ring = ring_for(t, "Drowned Chapel").await?;
+        check(
+            ring.get("existence").and_then(|e| e.as_str()) == Some("contested"),
+            format!("the ring must carry the contested verdict it draws, got {ring:?}"),
+        )?;
+
+        // The About card opens over the map on a first visit, and these
+        // screenshots are how the ring's colour, weight and dash get judged.
+        t.click("button[aria-label='Hide the About panel']").await?;
+        t.screenshot("test_a_photographed_contested_entity_wears_the_verdict_ring")
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
+/// An entity with no dates at all is unknown at every instant, and says so with
+/// a ring.
+///
+/// The sprite roll-call covers the rings nothing on screen here draws: a ring is
+/// authored at two sizes, and this marker is a bare dot, so the thumbnail-sized
+/// unevidenced sprite has no rendered case anywhere in the suite.
+#[tokio::test]
+async fn test_an_undated_entity_wears_the_unevidenced_ring() -> TestResult {
+    let seeds = vec![seed_entity_at("Nameless Ruin", 25.0, -40.0)?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 12.0).await?;
+
+        let ring = ring_for(t, "Nameless Ruin").await?;
+        check(
+            ring.get("existence").and_then(|e| e.as_str()) == Some("unknown"),
+            format!("an entity with no dates must read unknown, got {ring:?}"),
+        )?;
+        check(
+            t.ring_sprites_registered().await?,
+            "every verdict ring the layer names must have its sprite registered",
+        )?;
+
+        // The About card opens over the map on a first visit, and these
+        // screenshots are how the ring's colour, weight and dash get judged.
+        t.click("button[aria-label='Hide the About panel']").await?;
+        t.screenshot("test_an_undated_entity_wears_the_unevidenced_ring")
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
+/// A click on a marker's ring selects the marker.
+///
+/// The ring reaches past the disc, onto pixels the disc's own hit region never
+/// covers. Those pixels used to belong to no hit-tested layer at all: a click
+/// there matched nothing and the background handler cleared the selection
+/// instead.
+#[tokio::test]
+async fn test_clicking_a_markers_ring_selects_it() -> TestResult {
+    let seeds = vec![seed_entity_at("Nameless Ruin", 25.0, -40.0)?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 12.0).await?;
+
+        // Straight up from the coordinate, into the middle of the band the ring
+        // has to itself. Aiming at the middle rather than a chosen distance
+        // leaves the widest margin any radius allows, and the margin moves when
+        // the radii do. Upward so the name below the marker plays no part.
+        let band = t.unevidenced_ring_band().await?;
+        let (inner, outer) = (
+            *band.first().ok_or("ring band missing its inner radius")?,
+            *band.get(1).ok_or("ring band missing its outer radius")?,
+        );
+        check(
+            outer > inner,
+            format!("a verdict ring must reach past the disc, got band {band:?}"),
+        )?;
+        let point = t
+            .offset_lnglat(-40.0, 25.0, 0.0, -(inner + outer) / 2.0)
+            .await?;
+        let (lng, lat) = (
+            *point.first().ok_or("offset coordinate missing lng")?,
+            *point.get(1).ok_or("offset coordinate missing lat")?,
+        );
+
+        // The premise: the disc does not reach that pixel. If it did, the click
+        // below would select through the disc's own hit region and pass no
+        // matter where the ring's pixels were hit-tested.
+        let layers = t.marker_layers_at(lng, lat).await?;
+        check(
+            !layers.iter().any(|l| l == ENTITY_CIRCLES_LAYER),
+            format!(
+                "{}px out must be past the disc, but {ENTITY_CIRCLES_LAYER} claims it: {layers:?}",
+                (inner + outer) / 2.0
+            ),
+        )?;
+        check(
+            !layers.is_empty(),
+            "a ring pixel must belong to some hit-tested layer, or a click there deselects",
+        )?;
+
+        t.click_map_at(lng, lat).await?;
+        // The panel is always mounted and slides in on selection, so its own
+        // presence says nothing. The detail fetch is async on top of that, which
+        // makes the entity's name the one token that means "selected and loaded".
+        t.wait_for_body_text("Nameless Ruin").await?;
+        let panel_text = t.text("[role='complementary']").await?;
+        check(
+            panel_text.contains("Nameless Ruin"),
+            format!("clicking the ring must open its marker's panel, got: {panel_text}"),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// Blank basemap beside a marker's ring is still the map.
+///
+/// A ring is a sprite on a symbol layer, and a symbol layer answers a hit test
+/// with the sprite's whole transparent square. Hit-testing the ring there handed
+/// a dot the basemap out to its corners, where a click selected the marker the
+/// reader was aiming past and suppressed the deselect that click was for.
+#[tokio::test]
+async fn test_a_click_beside_a_markers_ring_lands_on_the_map() -> TestResult {
+    let seeds = vec![seed_entity_at("Nameless Ruin", 25.0, -40.0)?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 12.0).await?;
+
+        // The About card stands while nothing is selected and steps aside once
+        // something is, so its toggle says which side of a selection the map is
+        // on without waiting on the detail fetch.
+        let about = "#about-card-toggle";
+        t.click_map_at(-40.0, 25.0).await?;
+        t.wait_for_selector_removal(about).await?;
+
+        // Diagonally out, so the point clears the far edge of everything the
+        // marker draws while staying inside the square a sprite hit-test answers
+        // for. Four fifths of the radius on each leg lands 1.13 radii away along
+        // the diagonal, while the sprite's square reaches past a whole radius on
+        // both axes.
+        let band = t.unevidenced_ring_band().await?;
+        let outer = *band.get(1).ok_or("ring band missing its outer radius")?;
+        let leg = outer * 0.8;
+        let point = t.offset_lnglat(-40.0, 25.0, leg, -leg).await?;
+        let (lng, lat) = (
+            *point.first().ok_or("offset coordinate missing lng")?,
+            *point.get(1).ok_or("offset coordinate missing lat")?,
+        );
+
+        let layers = t.marker_layers_at(lng, lat).await?;
+        check(
+            layers.is_empty(),
+            format!("basemap {leg} px off each axis must belong to no marker, got {layers:?}"),
+        )?;
+
+        t.click_map_at(lng, lat).await?;
+        t.wait_for_selector(about).await?;
+        Ok(())
+    })
+    .await
+}
+
+/// The pointer cursor holds from a marker's disc out to the far side of its
+/// ring.
+///
+/// A marker was hit-tested by two nested layers, the disc and the square its
+/// ring sprite sits in. Crossing out of the disc into the ring left the inner
+/// one without entering anything new, and its `mouseleave` cleared the cursor
+/// over pixels the click still works on.
+#[tokio::test]
+async fn test_the_pointer_holds_from_a_markers_disc_out_to_its_ring() -> TestResult {
+    let seeds = vec![seed_entity_at("Nameless Ruin", 25.0, -40.0)?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 12.0).await?;
+
+        // The premise: the pointer starts on the disc, where the affordance has
+        // never been in doubt. Without this the assertion below would pass on a
+        // map that never offered a pointer at all.
+        t.fire_canvas_mousemove(-40.0, 25.0).await?;
+        let cursor = t.map_cursor().await?;
+        check(
+            cursor == "pointer",
+            format!("the disc itself must offer a pointer, got: {cursor}"),
+        )?;
+
+        let band = t.unevidenced_ring_band().await?;
+        let (inner, outer) = (
+            *band.first().ok_or("ring band missing its inner radius")?,
+            *band.get(1).ok_or("ring band missing its outer radius")?,
+        );
+        let point = t
+            .offset_lnglat(-40.0, 25.0, 0.0, -(inner + outer) / 2.0)
+            .await?;
+        let (lng, lat) = (
+            *point.first().ok_or("offset coordinate missing lng")?,
+            *point.get(1).ok_or("offset coordinate missing lat")?,
+        );
+        t.fire_canvas_mousemove(lng, lat).await?;
+        let cursor = t.map_cursor().await?;
+        check(
+            cursor == "pointer",
+            format!("crossing from the disc onto the ring must keep the pointer, got: {cursor}"),
+        )?;
         Ok(())
     })
     .await
@@ -1334,40 +1677,238 @@ async fn test_disclosure_toggles_hold_position_and_stay_reachable() -> TestResul
     .await
 }
 
-/// The time slider is one bar, not a chip sitting on a taller card.
+/// The year chip and the track it is pinned over share a centre line.
 ///
-/// Its chip *is* the bar's left end, so the two share a height — and a border
-/// gets counted two different ways across that seam: an element with an
-/// explicit height keeps its border inside that height under
-/// `box-sizing: border-box`, while one sized by its content has the border
-/// added on top. Same 1 px, and the bar grew 2 px taller than the chip it
-/// expanded from.
+/// The chip is not in the track row's flow: it rides the card's bottom-left
+/// corner while the row is inset to clear it, so nothing lays the two out
+/// together and only their two boxes say whether they line up. Off by a few
+/// pixels and the year reads as a label stuck onto the bar rather than the
+/// bar's own left end, which is the whole shape of the control.
+///
+/// The card standing taller than its chip is the premise: the chip rides the
+/// corner of a *box* here, and a card that had lost its body would collapse
+/// onto the chip and make the centre lines agree for no reason.
+///
+/// The card container has no id of its own, so it is named by the toggle it
+/// wraps.
 ///
 /// Not part of the battery above because it doesn't generalise: the About
 /// card's chip is a small circle on a tall panel and shares no dimension with
 /// it.
 #[tokio::test]
-async fn test_time_slider_bar_matches_its_chip_height() -> TestResult {
+async fn test_the_year_chip_sits_on_the_tracks_centre_line() -> TestResult {
     web_test(async |t| {
         t.goto("/").await?;
         let toggle = "#time-slider-panel-toggle";
+        let card = "div:has(> #time-slider-panel-toggle)";
         t.wait_for_selector(toggle).await?;
         // Geometry is only meaningful once the webfonts have stopped
         // reflowing the page around them.
         t.wait_for_fonts().await?;
 
-        let expanded_bar = t.element_rect("#time-slider-panel").await?;
+        let expanded = t.element_rect(card).await?;
         let chip = t.element_rect(toggle).await?;
+        let track = t.element_rect("#time-slider").await?;
         check(
-            expanded_bar.len() == 4 && chip.len() == 4,
-            "expected rects for both the slider bar and its chip",
+            expanded.len() == 4 && chip.len() == 4 && track.len() == 4,
+            "expected rects for the time card, its chip and its track",
         )?;
         check(
-            expanded_bar[3] == chip[3],
+            expanded[3] > chip[3],
             format!(
-                "the expanded bar and its chip must be the same height, got bar {} vs chip {}",
-                expanded_bar[3], chip[3]
+                "the expanded card is a box holding the legend above the track, so it must \
+                 stand taller than its chip, got card {} vs chip {}",
+                expanded[3], chip[3]
             ),
+        )?;
+
+        let chip_centre = chip[1] + chip[3] / 2.0;
+        let track_centre = track[1] + track[3] / 2.0;
+        check(
+            (chip_centre - track_centre).abs() < 1.0,
+            format!(
+                "the year chip and its track must share a centre line, got chip {chip_centre} \
+                 vs track {track_centre}"
+            ),
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// The time card carries the legend for what the map's markers mean, and both
+/// arrive together.
+///
+/// The swatches have to be canvases: Tailwind scans source text for class
+/// names, so a swatch styled with a computed `format!("bg-[{fill}]")` compiles,
+/// ships, and paints nothing at all. Each drawn swatch sizes its own canvas, so
+/// a `width` attribute is the mark of a swatch that actually ran through the
+/// map's drawing routine rather than one that merely mounted.
+///
+/// Seven drawings across four rows: the map draws a pin and a photograph for
+/// each of the three verdicts, and a badge stands for a group, which never
+/// carries one photograph of its own.
+#[tokio::test]
+async fn test_the_time_card_carries_the_marker_legend() -> TestResult {
+    web_test(async |t| {
+        t.goto("/").await?;
+        t.wait_for_selector("#time-slider-panel").await?;
+
+        let legend = t.text("#time-slider-panel").await?;
+        check(
+            legend.contains("Undated, so we can't say"),
+            format!("the card must say what an unevidenced marker means, got: {legend}"),
+        )?;
+
+        let widths = t.attributes("#time-slider-panel canvas", "width").await?;
+        check(
+            widths.len() == 7,
+            format!("the legend must show both renderings of every look, got {widths:?}"),
+        )?;
+        check(
+            widths.iter().all(|w| w.is_some()),
+            format!("every swatch must have run through the map's drawing, got {widths:?}"),
+        )?;
+
+        // The legend belongs to the box, not to the corner: collapsing the card
+        // takes it with it rather than leaving it over the map.
+        t.click("#time-slider-panel-toggle").await?;
+        check(
+            !t.exists("#time-slider-panel").await?,
+            "collapsing the time card must take its legend with it",
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// The time card is reachable where the About card overlaps it.
+///
+/// On a phone the two genuinely collide: the About card runs from under the nav
+/// down past halfway, and the time card grows up out of the opposite corner to
+/// meet it. Both float over the map, and one of them has to win. The card the
+/// reader is working wins, so the legend's link into the FAQ is a link rather
+/// than a decoration behind a panel.
+#[tokio::test]
+async fn test_the_time_cards_legend_stays_reachable_under_the_about_card() -> TestResult {
+    web_test(async |t| {
+        t.set_viewport(375, 667).await?;
+        t.goto("/").await?;
+        t.wait_for_selector("#time-slider-panel").await?;
+        // Geometry is only meaningful once the webfonts have stopped
+        // reflowing the page around them.
+        t.wait_for_fonts().await?;
+
+        // The premise: both cards are open, so there is an overlap to win.
+        check(
+            t.is_visible("#about-card").await?,
+            "the About card must be open on a first visit, or nothing overlaps here",
+        )?;
+
+        // The blurb rather than the link inside it: a link that wraps across two
+        // lines has a box whose centre falls in the gap between them, so a
+        // hit test aimed there answers with the paragraph either way.
+        check(
+            t.is_hittable("#time-slider-panel p").await?,
+            "the legend's blurb must take its own clicks, not the About card's",
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// The expanded time card fits a phone screen.
+///
+/// It grows upward out of a corner, so the only thing keeping it on screen is
+/// the height bound on the band its legend scrolls in. Past the top edge there
+/// is no way back to what overflowed: the page itself doesn't scroll, and the
+/// card's own scroller has already been left behind.
+#[tokio::test]
+async fn test_the_expanded_time_card_fits_a_phone_screen() -> TestResult {
+    web_test(async |t| {
+        t.set_viewport(375, 667).await?;
+        t.goto("/").await?;
+        t.wait_for_selector("#time-slider-panel").await?;
+        // Geometry is only meaningful once the webfonts have stopped
+        // reflowing the page around them.
+        t.wait_for_fonts().await?;
+
+        let card = t
+            .element_rect("div:has(> #time-slider-panel-toggle)")
+            .await?;
+        check(
+            card.len() == 4,
+            "expected a rect for the expanded time card",
+        )?;
+        check(
+            card[1] >= 0.0,
+            format!(
+                "the time card ran {} px off the top of a 667 px viewport",
+                -card[1]
+            ),
+        )?;
+
+        t.screenshot("test_the_expanded_time_card_fits_a_phone_screen")
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
+/// The time card yields the corner to the detail sheet only where the two
+/// collide.
+///
+/// On a phone the sheet spans the bottom two thirds and the card draws after it,
+/// so a card left standing there takes the sheet's taps. On a wider screen the
+/// sheet is a right-hand panel and the corner is the card's alone, where hiding
+/// it reads as the app having broken: the year is the map's whole context, and
+/// it disappears exactly when a marker is being read.
+///
+/// The card and the panel first fit side by side at 780 px, which is the width
+/// the card's own rule names.
+#[tokio::test]
+async fn test_the_time_card_yields_the_corner_only_where_the_sheet_covers_it() -> TestResult {
+    const SIDE_BY_SIDE: &str = "(min-width: 780px)";
+    // Each resize is waited on through a query that flips across it. Two widths
+    // on the same side of one query would leave the second read racing the
+    // resize it followed, which is the whole hazard here.
+    const WIDER_THAN_A_PHONE: &str = "(min-width: 400px)";
+    web_test(async |t| {
+        t.goto_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1, 14.0).await?;
+        t.click_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1).await?;
+        // The panel's own content, so a click that selected nothing fails here
+        // rather than leaving both assertions below reading an unselected map.
+        t.wait_for_body_text("Known to exist").await?;
+
+        let toggle = "#time-slider-panel-toggle";
+        t.wait_for_media_query(SIDE_BY_SIDE, true).await?;
+        check(
+            t.is_visible(toggle).await?,
+            "the time card must stay put while a detail panel is open on a wide screen, \
+             where the panel is a right-hand sheet clear of this corner",
+        )?;
+
+        // A dozen pixels short of side by side, where the panel is already a
+        // right-hand sheet: wide enough that the corner looks free, narrow
+        // enough that the card would sit on the sheet's left edge.
+        t.set_viewport(775, 800).await?;
+        // The resize lands asynchronously: the override call returns before the
+        // renderer has recalculated style against this query, and reading the
+        // card's visibility before that flips reads the wide layout.
+        t.wait_for_media_query(SIDE_BY_SIDE, false).await?;
+        check(
+            !t.is_visible(toggle).await?,
+            "at 775 px the card's 384 px and the sheet's 384 px do not both fit beside a \
+             12 px inset, so the card must yield rather than overlap the sheet",
+        )?;
+
+        t.set_viewport(375, 667).await?;
+        t.wait_for_media_query(WIDER_THAN_A_PHONE, false).await?;
+        check(
+            !t.is_visible(toggle).await?,
+            "on a phone the detail sheet covers this corner, so the time card must yield it",
         )?;
 
         Ok(())
