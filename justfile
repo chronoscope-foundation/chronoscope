@@ -16,12 +16,18 @@
 #                            be allowlisted in .claude/settings.json without
 #                            opening a permission hole the way `nix develop` would.
 #
+#   `deploy`               — the exception to that: it publishes an image and
+#                            rolls the production service, so it stays a recipe
+#                            a human types. Allowlisting it hands that away.
+#
 # Targets, where supported:
 #   all              everything (default)
 #   nix              .nix files only
 #   rust             native cargo workspace (default-members)
 #   web              chronoscope-web (wasm32 target)
 #   triton           analysis/triton/ python
+#   linux            `check` only: the x86_64-linux checks (needs a builder
+#                    for that system; outside the commit gate)
 #   analysis         chronoscope-analysis crate
 #   <crate-name>     single crate (core, db, api, api-client, ingestion,
 #                                  workers, dev, integrations)
@@ -135,9 +141,25 @@ check target="all":
                 ".#checks.$SYS.triton-test" \
                 --no-link
             ;;
+        linux)
+            # x86_64-linux is what the API deploys onto, and `nix flake check`
+            # only evaluates the current system, so from a darwin machine these
+            # are asked for by name and need a builder for that system. Outside
+            # the commit gate on purpose (see CLAUDE.md): the image boot proves
+            # the linked binary starts under the image's own environment, and
+            # the suite run is where a filesystem or signal assumption that
+            # holds on darwin shows up.
+            # -L streams build logs: this run is long and unattended, so
+            # without it the suite is a silent block that only becomes
+            # diagnosable once it has already finished or failed.
+            nix build \
+                ".#checks.x86_64-linux.oci-api-boots" \
+                ".#checks.x86_64-linux.llvm-cov" \
+                --no-link -L
+            ;;
         *)
             echo "error: \`just check\` only accepts coarse targets (hermetic)." >&2
-            echo "valid: all, nix, rust, web, triton" >&2
+            echo "valid: all, nix, rust, web, triton, linux" >&2
             echo "for per-crate iteration, use \`just clippy <crate>\` or \`just test <crate>\`." >&2
             exit 1
             ;;
@@ -323,6 +345,95 @@ xcodegen:
     spec=$(nix build .#ios-project-spec --out-link .nix-gc-roots/ios-project-spec --print-out-paths)
     cd ios
     xcodegen generate --spec "$spec" --project-root . --project .
+
+# ---------------------------------------------------------------------------
+# Deployment to Cloud Run.
+#
+# The image is a Nix derivation, so the same tree always produces the same
+# bytes; deploying by digest makes the running revision a content hash of the
+# tree it came from, and takes a mutable tag out of the path between build and
+# production.
+#
+# Secrets stay out of the image. JWT_SECRET and friends live on the Cloud Run
+# service, set once with `gcloud run services update --set-secrets`; rolling a
+# new image leaves them in place.
+#
+# The server answers an unauthenticated readiness probe at GET /health, which
+# reports whether both stores opened. The deploy points Cloud Run's startup
+# probe there, so a revision that came up without a usable store never takes
+# traffic; the default TCP probe passes as soon as the port is bound.
+#
+# The instance filesystem is memory-backed and per-instance: the app database
+# and the fact-store overlay both live under /tmp and vanish with the instance,
+# and their size is charged against --memory. Nothing written through the API
+# survives a revision, which is why --memory is sized for the read path plus
+# whatever a session accumulates rather than for a growing store.
+#
+# The Artifact Registry repo has to exist before the first deploy:
+#   gcloud artifacts repositories create <repo> --repository-format=docker \
+#       --location=<region> --project=<project>
+# ---------------------------------------------------------------------------
+
+# Build the API image, push it to Artifact Registry, roll Cloud Run onto the digest.
+deploy project="chronoscope-io-prod" region="us-central1" repo="chronoscope" service="chronoscope-api":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    _ensure_nix
+    # Re-exec on the tools rather than on IN_NIX_SHELL: every dev shell sets
+    # that variable and only this one carries gcloud and skopeo, so keying off
+    # it strands a direnv'd caller after the multi-minute image build.
+    if ! command -v gcloud >/dev/null 2>&1 || ! command -v skopeo >/dev/null 2>&1; then
+        exec nix develop .#deploy --command just deploy \
+            "{{ project }}" "{{ region }}" "{{ repo }}" "{{ service }}"
+    fi
+    # Cloud Run is linux/amd64; build that system's image regardless of the
+    # machine driving the deploy. The --out-link pins the manifest and every
+    # layer store path it names, so the push below can't race collection.
+    mkdir -p .nix-gc-roots
+    image=$(nix build .#packages.x86_64-linux.oci-api \
+        --out-link .nix-gc-roots/oci-api --print-out-paths)
+    # nix2container tags an untagged image by its manifest derivation's hash,
+    # which is the basename of the path the build just printed. Reading it here
+    # keeps the tag tied to the artifact in hand.
+    tag=${image##*/}
+    tag=${tag%%-*}
+    ref="{{ region }}-docker.pkg.dev/{{ project }}/{{ repo }}/{{ service }}"
+
+    # A short-lived access token in a 0600 file, rather than a credential helper
+    # or --dest-creds: nothing depends on ~/.docker state, and the token stays
+    # out of the process table.
+    authfile=$(mktemp)
+    digestfile=$(mktemp)
+    trap 'rm -f "$authfile" "$digestfile"' EXIT
+    token=$(gcloud auth print-access-token --project "{{ project }}")
+    basic=$(printf 'oauth2accesstoken:%s' "$token" | base64 | tr -d '\n')
+    cat > "$authfile" <<JSON
+    { "auths": { "{{ region }}-docker.pkg.dev": { "auth": "$basic" } } }
+    JSON
+
+    echo "==> Pushing $ref:$tag"
+    # --insecure-policy: a nix shell has no /etc/containers/policy.json, and the
+    # source here is the local store rather than a registry to verify.
+    # --digestfile reports what this push produced, so the deploy names the
+    # bytes it just sent instead of resolving a tag someone else could move.
+    skopeo --insecure-policy copy --authfile "$authfile" \
+        --digestfile "$digestfile" "nix:$image" "docker://$ref:$tag"
+    digest=$(cat "$digestfile")
+
+    echo "==> Deploying $ref@$digest"
+    # --quiet and --allow-unauthenticated go together: without the first, a
+    # service's initial deploy stops on an interactive prompt; without the
+    # second, the answer --quiet gives that prompt is "no" and the API 403s
+    # every request. The port comes from Cloud Run's own PORT variable.
+    gcloud run deploy "{{ service }}" \
+        --project "{{ project }}" \
+        --region "{{ region }}" \
+        --image "$ref@$digest" \
+        --allow-unauthenticated \
+        --quiet \
+        --memory 2Gi \
+        --startup-probe httpGet.path=/health,timeoutSeconds=4,periodSeconds=5,failureThreshold=6
 
 # ---------------------------------------------------------------------------
 # Data fetches. Each is a thin wrapper around `nix build` + GC root pinning.

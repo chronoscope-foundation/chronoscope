@@ -14,6 +14,7 @@ Nix build infrastructure. One derivation module per project area;
 | `python.nix`    | `analysisEnv`, model weight FODs, triton checks     |
 | `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |
 | `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL → SQLite facts DBs) |
+| `oci.nix`       | nix2container image for the API server (Cloud Run) + the check that boots its entrypoint, Linux systems only |
 
 Dev shell composition lives in `flake.nix`, not in any single component
 module — it has the visibility to compose across modules.
@@ -37,6 +38,11 @@ focused subset). **Every gate the project commits behind must be a
 flake check.** If you add a new check (e.g. a new lint, a new build),
 expose it via `checks.<system>.<name>`, not just as a step in the
 justfile — otherwise it slips past the pre-commit gate.
+
+A check behind `lib.optionalAttrs isLinux` is a flake check that the gate
+still cannot see, since only the current system is evaluated. Those are
+named explicitly by `just check linux`, which runs outside the commit gate
+(see the root CLAUDE.md for when to reach for it).
 
 ## GC root pinning
 

@@ -49,6 +49,7 @@ each other beyond what they explicitly compose.
 | `analysis` | api + Python analysis env + weights + corpus                     | Iterating on `chronoscope-analysis` correctness |
 | `triton`   | Python analysis env + weights + rust toolchain (for schematool)  | Triton harness / serving config              |
 | `ios`      | xcodegen + swiftformat/swiftlint/xcbeautify                      | iOS project generation & Swift lint/format   |
+| `deploy`   | gcloud + skopeo (nix: transport)                                 | Pushing the API image, rolling Cloud Run     |
 
 `just` recipes pick the smallest shell that covers their target
 (e.g. `just clippy web` enters `web`, `just check triton` runs hermetically
@@ -115,6 +116,24 @@ subset. Confirming still lets a deliberate commit (e.g. a WIP checkpoint)
 through; the prompt just keeps skipping the full gate a conscious choice
 rather than an accident.
 
+### Linux checks: `just check linux`
+
+`nix flake check` evaluates only the current system, so on a darwin machine
+the Linux outputs never build. `just check linux` asks for them by name
+(`checks.x86_64-linux.oci-api-boots` plus the workspace suite under
+`llvm-cov`) and needs a builder for that system.
+
+Reach for it when a change could land differently on Linux:
+
+- linking or dynamic libraries (RPATH, `dlopen`, the SpatiaLite load path)
+- the container image or the environment it runs under
+- process signals and shutdown
+- filesystem assumptions (`/tmp`, `/etc/hosts`, anything a sandbox may omit)
+
+It is deliberately **outside** `just check`, so passing the commit gate says
+nothing about it: a cross-platform builder is not something every contributor
+has, and CI will carry this later.
+
 `just test`, `just clippy`, `just fmt` are the **fast inner loop**:
 cargo direct, dev shell, incremental compilation. They are deliberately
 **not** a substitute for `just check` — they don't write the marker, and
@@ -130,6 +149,8 @@ just check web              # WASM build + browser-test build + wasm clippy
                             #   (browser tests run ONLY in the full `just check`)
 just check triton           # Python ruff + mypy + pytest
 just check nix              # Nix lint (nixfmt + statix + deadnix)
+just check linux            # x86_64-linux: container boot + workspace suite
+                            #   (needs a Linux builder; not part of the gate)
 # Targeted subsets are for iteration; only the full `just check` runs the
 # whole gate (web-test is ordered after the heavy checks, so it lives there).
 
@@ -149,7 +170,29 @@ just xcodegen               # splice store paths into the xcodegen spec, regener
 just corpus-hash            # add hashes for new corpus URLs
 just corpus-test            # run Rust corpus test suite
 just corpus-test-vlm        # corpus tests + VLM (needs remote Triton)
+just deploy [project] [region] [repo] [service]
+                            # build+push the API image, deploy Cloud Run by digest
 ```
+
+### Container image
+
+`packages.oci-api` (Linux systems only) is the API server as an OCI image,
+built with nix2container: the derivation output is a manifest over store
+paths, so a build costs a JSON file and a push moves only the layers the
+registry lacks. Layers split by rate of change: the C runtime closure
+(glibc/openssl/sqlite/libspatialite + geo stack), then the baked curated
+facts DB, then the rootfs, then the binary alone on top. Build it
+cross-system from a dev machine:
+
+```bash
+nix build .#packages.x86_64-linux.oci-api
+```
+
+`checks.oci-api-boots` (also Linux-only) builds that image and runs its
+entrypoint under the image's own environment, so a container that cannot
+start fails a check rather than a deploy. `nix flake check` only evaluates
+the current system, so on a darwin dev machine it never runs; `just check
+linux` builds it.
 
 ### Workflow examples
 

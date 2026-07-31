@@ -9,6 +9,15 @@
 }:
 
 let
+  # Everything the server needs in its environment to run at all. One
+  # definition, because each way of launching it (wrapper script, dev shell,
+  # OCI image config) has to carry the same set or the ones that miss an
+  # addition fail at runtime.
+  runtimeEnv = {
+    SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
+  }
+  // spatialitePreload;
+
   apiBin = craneLib.buildPackage (
     rustCommonArgs
     // {
@@ -24,12 +33,9 @@ let
     paths = [ apiBin ];
     nativeBuildInputs = [ pkgs.makeWrapper ];
     postBuild = ''
-      wrapProgram $out/bin/chronoscope-api \
-        --set SPATIALITE_LIBRARY_PATH "${pkgs.libspatialite}/lib" ${
-          pkgs.lib.concatStringsSep " " (
-            pkgs.lib.mapAttrsToList (n: v: ''--set ${n} "${v}"'') spatialitePreload
-          )
-        }
+      wrapProgram $out/bin/chronoscope-api ${
+        pkgs.lib.concatStringsSep " " (pkgs.lib.mapAttrsToList (n: v: ''--set ${n} "${v}"'') runtimeEnv)
+      }
     '';
     meta = {
       description = "Chronoscope API server";
@@ -38,5 +44,9 @@ let
 
 in
 {
-  inherit api;
+  # `api` is the shell/CLI entry point: a wrapper that exports `runtimeEnv`
+  # before exec'ing. `apiBin` is the same binary with nothing in front of it,
+  # for callers that can set the environment themselves: the container image
+  # puts `runtimeEnv` in the OCI config, so the bash hop buys nothing there.
+  inherit api apiBin runtimeEnv;
 }

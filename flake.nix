@@ -17,6 +17,13 @@
     crane.url = "github:ipetkov/crane";
 
     flake-utils.url = "github:numtide/flake-utils";
+
+    # Container images as manifests over store paths: a code change pushes the
+    # layers that changed, not a fresh multi-hundred-MB tarball per build.
+    nix2container = {
+      url = "github:nlewo/nix2container";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -26,14 +33,41 @@
       fenix,
       crane,
       flake-utils,
+      nix2container,
       ...
     }:
+    let
+      # libspatialite's per-connection close hook calls `xmlCleanupParser()`,
+      # which libxml2 defines as process-global teardown to be run once at exit
+      # with no other thread inside libxml2. SQLite loads and unloads the
+      # extension per connection, so any pool with churn runs that global
+      # teardown while sibling connections are still using libxml2, and a
+      # thread blocks forever on the catalog mutex being torn down under it.
+      # Measured: 24/24 hangs with libxml2 linked, 0/24 without, on both
+      # x86_64-linux and aarch64, in a threaded open/load/close loop.
+      #
+      # An overlay rather than a per-callsite override so every consumer (the
+      # crate buildInputs, SPATIALITE_LIBRARY_PATH, the image, the dev shells)
+      # resolves the same library. A mixture would be undetectable.
+      #
+      # Costs XmlBLOB support (`XB_*`, ISO metadata), unused here. Revert once
+      # upstream stops running a process-global cleanup per connection.
+      spatialiteWithoutLibxml2 = _final: prev: {
+        libspatialite = prev.libspatialite.overrideAttrs (old: {
+          configureFlags = old.configureFlags ++ [ "--disable-libxml2" ];
+          buildInputs = builtins.filter (p: !(prev.lib.hasInfix "libxml2" (toString p))) old.buildInputs;
+        });
+      };
+    in
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ spatialiteWithoutLibxml2 ];
+        };
         inherit (pkgs) lib;
-        inherit (pkgs.stdenv.hostPlatform) isDarwin;
+        inherit (pkgs.stdenv.hostPlatform) isDarwin isLinux;
 
         toolchain =
           with fenix.packages.${system};
@@ -140,6 +174,15 @@
           inherit (rust) cargoArtifacts;
         };
 
+        # The curated facts DB rides in the image, so a fresh instance serves
+        # the moment it boots instead of waiting on an external mount.
+        ociImage = import ./nix/oci.nix {
+          inherit pkgs lib;
+          inherit (nix2container.packages.${system}) nix2container;
+          inherit (api) apiBin runtimeEnv;
+          factsDb = wikidata.factsDbs.curated;
+        };
+
         # Swift sources for the ChronoscopeAPI package, filtered so a source
         # edit is the only thing that rebuilds the store package.
         iosApiSrc = lib.cleanSourceWith {
@@ -188,31 +231,43 @@
         # and the hermetic `postgres-smoke` check.
         postgresWithPostgis = pkgs.postgresql_16.withPackages (p: [ p.postgis ]);
 
-        # Preload libspatialite so it and its C++ deps (PROJ/GEOS/libxml2) stay
-        # mapped for the whole process. SQLite dlcloses the mod_spatialite
-        # extension at connection close; without the preload those deps unload
-        # mid-run and their static destructors fault at exit — a known SQLite
+        # Preload libspatialite so it and its C++ deps (PROJ/GEOS) stay mapped
+        # for the whole process. SQLite dlcloses the mod_spatialite extension at
+        # connection close; without the preload those deps unload mid-run and
+        # their static destructors fault at exit, a known SQLite
         # loadable-extension teardown bug. mod_spatialite is a Mach-O bundle
         # (unpreloadable), so we name libspatialite, the sibling library that
         # links the same deps, and let the loader follow its NEEDED list.
         #
-        # Darwin-only: validated there (DYLD_INSERT_LIBRARIES). The crash is
-        # unconfirmed on Linux (glibc ≠ dyld), the unversioned `.so` lives in a
-        # different output, and prod is Postgres — so a Linux LD_PRELOAD waits
-        # on a Linux box to validate the path and reproduce the fault.
+        # Darwin-only: validated there (DYLD_INSERT_LIBRARIES). The Linux
+        # analog was measured and rejected: LD_PRELOAD of libspatialite.so
+        # faults on load, and pinning mod_spatialite resident leaves the
+        # libxml2 teardown hang untouched, which the overlay above settles at
+        # the source instead.
         spatialitePreload = lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
           DYLD_INSERT_LIBRARIES = "${pkgs.libspatialite}/lib/libspatialite.dylib";
         };
         # Runtime env for the api/db/ingestion code paths (consumed by the
         # backend/web dev shells AND by the hermetic test/llvm-cov checks).
-        apiRuntimeEnv = {
-          SPATIALITE_LIBRARY_PATH = "${pkgs.libspatialite}/lib";
+        # The server's own share of it comes from nix/api.nix, which is also
+        # what the wrapper script and the image config carry, so a new variable
+        # reaches all four at once. The entities snapshot is the ingestion
+        # tooling's, not the server's, so it is added here.
+        apiRuntimeEnv = api.runtimeEnv // {
           WIKIDATA_ENTITIES_JSONL = "${wikidata.bundles.curated.entities}/entities.jsonl";
-        }
-        // spatialitePreload;
-        backendEnv = apiRuntimeEnv // {
-          PROTOC = "${pkgs.protobuf}/bin/protoc";
         };
+        backendEnv =
+          apiRuntimeEnv
+          // {
+            PROTOC = "${pkgs.protobuf}/bin/protoc";
+          }
+          // lib.optionalAttrs isLinux {
+            # Carries nix/rust.nix's reason into the shells: cargo here links the
+            # same way the hermetic builds do, so a `cargo run` produces a binary
+            # with the same RPATH rather than one that dies at exec. wasm32 keeps
+            # lld regardless, so the web shell is unaffected.
+            RUSTFLAGS = "-Clinker-features=-lld";
+          };
 
         # WASM frontend tooling (trunk, wasm-bindgen, tailwind).
         webNativeBuildInputs = with pkgs; [
@@ -345,6 +400,14 @@
           }
           // lib.optionalAttrs isDarwin {
             ios-project-spec = openapi.projectSpec;
+          }
+          // lib.optionalAttrs isLinux {
+            # Builds the image and runs its entrypoint, so a container that
+            # cannot start fails a check rather than a deploy. Only the current
+            # system's checks run, so a darwin machine reaches this through
+            # `just check linux`, which asks for the x86_64-linux outputs by
+            # name.
+            oci-api-boots = ociImage.boots;
           };
 
         packages =
@@ -386,6 +449,11 @@
           // lib.optionalAttrs isDarwin {
             ios-api-package = openapi.apiPackage;
             ios-project-spec = openapi.projectSpec;
+          }
+          // lib.optionalAttrs isLinux {
+            # Built cross-system from a dev machine: `nix build
+            # .#packages.x86_64-linux.oci-api`.
+            oci-api = ociImage.image;
           };
 
         formatter = pkgs.nixfmt;
@@ -491,6 +559,23 @@
             '';
           };
 
+          # Pushing images and driving Cloud Run. Scoped to moving an artifact
+          # `nix build` already produced, so it carries only the two tools that
+          # do the moving. skopeo-nix2container is the skopeo that speaks the
+          # `nix:` transport, letting a push stream the manifest's store paths
+          # straight to the registry.
+          deploy = pkgs.mkShell {
+            nativeBuildInputs = [
+              pkgs.just
+              pkgs.google-cloud-sdk
+              nix2container.packages.${system}.skopeo-nix2container
+            ];
+            shellHook = ''
+              ${mkBanner "deploy" ''
+                echo "  gcloud: $(gcloud --version 2>/dev/null | head -n1)"
+              ''}
+            '';
+          };
         }
         // lib.optionalAttrs isDarwin {
           # iOS project generation & Swift lint/format. The OpenAPI spec is
