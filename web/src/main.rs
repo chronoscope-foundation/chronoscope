@@ -1,8 +1,8 @@
 mod api;
 mod app;
 mod components;
+mod content;
 mod maplibre;
-mod markdown;
 mod pages;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;

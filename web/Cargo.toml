@@ -27,7 +27,6 @@ console_error_panic_hook = "0.1"
 wasm-bindgen = "= 0.2.108"
 web-sys = { version = "0.3", features = ["AddEventListenerOptions", "CanvasRenderingContext2d", "CssStyleDeclaration", "CustomEvent", "CustomEventInit", "Document", "DomRect", "Element", "ErrorEvent", "Event", "EventTarget", "HtmlCanvasElement", "HtmlDivElement", "HtmlElement", "HtmlImageElement", "ImageData", "KeyboardEvent", "KeyboardEventInit", "Location", "MouseEvent", "MouseEventInit", "MutationObserver", "MutationObserverInit", "Navigator", "Node", "NodeList", "PromiseRejectionEvent", "Response", "Storage", "Window"] }
 send_wrapper = "0.6"
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 serde.workspace = true
@@ -38,3 +37,14 @@ chrono.workspace = true
 futures-util.workspace = true
 serde-wasm-bindgen = "0.6"
 geojson = "0.24"
+
+# The content pages are rendered by `build.rs` and their markdown parser stays
+# on the host: `build/render.rs` is pulled into the build script (which does the
+# rendering) and into `tests/content_render.rs` (which runs its tests), so the
+# same dependency is named in both tables and never reaches the wasm bundle.
+# One workspace pin, so both tables are always the same parser.
+[build-dependencies]
+pulldown-cmark = { workspace = true }
+
+[dev-dependencies]
+pulldown-cmark = { workspace = true }

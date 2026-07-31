@@ -251,7 +251,10 @@ pub fn Nav() -> impl IntoView {
                         "\u{2014}\u{00a0}\u{2767}\u{00a0}\u{2014}"
                     </p>
 
-                    // Navigation links
+                    // Ordered for a reader arriving cold, so the entries are
+                    // written out rather than generated: an article's stem is
+                    // its URL, and a rename that stranded one of these would
+                    // fail `test_every_nav_drawer_link_reaches_a_real_page`.
                     <nav class="flex-1 px-3">
                         <A href="/" attr:class=NAV_LINK_CLASS on:click=close>"Explore"</A>
                         <A href="/about" attr:class=NAV_LINK_CLASS on:click=close>"About"</A>

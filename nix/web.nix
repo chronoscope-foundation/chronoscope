@@ -32,6 +32,9 @@ let
 
   # Filter source: Cargo files from the whole workspace (crane needs root
   # Cargo.toml/Cargo.lock), but web-specific assets only from web/.
+  #
+  # The `.md` clause carries `web/content/`, which `web/build.rs` reads: drop it
+  # and every web build fails on a missing `include_str!` in `build/render.rs`.
   webSrc = lib.cleanSourceWith {
     src = wasmCraneLib.path (toString ../. + "/.");
     filter =
@@ -378,12 +381,14 @@ let
     }
   );
 
-  # The crate's plain #[test]s (e.g. faq.rs's `parse_faq` suite) run on the
-  # host, not wasm — a workspace `cargo test` never reaches them because
-  # chronoscope-web is excluded from default-members. Built with the native
-  # craneLib against webSrc (the shared workspace filter drops the `.md`
-  # content that the pages `include_str!`). Test-profile deps-only so the
-  # release LTO profile doesn't recompile the dependency tree.
+  # The crate's plain #[test]s (e.g. the build-time render suite in
+  # `web/build/render.rs`, which `web/tests/content_render.rs` gives a runner)
+  # run on the host, not wasm — a workspace `cargo test` never reaches them
+  # because chronoscope-web is excluded from default-members. Built with the native
+  # craneLib against webSrc, because the shared workspace filter keeps only
+  # cargo sources and every web build needs the `.md` content pages that
+  # `web/build.rs` renders. Test-profile deps-only so the release LTO profile
+  # doesn't recompile the dependency tree.
   webNativeTestDeps = craneLib.buildDepsOnly (
     rustCommonArgs
     // {

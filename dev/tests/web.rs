@@ -509,6 +509,67 @@ async fn check_nav_links(t: &WebTest) -> TestResult {
     )
 }
 
+/// Every link the nav drawer offers, in drawer order.
+const DRAWER_LINK: &str = "#site-nav-drawer nav a[href]";
+
+/// The body the router renders for a path nothing serves. Asked for by id
+/// rather than by its wording, which is free to change.
+const NOT_FOUND: &str = "#not-found";
+
+/// Whatever the router mounted for the current path. `<Routes>` is the only
+/// thing inside `#main-content`, so an element child of it is a route body and
+/// nothing else.
+const ROUTE_BODY: &str = "#main-content > *";
+
+/// Every entry in the nav drawer reaches a page the app actually serves.
+///
+/// The article entries are generated from the same rows the routes are, so
+/// those two cannot drift; the map and the FAQ are hand-written on both sides,
+/// and this is what covers them. Nothing else does: a stale entry is a link
+/// like any other, and every unrouted path renders the same fallback, so the
+/// only symptom is a reader being told "Not found." by the site's own menu.
+#[tokio::test]
+async fn test_every_nav_drawer_link_reaches_a_real_page() -> TestResult {
+    web_test(async |t| {
+        t.goto("/").await?;
+        t.wait_for_selector(DRAWER_LINK).await?;
+
+        let hrefs: Vec<String> = t
+            .attributes(DRAWER_LINK, "href")
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+        // Without a link to follow, the loop below asserts nothing at all.
+        check(
+            !hrefs.is_empty(),
+            "the drawer offers no links; the enumeration, not the page, is probably wrong",
+        )?;
+
+        for href in hrefs {
+            let path = href
+                .strip_prefix('/')
+                .map(|rest| format!("/{rest}"))
+                .ok_or_else(|| format!("the drawer's {href} entry is not a site-relative path"))?;
+            t.goto(&path).await?;
+            // Waiting on the route body rather than on `#main-content`, which
+            // is rendered outside `<Routes>` and so is there whether the router
+            // mounted anything or not. Route bodies mount asynchronously, so
+            // without this the absence below could be the absence of any page
+            // at all.
+            t.wait_for_selector(ROUTE_BODY).await?;
+            check(
+                !t.exists(NOT_FOUND).await?,
+                format!(
+                    "the drawer offers {path}, which no route serves: following it lands the reader on the not-found body"
+                ),
+            )?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 // ==================== Navigation & Rendering Tests ====================
 
 #[tokio::test]
@@ -593,35 +654,36 @@ async fn test_navigation_between_pages() -> TestResult {
     .await
 }
 
+/// An article route renders its heading over a body of prose.
+///
+/// Structural on purpose: the words on these pages are expected to change, and
+/// this suite runs against a bundle built before the run, so pinning prose here
+/// fails a correct tree against a stale bundle. Which markdown reached which
+/// constant is settled at build time, where both come from one `ARTICLES` row.
+async fn check_article_page(t: &WebTest, path: &str, heading: &str) -> TestResult {
+    t.goto(path).await?;
+
+    let rendered = t.text("h1").await?;
+    check(
+        rendered.contains(heading),
+        format!("{path} h1 should say '{heading}', got: {rendered}"),
+    )?;
+
+    let article_text = t.text("article, .prose-chronoscope").await?;
+    check(
+        article_text.len() > 200,
+        format!("{path} should render a body of prose, got {article_text:?}"),
+    )
+}
+
 #[tokio::test]
 async fn test_about_page_content() -> TestResult {
-    web_test(async |t| {
-        t.goto("/about").await?;
+    web_test(async |t| check_article_page(t, "/about", "About Chronoscope").await).await
+}
 
-        // Should have the heading inside an h1
-        let heading = t.text("h1").await?;
-        check(
-            heading.contains("About Chronoscope"),
-            format!("h1 should say 'About Chronoscope', got: {heading}"),
-        )?;
-
-        // Should have rendered markdown content (prose container) with substance
-        let article_text = t.text("article, .prose-chronoscope").await?;
-        check(
-            !article_text.is_empty(),
-            "Should have article or prose container with content",
-        )?;
-        check(
-            article_text.len() > 50,
-            format!(
-                "Article should have substantial content, got {} chars",
-                article_text.len()
-            ),
-        )?;
-
-        Ok(())
-    })
-    .await
+#[tokio::test]
+async fn test_related_work_page_content() -> TestResult {
+    web_test(async |t| check_article_page(t, "/related-work", "Related work").await).await
 }
 
 #[tokio::test]
@@ -694,18 +756,76 @@ async fn test_faq_accordion() -> TestResult {
     .await
 }
 
-/// The FAQ anchor the About page deep-links to. A native test in
-/// `web/src/pages/faq.rs` ties this fragment to both pages' markdown, so a
-/// rename shows up there as a clear failure before it reaches the browser.
-const DEEP_LINKED_FAQ_ANCHOR: &str = "how-does-chronoscope-work";
+/// The prose column an article route renders. Present as soon as the page has
+/// rendered at all, which is what makes "the link is not there" observable.
+const ARTICLE_BODY: &str = "#main-content article";
 
-/// Whether the deep-linked FAQ item is expanded, waiting for it to render first.
-async fn deep_linked_faq_item_is_expanded(
+/// What a link into the FAQ starts with, fragment marker and all.
+const FAQ_DEEP_LINK_PREFIX: &str = "/faq#";
+
+/// The anchor of the About page's deep link into the FAQ, read off the page.
+///
+/// The slug belongs to the FAQ heading it anchors and the About markdown is
+/// where it gets named, so the browser suite asks the page rather than keeping
+/// a copy that a reword can strand. `web/build/render.rs` already fails the
+/// fast native loop when a link names an anchor the FAQ does not assign, and
+/// when the About page stops carrying one at all; this is the same pair checked
+/// through a browser.
+///
+/// The hrefs are read in bulk after waiting for the page, rather than through
+/// `attr`, which waits for its own selector: asking that for a link the page
+/// does not carry is a 90s timeout saying nothing, where this is a failure that
+/// names what it found.
+async fn about_page_faq_anchor(
     t: &WebTest,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    t.goto("/about").await?;
+    t.wait_for_selector(ARTICLE_BODY).await?;
+
+    let hrefs = t
+        .attributes(
+            &format!("{ARTICLE_BODY} a[href^='{FAQ_DEEP_LINK_PREFIX}']"),
+            "href",
+        )
+        .await?;
+    let anchor = hrefs
+        .iter()
+        .flatten()
+        .find_map(|href| href.strip_prefix(FAQ_DEEP_LINK_PREFIX))
+        .ok_or_else(|| {
+            format!(
+                "the About page should carry a `{FAQ_DEEP_LINK_PREFIX}…` link for this test to follow, found: {hrefs:?}"
+            )
+        })?;
+    Ok(anchor.to_string())
+}
+
+/// The About page's link to a given FAQ anchor.
+///
+/// Named by its exact href, so the click lands on the element the anchor was
+/// read from the day the page carries a second deep link.
+fn about_page_link_to(anchor: &str) -> String {
+    format!("{ARTICLE_BODY} a[href='{FAQ_DEEP_LINK_PREFIX}{anchor}']")
+}
+
+/// The FAQ item an anchor names.
+///
+/// Matched on the `id` attribute rather than as `#anchor`: a slug is a valid
+/// HTML id but not always a valid CSS identifier, and a question opening
+/// "1920s photographs…" anchors an item no `#`-selector can name. The browser
+/// rejects the whole selector, and the harness times out with nothing to say.
+fn faq_item(anchor: &str) -> String {
+    format!("[id=\"{anchor}\"]")
+}
+
+/// Whether the FAQ item at `anchor` is expanded, waiting for it to render first.
+async fn faq_item_is_expanded(
+    t: &WebTest,
+    anchor: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let expanded = t
         .attr(
-            &format!("#{DEEP_LINKED_FAQ_ANCHOR} button[aria-expanded]"),
+            &format!("{} button[aria-expanded]", faq_item(anchor)),
             "aria-expanded",
         )
         .await?;
@@ -721,30 +841,50 @@ async fn deep_linked_faq_item_is_expanded(
 #[tokio::test]
 async fn test_faq_deep_link_followed_from_the_about_page_arrives_expanded() -> TestResult {
     web_test(async |t| {
-        t.goto("/about").await?;
+        let anchor = about_page_faq_anchor(t).await?;
 
-        t.click(&format!(
-            "#main-content a[href='/faq#{DEEP_LINKED_FAQ_ANCHOR}']"
-        ))
-        .await?;
+        t.click(&about_page_link_to(&anchor)).await?;
 
         check(
-            deep_linked_faq_item_is_expanded(t).await?,
-            "the FAQ item named by the About page's deep link should be expanded on arrival",
+            faq_item_is_expanded(t, &anchor).await?,
+            format!("the FAQ item at #{anchor}, named by the About page's deep link, should be expanded on arrival"),
         )
     })
     .await
 }
 
-/// The same deep link pasted into the address bar expands the item it names.
+/// The same deep link pasted into the address bar expands the item it names,
+/// onto an answer with something in it.
+///
+/// The FAQ is parsed at build time and emitted as Rust source, so the page can
+/// only be as good as that codegen: an entry whose answer was truncated to
+/// nothing would still render an accordion of the right shape.
+///
+/// Its own visit to the About page, rather than sharing the test above's: a
+/// fragment is only loaded at document load, and `goto` from a page already
+/// under `/faq` changes nothing but the hash, which is a same-document
+/// navigation it waits out. Reaching a different path first is the page load
+/// this one is already paying for.
 #[tokio::test]
-async fn test_faq_deep_link_loaded_directly_arrives_expanded() -> TestResult {
+async fn test_faq_deep_link_loaded_directly_opens_onto_its_answer() -> TestResult {
     web_test(async |t| {
-        t.goto(&format!("/faq#{DEEP_LINKED_FAQ_ANCHOR}")).await?;
+        let anchor = about_page_faq_anchor(t).await?;
+
+        t.goto(&format!("{FAQ_DEEP_LINK_PREFIX}{anchor}")).await?;
 
         check(
-            deep_linked_faq_item_is_expanded(t).await?,
-            "the FAQ item named by the loaded fragment should be expanded on arrival",
+            faq_item_is_expanded(t, &anchor).await?,
+            format!("the FAQ item at #{anchor}, named by the loaded fragment, should be expanded on arrival"),
+        )?;
+
+        // Every answer that survives the build has prose in it; an entry
+        // emptied by the codegen would still render this accordion.
+        let answer = t
+            .text(&format!("{} .prose-chronoscope", faq_item(&anchor)))
+            .await?;
+        check(
+            !answer.trim().is_empty(),
+            format!("the answer under #{anchor} should carry its prose, got: {answer:?}"),
         )
     })
     .await
