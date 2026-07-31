@@ -15,6 +15,8 @@ Nix build infrastructure. One derivation module per project area;
 | `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |
 | `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL → SQLite facts DBs) |
 | `oci.nix`       | nix2container image for the API server (Cloud Run) + the check that boots its entrypoint, Linux systems only |
+| `infra.nix`     | terranix modules for the cloud project, the `config.tf.json` they compile to, the pinned OpenTofu, and the check that validates the two together |
+| `infra-settings.nix` | The project's cloud coordinates (project, region, registry, state bucket). Read by `infra.nix` and by the justfile via `nix eval --file`, so there is one definition |
 
 Dev shell composition lives in `flake.nix`, not in any single component
 module — it has the visibility to compose across modules.

@@ -59,3 +59,8 @@ web/tailwind.css
 /result-*
 .direnv/
 .nix-gc-roots/
+
+# OpenTofu working directory: the generated config.tf.json plus the lock file
+# and provider links tofu keeps beside it. Everything here is derived from
+# nix/infra.nix by `just infra-plan`.
+/.infra/

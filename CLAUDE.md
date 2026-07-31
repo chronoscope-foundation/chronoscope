@@ -50,6 +50,7 @@ each other beyond what they explicitly compose.
 | `triton`   | Python analysis env + weights + rust toolchain (for schematool)  | Triton harness / serving config              |
 | `ios`      | xcodegen + swiftformat/swiftlint/xcbeautify                      | iOS project generation & Swift lint/format   |
 | `deploy`   | gcloud + skopeo (nix: transport)                                 | Pushing the API image, rolling Cloud Run     |
+| `infra`    | opentofu (google provider from nixpkgs) + gcloud                 | Declaring cloud resources with terranix      |
 
 `just` recipes pick the smallest shell that covers their target
 (e.g. `just clippy web` enters `web`, `just check triton` runs hermetically
@@ -170,8 +171,9 @@ just xcodegen               # splice store paths into the xcodegen spec, regener
 just corpus-hash            # add hashes for new corpus URLs
 just corpus-test            # run Rust corpus test suite
 just corpus-test-vlm        # corpus tests + VLM (needs remote Triton)
-just deploy [project] [region] [repo] [service]
-                            # build+push the API image, deploy Cloud Run by digest
+just infra-plan             # compile the terranix modules, show what OpenTofu would change
+just infra-apply            # apply them (real cloud resources; type it yourself)
+just deploy                 # build+push the API image, deploy Cloud Run by digest
 ```
 
 ### Container image
@@ -193,6 +195,23 @@ entrypoint under the image's own environment, so a container that cannot
 start fails a check rather than a deploy. `nix flake check` only evaluates
 the current system, so on a darwin dev machine it never runs; `just check
 linux` builds it.
+
+### Infrastructure
+
+Cloud resources are declared with terranix (Nix modules compiled to the
+`config.tf.json` OpenTofu reads) in `nix/infra.nix`, and applied with
+`just infra-apply`. `nix/infra-settings.nix` is the single definition of the
+project's cloud coordinates: the declarations build from it and `just deploy`
+reads it back, so the registry a push targets is the registry that was
+declared. The state bucket is created once by hand, since state describing the
+bucket would have to live in it; the justfile's infra section carries that
+command.
+
+The Cloud Run service is declared there too, down to its environment, its
+runtime service account and its startup probe. The image is the one part a
+deploy moves: `just deploy` builds it, pushes it, and hands the digest to
+`tofu apply` as a variable, so a single tool owns the service and the
+declaration keeps describing what is running.
 
 ### Workflow examples
 

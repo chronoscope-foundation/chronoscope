@@ -12,13 +12,16 @@
 #                            satisfy the pre-commit gate — only `just check` does.
 #
 #   Everything else        — concrete actions (web-dev, fetch-*, corpus-*,
-#                            openapi). Each is safe-by-construction so it can
-#                            be allowlisted in .claude/settings.json without
-#                            opening a permission hole the way `nix develop` would.
+#                            openapi, infra-plan). Each is safe-by-construction
+#                            so it can be allowlisted in .claude/settings.json
+#                            without opening a permission hole the way
+#                            `nix develop` would.
 #
-#   `deploy`               — the exception to that: it publishes an image and
-#                            rolls the production service, so it stays a recipe
-#                            a human types. Allowlisting it hands that away.
+#   `deploy`, `infra-apply`
+#                          — the exceptions to that: one publishes an image and
+#                            rolls the production service, the other creates and
+#                            destroys real cloud resources. Both stay recipes a
+#                            human types. Allowlisting them hands that away.
 #
 # Targets, where supported:
 #   all              everything (default)
@@ -73,6 +76,39 @@ _nix_reexec_for_target() {
     local shell
     shell=$(_shell_for_target "$target") || exit 1
     exec nix develop ".#$shell" --command just "$recipe" "$target"
+}
+'''
+
+# Compile the terranix modules and stage them where tofu runs. `.infra/` is
+# gitignored working state: the generated config, plus the lock file and
+# provider links tofu keeps beside it. The generated file is copied rather than
+# symlinked because tofu writes into the directory it reads from.
+_infra_sync := '''
+_infra_sync() {
+    local cfg
+    cfg=$(nix build .#infra-config --no-link --print-out-paths)
+    mkdir -p .infra
+    install -m 644 "$cfg" .infra/config.tf.json
+    tofu -chdir=.infra init -input=false
+}
+'''
+
+# Resolve the image the Cloud Run service should run. `deploy` exports the
+# digest it just pushed; everything else carries forward what the last apply
+# recorded, so an infrastructure-only change leaves the running revision alone.
+# Runs after _infra_sync, which is what initializes the state the output is read
+# from.
+_infra_image := '''
+_infra_image() {
+    if [ -n "${TF_VAR_image:-}" ]; then return 0; fi
+    TF_VAR_image=$(tofu -chdir=.infra output -raw image 2>/dev/null || true)
+    # A state that carries no outputs at all warns and exits 0, with the
+    # warning on stdout. An image reference has no whitespace in it, so that is
+    # what separates one from anything tofu says instead.
+    case "$TF_VAR_image" in
+        *[[:space:]]*) TF_VAR_image="" ;;
+    esac
+    export TF_VAR_image
 }
 '''
 
@@ -347,6 +383,78 @@ xcodegen:
     xcodegen generate --spec "$spec" --project-root . --project .
 
 # ---------------------------------------------------------------------------
+# Infrastructure: terranix modules compiled to OpenTofu config.
+#
+# nix/infra-settings.nix is the one definition of the project's cloud
+# coordinates. The terranix modules declare resources from it and `deploy`
+# below reads it back, so an image can only be pushed to a registry that was
+# actually declared.
+#
+# Both recipes authenticate as you, through application-default credentials:
+#   gcloud auth application-default login
+#
+# An apply prints its plan and waits for a typed confirmation before it touches
+# anything.
+#
+# The state bucket is the one thing that cannot declare itself, since the state
+# describing it would have to live in it. Create it once, by hand:
+#
+#   bucket="gs://$(nix eval --file nix/infra-settings.nix stateBucket --raw)"
+#   gcloud storage buckets create "$bucket" \
+#       --project="$(nix eval --file nix/infra-settings.nix project --raw)" \
+#       --location="$(nix eval --file nix/infra-settings.nix region --raw)" \
+#       --uniform-bucket-level-access --public-access-prevention
+#   gcloud storage buckets update "$bucket" --versioning
+#
+# Versioning is what makes a truncated or clobbered state write recoverable.
+# ---------------------------------------------------------------------------
+
+# Show what OpenTofu would change. Reads live cloud state; writes nothing.
+infra-plan:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    {{ _infra_sync }}
+    {{ _infra_image }}
+    _ensure_nix
+    # Re-exec on the tool rather than on IN_NIX_SHELL: every dev shell sets that
+    # variable and only this one carries tofu.
+    if ! command -v tofu >/dev/null 2>&1; then
+        exec nix develop .#infra --command just infra-plan
+    fi
+    _infra_sync
+    _infra_image
+    if [ -z "$TF_VAR_image" ]; then
+        # A plan writes nothing, so a placeholder here costs nothing and keeps
+        # the rest of the plan readable before anything has been published.
+        export TF_VAR_image=none-published-yet
+        echo "note: no image published yet; planning the service with a placeholder" >&2
+    fi
+    tofu -chdir=.infra plan
+
+# Apply the OpenTofu config: creates, changes and destroys real cloud resources.
+infra-apply:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    {{ _infra_sync }}
+    {{ _infra_image }}
+    _ensure_nix
+    if ! command -v tofu >/dev/null 2>&1; then
+        exec nix develop .#infra --command just infra-apply
+    fi
+    _infra_sync
+    _infra_image
+    if [ -z "$TF_VAR_image" ]; then
+        # Applying a placeholder would create a service that cannot pull, so
+        # send the first run through the recipe that publishes an image.
+        echo "error: no image published yet. 'just deploy' builds one, pushes it," >&2
+        echo "and applies everything here with the digest the push reported." >&2
+        exit 1
+    fi
+    tofu -chdir=.infra apply
+
+# ---------------------------------------------------------------------------
 # Deployment to Cloud Run.
 #
 # The image is a Nix derivation, so the same tree always produces the same
@@ -354,39 +462,53 @@ xcodegen:
 # tree it came from, and takes a mutable tag out of the path between build and
 # production.
 #
-# Secrets stay out of the image. JWT_SECRET and friends live on the Cloud Run
-# service, set once with `gcloud run services update --set-secrets`; rolling a
-# new image leaves them in place.
+# The service's shape is declared infrastructure (nix/infra.nix): its memory,
+# its environment, its runtime identity, its startup probe, the secret it reads
+# and who may invoke it. A deploy builds the image, pushes it, and hands the
+# digest to `tofu apply` as a variable, so one tool owns the service and the
+# checked-in config keeps describing what is actually running. That last step
+# reads the same application-default credentials the infra recipes above do.
+#
+# Secrets stay out of the image and out of the revision. JWT_SECRET is generated
+# on first apply, kept in Secret Manager, and reaches the container as a secret
+# reference the runtime service account is allowed to read.
 #
 # The server answers an unauthenticated readiness probe at GET /health, which
-# reports whether both stores opened. The deploy points Cloud Run's startup
-# probe there, so a revision that came up without a usable store never takes
-# traffic; the default TCP probe passes as soon as the port is bound.
+# reports whether both stores opened. The declared startup probe points there,
+# so a revision that came up without a usable store never takes traffic; the
+# default TCP probe passes as soon as the port is bound.
 #
 # The instance filesystem is memory-backed and per-instance: the app database
 # and the fact-store overlay both live under /tmp and vanish with the instance,
-# and their size is charged against --memory. Nothing written through the API
-# survives a revision, which is why --memory is sized for the read path plus
-# whatever a session accumulates rather than for a growing store.
+# and their size is charged against the declared memory limit. Nothing written
+# through the API survives a revision, which is why that limit is sized for the
+# read path plus whatever a session accumulates rather than for a growing store.
 #
-# The Artifact Registry repo has to exist before the first deploy:
-#   gcloud artifacts repositories create <repo> --repository-format=docker \
-#       --location=<region> --project=<project>
+# The Artifact Registry repo the push targets is declared infrastructure too;
+# `just infra-apply` is what creates it, and it has to exist before the push
+# below can land.
 # ---------------------------------------------------------------------------
 
-# Build the API image, push it to Artifact Registry, roll Cloud Run onto the digest.
-deploy project="chronoscope-io-prod" region="us-central1" repo="chronoscope" service="chronoscope-api":
+# Build the API image, push it to Artifact Registry, apply Cloud Run onto the digest.
+deploy:
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _ensure_nix }}
+    {{ _infra_sync }}
     _ensure_nix
     # Re-exec on the tools rather than on IN_NIX_SHELL: every dev shell sets
-    # that variable and only this one carries gcloud and skopeo, so keying off
-    # it strands a direnv'd caller after the multi-minute image build.
-    if ! command -v gcloud >/dev/null 2>&1 || ! command -v skopeo >/dev/null 2>&1; then
-        exec nix develop .#deploy --command just deploy \
-            "{{ project }}" "{{ region }}" "{{ repo }}" "{{ service }}"
+    # that variable and only this one carries all three, so keying off it
+    # strands a direnv'd caller after the multi-minute image build.
+    if ! command -v gcloud >/dev/null 2>&1 || ! command -v skopeo >/dev/null 2>&1 \
+       || ! command -v tofu >/dev/null 2>&1; then
+        exec nix develop .#deploy --command just deploy
     fi
+    # The same definition the infrastructure is declared from, so the push
+    # cannot address a registry nothing ever created.
+    project=$(nix eval --file nix/infra-settings.nix project --raw)
+    region=$(nix eval --file nix/infra-settings.nix region --raw)
+    repo=$(nix eval --file nix/infra-settings.nix artifactRepository --raw)
+    service=$(nix eval --file nix/infra-settings.nix cloudRunService --raw)
     # Cloud Run is linux/amd64; build that system's image regardless of the
     # machine driving the deploy. The --out-link pins the manifest and every
     # layer store path it names, so the push below can't race collection.
@@ -398,7 +520,7 @@ deploy project="chronoscope-io-prod" region="us-central1" repo="chronoscope" ser
     # keeps the tag tied to the artifact in hand.
     tag=${image##*/}
     tag=${tag%%-*}
-    ref="{{ region }}-docker.pkg.dev/{{ project }}/{{ repo }}/{{ service }}"
+    ref="$region-docker.pkg.dev/$project/$repo/$service"
 
     # A short-lived access token in a 0600 file, rather than a credential helper
     # or --dest-creds: nothing depends on ~/.docker state, and the token stays
@@ -406,10 +528,10 @@ deploy project="chronoscope-io-prod" region="us-central1" repo="chronoscope" ser
     authfile=$(mktemp)
     digestfile=$(mktemp)
     trap 'rm -f "$authfile" "$digestfile"' EXIT
-    token=$(gcloud auth print-access-token --project "{{ project }}")
+    token=$(gcloud auth print-access-token --project "$project")
     basic=$(printf 'oauth2accesstoken:%s' "$token" | base64 | tr -d '\n')
     cat > "$authfile" <<JSON
-    { "auths": { "{{ region }}-docker.pkg.dev": { "auth": "$basic" } } }
+    { "auths": { "$region-docker.pkg.dev": { "auth": "$basic" } } }
     JSON
 
     echo "==> Pushing $ref:$tag"
@@ -422,18 +544,13 @@ deploy project="chronoscope-io-prod" region="us-central1" repo="chronoscope" ser
     digest=$(cat "$digestfile")
 
     echo "==> Deploying $ref@$digest"
-    # --quiet and --allow-unauthenticated go together: without the first, a
-    # service's initial deploy stops on an interactive prompt; without the
-    # second, the answer --quiet gives that prompt is "no" and the API 403s
-    # every request. The port comes from Cloud Run's own PORT variable.
-    gcloud run deploy "{{ service }}" \
-        --project "{{ project }}" \
-        --region "{{ region }}" \
-        --image "$ref@$digest" \
-        --allow-unauthenticated \
-        --quiet \
-        --memory 2Gi \
-        --startup-probe httpGet.path=/health,timeoutSeconds=4,periodSeconds=5,failureThreshold=6
+    # The bytes just pushed, by digest, named to the one tool that owns the
+    # service. Everything else about the revision comes from the declaration,
+    # so an apply that finds nothing else changed rolls the image and stops
+    # there. It prints its plan and waits for a typed confirmation first.
+    export TF_VAR_image="$ref@$digest"
+    _infra_sync
+    tofu -chdir=.infra apply
 
 # ---------------------------------------------------------------------------
 # Data fetches. Each is a thin wrapper around `nix build` + GC root pinning.

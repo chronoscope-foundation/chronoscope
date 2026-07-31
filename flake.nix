@@ -24,6 +24,14 @@
       url = "github:nlewo/nix2container";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Infrastructure as Nix modules instead of HCL, compiled to the
+    # config.tf.json OpenTofu reads. OpenTofu rather than Terraform: the latter
+    # is BSL, which nixpkgs marks unfree.
+    terranix = {
+      url = "github:terranix/terranix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -34,6 +42,7 @@
       crane,
       flake-utils,
       nix2container,
+      terranix,
       ...
     }:
     let
@@ -181,6 +190,11 @@
           inherit (nix2container.packages.${system}) nix2container;
           inherit (api) apiBin runtimeEnv;
           factsDb = wikidata.factsDbs.curated;
+        };
+
+        infra = import ./nix/infra.nix {
+          inherit pkgs terranix;
+          settings = import ./nix/infra-settings.nix;
         };
 
         # Swift sources for the ChronoscopeAPI package, filtered so a source
@@ -392,6 +406,11 @@
 
             openapi = openapi.spec;
 
+            # Compiles the terranix modules and holds the result to the
+            # providers' own schemas, so an infrastructure change that cannot
+            # apply fails here instead of halfway through an apply.
+            infra-validate = infra.validate;
+
             # Hermetic coverage of the build-db path: a dump-free facts DB from
             # the curated bundle, self-validating that it holds facts.
             wikidata-facts-db-curated = wikidata.factsDbs.curated;
@@ -416,6 +435,10 @@
           // {
             inherit (api) api;
             openapi = openapi.spec;
+
+            # The generated OpenTofu config. `just infra-plan` stages this file
+            # into the working directory it runs tofu from.
+            infra-config = infra.tfConfig;
 
             corpus-images = corpus.corpusImages;
             corpus-fetch = corpus.corpusFetchBin;
@@ -559,20 +582,39 @@
             '';
           };
 
-          # Pushing images and driving Cloud Run. Scoped to moving an artifact
-          # `nix build` already produced, so it carries only the two tools that
-          # do the moving. skopeo-nix2container is the skopeo that speaks the
-          # `nix:` transport, letting a push stream the manifest's store paths
-          # straight to the registry.
+          # Pushing images and rolling Cloud Run. gcloud and skopeo move the
+          # artifact `nix build` already produced; tofu is what rolls the
+          # service onto it, since the service's shape is declared and a deploy
+          # only hands over the digest. skopeo-nix2container is the skopeo that
+          # speaks the `nix:` transport, letting a push stream the manifest's
+          # store paths straight to the registry.
           deploy = pkgs.mkShell {
             nativeBuildInputs = [
               pkgs.just
               pkgs.google-cloud-sdk
               nix2container.packages.${system}.skopeo-nix2container
+              infra.tofu
             ];
             shellHook = ''
               ${mkBanner "deploy" ''
                 echo "  gcloud: $(gcloud --version 2>/dev/null | head -n1)"
+              ''}
+            '';
+          };
+
+          # Declaring cloud resources. A subset of `deploy`: planning or
+          # applying an infrastructure change publishes no image, so it leaves
+          # out the tools that push one. gcloud is here for the
+          # application-default credentials the provider authenticates with.
+          infra = pkgs.mkShell {
+            nativeBuildInputs = [
+              pkgs.just
+              pkgs.google-cloud-sdk
+              infra.tofu
+            ];
+            shellHook = ''
+              ${mkBanner "infra" ''
+                echo "  tofu: $(tofu --version 2>/dev/null | head -n1)"
               ''}
             '';
           };
