@@ -41,6 +41,19 @@ let
       ++ lib.optionals stdenv.hostPlatform.isDarwin [
         libiconv
       ];
+  }
+  // lib.optionalAttrs (pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64) {
+    # rustc 1.90+ links x86_64-unknown-linux-gnu with rust-lld, which bypasses
+    # the nixpkgs ld wrapper that turns the link line's `-L /nix/store/...` into
+    # RPATH. What comes out runs only where LD_LIBRARY_PATH already names
+    # openssl and gcc-lib, so the container dies at exec and cargo's test
+    # binaries exit 127. Linking through the wrapped GNU ld keeps RPATH derived
+    # from the real link line rather than hand-listed here.
+    #
+    # Keyed on the architecture rather than the OS: rust-lld is the default only
+    # on x86_64, and rustc rejects this flag as unstable on aarch64-linux, so a
+    # per-OS guard would break that target the moment anything builds for it.
+    RUSTFLAGS = "-Clinker-features=-lld";
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
