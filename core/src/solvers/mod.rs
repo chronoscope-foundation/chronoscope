@@ -873,8 +873,8 @@ mod tests {
         Ok(())
     }
 
-    /// Chioggia Cathedral's shape: a 1623 demolition (P576) and a 1633 existence
-    /// witness (P571), no construction. The witness sits after the entity was
+    /// A sighting past a demolition: a 1623 demolition and a 1633 existence
+    /// witness, no construction. The witness sits after the entity was
     /// demolished, so the two can't jointly hold.
     #[tokio::test]
     async fn existence_witness_after_demolition_is_a_temporal_conflict() -> TestResult {

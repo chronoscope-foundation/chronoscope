@@ -30,10 +30,10 @@ type SeedResult = Result<Commit<ServerIds>, Box<dyn std::error::Error + Send + S
 
 /// Hagia Sophia, Istanbul — single entity, good for detail panel tests (lng, lat).
 const HAGIA_SOPHIA: (f64, f64) = (28.979917, 41.008528);
-/// Chioggia Cathedral, Venice lagoon (lng, lat). Demolished 1623 and refounded
-/// 1633 with no rebuild construction, so it projects as one entity carrying an
-/// existence-after-demolition conflict.
-const CHIOGGIA_CATHEDRAL: (f64, f64) = (12.27725, 45.217056);
+/// Bostancı railway station, Istanbul (lng, lat). Four P1619 openings and no
+/// claim dating its construction, so its build bound is inferred off the
+/// earliest opening.
+const BOSTANCI_STATION: (f64, f64) = (29.09522, 40.95389);
 
 // ==================== Fact seeding helpers ====================
 //
@@ -219,6 +219,49 @@ fn seed_disputed_photographed_entity_at(
         entities: vec![Decl::Local],
         events: Vec::new(),
         images: vec![Decl::Local],
+        facts: facts.into_iter().collect(),
+    })
+}
+
+/// A commit placing one named entity at `(lat, lon)` whose sources disagree
+/// about when it began: a construction start, and a witness that saw it standing
+/// before the build.
+///
+/// The sighting sits under the construction floor, so the entity reads contested
+/// from that instant onward, the present included, and no scrub is needed to
+/// reach it.
+fn seed_witness_before_construction_at(
+    name: &str,
+    lat: f64,
+    lon: f64,
+    witnessed: i32,
+    built: i32,
+) -> SeedResult {
+    let mut facts = name_and_location_facts(name, lat, lon)?;
+    facts.push(SubmitFact::Factual {
+        assertion: FactualAssertion::Existence {
+            fact: existence::Fact {
+                entity: EntityIdx(0),
+                at: year(witnessed)?,
+            },
+        },
+        citation: seed_citation("https://example.com/seed-witness")?,
+    });
+    facts.push(SubmitFact::Factual {
+        assertion: FactualAssertion::Construction {
+            fact: ConstructionFact::Started {
+                entity: EntityIdx(0),
+                bound: year(built)?,
+            },
+        },
+        citation: seed_citation("https://example.com/seed-built")?,
+    });
+    Ok(Commit::<ServerIds> {
+        author: CommitAuthor::User(UserId::new("seed")?),
+        recorded_at: chrono::Utc::now(),
+        entities: vec![Decl::Local],
+        events: Vec::new(),
+        images: Vec::new(),
         facts: facts.into_iter().collect(),
     })
 }
@@ -749,9 +792,9 @@ async fn test_entity_click_opens_detail() -> TestResult {
 
         // The panel renders "Loading..." while fetching the entity detail.
         // Wait for a loaded-state token instead of polling for absence of
-        // "Loading..." — "Known to exist" is asserted on below, so its
+        // "Loading..." — "Construction started" is asserted on below, so its
         // presence proves the fetch settled and rendered.
-        t.wait_for_body_text("Known to exist").await?;
+        t.wait_for_body_text("Construction started").await?;
 
         let panel_text = t.text("[role='complementary']").await?;
 
@@ -767,17 +810,16 @@ async fn test_entity_click_opens_detail() -> TestResult {
             format!("Panel should show timeline section, got: {panel_text}"),
         )?;
 
-        // Hagia Sophia's only lifecycle date is its P571 inception (year 0537),
-        // read as an existence witness. The year reaches the panel on its
-        // "Known to exist" row.
+        // Hagia Sophia's P571 inception (year 0537) dates its construction, so
+        // the year reaches the panel on the "Construction started" row.
         check(
             panel_text.contains("537"),
-            format!("Panel should show Hagia Sophia's 537 existence witness, got: {panel_text}"),
+            format!("Panel should show Hagia Sophia's 537 construction date, got: {panel_text}"),
         )?;
         check(
-            panel_text.contains("Known to exist"),
+            panel_text.contains("Construction started"),
             format!(
-                "Panel should label Hagia Sophia's P571 inception as 'Known to exist', \
+                "Panel should label Hagia Sophia's P571 inception as 'Construction started', \
                  got: {panel_text}"
             ),
         )?;
@@ -795,18 +837,24 @@ async fn test_entity_click_opens_detail() -> TestResult {
     .await
 }
 
-/// Hagia Sophia carries a P571 inception (537) and no asserted construction, so
-/// the read-time solver fills the empty construction slot with an inferred "built
-/// by 537" bound. The panel renders that row with the sage inferred marker,
-/// distinct from a citation bullet and a conflict marker; opening it names the
-/// derivation, the witness reason, and the underlying Wikidata source.
+/// Bostancı station carries four P1619 openings (the earliest 1874) and nothing
+/// dating its construction, so the read-time solver fills the empty construction
+/// slot with an inferred "built by 1874" bound off the earliest opening. The
+/// panel renders that row with the sage inferred marker, distinct from a citation
+/// bullet and a conflict marker; opening it names the derivation, the witness
+/// reason, and the underlying Wikidata source.
 #[tokio::test]
 async fn test_inferred_construction_bound_renders_marker_and_names_witness() -> TestResult {
     web_test(async |t| {
-        t.goto_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1, 14.0).await?;
-        t.click_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1).await?;
+        t.goto_map_at(BOSTANCI_STATION.0, BOSTANCI_STATION.1, 14.0)
+            .await?;
+        t.click_map_at(BOSTANCI_STATION.0, BOSTANCI_STATION.1)
+            .await?;
         t.wait_for_selector("[role='complementary']").await?;
-        t.wait_for_body_text("Known to exist").await?;
+        // The timeline header, which only a rendered detail draws: the picker
+        // renders the entity's name too, so a name wait can settle on a list
+        // with no detail on it.
+        t.wait_for_body_text("Timeline (").await?;
 
         // The inferred marker's aria-label names the derived bound, distinct from a
         // citation bullet's "N sources" and a conflict marker's "date conflict".
@@ -814,8 +862,8 @@ async fn test_inferred_construction_bound_renders_marker_and_names_witness() -> 
         t.wait_for_selector(marker).await?;
         let label = t.attr(marker, "aria-label").await?.unwrap_or_default();
         check(
-            label.contains("537"),
-            format!("the inferred marker names the 537 built-by bound, got: {label}"),
+            label.contains("1874"),
+            format!("the inferred marker names the 1874 built-by bound, got: {label}"),
         )?;
 
         t.screenshot("test_inferred_construction_bound_marker")
@@ -830,7 +878,7 @@ async fn test_inferred_construction_bound_renders_marker_and_names_witness() -> 
         for token in [
             "inferred",
             "built by",
-            "537",
+            "1874",
             "recorded existing",
             "wikidata",
         ] {
@@ -845,47 +893,42 @@ async fn test_inferred_construction_bound_renders_marker_and_names_witness() -> 
     .await
 }
 
-/// Chioggia's 1633 refounding witnesses existence *after* its 1623 demolition —
-/// the demolition-ceiling side of the temporal solver, complementing Notre-Dame's
-/// construction-floor conflict. The item projects as one entity (the demolition
-/// and refounding no longer split it), so the click opens the detail directly,
-/// and the conflict rides its participating rows as an amber "!" marker.
+/// A sighting dated after a demolition witnesses existence past the entity's
+/// lifetime ceiling — the demolition-ceiling side of the temporal solver. The
+/// conflict rides its participating rows as an amber "!" marker, and opening it
+/// reveals the clash and a time-axis plotting the rival instants.
 #[tokio::test]
-async fn test_chioggia_existence_after_demolition_conflict() -> TestResult {
-    web_test(async |t| {
-        t.goto_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1, 14.0)
-            .await?;
-        // Rewind into the disputed era — after the demolition, onto the grid year
-        // beside the 1633 witness, since the early modern band steps two years at
-        // a time — where the cathedral is exactly the contested pin this test is
-        // about. (The 1633 refounding refutes the 1623 demolition, so the pin
-        // draws contested at every later instant, the present day included.)
-        t.set_time_slider_year(1634.0).await?;
-        t.click_map_at(CHIOGGIA_CATHEDRAL.0, CHIOGGIA_CATHEDRAL.1)
-            .await?;
+async fn test_a_sighting_after_a_demolition_renders_a_conflict() -> TestResult {
+    let seeds = vec![seed_disputed_photographed_entity_at(
+        "Drowned Chapel",
+        25.0,
+        -40.0,
+        1885,
+        1887,
+    )?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 12.0).await?;
+        t.click_map_at(-40.0, 25.0).await?;
         t.wait_for_selector("[role='complementary']").await?;
 
-        // A single entity here, so the click lands on the detail, not a picker.
+        // The chapel's own rows: the detail fetch is async on top of the panel's
+        // permanent mount, so this is what "selected and loaded" means.
         t.wait_for_body_text("Known to exist").await?;
         let panel_text = t.text("[role='complementary']").await?;
-        check(
-            !panel_text.contains("Multiple entities"),
-            format!("Chioggia projects one entity, not a disambiguation picker, got: {panel_text}"),
-        )?;
         for token in [
-            "Chioggia Cathedral",
+            "Drowned Chapel",
             "Demolition completed",
-            "1623",
+            "1885",
             "Known to exist",
-            "1633",
+            "1887",
         ] {
             check(
                 panel_text.contains(token),
-                format!("Chioggia's detail should render '{token}', got: {panel_text}"),
+                format!("the chapel's detail should render '{token}', got: {panel_text}"),
             )?;
         }
 
-        t.screenshot("test_chioggia_existence_after_demolition_conflict")
+        t.screenshot("test_a_sighting_after_a_demolition_renders_a_conflict")
             .await?;
 
         // The conflict marker's aria-label names the date conflict; opening it
@@ -895,7 +938,68 @@ async fn test_chioggia_existence_after_demolition_conflict() -> TestResult {
         t.click(marker).await?;
         t.wait_for_selector("[role='group']").await?;
         let popover = t.text("[role='group']").await?.to_lowercase();
-        for token in ["existed", "1633", "1623", "demolished"] {
+        for token in ["existed", "1887", "1885", "demolished"] {
+            check(
+                popover.contains(token),
+                format!("the conflict popover must name '{token}', got: {popover}"),
+            )?;
+        }
+        check(
+            t.exists("[role='group'] svg").await?,
+            "the conflict popover must plot its participants on a time-axis",
+        )?;
+
+        Ok(())
+    })
+    .await
+}
+
+/// A sighting dated before a construction start witnesses existence under the
+/// entity's lifetime floor: the construction-floor side of the temporal solver.
+/// The conflict rides its participating rows as an amber "!" marker, and opening
+/// it reveals the clash and a time-axis plotting the rival instants.
+#[tokio::test]
+async fn test_a_sighting_before_a_construction_renders_a_conflict() -> TestResult {
+    let seeds = vec![seed_witness_before_construction_at(
+        "Old Watchtower",
+        25.0,
+        -40.0,
+        1885,
+        1887,
+    )?];
+    web_test_seeded(seeds, async |t| {
+        t.goto_map_at(-40.0, 25.0, 12.0).await?;
+        t.click_map_at(-40.0, 25.0).await?;
+        t.wait_for_selector("[role='complementary']").await?;
+
+        // The watchtower's own rows: the detail fetch is async on top of the
+        // panel's permanent mount, so this is what "selected and loaded" means.
+        t.wait_for_body_text("Known to exist").await?;
+        let panel_text = t.text("[role='complementary']").await?;
+        for token in [
+            "Old Watchtower",
+            "Known to exist",
+            "1885",
+            "Construction started",
+            "1887",
+        ] {
+            check(
+                panel_text.contains(token),
+                format!("the watchtower's detail should render '{token}', got: {panel_text}"),
+            )?;
+        }
+
+        t.screenshot("test_a_sighting_before_a_construction_renders_a_conflict")
+            .await?;
+
+        // The conflict marker's aria-label names the date conflict; opening it
+        // reveals the clash and a time-axis plotting the rival instants.
+        let marker = "[role='complementary'] button[aria-label*='date conflict']";
+        t.wait_for_selector(marker).await?;
+        t.click(marker).await?;
+        t.wait_for_selector("[role='group']").await?;
+        let popover = t.text("[role='group']").await?.to_lowercase();
+        for token in ["existed", "1885", "1887", "construction started"] {
             check(
                 popover.contains(token),
                 format!("the conflict popover must name '{token}', got: {popover}"),
@@ -1880,7 +1984,7 @@ async fn test_the_time_card_yields_the_corner_only_where_the_sheet_covers_it() -
         t.click_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1).await?;
         // The panel's own content, so a click that selected nothing fails here
         // rather than leaving both assertions below reading an unselected map.
-        t.wait_for_body_text("Known to exist").await?;
+        t.wait_for_body_text("Construction started").await?;
 
         let toggle = "#time-slider-panel-toggle";
         t.wait_for_media_query(SIDE_BY_SIDE, true).await?;
@@ -2701,36 +2805,33 @@ async fn test_notre_dame_interior_event_renders_between_construction_endpoints()
     .await
 }
 
-/// Notre-Dame is attested existing (P571, 1160) before its construction started
-/// (P793, 1163) — a contradiction spanning two fields with no per-slot home, so it
-/// surfaces as an entity-level temporal conflict. The panel rides it inline on the
-/// participating rows as an amber "!" marker; opening it reveals the plain-language
-/// clash and a time-axis plotting the rival instants.
+/// Notre-Dame's founding (P571, 1160) and its build start (P793, 1163) date one
+/// bound differently, so the construction-started row reads disputed: an amber
+/// bullet labelled by its rival count, and a popover laying the rival claims out
+/// with the Wikidata statements behind them.
 #[tokio::test]
-async fn test_notre_dame_existence_before_construction_conflict() -> TestResult {
+async fn test_notre_dame_rival_construction_starts_render_as_disputed() -> TestResult {
     web_test(async |t| {
         open_notre_dame_panel(t).await?;
 
-        // The conflict marker's aria-label names the date conflict, distinguishing
-        // it from a citation bullet's "conflicting sources".
-        let marker = "[role='complementary'] button[aria-label*='date conflict']";
-        t.wait_for_selector(marker).await?;
-        t.click(marker).await?;
+        // The disputed bullet reads "N conflicting sources", where a settled one
+        // reads "N sources". Scoped to the construction-started row, so another
+        // disputed row can't stand in for the one under test.
+        let bullet = "[role='complementary'] li[data-row='Construction started'] \
+                      button[aria-label*='conflicting sources']";
+        t.wait_for_selector(bullet).await?;
+        t.click(bullet).await?;
 
         // The popover portals to document.body with role='group'; wait for it,
-        // then read the clash and confirm the time-axis rendered.
+        // then read the rivals it lays out.
         t.wait_for_selector("[role='group']").await?;
         let popover = t.text("[role='group']").await?.to_lowercase();
-        for token in ["existed", "1160", "1163", "construction"] {
+        for token in ["disputed", "1160", "1163", "wikidata"] {
             check(
                 popover.contains(token),
-                format!("the conflict popover must name '{token}', got: {popover}"),
+                format!("the disputed popover must name '{token}', got: {popover}"),
             )?;
         }
-        check(
-            t.exists("[role='group'] svg").await?,
-            "the conflict popover must plot its participants on a time-axis",
-        )?;
 
         Ok(())
     })

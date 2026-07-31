@@ -258,8 +258,8 @@ pub fn timeline_span<EvtId, ImgId>(
     let mut latest: Option<NaiveDate> = None;
     for event in events {
         // Existence witnesses count: a "known to exist" date is often an entity's
-        // only anchor (a sole-P571 inception with no build or demolition), so
-        // dropping it would strand such entities undated on the map.
+        // only anchor (a lone sighting, with no build or demolition on record),
+        // so dropping it would strand such entities undated on the map.
         for date in typed::entry_date_bounds(&event.detail) {
             if let Some(lo) = date.possible.earliest() {
                 earliest = Some(earliest.map_or(lo, |cur| cur.min(lo)));

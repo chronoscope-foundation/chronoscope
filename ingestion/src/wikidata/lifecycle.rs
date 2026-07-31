@@ -1,11 +1,12 @@
 //! Lifecycle extraction from Wikidata claims.
 //!
-//! Extracts construction/demolition bookends, existence witnesses, and interior
-//! lifetime events from Wikidata properties as fact-shaped [`Contribution`]s,
-//! each date and location paired with its [`FactualCitation`] at the point of
-//! extraction. Construction phases come from P793's start/end qualifiers; P571
-//! inception dates the entity's existence. Handles entity splitting when
-//! demolish→rebuild patterns indicate a new entity.
+//! Extracts construction/demolition bookends and interior lifetime events from
+//! Wikidata properties as fact-shaped [`Contribution`]s, each date and location
+//! paired with its [`FactualCitation`] at the point of extraction. A claim
+//! becomes the fact it states, cited to its own property: construction phases
+//! come from P571's inception and from P793's start/end qualifiers, and two
+//! properties disagreeing is a conflict the solver reads off the facts. Handles
+//! entity splitting when demolish→rebuild patterns indicate a new entity.
 //!
 //! Date and location fields are `Vec`s because parallel claims (multiple
 //! non-deprecated statements about one slot) each contribute a competing
@@ -64,6 +65,13 @@ pub enum Contribution {
     },
     /// Existence witnesses: dates the entity is attested to have existed at,
     /// each becoming its own existence fact.
+    ///
+    /// The surface syntax for what a dated depiction says the long way round.
+    /// A `SubjectDate` on an image, an interior event's date, and an existence
+    /// fact all land on `Lifespan::witness`, so this is the form a source takes
+    /// when it attests a moment directly, with no photograph or event to hang it
+    /// on. Wikidata has no such property today, which is why nothing here builds
+    /// one.
     Existence { dates: Vec<CitedDate> },
     /// An interior lifetime event.
     Event(Box<InteriorEvent>),
@@ -568,6 +576,18 @@ fn construction(started: Vec<CitedDate>, completed: Vec<CitedDate>) -> Option<Co
     })
 }
 
+/// The construction a P571 inception dates, keyed on its earliest start.
+fn inception_construction(started: Vec<CitedDate>) -> DatedContribution {
+    DatedContribution {
+        sort_key: earliest_of(&started),
+        contribution: Contribution::Construction {
+            started,
+            completed: Vec::new(),
+            location: Vec::new(),
+        },
+    }
+}
+
 /// A durational interior event, when at least one date was extracted.
 fn durational(
     kind: DurationalKind,
@@ -632,10 +652,10 @@ fn usage_changed(
 ///
 /// Extracts P571, P576, P625, P793, and the usage-transition properties
 /// (P1619, P3999, P729, P730) into contributions, and sorts chronologically.
-/// P571 becomes existence witnesses; construction bookends come from P793;
-/// P625 is the build location. Returns (`entity_lifecycles`, warnings). Multiple
-/// inner vecs when demolish→construct indicates entity splitting; the caller
-/// creates `Replaces` relationships between them.
+/// P571 and P793 each date a construction of their own; P625 is the item's site,
+/// which every split stands on. Returns (`entity_lifecycles`, warnings).
+/// Multiple inner vecs when demolish→construct indicates entity splitting; the
+/// caller creates `Replaces` relationships between them.
 pub fn build_lifecycles(
     claims: &BTreeMap<PropertyId, Vec<Claim>>,
     ctx: &ItemContext,
@@ -658,68 +678,24 @@ pub fn build_lifecycles(
     let service_retirements =
         extract_property_dates(claims, WikidataPropertyId::new(730), ctx, &mut warnings);
 
-    // 2. Process P793 events first to collect construction events
-    let mut p793_constructions: Vec<DatedContribution> = Vec::new();
-    let mut p793_other: Vec<DatedContribution> = Vec::new();
-
+    // 2. P793 significant events: construction bookends bracketed by a
+    //    statement's own qualifiers, plus the interior events.
     if let Some(p793_claims) = claims.get("P793") {
         for claim in asserted_claims(p793_claims) {
             let (contributions, w) = process_p793_claim(claim, ctx);
             warnings.extend(w);
-            for dc in contributions {
-                if matches!(dc.contribution, Contribution::Construction { .. }) {
-                    p793_constructions.push(dc);
-                } else {
-                    p793_other.push(dc);
-                }
-            }
+            dated.extend(contributions);
         }
     }
 
-    // 3. P571 inceptions are existence witnesses — the entity provably existed
-    //    at each. A witness before the construction start surfaces as a
-    //    read-time contradiction.
+    // 3. The P571 inception dates a construction start of its own, cited to
+    //    P571. Two properties dating the build differently is a disagreement
+    //    the solver reads off the facts.
     if !inceptions.is_empty() {
-        let sort_key = earliest_of(&inceptions);
-        dated.push(DatedContribution {
-            contribution: Contribution::Existence { dates: inceptions },
-            sort_key,
-        });
+        dated.push(inception_construction(inceptions));
     }
 
-    // 4. Construction bookends come from P793's start/end qualifiers; P625 is the
-    //    build location. It rides the earliest P793 construction, or — with no
-    //    dated construction — its own location-only construction, so a placeable
-    //    entity keeps its site.
-    if p793_constructions.is_empty() {
-        if !locations.is_empty() {
-            dated.push(DatedContribution {
-                contribution: Contribution::Construction {
-                    started: Vec::new(),
-                    completed: Vec::new(),
-                    location: locations,
-                },
-                sort_key: None,
-            });
-        }
-    } else {
-        p793_constructions.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
-        let mut remaining_locations = locations;
-
-        for (i, mut dc) in p793_constructions.into_iter().enumerate() {
-            if i == 0
-                && let Contribution::Construction { location, .. } = &mut dc.contribution
-            {
-                *location = std::mem::take(&mut remaining_locations);
-            }
-            dated.push(dc);
-        }
-    }
-
-    // 5. Add non-construction P793 events
-    dated.extend(p793_other);
-
-    // 6. Add P576 demolition
+    // 4. Add P576 demolition
     if !demolition_dates.is_empty() {
         let sort_key = earliest_of(&demolition_dates);
         dated.push(DatedContribution {
@@ -731,7 +707,7 @@ pub fn build_lifecycles(
         });
     }
 
-    // 7. Add usage-transition events, one per distinct claimed date. One
+    // 5. Add usage-transition events, one per distinct claimed date. One
     //    property can carry several genuine transitions — a station reopened
     //    over decades — so each distinct date becomes its own event, and claims
     //    sharing a date merge into one, pooling their citations.
@@ -752,27 +728,26 @@ pub fn build_lifecycles(
     // P730 service retirement: ceased use.
     push_usage(service_retirements, Some(BTreeSet::new()));
 
-    // 8. Sort chronologically
-    dated.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    // 6. Sort chronologically, a construction leading its date: a build and a
+    //    teardown claimed for the same year are one entity's two bookends, and
+    //    the split boundary reads demolish→construct.
+    dated.sort_by_key(|dc| {
+        (
+            dc.sort_key,
+            !matches!(dc.contribution, Contribution::Construction { .. }),
+        )
+    });
 
-    // 9. Split on demolish->construct boundaries
-    let entities = split_on_rebuild(dated);
+    // 7. Split on demolish->construct boundaries, then stand each split on the
+    //    item's site.
+    let entities = place_on_site(split_on_rebuild(dated), locations);
 
     (entities, warnings)
 }
 
 /// Split contributions into separate entities when demolish→construct
 /// indicates a rebuild.
-///
-/// When splitting, if the construction that triggers the split has a location,
-/// the predecessor gets a synthetic dateless `Construction` with that same
-/// location — the previous building occupied the same site, we just don't know
-/// when it was built.
 fn split_on_rebuild(contributions: Vec<DatedContribution>) -> Vec<Vec<Contribution>> {
-    if contributions.is_empty() {
-        return vec![];
-    }
-
     let mut entities: Vec<Vec<Contribution>> = vec![vec![]];
     let mut saw_demolition = false;
 
@@ -780,30 +755,8 @@ fn split_on_rebuild(contributions: Vec<DatedContribution>) -> Vec<Vec<Contributi
         let is_construction = matches!(dc.contribution, Contribution::Construction { .. });
         let is_demolition = matches!(dc.contribution, Contribution::Demolition { .. });
 
-        // If we see construction after demolition, start a new entity.
-        // Give the predecessor entity a Construction at the same location.
+        // A construction after a demolition builds something new.
         if saw_demolition && is_construction {
-            if let Contribution::Construction { location, .. } = &dc.contribution
-                && !location.is_empty()
-                && let Some(prev) = entities.last_mut()
-            {
-                let has_location = prev.iter().any(|c| {
-                    matches!(
-                        c,
-                        Contribution::Construction { location, .. } if !location.is_empty()
-                    )
-                });
-                if !has_location {
-                    prev.insert(
-                        0,
-                        Contribution::Construction {
-                            started: Vec::new(),
-                            completed: Vec::new(),
-                            location: location.clone(),
-                        },
-                    );
-                }
-            }
             entities.push(vec![]);
             saw_demolition = false;
         }
@@ -820,6 +773,41 @@ fn split_on_rebuild(contributions: Vec<DatedContribution>) -> Vec<Vec<Contributi
 
     // Filter out empty entities
     entities.into_iter().filter(|e| !e.is_empty()).collect()
+}
+
+/// Stand every split on the item's P625 site: a rebuild occupies the site its
+/// predecessor did, so each split carries the coordinate on a construction of
+/// its own, and a split with no construction gets a dateless one to hold it.
+/// An item whose only lifecycle claim is its coordinate is that dateless
+/// construction alone.
+fn place_on_site(
+    mut entities: Vec<Vec<Contribution>>,
+    site: Vec<CitedLocation>,
+) -> Vec<Vec<Contribution>> {
+    if site.is_empty() {
+        return entities;
+    }
+    if entities.is_empty() {
+        entities.push(Vec::new());
+    }
+    for entity in &mut entities {
+        let existing = entity.iter_mut().find_map(|c| match c {
+            Contribution::Construction { location, .. } => Some(location),
+            _ => None,
+        });
+        match existing {
+            Some(location) => location.clone_from(&site),
+            None => entity.insert(
+                0,
+                Contribution::Construction {
+                    started: Vec::new(),
+                    completed: Vec::new(),
+                    location: site.clone(),
+                },
+            ),
+        }
+    }
+    entities
 }
 
 #[cfg(test)]
@@ -861,6 +849,30 @@ mod tests {
             } => Ok(*property_id),
             other => Err(format!("expected Wikidata statement source, got {other:?}")),
         }
+    }
+
+    /// Every construction start in one entity's contributions as
+    /// (citing property, year), in contribution order. A start this can't read
+    /// (an undatable bound, a citation naming no statement) is an error, so an
+    /// assertion over the result never passes by omission.
+    fn construction_starts(
+        contributions: &[Contribution],
+    ) -> Result<Vec<(WikidataPropertyId, i32)>, String> {
+        contributions
+            .iter()
+            .filter_map(|c| match c {
+                Contribution::Construction { started, .. } => Some(started),
+                _ => None,
+            })
+            .flatten()
+            .map(|d| {
+                let day = d
+                    .bound
+                    .earliest()
+                    .ok_or_else(|| format!("start bound names no earliest day: {:?}", d.bound))?;
+                Ok((citation_property(&d.citation)?, day.year()))
+            })
+            .collect()
     }
 
     /// The observed value a citation quotes.
@@ -1093,57 +1105,50 @@ mod tests {
     }
 
     #[test]
-    fn split_on_rebuild_gives_predecessor_the_successor_location() -> TestResult {
-        // Predecessor has no location; successor was constructed at a known
-        // location. The predecessor gets a synthetic dateless Construction
-        // with the inherited location, same citation.
-        let location = CitedLocation {
+    fn place_on_site_stands_every_split_on_the_item_coordinate() -> TestResult {
+        let site = vec![CitedLocation {
             location: UnresolvedLocation::Resolved(Location::point(GeoPoint::new(45.217, 12.277)?)),
             citation: ctx()?.statement_citation(WikidataPropertyId::new(625), "45.217,12.277")?,
-        };
-        let contributions = vec![
-            DatedContribution {
-                contribution: Contribution::Demolition {
-                    started: Vec::new(),
-                    completed: Vec::new(),
-                },
-                sort_key: ymd(1623, 1, 1),
-            },
-            DatedContribution {
-                contribution: Contribution::Construction {
-                    started: Vec::new(),
-                    completed: Vec::new(),
-                    location: vec![location.clone()],
-                },
-                sort_key: ymd(1633, 1, 1),
-            },
+        }];
+        // A razed predecessor with nothing but its demolition, then a successor
+        // whose own construction stands ready to carry the site.
+        let entities = vec![
+            vec![Contribution::Demolition {
+                started: Vec::new(),
+                completed: Vec::new(),
+            }],
+            vec![Contribution::Construction {
+                started: Vec::new(),
+                completed: Vec::new(),
+                location: Vec::new(),
+            }],
         ];
 
-        let entities = split_on_rebuild(contributions);
-        assert_eq!(entities.len(), 2);
+        let placed = place_on_site(entities, site.clone());
+        assert_eq!(placed.len(), 2);
 
-        // Predecessor: synthetic Construction (with location) + Demolition
-        assert_eq!(entities[0].len(), 2);
+        // The predecessor leads with a dateless construction holding the site.
+        assert_eq!(placed[0].len(), 2);
         let Contribution::Construction {
             started,
             completed,
-            location: inherited,
-        } = &entities[0][0]
+            location,
+        } = &placed[0][0]
         else {
-            return Err("predecessor should lead with a synthetic Construction".into());
+            return Err("the predecessor should lead with a construction".into());
         };
         assert!(
             started.is_empty() && completed.is_empty(),
             "no dates invented"
         );
-        assert_eq!(inherited, &vec![location]);
-        assert!(matches!(&entities[0][1], Contribution::Demolition { .. }));
+        assert_eq!(location, &site);
+        assert!(matches!(&placed[0][1], Contribution::Demolition { .. }));
 
-        // Successor: Construction with location
-        assert_eq!(entities[1].len(), 1);
+        // The successor's own construction takes the site.
+        assert_eq!(placed[1].len(), 1, "the construction it had holds the site");
         assert!(matches!(
-            &entities[1][0],
-            Contribution::Construction { location, .. } if !location.is_empty()
+            &placed[1][0],
+            Contribution::Construction { location, .. } if location == &site
         ));
 
         Ok(())
@@ -1153,9 +1158,10 @@ mod tests {
     // build_lifecycles integration tests
     // =========================================================================
 
-    /// P571 inception date only -> a single existence witness, no construction.
+    /// P571 inception date only -> a construction started at the inception,
+    /// cited to P571.
     #[test]
-    fn build_p571_inception_only() -> TestResult {
+    fn p571_inception_dates_a_construction_start() -> TestResult {
         let claims = claims_from(vec![(
             "P571",
             vec![time_claim(
@@ -1170,26 +1176,39 @@ mod tests {
 
         let contributions = &lifecycles[0];
         assert_eq!(contributions.len(), 1);
-        let Contribution::Existence { dates } = &contributions[0] else {
-            return Err("expected Existence".into());
+        let Contribution::Construction {
+            started,
+            completed,
+            location,
+        } = &contributions[0]
+        else {
+            return Err("expected Construction".into());
         };
-        // P571 witnesses existence, cited to P571.
-        assert_eq!(dates.len(), 1);
+        assert!(
+            completed.is_empty() && location.is_empty(),
+            "the one claim states one bound"
+        );
+        assert_eq!(started.len(), 1);
         assert_eq!(
-            dates[0].bound.earliest().ok_or("expected earliest")?.year(),
+            started[0]
+                .bound
+                .earliest()
+                .ok_or("expected earliest")?
+                .year(),
             1920
         );
         assert_eq!(
-            citation_property(&dates[0].citation)?,
+            citation_property(&started[0].citation)?,
             WikidataPropertyId::new(571)
         );
         Ok(())
     }
 
-    /// P571 + P625 -> an existence witness (P571) plus a dateless construction
-    /// carrying the P625 build location, since no P793 dates the construction.
+    /// P571 + P625 -> one construction, started at the inception and standing at
+    /// the P625 coordinate. The common Wikidata shape, and the reason the
+    /// location rides the inception's construction.
     #[test]
-    fn build_p571_with_p625_location() -> TestResult {
+    fn p571_and_p625_yield_one_dated_placed_construction() -> TestResult {
         let claims = claims_from(vec![
             (
                 "P571",
@@ -1201,36 +1220,31 @@ mod tests {
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
-        assert_eq!(lifecycles[0].len(), 2);
+        assert_eq!(lifecycles[0].len(), 1, "one construction, not two");
 
-        let existence = lifecycles[0]
-            .iter()
-            .find_map(|c| match c {
-                Contribution::Existence { dates } => Some(dates),
-                _ => None,
-            })
-            .ok_or("expected an existence witness")?;
-        assert_eq!(existence.len(), 1);
+        let Contribution::Construction {
+            started,
+            completed,
+            location,
+        } = &lifecycles[0][0]
+        else {
+            return Err("expected Construction".into());
+        };
+        assert!(completed.is_empty(), "nothing dates the completion");
+        assert_eq!(started.len(), 1);
         assert_eq!(
-            citation_property(&existence[0].citation)?,
+            started[0]
+                .bound
+                .earliest()
+                .ok_or("expected earliest")?
+                .year(),
+            1889
+        );
+        assert_eq!(
+            citation_property(&started[0].citation)?,
             WikidataPropertyId::new(571)
         );
 
-        let (started, completed, location) = lifecycles[0]
-            .iter()
-            .find_map(|c| match c {
-                Contribution::Construction {
-                    started,
-                    completed,
-                    location,
-                } => Some((started, completed, location)),
-                _ => None,
-            })
-            .ok_or("expected a location-only construction")?;
-        assert!(
-            started.is_empty() && completed.is_empty(),
-            "no construction date is invented from P571"
-        );
         assert_eq!(location.len(), 1);
         assert_eq!(
             citation_property(&location[0].citation)?,
@@ -1246,10 +1260,10 @@ mod tests {
         Ok(())
     }
 
-    /// P571 + P576 -> an existence witness (P571) + a demolition (P576), sorted
-    /// chronologically. No construction, since nothing dates a build phase.
+    /// P571 + P576 -> a construction started at the inception (P571) and a
+    /// demolition (P576), sorted chronologically.
     #[test]
-    fn build_p571_p576_existence_and_demolition() -> TestResult {
+    fn build_p571_p576_construction_and_demolition() -> TestResult {
         let claims = claims_from(vec![
             (
                 "P571",
@@ -1272,12 +1286,12 @@ mod tests {
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
-        // Sorted chronologically: Existence (P571) 1900, Demolition (P576) 1960
-        let Contribution::Existence { dates } = &lifecycles[0][0] else {
-            return Err("expected Existence".into());
+        // Sorted chronologically: Construction (P571) 1900, Demolition (P576) 1960
+        let Contribution::Construction { started, .. } = &lifecycles[0][0] else {
+            return Err("expected Construction".into());
         };
         assert_eq!(
-            citation_property(&dates[0].citation)?,
+            citation_property(&started[0].citation)?,
             WikidataPropertyId::new(571)
         );
 
@@ -1541,10 +1555,13 @@ mod tests {
         assert_eq!(lifecycles.len(), 1);
 
         let contributions = &lifecycles[0];
-        // Existence (1850), Opening (1855), Renovation (1920), Demolition (1960)
+        // Construction (1850), Opening (1855), Renovation (1920), Demolition (1960)
         assert_eq!(contributions.len(), 4);
 
-        assert!(matches!(&contributions[0], Contribution::Existence { .. }));
+        assert!(matches!(
+            &contributions[0],
+            Contribution::Construction { .. }
+        ));
         assert!(matches!(
             &contributions[1],
             Contribution::Event(e) if matches!(
@@ -1601,9 +1618,9 @@ mod tests {
         Ok(())
     }
 
-    /// P571 and a P793 construction stand as separate contributions: the P793
-    /// start dates the build, the P571 inception witnesses existence, each cited
-    /// to its own property.
+    /// P571 and a P793 construction each state their own start, cited to their
+    /// own property. Two sources disagreeing about the build is a conflict,
+    /// settled downstream.
     #[test]
     fn p571_inception_and_p793_construction_are_separate() -> TestResult {
         let claims = claims_from(vec![
@@ -1629,46 +1646,33 @@ mod tests {
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
-        // The P793 construction start (1887), cited to P793, dates the build.
-        let (started, completed) = lifecycles[0]
-            .iter()
-            .find_map(|c| match c {
-                Contribution::Construction {
-                    started, completed, ..
-                } => Some((started, completed)),
-                _ => None,
-            })
-            .ok_or("expected a construction")?;
-        assert!(completed.is_empty(), "no completion is invented");
-        assert_eq!(started.len(), 1);
+        // Each construction carries the one start its own property states.
+        let starts = construction_starts(&lifecycles[0])?;
         assert_eq!(
-            citation_property(&started[0].citation)?,
-            WikidataPropertyId::new(793)
+            starts,
+            vec![
+                (WikidataPropertyId::new(793), 1887),
+                (WikidataPropertyId::new(571), 1889),
+            ],
+            "each property states its own start, in chronological order"
         );
-        assert_eq!(started[0].bound.earliest().ok_or("earliest")?.year(), 1887);
 
-        // The P571 inception (1889) survives as an existence witness, cited to P571.
-        let dates = lifecycles[0]
+        let completions: usize = lifecycles[0]
             .iter()
-            .find_map(|c| match c {
-                Contribution::Existence { dates } => Some(dates),
+            .filter_map(|c| match c {
+                Contribution::Construction { completed, .. } => Some(completed.len()),
                 _ => None,
             })
-            .ok_or("the P571 inception is asserted, not dropped")?;
-        assert_eq!(dates.len(), 1);
-        assert_eq!(
-            citation_property(&dates[0].citation)?,
-            WikidataPropertyId::new(571)
-        );
-        assert_eq!(dates[0].bound.earliest().ok_or("earliest")?.year(), 1889);
+            .sum();
+        assert_eq!(completions, 0, "no completion is invented");
         Ok(())
     }
 
     /// Mirrors Notre-Dame (Q2981): a P571 founding of 1160 plus a P793
-    /// construction (1163–1345). The founding is an existence witness before the
-    /// build start — the read-time conflict the solver surfaces.
+    /// construction (1163–1345). Both starts survive as competing bounds on the
+    /// build, the disagreement the solver reads off them.
     #[test]
-    fn p571_founding_witnesses_existence_before_p793_construction() -> TestResult {
+    fn p571_founding_competes_with_the_p793_construction_start() -> TestResult {
         let claims = claims_from(vec![
             (
                 "P571",
@@ -1692,38 +1696,140 @@ mod tests {
         assert_eq!(lifecycles.len(), 1);
         assert_eq!(lifecycles[0].len(), 2);
 
-        // The P793 construction dates the build: 1163 start through 1345 completion.
-        let (started, completed) = lifecycles[0]
+        // The 1163 P793 start and the 1160 P571 founding both stand, each cited
+        // to the property that states it.
+        assert_eq!(
+            construction_starts(&lifecycles[0])?,
+            vec![
+                (WikidataPropertyId::new(571), 1160),
+                (WikidataPropertyId::new(793), 1163),
+            ],
+        );
+
+        // The P793 statement's own completion is untouched by the founding.
+        let completed = lifecycles[0]
             .iter()
             .find_map(|c| match c {
-                Contribution::Construction {
-                    started, completed, ..
-                } => Some((started, completed)),
+                Contribution::Construction { completed, .. } if !completed.is_empty() => {
+                    Some(completed)
+                }
                 _ => None,
             })
-            .ok_or("expected a construction")?;
-        assert_eq!(started.len(), 1);
-        assert_eq!(started[0].bound.earliest().ok_or("earliest")?.year(), 1163);
+            .ok_or("expected the P793 completion")?;
         assert_eq!(completed.len(), 1);
         assert_eq!(
             completed[0].bound.earliest().ok_or("earliest")?.year(),
             1345
         );
+        Ok(())
+    }
 
-        // The P571 founding (1160) witnesses existence before the build start.
-        let dates = lifecycles[0]
-            .iter()
-            .find_map(|c| match c {
-                Contribution::Existence { dates } => Some(dates),
-                _ => None,
-            })
-            .ok_or("the P571 founding is not dropped")?;
-        assert_eq!(dates.len(), 1);
-        assert_eq!(
-            citation_property(&dates[0].citation)?,
-            WikidataPropertyId::new(571)
+    /// An inception dated after a demolition splits the item, the same
+    /// demolish→construct boundary a P793 reconstruction splits on: Chioggia
+    /// Cathedral's shape, torn down in 1623 and refounded in 1633.
+    #[test]
+    fn p571_inception_after_a_demolition_splits_the_entity() -> TestResult {
+        let claims = claims_from(vec![
+            (
+                "P571",
+                vec![time_claim(
+                    "+1633-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+            (
+                "P576",
+                vec![time_claim(
+                    "+1623-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+            ("P625", vec![coordinate_claim(45.217, 12.277)]),
+        ])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(lifecycles.len(), 2, "the refounding is a second entity");
+
+        // Predecessor: the 1623 demolition, standing where its successor stands.
+        assert!(
+            construction_starts(&lifecycles[0])?.is_empty(),
+            "nothing dates the predecessor's build"
         );
-        assert_eq!(dates[0].bound.earliest().ok_or("earliest")?.year(), 1160);
+        assert!(matches!(
+            &lifecycles[0][0],
+            Contribution::Construction { location, .. } if !location.is_empty()
+        ));
+        assert!(matches!(&lifecycles[0][1], Contribution::Demolition { .. }));
+
+        // Successor: built in 1633, cited to P571.
+        assert_eq!(
+            construction_starts(&lifecycles[1])?,
+            vec![(WikidataPropertyId::new(571), 1633)]
+        );
+        Ok(())
+    }
+
+    /// A P793 build, a demolition, and a P571 inception dating the rebuild after
+    /// it. The inception triggers the split, and both the razed predecessor and
+    /// its replacement stand on the item's P625 site. A split entity with no
+    /// location is unplaceable: absent from the map, and unreachable from the
+    /// `Replaces` edge pointing at it.
+    #[test]
+    fn an_inception_triggered_split_leaves_both_entities_placeable() -> TestResult {
+        let claims = claims_from(vec![
+            ("P625", vec![coordinate_claim(45.217, 12.277)]),
+            (
+                "P793",
+                vec![p793_event(
+                    "Q27136782", // start of construction
+                    "+1500-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+            (
+                "P576",
+                vec![time_claim(
+                    "+1623-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+            (
+                "P571",
+                vec![time_claim(
+                    "+1633-01-01T00:00:00Z",
+                    WikidataPrecision::Year,
+                )?],
+            ),
+        ])?;
+
+        let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(lifecycles.len(), 2, "the 1633 rebuild is a second entity");
+        assert_eq!(
+            construction_starts(&lifecycles[0])?,
+            vec![(WikidataPropertyId::new(793), 1500)]
+        );
+        assert_eq!(
+            construction_starts(&lifecycles[1])?,
+            vec![(WikidataPropertyId::new(571), 1633)]
+        );
+
+        for (i, contributions) in lifecycles.iter().enumerate() {
+            let sited = contributions
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c,
+                        Contribution::Construction { location, .. } if !location.is_empty()
+                    )
+                })
+                .count();
+            assert_eq!(
+                sited, 1,
+                "split {i} stands on the site once: {contributions:?}"
+            );
+        }
         Ok(())
     }
 
@@ -1877,13 +1983,10 @@ mod tests {
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
-        let Contribution::Existence { dates } = &lifecycles[0][0] else {
-            return Err("expected Existence".into());
-        };
-        assert_eq!(dates.len(), 1, "the deprecated bound contributes nothing");
         assert_eq!(
-            dates[0].bound.earliest().ok_or("expected earliest")?.year(),
-            1920
+            construction_starts(&lifecycles[0])?,
+            vec![(WikidataPropertyId::new(571), 1920)],
+            "the deprecated bound contributes nothing"
         );
         Ok(())
     }
@@ -1901,10 +2004,10 @@ mod tests {
         Ok(())
     }
 
-    /// Multiple non-deprecated P571 claims each witness existence, pooled in one
-    /// existence contribution.
+    /// Multiple non-deprecated P571 claims are competing start bounds on one
+    /// construction.
     #[test]
-    fn parallel_p571_claims_yield_multiple_existence_witnesses() -> TestResult {
+    fn parallel_p571_claims_are_competing_construction_starts() -> TestResult {
         let claims = claims_from(vec![(
             "P571",
             vec![
@@ -1916,15 +2019,14 @@ mod tests {
         let (lifecycles, warnings) = build_lifecycles(&claims, &ctx()?);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(lifecycles.len(), 1);
-        assert_eq!(lifecycles[0].len(), 1, "one existence contribution");
-        let Contribution::Existence { dates } = &lifecycles[0][0] else {
-            return Err("expected Existence".into());
-        };
-        let years: Vec<i32> = dates
-            .iter()
-            .filter_map(|d| d.bound.earliest().map(|e| e.year()))
-            .collect();
-        assert_eq!(years, vec![1900, 1905]);
+        assert_eq!(lifecycles[0].len(), 1, "one construction contribution");
+        assert_eq!(
+            construction_starts(&lifecycles[0])?,
+            vec![
+                (WikidataPropertyId::new(571), 1900),
+                (WikidataPropertyId::new(571), 1905),
+            ]
+        );
         Ok(())
     }
 

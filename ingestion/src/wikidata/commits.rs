@@ -732,10 +732,13 @@ mod tests {
     use chronoscope_core::grammar::attribute::NameType;
     use chronoscope_core::grammar::lifecycle::{DurationalKind, LifetimeEventKind, PointKind};
     use chronoscope_core::grammar::text::TEXT_MAX_LEN;
-    use chronoscope_core::listing::summaries_in_viewport;
+    use chronoscope_core::lifespan::ExistenceState;
+    use chronoscope_core::listing::{EntitySummary, summaries_in_viewport};
     use chronoscope_core::projection::{member_lineage, project_entity};
     use chronoscope_core::store::FactStore;
-    use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds};
+    use chronoscope_core::store::memory::{
+        MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId,
+    };
     use chronoscope_core::typed;
     use chronoscope_integrations::wikidata::{
         Claim, CoordinateValue, DataValue, EntityRefValue, Label, LanguageCode, PropertyId, Rank,
@@ -925,13 +928,13 @@ mod tests {
             commit.facts.iter().any(|f| matches!(
                 f,
                 SubmitFact::Factual {
-                    assertion: FactualAssertion::Existence {
-                        fact: existence::Fact { entity, .. }
+                    assertion: FactualAssertion::Construction {
+                        fact: bookend::ConstructionFact::Started { entity, .. }
                     },
                     ..
                 } if *entity == EntityIdx(0)
             )),
-            "the P571 inception is an existence witness"
+            "the P571 inception is the construction start bookend"
         );
 
         assert!(
@@ -1222,20 +1225,24 @@ mod tests {
             "the QID reference reads back off the projection"
         );
 
-        // P625 gives a construction location, but no source dates the build —
-        // P571 witnesses existence, off the timeline. The Constructed row is
-        // present yet undated.
-        let construction_start = entity.timeline.events().iter().find_map(|entry| {
-            if let typed::EventDetail::Constructed { period, .. } = &entry.detail {
-                Some(period.started.possible.earliest())
-            } else {
-                None
-            }
-        });
+        // P571 dates the build, so the Constructed row reads back with its
+        // start date.
+        let construction_start = entity
+            .timeline
+            .events()
+            .iter()
+            .find_map(|entry| {
+                if let typed::EventDetail::Constructed { period, .. } = &entry.detail {
+                    Some(period.started.possible.earliest())
+                } else {
+                    None
+                }
+            })
+            .flatten();
         assert_eq!(
-            construction_start,
-            Some(None),
-            "the construction is a location-only bookend with no start date"
+            construction_start.map(|d| d.year()),
+            Some(1800),
+            "the P571 inception dates the construction start"
         );
 
         assert!(
@@ -1529,12 +1536,14 @@ mod tests {
     const PANTHEON_LAT: f64 = 41.8986;
     const PANTHEON_LON: f64 = 12.4769;
 
-    /// Commit the Pantheon fixture into a fresh store, returning the store and
-    /// the minted entity id so a listing test can query the same snapshot.
-    async fn committed_pantheon()
-    -> Result<(MemoryFactStore, MemoryEntityId), Box<dyn std::error::Error>> {
+    /// Commit one item into a fresh store, returning the store and the id
+    /// minted for its first entity so a listing test can query the same
+    /// snapshot.
+    async fn committed(
+        entity: &WikidataEntity,
+    ) -> Result<(MemoryFactStore, MemoryEntityId), Box<dyn std::error::Error>> {
         let store = MemoryFactStore::new();
-        let commit = build_commit(&pantheon()?, &run_id()?, fixed_time()?, &mut Vec::new())?
+        let commit = build_commit::<MemoryIds>(entity, &run_id()?, fixed_time()?, &mut Vec::new())?
             .ok_or("expected commit")?;
         let result = commit_facts(&store, commit)
             .await
@@ -1547,26 +1556,30 @@ mod tests {
         Ok((store, id))
     }
 
+    /// The summaries a viewport listing returns for `viewport` as of `as_of`.
+    async fn summaries_at(
+        store: &MemoryFactStore,
+        viewport: &Viewport,
+        as_of: chrono::NaiveDate,
+    ) -> Result<Vec<EntitySummary<MemoryEntityId, MemoryImageId>>, Box<dyn std::error::Error>> {
+        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
+        let page =
+            summaries_in_viewport::<MemoryFactStore, _>(&mut view, viewport, None, limit, as_of)
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+        Ok(page.summaries)
+    }
+
     #[tokio::test]
     async fn viewport_listing_surfaces_pantheon_at_its_coordinate() -> TestResult {
-        let (store, id) = committed_pantheon().await?;
-        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let (store, id) = committed(&pantheon()?).await?;
 
         // A box around central Rome, comfortably covering the P625 point.
         let viewport = Viewport::new(GeoPoint::new(41.8, 12.4)?, GeoPoint::new(42.0, 12.6)?)?;
-        let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
-        let page = summaries_in_viewport::<MemoryFactStore, _>(
-            &mut view,
-            &viewport,
-            None,
-            limit,
-            chrono::NaiveDate::MIN,
-        )
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+        let summaries = summaries_at(&store, &viewport, chrono::NaiveDate::MIN).await?;
 
-        let summary = page
-            .summaries
+        let summary = summaries
             .iter()
             .find(|s| s.id == id)
             .ok_or("the ingested Pantheon surfaces in a box covering its coordinate")?;
@@ -1580,39 +1593,80 @@ mod tests {
             "the summary carries the ingested name: {:?}",
             summary.names
         );
-        // The P571 inception (1800) witnesses existence and anchors the span's
-        // earliest bound; the fire (1900) is a later interior event.
+        // The P571 inception (1800) starts the construction and anchors the
+        // span's earliest bound; the fire (1900) is a later interior event.
         assert_eq!(
             summary.earliest.map(|d| d.year()),
             Some(1800),
-            "the P571 inception anchors the summary's earliest span bound"
+            "the P571 construction start anchors the summary's earliest span bound"
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn viewport_listing_omits_pantheon_from_a_faraway_box() -> TestResult {
-        let (store, id) = committed_pantheon().await?;
-        let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+        let (store, id) = committed(&pantheon()?).await?;
 
         // A box over the mid-Atlantic — nowhere near Rome.
         let viewport = Viewport::new(GeoPoint::new(0.0, -40.0)?, GeoPoint::new(10.0, -30.0)?)?;
-        let limit = NonZeroUsize::new(16).ok_or("nonzero limit")?;
-        let page = summaries_in_viewport::<MemoryFactStore, _>(
-            &mut view,
-            &viewport,
-            None,
-            limit,
-            chrono::NaiveDate::MIN,
-        )
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+        let summaries = summaries_at(&store, &viewport, chrono::NaiveDate::MIN).await?;
 
         assert!(
-            page.summaries.iter().all(|s| s.id != id),
+            summaries.iter().all(|s| s.id != id),
             "the spatial filter excludes the Pantheon from a box that omits its \
-             coordinate: {:?}",
-            page.summaries
+             coordinate: {summaries:?}"
+        );
+        Ok(())
+    }
+
+    /// The listing's existence verdict for `id` at `as_of`, over `viewport`.
+    async fn existence_at(
+        store: &MemoryFactStore,
+        id: MemoryEntityId,
+        viewport: &Viewport,
+        as_of: chrono::NaiveDate,
+    ) -> Result<ExistenceState, Box<dyn std::error::Error>> {
+        Ok(summaries_at(store, viewport, as_of)
+            .await?
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or("the entity surfaces in a box covering its coordinate")?
+            .existence)
+    }
+
+    /// The commonest Wikidata shape — a P571 inception and a P625 coordinate,
+    /// nothing else — places the entity in time as well as space: the map holds
+    /// it absent until the inception, then standing.
+    #[tokio::test]
+    async fn an_inception_and_a_coordinate_date_the_entity_on_the_map() -> TestResult {
+        let claims = BTreeMap::from([
+            (
+                PropertyId::try_from("P571".to_owned())?,
+                vec![time_claim("+1889-03-31T00:00:00Z", WikidataPrecision::Day)?],
+            ),
+            (
+                PropertyId::try_from("P625".to_owned())?,
+                vec![coordinate_claim(48.8584, 2.2945)],
+            ),
+        ]);
+        let tower = item(
+            "Q243",
+            BTreeMap::from([label("en", "Eiffel Tower")]),
+            claims,
+        )?;
+        let (store, id) = committed(&tower).await?;
+
+        let viewport = Viewport::new(GeoPoint::new(48.8, 2.2)?, GeoPoint::new(48.9, 2.4)?)?;
+        let year = |y: i32| chrono::NaiveDate::from_ymd_opt(y, 7, 1).ok_or("valid date");
+        assert_eq!(
+            existence_at(&store, id, &viewport, year(1850)?).await?,
+            ExistenceState::Absent,
+            "rewound past the 1889 inception, the tower was not there yet"
+        );
+        assert_eq!(
+            existence_at(&store, id, &viewport, year(1900)?).await?,
+            ExistenceState::Presumed,
+            "past the inception with no removal on record, it stands"
         );
         Ok(())
     }

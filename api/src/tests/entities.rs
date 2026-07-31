@@ -544,9 +544,9 @@ async fn commit_entity_with_event_before_construction(
     commit_single_entity(facts, commit).await
 }
 
-/// Commit a named entity attested to exist at `witness` — a P571 existence
-/// witness — with no construction start. The Colosseum shape the derived-bound
-/// producer fills: the read infers `construction ≤ witness`.
+/// Commit a named entity attested to exist at `witness`, with no construction
+/// start. The shape the derived-bound producer fills: the read infers
+/// `construction ≤ witness`.
 async fn commit_entity_with_existence_witness(
     facts: &ServerFactStore,
     name: &str,

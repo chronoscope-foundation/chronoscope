@@ -1234,6 +1234,8 @@ fn move_summary(
 /// popover.
 fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> AnyView {
     let label = row.label.clone();
+    // The row's own label, the hook a test addresses one row's markers through.
+    let row_label = label.clone();
     let description = row.description.clone();
     // Existence witnesses are evidence, not a lifecycle phase — muted, not bold,
     // with a fainter rule. An inferred bound is derived rather than asserted, so
@@ -1311,7 +1313,7 @@ fn timeline_row_view(row: &TimelineRow, conflicts: Vec<ResolvedConflict>) -> Any
         "font-semibold"
     };
     view! {
-        <li class=li_class>
+        <li class=li_class data-row=row_label>
             <div>
                 <span class=label_class>{label}</span>{date_view}{bullet}{inferred_marker}{marker}
             </div>

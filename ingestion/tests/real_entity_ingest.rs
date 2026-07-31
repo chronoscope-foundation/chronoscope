@@ -9,12 +9,13 @@
 //! tests skip.
 //!
 //! Assertions are grounded in the pinned 2022-01-03 snapshot: the Colosseum is
-//! antiquity, the Eiffel Tower is an 1880s build, and demolished-and-rebuilt
+//! antiquity, the Eiffel Tower is an 1880s build, and demolished-and-refounded
 //! Chioggia Cathedral splits into two dated entities. Re-pinning the FOD is a
 //! deliberate act that updates these like a golden.
 
 use chrono::{Datelike, TimeZone, Utc};
 use chronoscope_core::conflicts::fact_lineage;
+use chronoscope_core::date::UncertainDate;
 use chronoscope_core::external_ids::WikidataEntityId;
 use chronoscope_core::geo::{GeoPoint, Viewport};
 use chronoscope_core::grammar::ids::IngesterRunId;
@@ -25,6 +26,7 @@ use chronoscope_core::solvers::temporal_conflicts;
 use chronoscope_core::store::FactStore;
 use chronoscope_core::store::memory::{MemoryEntityId, MemoryFactStore, MemoryIds, MemoryImageId};
 use chronoscope_core::submit::commit_facts;
+use chronoscope_core::typed;
 use chronoscope_ingestion::wikidata::ItemContext;
 use chronoscope_ingestion::wikidata::commits::build_commit;
 use chronoscope_ingestion::wikidata::lifecycle::{
@@ -245,15 +247,15 @@ async fn viewport_listing_projects_landmarks_with_their_dates() -> Result<(), Bo
 }
 
 #[tokio::test]
-async fn notre_dame_founding_witnesses_existence_before_construction() -> Result<(), BoxError> {
+async fn notre_dame_founding_and_build_start_are_rival_bounds() -> Result<(), BoxError> {
     let Some(store) = ingest_curated().await? else {
         return Ok(());
     };
 
     // Notre-Dame de Paris (Q2981) carries a P571 founding of 1160 alongside a
-    // P793 construction (1163–1345). The founding witnesses existence, so it
-    // anchors the summary's span: the earliest is the 1160 founding, not the 1163
-    // build start, and the read-time solver reports exactly one conflict.
+    // P793 construction (1163–1345). Each property states a construction start of
+    // its own, so the earliest span bound is the 1160 founding and the two starts
+    // reach the reader as rivals on one slot rather than one silently winning.
     let paris = placeable_in(&store, (48.84, 2.28), (48.87, 2.36)).await?;
     let notre_dame = paris
         .iter()
@@ -262,35 +264,70 @@ async fn notre_dame_founding_witnesses_existence_before_construction() -> Result
     assert_eq!(
         notre_dame.earliest.map(|d| d.year()),
         Some(1160),
-        "the 1160 founding witness anchors the earliest span, got {:?}",
+        "the 1160 founding anchors the earliest span, got {:?}",
         notre_dame.earliest
     );
 
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let (_, projected) =
+    let (class, projected) =
         project_entity::<MemoryFactStore, _, _>(&mut view, notre_dame.id, fact_lineage)
             .await
             .map_err(|e| format!("{e:?}"))?
             .ok_or("Notre-Dame projects")?;
-    let conflicts = temporal_conflicts::<MemoryIds>(&projected);
+    let entity = typed::Entity::parse(&projected, &class);
+    let started = entity
+        .timeline
+        .events()
+        .iter()
+        .find_map(|entry| match &entry.detail {
+            typed::EventDetail::Constructed { period, .. } => Some(&period.started),
+            _ => None,
+        })
+        .ok_or("Notre-Dame has a construction row")?;
+    let years = |d: &UncertainDate| (d.earliest().map(|d| d.year()), d.latest().map(|d| d.year()));
     assert_eq!(
-        conflicts.len(),
-        1,
-        "the 1160 founding before the 1163 build start is one conflict, got {conflicts:?}"
+        years(&started.possible),
+        (Some(1160), Some(1163)),
+        "the extent spans both claimed starts, got {:?}",
+        started.possible
+    );
+    let typed::Consensus::Conflict { fighting } = &started.consensus else {
+        return Err(format!(
+            "two sources dating the start differently is a conflict, got {:?}",
+            started.consensus
+        )
+        .into());
+    };
+    let rival_years: Vec<(Option<i32>, Option<i32>)> = typed::distinct_rivals(fighting)
+        .iter()
+        .map(|rival| years(&rival.value))
+        .collect();
+    assert_eq!(
+        rival_years,
+        vec![(Some(1160), Some(1160)), (Some(1163), Some(1163))],
+        "the founding and the build start are the rivals"
+    );
+
+    let conflicts = temporal_conflicts::<MemoryIds>(&projected);
+    assert!(
+        conflicts.is_empty(),
+        "rival starts are a field disagreement, not a lifetime-window \
+         contradiction, got {conflicts:?}"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn chioggia_p571_only_rebuild_projects_one_placeable_entity() -> Result<(), BoxError> {
+async fn chioggia_refounding_after_demolition_splits_the_item() -> Result<(), BoxError> {
     let Some(store) = ingest_curated().await? else {
         return Ok(());
     };
 
     // Chioggia Cathedral (Q1111481) carries a P576 demolition (1623) and a P571
-    // founding (1633), with no P793 construction. The founding witnesses the
-    // rebuilt cathedral's existence, so the item projects as one placeable entity
-    // at its P625 coordinate.
+    // founding (1633), with no P793 construction. The founding dates a build
+    // after the demolition, the same demolish→construct boundary a P793
+    // reconstruction splits on, so the item projects as the razed cathedral and
+    // its replacement, both at the P625 coordinate.
     let chioggia = placeable_in(&store, (45.20, 12.26), (45.23, 12.29)).await?;
     let cathedrals: Vec<_> = chioggia
         .iter()
@@ -298,9 +335,46 @@ async fn chioggia_p571_only_rebuild_projects_one_placeable_entity() -> Result<()
         .collect();
     assert_eq!(
         cathedrals.len(),
-        1,
-        "the P571-only rebuild projects one placeable entity, got {}",
+        2,
+        "the refounding splits the item into predecessor and successor, got {}",
         cathedrals.len()
+    );
+    let [first, second] = cathedrals.as_slice() else {
+        return Err("the split is a predecessor and a successor".into());
+    };
+    assert_eq!(
+        first.point, second.point,
+        "the rebuilt cathedral stands where the razed one did, got {:?} and {:?}",
+        first.point, second.point
+    );
+
+    // Only the refounding is dated: the predecessor is the razed cathedral, not
+    // a second copy of its replacement.
+    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
+    let mut starts = Vec::new();
+    for cathedral in [first, second] {
+        let (class, projected) =
+            project_entity::<MemoryFactStore, _, _>(&mut view, cathedral.id, fact_lineage)
+                .await
+                .map_err(|e| format!("{e:?}"))?
+                .ok_or("each split projects")?;
+        let entity = typed::Entity::parse(&projected, &class);
+        let started = entity
+            .timeline
+            .events()
+            .iter()
+            .find_map(|entry| match &entry.detail {
+                typed::EventDetail::Constructed { period, .. } => Some(&period.started),
+                _ => None,
+            })
+            .ok_or("each split carries a construction row")?;
+        starts.push(started.possible.earliest().map(|d| d.year()));
+    }
+    starts.sort_unstable();
+    assert_eq!(
+        starts,
+        vec![None, Some(1633)],
+        "the 1633 refounding dates one split's build and nothing dates the other's"
     );
     Ok(())
 }
