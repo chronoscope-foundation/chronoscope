@@ -78,10 +78,10 @@ fn screenshot_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>>
 /// more than once (see `chronoscope-learnings/web-test-timeout-flakes-*.md`), so
 /// the count rides along in every timeout message.
 ///
-/// Counted by reparenting, not by name alone: a browser whose parent is `init`
-/// has outlived whatever launched it, while a browser this run started has a
-/// live parent. That distinction is what makes the sample race-free against the
-/// suite's own concurrent tests, which launch a browser each.
+/// Sampled by the first test to start, before any browser of this run exists,
+/// which is what lets the count mean "already running". Chrome reparents to
+/// `init` shortly after launch on macOS, so the parent alone dates a browser
+/// only while the suite has yet to start one of its own.
 fn orphaned_browsers() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {
@@ -889,6 +889,10 @@ async fn run_web_test(
     seed_commits: Vec<Commit<ServerIds>>,
     test: impl AsyncFnOnce(&WebTest) -> TestResult,
 ) -> TestResult {
+    // Sample before this test's browser exists, so the count means what its
+    // message says. The first test to arrive takes it for the whole suite.
+    let _ = orphaned_browsers();
+
     let t = WebTest::new(seed_commits).await?;
 
     // A panicking test must still reach the graceful `close()` below, so the

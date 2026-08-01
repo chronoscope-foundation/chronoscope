@@ -748,21 +748,29 @@ fn wait_for_map_idle(handle: &Rc<RefCell<Option<maplibre::Map>>>) -> js_sys::Pro
         let Some(map) = handle.borrow().as_ref().cloned() else {
             return Ok(JsValue::NULL);
         };
-        // Idle is a state, not a transient event — if it holds now, it holds
-        // until the next move. So an eager check is race-free; only attach a
-        // listener if we observe active state.
-        if map.is_style_loaded() && !map.is_moving() {
-            return Ok(JsValue::NULL);
+        // Idle is a state, and MapLibre evaluates it only inside a render pass:
+        // once nothing is dirty it stops requesting frames, so a map that
+        // settles before a listener attaches never emits the event again.
+        // Polling the same predicate its render loop uses reads the state
+        // directly, which is what the waiter actually wants to know.
+        let dirty = |name: &str| {
+            js_sys::Reflect::get(&map, &name.into())
+                .ok()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+        loop {
+            if map.map_loaded()
+                && !map.is_moving()
+                && map.are_tiles_loaded()
+                && !dirty("_sourcesDirty")
+                && !dirty("_styleDirty")
+                && !dirty("_placementDirty")
+            {
+                return Ok(JsValue::NULL);
+            }
+            request_animation_frame_async().await;
         }
-        let idle_promise = js_sys::Promise::new(&mut |resolve, _reject| {
-            let cb = Closure::once(move || {
-                let _ = resolve.call0(&JsValue::NULL);
-            });
-            map.once("idle", cb.as_ref());
-            cb.forget(); // Transferred to MapLibre's event system; one event, one drop.
-        });
-        let _ = wasm_bindgen_futures::JsFuture::from(idle_promise).await;
-        Ok(JsValue::NULL)
     })
 }
 
@@ -1558,6 +1566,12 @@ fn fire_canvas_mousemove(map: &maplibre::Map, lng: f64, lat: f64) {
 extern "C" {
     #[wasm_bindgen(method, js_class = "Map", js_name = isMoving)]
     fn is_moving(this: &maplibre::Map) -> bool;
+
+    #[wasm_bindgen(method, js_class = "Map", js_name = areTilesLoaded)]
+    fn are_tiles_loaded(this: &maplibre::Map) -> bool;
+
+    #[wasm_bindgen(method, js_class = "Map", js_name = loaded)]
+    fn map_loaded(this: &maplibre::Map) -> bool;
 
     #[wasm_bindgen(method, js_class = "Map", js_name = jumpTo)]
     fn jump_to_raw(this: &maplibre::Map, options: &JsValue);
