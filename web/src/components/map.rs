@@ -165,6 +165,18 @@ pub(crate) fn query_layers(
     map.query_rendered_features(point, &opts)
 }
 
+/// Register `callback` for `event` on `layer`.
+///
+/// The one route to [`maplibre::Map::on_layer`], and it names the layer by
+/// [`EntityLayer`] rather than by id. MapLibre resolves the name against the
+/// style every time the event fires and hit-tests what it finds, so a handler
+/// registered on a name nobody added stays silent for the session, with the
+/// marker looking merely unresponsive. A variant has no way to name a layer
+/// [`init_source_and_layers`] did not add.
+fn on_layer(map: &maplibre::Map, event: &str, layer: EntityLayer, callback: &JsValue) {
+    map.on_layer(event, layer.id(), callback);
+}
+
 /// DOM event name signaling map mount completion (used by test hooks).
 #[cfg(feature = "test-hooks")]
 pub(crate) const MAP_READY_EVENT: &str = "chronoscope-map-ready";
@@ -2511,39 +2523,34 @@ fn handle_background_click(
 
 // ==================== Map lifecycle helpers ====================
 
-/// Register click, hover, and background-click handlers on the entity layer.
-///
-/// Returns the closures that must be kept alive for the handlers to work.
-/// (`wasm_bindgen::Closure` is invalidated when dropped — the Vec keeps
-/// them alive for the map's lifetime, and they're cleared on cleanup/remount.)
 /// Register click + hover handlers for a single marker layer.
 ///
 /// Each layer needs its own `Closure` instances (MapLibre takes ownership),
 /// so this is called once per interactive layer.
 fn register_marker_layer(
     map: &maplibre::Map,
-    layer: &str,
+    layer: EntityLayer,
     set_selected: WriteSignal<Option<EntitySelection>>,
     closures: &mut Vec<Box<dyn std::any::Any>>,
 ) {
     let click_cb = Closure::<dyn Fn(JsValue)>::new(move |event: JsValue| {
         handle_marker_click(event, set_selected);
     });
-    map.on_layer("click", layer, click_cb.as_ref());
+    on_layer(map, "click", layer, click_cb.as_ref());
     closures.push(Box::new(click_cb));
 
     let map_for_enter = map.clone();
     let enter_cb = Closure::<dyn Fn()>::new(move || {
         maplibre::set_cursor(&map_for_enter, "pointer");
     });
-    map.on_layer("mouseenter", layer, enter_cb.as_ref());
+    on_layer(map, "mouseenter", layer, enter_cb.as_ref());
     closures.push(Box::new(enter_cb));
 
     let map_for_leave = map.clone();
     let leave_cb = Closure::<dyn Fn()>::new(move || {
         maplibre::set_cursor(&map_for_leave, "");
     });
-    map.on_layer("mouseleave", layer, leave_cb.as_ref());
+    on_layer(map, "mouseleave", layer, leave_cb.as_ref());
     closures.push(Box::new(leave_cb));
 }
 
@@ -2563,24 +2570,29 @@ fn register_badge_layer(
     let click_cb = Closure::<dyn Fn(JsValue)>::new(move |event: JsValue| {
         handle_badge_click(event, &map_for_click, set_selected, &source_generation);
     });
-    map.on_layer("click", ENTITY_BADGE_LAYER, click_cb.as_ref());
+    on_layer(map, "click", EntityLayer::Badge, click_cb.as_ref());
     closures.push(Box::new(click_cb));
 
     let map_for_enter = map.clone();
     let enter_cb = Closure::<dyn Fn()>::new(move || {
         maplibre::set_cursor(&map_for_enter, "pointer");
     });
-    map.on_layer("mouseenter", ENTITY_BADGE_LAYER, enter_cb.as_ref());
+    on_layer(map, "mouseenter", EntityLayer::Badge, enter_cb.as_ref());
     closures.push(Box::new(enter_cb));
 
     let map_for_leave = map.clone();
     let leave_cb = Closure::<dyn Fn()>::new(move || {
         maplibre::set_cursor(&map_for_leave, "");
     });
-    map.on_layer("mouseleave", ENTITY_BADGE_LAYER, leave_cb.as_ref());
+    on_layer(map, "mouseleave", EntityLayer::Badge, leave_cb.as_ref());
     closures.push(Box::new(leave_cb));
 }
 
+/// Register click, hover, and background-click handlers on the entity layers.
+///
+/// Returns the closures that must be kept alive for the handlers to work.
+/// (`wasm_bindgen::Closure` is invalidated when dropped — the Vec keeps
+/// them alive for the map's lifetime, and they're cleared on cleanup/remount.)
 fn register_layer_handlers(
     map: &maplibre::Map,
     set_selected: WriteSignal<Option<EntitySelection>>,
@@ -2591,8 +2603,8 @@ fn register_layer_handlers(
     // The bare dot goes through its hit region rather than its disc: a verdict
     // ring reaches past the disc, and a pointer that crossed out of the disc
     // into the ring would lose its cursor over pixels the click still works on.
-    register_marker_layer(map, ENTITY_HIT_LAYER, set_selected, &mut closures);
-    register_marker_layer(map, ENTITY_THUMBNAILS_LAYER, set_selected, &mut closures);
+    register_marker_layer(map, EntityLayer::Hit, set_selected, &mut closures);
+    register_marker_layer(map, EntityLayer::Thumbnails, set_selected, &mut closures);
     register_badge_layer(map, set_selected, source_generation, &mut closures);
 
     // --- Map background click: dismiss panel when clicking empty area ---

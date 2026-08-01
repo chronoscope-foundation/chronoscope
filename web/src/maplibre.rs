@@ -35,6 +35,15 @@ extern "C" {
     pub fn once(this: &Map, event: &str, callback: &JsValue);
 
     /// Register a layer-specific event handler: `map.on(event, layer, callback)`.
+    ///
+    /// The layer name is resolved late, read off maplibre-gl 5.1.0, the build
+    /// `index.html` pins by integrity hash: the delegated listener filters its
+    /// names through `getLayer` on each event and hit-tests the survivors. A
+    /// name the style lacks is dropped there, ahead of the query, so the
+    /// handler never runs and no `error` event marks it, where the query path
+    /// at least fires one. `components::map::on_layer` is the one caller, and
+    /// it names layers by `EntityLayer`, so a handler's layer is a layer we
+    /// added.
     #[wasm_bindgen(method, js_name = on)]
     pub fn on_layer(this: &Map, event: &str, layer: &str, callback: &JsValue);
 
