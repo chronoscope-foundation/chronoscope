@@ -299,8 +299,8 @@ fn EntityDetailContent(
 
 /// The entity's lifecycle timeline: a header with the moment count over a list
 /// of dated rows. Renders nothing when the entity has no timeline. Entity-level
-/// temporal conflicts ride inline on the participating rows (an amber marker
-/// beside the citation bullet), not as a detached card.
+/// temporal conflicts ride inline on the participating rows (a disputed-toned
+/// marker beside the citation bullet), not as a detached card.
 #[component]
 fn EntityTimeline(timeline: Vec<TimelineRow>, conflicts: Vec<ConflictInfo>) -> impl IntoView {
     (!timeline.is_empty()).then(move || {
@@ -1526,9 +1526,10 @@ fn Popover(
 // ==================== Citation marker ====================
 
 /// A citation marker: a small superscript mark showing a field's source count,
-/// neutral normally and amber when the field is contested. Tapping it toggles a
-/// popover listing the sources — each linked to its source when it has one — or,
-/// for a contested field, the rival claims. An outside click or Escape closes it.
+/// neutral normally and disputed when the field is contested. Tapping it
+/// toggles a popover listing the sources — each linked to its source when it
+/// has one — or, for a contested field, the rival claims. An outside click or
+/// Escape closes it.
 #[component]
 fn CitationMarker(lines: CitationLines) -> impl IntoView {
     // The variant is the bullet's meaning: rival claims read as the disputed
@@ -1633,7 +1634,7 @@ fn citation_entry_views(entries: Vec<CiteEntry>) -> Vec<AnyView> {
 
 /// The glyph classes: a small superscript footnote mark, sized in `em` so it
 /// scales with the host text. A neutral outline that darkens on hover/open, or
-/// the amber contested tone.
+/// the contested tone.
 fn bullet_class(disputed: bool, open: bool) -> String {
     let base = "inline-flex items-center justify-center align-[0.5em] \
                 min-w-[1.3em] h-[1.3em] px-[0.25em] ml-[0.15em] \
@@ -1658,9 +1659,9 @@ fn bullet_class(disputed: bool, open: bool) -> String {
 const POPOVER_WIDTH_PX: f64 = 240.0;
 
 /// The hue a citation/marker popover carries: neutral for a plain source list,
-/// disputed (amber) for a contested field or a temporal conflict, inferred (sage)
-/// for a bound the solver rules derived. Drives the border, accent, and header
-/// color.
+/// disputed (vermilion) for a contested field or a temporal conflict, inferred
+/// (sage) for a bound the solver rules derived. Drives the border, accent, and
+/// header color.
 #[derive(Clone, Copy)]
 enum PopoverTone {
     Neutral,
@@ -1696,8 +1697,8 @@ fn popover_style(anchor: Option<(f64, f64)>) -> String {
     format!("top: {top}px; left: {left}px; width: {POPOVER_WIDTH_PX}px;")
 }
 
-/// The 2px top accent, in the popover's tone: amber for a contested field, sage
-/// for an inferred bound, muted otherwise.
+/// The 2px top accent, in the popover's tone: vermilion for a contested field,
+/// sage for an inferred bound, muted otherwise.
 fn top_accent_class(tone: PopoverTone) -> &'static str {
     match tone {
         PopoverTone::Neutral => "h-0.5 bg-sepia/50",
@@ -1720,8 +1721,8 @@ fn header_class(tone: PopoverTone) -> String {
 
 // ==================== Conflict marker ====================
 
-/// A conflict marker: a small amber alert disc beside the citation bullet on a
-/// timeline row whose date takes part in an entity-level temporal conflict.
+/// A conflict marker: a small vermilion alert disc beside the citation bullet
+/// on a timeline row whose date takes part in an entity-level temporal conflict.
 /// Tapping it opens a [`Popover`] naming each clash in plain language and
 /// plotting its participating facts on a small inline time-axis.
 #[component]
@@ -1843,7 +1844,7 @@ fn conflict_brackets(points: &[ConflictPoint]) -> Vec<(&ConflictPoint, &Conflict
 /// Build the inline-SVG markup for a conflict's time-axis, or `None` when no
 /// participant carries a plottable date. Positions scale to the participants'
 /// date range with padding; each witness point and its "before"/"after" bracket
-/// to the nearest anchor use the amber conflict tones.
+/// to the nearest anchor use the disputed tones.
 fn build_conflict_svg(conflict: &ResolvedConflict) -> Option<String> {
     const VB_W: f64 = 240.0;
     const VB_H: f64 = 88.0;
@@ -1950,7 +1951,7 @@ fn disc_base() -> &'static str {
      cursor-pointer transition-colors"
 }
 
-/// The conflict marker's tone over [`disc_base`]: a solid amber disc, its
+/// The conflict marker's tone over [`disc_base`]: a solid vermilion disc, its
 /// parchment `!` a cut-out, deepening while its popover is open — solid alert
 /// against the citation bullet's neutral outline.
 fn conflict_glyph_class(open: bool) -> String {

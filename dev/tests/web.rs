@@ -1063,8 +1063,8 @@ async fn test_inferred_construction_bound_renders_marker_and_names_witness() -> 
 
 /// A sighting dated after a demolition witnesses existence past the entity's
 /// lifetime ceiling — the demolition-ceiling side of the temporal solver. The
-/// conflict rides its participating rows as an amber "!" marker, and opening it
-/// reveals the clash and a time-axis plotting the rival instants.
+/// conflict rides its participating rows as a disputed "!" marker, and opening
+/// it reveals the clash and a time-axis plotting the rival instants.
 #[tokio::test]
 async fn test_a_sighting_after_a_demolition_renders_a_conflict() -> TestResult {
     let seeds = vec![seed_disputed_photographed_entity_at(
@@ -1124,8 +1124,8 @@ async fn test_a_sighting_after_a_demolition_renders_a_conflict() -> TestResult {
 
 /// A sighting dated before a construction start witnesses existence under the
 /// entity's lifetime floor: the construction-floor side of the temporal solver.
-/// The conflict rides its participating rows as an amber "!" marker, and opening
-/// it reveals the clash and a time-axis plotting the rival instants.
+/// The conflict rides its participating rows as a disputed "!" marker, and
+/// opening it reveals the clash and a time-axis plotting the rival instants.
 #[tokio::test]
 async fn test_a_sighting_before_a_construction_renders_a_conflict() -> TestResult {
     let seeds = vec![seed_witness_before_construction_at(
@@ -3044,9 +3044,9 @@ async fn test_notre_dame_interior_event_renders_between_construction_endpoints()
 }
 
 /// Notre-Dame's founding (P571, 1160) and its build start (P793, 1163) date one
-/// bound differently, so the construction-started row reads disputed: an amber
-/// bullet labelled by its rival count, and a popover laying the rival claims out
-/// with the Wikidata statements behind them.
+/// bound differently, so the construction-started row reads disputed: a
+/// vermilion bullet labelled by its rival count, and a popover laying the rival
+/// claims out with the Wikidata statements behind them.
 #[tokio::test]
 async fn test_notre_dame_rival_construction_starts_render_as_disputed() -> TestResult {
     web_test(async |t| {

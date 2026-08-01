@@ -11,8 +11,8 @@
   --color-copper-deep: #6b4a2f;
   --color-sage: #7a8b6f;
   --color-sage-deep: #5f6e54;
-  --color-amber: #b8651e;
-  --color-amber-deep: #8c4a13;
+  --color-vermilion: #af3123;
+  --color-vermilion-deep: #802319;
 
   --font-serif: "Source Serif 4", Georgia, serif;
   /* One glyph, U+2767, subsetted out of Noto Sans Symbols 2 by nix/web.nix.
@@ -49,8 +49,8 @@
   --color-accent-deep: var(--color-copper-deep);
   --color-verified: var(--color-sage);
   --color-verified-deep: var(--color-sage-deep);
-  --color-disputed: var(--color-amber);
-  --color-disputed-deep: var(--color-amber-deep);
+  --color-disputed: var(--color-vermilion);
+  --color-disputed-deep: var(--color-vermilion-deep);
   --color-selected: #ffffff;
 }
 

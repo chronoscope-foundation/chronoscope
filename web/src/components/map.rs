@@ -313,9 +313,9 @@ pub(crate) const STANDING: MarkerAppearance = MarkerAppearance {
     ring: None,
 };
 
-/// Sources disagree about whether it stood, in the amber the entity panel marks
-/// a contested field with, so one colour says "contested" wherever a reader
-/// meets it.
+/// Sources disagree about whether it stood, in the red the entity panel marks a
+/// contested field with, so one colour says "contested" wherever a reader meets
+/// it.
 ///
 /// The disc's own rim carries that colour as well as the ring. The ring is a
 /// canvas sprite and a sprite can fail to register; the rim is a paint
@@ -326,12 +326,12 @@ pub(crate) const DISPUTED: MarkerAppearance = MarkerAppearance {
     fill: "#9A5F28",
     opacity: 0.9,
     edge: Ring {
-        color: "#B8651E",
+        color: "#AF3123",
         width: 2.0,
         dashed: false,
     },
     ring: Some(Ring {
-        color: "#B8651E",
+        color: "#AF3123",
         width: 3.0,
         dashed: false,
     }),
