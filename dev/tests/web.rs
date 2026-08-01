@@ -2342,6 +2342,39 @@ async fn test_error_banner_custom_event() -> TestResult {
     .await
 }
 
+/// A MapLibre failure the style owns reaches the reader; a basemap source's
+/// does not.
+///
+/// MapLibre leaves `sourceId` off an error about the style itself: a layer it
+/// lacks, a style that failed to parse, a glyph fetch, a WebGL fault. Every one
+/// of those leaves the markers in front of the reader inert, so it belongs on
+/// the strip. A basemap tile that missed is the map still working.
+#[tokio::test]
+async fn test_a_style_level_map_error_reaches_the_reader() -> TestResult {
+    const BASEMAP_NOISE: &str = "a basemap tile did not load";
+    const STYLE_FAULT: &str = "the layer 'entity-circles' does not exist in the map's style";
+
+    web_test(async |t| {
+        t.goto("/").await?;
+        t.wait_for_map_idle().await?;
+
+        t.fire_map_error(BASEMAP_NOISE, Some("openmaptiles"))
+            .await?;
+        // The fire and this read are separate evaluations, so whatever reactive
+        // work the fire queued has run by the time the text is sampled.
+        check(
+            !t.has_text(BASEMAP_NOISE).await?,
+            "a basemap source's error belongs off the strip",
+        )?;
+
+        t.fire_map_error(STYLE_FAULT, None).await?;
+        t.wait_for_body_text(STYLE_FAULT).await?;
+
+        Ok(())
+    })
+    .await
+}
+
 /// An error strip still leaves the About card's toggle usable on a phone.
 ///
 /// Both sit at `top-14` below `md`: the strip spans the width at `z-50` and the

@@ -77,6 +77,15 @@ extern "C" {
 
     /// Query rendered features at a point, optionally filtered by layer.
     /// `options` is a JS object like `{ layers: ["entity-circles"] }`.
+    ///
+    /// [`Array`] is read off maplibre-gl 5.1.0, the build `index.html` pins by
+    /// integrity hash: every path out of `Map.queryRenderedFeatures` and the
+    /// `Style` method behind it returns an array. A name in `options.layers`
+    /// that the style lacks is one of those paths. It fires an `error` event
+    /// and takes the whole call to `[]`, which a hit test reads as a miss
+    /// across every layer it named. `components::map::query_layers` is the one
+    /// caller, and it names layers by `EntityLayer`, so the queryable names and
+    /// the added layers stay one list.
     #[wasm_bindgen(method, js_name = queryRenderedFeatures)]
     pub fn query_rendered_features(this: &Map, point: &JsValue, options: &JsValue) -> Array;
 
@@ -241,30 +250,23 @@ pub struct MapOptions<'a> {
 
 /// Create a new MapLibre map in the given container element.
 ///
-/// Returns `None` if `maplibregl` is not loaded (e.g., script tag failed to
-/// load) or the constructor throws for any other reason.
-pub fn create_map(container: &web_sys::HtmlDivElement, options: &MapOptions<'_>) -> Option<Map> {
-    let opts = match crate::components::map::to_js(options) {
-        Ok(v) => v,
-        Err(e) => {
-            web_sys::console::error_1(&format!("Failed to serialize map options: {e}").into());
-            return None;
-        }
-    };
+/// The error is what the reader gets in place of a map, so it names the step
+/// that failed. A `maplibregl` the script tag never loaded arrives as the
+/// constructor's own throw.
+pub fn create_map(
+    container: &web_sys::HtmlDivElement,
+    options: &MapOptions<'_>,
+) -> Result<Map, String> {
+    let opts = crate::components::map::to_js(options).map_err(|e| {
+        format!("The map could not be created: its options failed to serialize: {e}")
+    })?;
 
     // `container` is a DOM element, not serializable — set it on the JS object directly.
-    if let Err(e) = js_sys::Reflect::set(&opts, &"container".into(), container) {
-        web_sys::console::error_1(&format!("Failed to set container on map options: {e:?}").into());
-        return None;
-    }
+    js_sys::Reflect::set(&opts, &"container".into(), container).map_err(|e| {
+        format!("The map could not be created: its container could not be set: {e:?}")
+    })?;
 
-    match Map::new(&opts) {
-        Ok(map) => Some(map),
-        Err(e) => {
-            web_sys::console::error_1(&format!("maplibregl.Map constructor failed: {e:?}").into());
-            None
-        }
-    }
+    Map::new(&opts).map_err(|e| format!("The map could not be created: {e:?}"))
 }
 
 // ==================== Cursor helper ====================

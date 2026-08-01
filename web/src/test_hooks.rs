@@ -28,7 +28,9 @@ use wasm_bindgen::prelude::*;
 
 use crate::api::Client;
 use crate::components::focus_trap::is_rendered;
-use crate::components::map::{FETCH_COMPLETE_EVENT, MAP_READY_EVENT, current_fetch_settled};
+use crate::components::map::{
+    EntityLayer, FETCH_COMPLETE_EVENT, MAP_READY_EVENT, current_fetch_settled, query_layers,
+};
 use crate::maplibre;
 use crate::time_scale::{TimeScale, era_label};
 
@@ -296,6 +298,14 @@ pub fn register_map_hooks(
             let h = map_handle.clone();
             move |lng: f64, lat: f64| {
                 with_map(&h, |m| fire_canvas_mousemove(m, lng, lat));
+            }
+        },
+        // A `sourceId` of `None` is the style-level shape MapLibre uses when no
+        // source owns the failure.
+        fire_map_error: {
+            let h = map_handle.clone();
+            move |message: String, source_id: Option<String>| {
+                with_map(&h, |m| fire_map_error(m, &message, source_id.as_deref()));
             }
         },
 
@@ -1278,24 +1288,16 @@ fn listen_once_and_resolve(event_name: &str, resolve: js_sys::Function) {
 /// `["!", ["has", "thumbnail"]]` and thumbnails use `["has", "thumbnail"]`,
 /// so a given feature only appears in one layer at a time.
 fn marker_count(map: &maplibre::Map) -> u32 {
-    use crate::components::map::{ENTITY_CIRCLES_LAYER, ENTITY_THUMBNAILS_LAYER};
-    let opts = js_sys::Object::new();
-    let layers = js_sys::Array::new();
-    layers.push(&ENTITY_CIRCLES_LAYER.into());
-    layers.push(&ENTITY_THUMBNAILS_LAYER.into());
-    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
-    map.query_rendered_features(&JsValue::UNDEFINED, &opts)
-        .length()
+    query_layers(
+        map,
+        &JsValue::UNDEFINED,
+        [EntityLayer::Circles, EntityLayer::Thumbnails],
+    )
+    .length()
 }
 
 fn thumbnail_marker_count(map: &maplibre::Map) -> u32 {
-    use crate::components::map::ENTITY_THUMBNAILS_LAYER;
-    let opts = js_sys::Object::new();
-    let layers = js_sys::Array::new();
-    layers.push(&ENTITY_THUMBNAILS_LAYER.into());
-    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
-    map.query_rendered_features(&JsValue::UNDEFINED, &opts)
-        .length()
+    query_layers(map, &JsValue::UNDEFINED, [EntityLayer::Thumbnails]).length()
 }
 
 /// Descriptors for the individual-entity layers (circles + thumbnails) — one
@@ -1304,8 +1306,7 @@ fn thumbnail_marker_count(map: &maplibre::Map) -> u32 {
 /// so tests can assert on properties, click the rendered coordinates, and
 /// measure pairwise screen distance.
 fn marker_properties(map: &maplibre::Map) -> JsValue {
-    use crate::components::map::{ENTITY_CIRCLES_LAYER, ENTITY_THUMBNAILS_LAYER};
-    layer_descriptors(map, &[ENTITY_CIRCLES_LAYER, ENTITY_THUMBNAILS_LAYER])
+    layer_descriptors(map, &[EntityLayer::Circles, EntityLayer::Thumbnails])
 }
 
 /// Descriptors for the cluster-badge layer — MapLibre proximity clusters
@@ -1313,8 +1314,7 @@ fn marker_properties(map: &maplibre::Map) -> JsValue {
 /// "cluster"`). Same shape as [`marker_properties`], so a test can count
 /// badges and read each badge's centroid for a click.
 fn badge_properties(map: &maplibre::Map) -> JsValue {
-    use crate::components::map::ENTITY_BADGE_LAYER;
-    layer_descriptors(map, &[ENTITY_BADGE_LAYER])
+    layer_descriptors(map, &[EntityLayer::Badge])
 }
 
 /// Descriptors for the verdict-ring layer alone.
@@ -1324,8 +1324,7 @@ fn badge_properties(map: &maplibre::Map) -> JsValue {
 /// and thumbnail layers, a ring would be deduped away and an assertion aimed at
 /// it would read its marker's disc instead.
 fn ring_properties(map: &maplibre::Map) -> JsValue {
-    use crate::components::map::ENTITY_RING_LAYER;
-    layer_descriptors(map, &[ENTITY_RING_LAYER])
+    layer_descriptors(map, &[EntityLayer::Ring])
 }
 
 /// Deduplicated descriptors for every feature rendered across `layers`.
@@ -1334,14 +1333,8 @@ fn ring_properties(map: &maplibre::Map) -> JsValue {
 /// the point geometry and `_x`/`_y` — the geometry projected to CSS pixels via
 /// `map.project`. The pixel coordinates let a test assert that no two rendered
 /// markers sit within the proximity-cluster radius (the near-split check).
-fn layer_descriptors(map: &maplibre::Map, layers: &[&str]) -> JsValue {
-    let opts = js_sys::Object::new();
-    let layer_arr = js_sys::Array::new();
-    for layer in layers {
-        layer_arr.push(&(*layer).into());
-    }
-    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layer_arr);
-    let features = map.query_rendered_features(&JsValue::UNDEFINED, &opts);
+fn layer_descriptors(map: &maplibre::Map, layers: &[EntityLayer]) -> JsValue {
+    let features = query_layers(map, &JsValue::UNDEFINED, layers.iter().copied());
 
     // Dedupe by `feature.id`: a feature can surface once per tile it spans, and
     // an individual with a thumbnail is promoted across the circle and
@@ -1405,18 +1398,28 @@ fn layer_descriptors(map: &maplibre::Map, layers: &[&str]) -> JsValue {
     result.into()
 }
 
+/// Put an `error` event through the map's own dispatch, shaped as MapLibre
+/// shapes one: the text under `error`, and `source_id` beside it where MapLibre
+/// knows which source failed.
+///
+/// A `source_id` of `None` is the style-level shape, which covers a missing
+/// layer, a style that failed to parse, a glyph fetch, and a WebGL fault.
+fn fire_map_error(map: &maplibre::Map, message: &str, source_id: Option<&str>) {
+    let data = js_sys::Object::new();
+    let error = JsValue::from(js_sys::Error::new(message));
+    let _ = js_sys::Reflect::set(&data, &"error".into(), &error);
+    if let Some(source_id) = source_id {
+        let _ = js_sys::Reflect::set(&data, &"sourceId".into(), &source_id.into());
+    }
+    let _ = map.fire("error", &data);
+}
+
 /// The marker layers rendering something at `lng`/`lat`, as a JS array of layer
 /// ids. Which layer owns a pixel is what decides whether a click there selects
 /// the marker or falls through to the background handler.
 fn layers_at(map: &maplibre::Map, lng: f64, lat: f64) -> JsValue {
     let point = project_lnglat(map, lng, lat);
-    let opts = js_sys::Object::new();
-    let layers = js_sys::Array::new();
-    for layer in crate::components::map::marker_layers() {
-        layers.push(&layer.into());
-    }
-    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
-    let features = map.query_rendered_features(&point, &opts);
+    let features = query_layers(map, &point, crate::components::map::marker_layers());
 
     let seen = js_sys::Set::new(&JsValue::UNDEFINED);
     let result = js_sys::Array::new();

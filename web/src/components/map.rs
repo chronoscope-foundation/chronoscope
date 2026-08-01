@@ -76,14 +76,14 @@ const MOVEEND_DEBOUNCE_MS: i32 = 150;
 const ENTITY_SOURCE_ID: &str = "entities";
 
 /// Name of the circle layer for entity markers.
-pub(crate) const ENTITY_CIRCLES_LAYER: &str = "entity-circles";
+const ENTITY_CIRCLES_LAYER: &str = "entity-circles";
 
 /// Name of the badge layer — the only layer a cluster draws on, covering both
 /// MapLibre proximity clusters and lone server `Expand` cells.
-pub(crate) const ENTITY_BADGE_LAYER: &str = "entity-badge";
+const ENTITY_BADGE_LAYER: &str = "entity-badge";
 
 /// Name of the symbol layer carrying the verdict rings.
-pub(crate) const ENTITY_RING_LAYER: &str = "entity-rings";
+const ENTITY_RING_LAYER: &str = "entity-rings";
 
 /// Name of the transparent circle layer a bare marker is hit-tested by.
 ///
@@ -99,12 +99,13 @@ const ENTITY_LABELS_LAYER: &str = "entity-labels";
 /// One list drives two things that must never disagree: what
 /// [`init_source_and_layers`] adds, and what a click is hit-tested against.
 /// `queryRenderedFeatures` answers a call naming a layer the style lacks with
-/// nothing at all, so a hit-test set naming a layer nobody added would turn
-/// every click on the map into a deselect. Nothing can join that set except by
-/// being a variant here, and the variants are all added before any handler that
-/// reads it exists.
+/// an empty array for the whole call (traced in the `maplibre` binding's doc),
+/// so a hit-test set naming a layer nobody added would turn every click on the
+/// map into a deselect. Nothing can join that set except by being a variant
+/// here, and the variants are all added before any handler that reads it
+/// exists.
 #[derive(Clone, Copy)]
-enum EntityLayer {
+pub(crate) enum EntityLayer {
     /// Bare marker dots.
     Circles,
     /// The transparent disc giving a bare marker its round hit region.
@@ -138,11 +139,30 @@ const ENTITY_LAYERS: [EntityLayer; 6] = [
 /// matches nothing, so a layer left out of it puts marker pixels outside every
 /// hit test: a click there falls through and clears the selection the user was
 /// aiming at.
-pub(crate) fn marker_layers() -> impl Iterator<Item = &'static str> {
-    ENTITY_LAYERS
-        .into_iter()
-        .filter(|layer| layer.hit_tested())
-        .map(EntityLayer::id)
+pub(crate) fn marker_layers() -> impl Iterator<Item = EntityLayer> {
+    ENTITY_LAYERS.into_iter().filter(|layer| layer.hit_tested())
+}
+
+/// The features rendered on exactly `layers`, at `point` or anywhere on them
+/// when `point` is `JsValue::UNDEFINED`.
+///
+/// The one route to [`maplibre::Map::query_rendered_features`], and it names
+/// layers by [`EntityLayer`] rather than by id. MapLibre answers a call naming a
+/// layer the style lacks with an empty array for the whole call, so a name
+/// nobody added reads as bare map across every layer the call asked about. A
+/// variant has no way to name a layer [`init_source_and_layers`] did not add.
+pub(crate) fn query_layers(
+    map: &maplibre::Map,
+    point: &JsValue,
+    layers: impl IntoIterator<Item = EntityLayer>,
+) -> js_sys::Array {
+    let opts = js_sys::Object::new();
+    let ids = js_sys::Array::new();
+    for layer in layers {
+        ids.push(&JsValue::from_str(layer.id()));
+    }
+    let _ = js_sys::Reflect::set(&opts, &"layers".into(), &ids);
+    map.query_rendered_features(point, &opts)
 }
 
 /// DOM event name signaling map mount completion (used by test hooks).
@@ -205,7 +225,7 @@ fn record_fetch_settled() {
 }
 
 /// Name of the symbol layer for thumbnail markers.
-pub(crate) const ENTITY_THUMBNAILS_LAYER: &str = "entity-thumbnails";
+const ENTITY_THUMBNAILS_LAYER: &str = "entity-thumbnails";
 
 /// DOM event name signaling thumbnail image loading completion (used by test hooks).
 #[cfg(feature = "test-hooks")]
@@ -2479,13 +2499,7 @@ fn handle_background_click(
 ) {
     let point = js_sys::Reflect::get(&event, &"point".into()).ok();
     if let Some(point) = point {
-        let opts = js_sys::Object::new();
-        let layers = js_sys::Array::new();
-        for layer in marker_layers() {
-            layers.push(&JsValue::from_str(layer));
-        }
-        let _ = js_sys::Reflect::set(&opts, &"layers".into(), &layers);
-        let features = map.query_rendered_features(&point, &opts);
+        let features = query_layers(map, &point, marker_layers());
         if features.length() > 0 {
             // Click hit a marker or a badge — its layer handler already fired.
             return;
@@ -2807,6 +2821,55 @@ struct MapState {
     rendered_as_of: Rc<Cell<Option<NaiveDate>>>,
 }
 
+/// What a MapLibre `error` event is about, read off the source it names.
+///
+/// MapLibre tags an error with the `sourceId` it arose in. An untagged one is
+/// the style itself: a layer the style lacks, a style that failed to parse, a
+/// glyph fetch, a WebGL fault. Each of those leaves the reader looking at a map
+/// that no longer answers, which is what the tagged entity-source failures do
+/// too, so the two share a strip.
+#[derive(Clone, Copy)]
+enum MapErrorScope {
+    /// The style, its glyphs, or the renderer.
+    Style,
+    /// The source this map paints its markers from.
+    Entities,
+    /// A basemap source. Its tile fetches miss often enough on a live network
+    /// to crowd out the two scopes a reader can act on.
+    Basemap,
+}
+
+impl MapErrorScope {
+    fn of(event: &JsValue) -> Self {
+        match js_sys::Reflect::get(event, &"sourceId".into())
+            .ok()
+            .and_then(|id| id.as_string())
+        {
+            None => Self::Style,
+            Some(id) if id == ENTITY_SOURCE_ID => Self::Entities,
+            Some(_) => Self::Basemap,
+        }
+    }
+
+    /// Whether the reader is told.
+    fn surfaced(self) -> bool {
+        match self {
+            Self::Style | Self::Entities => true,
+            Self::Basemap => false,
+        }
+    }
+}
+
+/// What a MapLibre `error` event says. The event carries an `Error` under
+/// `error` and extends the tag beside it, so the text lives one hop in.
+fn map_error_message(event: &JsValue) -> String {
+    js_sys::Reflect::get(event, &"error".into())
+        .and_then(|error| js_sys::Reflect::get(&error, &"message".into()))
+        .ok()
+        .and_then(|message| message.as_string())
+        .unwrap_or_else(|| "The map reported an error.".to_string())
+}
+
 /// Create the map, register the style-load callback (which adds source/layers,
 /// click/hover handlers, and kicks off the initial entity fetch), and the
 /// debounced moveend handler.
@@ -2819,7 +2882,10 @@ fn initialize_map(
     set_selected: WriteSignal<Option<EntitySelection>>,
     set_map_error: WriteSignal<Option<String>>,
 ) -> Option<maplibre::Map> {
-    let map = maplibre::create_map(
+    // A map that never got built leaves an empty rectangle, which reads as a
+    // region with nothing in it. The reason goes to the strip a style error
+    // uses, since that is the only place it can be read.
+    let map = match maplibre::create_map(
         el,
         &maplibre::MapOptions {
             style: MAP_STYLE_URL,
@@ -2829,7 +2895,14 @@ fn initialize_map(
             min_zoom: f64::from(MIN_ZOOM),
             fade_duration: SYMBOL_FADE_MS,
         },
-    )?;
+    ) {
+        Ok(map) => map,
+        Err(e) => {
+            web_sys::console::error_1(&e.clone().into());
+            set_map_error.set(Some(e));
+            return None;
+        }
+    };
 
     // --- On style load: add source/layers, register handlers, initial fetch ---
     //
@@ -2879,21 +2952,9 @@ fn initialize_map(
     let moveend_closure = register_moveend_handler(&map, state, signals);
     state.closures.borrow_mut().push(moveend_closure);
 
-    // Surface MapLibre errors from our entity source in the UI. Errors
-    // from the basemap (tile loading, style evaluation) are logged but
-    // not surfaced since they're outside our control.
     let error_cb = Closure::<dyn Fn(JsValue)>::new(move |event: JsValue| {
-        let msg = js_sys::Reflect::get(&event, &"message".into())
-            .ok()
-            .and_then(|v| v.as_string())
-            .unwrap_or_else(|| "Map style error".to_string());
-
-        let source_id = js_sys::Reflect::get(&event, &"sourceId".into())
-            .ok()
-            .and_then(|v| v.as_string());
-
-        if source_id.as_deref() == Some(ENTITY_SOURCE_ID) {
-            set_map_error.set(Some(msg));
+        if MapErrorScope::of(&event).surfaced() {
+            set_map_error.set(Some(map_error_message(&event)));
         }
     });
     map.on("error", error_cb.as_ref());

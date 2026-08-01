@@ -776,6 +776,10 @@ impl WebTest {
         // aren't exposed — tests use `pan_map_to` / `click_map_at`, which
         // bake in the appropriate waits.
         pub action fire_canvas_mousemove(lng: f64, lat: f64);
+        // Put an `error` event through MapLibre's own dispatch. `source_id` is
+        // the source it names; `None` is the style-level shape, which MapLibre
+        // uses when no source owns the failure.
+        pub action fire_map_error(message: &str, source_id: Option<&str>);
         pub action set_api_url(url: &str);
 
         // Wait hooks (public). Each bakes its own sequencing WASM-side so
