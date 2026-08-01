@@ -242,6 +242,10 @@ const MARKER_RADIUS: f64 = 10.0;
 const BADGE_RADIUS: f64 = 18.0;
 
 // ==================== Marker appearance ====================
+//
+// The colours are string literals because a MapLibre paint expression and a
+// canvas stroke each take one as a value. `web/input.css` is where they are
+// chosen; a test below holds every literal here to the entry it copies.
 
 /// A ring stroked around a marker's disc.
 #[derive(Clone, Copy, PartialEq)]
@@ -303,14 +307,15 @@ pub(crate) struct MarkerAppearance {
 /// after, and fading that would fade most of the map.
 pub(crate) const STANDING: MarkerAppearance = MarkerAppearance {
     radius: MARKER_RADIUS,
-    fill: "#8B5E3C",
+    fill: "#9A5F28",
     opacity: 0.9,
     edge: DISC_EDGE,
     ring: None,
 };
 
-/// Sources disagree about whether it stood, in a colour nothing else on the map
-/// uses, so a disagreement is visible without opening the entity.
+/// Sources disagree about whether it stood, in the amber the entity panel marks
+/// a contested field with, so one colour says "contested" wherever a reader
+/// meets it.
 ///
 /// The disc's own rim carries that colour as well as the ring. The ring is a
 /// canvas sprite and a sprite can fail to register; the rim is a paint
@@ -318,15 +323,15 @@ pub(crate) const STANDING: MarkerAppearance = MarkerAppearance {
 /// sprites at all.
 pub(crate) const DISPUTED: MarkerAppearance = MarkerAppearance {
     radius: MARKER_RADIUS,
-    fill: "#8B5E3C",
+    fill: "#9A5F28",
     opacity: 0.9,
     edge: Ring {
-        color: "#C2410C",
+        color: "#B8651E",
         width: 2.0,
         dashed: false,
     },
     ring: Some(Ring {
-        color: "#C2410C",
+        color: "#B8651E",
         width: 3.0,
         dashed: false,
     }),
@@ -3294,7 +3299,10 @@ pub fn MapView(
 
 #[cfg(test)]
 mod tests {
-    use super::{DOT_RADIUS, thumbnail_dot_drop, thumbnail_geometry};
+    use super::{
+        BADGE, DISC_EDGE, DISPUTED, DOT_RADIUS, SELECTED_EDGE, STANDING, UNEVIDENCED,
+        thumbnail_dot_drop, thumbnail_geometry,
+    };
 
     /// Device pixel ratios real displays report, including the fractional ones
     /// Windows and Android use, where a drop that forgot to divide by the ratio
@@ -3331,5 +3339,94 @@ mod tests {
                 thumbnail_dot_drop(dpr)
             );
         }
+    }
+
+    /// The stylesheet the marker colours are copies of, read at compile time so
+    /// editing the palette rebuilds the test that guards it.
+    const STYLESHEET: &str = include_str!("../../input.css");
+
+    /// The one value `web/input.css` declares for a custom property.
+    fn declared(name: &str) -> Result<&'static str, String> {
+        let values: Vec<&str> = STYLESHEET
+            .lines()
+            .filter_map(|line| {
+                let (property, value) = line.split_once(':')?;
+                (property.trim() == name).then_some(value.trim().trim_end_matches(';').trim())
+            })
+            .collect();
+        match values.as_slice() {
+            [value] => Ok(value),
+            [] => Err(format!("web/input.css declares no {name}")),
+            many => Err(format!(
+                "web/input.css declares {name} {} times",
+                many.len()
+            )),
+        }
+    }
+
+    /// The hex `name` arrives at, following the semantic aliases' `var()` hops
+    /// into the raw palette.
+    fn palette_hex(name: &str) -> Result<&'static str, String> {
+        let mut name = name.to_owned();
+        // The cap turns a palette that aliases in a circle into a failed test.
+        for _ in 0..4 {
+            let value = declared(&name)?;
+            match value
+                .strip_prefix("var(")
+                .and_then(|inner| inner.strip_suffix(')'))
+            {
+                Some(alias) => name = alias.trim().to_owned(),
+                None => return Ok(value),
+            }
+        }
+        Err(format!("{name} aliases deeper than the palette goes"))
+    }
+
+    /// A marker's colour is a copy of a palette entry, and a copy that drifts is
+    /// a second vocabulary for one meaning: the map's contested ring against the
+    /// entity panel's contested field.
+    #[test]
+    fn marker_colours_are_the_palette_entries_they_copy() {
+        // (what it paints, the copy, the entry the copy is of)
+        let painted = [
+            ("standing fill", STANDING.fill, "--color-accent"),
+            ("contested fill", DISPUTED.fill, "--color-accent"),
+            ("badge fill", BADGE.fill, "--color-accent-deep"),
+            ("hollow wash", UNEVIDENCED.fill, "--color-surface"),
+            ("disc edge", DISC_EDGE.color, "--color-surface"),
+            ("selection halo", SELECTED_EDGE.color, "--color-selected"),
+            ("contested rim", DISPUTED.edge.color, "--color-disputed"),
+            ("hollow rim", UNEVIDENCED.edge.color, "--color-secondary"),
+        ];
+        // The looks whose verdict adds a ring, which the type leaves optional.
+        let ringed = [
+            ("contested ring", DISPUTED.ring, "--color-disputed"),
+            ("hollow ring", UNEVIDENCED.ring, "--color-secondary"),
+        ];
+
+        let against_palette = |part: &str, copy: &str, entry: &str| match palette_hex(entry) {
+            Ok(pinned) if copy.eq_ignore_ascii_case(pinned) => None,
+            Ok(pinned) => Some(format!(
+                "the map's {part} is {copy}, where {entry} is {pinned}"
+            )),
+            Err(e) => Some(e),
+        };
+
+        let mut drifted: Vec<String> = painted
+            .into_iter()
+            .filter_map(|(part, copy, entry)| against_palette(part, copy, entry))
+            .collect();
+        for (part, ring, entry) in ringed {
+            match ring {
+                Some(ring) => drifted.extend(against_palette(part, ring.color, entry)),
+                None => drifted.push(format!("the map's {part} is gone, so {entry} pins nothing")),
+            }
+        }
+
+        assert!(
+            drifted.is_empty(),
+            "the map's colours and web/input.css disagree:\n{}",
+            drifted.join("\n")
+        );
     }
 }

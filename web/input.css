@@ -8,6 +8,7 @@
   --color-ink: #2c2416;
   --color-sepia: #6b5840;
   --color-copper: #9a5f28;
+  --color-copper-deep: #6b4a2f;
   --color-sage: #7a8b6f;
   --color-sage-deep: #5f6e54;
   --color-amber: #b8651e;
@@ -31,18 +32,26 @@
  *   text-body         primary readable text
  *   text-secondary    supporting/muted text, prose paragraphs
  *   text-accent       headings, links, interactive highlights
+ *   bg-accent-deep    a cluster badge's disc, heavier than a lone marker's
  *   text-verified     inferred/derived-value indicators (a solver-built bound)
  *   text-disputed     conflicting-claim indicators (a contested date/field)
+ *   ring-selected     the halo around whatever a reader has opened
+ *
+ * MapLibre paint expressions and canvas strokes take a colour as a value, so
+ * the map copies some of these into Rust string literals; a test in
+ * web/src/components/map.rs holds each copy to the entry it names.
  */
 @theme {
   --color-surface: var(--color-parchment);
   --color-body: var(--color-ink);
   --color-secondary: var(--color-sepia);
   --color-accent: var(--color-copper);
+  --color-accent-deep: var(--color-copper-deep);
   --color-verified: var(--color-sage);
   --color-verified-deep: var(--color-sage-deep);
   --color-disputed: var(--color-amber);
   --color-disputed-deep: var(--color-amber-deep);
+  --color-selected: #ffffff;
 }
 
 /* Prose styling for pulldown-cmark rendered markdown */
