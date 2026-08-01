@@ -27,4 +27,20 @@
   # Cloud Run service `just deploy` rolls. Also names the runtime service
   # account and the JWT secret, which exist only to serve it.
   cloudRunService = "chronoscope-api";
+
+  # The Cloudflare account holding the zone, and the zone `organization` is
+  # served from. Both are opaque ids the API addresses resources by.
+  cloudflareAccount = "8eb131c87dedde28b0f5006b388ca800";
+  cloudflareZone = "f2bfc494c8eb03fd4472a56b3f05598f";
+
+  # Worker in front of everything: it serves the web bundle as static assets
+  # and proxies /api to the Cloud Run service.
+  workerScript = "chronoscope-front-door";
+
+  # Secret Manager secret holding the Cloudflare API token. Created by hand,
+  # like the state bucket, since the credential that declares infrastructure
+  # cannot be declared by it. The infra recipes read it at run time and hand it
+  # to the provider through the environment, so it stays out of the state and
+  # off every command line.
+  cloudflareTokenSecret = "cloudflare-api-token";
 }

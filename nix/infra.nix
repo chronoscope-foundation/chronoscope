@@ -4,7 +4,7 @@
 # Nix rather than HCL so the declarations and the deploy read one definition of
 # the project's coordinates (./infra-settings.nix) instead of restating it in
 # .tf files. Each provider gets its own module in `modules` below, so adding
-# Cloudflare is a new binding and one more entry in that list.
+# one is a new binding and one more entry in that list.
 {
   pkgs,
   terranix,
@@ -19,10 +19,12 @@ let
   # drift apart.
   googleProvider = pkgs.terraform-providers.hashicorp_google;
   randomProvider = pkgs.terraform-providers.hashicorp_random;
+  cloudflareProvider = pkgs.terraform-providers.cloudflare_cloudflare;
 
   tofu = pkgs.opentofu.withPlugins (_: [
     googleProvider
     randomProvider
+    cloudflareProvider
   ]);
 
   # Keyed by the resource name dependents reference. Turning on another API is
@@ -166,7 +168,15 @@ let
             # app database and the fact-store overlay both land under /tmp.
             # Sized for the read path plus what a session accumulates, since
             # nothing written through the API outlives the instance anyway.
-            resources.limits.memory = "2Gi";
+            resources.limits = {
+              memory = "2Gi";
+              # Named because Cloud Run fills it in regardless, and a limit the
+              # declaration does not mention reads as one to remove, so every
+              # plan wants to roll a revision undoing the platform's default.
+              # Spelled in millicores because that is the form the API returns,
+              # and "1" would read as a change on every plan forever.
+              cpu = "1000m";
+            };
 
             env = [
               # Both of these default to localhost in the server, which is
@@ -244,9 +254,155 @@ let
     };
   };
 
+  # The edge in front of everything a browser touches. One Worker serves the
+  # web bundle as static assets and proxies /api to Cloud Run, which is what
+  # makes the site and the API one origin: no CORS in the app, no api.
+  # subdomain, and a passkey bound to the one hostname the API is told about.
+  #
+  # Workers rather than Pages because the media pipeline wants Queue consumers,
+  # Image Resizing and Cron Triggers, all of which are Workers-only. Serving the
+  # frontend from the same product keeps that one deployment model.
+  cloudflare = {
+    terraform.required_providers.cloudflare = {
+      source = "cloudflare/cloudflare";
+      inherit (cloudflareProvider) version;
+    };
+
+    # No provider block: the token comes from CLOUDFLARE_API_TOKEN, which the
+    # recipes read out of Secret Manager. Naming it here would put it in the
+    # config and, on the next apply, in the state.
+
+    # The other half of what a deploy moves. Unlike the image, this is a
+    # directory the provider reads while planning — it hashes every file to
+    # decide what to upload — so it has to be a path that exists right now,
+    # which is why the recipes build it rather than carrying the last one
+    # forward out of the state.
+    variable.web_dist = {
+      type = "string";
+      description = "Directory the Worker serves as static assets (a dist/ build of the web bundle)";
+    };
+
+    output.web_dist.value = "\${var.web_dist}";
+
+    resource = {
+      cloudflare_workers_script.front_door = {
+        account_id = settings.cloudflareAccount;
+        script_name = settings.workerScript;
+
+        # Read in rather than pointed at: a module's name and its file's name
+        # have to agree, and a store path's basename carries a hash.
+        main_module = "front-door.js";
+        content = builtins.readFile ./front-door.js;
+
+        # Pinned so a change in runtime semantics arrives when someone moves
+        # this line, rather than on whichever redeploy happens to follow one.
+        compatibility_date = "2026-07-01";
+
+        bindings = [
+          # What the Worker answers asset misses from, so a 404 is the one the
+          # assets config describes rather than a string this script invents.
+          {
+            name = "ASSETS";
+            type = "assets";
+          }
+          # The API's hostname, taken from the service declared above. The
+          # Worker never has it written down, and a Cloud Run recreate carries
+          # a new URL into the Worker on the same apply.
+          {
+            name = "API_ORIGIN";
+            type = "plain_text";
+            text = "\${google_cloud_run_v2_service.api.uri}";
+          }
+        ];
+
+        assets = {
+          directory = "\${var.web_dist}";
+
+          config = {
+            # The frontend routes /about, /faq and /related-work in the client,
+            # so a reload or a shared link on one of those has to arrive as
+            # index.html instead of a 404.
+            not_found_handling = "single-page-application";
+
+            # A list, not `true`: only /api/* runs the Worker before the assets
+            # are consulted, so everything in the bundle is still served with no
+            # code in the path. Naming it is what keeps the line above from
+            # swallowing the API — single-page-application answers *navigation*
+            # requests from index.html, so without this, opening an /api URL in
+            # a browser would return the app instead of the endpoint.
+            run_worker_first = [ "/api/*" ];
+          };
+        };
+      };
+
+      # A Worker is published on <script>.<account>.workers.dev by default.
+      # That is a second public origin serving the same app, which the API
+      # refuses to authenticate against (its RP_ORIGIN is the apex) and search
+      # engines would happily index alongside the real one.
+      cloudflare_workers_script_subdomain.front_door = {
+        account_id = settings.cloudflareAccount;
+        script_name = "\${cloudflare_workers_script.front_door.script_name}";
+        enabled = false;
+      };
+
+      # Creates the apex record and the certificate along with the binding, so
+      # the zone holds no placeholder address whose only purpose is to be
+      # proxied. Every path on the hostname is the Worker's.
+      cloudflare_workers_custom_domain.apex = {
+        account_id = settings.cloudflareAccount;
+        zone_id = settings.cloudflareZone;
+        hostname = settings.organization;
+        service = "\${cloudflare_workers_script.front_door.script_name}";
+      };
+
+      # www exists to be redirected, not served: the API checks WebAuthn
+      # origins against the apex exactly, so a passkey created on www would be
+      # rejected on the next sign-in. Proxied at a reserved documentation
+      # address (RFC 5737), which is never dialed — the rule below answers
+      # first, and the record exists only so Cloudflare terminates TLS for the
+      # name at all.
+      cloudflare_dns_record.www = {
+        zone_id = settings.cloudflareZone;
+        name = "www.${settings.organization}";
+        type = "A";
+        content = "192.0.2.1";
+        proxied = true;
+        # Proxied records are answered from Cloudflare's own addresses, so the
+        # record's TTL is not a thing a resolver ever sees. 1 is "automatic",
+        # which is the only value the API accepts here.
+        ttl = 1;
+        comment = "Redirected to the apex; see the redirects ruleset";
+      };
+
+      cloudflare_ruleset.redirects = {
+        zone_id = settings.cloudflareZone;
+        name = "redirects";
+        kind = "zone";
+        phase = "http_request_dynamic_redirect";
+        rules = [
+          {
+            description = "www to the apex";
+            expression = "http.host eq \"www.${settings.organization}\"";
+            action = "redirect";
+            action_parameters.from_value = {
+              status_code = 301;
+              # The path carries over, so a link someone wrote with www still
+              # lands where it meant to.
+              target_url.expression = "concat(\"https://${settings.organization}\", http.request.uri.path)";
+              preserve_query_string = true;
+            };
+          }
+        ];
+      };
+    };
+  };
+
   tfConfig = terranix.lib.terranixConfiguration {
     inherit pkgs;
-    modules = [ gcp ];
+    modules = [
+      gcp
+      cloudflare
+    ];
   };
 
   # Provider schema validation with no credentials and no network: -backend=false

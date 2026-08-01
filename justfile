@@ -17,11 +17,12 @@
 #                            without opening a permission hole the way
 #                            `nix develop` would.
 #
-#   `deploy`, `infra-apply`
-#                          — the exceptions to that: one publishes an image and
-#                            rolls the production service, the other creates and
-#                            destroys real cloud resources. Both stay recipes a
-#                            human types. Allowlisting them hands that away.
+#   `deploy`, `deploy-web`, `infra-apply`
+#                          — the exceptions to that: the first two publish an
+#                            artifact and roll what production serves, the third
+#                            creates and destroys real cloud resources. All
+#                            three stay recipes a human types. Allowlisting them
+#                            hands that away.
 #
 # Targets, where supported:
 #   all              everything (default)
@@ -109,6 +110,36 @@ _infra_image() {
         *[[:space:]]*) TF_VAR_image="" ;;
     esac
     export TF_VAR_image
+}
+'''
+
+# Resolve the bundle the Worker serves. Built rather than carried forward the
+# way the image is: the Cloudflare provider reads this directory while planning
+# — it hashes every file to work out what to upload — so it has to be a path
+# that exists now, and one recovered from an old state can have been collected.
+# The bundle is a pure function of the tree, so building it is also the shortest
+# statement of what this tree serves. The --out-link pins it against collection
+# between the build and the apply.
+_infra_web_dist := '''
+_infra_web_dist() {
+    if [ -n "${TF_VAR_web_dist:-}" ]; then return 0; fi
+    mkdir -p .nix-gc-roots
+    TF_VAR_web_dist=$(nix build .#web --out-link .nix-gc-roots/web --print-out-paths)
+    export TF_VAR_web_dist
+}
+'''
+
+# Put the Cloudflare credential in the environment the provider reads it from.
+# Fetched per run out of Secret Manager rather than kept in a file, a variable
+# in the config, or an argument: it never lands in the state, in the repo, or in
+# the process table.
+_cloudflare_token := '''
+_cloudflare_token() {
+    if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then return 0; fi
+    CLOUDFLARE_API_TOKEN=$(gcloud secrets versions access latest \
+        --secret="$(nix eval --file nix/infra-settings.nix cloudflareTokenSecret --raw)" \
+        --project="$(nix eval --file nix/infra-settings.nix project --raw)")
+    export CLOUDFLARE_API_TOKEN
 }
 '''
 
@@ -390,14 +421,21 @@ xcodegen:
 # below reads it back, so an image can only be pushed to a registry that was
 # actually declared.
 #
-# Both recipes authenticate as you, through application-default credentials:
+# Both recipes authenticate to Google as you, through application-default
+# credentials:
 #   gcloud auth application-default login
+#
+# Cloudflare authenticates with an API token instead, read out of Secret Manager
+# at run time and handed to the provider through CLOUDFLARE_API_TOKEN. That
+# keeps it out of the state, the repo and the process table; reading it needs
+# the same Google credentials as everything else here.
 #
 # An apply prints its plan and waits for a typed confirmation before it touches
 # anything.
 #
-# The state bucket is the one thing that cannot declare itself, since the state
-# describing it would have to live in it. Create it once, by hand:
+# Two things cannot declare themselves. The state bucket, since the state
+# describing it would have to live in it; and the Cloudflare token, since it is
+# the credential an apply authenticates with. Create the bucket once, by hand:
 #
 #   bucket="gs://$(nix eval --file nix/infra-settings.nix stateBucket --raw)"
 #   gcloud storage buckets create "$bucket" \
@@ -416,6 +454,8 @@ infra-plan:
     {{ _ensure_nix }}
     {{ _infra_sync }}
     {{ _infra_image }}
+    {{ _infra_web_dist }}
+    {{ _cloudflare_token }}
     _ensure_nix
     # Re-exec on the tool rather than on IN_NIX_SHELL: every dev shell sets that
     # variable and only this one carries tofu.
@@ -424,6 +464,8 @@ infra-plan:
     fi
     _infra_sync
     _infra_image
+    _infra_web_dist
+    _cloudflare_token
     if [ -z "$TF_VAR_image" ]; then
         # A plan writes nothing, so a placeholder here costs nothing and keeps
         # the rest of the plan readable before anything has been published.
@@ -439,12 +481,16 @@ infra-apply:
     {{ _ensure_nix }}
     {{ _infra_sync }}
     {{ _infra_image }}
+    {{ _infra_web_dist }}
+    {{ _cloudflare_token }}
     _ensure_nix
     if ! command -v tofu >/dev/null 2>&1; then
         exec nix develop .#infra --command just infra-apply
     fi
     _infra_sync
     _infra_image
+    _infra_web_dist
+    _cloudflare_token
     if [ -z "$TF_VAR_image" ]; then
         # Applying a placeholder would create a service that cannot pull, so
         # send the first run through the recipe that publishes an image.
@@ -498,6 +544,8 @@ deploy:
     set -euo pipefail
     {{ _ensure_nix }}
     {{ _infra_sync }}
+    {{ _infra_web_dist }}
+    {{ _cloudflare_token }}
     _ensure_nix
     # Re-exec on the tools rather than on IN_NIX_SHELL: every dev shell sets
     # that variable and only this one carries all three, so keying off it
@@ -512,6 +560,11 @@ deploy:
     region=$(nix eval --file nix/infra-settings.nix region --raw)
     repo=$(nix eval --file nix/infra-settings.nix artifactRepository --raw)
     service=$(nix eval --file nix/infra-settings.nix cloudRunService --raw)
+    # Resolved before the image is built, so a bundle that will not build or a
+    # credential that cannot be read stops the deploy before anything is
+    # published rather than between the push and the apply.
+    _infra_web_dist
+    _cloudflare_token
     # Cloud Run is linux/amd64; build that system's image regardless of the
     # machine driving the deploy. The --out-link pins the manifest and every
     # layer store path it names, so the push below can't race collection.
@@ -556,6 +609,56 @@ deploy:
     # From the terminal, not inherited stdin: the image build above leaves
     # stdin at EOF, which tofu reads as a refusal. That is why a first deploy
     # failed at the prompt and the cached re-run did not.
+    tofu -chdir=.infra apply < /dev/tty
+
+# ---------------------------------------------------------------------------
+# Deployment to the Cloudflare edge.
+#
+# The Worker in front of chronoscope.io serves the web bundle as static assets
+# and proxies /api to Cloud Run. Assets that match a file in the bundle are
+# answered without the script running at all, so the frontend costs no
+# invocation and the two halves share one origin: no CORS in the app, and one
+# hostname for a passkey to be bound to.
+#
+# The same shape as the image deploy above. The Worker's shape is declared
+# infrastructure (nix/infra.nix) and the bundle arrives as a variable, so this
+# recipe builds `packages.web`, names the store path it produced, and lets the
+# one tool that owns the Worker publish it. Terraform uploads the directory
+# itself, hashing each file to send only what changed, which is why there is no
+# separate wrangler step and no second place the Cloud Run URL is written down.
+#
+# Everything here is one state and one apply, so a deploy of either half plans
+# the other. That is deliberate: the checked-in declaration describes the whole
+# front of the system, and drift in either half shows up whichever one you roll.
+# ---------------------------------------------------------------------------
+
+# Build the web bundle and publish it to the Cloudflare Worker that fronts the site.
+deploy-web:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    {{ _infra_sync }}
+    {{ _infra_image }}
+    {{ _infra_web_dist }}
+    {{ _cloudflare_token }}
+    _ensure_nix
+    if ! command -v tofu >/dev/null 2>&1 || ! command -v gcloud >/dev/null 2>&1; then
+        exec nix develop .#infra --command just deploy-web
+    fi
+    _infra_web_dist
+    echo "==> Publishing $TF_VAR_web_dist"
+    _infra_sync
+    _infra_image
+    _cloudflare_token
+    if [ -z "$TF_VAR_image" ]; then
+        # The Worker's API_ORIGIN reads the Cloud Run service's URL, so there is
+        # nothing to point the proxy half at until that service exists.
+        echo "error: no image published yet. 'just deploy' builds one, pushes it," >&2
+        echo "and applies everything here with the digest the push reported." >&2
+        exit 1
+    fi
+    # From the terminal, not inherited stdin: the bundle build above leaves
+    # stdin at EOF, which tofu reads as a refusal.
     tofu -chdir=.infra apply < /dev/tty
 
 # ---------------------------------------------------------------------------

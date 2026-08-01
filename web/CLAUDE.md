@@ -64,7 +64,7 @@ because their needs diverge — same role, not redundancy:
 |---|---|---|
 | `web-dev` (dev iteration) | **Trunk** (`trunk serve`) | built-in `--proxy-backend` + `--proxy-rewrite=/api/` |
 | browser tests (`dev/tests/harness`) | minimal **axum** `ServeDir` | hand-written `proxy_api` handler (`ServeDir` can't proxy) |
-| production | **Cloudflare** (Pages + edge route) | edge route |
+| production | **Cloudflare Worker** (`nix/front-door.js`) | `fetch()` to the Cloud Run URL with `/api` sliced off |
 
 Dev uses Trunk for its live-rebuild + auto-reload. The browser tests can't use
 Trunk — they serve a fixed, hermetic prebuilt `WEB_DIST`, not a live rebuild — so

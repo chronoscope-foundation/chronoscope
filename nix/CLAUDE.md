@@ -16,10 +16,33 @@ Nix build infrastructure. One derivation module per project area;
 | `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL → SQLite facts DBs) |
 | `oci.nix`       | nix2container image for the API server (Cloud Run) + the check that boots its entrypoint, Linux systems only |
 | `infra.nix`     | terranix modules for the cloud project, the `config.tf.json` they compile to, the pinned OpenTofu, and the check that validates the two together |
-| `infra-settings.nix` | The project's cloud coordinates (project, region, registry, state bucket). Read by `infra.nix` and by the justfile via `nix eval --file`, so there is one definition |
+| `infra-settings.nix` | The project's cloud coordinates (project, region, registry, state bucket, Cloudflare account/zone). Read by `infra.nix` and by the justfile via `nix eval --file`, so there is one definition |
+| `front-door.js` | The Cloudflare Worker `infra.nix` reads inline: serves the web bundle as static assets, proxies `/api` to Cloud Run with the mount stripped |
 
 Dev shell composition lives in `flake.nix`, not in any single component
 module — it has the visibility to compose across modules.
+
+## Infrastructure modules
+
+`infra.nix` is one terranix module per provider (`gcp`, `cloudflare`),
+merged in `modules`. Provider versions come from the nixpkgs derivation
+in both places they appear (`withPlugins` and `required_providers`), so
+the tofu the shell runs and the constraint the config carries cannot
+drift.
+
+Each provider's artifact arrives as a variable rather than being baked
+into the config: `var.image` for Cloud Run, `var.web_dist` for the
+Worker's static assets. `var.web_dist` differs in one way that matters —
+the Cloudflare provider **reads that directory while planning** (it
+hashes every file to decide what to upload), so it must be a path that
+exists right now. That is why the justfile builds `packages.web` on
+every plan and apply instead of carrying the last value forward out of
+the state the way it does for the image.
+
+`checks.infra-validate` runs `tofu validate` with no credentials and no
+network, so a resource argument that does not exist fails at commit time
+rather than partway through an apply. Adding a provider means adding it
+to `withPlugins`, or `init` inside that check cannot resolve it.
 
 ## The function-with-named-instances pattern
 

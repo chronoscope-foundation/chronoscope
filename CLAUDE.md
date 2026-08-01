@@ -50,7 +50,7 @@ each other beyond what they explicitly compose.
 | `triton`   | Python analysis env + weights + rust toolchain (for schematool)  | Triton harness / serving config              |
 | `ios`      | xcodegen + swiftformat/swiftlint/xcbeautify                      | iOS project generation & Swift lint/format   |
 | `deploy`   | gcloud + skopeo (nix: transport)                                 | Pushing the API image, rolling Cloud Run     |
-| `infra`    | opentofu (google provider from nixpkgs) + gcloud                 | Declaring cloud resources with terranix      |
+| `infra`    | opentofu (google + cloudflare providers from nixpkgs) + gcloud   | Declaring cloud resources; publishing the frontend |
 
 `just` recipes pick the smallest shell that covers their target
 (e.g. `just clippy web` enters `web`, `just check triton` runs hermetically
@@ -174,6 +174,7 @@ just corpus-test-vlm        # corpus tests + VLM (needs remote Triton)
 just infra-plan             # compile the terranix modules, show what OpenTofu would change
 just infra-apply            # apply them (real cloud resources; type it yourself)
 just deploy                 # build+push the API image, deploy Cloud Run by digest
+just deploy-web             # build the web bundle, publish it to the Cloudflare Worker
 ```
 
 ### Container image
@@ -212,6 +213,24 @@ runtime service account and its startup probe. The image is the one part a
 deploy moves: `just deploy` builds it, pushes it, and hands the digest to
 `tofu apply` as a variable, so a single tool owns the service and the
 declaration keeps describing what is running.
+
+### The front door
+
+`chronoscope.io` is a Cloudflare Worker that serves the web bundle as static
+assets and proxies `/api/*` to Cloud Run with the mount stripped. Assets that
+match a file in the bundle are answered before the script runs, so only `/api`
+costs an invocation. That single origin is what removes CORS from the app and
+gives a passkey one hostname to bind to; `www` redirects to the apex, since the
+API checks WebAuthn origins against the apex exactly. Workers rather than Pages
+because Queue consumers, Image Resizing and Cron Triggers are Workers-only and
+the media pipeline wants all three.
+
+The Worker is declared alongside Cloud Run in `nix/infra.nix`, with the script
+itself in `nix/front-door.js` and the bundle arriving as a variable the way the
+image digest does. `just deploy-web` builds `packages.web` and applies; the
+provider uploads the directory, sending only the files that changed. The
+Cloudflare API token lives in Secret Manager and is read into the environment
+per run, so it never reaches the state or the repo.
 
 ### Workflow examples
 
