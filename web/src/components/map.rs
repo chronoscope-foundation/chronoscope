@@ -74,17 +74,20 @@ const BASEMAP: Basemap = Basemap {
 /// style declares attribution on none of its sources, so this string is the
 /// only place a reader can follow one from.
 ///
-/// The wording is a separate, open question, tracked with the basemap work:
-/// the three licences ask for different things (CC0 with courtesy credit,
-/// `ODbL`, public domain) and naming the sources was written before reading
-/// them. The links are what each name owes regardless of how it is worded.
+/// Only the land polygons carry an obligation. They are OSM-derived and so
+/// `ODbL`, which asks for the name in a corner of the map linking to
+/// `openstreetmap.org/copyright`; the Foundation's guidelines accept
+/// "OpenStreetMap" alone and the copyright form equally, and the latter is what
+/// an audit expects to find. OHM's data and its styles are CC0, so credit is
+/// courtesy and a copyright notice would misstate it. Natural Earth is public
+/// domain and asks for nothing; it is named because the map draws its water.
 const BASEMAP_CREDIT: [&str; 2] = [
     r#"<a href="https://maplibre.org/" target="_blank">MapLibre</a>"#,
     concat!(
         r#"<a href="https://www.openhistoricalmap.org/copyright" target="_blank">"#,
-        "OpenHistoricalMap</a>, ",
+        "OpenHistoricalMap</a>, © ",
         r#"<a href="https://www.openstreetmap.org/copyright" target="_blank">"#,
-        "OpenStreetMap</a>, ",
+        "OpenStreetMap</a> contributors, ",
         r#"<a href="https://www.naturalearthdata.com/about/terms-of-use/" target="_blank">"#,
         "Natural Earth</a>",
     ),
