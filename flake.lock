@@ -126,6 +126,18 @@
         "type": "github"
       }
     },
+    "ohm-style": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-ID4M7VaSdVXCt7ZwrGRHVNZN4iuoDTxOZqn2TgxI1zQ=",
+        "type": "file",
+        "url": "https://raw.githubusercontent.com/OpenHistoricalMap/map-styles/59503aac5f5dc5f0afac2ce326d55ef9e575b33b/dist/historical/historical.json"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://raw.githubusercontent.com/OpenHistoricalMap/map-styles/59503aac5f5dc5f0afac2ce326d55ef9e575b33b/dist/historical/historical.json"
+      }
+    },
     "root": {
       "inputs": {
         "crane": "crane",
@@ -133,6 +145,7 @@
         "flake-utils": "flake-utils",
         "nix2container": "nix2container",
         "nixpkgs": "nixpkgs",
+        "ohm-style": "ohm-style",
         "terranix": "terranix"
       }
     },

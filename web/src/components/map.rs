@@ -33,9 +33,62 @@ pub(crate) fn to_js<T: Serialize>(value: &T) -> Result<JsValue, serde_wasm_bindg
 
 // ==================== Constants ====================
 
-/// `OpenFreeMap` Liberty style — a free, open-source map style.
-/// <https://openfreemap.org/>
-const MAP_STYLE_URL: &str = "https://tiles.openfreemap.org/styles/liberty";
+/// A basemap style and the layer entity labels take their font and text paint
+/// from. The label layer id and font family belong to the style, so they are
+/// written down beside the style URL rather than at the sites that read them.
+struct Basemap {
+    style_url: &'static str,
+    label_layer: &'static str,
+    /// The font family the style's glyph endpoint serves, which entity labels
+    /// are drawn in. A stack the endpoint has no range files for comes back
+    /// 404 and the labels go unrendered, so this names one it does serve.
+    label_font: &'static str,
+}
+
+/// `OpenHistoricalMap`: one time-agnostic vector tileset carrying the decimal
+/// dates the time slider filters the map by (see [`crate::ohm`]).
+/// <https://www.openhistoricalmap.org/>
+///
+/// The style document is pinned in `flake.nix` and served from our own origin,
+/// so the map draws the style this build was made against. Its tiles, glyphs
+/// and sprites are named inside it by absolute URL and come from OHM.
+///
+/// `style_url` is the reading half of a path the build writes the document to.
+/// The writing half is `ohmStylePath` in `flake.nix`, the same path unrooted,
+/// which both the production dist and the dev server stage from; the browser
+/// filter test fetches this path off the served bundle, so the two halves
+/// disagreeing fails there.
+const BASEMAP: Basemap = Basemap {
+    style_url: "/basemap/ohm-historical.json",
+    label_layer: "city_labels_z11",
+    label_font: "OpenHistorical",
+};
+
+/// Everyone the map credits: the renderer, then the data the basemap draws. The
+/// style carries its own at the root, where the style spec defines no
+/// attribution and `MapLibre` reads none, so the map states it here.
+///
+/// `customAttribution` is the whole of what the control draws, and its default
+/// value is `MapLibre`'s own credit, so setting it takes that credit on. It is
+/// read as HTML, which is how each name reaches its own licence: the pinned
+/// style declares attribution on none of its sources, so this string is the
+/// only place a reader can follow one from.
+///
+/// The wording is a separate, open question, tracked with the basemap work:
+/// the three licences ask for different things (CC0 with courtesy credit,
+/// `ODbL`, public domain) and naming the sources was written before reading
+/// them. The links are what each name owes regardless of how it is worded.
+const BASEMAP_CREDIT: [&str; 2] = [
+    r#"<a href="https://maplibre.org/" target="_blank">MapLibre</a>"#,
+    concat!(
+        r#"<a href="https://www.openhistoricalmap.org/copyright" target="_blank">"#,
+        "OpenHistoricalMap</a>, ",
+        r#"<a href="https://www.openstreetmap.org/copyright" target="_blank">"#,
+        "OpenStreetMap</a>, ",
+        r#"<a href="https://www.naturalearthdata.com/about/terms-of-use/" target="_blank">"#,
+        "Natural Earth</a>",
+    ),
+];
 
 /// Initial map center: Rome, Italy (roughly central in the Mediterranean).
 const INITIAL_CENTER_LNG: f64 = 12.4964;
@@ -235,6 +288,65 @@ fn bump_and_dispatch(
 fn record_fetch_settled() {
     bump_and_dispatch(&FETCH_SETTLED, FETCH_COMPLETE_EVENT);
 }
+
+/// The basemap layer entity labels take their font from. Exposed so the font
+/// test reads the id from here rather than restating it.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn basemap_label_layer() -> &'static str {
+    BASEMAP.label_layer
+}
+
+/// Where the basemap style document is fetched from. Exposed so the filter test
+/// reads the same document the map did, without restating the path.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn basemap_style_url() -> &'static str {
+    BASEMAP.style_url
+}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// Ids whose labels the rewrite actually wrote. Exposed so the localization
+    /// test holds the style against what was done to it, rather than re-running
+    /// the selector as its own assertion.
+    static LABEL_REWRITE_TARGETS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn label_rewrite_targets() -> BTreeSet<String> {
+    LABEL_REWRITE_TARGETS.with(|ids| ids.borrow().clone())
+}
+
+#[cfg(feature = "test-hooks")]
+fn record_label_rewrite_targets(ids: &[String]) {
+    LABEL_REWRITE_TARGETS.with(|targets| {
+        *targets.borrow_mut() = ids.iter().cloned().collect();
+    });
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn record_label_rewrite_targets(_ids: &[String]) {}
+
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    /// Ids the snapshot kept without their own filter (see
+    /// [`BasemapStyle::dropped_filters`]).
+    static DROPPED_BASEMAP_FILTERS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) fn dropped_basemap_filters() -> BTreeSet<String> {
+    DROPPED_BASEMAP_FILTERS.with(|ids| ids.borrow().clone())
+}
+
+#[cfg(feature = "test-hooks")]
+fn record_dropped_basemap_filters(ids: &[String]) {
+    DROPPED_BASEMAP_FILTERS.with(|dropped| {
+        *dropped.borrow_mut() = ids.iter().cloned().collect();
+    });
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn record_dropped_basemap_filters(_ids: &[String]) {}
 
 /// Name of the symbol layer for thumbnail markers.
 const ENTITY_THUMBNAILS_LAYER: &str = "entity-thumbnails";
@@ -1113,6 +1225,12 @@ impl EntityLayer {
                 "filter": ["all", ["has", "name"], ctx.not_cluster],
                 "layout": {
                     "text-field": ["get", "name"],
+                    // The basemap's own label layer is copied over this where it
+                    // is found, so the two match exactly. Naming the family here
+                    // is what keeps the names on screen when it is not: the
+                    // renderer's default stack names families the style's glyph
+                    // endpoint has no range files for.
+                    "text-font": [BASEMAP.label_font],
                     "text-size": 12,
                     "text-anchor": "top",
                     "text-offset": [0, 0.8],
@@ -1155,29 +1273,65 @@ impl EntityLayer {
     }
 }
 
+/// The text paint entity labels take from the basemap's label layer. Our own
+/// spec names none of these, so each one matching is the copy's own doing.
+const COPIED_TEXT_PAINT: [&str; 4] = [
+    "text-color",
+    "text-halo-color",
+    "text-halo-width",
+    "text-halo-blur",
+];
+
+/// The text paint properties entity labels take from the basemap. Exposed so
+/// the label test iterates what the copy copies, and a property added here is
+/// covered from the moment it is added.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn copied_text_paint() -> &'static [&'static str] {
+    &COPIED_TEXT_PAINT
+}
+
 /// Take the label layer's font and text paint from the basemap's own city
 /// labels, so entity names match whichever style is loaded.
+///
+/// The spec arrives carrying [`Basemap::label_font`], so this is the exact match
+/// on top of a family the style's glyph endpoint already serves.
 fn copy_basemap_label_style(map: &maplibre::Map, spec: &JsValue) -> Result<(), String> {
-    let basemap = "label_city";
+    let basemap = BASEMAP.label_layer;
     let layout = js_sys::Reflect::get(spec, &"layout".into())
         .map_err(|e| format!("failed to read layout from the labels spec: {e:?}"))?;
     let font = map.get_layout_property(basemap, "text-font");
-    if !font.is_undefined() {
+    if font.is_undefined() {
+        // Warned and survivable, like a ring sprite that fails to register:
+        // entity names keep the family the spec named, where returning an error
+        // would take out every layer this spec is on the way to adding.
+        web_sys::console::warn_1(
+            &format!(
+                "basemap layer '{basemap}' has no text-font, so entity labels keep {}",
+                BASEMAP.label_font
+            )
+            .into(),
+        );
+    } else {
         let _ = js_sys::Reflect::set(&layout, &"text-font".into(), &font);
     }
-    let paint = js_sys::Object::new();
-    for prop in &[
-        "text-color",
-        "text-halo-color",
-        "text-halo-width",
-        "text-halo-blur",
-    ] {
+    // Merged into whatever the spec already paints with, the same way the font
+    // is merged into its layout: the copy owns the properties it names and the
+    // spec keeps the rest.
+    let paint = js_sys::Reflect::get(spec, &"paint".into())
+        .map_err(|e| format!("failed to read paint from the labels spec: {e:?}"))?;
+    let paint = if paint.is_object() {
+        paint
+    } else {
+        let fresh = JsValue::from(js_sys::Object::new());
+        let _ = js_sys::Reflect::set(spec, &"paint".into(), &fresh);
+        fresh
+    };
+    for prop in COPIED_TEXT_PAINT {
         let val = map.get_paint_property(basemap, prop);
         if !val.is_undefined() {
-            let _ = js_sys::Reflect::set(&paint, &(*prop).into(), &val);
+            let _ = js_sys::Reflect::set(&paint, &prop.into(), &val);
         }
     }
-    let _ = js_sys::Reflect::set(spec, &"paint".into(), &paint);
     Ok(())
 }
 
@@ -1251,6 +1405,243 @@ fn clear_source_data(map: &maplibre::Map, source_id: &str) {
     if let Ok(js) = to_js(&empty) {
         update_source_data(map, source_id, &js);
     }
+}
+
+// ==================== Basemap style rewrites ====================
+
+/// What the style is read for once it has loaded, in one pass over its layers.
+struct BasemapStyle {
+    /// Every basemap layer's own filter, keyed by layer id.
+    ///
+    /// OHM's tileset is time-agnostic: a feature carries the decimal years it
+    /// began and ended, and the instant is applied by rewriting the filters.
+    /// Keeping what the style shipped is what makes re-application idempotent,
+    /// since each instant rebuilds from the original rather than wrapping the
+    /// previous instant's clauses.
+    filters: BTreeMap<String, Option<serde_json::Value>>,
+    /// Ids of the layers drawing OHM's local `name`, which are the ones the
+    /// reader's own language is written over.
+    raw_name_labels: Vec<String>,
+    /// Ids whose own filter the snapshot could not keep, so the layer is
+    /// filtered by time alone. Reported so a test asking "is every layer still
+    /// filtered by what the style asks of it" can tell this handled case from a
+    /// filter that went missing.
+    dropped_filters: Vec<String>,
+}
+
+/// Read the loaded style: each basemap layer's filter to rewind from, and the
+/// labels to translate.
+///
+/// A `source-layer` is what marks a layer as the vector tileset's; the layers we
+/// add ourselves draw from a GeoJSON source and carry none.
+fn read_basemap_style(map: &maplibre::Map) -> BasemapStyle {
+    let mut read_style = BasemapStyle {
+        filters: BTreeMap::new(),
+        raw_name_labels: Vec::new(),
+        dropped_filters: Vec::new(),
+    };
+    let style = map.get_style();
+    // Both ways out of here leave an empty snapshot, which every filter pass for
+    // the rest of the session bails on: the basemap draws every era at once and
+    // this is the only place that knows why.
+    let Ok(layers) = js_sys::Reflect::get(&style, &"layers".into()) else {
+        web_sys::console::warn_1(
+            &"the loaded basemap style has no layers, so the map cannot be rewound to an instant"
+                .into(),
+        );
+        return read_style;
+    };
+    let Ok(layers) = layers.dyn_into::<js_sys::Array>() else {
+        web_sys::console::warn_1(
+            &"the loaded basemap style's layers are not a list, so the map cannot be rewound to \
+              an instant"
+                .into(),
+        );
+        return read_style;
+    };
+
+    for layer in layers.iter() {
+        let read = |key: &str| js_sys::Reflect::get(&layer, &key.into()).ok();
+        let Some(id) = read("id").and_then(|v| v.as_string()) else {
+            continue;
+        };
+        let Some(source_layer) = read("source-layer") else {
+            continue;
+        };
+        if source_layer.is_undefined() {
+            continue;
+        }
+        // Behind the `source-layer` guard, so a re-read of the style after our
+        // own layers are on it selects the basemap's labels and not ours.
+        if draws_the_raw_name(&layer) {
+            read_style.raw_name_labels.push(id.clone());
+        }
+        // A layer the style filters nothing on has to stay `None`: MapLibre
+        // rejects `["all", start, end, null]` outright.
+        //
+        // A filter we can't reproduce lands there too, and says so once. The
+        // layer keeps its place on the map and its instant, and over-draws
+        // inside it; dropped from the snapshot instead, it would draw
+        // present-day content at every instant.
+        let original = match read("filter").filter(|f| !f.is_undefined() && !f.is_null()) {
+            None => None,
+            Some(filter) => match serde_wasm_bindgen::from_value::<serde_json::Value>(filter) {
+                Ok(value) if crate::ohm::splices_as_expression(&value) => Some(value),
+                Ok(value) => {
+                    web_sys::console::warn_1(
+                        &format!(
+                            "basemap layer '{id}' is filtered by time alone: its own filter is \
+                             MapLibre's legacy syntax, {value}"
+                        )
+                        .into(),
+                    );
+                    read_style.dropped_filters.push(id.clone());
+                    None
+                }
+                Err(e) => {
+                    web_sys::console::warn_1(
+                        &format!(
+                            "basemap layer '{id}' is filtered by time alone: its own filter \
+                             didn't read, {e}"
+                        )
+                        .into(),
+                    );
+                    read_style.dropped_filters.push(id.clone());
+                    None
+                }
+            },
+        };
+        read_style.filters.insert(id, original);
+    }
+    read_style
+}
+
+/// Whether a layer's label is OHM's local `name`, the form every one of its
+/// symbol layers ships with. Matching the whole expression keeps the rewrite to
+/// the labels that name a place, which is what has a name in another language.
+fn draws_the_raw_name(layer: &JsValue) -> bool {
+    let Ok(layout) = js_sys::Reflect::get(layer, &"layout".into()) else {
+        return false;
+    };
+    let Ok(text_field) = js_sys::Reflect::get(&layout, &"text-field".into()) else {
+        return false;
+    };
+    serde_wasm_bindgen::from_value::<serde_json::Value>(text_field)
+        .is_ok_and(|field| field == serde_json::json!(["get", "name"]))
+}
+
+/// Label the basemap in the reader's language, so its place names and our
+/// markers' agree: the server negotiates a marker's display name from the
+/// request's `Accept-Language`, down to the same primary subtag the tiles key
+/// their names by.
+///
+/// Written once, at style load. The language a reader reads in doesn't move with
+/// the time slider, so it stays clear of the per-instant filter pass.
+///
+/// A throw is the map having been removed, so the pass stops there: the layers
+/// behind it belong to the same gone map. Whatever a single layer makes of the
+/// expression comes back as an `error` event, which the map's error handler
+/// logs.
+///
+/// The ids it got as far as writing are what it records, since a reader whose
+/// browser names no language we can key on gets no rewrite at all.
+fn localize_basemap_labels(map: &maplibre::Map, layers: &[String]) {
+    let mut rewritten = Vec::new();
+    if let Some(text_field) = crate::ohm::reader_text_field() {
+        match to_js(&text_field) {
+            Err(_) => {
+                web_sys::console::warn_1(&"the localized label expression didn't reach JS".into());
+            }
+            Ok(text_field) => {
+                let options = maplibre::skip_validation();
+                for id in layers {
+                    if let Err(e) = map.set_layout_property(id, "text-field", &text_field, &options)
+                    {
+                        web_sys::console::warn_1(
+                            &format!("the basemap label rewrite stopped at '{id}': {e:?}").into(),
+                        );
+                        break;
+                    }
+                    rewritten.push(id.clone());
+                }
+            }
+        }
+    }
+    record_label_rewrite_targets(&rewritten);
+}
+
+/// Rewrite every snapshotted layer's filter to the instant the map is rewound
+/// to. This is the whole of what a scrub does to the basemap: no refetch, no new
+/// cache key, ~250 filters rebuilt.
+///
+/// Called on each of the four paths that reach the map (load, moveend, retry,
+/// scrub) ahead of the entity fetch those paths go on to make, so a session
+/// whose API configuration never loads still follows the slider. The basemap
+/// draws from OHM's own tiles and needs nothing of ours to rewind.
+///
+/// Latching the instant keeps a pan from redoing the work, and the three bails
+/// are the three ways a pass has no claim to latch. An unmounted component is
+/// one whose map `on_cleanup` has removed. An empty snapshot is a pass that beat
+/// the style's load: `register_moveend_handler` and `effect_refetch_on_as_of`
+/// are both armed at map construction, so a drag or a scrub during the style
+/// fetch arrives here first, and the load pass behind it is the one that rewinds
+/// the map. A throw is the map having been removed, which a remount reaches by
+/// replacing the map under a pass parked on an await.
+///
+/// Whatever a single layer makes of its filter comes back as an `error` event,
+/// which the map's error handler logs.
+fn apply_basemap_filters(map: &maplibre::Map, state: &MapState) {
+    if state.disposed.get() {
+        return;
+    }
+
+    let as_of = state.as_of.get();
+    if state.filtered_as_of.get() == Some(as_of) {
+        return;
+    }
+
+    let snapshot = state.basemap_filters.borrow();
+    if snapshot.is_empty() {
+        return;
+    }
+
+    let bounds = crate::ohm::ohm_day_bounds(as_of);
+    let options = maplibre::skip_validation();
+    for (id, original) in snapshot.iter() {
+        let filter = crate::ohm::layer_filter(bounds, original.as_ref());
+        let Ok(js) = to_js(&filter) else {
+            web_sys::console::warn_1(
+                &format!("basemap layer '{id}' time filter didn't reach JS: {filter}").into(),
+            );
+            continue;
+        };
+        if let Err(e) = map.set_filter(id, &js, &options) {
+            web_sys::console::warn_1(
+                &format!("the basemap time filter pass stopped at '{id}': {e:?}").into(),
+            );
+            return;
+        }
+    }
+
+    state.filtered_as_of.set(Some(as_of));
+}
+
+thread_local! {
+    /// Basemap sources already named in the console by
+    /// [`warn_basemap_error_once`].
+    static WARNED_BASEMAP_SOURCES: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
+}
+
+/// Name a basemap source that failed, once. `MapLibre` reports a failure per
+/// tile, so an endpoint that has gone away says so for every tile the session
+/// asks for, and the one line that carries the news is worth more than the
+/// thousand behind it.
+fn warn_basemap_error_once(source: &str, message: &str) {
+    WARNED_BASEMAP_SOURCES.with(|warned| {
+        if warned.borrow_mut().insert(source.to_string()) {
+            web_sys::console::warn_1(&format!("basemap error from {source}: {message}").into());
+        }
+    });
 }
 
 // ==================== Entity fetching ====================
@@ -2754,6 +3145,7 @@ fn register_moveend_handler(
         // the JS garbage collector after the timer fires.
         let timeout_cb = Closure::once_into_js(move || {
             st.debounce_timer.set(None);
+            apply_basemap_filters(&map_ref, &st);
             let st_pass = st.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let Some(client) = api::get_or_init_client(&st_pass.api_client).await else {
@@ -2831,6 +3223,14 @@ struct MapState {
     /// (drop it — markers labelled with a date they don't belong to are worse
     /// than none).
     rendered_as_of: Rc<Cell<Option<NaiveDate>>>,
+    /// Each basemap layer's filter as the style loaded it, keyed by layer id.
+    /// Every instant's filters are built from these, so re-applying is
+    /// idempotent (see [`BasemapStyle::filters`]).
+    basemap_filters: Rc<RefCell<BTreeMap<String, Option<serde_json::Value>>>>,
+    /// The instant the basemap's own layers are currently filtered to. Set by a
+    /// pass that had a snapshot to rewind from and a map to write it to, so a
+    /// pass that ran before the style loaded leaves the work to the next one.
+    filtered_as_of: Rc<Cell<Option<NaiveDate>>>,
 }
 
 /// What a MapLibre `error` event is about, read off the source it names.
@@ -2900,12 +3300,16 @@ fn initialize_map(
     let map = match maplibre::create_map(
         el,
         &maplibre::MapOptions {
-            style: MAP_STYLE_URL,
+            style: BASEMAP.style_url,
             center: [INITIAL_CENTER_LNG, INITIAL_CENTER_LAT],
             zoom: INITIAL_ZOOM,
             max_zoom: f64::from(MAX_ZOOM),
             min_zoom: f64::from(MIN_ZOOM),
             fade_duration: SYMBOL_FADE_MS,
+            attribution_control: maplibre::AttributionControl {
+                custom_attribution: &BASEMAP_CREDIT,
+                compact: true,
+            },
         },
     ) {
         Ok(map) => map,
@@ -2928,6 +3332,15 @@ fn initialize_map(
     let load_cb = Closure::<dyn Fn()>::new(move || {
         let map_ref = map_for_load.clone();
         let st2 = st.clone();
+
+        // Before anything that can fail: this callback returns early on a layer
+        // failure, and the retry path would then keep driving passes with no
+        // snapshot to rewind the basemap from.
+        let basemap_style = read_basemap_style(&map_ref);
+        *st.basemap_filters.borrow_mut() = basemap_style.filters;
+        record_dropped_basemap_filters(&basemap_style.dropped_filters);
+        localize_basemap_labels(&map_ref, &basemap_style.raw_name_labels);
+        apply_basemap_filters(&map_ref, &st);
 
         // A map missing a layer cannot be clicked at all, so this is surfaced
         // rather than logged: the alert strip is the only sign the reader gets
@@ -2965,8 +3378,17 @@ fn initialize_map(
     state.closures.borrow_mut().push(moveend_closure);
 
     let error_cb = Closure::<dyn Fn(JsValue)>::new(move |event: JsValue| {
+        let message = map_error_message(&event);
         if MapErrorScope::of(&event).surfaced() {
-            set_map_error.set(Some(map_error_message(&event)));
+            set_map_error.set(Some(message));
+        } else {
+            // On screen a dead tile server and an instant OHM holds little data
+            // for look alike, so the console is where they differ.
+            let source = js_sys::Reflect::get(&event, &"sourceId".into())
+                .ok()
+                .and_then(|id| id.as_string())
+                .unwrap_or_else(|| "style".to_string());
+            warn_basemap_error_once(&source, &message);
         }
     });
     map.on("error", error_cb.as_ref());
@@ -2999,6 +3421,10 @@ fn effect_mount_map(
         state.closures.borrow_mut().clear();
         state.thumbnail_urls.borrow_mut().clear();
         state.source_initialized.set(false);
+        // The new map loads its own style, so both the snapshot and the instant
+        // it was filtered to belong to the map being replaced.
+        state.basemap_filters.borrow_mut().clear();
+        state.filtered_as_of.set(None);
 
         if let Some(map) = initialize_map(&el, &state, signals, set_selected, set_map_error) {
             *map_handle.borrow_mut() = Some(map);
@@ -3119,10 +3545,13 @@ fn effect_retry_on_signal(
     Effect::new(move || {
         if retry_signal.get() {
             set_retry.set(false);
-            let map_ref = map_handle.borrow();
-            if let Some(map) = map_ref.as_ref() {
-                let map = map.clone();
+            // Cloned out of the handle rather than read through it, since the
+            // filter pass below drives MapLibre, whose error event runs our own
+            // handler while a borrow would still be live.
+            let map = map_handle.borrow().as_ref().cloned();
+            if let Some(map) = map {
                 let st = state.clone();
+                apply_basemap_filters(&map, &st);
                 wasm_bindgen_futures::spawn_local(async move {
                     let Some(client) = api::get_or_init_client(&st.api_client).await else {
                         signals
@@ -3158,10 +3587,13 @@ fn effect_refetch_on_as_of(
     let timer_map = Rc::clone(&map_handle);
     let timeout_cb: Rc<Closure<dyn Fn()>> = Rc::new(Closure::new(move || {
         timer_state.debounce_timer.set(None);
-        let map_ref = timer_map.borrow();
-        let Some(map) = map_ref.as_ref() else { return };
-        let map = map.clone();
+        // Cloned out of the handle rather than read through it, since the
+        // filter pass below drives MapLibre, whose error event runs our own
+        // handler while a borrow would still be live.
+        let map = timer_map.borrow().as_ref().cloned();
+        let Some(map) = map else { return };
         let st_pass = timer_state.clone();
+        apply_basemap_filters(&map, &st_pass);
         wasm_bindgen_futures::spawn_local(async move {
             let Some(client) = api::get_or_init_client(&st_pass.api_client).await else {
                 signals
@@ -3272,6 +3704,8 @@ pub fn MapView(
         disposed: Rc::new(Cell::new(false)),
         as_of: Rc::new(Cell::new(initial_as_of)),
         rendered_as_of: Rc::new(Cell::new(None)),
+        basemap_filters: Rc::new(RefCell::new(BTreeMap::new())),
+        filtered_as_of: Rc::new(Cell::new(None)),
     };
     effect_mount_map(
         container,

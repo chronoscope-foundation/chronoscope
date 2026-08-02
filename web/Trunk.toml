@@ -29,3 +29,15 @@ command_arguments = [
   "-c",
   "mkdir -p \"$TRUNK_STAGING_DIR/fonts\" && cp \"$CHRONOSCOPE_WEB_FONTS\"/* \"$TRUNK_STAGING_DIR/fonts/\"",
 ]
+
+# Same staging for the pinned basemap style. Both the document and the path it
+# goes to come from the nix shell, so the dev server hands out the same document
+# at the same path the production dist does. `set -u` keeps an unset path a
+# failure instead of a file staged somewhere the map never looks.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = [
+  "-c",
+  "set -u; mkdir -p \"$TRUNK_STAGING_DIR/$(dirname \"$CHRONOSCOPE_OHM_STYLE_PATH\")\" && cp \"$CHRONOSCOPE_OHM_STYLE\" \"$TRUNK_STAGING_DIR/$CHRONOSCOPE_OHM_STYLE_PATH\"",
+]

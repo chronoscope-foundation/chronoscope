@@ -16,6 +16,7 @@ doc-valid-idents = [
     "MediaWiki",
     "OpenAPI",
     "OpenFreeMap",
+    "OpenHistoricalMap",
     "OpenStreetMap",
     "SQLite",
     "SpatiaLite",

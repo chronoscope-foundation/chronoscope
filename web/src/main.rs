@@ -3,6 +3,7 @@ mod app;
 mod components;
 mod content;
 mod maplibre;
+mod ohm;
 mod pages;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;

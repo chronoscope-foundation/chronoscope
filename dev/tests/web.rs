@@ -947,6 +947,312 @@ async fn test_thumbnails_layer_above_labels() -> TestResult {
     .await
 }
 
+/// Entity names are drawn in the basemap's own label style, so they read as part
+/// of the map rather than as something laid over it.
+///
+/// `copy_basemap_label_style` writes only when it finds the layer it copies
+/// from, so a label-layer id the style doesn't carry leaves entity labels on the
+/// bare spec. The text paint is what carries this test: our spec names none of
+/// it, while it names a font family of its own that the pinned style happens to
+/// share, so the two fonts agree on either outcome. Which properties the copy
+/// covers comes from the copy itself, and comparing each against whatever the
+/// basemap layer carries keeps the assertion independent of the values the style
+/// ships.
+#[tokio::test]
+async fn test_entity_labels_take_the_basemap_font() -> TestResult {
+    web_test(async |t| {
+        t.goto("/").await?;
+        t.wait_for_map_idle().await?;
+
+        let layers = t.style_layers("text-font").await?;
+        let basemap = layers
+            .iter()
+            .find(|layer| layer["basemap_label"] == true)
+            .ok_or("the style carries no layer under the id entity labels copy their font from")?;
+        check(
+            !basemap["layout"].is_null(),
+            "the basemap's label layer must carry a text-font, or there is nothing to copy",
+        )?;
+
+        let labels = layers
+            .iter()
+            .find(|layer| layer["id"] == "entity-labels")
+            .ok_or("entity-labels layer not found")?;
+
+        let copied = t.copied_text_paint().await?;
+        check(
+            !copied.is_empty(),
+            "the copy must name text paint properties, or this asserts nothing at all",
+        )?;
+        for property in &copied {
+            let expected = &basemap["paint"][property];
+            check(
+                !expected.is_null(),
+                format!(
+                    "the basemap's label layer must carry {property}, or there is nothing to copy"
+                ),
+            )?;
+            check(
+                &labels["paint"][property] == expected,
+                format!(
+                    "entity labels must take {property} from the basemap's own labels ({expected}), \
+                     got {}",
+                    labels["paint"][property]
+                ),
+            )?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// 1850-07-01, the instant the slider emits for a year, as the decimal-year
+/// interval that day occupies. 1850 is a common year, so July 1 is day 181 of
+/// 365 and the day ends at day 182. Written out rather than computed, since
+/// `chronoscope-dev` doesn't depend on the web crate.
+const SCRUBBED_DAY_LO: f64 = 1850.495890410959;
+const SCRUBBED_DAY_HI: f64 = 1850.4986301369863;
+
+/// The bounds reach the test through JSON, so they are compared rather than
+/// matched. Anything this test is for is off by whole days at least.
+const DECDATE_TOLERANCE: f64 = 1e-9;
+
+/// The bound a clause compares `field` against, if the clause is the one the
+/// time filter builds: `["any", ["!", ["has", field]], [op, ["get", field], b]]`.
+fn decdate_bound(clause: &serde_json::Value, field: &str, op: &str) -> Option<f64> {
+    let parts = clause.as_array()?;
+    if parts.first()? != "any" || parts.get(1)? != &serde_json::json!(["!", ["has", field]]) {
+        return None;
+    }
+    let compare = parts.get(2)?.as_array()?;
+    if compare.first()? != op || compare.get(1)? != &serde_json::json!(["get", field]) {
+        return None;
+    }
+    compare.get(2)?.as_f64()
+}
+
+/// JSON equality that reads `1` and `1.0` as the same number. The served
+/// document is compared against a filter that has been through JS, where every
+/// number is a double, so which `serde_json::Number` variant a literal lands in
+/// belongs to the parser rather than to the style.
+fn same_json(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same_json(x, y))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(key, x)| y.get(key).is_some_and(|y| same_json(x, y)))
+        }
+        _ => a == b,
+    }
+}
+
+/// Scrubbing the slider rewrites every basemap layer's filter, which is the
+/// whole of how the basemap rewinds: the tileset is time-agnostic and the
+/// instant is applied client-side, per layer.
+///
+/// The two date clauses are the instant's, and the layer's own filter rides
+/// along as a third. What that third clause has to be comes from the style
+/// document itself, fetched from the same origin the map fetched it from: a
+/// layer the document filters must still be filtered by it. Reading the
+/// requirement off the served document rather than off the page's own snapshot
+/// is what makes the assertion independent of the bookkeeping it is checking.
+///
+/// A filter the snapshot cannot reproduce is deliberately left off, keeping its
+/// layer on the map and filtered by the instant alone, so the page reports which
+/// layers those are and they are held to the two clauses. That set is asserted
+/// empty in its own right, since the pinned style is written in expression
+/// syntax throughout: a style bump bringing a legacy filter in reads as the bump
+/// it is, and a filter that has gone missing still reads as that.
+///
+/// A layer carrying a `source-layer` is one of the basemap's; our entity layers
+/// draw from a GeoJSON source and carry none.
+#[tokio::test]
+async fn test_scrubbing_the_slider_filters_every_basemap_layer() -> TestResult {
+    web_test(async |t| {
+        t.goto("/").await?;
+        t.wait_for_map_idle().await?;
+        // Drain the mount fetch, so the scrub below is the pass that settles.
+        t.wait_for_fetch_settled_after(0.0).await?;
+        t.set_time_slider_year(1850.0).await?;
+
+        let style = t.frontend_json(&t.basemap_style_url().await?).await?;
+        let pinned: std::collections::BTreeMap<&str, &serde_json::Value> = style["layers"]
+            .as_array()
+            .ok_or("the served basemap style names no layers")?
+            .iter()
+            .filter(|layer| !layer["source-layer"].is_null() && !layer["filter"].is_null())
+            .filter_map(|layer| Some((layer["id"].as_str()?, &layer["filter"])))
+            .collect();
+        check(
+            !pinned.is_empty(),
+            "the served style must carry filtered vector layers, or the third clause is untested",
+        )?;
+
+        let layers = t.style_layers("text-font").await?;
+        let basemap: Vec<_> = layers
+            .iter()
+            .filter(|layer| layer["source_layer"] == true)
+            .collect();
+        check(
+            !basemap.is_empty(),
+            "the basemap style must contribute vector layers, or this asserts nothing at all",
+        )?;
+
+        for layer in basemap {
+            let id = &layer["id"];
+            let filter = &layer["filter"];
+            let clauses = filter
+                .as_array()
+                .ok_or_else(|| format!("{id} carries no filter after a scrub, but {filter}"))?;
+            check(
+                clauses.first() == Some(&serde_json::json!("all")),
+                format!("{id}'s filter must be an `all` over the date clauses, got {filter}"),
+            )?;
+
+            let start = clauses
+                .get(1)
+                .and_then(|clause| decdate_bound(clause, "start_decdate", "<"))
+                .ok_or_else(|| format!("{id}'s first clause is not the start one: {filter}"))?;
+            check(
+                (start - SCRUBBED_DAY_HI).abs() < DECDATE_TOLERANCE,
+                format!("{id} must draw what began before {SCRUBBED_DAY_HI}, got {start}"),
+            )?;
+
+            let end = clauses
+                .get(2)
+                .and_then(|clause| decdate_bound(clause, "end_decdate", ">="))
+                .ok_or_else(|| format!("{id}'s second clause is not the end one: {filter}"))?;
+            check(
+                (end - SCRUBBED_DAY_LO).abs() < DECDATE_TOLERANCE,
+                format!("{id} must draw what had not ended by {SCRUBBED_DAY_LO}, got {end}"),
+            )?;
+        }
+
+        let dropped: std::collections::BTreeSet<String> =
+            t.basemap_filters_dropped().await?.into_iter().collect();
+
+        let live: std::collections::BTreeMap<&str, &serde_json::Value> = layers
+            .iter()
+            .filter_map(|layer| Some((layer["id"].as_str()?, &layer["filter"])))
+            .collect();
+        for (id, original) in pinned {
+            if dropped.contains(id) {
+                continue;
+            }
+            let filter = live.get(id).ok_or_else(|| {
+                format!("the style filters {id}, but the map draws no such layer")
+            })?;
+            check(
+                filter.as_array().map(Vec::len) == Some(4)
+                    && filter
+                        .get(3)
+                        .is_some_and(|clause| same_json(clause, original)),
+                format!(
+                    "{id} must still be filtered by what the style asks of it, {original}, \
+                     beside the instant's own two clauses; got {filter}"
+                ),
+            )?;
+        }
+
+        // Behind the clause-by-clause requirement, so a filter that really has
+        // gone missing reports as itself and this reports as a style bump.
+        check(
+            dropped.is_empty(),
+            format!(
+                "the pinned style asks nothing the snapshot cannot reproduce, so no layer should \
+                 be left filtered by time alone; these are: {dropped:?}"
+            ),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
+/// The `name_<lang>` key a localized label reads, if the text-field is the one
+/// the load pass writes: `["coalesce", ["get", "name_<lang>"], ["get", "name"]]`.
+fn label_language(text_field: &serde_json::Value) -> Option<&str> {
+    let parts = text_field.as_array()?;
+    if parts.first()? != "coalesce" || parts.get(2)? != &serde_json::json!(["get", "name"]) {
+        return None;
+    }
+    let localized = parts.get(1)?.as_array()?;
+    if localized.first()? != "get" {
+        return None;
+    }
+    let language = localized.get(1)?.as_str()?.strip_prefix("name_")?;
+    (!language.is_empty()).then_some(language)
+}
+
+/// The basemap names places in the language the reader's browser asks for, which
+/// is the language our own markers are labelled in: the server negotiates a
+/// display name from the request's `Accept-Language`.
+///
+/// OHM ships every symbol layer reading the raw local `name`. Which language the
+/// browser running this asks for is its own business, so the expectation is read
+/// off `navigator.language` in the page and reduced here to the primary subtag
+/// the tiles key their names by: a rewrite that ignored the browser's locale, or
+/// wrote `name_en-US` where the tiles carry `name_en`, disagrees with it.
+///
+/// The hook reports what the rewrite wrote, so the assertion is held against
+/// that rather than against the same predicate the rewrite selected on, which a
+/// layer the selector missed would satisfy for free.
+#[tokio::test]
+async fn test_basemap_labels_are_drawn_in_the_readers_language() -> TestResult {
+    web_test(async |t| {
+        t.goto("/").await?;
+        t.wait_for_map_idle().await?;
+
+        let locale = t.navigator_language().await?;
+        let reader = locale
+            .as_deref()
+            .map(|locale| {
+                locale
+                    .split('-')
+                    .next()
+                    .unwrap_or(locale)
+                    .to_ascii_lowercase()
+            })
+            .filter(|primary| !primary.is_empty())
+            .ok_or_else(|| {
+                format!("this browser names no language ({locale:?}), so the map has none to draw")
+            })?;
+
+        let layers = t.style_layers("text-field").await?;
+        let rewritten: Vec<_> = layers
+            .iter()
+            .filter(|layer| layer["label_rewrite_target"] == true)
+            .collect();
+        check(
+            !rewritten.is_empty(),
+            format!(
+                "the label rewrite must reach layers to translate into {reader}, or this asserts \
+                 nothing at all"
+            ),
+        )?;
+
+        for layer in rewritten {
+            let (id, field) = (&layer["id"], &layer["layout"]);
+            let language = label_language(field).ok_or_else(|| {
+                format!(
+                    "{id} was rewritten for the reader's language, so it must read a \
+                     name_<lang> with the local name behind it, got {field}"
+                )
+            })?;
+            check(
+                language == reader,
+                format!("{id} names places in {language} where the browser reads {reader}"),
+            )?;
+        }
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test]
 async fn test_entity_click_opens_detail() -> TestResult {
     web_test(async |t| {

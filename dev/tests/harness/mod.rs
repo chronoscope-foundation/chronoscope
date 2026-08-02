@@ -514,6 +514,28 @@ impl WebTest {
         format!("{}/api", self.frontend_url)
     }
 
+    /// Read a JSON document the front door serves, by the page-relative path the
+    /// page itself would ask for it by.
+    ///
+    /// Lets a test hold the live page against a document it was built from,
+    /// which is a stronger statement than holding it against the page's own
+    /// bookkeeping. The SPA fallback serves `index.html` for anything that isn't
+    /// a file, so a path that names nothing arrives as a JSON parse failure
+    /// rather than a 404.
+    pub async fn frontend_json(
+        &self,
+        path: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{}{path}", self.frontend_url);
+        let body = reqwest::get(&url)
+            .await
+            .map_err(|e| format!("fetching {url}: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("reading {url}: {e}"))?;
+        serde_json::from_str(&body).map_err(|e| format!("{url} is not JSON: {e}").into())
+    }
+
     // ---- Hook invocation primitives ----
     //
     // Every interaction with the WASM-side test surface flows through these
@@ -637,6 +659,10 @@ impl WebTest {
         pub action slow_animations(ms: f64);
         pub query is_active_inside(selector: &str) -> bool;
         pub query active_element_attribute(attribute: &str) -> Option<String>;
+        // The locale this browser reads in, exactly as `navigator.language`
+        // names it. A test that wants the primary subtag reduces it itself,
+        // since the reduction is the thing under test.
+        pub query navigator_language() -> Option<String>;
         pub query press_key(selector: &str, key: &str) -> bool;
         // Plural: returns every match's attribute. Use only when you
         // genuinely want all matches (e.g., accessibility assertions);
@@ -762,6 +788,21 @@ impl WebTest {
         // there hit-tests against.
         pub query marker_layers_at(lng: f64, lat: f64) -> Vec<String>;
         pub query layer_order() -> Vec<String>;
+        // One descriptor per style layer: `id`, `source_layer` (the basemap's
+        // own layers carry one), `filter`, the named layout property's value as
+        // `layout`, the whole `paint` object, `basemap_label` for the layer
+        // entity labels take their font and text paint from, and
+        // `label_rewrite_target` for the layers the reader's-language rewrite
+        // actually wrote at style load.
+        pub query style_layers(layout_property: &str) -> Vec<serde_json::Value>;
+        // The page-relative path the map fetched its basemap style from.
+        pub query basemap_style_url() -> String;
+        // The text paint properties entity labels take off the basemap's label
+        // layer, as named by the code that copies them.
+        pub query copied_text_paint() -> Vec<String>;
+        // Basemap layers whose own filter the style snapshot could not keep, so
+        // they are filtered by the instant alone.
+        pub query basemap_filters_dropped() -> Vec<String>;
         // Current map zoom — for asserting a cluster click zooms the map in.
         pub query zoom() -> f64;
         // Map canvas size in CSS pixels `[width, height]` — the frame

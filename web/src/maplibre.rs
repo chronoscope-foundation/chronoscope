@@ -60,6 +60,19 @@ extern "C" {
     #[wasm_bindgen(method, js_name = getLayoutProperty)]
     pub fn get_layout_property(this: &Map, layer: &str, name: &str) -> JsValue;
 
+    /// Replace a layout property on an existing style layer. A layer the style
+    /// no longer carries, or a value the style spec rejects, arrives as an
+    /// `error` event; the throw is the removed-map case. `options` takes
+    /// [`skip_validation`].
+    #[wasm_bindgen(method, js_name = setLayoutProperty, catch)]
+    pub fn set_layout_property(
+        this: &Map,
+        layer: &str,
+        name: &str,
+        value: &JsValue,
+        options: &JsValue,
+    ) -> Result<(), JsValue>;
+
     /// Read a paint property from an existing style layer.
     #[wasm_bindgen(method, js_name = getPaintProperty)]
     pub fn get_paint_property(this: &Map, layer: &str, name: &str) -> JsValue;
@@ -79,6 +92,22 @@ extern "C" {
     /// Whether the map's style is fully loaded.
     #[wasm_bindgen(method, js_name = isStyleLoaded)]
     pub fn is_style_loaded(this: &Map) -> bool;
+
+    /// The style as it currently stands, including every layer's live filter.
+    #[wasm_bindgen(method, js_name = getStyle)]
+    pub fn get_style(this: &Map) -> JsValue;
+
+    /// Replace a style layer's filter. A layer the style no longer carries, or a
+    /// filter the style spec rejects, arrives as an `error` event; the throw is
+    /// the removed-map case, which is how a caller driving a torn-down map finds
+    /// out. `options` takes [`skip_validation`].
+    #[wasm_bindgen(method, js_name = setFilter, catch)]
+    pub fn set_filter(
+        this: &Map,
+        layer: &str,
+        filter: &JsValue,
+        options: &JsValue,
+    ) -> Result<(), JsValue>;
 
     /// Get the map's `<canvas>` element.
     #[wasm_bindgen(method, js_name = getCanvas)]
@@ -212,6 +241,20 @@ extern "C" {
     ) -> js_sys::Promise;
 }
 
+// ==================== Style writes ====================
+
+/// Options declaring a style write's value already good, so `MapLibre` takes it
+/// as given.
+///
+/// Every write carrying this builds its JSON in [`crate::ohm`], where the exact
+/// shape is pinned by that module's unit tests. `MapLibre` otherwise runs its
+/// style-spec validator per layer, which a scrub pays ~250 times.
+pub fn skip_validation() -> JsValue {
+    let options = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&options, &"validate".into(), &JsValue::FALSE);
+    options.into()
+}
+
 // ==================== Clone impls ====================
 // wasm_bindgen extern types don't auto-derive Clone. Each wraps a JsValue
 // handle to the same JS object — cloning creates a new Rust handle, not
@@ -233,10 +276,32 @@ impl Clone for GeoJsonSource {
 
 // ==================== Map construction ====================
 
+/// Settings for the credit the map draws in its corner.
+///
+/// This whole object stands in for `MapLibre`'s default one, `{compact: true,
+/// customAttribution: <its own credit>}`, so every field it defaults has to be
+/// stated here.
+#[derive(Serialize)]
+pub struct AttributionControl<'a> {
+    /// The whole credit the map draws. `MapLibre` fills this with its own credit
+    /// when the map is left to its default, so a caller setting it owns naming
+    /// `MapLibre` alongside the data's sources.
+    ///
+    /// The style spec has no root-level `attribution` field, so a style that
+    /// puts its credit there is credited from here.
+    #[serde(rename = "customAttribution")]
+    pub custom_attribution: &'a [&'a str],
+    /// Whether the credit collapses behind an "i" button the reader opens.
+    /// Left unset it collapses only below 640px, which leaves the full string
+    /// lying across the map at every desktop width.
+    pub compact: bool,
+}
+
 /// Options for constructing a MapLibre map.
 #[derive(Serialize)]
 pub struct MapOptions<'a> {
-    /// The style URL (e.g., `"https://tiles.openfreemap.org/styles/liberty"`).
+    /// Where the style document is fetched from, resolved against the page
+    /// (e.g. `"/basemap/ohm-historical.json"`).
     pub style: &'a str,
     /// Initial center as `[longitude, latitude]`.
     pub center: [f64; 2],
@@ -255,6 +320,9 @@ pub struct MapOptions<'a> {
     /// eases in rather than popping. Circles have no equivalent native fade.
     #[serde(rename = "fadeDuration")]
     pub fade_duration: f64,
+    /// Who the map credits for the data it draws.
+    #[serde(rename = "attributionControl")]
+    pub attribution_control: AttributionControl<'a>,
 }
 
 /// Create a new MapLibre map in the given container element.
@@ -328,7 +396,8 @@ pub fn get_raw_viewport_bounds(map: &Map) -> (f64, f64, f64, f64) {
     (bounds.west(), bounds.south(), bounds.east(), bounds.north())
 }
 
-// (No unit tests for `wrap_lon` here: the `web` crate is bin-only and
-//  brings in wasm-bindgen extern declarations that don't compile on the
-//  host test target. The behavior is pinned by the antimeridian
-//  integration tests in `dev/tests/web.rs`.)
+// (`wrap_lon`'s behavior is pinned by the antimeridian integration tests in
+//  `dev/tests/web.rs`, which drive it through the viewport it feeds. Host unit
+//  tests do run for this crate: `web-native-test` runs `cargo test -p
+//  chronoscope-web`, and `time_scale.rs` and `ohm.rs` both carry live
+//  `#[cfg(test)]` modules, so a direct one can live here too.)

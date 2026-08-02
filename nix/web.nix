@@ -16,6 +16,8 @@
   system,
   src,
   rustCommonArgs,
+  ohmStyle,
+  ohmStylePath,
 }:
 
 let
@@ -344,6 +346,14 @@ let
         # from, so one set of @font-face rules works in both.
         mkdir -p $out/fonts
         cp ${fonts}/* $out/fonts/
+
+        # The basemap style, at the path flake.nix names for it, which is also
+        # what the dev server stages it at and what the map asks for. Pinned in
+        # flake.nix and served from here, so the map draws the style this build
+        # was made against; the tiles, glyphs and sprites it names by absolute
+        # URL are still fetched from OHM.
+        mkdir -p "$(dirname "$out/${ohmStylePath}")"
+        cp ${ohmStyle} "$out/${ohmStylePath}"
 
         # Process index.html — replace Trunk data attributes with direct references
         sed \

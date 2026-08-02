@@ -32,6 +32,20 @@
       url = "github:terranix/terranix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # OpenHistoricalMap's built basemap style, tag v0.9.17, pinned by the commit
+    # that tag names. We serve this document ourselves, so the basemap the map
+    # draws moves when this line moves: bump the SHA, `nix flake update
+    # ohm-style`, read the lock diff.
+    #
+    # `type = "file"` fetches the one document (254 KB) rather than the
+    # repository (85 MB). The tiles, glyphs and sprites it names by absolute URL
+    # stay OHM's own.
+    ohm-style = {
+      url = "https://raw.githubusercontent.com/OpenHistoricalMap/map-styles/59503aac5f5dc5f0afac2ce326d55ef9e575b33b/dist/historical/historical.json";
+      flake = false;
+      type = "file";
+    };
   };
 
   outputs =
@@ -43,6 +57,7 @@
       flake-utils,
       nix2container,
       terranix,
+      ohm-style,
       ...
     }:
     let
@@ -161,6 +176,12 @@
           inherit (rust) cargoArtifacts;
         };
 
+        # Where in the served bundle the pinned basemap style is staged. The
+        # production dist and the dev server both stage it from here, and
+        # `BASEMAP.style_url` in web/src/components/map.rs asks for this same
+        # path, rooted at the page.
+        ohmStylePath = "basemap/ohm-historical.json";
+
         web = import ./nix/web.nix {
           inherit
             pkgs
@@ -170,11 +191,13 @@
             craneLib
             system
             src
+            ohmStylePath
             ;
           # Native (non-wasm) crane bits for the host-target `web-native-test`
           # and `web-native-clippy` checks, which run and lint the crate's plain
           # #[test]s. The wasm pipeline covers only what ships.
           rustCommonArgs = rust.commonArgs;
+          ohmStyle = ohm-style;
         };
 
         api = import ./nix/api.nix {
@@ -326,6 +349,11 @@
           # Trunk's pre_build hook stages these into web/fonts so the dev server
           # serves exactly what the production dist does.
           CHRONOSCOPE_WEB_FONTS = web.packages.web-fonts;
+          # Likewise for the pinned basemap style, which the map loads from our
+          # own origin in all three serving environments. Trunk's post_build
+          # hook stages the document at the path the dist puts it at.
+          CHRONOSCOPE_OHM_STYLE = "${ohm-style}";
+          CHRONOSCOPE_OHM_STYLE_PATH = ohmStylePath;
           # chromiumoxide picks up CHROME as the executable path.
           CHROME = chromeHeadlessBin;
           # The read-only facts DB the dev servers and browser tests mount (a

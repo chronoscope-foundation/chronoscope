@@ -20,7 +20,7 @@
 //! since we're just observing state, not driving behavior.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -50,6 +50,10 @@ use crate::time_scale::{TimeScale, era_label};
 thread_local! {
     static REGISTERED_HOOKS: RefCell<HashMap<&'static str, Box<dyn std::any::Any>>> =
         RefCell::new(HashMap::new());
+
+    /// Render-state fields `wait_for_map_idle` has already reported missing.
+    static MISSING_IDLE_FIELDS: RefCell<BTreeSet<&'static str>> =
+        const { RefCell::new(BTreeSet::new()) };
 }
 
 // ==================== Hook registration ====================
@@ -177,6 +181,15 @@ pub fn register_base() {
         wait_for_fonts,
         wait_for_media_query,
 
+        // The locale this browser reads in, raw. A test asserting the map is
+        // labelled in it has to reduce it itself, or it asserts our own
+        // reduction against itself.
+        navigator_language: || {
+            web_sys::window()
+                .and_then(|w| w.navigator().language())
+                .map_or(JsValue::NULL, JsValue::from)
+        },
+
         // Fetch-settled counter — sample then await (closes listener race).
         // f64 across the FFI: integer counters fit losslessly under 2^53.
         current_fetch_settled: || current_fetch_settled() as f64,
@@ -219,6 +232,35 @@ pub fn register_map_hooks(
             f64::from(thumbnail_marker_count(m))
         }),
         layer_order: map_query(&map_handle, JsValue::NULL, layer_order),
+        style_layers: {
+            let h = map_handle.clone();
+            move |layout_property: String| {
+                with_map(&h, |m| style_layers(m, &layout_property)).unwrap_or(JsValue::NULL)
+            }
+        },
+        // Where the map fetched its style from, so a test can read the same
+        // document and hold the live style against it.
+        basemap_style_url: || JsValue::from(crate::components::map::basemap_style_url()),
+        // The text paint entity labels take off the basemap's label layer, named
+        // by the code that takes it, so a property added to the copy is asserted
+        // on from the moment it is added.
+        copied_text_paint: || {
+            let properties = js_sys::Array::new();
+            for &property in crate::components::map::copied_text_paint() {
+                properties.push(&JsValue::from_str(property));
+            }
+            JsValue::from(properties)
+        },
+        // Basemap layers the style snapshot kept without a filter of their own,
+        // so they draw the instant's clauses and nothing else. Reported so a
+        // test can tell that handled case from a filter gone missing.
+        basemap_filters_dropped: || {
+            let ids = js_sys::Array::new();
+            for id in crate::components::map::dropped_basemap_filters() {
+                ids.push(&JsValue::from_str(&id));
+            }
+            JsValue::from(ids)
+        },
         zoom: map_query(&map_handle, 0.0, |m| m.get_zoom_raw()),
         get_center: map_query(&map_handle, JsValue::NULL, |m| {
             let center = m.get_center();
@@ -753,11 +795,23 @@ fn wait_for_map_idle(handle: &Rc<RefCell<Option<maplibre::Map>>>) -> js_sys::Pro
         // settles before a listener attaches never emits the event again.
         // Polling the same predicate its render loop uses reads the state
         // directly, which is what the waiter actually wants to know.
-        let dirty = |name: &str| {
-            js_sys::Reflect::get(&map, &name.into())
-                .ok()
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
+        //
+        // Read the way that loop reads them, by JS truthiness: it asks
+        // `!this._placementDirty`, and that field holds `this.style &&
+        // this.style._updatePlacement(…)`, whose value for a pass that ran
+        // without a style is the style itself.
+        //
+        // A field the map carries no property for at all has been renamed or
+        // mangled by a version bump. That reads as dirty, so the wait runs out
+        // with the field named in the log, which is the loud way to hear that a
+        // term of the predicate has gone.
+        let dirty = |name: &'static str| {
+            let field = JsValue::from_str(name);
+            if !js_sys::Reflect::has(&map, &field).unwrap_or(false) {
+                warn_missing_idle_field(name);
+                return true;
+            }
+            js_sys::Reflect::get(&map, &field).is_ok_and(|value| value.is_truthy())
         };
         loop {
             if map.map_loaded()
@@ -772,6 +826,23 @@ fn wait_for_map_idle(handle: &Rc<RefCell<Option<maplibre::Map>>>) -> js_sys::Pro
             request_animation_frame_async().await;
         }
     })
+}
+
+/// Name a render-state field the map carries no property for. Once per field,
+/// since the poll runs every frame and the message has to survive in the log
+/// the resulting timeout is read against.
+fn warn_missing_idle_field(name: &'static str) {
+    MISSING_IDLE_FIELDS.with(|seen| {
+        if seen.borrow_mut().insert(name) {
+            web_sys::console::warn_1(
+                &format!(
+                    "the map has no '{name}' for the idle poll to read, so it reads as dirty and \
+                     every wait on the map will run out its budget"
+                )
+                .into(),
+            );
+        }
+    });
 }
 
 /// Returns a Promise that resolves on map idle + two `requestAnimationFrame`
@@ -1487,6 +1558,81 @@ fn layer_order(map: &maplibre::Map) -> JsValue {
     result.into()
 }
 
+/// Per-layer style detail, one descriptor per layer in draw order: its `id`,
+/// whether it carries a `source_layer` (which is what makes it the basemap's
+/// rather than one of ours), its `filter`, its `layout` value for the named
+/// layout property, its whole `paint` object, whether it is the layer entity
+/// labels take their font and text paint from, and whether the label rewrite
+/// wrote it at style load.
+///
+/// The basemap tests read the filters the time slider writes off `filter`, the
+/// copied label style off `layout` and `paint` at `basemap_label`, and the
+/// localized labels off `label_rewrite_target`, which reports what the rewrite
+/// actually wrote so a test can hold the style against it.
+///
+/// `paint` arrives whole because the properties one test needs, and the ones the
+/// next needs, are the same shape of question; naming them one at a time would
+/// grow an argument per property.
+fn style_layers(map: &maplibre::Map, layout_property: &str) -> JsValue {
+    let rewrite_targets = crate::components::map::label_rewrite_targets();
+    let style = map.get_style();
+    let Ok(layers) = js_sys::Reflect::get(&style, &"layers".into()) else {
+        return JsValue::NULL;
+    };
+    let Ok(layers) = layers.dyn_into::<js_sys::Array>() else {
+        return JsValue::NULL;
+    };
+
+    let result = js_sys::Array::new();
+    for layer in layers.iter() {
+        let Some(id) = js_sys::Reflect::get(&layer, &"id".into())
+            .ok()
+            .and_then(|v| v.as_string())
+        else {
+            continue;
+        };
+        // `undefined` disappears on the way through JSON, taking the key with
+        // it; `null` survives as the absence the test asserts on.
+        let defined = |value: JsValue| {
+            if value.is_undefined() {
+                JsValue::NULL
+            } else {
+                value
+            }
+        };
+        let source_layer =
+            js_sys::Reflect::get(&layer, &"source-layer".into()).is_ok_and(|v| !v.is_undefined());
+        let filter =
+            defined(js_sys::Reflect::get(&layer, &"filter".into()).unwrap_or(JsValue::NULL));
+        // Off the serialized layer rather than `getLayoutProperty`, which is
+        // asked here about layers of every type, most of which have no property
+        // under that name at all.
+        let layout = defined(
+            js_sys::Reflect::get(&layer, &"layout".into())
+                .and_then(|layout| js_sys::Reflect::get(&layout, &layout_property.into()))
+                .unwrap_or(JsValue::NULL),
+        );
+        let paint = defined(js_sys::Reflect::get(&layer, &"paint".into()).unwrap_or(JsValue::NULL));
+        let basemap_label = id == crate::components::map::basemap_label_layer();
+        let rewrite_target = rewrite_targets.contains(&id);
+
+        let descriptor = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&descriptor, &"id".into(), &id.into());
+        let _ = js_sys::Reflect::set(&descriptor, &"source_layer".into(), &source_layer.into());
+        let _ = js_sys::Reflect::set(&descriptor, &"filter".into(), &filter);
+        let _ = js_sys::Reflect::set(&descriptor, &"layout".into(), &layout);
+        let _ = js_sys::Reflect::set(&descriptor, &"paint".into(), &paint);
+        let _ = js_sys::Reflect::set(&descriptor, &"basemap_label".into(), &basemap_label.into());
+        let _ = js_sys::Reflect::set(
+            &descriptor,
+            &"label_rewrite_target".into(),
+            &rewrite_target.into(),
+        );
+        result.push(&descriptor);
+    }
+    result.into()
+}
+
 fn jump_to(map: &maplibre::Map, lng: f64, lat: f64, zoom: f64) {
     let opts = js_sys::Object::new();
     let center = js_sys::Array::new();
@@ -1584,7 +1730,4 @@ extern "C" {
 
     #[wasm_bindgen(method, js_class = "Map")]
     fn fire(this: &maplibre::Map, event_type: &str, data: &JsValue) -> JsValue;
-
-    #[wasm_bindgen(method, js_class = "Map", js_name = getStyle)]
-    fn get_style(this: &maplibre::Map) -> JsValue;
 }
