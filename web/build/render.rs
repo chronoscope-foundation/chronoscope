@@ -77,19 +77,65 @@ fn is_raw_html(event: &Event<'_>) -> bool {
     matches!(event, Event::Html(_) | Event::InlineHtml(_))
 }
 
-/// Convert markdown to HTML using pulldown-cmark, dropping any raw markup the
+/// Convert markdown to HTML using pulldown-cmark, reporting any raw markup the
 /// source carried: the content pages are written in markdown, and hand-written
-/// HTML in them is not a supported way to say anything.
-fn md_to_html(markdown: &str) -> String {
-    let parser = Parser::new_ext(markdown, Options::empty()).filter(|event| !is_raw_html(event));
+/// HTML in one is dropped rather than rendered.
+fn md_to_html(markdown: &str, problems: &mut Vec<String>) -> String {
+    let parser = Parser::new_ext(markdown, Options::empty()).filter(|event| {
+        let raw = is_raw_html(event);
+        if raw {
+            problems.push(
+                "raw HTML is dropped: these pages are markdown, and hand-written markup in one \
+                 reaches no reader"
+                    .to_string(),
+            );
+        }
+        !raw
+    });
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
     html_output
 }
 
-/// Render one content page into the HTML its component drops into `inner_html`.
-fn render_article(markdown: &str) -> String {
-    md_to_html(&expand_snippets(markdown))
+/// Report an article heading that carries `{#`, which the page renders as
+/// visible braces: pinning an anchor is a FAQ feature, and an article parses
+/// with heading attributes off.
+///
+/// Reads a heading's `Text` events and nothing else, so a `{#` in a code span
+/// or a fenced block is left alone, and a setext heading is read line by line.
+fn report_article_pins(markdown: &str, problems: &mut Vec<String>) {
+    let mut in_heading = false;
+    let mut heading_text = String::new();
+    for event in Parser::new_ext(markdown, Options::empty()) {
+        match event {
+            Event::Start(Tag::Heading { .. }) => {
+                in_heading = true;
+                heading_text.clear();
+            }
+            Event::Text(text) if in_heading => heading_text.push_str(&text),
+            Event::End(TagEnd::Heading(_)) => {
+                in_heading = false;
+                if heading_text.contains("{#") {
+                    problems.push(format!(
+                        "the heading {heading_text:?} pins an anchor, which this page renders as \
+                         visible braces: only the FAQ gives its headings ids"
+                    ));
+                }
+                heading_text.clear();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Render one content page into the HTML its component drops into `inner_html`,
+/// alongside everything the page said that the render had no place for.
+fn render_article(markdown: &str) -> (String, Vec<String>) {
+    let expanded = expand_snippets(markdown);
+    let mut problems = Vec::new();
+    report_article_pins(&expanded, &mut problems);
+    let html = md_to_html(&expanded, &mut problems);
+    (html, problems)
 }
 
 /// A content page: the markdown it is written in, the heading it renders under,
@@ -391,47 +437,130 @@ fn claim_slug(base: &str, claimed: &mut BTreeSet<String>) -> String {
     candidate
 }
 
-/// Render accumulated answer events to HTML and push onto the current category.
+/// Render accumulated answer events to HTML and push onto the current category,
+/// reporting an answer that reaches no reader.
 fn flush_answer<'a>(
     question: Option<OpenQuestion>,
     answer_events: impl Iterator<Item = Event<'a>>,
     categories: &mut [FaqCategory<PendingEntry>],
+    problems: &mut Vec<String>,
 ) {
-    if let Some(question) = question {
-        let mut answer_html = String::new();
-        html::push_html(
-            &mut answer_html,
-            answer_events.filter(|event| !is_raw_html(event)),
-        );
-        let answer_html = answer_html.trim().to_string();
-        if !answer_html.is_empty()
-            && let Some(cat) = categories.last_mut()
-        {
-            cat.entries.push(PendingEntry {
-                question: question.text,
-                pinned: question.pinned,
-                answer_html,
-            });
-        }
+    let Some(OpenQuestion { text, pinned }) = question else {
+        return;
+    };
+    let mut answer_html = String::new();
+    html::push_html(
+        &mut answer_html,
+        answer_events.filter(|event| {
+            let raw = is_raw_html(event);
+            if raw {
+                problems.push(format!(
+                    "the answer to {text:?} carries raw HTML, which is dropped: these pages are \
+                     markdown"
+                ));
+            }
+            !raw
+        }),
+    );
+    let answer_html = answer_html.trim().to_string();
+    if answer_html.is_empty() {
+        problems.push(format!(
+            "the question {text:?} has no answer: a `## Question` publishes the content under it, \
+             and an entry with nothing under it is left off the page"
+        ));
+    } else if let Some(cat) = categories.last_mut() {
+        cat.entries.push(PendingEntry {
+            question: text,
+            pinned,
+            answer_html,
+        });
+    } else {
+        problems.push(format!(
+            "the question {text:?} comes before any `# Category` heading, so there is no category \
+             to file it under"
+        ));
     }
 }
 
-/// Parse FAQ markdown using pulldown-cmark events.
+/// Block containers a heading can end up nested inside.
 ///
-/// Expected structure: `# Category` headings containing `## Question` headings
-/// followed by answer content. Uses the pulldown-cmark parser to handle all
-/// markdown edge cases correctly instead of fragile string splitting.
+/// A heading in one is markdown the generator has no place for: it invents a
+/// category or an entry that the page then renders inside nothing, and leaves
+/// the answer before it holding an unclosed tag.
+///
+/// Written over `TagEnd` and reached for a `Tag` through [`Tag::to_end`], so
+/// the opening and closing halves cannot drift apart.
+fn is_block_container(tag: &TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::BlockQuote(_)
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+    )
+}
+
+/// Inline markup a heading carries through: the text inside it accumulates, so
+/// only the wrapper events themselves go unrecorded and nothing is lost.
+fn is_inline_wrapper(event: &Event<'_>) -> bool {
+    matches!(
+        event,
+        Event::Start(Tag::Emphasis | Tag::Strong | Tag::Link { .. })
+            | Event::End(TagEnd::Emphasis | TagEnd::Strong | TagEnd::Link)
+    )
+}
+
+/// What an event was, for the message that reports it going nowhere.
+///
+/// Fixed strings, like every other interpolation into a problem: `cargo::error=`
+/// truncates a message at the first newline without saying so.
+fn describe(event: &Event<'_>) -> &'static str {
+    match event {
+        Event::Start(Tag::Paragraph) => "a paragraph",
+        Event::Start(Tag::BlockQuote(_)) => "a block quote",
+        Event::Start(Tag::CodeBlock(_)) => "a code block",
+        Event::Start(Tag::List(_)) => "a list",
+        Event::Start(Tag::Image { .. }) => "an image",
+        Event::Start(Tag::Table(_)) => "a table",
+        Event::Start(Tag::FootnoteDefinition(_)) => "a footnote definition",
+        Event::Start(Tag::HtmlBlock) | Event::Html(_) | Event::InlineHtml(_) => "raw HTML",
+        Event::Code(_) => "inline code",
+        Event::Text(_) => "text",
+        Event::Rule => "a horizontal rule",
+        Event::HardBreak => "a hard line break",
+        Event::FootnoteReference(_) => "a footnote reference",
+        _ => "content",
+    }
+}
+
+/// Parse FAQ markdown using pulldown-cmark events, alongside everything the
+/// file said that the parse had no place for.
+///
+/// The one shape handled: `# Category` headings containing `## Question`
+/// headings, optionally pinned `{#id}`, each followed by the block content that
+/// becomes its answer, with text, inline code, emphasis, strong and links
+/// inside a heading. Anything else is reported rather than dropped, since a
+/// dropped line is content an author wrote and a reader never sees.
 ///
 /// Anchors are assigned here rather than at render time: a slug is a
 /// page-global id, so uniqueness is only enforceable where every category is
 /// in view.
-fn parse_faq(markdown: &str) -> Vec<FaqCategory<FaqEntry>> {
-    assign_slugs(parse_entries(markdown))
+fn parse_faq(markdown: &str) -> (Vec<FaqCategory<FaqEntry>>, Vec<String>) {
+    let mut problems = Vec::new();
+    let categories = assign_slugs(parse_entries(markdown, &mut problems));
+    (categories, problems)
 }
 
 /// Collect categories and their questions, each carrying whatever anchor its
-/// heading pinned.
-fn parse_entries(markdown: &str) -> Vec<FaqCategory<PendingEntry>> {
+/// heading pinned, reporting into `problems` at every point content is lost.
+fn parse_entries(markdown: &str, problems: &mut Vec<String>) -> Vec<FaqCategory<PendingEntry>> {
     let parser = Parser::new_ext(markdown, Options::ENABLE_HEADING_ATTRIBUTES);
     let mut categories: Vec<FaqCategory<PendingEntry>> = Vec::new();
     let mut current_heading_level: Option<HeadingLevel> = None;
@@ -439,14 +568,30 @@ fn parse_entries(markdown: &str) -> Vec<FaqCategory<PendingEntry>> {
     let mut heading_id: Option<String> = None;
     let mut answer_events: Vec<Event<'_>> = Vec::new();
     let mut current_question: Option<OpenQuestion> = None;
+    let mut container_depth: usize = 0;
+    let mut last_heading: Option<String> = None;
+    // One report per stretch between headings. A stray paragraph is a start, a
+    // text and an end, and saying so three times buries the next problem.
+    let mut reported_since_heading = false;
 
     for event in parser {
+        // Counted before the match below, so the arms still see the container
+        // events and a list in an answer keeps its `<ul>`.
+        match &event {
+            Event::Start(tag) if is_block_container(&tag.to_end()) => container_depth += 1,
+            Event::End(tag) if is_block_container(tag) => {
+                container_depth = container_depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+
         match &event {
             Event::Start(Tag::Heading { level, id, .. }) => {
                 flush_answer(
                     current_question.take(),
                     answer_events.drain(..),
                     &mut categories,
+                    problems,
                 );
                 current_heading_level = Some(*level);
                 heading_id = id.as_ref().map(|id| id.to_string());
@@ -455,29 +600,82 @@ fn parse_entries(markdown: &str) -> Vec<FaqCategory<PendingEntry>> {
             Event::Text(text) if current_heading_level.is_some() => {
                 heading_text.push_str(text);
             }
+            Event::Code(code) if current_heading_level.is_some() => {
+                heading_text.push_str(code);
+            }
+            // A setext heading's second line is a word boundary, not a join.
+            Event::SoftBreak if current_heading_level.is_some() => {
+                heading_text.push(' ');
+            }
             Event::End(TagEnd::Heading(_)) => {
+                let text = std::mem::take(&mut heading_text);
                 let pinned = heading_id.take();
+                if container_depth > 0 {
+                    problems.push(format!(
+                        "the heading {text:?} sits inside a list or block quote, where the FAQ \
+                         page has nowhere to put it"
+                    ));
+                }
+                if text.trim().is_empty() {
+                    problems.push(
+                        "a heading has no text: a category needs a name and a question needs to \
+                         be asked"
+                            .to_string(),
+                    );
+                }
                 match current_heading_level.take() {
                     Some(HeadingLevel::H1) => {
+                        if pinned.is_some() {
+                            problems.push(format!(
+                                "the category heading {text:?} pins an anchor, which is dropped: \
+                                 only a `## Question` is given one"
+                            ));
+                        }
                         categories.push(FaqCategory {
-                            title: heading_text.clone(),
+                            title: text.clone(),
                             entries: Vec::new(),
                         });
                     }
                     Some(HeadingLevel::H2) => {
                         current_question = Some(OpenQuestion {
-                            text: heading_text.clone(),
+                            text: text.clone(),
                             pinned,
                         });
                     }
-                    _ => {}
+                    _ => problems.push(format!(
+                        "the heading {text:?} is deeper than `##`, and the FAQ page publishes \
+                         nothing below that: a `# Category` holds `## Question` headings and \
+                         nothing else"
+                    )),
                 }
-                heading_text.clear();
+                last_heading = Some(text);
+                reported_since_heading = false;
             }
             _ if current_question.is_some() && current_heading_level.is_none() => {
                 answer_events.push(event);
             }
-            _ => {}
+            _ => {
+                if !reported_since_heading && !is_inline_wrapper(&event) {
+                    reported_since_heading = true;
+                    let what = describe(&event);
+                    problems.push(if current_heading_level.is_some() {
+                        format!(
+                            "the heading {heading_text:?} carries {what}, which is dropped: a \
+                             heading holds text, inline code, emphasis, strong and links"
+                        )
+                    } else if let Some(heading) = &last_heading {
+                        format!(
+                            "{what} under the heading {heading:?} is dropped: the FAQ page \
+                             publishes only what sits under a `## Question`"
+                        )
+                    } else {
+                        format!(
+                            "{what} before the first heading is dropped: the FAQ page publishes \
+                             only what sits under a `## Question`"
+                        )
+                    });
+                }
+            }
         }
     }
 
@@ -485,6 +683,7 @@ fn parse_entries(markdown: &str) -> Vec<FaqCategory<PendingEntry>> {
         current_question.take(),
         answer_events.into_iter(),
         &mut categories,
+        problems,
     );
     categories
 }
@@ -540,9 +739,10 @@ fn assign_slugs(mut pending: Vec<FaqCategory<PendingEntry>>) -> Vec<FaqCategory<
 /// Every string goes out through `{:?}`, whose `str` impl is a valid Rust
 /// literal for any input. That is what makes the emitter correct: each rendered
 /// link carries `"`, and the prose carries typographic quotes and dashes.
-fn generated_faq_source(markdown: &str) -> String {
+fn generated_faq_source(markdown: &str) -> (String, Vec<String>) {
+    let (categories, problems) = parse_faq(&expand_snippets(markdown));
     let mut source = String::from("pub static FAQ: &[FaqCategory] = &[\n");
-    for cat in parse_faq(&expand_snippets(markdown)) {
+    for cat in categories {
         source.push_str(&format!(
             "    FaqCategory {{\n        title: {:?},\n        entries: &[\n",
             cat.title
@@ -556,7 +756,7 @@ fn generated_faq_source(markdown: &str) -> String {
         source.push_str("        ],\n    },\n");
     }
     source.push_str("];\n");
-    source
+    (source, problems)
 }
 
 #[cfg(test)]
@@ -660,7 +860,11 @@ mod tests {
     fn raw_html_in_a_content_page_is_dropped_rather_than_rendered() {
         for case in RAW_HTML_CASES {
             let markdown = case.markdown;
-            let rendered = render_article(markdown);
+            let (rendered, problems) = render_article(markdown);
+            assert!(
+                problems.iter().any(|problem| problem.contains("raw HTML")),
+                "{markdown:?} dropped its markup without reporting it: {problems:?}"
+            );
             assert!(
                 !rendered.contains(case.tag),
                 "{markdown:?} rendered {rendered:?}"
@@ -682,7 +886,11 @@ mod tests {
     fn raw_html_in_a_faq_answer_is_dropped_rather_than_rendered() {
         for case in RAW_HTML_CASES {
             let markdown = case.markdown;
-            let cats = parse_faq(&format!("# Cat\n\n## Q\n\n{markdown}"));
+            let (cats, problems) = parse_faq(&format!("# Cat\n\n## Q\n\n{markdown}"));
+            assert!(
+                problems.iter().any(|problem| problem.contains("raw HTML")),
+                "{markdown:?} dropped its markup without reporting it: {problems:?}"
+            );
             let answer = cats
                 .first()
                 .and_then(|cat| cat.entries.first())
@@ -780,7 +988,7 @@ mod tests {
         for article in ARTICLES {
             let stem = article.stem;
             assert!(!article.title.is_empty(), "{stem} has no heading");
-            let rendered = render_article(article.markdown);
+            let (rendered, _) = render_article(article.markdown);
             assert!(
                 rendered.contains("</p>"),
                 "{stem}.md rendered no prose at all: {rendered:?}"
@@ -795,10 +1003,40 @@ mod tests {
             .collect()
     }
 
+    /// Parse markdown the generator is supposed to handle, failing if anything
+    /// in it was reported. Every shape test below reads the parse of a fixture,
+    /// and a fixture that drifts into rejected markdown would otherwise go on
+    /// being checked for a shape the build no longer accepts.
+    fn parse_clean(markdown: &str) -> Vec<FaqCategory<FaqEntry>> {
+        let (cats, problems) = parse_faq(markdown);
+        // The markdown itself stays out of the message: every problem names the
+        // heading it is about, and `faq.md` is ten thousand characters.
+        assert!(problems.is_empty(), "reported {problems:?}");
+        cats
+    }
+
+    /// What the generator reports about markdown it does not handle.
+    fn problems_of(markdown: &str) -> Vec<String> {
+        parse_faq(markdown).1
+    }
+
+    /// The problems reported for markdown, asserted to be exactly one and to
+    /// name `names`, which is how a message reaches the author who wrote it.
+    fn sole_problem_naming(markdown: &str, names: &str) -> String {
+        let problems = problems_of(markdown);
+        assert_eq!(problems.len(), 1, "{markdown:?} reported {problems:?}");
+        let problem = problems.into_iter().next().unwrap_or_default();
+        assert!(
+            problem.contains(names),
+            "{markdown:?} reported {problem:?}, which does not name {names:?}"
+        );
+        problem
+    }
+
     #[test]
     fn parse_faq_basic_structure() {
         let md = "# Category One\n\n## Question A\n\nAnswer A.\n\n## Question B\n\nAnswer B.\n\n# Category Two\n\n## Question C\n\nAnswer C.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(cats.len(), 2);
         assert_eq!(cats[0].title, "Category One");
         assert_eq!(cats[0].entries.len(), 2);
@@ -813,7 +1051,7 @@ mod tests {
     #[test]
     fn parse_faq_with_links_in_answer() {
         let md = "# Tech\n\n## How?\n\nSee [the docs](https://example.com) for details.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(cats.len(), 1);
         assert!(
             cats[0].entries[0]
@@ -825,7 +1063,7 @@ mod tests {
     #[test]
     fn parse_faq_with_list_in_answer() {
         let md = "# Info\n\n## What tools?\n\nThree tools:\n\n- **Tool A** — does X\n- **Tool B** — does Y\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(cats.len(), 1);
         assert!(cats[0].entries[0].answer_html.contains("<li>"));
     }
@@ -833,7 +1071,7 @@ mod tests {
     #[test]
     fn a_category_heading_with_no_questions_is_kept_and_left_empty() {
         let md = "# Empty\n\n# HasContent\n\n## Q\n\nA.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(cats.len(), 2);
         assert_eq!(cats[0].entries.len(), 0);
         assert_eq!(cats[1].entries.len(), 1);
@@ -842,7 +1080,7 @@ mod tests {
     #[test]
     fn parse_faq_multi_paragraph_answer() {
         let md = "# Cat\n\n## Q\n\nFirst paragraph.\n\nSecond paragraph.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert!(cats[0].entries[0].answer_html.contains("First paragraph."));
         assert!(cats[0].entries[0].answer_html.contains("Second paragraph."));
     }
@@ -868,7 +1106,7 @@ mod tests {
     #[test]
     fn questions_differing_only_in_punctuation_get_distinct_slugs() {
         let md = "# Cat\n\n## Is it open source?\n\nYes.\n\n## Is it open source!\n\nStill yes.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(
             all_slugs(&cats),
             ["is-it-open-source", "is-it-open-source-2"]
@@ -878,22 +1116,15 @@ mod tests {
     #[test]
     fn slugs_are_unique_across_categories_not_just_within_one() {
         let md = "# A\n\n## Same question\n\nOne.\n\n# B\n\n## Same question\n\nTwo.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(all_slugs(&cats), ["same-question", "same-question-2"]);
     }
 
     #[test]
     fn disambiguation_skips_a_number_a_question_already_slugs_to() {
         let md = "# Cat\n\n## Step\n\nOne.\n\n## Step 2\n\nTwo.\n\n## Step!\n\nThree.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(all_slugs(&cats), ["step", "step-2", "step-3"]);
-    }
-
-    #[test]
-    fn a_dropped_empty_answer_does_not_consume_its_slug() {
-        let md = "# Cat\n\n## Repeat\n\n## Repeat\n\nOnly answer.\n";
-        let cats = parse_faq(md);
-        assert_eq!(all_slugs(&cats), ["repeat"]);
     }
 
     #[test]
@@ -911,45 +1142,233 @@ mod tests {
     #[test]
     fn a_pinned_anchor_becomes_the_slug_verbatim() {
         let md = "# Cat\n\n## How is this different from a dozen other projects? {#vs-other-projects}\n\nAnswer.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(all_slugs(&cats), ["vs-other-projects"]);
     }
 
     #[test]
     fn a_pinned_anchor_is_normalized_into_a_usable_id() {
         let md = "# Cat\n\n## Q {#Weird--ID!}\n\nAnswer.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(all_slugs(&cats), ["weird-id"]);
     }
 
     #[test]
     fn a_pinned_anchor_does_not_leak_into_the_question_text() {
         let md = "# Cat\n\n## How does it work? {#how-it-works}\n\nAnswer.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(cats[0].entries[0].question, "How does it work?");
     }
 
     #[test]
     fn a_derived_slug_numbers_out_of_the_way_of_a_pinned_one() {
         let md = "# Cat\n\n## Overview\n\nOne.\n\n## Something else {#overview}\n\nTwo.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(all_slugs(&cats), ["overview-2", "overview"]);
     }
 
     #[test]
     fn headings_pinning_the_same_anchor_settle_in_document_order() {
         let md = "# Cat\n\n## First {#dup}\n\nOne.\n\n## Second {#dup}\n\nTwo.\n";
-        let cats = parse_faq(md);
+        let cats = parse_clean(md);
         assert_eq!(all_slugs(&cats), ["dup", "dup-2"]);
     }
 
+    /// A `###` reads as a subheading of the answer above it and publishes
+    /// nothing: its text goes into the heading accumulator and never reaches
+    /// the answer. A pin on one is lost with it.
+    #[test]
+    fn a_heading_deeper_than_a_question_is_reported() {
+        sole_problem_naming("# Cat\n\n## Q\n\nA.\n\n### Detail\n", "Detail");
+        sole_problem_naming("# Cat\n\n## Q\n\nA.\n\n### Detail {#detail}\n", "Detail");
+    }
+
+    /// A heading in a list or a block quote invents a category or an entry the
+    /// page has no place to draw, and leaves the answer before it holding the
+    /// container's closing tag.
+    #[test]
+    fn a_heading_inside_a_container_is_reported() {
+        // The container itself is a second, separate loss: it opens where no
+        // question is, so it is reported on its own account before the heading
+        // inside it is.
+        for (md, heading) in [
+            ("# Cat\n\n> ## Quoted\n\n> A.\n", "Quoted"),
+            ("# Cat\n\n- ## Listed\n\n  A.\n", "Listed"),
+        ] {
+            let problems = problems_of(md);
+            assert!(
+                problems.iter().any(|problem| {
+                    problem.contains(heading) && problem.contains("inside a list or block quote")
+                }),
+                "{md:?} reported {problems:?}"
+            );
+        }
+    }
+
+    /// A question with no category above it has nowhere to be filed, and today
+    /// vanishes with its answer.
+    #[test]
+    fn a_question_before_any_category_is_reported() {
+        sole_problem_naming("## Q\n\nAnswer.\n", "Q");
+    }
+
+    /// An entry whose answer is empty is left off the page entirely, taking its
+    /// anchor with it. The second case is the one nobody would look for: the
+    /// author wrote something, and the raw-markup filter emptied it.
+    #[test]
+    fn a_question_with_no_answer_is_reported() {
+        sole_problem_naming("# Cat\n\n## Q\n\n## Q2\n\nA.\n", "Q");
+        let problems = problems_of("# Cat\n\n## Q\n\n<div>markup</div>\n");
+        assert!(
+            problems.iter().any(|problem| problem.contains("no answer")),
+            "{problems:?}"
+        );
+    }
+
+    /// Prose outside a question is published nowhere: the FAQ page draws
+    /// categories and the entries under them, and nothing else.
+    #[test]
+    fn prose_belonging_to_no_question_is_reported() {
+        sole_problem_naming("# Cat\n\nStray.\n\n## Q\n\nA.\n", "Cat");
+        sole_problem_naming(
+            "Stray.\n\n# Cat\n\n## Q\n\nA.\n",
+            "before the first heading",
+        );
+    }
+
+    /// One paragraph is a start, a text and an end, and three messages about
+    /// one stray sentence bury the next problem. Reporting per stretch between
+    /// headings is what keeps two real losses at two messages.
+    #[test]
+    fn each_stretch_between_headings_reports_once() {
+        assert_eq!(problems_of("# Cat\n\nStray.\n\n## Q\n\nA.\n").len(), 1);
+        assert_eq!(
+            problems_of("Stray.\n\n# Cat\n\nMore stray.\n\n## Q\n\nA.\n").len(),
+            2
+        );
+    }
+
+    /// A heading with no text draws as a blank row, and a question with no
+    /// words slugs to the fallback stem.
+    #[test]
+    fn a_heading_with_no_text_is_reported() {
+        sole_problem_naming("# Cat\n\n##\n\nA.\n", "no text");
+    }
+
+    /// Only a `## Question` is given an anchor, so a pin on a category is a URL
+    /// the author published and the page never carried.
+    #[test]
+    fn a_pinned_category_is_reported() {
+        sole_problem_naming("# Cat {#cat}\n\n## Q\n\nA.\n", "Cat");
+    }
+
+    /// A heading holds text and the inline markup around it. An image's alt
+    /// text is spliced into the question as if it were prose, and raw markup in
+    /// one is dropped outright.
+    #[test]
+    fn markup_a_heading_cannot_carry_is_reported() {
+        let problem = sole_problem_naming(
+            "# Cat\n\n## What is a ![diagram](d.png) thing?\n\nA.\n",
+            "What is a ",
+        );
+        assert!(problem.contains("an image"), "{problem}");
+        let problem = sole_problem_naming(
+            "# Cat\n\n## What is a <b>bold</b> thing?\n\nA.\n",
+            "What is a ",
+        );
+        assert!(problem.contains("raw HTML"), "{problem}");
+    }
+
+    /// Emphasis, strong and links wrap text that still accumulates, so a
+    /// heading using them loses nothing and must not be reported: these pages
+    /// link into themselves constantly.
+    #[test]
+    fn inline_markup_around_heading_text_is_carried_through() {
+        let cats = parse_clean("# Cat\n\n## See [the docs](/about) first\n\nA.\n");
+        assert_eq!(cats[0].entries[0].question, "See the docs first");
+        let cats = parse_clean("# Cat\n\n## *Really* **important** question\n\nA.\n");
+        assert_eq!(cats[0].entries[0].question, "Really important question");
+    }
+
+    /// Inline code in a question used to vanish, leaving "What is a ?" over the
+    /// slug `what-is-a`. Keeping it means the two spellings of one question
+    /// now slug alike, and the second numbers itself out of the way.
+    #[test]
+    fn inline_code_in_a_question_keeps_its_text_and_collides_with_the_plain_spelling() {
+        let cats = parse_clean(
+            "# Cat\n\n## What is a Commit?\n\nOne.\n\n## What is a `Commit`?\n\nTwo.\n",
+        );
+        assert_eq!(cats[0].entries[1].question, "What is a Commit?");
+        assert_eq!(all_slugs(&cats), ["what-is-a-commit", "what-is-a-commit-2"]);
+    }
+
+    /// A setext heading's line break is a word boundary. Dropping it jammed
+    /// the two lines together into one word.
+    #[test]
+    fn a_question_spanning_two_lines_joins_them_with_a_space() {
+        let cats = parse_clean("# Cat\n\nWhat is\nthis?\n---\n\nAnswer.\n");
+        assert_eq!(cats[0].entries[0].question, "What is this?");
+    }
+
+    /// The pages that actually ship. Every rejection above is a build failure,
+    /// so this is what says the rule admits the content we write rather than
+    /// stopping the build on it.
+    #[test]
+    fn the_shipped_pages_render_with_nothing_dropped() {
+        let cats = parse_clean(&expand_snippets(FAQ_MARKDOWN));
+        assert!(
+            cats.iter().any(|cat| !cat.entries.is_empty()),
+            "faq.md parsed to no entries at all, so nothing above was checked"
+        );
+        for article in ARTICLES {
+            let stem = article.stem;
+            let (_, problems) = render_article(article.markdown);
+            assert!(problems.is_empty(), "{stem}.md reported {problems:?}");
+        }
+    }
+
+    /// A pin renders as literal braces on an article page: only the FAQ parses
+    /// with heading attributes on. The author sees an anchor they can link to,
+    /// and the reader sees `{#…}` in the middle of a heading.
+    #[test]
+    fn a_pinned_heading_in_an_article_is_reported() {
+        let (_, problems) = render_article("## How it works {#how-it-works}\n\nProse.\n");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("How it works")),
+            "{problems:?}"
+        );
+    }
+
+    /// Whether a destination names a URI scheme, and so points off the site.
+    ///
+    /// RFC 3986's scheme rule, which is what tells `https://…` and `mailto:…`
+    /// apart from a path.
+    fn names_a_uri_scheme(dest: &str) -> bool {
+        let Some((scheme, _)) = dest.split_once(':') else {
+            return false;
+        };
+        let mut chars = scheme.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    }
+
     /// Destinations of the site-internal links in a markdown source, in
-    /// document order: every one starting `/`, fragment and all.
+    /// document order: every one naming no URI scheme, fragment and all.
+    ///
+    /// Anything scheme-less is a destination on this site whatever its shape,
+    /// so a link that resolves nowhere is the guard's business even when it is
+    /// not written from the root. Taking only the `/…` ones let a destination
+    /// the author never wrote through unseen: with footnotes off, `[^1]` plus
+    /// a `[^1]: note` line is a shortcut reference link to `note`.
     fn internal_link_destinations(markdown: &str) -> Vec<String> {
         Parser::new(markdown)
             .filter_map(|event| match event {
                 Event::Start(Tag::Link { dest_url, .. }) => {
-                    dest_url.starts_with('/').then(|| dest_url.to_string())
+                    (!names_a_uri_scheme(&dest_url)).then(|| dest_url.to_string())
                 }
                 _ => None,
             })
@@ -1005,6 +1424,11 @@ mod tests {
     /// link into the middle of an article page resolves as far as the page and
     /// then lands the reader at the top of it, which reads as the link being
     /// fine.
+    ///
+    /// A destination not written from the root is reported rather than
+    /// resolved: it only reaches the right page while every route is one
+    /// segment deep, and it is the shape markdown produces on its own when a
+    /// footnote is parsed with footnotes off.
     #[test]
     fn every_internal_link_in_the_content_names_a_route_that_exists() {
         let served = served_paths();
@@ -1012,6 +1436,10 @@ mod tests {
         for (page, source) in content_pages() {
             for dest in internal_link_destinations(&expand_snippets(source)) {
                 checked += 1;
+                assert!(
+                    dest.starts_with('/'),
+                    "{page} links to {dest}, which reads as a path beside the page it sits on; a site link is written from the root, as /{dest}"
+                );
                 let (path, fragment) = dest
                     .split_once('#')
                     .map_or((dest.as_str(), None), |(path, fragment)| {
@@ -1042,7 +1470,7 @@ mod tests {
     #[test]
     fn every_faq_deep_link_in_the_content_names_a_real_anchor() {
         // Both sides expanded, so the check sees the pages as a reader does.
-        let cats = parse_faq(&expand_snippets(FAQ_MARKDOWN));
+        let cats = parse_clean(&expand_snippets(FAQ_MARKDOWN));
         let slugs = all_slugs(&cats);
         let mut checked = 0;
         for (page, source) in content_pages() {
@@ -1090,7 +1518,7 @@ mod tests {
     /// Read the way [`assign_slugs`] reads them, or the guards below hunt for
     /// something the page never carried: a pin goes out through [`slugify`],
     /// and only a `## Question` heading is given an anchor at all, since
-    /// [`parse_entries`] drops the pin on a category heading.
+    /// [`parse_entries`] rejects a pin anywhere else.
     fn pinned_faq_anchors(markdown: &str) -> Vec<String> {
         Parser::new_ext(markdown, Options::ENABLE_HEADING_ATTRIBUTES)
             .filter_map(|event| match event {
@@ -1106,9 +1534,8 @@ mod tests {
 
     /// Without the heading-attribute option the parser reports no ids at all,
     /// and the guards below would derive an empty published set and check
-    /// nothing. The other two cases are the ones that made this disagree with
-    /// the page: a pin ships normalized, and a pinned category heading ships no
-    /// anchor whatsoever.
+    /// nothing. Normalization is the other case that made this disagree with
+    /// the page: a pin ships through [`slugify`], not as it was typed.
     #[test]
     fn a_pinned_question_reports_the_anchor_the_page_publishes() {
         assert_eq!(
@@ -1120,7 +1547,6 @@ mod tests {
             pinned_faq_anchors("# Cat\n\n## Q {#Weird--ID!}\n\nA.\n"),
             ["weird-id"]
         );
-        assert!(pinned_faq_anchors("# Cat {#cat}\n\n## Q\n\nA.\n").is_empty());
     }
 
     /// Two headings pinning one id is a content bug nothing else reports: the
@@ -1148,17 +1574,18 @@ mod tests {
     /// are all relative.
     const PUBLISHED_FAQ_ANCHORS: &[&str] = &["how-does-chronoscope-work"];
 
-    /// A published anchor is a promise, and the FAQ pipeline can break one
-    /// without any heading being touched: a pinned entry whose answer went
-    /// empty is dropped from the page, taking its anchor with it. What this
-    /// checks is that every anchor the file pins, plus the unpinned ones named
-    /// below, is still assigned to some entry. Deleting a pin retires its URL,
-    /// which is the one way this passes and a reader still gets nothing; that
-    /// edit is deliberate and lands in the diff of `faq.md`.
+    /// A published anchor is a promise, and a derived one is broken by the
+    /// wording of its heading: `how-does-chronoscope-work` comes out of the
+    /// words in that question, so a reword moves the URL out from under
+    /// everyone who saved it. What this checks is that every anchor the file
+    /// pins, plus the unpinned ones named above, is still assigned to some
+    /// entry. Deleting a pin retires its URL, which is the one way this passes
+    /// and a reader still gets nothing; that edit is deliberate and lands in
+    /// the diff of `faq.md`.
     #[test]
     fn the_faq_still_anchors_every_published_fragment() {
         let expanded = expand_snippets(FAQ_MARKDOWN);
-        let cats = parse_faq(&expanded);
+        let cats = parse_clean(&expanded);
         let slugs = all_slugs(&cats);
         let pinned = pinned_faq_anchors(&expanded);
         for anchor in pinned
@@ -1178,7 +1605,9 @@ mod tests {
     /// got out of its literal would end the string and turn prose into syntax.
     #[test]
     fn an_emitted_answer_keeps_its_quotes_inside_the_literal() {
-        let source = generated_faq_source("# Cat\n\n## Q\n\nSee [docs](https://example.com).\n");
+        let (source, problems) =
+            generated_faq_source("# Cat\n\n## Q\n\nSee [docs](https://example.com).\n");
+        assert!(problems.is_empty(), "{problems:?}");
         assert!(source.contains(r#"title: "Cat""#), "{source}");
         assert!(
             source.contains(
@@ -1234,7 +1663,7 @@ mod tests {
     /// failure names the entry that moved.
     #[test]
     fn the_emitted_table_carries_every_parsed_faq_entry_in_document_order() {
-        let parsed = parse_faq(&expand_snippets(FAQ_MARKDOWN));
+        let parsed = parse_clean(&expand_snippets(FAQ_MARKDOWN));
         // An empty parse would make every assertion below vacuously true.
         assert!(
             parsed.iter().any(|cat| !cat.entries.is_empty()),
@@ -1265,7 +1694,7 @@ mod tests {
             })
             .collect();
 
-        let generated = generated_faq_source(FAQ_MARKDOWN);
+        let (generated, _) = generated_faq_source(FAQ_MARKDOWN);
         let emitted = string_literals(&generated);
         for (position, (what, want)) in expected.iter().enumerate() {
             let got = emitted

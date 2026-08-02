@@ -23,12 +23,20 @@ fn write_artifact(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = std::env::var("OUT_DIR")?;
     let out_dir = Path::new(&out_dir);
+    let mut problems: Vec<String> = Vec::new();
 
     for article in ARTICLES {
+        let stem = article.stem;
+        let (html, page_problems) = render_article(article.markdown);
+        problems.extend(
+            page_problems
+                .into_iter()
+                .map(|problem| format!("{stem}.md: {problem}")),
+        );
         write_artifact(
-            &out_dir.join(output_file(article.stem)),
-            &format!("the rendered body of {}.md", article.stem),
-            &render_article(article.markdown),
+            &out_dir.join(output_file(stem)),
+            &format!("the rendered body of {stem}.md"),
+            &html,
         )?;
     }
     write_artifact(
@@ -40,11 +48,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             generated_route_macro_source()
         ),
     )?;
+    let (faq_source, faq_problems) = generated_faq_source(FAQ_MARKDOWN);
+    problems.extend(
+        faq_problems
+            .into_iter()
+            .map(|problem| format!("faq.md: {problem}")),
+    );
     write_artifact(
         &out_dir.join("faq.rs"),
         "the generated FAQ table",
-        &generated_faq_source(FAQ_MARKDOWN),
+        &faq_source,
     )?;
+
+    // Anything the renderers had no place for is content an author wrote that
+    // no reader would ever see, so the build stops instead of publishing the
+    // page without it. Cargo aborts once a `cargo::error=` line is emitted;
+    // returning `Err` as well would bury these behind an escaped blob.
+    for problem in &problems {
+        println!("cargo::error={problem}");
+    }
 
     println!("cargo:rerun-if-changed=content");
     Ok(())
