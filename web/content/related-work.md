@@ -6,6 +6,26 @@ Chronoscope is a **media-centric link layer** for the historical built environme
 
 ## How we relate to specific projects
 
+### Yesterdays (MapRVA / Richmond, VA)
+
+[Yesterdays](https://yesterdays.maprva.org/) shares many of Chronoscope's goals, scoped to a single city. Built by [MapRVA](https://maprva.org/projects/yesterdays/), a collective of Richmond mapmakers, with imagery drawn from The Valentine, the Library of Virginia, VCU, and Richmond Public Library, it pins tens of thousands of historical photos of Richmond to their locations and layers an AI-powered semantic search over the collection.
+
+Aside from scope, the projects differ in how they use AI. Yesterdays is a focused civic project with human curators doing the geolocation work by hand and AI providing search over the results. Chronoscope uses AI to scale the research itself: segmenting buildings from photos, matching the same structure across eras, estimating dates, and proposing locations. The goal is a knowledge base that grows with less manual effort while staying trustworthy through citations and verification.
+
+The [University of Richmond's Digital Scholarship Lab](https://dsl.richmond.edu/) runs *Richmond Then & Now* and the broader *American Panorama* project, both focused on historical mapping and data visualization.
+
+### Chronoscope World
+
+An unfortunate name collision with another angle on the same concept, focused on how maps themselves portrayed the world across history. [Chronoscope World](https://mprove.de/chronoscope/index.html) is Matthias Müller-Prove's cartography-specialized IIIF viewer, grown out of Chronoscope Hamburg at a 2016 Coding da Vinci hackathon: thousands of historical map sheets georeferenced and readable at their true locations, drawn from libraries and archives worldwide. We found it after we had been calling ourselves Chronoscope for a while, registered the accounts, and filed for incorporation as a non-profit.
+
+The difference in focus is the source material versus what it depicts. Chronoscope World puts a georeferenced sheet in front of you and gives you the tools to read it; Chronoscope treats that same sheet, or a photograph, as evidence about a building, attachable to everything else said about that building.
+
+### Kartta Labs
+
+[Kartta Labs](https://github.com/kartta-labs) began at Google Research and reconstructs a city's past streets in 3D, walkable under a time slider, as covered in [this write-up of the re.city streetscape viewer](https://thinkwhere.wordpress.com/2026/06/08/3d-time-enabled-historical-streetscapes-re-city-kartta-labs-with-google-research/). It is the closest published work to where Chronoscope eventually wants to go.
+
+The difference is what each project assumes it starts with. Kartta's crowdsourcing tools *are* the corpus layer: a volunteer places control points to georectify a scanned map, another traces the building footprints off it, another annotates facades in historical photos, and the machine learning picks up downstream to turn those inputs into 3D structure. Chronoscope's first job is that upstream corpus, tying images reliably to a building, a place, and a time with citations attached. We want the AI to do as much of that as it can. What is left over should be genuinely fun to research and contribute to rather than data entry, with the machine assisting there too rather than simply handing the residual to a human. 3D is on our roadmap, not at the front of it.
+
 ### OpenStreetMap (OSM)
 
 OSM is the canonical open map of the present-day world. Chronoscope uses it as the base map for the present: when we need to know what's at a coordinate today, OSM is the source of truth, and we link to OSM IDs wherever a building or feature we describe corresponds to one in OSM.
@@ -34,14 +54,6 @@ Pleiades is the gazetteer of ancient places, focused on the Greco-Roman world an
 ### OldInsuranceMaps.net
 
 OldInsuranceMaps is a community project for georeferencing Sanborn fire insurance maps. Sanborn maps were produced from the 1860s through the 1970s for fire insurance underwriters, recording building footprints, construction materials, and uses block by block across thousands of US cities. Each georeferenced sheet depicts buildings at a known time and place, and the overlay provides geometry to link them to today's map.
-
-### Yesterdays (MapRVA / Richmond, VA)
-
-[Yesterdays](https://yesterdays.maprva.org/) shares many of Chronoscope's goals, scoped to a single city. Built by [MapRVA](https://maprva.org/projects/yesterdays/), a collective of Richmond mapmakers, with imagery drawn from The Valentine, the Library of Virginia, VCU, and Richmond Public Library, it pins tens of thousands of historical photos of Richmond to their locations and layers an AI-powered semantic search over the collection.
-
-Aside from scope, the projects differ in how they use AI. Yesterdays is a focused civic project with human curators doing the geolocation work by hand and AI providing search over the results. Chronoscope uses AI to scale the research itself: segmenting buildings from photos, matching the same structure across eras, estimating dates, and proposing locations. The goal is a knowledge base that grows with less manual effort while staying trustworthy through citations and verification.
-
-The [University of Richmond's Digital Scholarship Lab](https://dsl.richmond.edu/) runs *Richmond Then & Now* and the broader *American Panorama* project, both focused on historical mapping and data visualization.
 
 ### Digital library and archive collections
 

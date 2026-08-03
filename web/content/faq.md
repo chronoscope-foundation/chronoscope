@@ -34,7 +34,7 @@ A **badge** is a cluster: several places too close together to draw separately a
 
 ## How does the automated image analysis work?
 
-AI models analyze images in a pipeline of focused steps. First, individual buildings are outlined in each photo so they can be studied separately. Then a visual similarity engine finds the same building across photos from different eras. Finally, a vision-language model describes what it sees: building type, approximate age, architectural style, visible damage. Each step is independently checkable, and every AI-generated conclusion is grounded in the specific photo or source it came from. For more technical details on the specific models used, see our [GitHub documentation](https://github.com/copumpkin/chronoscope).
+AI models work over each image in focused steps. A segmentation model outlines the individual buildings in a photo, drawing, or map so each can be studied separately. An embedding model indexes how each one looks, so a building in one image can surface candidates in others. A vision-language model reads what the image can tell us about them and how they sit relative to each other, such as one building standing next to another. None of those steps decides identity on its own: it all arrives at the reasoning engine as evidence, weighed alongside dates and locations, and that is where whether we have seen this building before is actually settled. Keeping the decision there rather than inside an image model makes the reasoning deterministic and traceable, with every conclusion pointing back to the specific evidence behind it. For more technical details on the specific models used, see our [GitHub documentation](https://github.com/copumpkin/chronoscope).
 
 ## Can the AI make mistakes?
 
