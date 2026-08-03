@@ -128,6 +128,68 @@
           name = "chronoscope-source";
         };
 
+        workspaceSrc = import ./nix/workspace-src.nix { inherit lib pkgs craneLib; };
+
+        # Artifacts built from one package of the workspace, each with the
+        # crates it compiles and the non-cargo files its build reads.
+        #
+        # Registered together rather than beside each build so `workspace-
+        # closures` covers every one of them: a deployable gets the guarantee
+        # by being listed here, not by someone remembering to check it.
+        deployables = {
+          api = rec {
+            package = "chronoscope-api";
+            crates = [
+              "analysis"
+              "api"
+              "api-client"
+              "core"
+              "db"
+              "integrations"
+              "macros"
+            ];
+            # Compile-time inputs, both: `sqlx::migrate!` embeds the .sql under
+            # db/migrations*/, and analysis/build.rs compiles analysis/proto/.
+            # The .json fixtures under integrations/ are not, since the binary
+            # builds with doCheck = false, so editing a test fixture leaves the
+            # production image alone.
+            extra = map (workspaceSrc.withExtensions [
+              "sql"
+              "proto"
+            ]) (map (crate: ./. + "/${crate}") crates);
+          };
+
+          web = {
+            package = "chronoscope-web";
+            crates = [
+              "api-client"
+              "core"
+              "macros"
+              "web"
+            ];
+            extra = [
+              # Read by the clippy checks sharing this source. It arrived
+              # incidentally before, when the filter kept every .toml.
+              ./clippy.toml
+              # trunk's entry point, tailwind's input, any hand-written script.
+              (workspaceSrc.withExtensions [ "html" "css" "js" ] ./web)
+              # web/build.rs include_str!s these. Scoped to content/ rather
+              # than all of web/, so prose does not rebuild the bundle.
+              (workspaceSrc.withExtensions [ "md" ] ./web/content)
+            ];
+          };
+        };
+
+        deployableSrcs = lib.mapAttrs (
+          name: deployable:
+          workspaceSrc.mkWorkspaceSrc {
+            name = "chronoscope-${name}-source";
+            root = ./.;
+            fullSrc = src;
+            inherit (deployable) crates extra;
+          }
+        ) deployables;
+
         # The `doc` check builds the whole workspace incl. chronoscope-web on
         # the host target, and web include_str!s page content (.md) from web/.
         # Superset of `src`; scoped to web/ so doc/README markdown edits don't
@@ -193,6 +255,7 @@
             src
             ohmStylePath
             ;
+          webSrc = deployableSrcs.web;
           # Native (non-wasm) crane bits for the host-target `web-native-test`
           # and `web-native-clippy` checks, which run and lint the crate's plain
           # #[test]s. The wasm pipeline covers only what ships.
@@ -202,6 +265,7 @@
 
         api = import ./nix/api.nix {
           inherit pkgs craneLib spatialitePreload;
+          apiSrc = deployableSrcs.api;
           rustCommonArgs = rust.commonArgs;
           inherit (rust) cargoArtifacts;
         };
@@ -438,6 +502,11 @@
             # providers' own schemas, so an infrastructure change that cannot
             # apply fails here instead of halfway through an apply.
             infra-validate = infra.validate;
+
+            workspace-closures = workspaceSrc.mkClosureCheck {
+              inherit src deployables;
+              cargo = toolchain;
+            };
 
             # Hermetic coverage of the build-db path: a dump-free facts DB from
             # the curated bundle, self-validating that it holds facts.

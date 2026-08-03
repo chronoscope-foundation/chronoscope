@@ -3,6 +3,10 @@
   craneLib,
   rustCommonArgs,
   cargoArtifacts,
+  # Workspace source narrowed to the crates this binary compiles — see
+  # flake.nix. Keeps an edit elsewhere in the workspace from producing a new
+  # image digest and rolling a revision that cannot behave differently.
+  apiSrc,
   # Env that preloads libspatialite to avoid the teardown segfault — see
   # flake.nix. `{}` keeps the module loadable standalone.
   spatialitePreload ? { },
@@ -22,6 +26,7 @@ let
     rustCommonArgs
     // {
       inherit cargoArtifacts;
+      src = apiSrc;
       pname = "chronoscope-api";
       cargoExtraArgs = "-p chronoscope-api --bin chronoscope-api";
       doCheck = false;

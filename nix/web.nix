@@ -15,6 +15,10 @@
   craneLib,
   system,
   src,
+  # Workspace source narrowed to the crates this bundle compiles — see
+  # nix/workspace-src.nix. Keeps a backend edit from rebuilding the WASM
+  # pipeline and republishing a bundle that cannot have changed.
+  webSrc,
   rustCommonArgs,
   ohmStyle,
   ohmStylePath,
@@ -31,28 +35,6 @@ let
     ];
 
   wasmCraneLib = (crane.mkLib pkgs).overrideToolchain wasmToolchain;
-
-  # Filter source: Cargo files from the whole workspace (crane needs root
-  # Cargo.toml/Cargo.lock), but web-specific assets only from web/.
-  #
-  # The `.md` clause carries `web/content/`, which `web/build.rs` reads: drop it
-  # and every web build fails on a missing `include_str!` in `build/render.rs`.
-  webSrc = lib.cleanSourceWith {
-    src = wasmCraneLib.path (toString ../. + "/.");
-    filter =
-      path: type:
-      (wasmCraneLib.filterCargoSources path type)
-      || (
-        lib.hasInfix "/web/" path
-        && (
-          lib.hasSuffix ".html" path
-          || lib.hasSuffix ".css" path
-          || lib.hasSuffix ".md" path
-          || lib.hasSuffix ".js" path
-        )
-      );
-    name = "chronoscope-web-source";
-  };
 
   commonArgs = {
     src = webSrc;

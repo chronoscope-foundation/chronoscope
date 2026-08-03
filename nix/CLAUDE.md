@@ -15,6 +15,7 @@ Nix build infrastructure. One derivation module per project area;
 | `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |
 | `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL → SQLite facts DBs) |
 | `oci.nix`       | nix2container image for the API server (Cloud Run) + the check that boots its entrypoint, Linux systems only |
+| `workspace-src.nix` | Narrowed sources for artifacts built from one workspace package, plus `workspace-closures`, the check that keeps the declared crate lists matching cargo |
 | `infra.nix`     | terranix modules for the cloud project, the `config.tf.json` they compile to, the pinned OpenTofu, and the check that validates the two together |
 | `infra-settings.nix` | The project's cloud coordinates (project, region, registry, state bucket, Cloudflare account/zone). Read by `infra.nix` and by the justfile via `nix eval --file`, so there is one definition |
 | `front-door.js` | The Cloudflare Worker `infra.nix` reads inline: serves the web bundle as static assets, proxies `/api` to Cloud Run with the mount stripped |
@@ -43,6 +44,31 @@ the state the way it does for the image.
 network, so a resource argument that does not exist fails at commit time
 rather than partway through an apply. Adding a provider means adding it
 to `withPlugins`, or `init` inside that check cannot resolve it.
+
+## Deployable sources
+
+A build that names one package compiles only that package's closure, but a
+workspace has one source tree. Handing the whole tree to such a build puts
+every other crate in its input hash, so an unrelated edit yields a different
+output path: a new container image, a republished bundle, a rebuilt pipeline
+that cannot have changed.
+
+`deployables` in `flake.nix` registers each such artifact with the crates it
+compiles and the non-cargo files its build reads (embedded `.sql` migrations,
+`.proto` a build script compiles, the stylesheet a bundler consumes).
+`mkWorkspaceSrc` turns that into a source: every member's `Cargo.toml`, since
+cargo will not load a workspace whose members it cannot read, plus the full
+contents of the listed crates.
+
+The lists are allow-lists on purpose. A crate missing from one has no sources
+and the build stops; an unrelated crate missing from a deny-list would quietly
+rejoin the hash, and the churn would return with nothing to signal it.
+
+**Adding a container means adding an entry**, not writing a fileset. The
+`workspace-closures` check then covers it: it reads the real graph from
+`cargo metadata --no-deps` and fails naming the crate to add or remove, which
+matters because cargo's own response to a wrong list is a warning printed while
+it drops the dependency.
 
 ## The function-with-named-instances pattern
 
