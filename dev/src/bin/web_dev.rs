@@ -135,12 +135,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(log, "========================================");
     info!(log, "");
 
-    // 6. Wait for Ctrl+C
-    signal::ctrl_c().await.ok();
-    info!(log, "Shutting down...");
+    // 6. Serve until something tells us to stop, or nothing can any more.
+    let reason = shutdown_reason().await;
+    info!(log, "Shutting down"; "reason" => reason);
     trunk.kill().ok();
     server.shutdown().await;
     drop(db_dir);
 
     Ok(())
+}
+
+/// Resolves when this server should stop, naming why.
+///
+/// `just web-dev` runs the server three processes deep (`nix develop`, then
+/// `cargo run`), so a launcher that goes away signals nothing down the chain and
+/// the server is left holding its ports and its Trunk child. Reparenting to
+/// `init` is what that looks like from here, and polling for it is what lets the
+/// shutdown below run at all: for a long time these servers outlived the
+/// sessions that started them, sixteen deep across two worktrees at one point.
+///
+/// `SIGTERM` and `SIGHUP` matter for the same reason. A plain `kill` used to
+/// take the server down without ever reaching Trunk, which then outlived it.
+async fn shutdown_reason() -> &'static str {
+    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
+    let mut hangup = signal::unix::signal(signal::unix::SignalKind::hangup()).ok();
+
+    // A signal we could not register for is one that will never arrive.
+    async fn on(source: Option<&mut signal::unix::Signal>) {
+        match source {
+            Some(signal) => {
+                signal.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn orphaned() {
+        // Slow enough to cost nothing, quick enough that a session's servers are
+        // gone before the next one starts.
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tick.tick().await;
+            if std::os::unix::process::parent_id() == 1 {
+                return;
+            }
+        }
+    }
+
+    tokio::select! {
+        _ = signal::ctrl_c() => "interrupt",
+        () = on(terminate.as_mut()) => "terminate",
+        () = on(hangup.as_mut()) => "hangup",
+        () = orphaned() => "launcher exited",
+    }
 }
