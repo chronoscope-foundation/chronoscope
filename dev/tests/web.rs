@@ -440,12 +440,21 @@ const DISCLOSURE: &str = "[aria-expanded]";
 /// removal wait on that selector can never be satisfied.
 const LIGHTBOX: &str = "[role='dialog'][aria-label='Image preview']";
 
+/// The nav drawer, which is what the menu toggle actually animates.
+const DRAWER: &str = "[role='dialog'][aria-label='Site navigation']";
+
 /// Open the nav drawer and assert its links are present.
 ///
 /// The links live only in the drawer now, at every viewport, so reaching them
 /// means opening it first — there is no always-visible copy to read.
 async fn check_nav_links(t: &WebTest) -> TestResult {
     t.click("button[aria-label='Toggle menu']").await?;
+
+    // The click above waits on a transition of the button, which doesn't have
+    // one; the drawer does. Its 200 ms slide outlives the click's 250 ms
+    // fallback whenever the machine is busy, and the hit test below then reads
+    // a drawer still on its way in.
+    t.wait_for_animations(DRAWER).await?;
 
     // The drawer stays mounted so its slide can animate, so its links read fine
     // through `translateX(-100%)` and every assertion below would pass with a

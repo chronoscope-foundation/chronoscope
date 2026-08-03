@@ -180,6 +180,7 @@ pub fn register_base() {
         wait_for_body_text,
         wait_for_fonts,
         wait_for_media_query,
+        wait_for_animations,
 
         // The locale this browser reads in, raw. A test asserting the map is
         // labelled in it has to reduce it itself, or it asserts our own
@@ -684,6 +685,86 @@ fn wait_for_media_query(query: String, expected: bool) -> js_sys::Promise {
         }
         listener_cell.set(Some(listener));
     })
+}
+
+/// How many times this animation runs, as `getComputedTiming()` reports it.
+/// `Infinity` for a looping one.
+fn animation_iterations(animation: &JsValue) -> Option<f64> {
+    js_sys::Reflect::get(animation, &"effect".into())
+        .ok()
+        .and_then(|effect| {
+            js_sys::Reflect::get(&effect, &"getComputedTiming".into())
+                .ok()
+                .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+                .and_then(|f| f.call0(&effect).ok())
+        })
+        .and_then(|timing| js_sys::Reflect::get(&timing, &"iterations".into()).ok())
+        .and_then(|v| v.as_f64())
+}
+
+/// Resolves once every animation on the first match and its subtree that can
+/// finish has finished.
+///
+/// [`click`] waits on a transition of the element it clicked, so an interaction
+/// whose effect moves something *else* is covered only by that wait's fallback
+/// timer: the nav trigger resolves on a 250 ms timeout while the drawer it
+/// opens slides for 200 ms, and a loaded machine spends that 50 ms of margin
+/// elsewhere. An assertion about where the moved thing came to rest has to wait
+/// on the thing that moved.
+///
+/// Looping animations are left out rather than awaited. A loading skeleton's
+/// `animate-pulse` never finishes, so awaiting one would spend the harness
+/// timeout and report a stall where there is none.
+fn wait_for_animations(selector: String) -> js_sys::Promise {
+    let reject = |message: String| js_sys::Promise::reject(&JsValue::from_str(&message));
+
+    let Some(element) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(&selector).ok().flatten())
+    else {
+        return reject(format!(
+            "wait_for_animations({selector:?}): nothing matches, so there is no animation to wait on"
+        ));
+    };
+
+    // Reading geometry flushes pending style, which is where a transition for a
+    // style change made in this same task gets created. Without the flush the
+    // list below can come back empty for an element that is about to move.
+    let _ = element.get_bounding_client_rect();
+
+    // `getAnimations({subtree: true})` — reached through Reflect because
+    // web-sys doesn't bind the options form.
+    let opts = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&opts, &"subtree".into(), &JsValue::TRUE);
+    let animations = js_sys::Reflect::get(&element, &"getAnimations".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .and_then(|f| f.call1(&element, &opts).ok())
+        .and_then(|v| v.dyn_into::<js_sys::Array>().ok())
+        .unwrap_or_default();
+
+    let pending = js_sys::Array::new();
+    for animation in animations.iter() {
+        // Reported rather than assumed either way: taking an unreadable count
+        // for looping drops a real wait and puts the race back, and taking it
+        // for finite hangs on the one animation that never ends.
+        let Some(iterations) = animation_iterations(&animation) else {
+            return reject(format!(
+                "wait_for_animations({selector:?}): an animation reported no iteration count, so \
+                 there is no telling whether it ever finishes"
+            ));
+        };
+        if !iterations.is_finite() {
+            continue;
+        }
+        let Ok(finished) = js_sys::Reflect::get(&animation, &"finished".into()) else {
+            return reject(format!(
+                "wait_for_animations({selector:?}): an animation exposed no `finished` promise"
+            ));
+        };
+        pending.push(&finished);
+    }
+    js_sys::Promise::all(&pending)
 }
 
 #[derive(Clone, Copy)]

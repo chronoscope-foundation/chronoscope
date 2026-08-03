@@ -641,6 +641,10 @@ impl WebTest {
         // renderer has resized and recalculated style, so a responsive
         // assertion has to wait for the predicate the stylesheet branches on.
         pub wait wait_for_media_query(query: &str, expected: bool);
+        // Every animation on the element and its subtree that can finish has.
+        // Required before asserting where something a click *elsewhere* moved
+        // has come to rest: `click` only waits on the element it clicked.
+        pub wait wait_for_animations(selector: &str);
 
         // DOM queries (compositions: wait then read, where natural).
         pub query text(selector: &str) -> String;
