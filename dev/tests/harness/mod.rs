@@ -69,38 +69,38 @@ fn screenshot_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>>
     .map_err(Into::into)
 }
 
-/// How many orphaned browser processes were already running when this suite
-/// started, sampled once.
+/// How many test browsers were already running when this suite started,
+/// sampled once.
 ///
 /// A `Timeout` from a wait hook says nothing about *why* the page stalled, and
-/// the usual why is contention: browsers stranded by an earlier run compete for
-/// the CPU and starve the headless event loop. That has cost real diagnosis time
-/// more than once (see `chronoscope-learnings/web-test-timeout-flakes-*.md`), so
-/// the count rides along in every timeout message.
+/// the usual why is contention: another suite competing for the CPU starves the
+/// headless event loop. That has cost real diagnosis time more than once (see
+/// `chronoscope-learnings/web-test-timeout-flakes-*.md`), so the count rides
+/// along in every timeout message.
+///
+/// Counted whoever owns them. A browser stranded by a killed run and a browser
+/// belonging to another worktree's gate cost the same cores, and this machine
+/// carries a dozen worktrees, so a live sibling suite is the likelier of the
+/// two. An earlier version counted only processes reparented to `init`, which
+/// saw the abandoned case and missed the concurrent one entirely.
 ///
 /// Sampled by the first test to start, before any browser of this run exists,
-/// which is what lets the count mean "already running". Chrome reparents to
-/// `init` shortly after launch on macOS, so the parent alone dates a browser
-/// only while the suite has yet to start one of its own.
-fn orphaned_browsers() -> usize {
+/// which is what lets the count mean "already running".
+///
+/// The harness launches "Google Chrome for Testing", a separate binary from
+/// Chrome or Chromium, so a browser someone is reading this in is never counted.
+fn browsers_already_running() -> usize {
     static COUNT: OnceLock<usize> = OnceLock::new();
     *COUNT.get_or_init(|| {
         let Ok(out) = std::process::Command::new("ps")
-            .args(["-axo", "ppid=,command="])
+            .args(["-axo", "command="])
             .output()
         else {
             return 0;
         };
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            .filter(|line| {
-                let mut parts = line.trim().splitn(2, char::is_whitespace);
-                let orphaned = parts.next().is_some_and(|ppid| ppid.trim() == "1");
-                // The harness launches "Google Chrome for Testing"; a developer's
-                // own Chrome or Chromium does not carry that suffix, so this
-                // cannot mistake an ordinary browser window for a leak.
-                orphaned && parts.next().is_some_and(|cmd| cmd.contains("for Testing"))
-            })
+            .filter(|line| line.contains("for Testing"))
             .count()
     })
 }
@@ -108,12 +108,10 @@ fn orphaned_browsers() -> usize {
 /// Appended to every timeout so a stall names its most likely cause instead of
 /// leaving the reader to guess.
 fn contention_note() -> String {
-    match orphaned_browsers() {
+    match browsers_already_running() {
         0 => String::new(),
         n => format!(
-            " ({n} orphaned browser process(es) were already running when this \
-             suite started, which starves the headless event loop \u{2014} \
-             `pkill -f \"for Testing\"` and re-run before suspecting the code)"
+            " ({n} test browser process(es) were already running when this suite              started, from a concurrent run or a stranded one, which starves the              headless event loop; re-run on a quiet machine before suspecting              the code)"
         ),
     }
 }
@@ -966,7 +964,7 @@ async fn run_web_test(
 ) -> TestResult {
     // Sample before this test's browser exists, so the count means what its
     // message says. The first test to arrive takes it for the whole suite.
-    let _ = orphaned_browsers();
+    let _ = browsers_already_running();
 
     let t = WebTest::new(seed_commits).await?;
 
