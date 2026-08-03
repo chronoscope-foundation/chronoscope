@@ -129,6 +129,24 @@ _infra_web_dist() {
 }
 '''
 
+# Keep stdin intact for the confirmation an apply asks for at the end.
+#
+# The builds and pushes in between are free to read stdin, and nix does: a cold
+# run left it at EOF, which tofu takes as a refusal, so a first deploy failed at
+# the prompt while the cached re-run sailed past. Redirecting each build would
+# fix it until someone adds the next one, so stdin is saved once here and
+# replaced with /dev/null. Nothing downstream can consume what it cannot reach.
+#
+# The apply reads the saved copy with `<&3`: a terminal when a human types this,
+# a pipe when something scripts it. Reading /dev/tty instead would also fix the
+# EOF, at the cost of refusing to run anywhere without a controlling terminal.
+_hold_stdin := '''
+_hold_stdin() {
+    exec 3<&0
+    exec 0</dev/null
+}
+'''
+
 # Put the Cloudflare credential in the environment the provider reads it from.
 # Fetched per run out of Secret Manager rather than kept in a file, a variable
 # in the config, or an argument: it never lands in the state, in the repo, or in
@@ -483,10 +501,12 @@ infra-apply:
     {{ _infra_image }}
     {{ _infra_web_dist }}
     {{ _cloudflare_token }}
+    {{ _hold_stdin }}
     _ensure_nix
     if ! command -v tofu >/dev/null 2>&1; then
         exec nix develop .#infra --command just infra-apply
     fi
+    _hold_stdin
     _infra_sync
     _infra_image
     _infra_web_dist
@@ -498,10 +518,7 @@ infra-apply:
         echo "and applies everything here with the digest the push reported." >&2
         exit 1
     fi
-    # Read the confirmation off the terminal rather than inherited stdin. A
-    # build earlier in the recipe can leave stdin at EOF, and tofu reads that
-    # as a refusal, so a cold run fails at the prompt while a warm one works.
-    tofu -chdir=.infra apply < /dev/tty
+    tofu -chdir=.infra apply <&3
 
 # ---------------------------------------------------------------------------
 # Deployment to Cloud Run.
@@ -546,6 +563,7 @@ deploy:
     {{ _infra_sync }}
     {{ _infra_web_dist }}
     {{ _cloudflare_token }}
+    {{ _hold_stdin }}
     _ensure_nix
     # Re-exec on the tools rather than on IN_NIX_SHELL: every dev shell sets
     # that variable and only this one carries all three, so keying off it
@@ -554,6 +572,7 @@ deploy:
        || ! command -v tofu >/dev/null 2>&1; then
         exec nix develop .#deploy --command just deploy
     fi
+    _hold_stdin
     # The same definition the infrastructure is declared from, so the push
     # cannot address a registry nothing ever created.
     project=$(nix eval --file nix/infra-settings.nix project --raw)
@@ -606,10 +625,7 @@ deploy:
     # there. It prints its plan and waits for a typed confirmation first.
     export TF_VAR_image="$ref@$digest"
     _infra_sync
-    # From the terminal, not inherited stdin: the image build above leaves
-    # stdin at EOF, which tofu reads as a refusal. That is why a first deploy
-    # failed at the prompt and the cached re-run did not.
-    tofu -chdir=.infra apply < /dev/tty
+    tofu -chdir=.infra apply <&3
 
 # ---------------------------------------------------------------------------
 # Deployment to the Cloudflare edge.
@@ -641,10 +657,12 @@ deploy-web:
     {{ _infra_image }}
     {{ _infra_web_dist }}
     {{ _cloudflare_token }}
+    {{ _hold_stdin }}
     _ensure_nix
     if ! command -v tofu >/dev/null 2>&1 || ! command -v gcloud >/dev/null 2>&1; then
         exec nix develop .#infra --command just deploy-web
     fi
+    _hold_stdin
     _infra_web_dist
     echo "==> Publishing $TF_VAR_web_dist"
     _infra_sync
@@ -657,9 +675,7 @@ deploy-web:
         echo "and applies everything here with the digest the push reported." >&2
         exit 1
     fi
-    # From the terminal, not inherited stdin: the bundle build above leaves
-    # stdin at EOF, which tofu reads as a refusal.
-    tofu -chdir=.infra apply < /dev/tty
+    tofu -chdir=.infra apply <&3
 
 # ---------------------------------------------------------------------------
 # Data fetches. Each is a thin wrapper around `nix build` + GC root pinning.
