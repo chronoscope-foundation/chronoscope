@@ -298,11 +298,12 @@ pub struct AttributionControl<'a> {
 }
 
 /// Options for constructing a MapLibre map.
+///
+/// The style is [`create_map`]'s own argument, set on the serialized object
+/// beside the container, so it can be a whole document and not just the URL one
+/// is fetched from.
 #[derive(Serialize)]
 pub struct MapOptions<'a> {
-    /// Where the style document is fetched from, resolved against the page
-    /// (e.g. `"/basemap/ohm-historical.json"`).
-    pub style: &'a str,
     /// Initial center as `[longitude, latitude]`.
     pub center: [f64; 2],
     /// Initial zoom level.
@@ -327,11 +328,17 @@ pub struct MapOptions<'a> {
 
 /// Create a new MapLibre map in the given container element.
 ///
+/// `style` is either a whole style document or the URL one is fetched from.
+/// Handing over the document is what puts the caller's own rewrites in the map's
+/// first frame, since a style named by URL is drawn as it arrives and can only
+/// be rewritten afterwards.
+///
 /// The error is what the reader gets in place of a map, so it names the step
 /// that failed. A `maplibregl` the script tag never loaded arrives as the
 /// constructor's own throw.
 pub fn create_map(
     container: &web_sys::HtmlDivElement,
+    style: &JsValue,
     options: &MapOptions<'_>,
 ) -> Result<Map, String> {
     let opts = crate::components::map::to_js(options).map_err(|e| {
@@ -342,6 +349,9 @@ pub fn create_map(
     js_sys::Reflect::set(&opts, &"container".into(), container).map_err(|e| {
         format!("The map could not be created: its container could not be set: {e:?}")
     })?;
+
+    js_sys::Reflect::set(&opts, &"style".into(), style)
+        .map_err(|e| format!("The map could not be created: its style could not be set: {e:?}"))?;
 
     Map::new(&opts).map_err(|e| format!("The map could not be created: {e:?}"))
 }

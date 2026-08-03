@@ -287,11 +287,6 @@ fn bump_and_dispatch(
     }
 }
 
-#[cfg(feature = "test-hooks")]
-fn record_fetch_settled() {
-    bump_and_dispatch(&FETCH_SETTLED, FETCH_COMPLETE_EVENT);
-}
-
 /// The basemap layer entity labels take their font from. Exposed so the font
 /// test reads the id from here rather than restating it.
 #[cfg(feature = "test-hooks")]
@@ -331,8 +326,10 @@ fn record_label_rewrite_targets(_ids: &[String]) {}
 
 #[cfg(feature = "test-hooks")]
 thread_local! {
-    /// Ids the snapshot kept without their own filter (see
-    /// [`BasemapStyle::dropped_filters`]).
+    /// Ids whose own filter the rewrite could not keep, so the layer is filtered
+    /// by time alone. Exposed so a test asking "is every layer still filtered by
+    /// what the style asks of it" can tell this handled case from a filter that
+    /// went missing.
     static DROPPED_BASEMAP_FILTERS: RefCell<BTreeSet<String>> = const { RefCell::new(BTreeSet::new()) };
 }
 
@@ -1346,7 +1343,7 @@ fn copy_basemap_label_style(map: &maplibre::Map, spec: &JsValue) -> Result<(), S
 /// All or nothing, and the caller registers no click handlers unless it
 /// succeeded, so no handler can ever hit-test against a stack this left
 /// half-built.
-fn init_source_and_layers(map: &maplibre::Map) -> Result<(), String> {
+fn init_source_and_layers(map: &maplibre::Map, state: &MapState) -> Result<(), String> {
     let dpr = device_pixel_ratio();
     let source = GeoJsonSourceSpec {
         r#type: "geojson",
@@ -1384,7 +1381,40 @@ fn init_source_and_layers(map: &maplibre::Map) -> Result<(), String> {
         map.add_layer(&spec)
             .map_err(|e| format!("failed to add the {} layer: {e:?}", layer.id()))?;
     }
+    hold_entity_labels(map, state);
     Ok(())
+}
+
+/// Hold our own labels back with the basemap's, since a name of ours going up
+/// first displaces the basemap names around it just as surely.
+///
+/// Hidden here rather than in the layer spec so that one condition governs it:
+/// the labels can have gone up already, on the backstop, before this runs. The
+/// layer draws from an empty source until the first pass, so it has nothing on
+/// screen to take back.
+///
+/// Warned and survivable, like a ring sprite that fails to register: the cost of
+/// a miss is one pass of labels rearranging, where an error would take out every
+/// layer this is on the way to finishing.
+fn hold_entity_labels(map: &maplibre::Map, state: &MapState) {
+    if state.labels_revealed.get() {
+        return;
+    }
+    let hidden = JsValue::from_str("none");
+    let options = maplibre::skip_validation();
+    match map.set_layout_property(ENTITY_LABELS_LAYER, "visibility", &hidden, &options) {
+        Ok(()) => {
+            state
+                .held_labels
+                .borrow_mut()
+                .insert(ENTITY_LABELS_LAYER.to_string());
+        }
+        Err(e) => {
+            web_sys::console::warn_1(
+                &format!("entity labels could not be held back with the basemap's: {e:?}").into(),
+            );
+        }
+    }
 }
 
 /// Update an existing GeoJSON source with new data.
@@ -1412,8 +1442,12 @@ fn clear_source_data(map: &maplibre::Map, source_id: &str) {
 
 // ==================== Basemap style rewrites ====================
 
-/// What the style is read for once it has loaded, in one pass over its layers.
+/// The style document the map is handed, and what the session keeps rewriting
+/// it from.
 struct BasemapStyle {
+    /// The document itself: every layer already filtered to the instant the map
+    /// opens at, every label already in the reader's language.
+    document: serde_json::Value,
     /// Every basemap layer's own filter, keyed by layer id.
     ///
     /// OHM's tileset is time-agnostic: a feature carries the decimal years it
@@ -1422,63 +1456,144 @@ struct BasemapStyle {
     /// since each instant rebuilds from the original rather than wrapping the
     /// previous instant's clauses.
     filters: BTreeMap<String, Option<serde_json::Value>>,
-    /// Ids of the layers drawing OHM's local `name`, which are the ones the
-    /// reader's own language is written over.
-    raw_name_labels: Vec<String>,
-    /// Ids whose own filter the snapshot could not keep, so the layer is
-    /// filtered by time alone. Reported so a test asking "is every layer still
-    /// filtered by what the style asks of it" can tell this handled case from a
-    /// filter that went missing.
-    dropped_filters: Vec<String>,
+    /// The style's symbol layers, hidden in the document and waiting for
+    /// [`reveal_held_labels`].
+    held_labels: BTreeSet<String>,
 }
 
-/// Read the loaded style: each basemap layer's filter to rewind from, and the
-/// labels to translate.
+/// Fetch the style document and rewrite it to `bounds` before there is a map to
+/// draw it.
+///
+/// A style named by URL is fetched by `MapLibre` and drawn as it arrives, so
+/// every era of OHM stands on screen together until the first filter pass lands.
+/// The document is served from our own origin, so it can be read and rewritten
+/// first and the map's opening frame is already the instant the reader asked
+/// for.
+///
+/// `None` leaves the caller to hand `MapLibre` the URL.
+async fn prefiltered_basemap_style(bounds: (f64, f64)) -> Option<BasemapStyle> {
+    match fetch_basemap_style().await {
+        Ok(document) => rewrite_basemap_style(document, bounds),
+        Err(cause) => {
+            web_sys::console::warn_1(
+                &format!(
+                    "the basemap style at '{}' did not read, so the map draws every era of it at \
+                     once: {cause}",
+                    BASEMAP.style_url
+                )
+                .into(),
+            );
+            None
+        }
+    }
+}
+
+/// The pinned style document, parsed. Same-origin: it is served out of the same
+/// dist as the bundle asking for it.
+async fn fetch_basemap_style() -> Result<serde_json::Value, String> {
+    let window = web_sys::window().ok_or("there is no window to fetch from")?;
+    let response = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(BASEMAP.style_url))
+        .await
+        .map_err(|e| format!("the request failed, {e:?}"))?;
+    let response: web_sys::Response = response
+        .dyn_into()
+        .map_err(|e| format!("the request answered with no response, {e:?}"))?;
+    if !response.ok() {
+        return Err(format!("the server answered {}", response.status()));
+    }
+    let body = response
+        .text()
+        .map_err(|e| format!("its body could not be read as text, {e:?}"))?;
+    let body = wasm_bindgen_futures::JsFuture::from(body)
+        .await
+        .map_err(|e| format!("its body did not arrive, {e:?}"))?;
+    let body = body.as_string().ok_or("its body was not text")?;
+    serde_json::from_str(&body).map_err(|e| format!("it is not JSON, {e}"))
+}
+
+/// Write the instant's filters and the reader's own language into the parsed
+/// style, and hide the labels until the markers that share their space are in
+/// (see [`reveal_held_labels`]). Each layer's filter is kept as it shipped.
 ///
 /// A `source-layer` is what marks a layer as the vector tileset's; the layers we
 /// add ourselves draw from a GeoJSON source and carry none.
-fn read_basemap_style(map: &maplibre::Map) -> BasemapStyle {
-    let mut read_style = BasemapStyle {
-        filters: BTreeMap::new(),
-        raw_name_labels: Vec::new(),
-        dropped_filters: Vec::new(),
-    };
-    let style = map.get_style();
-    // Both ways out of here leave an empty snapshot, which every filter pass for
-    // the rest of the session bails on: the basemap draws every era at once and
-    // this is the only place that knows why.
-    let Ok(layers) = js_sys::Reflect::get(&style, &"layers".into()) else {
+///
+/// The language a reader reads in doesn't move with the time slider, so the
+/// labels are written here and stay clear of the per-instant filter pass. They
+/// name places in the language our own markers are labelled in: the server
+/// negotiates a marker's display name from the request's `Accept-Language`, down
+/// to the same primary subtag the tiles key their names by.
+fn rewrite_basemap_style(
+    mut document: serde_json::Value,
+    bounds: (f64, f64),
+) -> Option<BasemapStyle> {
+    let text_field = crate::ohm::reader_text_field();
+    let Some(layers) = document
+        .get_mut("layers")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
         web_sys::console::warn_1(
-            &"the loaded basemap style has no layers, so the map cannot be rewound to an instant"
-                .into(),
+            &format!(
+                "the basemap style at '{}' names no layers, so the map draws every era of it at \
+                 once",
+                BASEMAP.style_url
+            )
+            .into(),
         );
-        return read_style;
-    };
-    let Ok(layers) = layers.dyn_into::<js_sys::Array>() else {
-        web_sys::console::warn_1(
-            &"the loaded basemap style's layers are not a list, so the map cannot be rewound to \
-              an instant"
-                .into(),
-        );
-        return read_style;
+        return None;
     };
 
-    for layer in layers.iter() {
-        let read = |key: &str| js_sys::Reflect::get(&layer, &key.into()).ok();
-        let Some(id) = read("id").and_then(|v| v.as_string()) else {
+    let mut filters = BTreeMap::new();
+    let mut held_labels = BTreeSet::new();
+    let mut dropped = Vec::new();
+    let mut relabelled = Vec::new();
+    for layer in layers.iter_mut() {
+        let Some(fields) = layer.as_object_mut() else {
             continue;
         };
-        let Some(source_layer) = read("source-layer") else {
+        let Some(id) = fields
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
             continue;
         };
-        if source_layer.is_undefined() {
+
+        // A symbol layer is the only kind that competes for label space, so the
+        // terrain, water, boundaries and roads can draw the moment they arrive
+        // while the names wait for the markers.
+        let symbol = fields.get("type").and_then(serde_json::Value::as_str) == Some("symbol");
+        if symbol
+            && let Some(layout) = fields
+                .entry("layout")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+        {
+            layout.insert("visibility".to_string(), serde_json::json!("none"));
+            held_labels.insert(id.clone());
+        }
+
+        if fields
+            .get("source-layer")
+            .is_none_or(serde_json::Value::is_null)
+        {
             continue;
         }
-        // Behind the `source-layer` guard, so a re-read of the style after our
-        // own layers are on it selects the basemap's labels and not ours.
-        if draws_the_raw_name(&layer) {
-            read_style.raw_name_labels.push(id.clone());
+
+        // OHM's local `name` is the form every one of its symbol layers ships
+        // with, and matching the whole expression keeps the rewrite to the
+        // labels that name a place, which is what has a name in another
+        // language.
+        if let Some(text_field) = text_field.as_ref()
+            && let Some(drawn) = fields
+                .get_mut("layout")
+                .and_then(|layout| layout.get_mut("text-field"))
+            && *drawn == serde_json::json!(["get", "name"])
+        {
+            *drawn = text_field.clone();
+            relabelled.push(id.clone());
         }
+
         // A layer the style filters nothing on has to stay `None`: MapLibre
         // rejects `["all", start, end, null]` outright.
         //
@@ -1486,91 +1601,35 @@ fn read_basemap_style(map: &maplibre::Map) -> BasemapStyle {
         // layer keeps its place on the map and its instant, and over-draws
         // inside it; dropped from the snapshot instead, it would draw
         // present-day content at every instant.
-        let original = match read("filter").filter(|f| !f.is_undefined() && !f.is_null()) {
+        let original = match fields.get("filter").filter(|f| !f.is_null()) {
             None => None,
-            Some(filter) => match serde_wasm_bindgen::from_value::<serde_json::Value>(filter) {
-                Ok(value) if crate::ohm::splices_as_expression(&value) => Some(value),
-                Ok(value) => {
-                    web_sys::console::warn_1(
-                        &format!(
-                            "basemap layer '{id}' is filtered by time alone: its own filter is \
-                             MapLibre's legacy syntax, {value}"
-                        )
-                        .into(),
-                    );
-                    read_style.dropped_filters.push(id.clone());
-                    None
-                }
-                Err(e) => {
-                    web_sys::console::warn_1(
-                        &format!(
-                            "basemap layer '{id}' is filtered by time alone: its own filter \
-                             didn't read, {e}"
-                        )
-                        .into(),
-                    );
-                    read_style.dropped_filters.push(id.clone());
-                    None
-                }
-            },
+            Some(filter) if crate::ohm::splices_as_expression(filter) => Some(filter.clone()),
+            Some(filter) => {
+                web_sys::console::warn_1(
+                    &format!(
+                        "basemap layer '{id}' is filtered by time alone: its own filter is \
+                         MapLibre's legacy syntax, {filter}"
+                    )
+                    .into(),
+                );
+                dropped.push(id.clone());
+                None
+            }
         };
-        read_style.filters.insert(id, original);
+        fields.insert(
+            "filter".to_string(),
+            crate::ohm::layer_filter(bounds, original.as_ref()),
+        );
+        filters.insert(id, original);
     }
-    read_style
-}
 
-/// Whether a layer's label is OHM's local `name`, the form every one of its
-/// symbol layers ships with. Matching the whole expression keeps the rewrite to
-/// the labels that name a place, which is what has a name in another language.
-fn draws_the_raw_name(layer: &JsValue) -> bool {
-    let Ok(layout) = js_sys::Reflect::get(layer, &"layout".into()) else {
-        return false;
-    };
-    let Ok(text_field) = js_sys::Reflect::get(&layout, &"text-field".into()) else {
-        return false;
-    };
-    serde_wasm_bindgen::from_value::<serde_json::Value>(text_field)
-        .is_ok_and(|field| field == serde_json::json!(["get", "name"]))
-}
-
-/// Label the basemap in the reader's language, so its place names and our
-/// markers' agree: the server negotiates a marker's display name from the
-/// request's `Accept-Language`, down to the same primary subtag the tiles key
-/// their names by.
-///
-/// Written once, at style load. The language a reader reads in doesn't move with
-/// the time slider, so it stays clear of the per-instant filter pass.
-///
-/// A throw is the map having been removed, so the pass stops there: the layers
-/// behind it belong to the same gone map. Whatever a single layer makes of the
-/// expression comes back as an `error` event, which the map's error handler
-/// logs.
-///
-/// The ids it got as far as writing are what it records, since a reader whose
-/// browser names no language we can key on gets no rewrite at all.
-fn localize_basemap_labels(map: &maplibre::Map, layers: &[String]) {
-    let mut rewritten = Vec::new();
-    if let Some(text_field) = crate::ohm::reader_text_field() {
-        match to_js(&text_field) {
-            Err(_) => {
-                web_sys::console::warn_1(&"the localized label expression didn't reach JS".into());
-            }
-            Ok(text_field) => {
-                let options = maplibre::skip_validation();
-                for id in layers {
-                    if let Err(e) = map.set_layout_property(id, "text-field", &text_field, &options)
-                    {
-                        web_sys::console::warn_1(
-                            &format!("the basemap label rewrite stopped at '{id}': {e:?}").into(),
-                        );
-                        break;
-                    }
-                    rewritten.push(id.clone());
-                }
-            }
-        }
-    }
-    record_label_rewrite_targets(&rewritten);
+    record_dropped_basemap_filters(&dropped);
+    record_label_rewrite_targets(&relabelled);
+    Some(BasemapStyle {
+        document,
+        filters,
+        held_labels,
+    })
 }
 
 /// Rewrite every snapshotted layer's filter to the instant the map is rewound
@@ -1584,12 +1643,11 @@ fn localize_basemap_labels(map: &maplibre::Map, layers: &[String]) {
 ///
 /// Latching the instant keeps a pan from redoing the work, and the three bails
 /// are the three ways a pass has no claim to latch. An unmounted component is
-/// one whose map `on_cleanup` has removed. An empty snapshot is a pass that beat
-/// the style's load: `register_moveend_handler` and `effect_refetch_on_as_of`
-/// are both armed at map construction, so a drag or a scrub during the style
-/// fetch arrives here first, and the load pass behind it is the one that rewinds
-/// the map. A throw is the map having been removed, which a remount reaches by
-/// replacing the map under a pass parked on an await.
+/// one whose map `on_cleanup` has removed. An empty snapshot is a session whose
+/// style document could not be read: the map drew whatever `MapLibre` fetched
+/// for itself, and there is nothing here to rebuild a filter from. A throw is
+/// the map having been removed, which a remount reaches by replacing the map
+/// under a pass parked on an await.
 ///
 /// Whatever a single layer makes of its filter comes back as an `error` event,
 /// which the map's error handler logs.
@@ -1627,6 +1685,65 @@ fn apply_basemap_filters(map: &maplibre::Map, state: &MapState) {
     }
 
     state.filtered_as_of.set(Some(as_of));
+}
+
+/// Every label the map is holding back, put up in one pass.
+///
+/// A symbol layer both dodges the labels already placed and blocks the ones
+/// after it, so a label that arrives late evicts a name the reader is already
+/// reading. Our markers arrive an API round-trip after the basemap, and our own
+/// layers sit near the top of the stack, which is enough to rearrange the
+/// basemap's names as they land. Holding every label until the markers are in
+/// leaves placement one pass to run, over the whole set at once.
+///
+/// The markers are what the wait is for, not what it depends on: a fetch that
+/// failed and a backstop timer both reach here, so an API that never answers
+/// costs the reader their markers and not the map's names.
+fn reveal_held_labels(map: &maplibre::Map, state: &MapState) {
+    if state.disposed.get() || state.labels_revealed.get() {
+        return;
+    }
+    state.labels_revealed.set(true);
+
+    let held = std::mem::take(&mut *state.held_labels.borrow_mut());
+    let visible = JsValue::from_str("visible");
+    let options = maplibre::skip_validation();
+    for id in held {
+        // A throw is the map having been removed, so the layers behind this one
+        // belong to the same gone map.
+        if let Err(e) = map.set_layout_property(&id, "visibility", &visible, &options) {
+            web_sys::console::warn_1(&format!("the label reveal stopped at '{id}': {e:?}").into());
+            return;
+        }
+    }
+}
+
+/// How long the labels wait for markers before going up regardless. Long enough
+/// that a healthy first fetch lands inside it, short enough that a reader facing
+/// an unreachable API is looking at a named map rather than an anonymous one.
+const LABEL_REVEAL_BACKSTOP_MS: i32 = 4000;
+
+/// Put the held labels up on a clock, for the session whose markers never
+/// settle: a map with no names at all is a worse outcome than the reflow the
+/// hold is there to prevent.
+///
+/// The timer runs to completion, which is what frees its own closure; a mount
+/// the map no longer belongs to is what the generation check catches.
+fn arm_label_reveal_backstop(map: &maplibre::Map, state: &MapState) {
+    let map = map.clone();
+    let state = state.clone();
+    let mount = state.mount_generation.get();
+    let backstop = Closure::once_into_js(move || {
+        if state.mount_generation.get() == mount {
+            reveal_held_labels(&map, &state);
+        }
+    });
+    if let Some(w) = web_sys::window() {
+        let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
+            backstop.unchecked_ref(),
+            LABEL_REVEAL_BACKSTOP_MS,
+        );
+    }
 }
 
 thread_local! {
@@ -1736,6 +1853,17 @@ fn marker_from_wire(m: api::Marker) -> MapMarker {
     }
 }
 
+/// A marker pass has settled, on markers or on the reason there are none.
+///
+/// Every way out of a pass that came back reaches here, which is what the label
+/// reveal rides on: the labels wait for the markers to be in, and a pass that
+/// errored is as in as one that filled the map.
+fn record_fetch_settled(map: &maplibre::Map, state: &MapState) {
+    reveal_held_labels(map, state);
+    #[cfg(feature = "test-hooks")]
+    bump_and_dispatch(&FETCH_SETTLED, FETCH_COMPLETE_EVENT);
+}
+
 /// Fetch the container tiles overlapping the viewport (plus a margin ring) at a
 /// zoom-tracking level, clip their cells to the visible box, and hand the
 /// survivors to the `cluster: true` source for on-screen decluttering.
@@ -1784,8 +1912,7 @@ async fn refresh_tiles_for_viewport(
             signals
                 .set_fetch_error
                 .set(Some(format!("Invalid viewport bounds: {e}")));
-            #[cfg(feature = "test-hooks")]
-            record_fetch_settled();
+            record_fetch_settled(map, state);
             return;
         }
     };
@@ -1815,8 +1942,7 @@ async fn refresh_tiles_for_viewport(
             .into(),
         );
         signals.set_loading.set(false);
-        #[cfg(feature = "test-hooks")]
-        record_fetch_settled();
+        record_fetch_settled(map, state);
         return;
     }
 
@@ -1970,8 +2096,7 @@ async fn refresh_tiles_for_viewport(
             state.rendered_as_of.set(Some(as_of));
             signals.set_cached_markers.set(Vec::new());
         }
-        #[cfg(feature = "test-hooks")]
-        record_fetch_settled();
+        record_fetch_settled(map, state);
         return;
     }
 
@@ -2047,8 +2172,7 @@ async fn refresh_tiles_for_viewport(
     state.rendered_as_of.set(Some(as_of));
     signals.set_cached_markers.set(in_view);
 
-    #[cfg(feature = "test-hooks")]
-    record_fetch_settled();
+    record_fetch_settled(map, state);
 }
 
 // ==================== Thumbnail registration ====================
@@ -3155,6 +3279,7 @@ fn register_moveend_handler(
                     signals
                         .set_fetch_error
                         .set(Some("Failed to load API configuration".to_string()));
+                    reveal_held_labels(&map_ref, &st_pass);
                     return;
                 };
                 refresh_tiles_for_viewport(&map_ref, &client, signals, &st_pass).await;
@@ -3234,6 +3359,18 @@ struct MapState {
     /// pass that had a snapshot to rewind from and a map to write it to, so a
     /// pass that ran before the style loaded leaves the work to the next one.
     filtered_as_of: Rc<Cell<Option<NaiveDate>>>,
+    /// Which mount the map belongs to. A mount awaits the style document before
+    /// it builds anything, and the mount that starts during that await is the
+    /// one whose map the container ends up holding.
+    mount_generation: Rc<Cell<u64>>,
+    /// The layers hidden at mount, put up together once the markers are in so
+    /// that symbol placement runs once over the whole set (see
+    /// [`reveal_held_labels`]).
+    held_labels: Rc<RefCell<BTreeSet<String>>>,
+    /// Whether this mount's labels have gone up. Read by the layer setup, which
+    /// can run either side of the reveal: the map's `load` waits on the style's
+    /// sprites and glyphs, while the backstop runs on a clock of its own.
+    labels_revealed: Rc<Cell<bool>>,
 }
 
 /// What a MapLibre `error` event is about, read off the source it names.
@@ -3292,6 +3429,7 @@ fn map_error_message(event: &JsValue) -> String {
 /// Returns the closures that must be kept alive and the map instance.
 fn initialize_map(
     el: &web_sys::HtmlDivElement,
+    style: &JsValue,
     state: &MapState,
     signals: ViewportSignals,
     set_selected: WriteSignal<Option<EntitySelection>>,
@@ -3302,8 +3440,8 @@ fn initialize_map(
     // uses, since that is the only place it can be read.
     let map = match maplibre::create_map(
         el,
+        style,
         &maplibre::MapOptions {
-            style: BASEMAP.style_url,
             center: [INITIAL_CENTER_LNG, INITIAL_CENTER_LAT],
             zoom: INITIAL_ZOOM,
             max_zoom: f64::from(MAX_ZOOM),
@@ -3336,21 +3474,22 @@ fn initialize_map(
         let map_ref = map_for_load.clone();
         let st2 = st.clone();
 
-        // Before anything that can fail: this callback returns early on a layer
-        // failure, and the retry path would then keep driving passes with no
-        // snapshot to rewind the basemap from.
-        let basemap_style = read_basemap_style(&map_ref);
-        *st.basemap_filters.borrow_mut() = basemap_style.filters;
-        record_dropped_basemap_filters(&basemap_style.dropped_filters);
-        localize_basemap_labels(&map_ref, &basemap_style.raw_name_labels);
+        // The style the map opened with is already rewound to the instant it was
+        // read at, so this is here for the scrub that landed while it was in
+        // flight. Ahead of the layer setup, whose failure returns from this
+        // callback: the basemap follows the slider on OHM's own tiles and needs
+        // nothing of ours to do it.
         apply_basemap_filters(&map_ref, &st);
 
         // A map missing a layer cannot be clicked at all, so this is surfaced
         // rather than logged: the alert strip is the only sign the reader gets
         // that the markers in front of them are inert.
-        if let Err(e) = init_source_and_layers(&map_ref) {
+        if let Err(e) = init_source_and_layers(&map_ref, &st) {
             web_sys::console::error_1(&e.clone().into());
             signals.set_map_error.set(Some(e));
+            // A stack this left half-built draws no markers and fetches nothing,
+            // so the labels have nothing left to wait for.
+            reveal_held_labels(&map_ref, &st);
             return;
         }
         st.source_initialized.set(true);
@@ -3368,6 +3507,9 @@ fn initialize_map(
                 signals
                     .set_fetch_error
                     .set(Some("Failed to load API configuration".to_string()));
+                // No client means no markers are coming, so nothing is left to
+                // compete with the labels for space.
+                reveal_held_labels(&map_ref, &st2);
                 return;
             };
             refresh_tiles_for_viewport(&map_ref, &client, signals, &st2).await;
@@ -3407,6 +3549,9 @@ fn initialize_map(
 /// On first run, `container.get()` is `None` (DOM not yet rendered); the
 /// effect re-runs automatically when the `NodeRef` resolves. On subsequent
 /// runs (e.g., hot-reload), the old map is destroyed before creating a new one.
+///
+/// The map is built behind the style document's own fetch, so that the style it
+/// opens with is one already rewound to the reader's instant.
 fn effect_mount_map(
     container: NodeRef<leptos::html::Div>,
     map_handle: Rc<RefCell<Option<maplibre::Map>>>,
@@ -3424,18 +3569,78 @@ fn effect_mount_map(
         state.closures.borrow_mut().clear();
         state.thumbnail_urls.borrow_mut().clear();
         state.source_initialized.set(false);
-        // The new map loads its own style, so both the snapshot and the instant
-        // it was filtered to belong to the map being replaced.
+        // The new map loads its own style, so the snapshot, the instant it was
+        // filtered to, the labels being held back and what the rewrite reports
+        // of it all belong to the map being replaced.
         state.basemap_filters.borrow_mut().clear();
         state.filtered_as_of.set(None);
+        state.held_labels.borrow_mut().clear();
+        state.labels_revealed.set(false);
+        record_dropped_basemap_filters(&[]);
+        record_label_rewrite_targets(&[]);
+        state
+            .mount_generation
+            .set(state.mount_generation.get().wrapping_add(1));
 
-        if let Some(map) = initialize_map(&el, &state, signals, set_selected, set_map_error) {
-            *map_handle.borrow_mut() = Some(map);
+        let mount = state.mount_generation.get();
+        let state = state.clone();
+        let map_handle = Rc::clone(&map_handle);
+        wasm_bindgen_futures::spawn_local(async move {
+            let as_of = state.as_of.get();
+            let prefiltered = prefiltered_basemap_style(crate::ohm::ohm_day_bounds(as_of)).await;
+            // The fetch is the one await between this mount's teardown and its
+            // map: a remount or an unmount reached during it owns the container
+            // now, and a map built into that would be the one nothing can reach.
+            if state.disposed.get() || state.mount_generation.get() != mount {
+                return;
+            }
 
-            // Signal that the map has mounted (used by test hooks).
-            #[cfg(feature = "test-hooks")]
-            dispatch_window_event(MAP_READY_EVENT);
-        }
+            let mut style = JsValue::from_str(BASEMAP.style_url);
+            if prefiltered.is_none() {
+                // Served from our own dist, so a failure here is this build
+                // being wrong rather than a network that will recover. The map
+                // still draws, and says outright that its dates do not hold.
+                set_map_error.set(Some(
+                    "The basemap could not be rewound to the year on the slider, so it is \
+                     showing every era at once. What it draws is not what stood at that year."
+                        .to_string(),
+                ));
+            }
+            if let Some(prefiltered) = prefiltered {
+                *state.basemap_filters.borrow_mut() = prefiltered.filters;
+                match to_js(&prefiltered.document) {
+                    Ok(document) => {
+                        style = document;
+                        // The map's first frame is this instant, so the load
+                        // pass has nothing to redo.
+                        state.filtered_as_of.set(Some(as_of));
+                        // The hidden layers are the ones in this document, so
+                        // the reveal's set is only ever the style the map got.
+                        *state.held_labels.borrow_mut() = prefiltered.held_labels;
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!(
+                                "the rewound basemap style didn't reach JS, so the map draws every \
+                                 era of it until the first filter pass lands: {e}"
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+
+            if let Some(map) =
+                initialize_map(&el, &style, &state, signals, set_selected, set_map_error)
+            {
+                arm_label_reveal_backstop(&map, &state);
+                *map_handle.borrow_mut() = Some(map);
+
+                // Signal that the map has mounted (used by test hooks).
+                #[cfg(feature = "test-hooks")]
+                dispatch_window_event(MAP_READY_EVENT);
+            }
+        });
     });
 }
 
@@ -3560,6 +3765,7 @@ fn effect_retry_on_signal(
                         signals
                             .set_fetch_error
                             .set(Some("Failed to load API configuration".to_string()));
+                        reveal_held_labels(&map, &st);
                         return;
                     };
                     refresh_tiles_for_viewport(&map, &client, signals, &st).await;
@@ -3602,6 +3808,7 @@ fn effect_refetch_on_as_of(
                 signals
                     .set_fetch_error
                     .set(Some("Failed to load API configuration".to_string()));
+                reveal_held_labels(&map, &st_pass);
                 return;
             };
             refresh_tiles_for_viewport(&map, &client, signals, &st_pass).await;
@@ -3709,6 +3916,9 @@ pub fn MapView(
         rendered_as_of: Rc::new(Cell::new(None)),
         basemap_filters: Rc::new(RefCell::new(BTreeMap::new())),
         filtered_as_of: Rc::new(Cell::new(None)),
+        mount_generation: Rc::new(Cell::new(0)),
+        held_labels: Rc::new(RefCell::new(BTreeSet::new())),
+        labels_revealed: Rc::new(Cell::new(false)),
     };
     effect_mount_map(
         container,
