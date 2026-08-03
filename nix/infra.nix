@@ -353,6 +353,16 @@ let
         zone_id = settings.cloudflareZone;
         hostname = settings.organization;
         service = "\${cloudflare_workers_script.front_door.script_name}";
+        # Cloudflare fills in `environment` regardless, and an attribute the
+        # declaration omits reads as one to remove. Removing this one is not an
+        # in-place update: it forces replacement, so every deploy would destroy
+        # and recreate the apex binding and take the site off the Worker while
+        # it did. Ignored rather than assigned: both spellings warn that the
+        # attribute is deprecated, so the warning is not what separates them.
+        # Assigning a value claims we manage a field Cloudflare owns, while
+        # ignoring it says we do not, and when the attribute goes away the diff
+        # being suppressed goes with it.
+        lifecycle = [ { ignore_changes = [ "environment" ]; } ];
       };
 
       # www exists to be redirected, not served: the API checks WebAuthn
