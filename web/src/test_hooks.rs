@@ -197,6 +197,9 @@ pub fn register_base() {
         wait_for_fetch_settled_after: |prev: f64| {
             wait_for_fetch_settled_after(prev as u64)
         },
+        // Read by the harness when the wait above expires, to say which of the
+        // four upstream stalls left its bump unarrivable.
+        fetch_diagnostics: crate::components::map::fetch_diagnostics,
     ]);
 
     let _ = js_sys::Reflect::set(&window, &"__test".into(), &obj);

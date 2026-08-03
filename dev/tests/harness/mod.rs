@@ -816,6 +816,9 @@ impl WebTest {
         // Fetch-settled counter sample, so a test can click a badge and then
         // wait for the expansion's re-fetch via `wait_for_fetch_settled_after`.
         pub query current_fetch_settled() -> f64;
+        // Why the settled counter is where it is, for the bespoke
+        // `wait_for_fetch_settled_after` below to attach to a stall.
+        pub query fetch_diagnostics() -> String;
 
         // Actions (public). The raw `jump_to`/`fire_map_click` primitives
         // aren't exposed — tests use `pan_map_to` / `click_map_at`, which
@@ -839,8 +842,35 @@ impl WebTest {
         // Internal: the thumbnails-loaded counter is consumed only by the
         // bespoke `goto_map_with_thumbnails` composer below.
         pub query current_thumbnails_loaded() -> f64;
-        pub wait wait_for_fetch_settled_after(prev: f64);
         pub wait wait_for_thumbnails_loaded_after(prev: f64);
+    }
+
+    /// Wait for the entity-fetch counter to advance past `prev`, naming what
+    /// stalled if it never does.
+    ///
+    /// Every map test drains the mount fetch through this before it does
+    /// anything else, and the bump it waits for cannot arrive at all when the
+    /// pass that would produce it never runs. Bare, that reads exactly like a
+    /// slow machine, which is how this suite has repeatedly spent an
+    /// investigation on a 60-second stall; the diagnostics say which it was.
+    pub async fn wait_for_fetch_settled_after(&self, prev: f64) -> TestResult {
+        let Err(stall) = self
+            .await_hook("wait_for_fetch_settled_after", &[serde_json::json!(prev)])
+            .await
+        else {
+            return Ok(());
+        };
+        // Bounded separately and tightly. A wedged renderer is one of the
+        // things this explains, and in that state the read is answered by
+        // nothing until `CDP_REQUEST_TIMEOUT` gives up 90 s later — turning the
+        // worst failure from 60 s into 150 s to say the same thing. The read is
+        // a few cell loads, so anything but a prompt answer is that case.
+        let why = match tokio::time::timeout(DIAGNOSTICS_TIMEOUT, self.fetch_diagnostics()).await {
+            Ok(Ok(diagnostics)) => diagnostics,
+            Ok(Err(err)) => format!("diagnostics unavailable: {err}"),
+            Err(_) => format!("diagnostics unanswered within {DIAGNOSTICS_TIMEOUT:?}"),
+        };
+        Err(format!("{stall} [{why}]").into())
     }
 
     /// Number of rendered entity markers (across circle + thumbnail layers).
@@ -994,3 +1024,12 @@ pub const TIMEOUT: Duration = Duration::from_secs(60);
 /// harness wrapper is what fires first: a timeout then names the hook and its
 /// context instead of surfacing chromiumoxide's bare "Request timed out."
 const CDP_REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Deadline for reading diagnostics off an already-failed wait.
+///
+/// Well under [`TIMEOUT`], because this runs *after* a stall has already cost
+/// its full budget and only reads a handful of cells. Left to [`TIMEOUT`] or to
+/// [`CDP_REQUEST_TIMEOUT`], a renderer wedged badly enough to answer nothing
+/// would more than double the cost of the worst failure to report the same
+/// stall.
+const DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(5);

@@ -919,6 +919,42 @@ async fn test_map_loads_entities() -> TestResult {
     .await
 }
 
+/// The four facts a stalled `wait_for_fetch_settled_after` reports to name its
+/// own cause are only read on a stall, so nothing else would notice one of them
+/// being wired to a value it never leaves.
+///
+/// A healthy map load reaches all four: MapLibre fires `load`, the handler
+/// installs the source, it spawns a pass, and the pass settles. Pinning that
+/// here is what lets the string be trusted during an investigation, which is
+/// the only time it is ever read.
+#[tokio::test]
+async fn test_fetch_diagnostics_report_a_completed_mount() -> TestResult {
+    web_test(async |t| {
+        t.goto_map_at(HAGIA_SOPHIA.0, HAGIA_SOPHIA.1, 14.0).await?;
+
+        let reported = t.fetch_diagnostics().await?;
+        for fact in [
+            "load_fired=true",
+            "source_initialized=true",
+            "passes_started=",
+            "passes_settled=",
+        ] {
+            check(
+                reported.contains(fact),
+                format!("a loaded map should report {fact}, got {reported:?}"),
+            )?;
+        }
+        // Zero either side would satisfy the substring checks above while
+        // saying the pass never ran, which is the exact stall this reports on.
+        check(
+            !reported.contains("passes_started=0") && !reported.contains("passes_settled=0"),
+            format!("a loaded map should have started and settled a pass, got {reported:?}"),
+        )?;
+        Ok(())
+    })
+    .await
+}
+
 /// The symbol layer thumbnail rasters draw on. It is also the only layer a
 /// photographed marker is hit-tested by, since the circle layers filter
 /// thumbnails out.

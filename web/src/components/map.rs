@@ -248,6 +248,18 @@ thread_local! {
     /// action, then wait for it to advance — that's how "wait for the fetch
     /// that follows my action" is expressed without a generation race.
     static FETCH_SETTLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Whether MapLibre's `load` fired. The first pass is spawned from that
+    /// handler, so until it does there is nothing to settle.
+    static LOAD_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Whether the source and layers were installed. The `load` handler does
+    /// that before spawning the first pass and returns early if it fails.
+    static SOURCE_INITIALIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Monotonic count of passes that committed to fetching. A pass counted
+    /// here that never settles was superseded and aborted.
+    static FETCH_STARTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(feature = "test-hooks")]
@@ -285,6 +297,62 @@ fn bump_and_dispatch(
             let _ = window.dispatch_event(&event);
         }
     }
+}
+
+#[cfg(feature = "test-hooks")]
+fn record_load_fired() {
+    LOAD_FIRED.with(|fired| fired.set(true));
+}
+
+#[cfg(feature = "test-hooks")]
+fn record_source_initialized() {
+    SOURCE_INITIALIZED.with(|init| init.set(true));
+}
+
+#[cfg(feature = "test-hooks")]
+fn record_fetch_started() {
+    FETCH_STARTED.with(|started| started.set(started.get() + 1));
+}
+
+/// Clear the per-mount flags, alongside the `source_initialized` cell the mount
+/// effect already resets.
+///
+/// A route away from the map and back builds a second map in the same wasm
+/// instance. Carrying the first mount's flags into it would report a `load`
+/// that this map never fired, sending a reader after the API client while the
+/// layers are what failed. The counters are deliberately left alone: they are
+/// monotonic across the page, which is what lets a test sample one and wait for
+/// it to advance.
+#[cfg(feature = "test-hooks")]
+fn reset_mount_diagnostics() {
+    LOAD_FIRED.with(|fired| fired.set(false));
+    SOURCE_INITIALIZED.with(|init| init.set(false));
+}
+
+/// What a stalled wait on the settled counter needs in order to name its own
+/// cause.
+///
+/// That counter only advances when a pass runs to completion, and four things
+/// upstream can leave the bump permanently unarrivable. Read together these say
+/// which: no `load` means MapLibre never finished the style; `load` without an
+/// initialized source means the layers failed; an initialized source with no
+/// pass started means the API client never resolved; passes started with none
+/// settled means each was superseded and aborted. A bare "hook timed out" is
+/// indistinguishable from a slow machine, and telling those apart by hand has
+/// cost this suite several investigations.
+///
+/// The flags describe the current mount; the counters are page totals. After a
+/// route away and back the counters carry the previous map's passes, so read
+/// them as "has this page ever fetched" rather than "has this map".
+#[cfg(feature = "test-hooks")]
+pub(crate) fn fetch_diagnostics() -> String {
+    format!(
+        "load_fired={} source_initialized={} passes_started={} passes_settled={}",
+        LOAD_FIRED.with(std::cell::Cell::get),
+        SOURCE_INITIALIZED.with(std::cell::Cell::get),
+        FETCH_STARTED.with(std::cell::Cell::get),
+        FETCH_SETTLED.with(std::cell::Cell::get),
+    )
 }
 
 /// The basemap layer entity labels take their font from. Exposed so the font
@@ -1951,6 +2019,9 @@ async fn refresh_tiles_for_viewport(
     // prior one, so a superseded pass's in-flight fetches are dropped — dropping
     // a wasm `fetch` future aborts the browser request rather than running it to
     // completion only to discard the result.
+    #[cfg(feature = "test-hooks")]
+    record_fetch_started();
+
     let my_gen = state.pass_generation.get().wrapping_add(1);
     state.pass_generation.set(my_gen);
     let (abort_handle, abort_reg) = AbortHandle::new_pair();
@@ -3471,6 +3542,9 @@ fn initialize_map(
     let st = state.clone();
     let map_for_load = map.clone();
     let load_cb = Closure::<dyn Fn()>::new(move || {
+        #[cfg(feature = "test-hooks")]
+        record_load_fired();
+
         let map_ref = map_for_load.clone();
         let st2 = st.clone();
 
@@ -3493,6 +3567,8 @@ fn initialize_map(
             return;
         }
         st.source_initialized.set(true);
+        #[cfg(feature = "test-hooks")]
+        record_source_initialized();
 
         let handler_closures =
             register_layer_handlers(&map_ref, set_selected, Rc::clone(&st.source_generation));
@@ -3569,6 +3645,8 @@ fn effect_mount_map(
         state.closures.borrow_mut().clear();
         state.thumbnail_urls.borrow_mut().clear();
         state.source_initialized.set(false);
+        #[cfg(feature = "test-hooks")]
+        reset_mount_diagnostics();
         // The new map loads its own style, so the snapshot, the instant it was
         // filtered to, the labels being held back and what the rewrite reports
         // of it all belong to the map being replaced.
