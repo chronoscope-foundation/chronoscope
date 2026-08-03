@@ -111,7 +111,10 @@ fn contention_note() -> String {
     match browsers_already_running() {
         0 => String::new(),
         n => format!(
-            " ({n} test browser process(es) were already running when this suite              started, from a concurrent run or a stranded one, which starves the              headless event loop; re-run on a quiet machine before suspecting              the code)"
+            " ({n} test browser process(es) were already running when this \
+             suite started, from a concurrent run or a stranded one, which \
+             starves the headless event loop; re-run on a quiet machine \
+             before suspecting the code)"
         ),
     }
 }
