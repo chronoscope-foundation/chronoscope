@@ -100,8 +100,10 @@ let
   # third-party request on the critical render path, handed every visitor's IP to
   # Google, and left the page reflowing when the real face arrived (~15 px on the
   # nav wordmark). Serving them same-origin also makes measurement reproducible:
-  # the browser tests run without egress, so they were laying out in a fallback
-  # serif and disagreeing with what a developer saw.
+  # what the browser tests can reach depends on the platform, since Nix sandboxes
+  # builds by default on Linux and not on macOS, so a font fetched at runtime
+  # lays out one way on a developer's machine and another on a Linux builder.
+  # A font in the bundle is the same font everywhere.
   #
   # Fetched file-by-file rather than from nixpkgs' `google-fonts`, whose closure
   # is 1.8 GB — too much to drag onto the gate's critical path for four files.

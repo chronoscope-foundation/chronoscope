@@ -1302,8 +1302,15 @@ impl EntityLayer {
                     "text-size": 12,
                     "text-anchor": "top",
                     "text-offset": [0, 0.8],
-                    "text-allow-overlap": false,
-                    "text-ignore-placement": false,
+                    // A marker's name is the reader's own content, so it draws
+                    // wherever its marker is, and the basemap's labels are laid
+                    // out as though it were not there. Both directions matter:
+                    // entering the collision index would let the basemap
+                    // suppress a name the reader came for, and acting as an
+                    // obstacle would shuffle the basemap's own labels every time
+                    // the slider moved a marker.
+                    "text-allow-overlap": true,
+                    "text-ignore-placement": true,
                     "text-max-width": 8
                 }
             }),
