@@ -131,7 +131,14 @@ let
     checkArgs
     // testExtraEnv
     // {
-      cargoLlvmCovExtraArgs = "--fail-under-lines 75 --lcov --output-path $out";
+      # Line coverage sits at 89.6%. At the old floor of 75 the check could
+      # only fire after ~5,450 covered lines vanished at once, so the ratchet
+      # was not doing its job. 87 fires on roughly a 970-line drop: a large
+      # untested module, or a test file deleted. The slack that remains is for
+      # the proptests, which seed from entropy per run and move the number
+      # between runs on identical code. Raise it as coverage climbs; lower it
+      # only deliberately.
+      cargoLlvmCovExtraArgs = "--fail-under-lines 87 --lcov --output-path $out";
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
         pkgs.cargo-llvm-cov
       ];
