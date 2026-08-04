@@ -135,6 +135,29 @@ let
       nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
         pkgs.cargo-llvm-cov
       ];
+
+      # Crane unpacks the shared dependency artifact into `target`, and
+      # `cargo llvm-cov` builds in `target/llvm-cov-target`. Left alone the
+      # artifact is decompressed (48 s) into a directory cargo never reads,
+      # and all 486 dependencies are rebuilt into the one it does: 497 crates
+      # compiled here against 29 for clippy, on every source edit, for
+      # byte-identical output. Dependencies are not instrumented — the
+      # wrapper's `CRATE_NAMES` covers workspace crates only — so they are
+      # reusable, just misplaced. Moving the tree to where the build looks is
+      # the whole fix.
+      #
+      # The count is the check: `nix log` on this derivation should show ~11
+      # `Compiling` lines, not 497. A silent return to 497 leaves the gate
+      # green and slow, which is why the number is worth reading rather than
+      # the clock.
+      # Moved wholesale rather than glob-by-glob: the unpacked tree carries
+      # dotfiles (`.rustc_info.json`, `.fingerprint`) that a bare `target/*`
+      # would leave behind, and a half-moved cache is a silent partial rebuild.
+      preBuild = ''
+        mv target .llvm-cov-deps
+        mkdir -p target
+        mv .llvm-cov-deps target/llvm-cov-target
+      '';
     }
   );
 
