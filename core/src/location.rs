@@ -2003,6 +2003,24 @@ mod tests {
     /// Sampling by geodesic offset (not a lat/lon box) keeps the cloud even at
     /// every latitude, so a high-latitude or seam-straddling region isn't
     /// under-sampled by a `cos(lat)`-compressed longitude span.
+    /// Rings and spokes the emptiness oracle fans over each cap, so the sample
+    /// count is `GRID_STEPS²` per cap.
+    ///
+    /// Sets the thinnest feasible region the grid can see: the radial spacing is
+    /// `radius / GRID_STEPS`, so at the 2-6 km caps these strategies draw, 50
+    /// resolves a 40-120 m lens. Nowhere near [`Circle::tol`]'s millimetre band,
+    /// which no practical density reaches — the grid finds fat regions, and this
+    /// is how fat.
+    ///
+    /// Measured against both strategies, the hit rate is flat from 200 down to
+    /// 100 and within one case of it at 50 (516 cases, clustered strategy),
+    /// because neither draws a lens thin enough to fall between samples. The
+    /// margin over the floor is for the ones that might: a grid too coarse for
+    /// its geometry stops asserting rather than failing, so it costs coverage
+    /// with no signal. Raise it alongside any strategy that probes an emptiness
+    /// boundary, where the feasible region shrinks toward a point.
+    const GRID_STEPS: usize = 50;
+
     fn samples_empty(loc: &Location, grid_steps: usize) -> bool {
         match loc {
             Location::Empty => return true,
@@ -2029,7 +2047,7 @@ mod tests {
         /// disagreement is the sole failure direction.
         #[test]
         fn prop_denotes_empty_matches_dense_grid(loc in arb_location()) {
-            if !samples_empty(&loc, 200) {
+            if !samples_empty(&loc, GRID_STEPS) {
                 prop_assert!(
                     !loc.denotes_empty(),
                     "grid found a covered point but routine reported empty: {loc:?}"
@@ -2381,7 +2399,7 @@ mod tests {
             let mixed =
                 resolved::one_of_from_members(resolved::canonical_one_of(vec![head, mixed_inner]));
             for loc in [all_of, mixed] {
-                if !samples_empty(&loc, 200) {
+                if !samples_empty(&loc, GRID_STEPS) {
                     prop_assert!(
                         !loc.denotes_empty(),
                         "grid found a covered point but routine reported empty: {loc:?}"
