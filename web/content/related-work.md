@@ -2,7 +2,7 @@ Chronoscope sits alongside many open geographic, historical, and cultural-herita
 
 ## The short version
 
-Chronoscope is a **media-centric link layer** for the historical built environment. Most existing projects are organized around a map, a gazetteer of named places, or a structured fact base. We're organized around **media and the things visible in it**: photographs, maps, drawings, and the buildings they depict over time. Our job is to connect those depictions to each other, to a place on the ground, to a moment (or fuzzy range) in time, and to existing records elsewhere.
+Most existing projects are organized around a map, a gazetteer of named places, or a structured fact base, where the usual goal is one agreed answer per place. Chronoscope is organized around **the buildings and places themselves**, and everything anyone has said about them over time. A building exists here as soon as someone submits a photograph of it, before we know where it is or what it was called, and its location, dates, and identity accumulate as evidence arrives. Media is where most of that evidence comes from: photographs, maps, and drawings, and our job is to connect what they depict to each other, to a place on the ground, to a moment (or fuzzy range) in time, and to existing records elsewhere.
 
 ## How we relate to specific projects
 
