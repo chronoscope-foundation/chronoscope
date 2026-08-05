@@ -264,8 +264,21 @@ in
     ;
 
   # Python check derivations for nix flake check.
+  #
+  # Lints only. The pytest suite ran here until it was dropped: it needed
+  # `schematool` on PATH for cross-language schema validation, and took it from
+  # `rust.packages.default`, so every gate compiled the whole workspace in the
+  # default profile to obtain one binary. That build is 5m27s and the largest
+  # single item in the gate, and with 18 concurrent jobs against 18 cores it
+  # slowed every check running beside it: excluding this one check took a gate
+  # from 601s to 325s.
+  #
+  # Restoring the suite means building `schematool` on its own, the way `ingest`
+  # already is — `deployables` in `flake.nix` plus `mkWorkspaceSrc` exist for
+  # exactly that, and `workspace-closures` would then hold its crate list to
+  # what cargo reports. Worth doing with whatever replaces this harness rather
+  # than to prop up a harness on its way out.
   checks =
-    { rustPackage }:
     let
       # Lightweight check: no model weights, no rust binary.
       mkLintCheck =
@@ -283,29 +296,6 @@ in
             touch $out
           '';
 
-      # Full check: model weights + schematool on PATH.
-      mkModelCheck =
-        name: script:
-        pkgs.runCommand "triton-${name}"
-          (
-            modelEnv
-            // {
-              nativeBuildInputs = [
-                analysisEnv
-                rustPackage
-              ];
-              src = tritonSrc;
-            }
-          )
-          ''
-            cp -r $src src
-            chmod -R u+w src
-            cd src
-            # stdenv may set SSL_CERT_FILE; we're fully offline so TLS is unnecessary.
-            unset SSL_CERT_FILE
-            ${script}
-            touch $out
-          '';
     in
     {
       triton-fmt = mkLintCheck "fmt" ''
@@ -325,10 +315,6 @@ in
             mypy --ignore-missing-imports "$f"
           fi
         done
-      '';
-
-      triton-test = mkModelCheck "test" ''
-        pytest -v
       '';
     };
 }

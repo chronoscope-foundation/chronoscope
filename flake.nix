@@ -304,9 +304,7 @@
           inherit (rust) cargoArtifacts;
         };
 
-        pythonChecks = pythonEnvs.checks {
-          rustPackage = rust.packages.default;
-        };
+        pythonChecks = pythonEnvs.checks;
 
         # Nix source for lint check (excludes .git/).
         nixSrc = lib.cleanSourceWith {

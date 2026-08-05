@@ -223,7 +223,6 @@ check target="all":
                 ".#checks.$SYS.triton-fmt" \
                 ".#checks.$SYS.triton-lint" \
                 ".#checks.$SYS.triton-typecheck" \
-                ".#checks.$SYS.triton-test" \
                 --no-link
             ;;
         linux)
