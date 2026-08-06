@@ -139,10 +139,8 @@ let
     ];
 
     doCheck = false;
-    # The submodule, not the package: `samexporter/__init__.py` is empty, so
-    # checking "samexporter" passes against nothing and would not notice a
-    # patch that applies cleanly but leaves an unresolvable import, or a
-    # pythonRemoveDeps entry that turns out to be reachable.
+    # `samexporter/__init__.py` is empty, so the check has to name the submodule
+    # to exercise the patches and the trimmed dependency set.
     pythonImportsCheck = [ "samexporter.export_sam3" ];
   };
 
@@ -160,11 +158,12 @@ let
     samexporter
   ]);
 
-  # Three ONNX models, each in its own directory. Torch spills tensors past the
-  # 2 GB protobuf limit into sibling files named after graph nodes
-  # (Constant_823_attr__value), and node numbering restarts per export, so a
-  # shared directory silently overwrites weights: the decoder exports last and
-  # loads fine while the image encoder is corrupt.
+  # Two ONNX models plus baked language constants, each in its own directory.
+  # The exporter emits three; the language encoder is consumed and deleted
+  # below. Torch spills tensors past the 2 GB protobuf limit into sibling files
+  # named after graph nodes (Constant_823_attr__value), and node numbering
+  # restarts per export, so a shared directory silently overwrites weights: the
+  # decoder exports last and loads fine while the image encoder is corrupt.
   sam3Onnx =
     pkgs.runCommand "sam3-onnx"
       {
@@ -186,12 +185,18 @@ let
         mkdir -p "$out"
         python -m samexporter.export_sam3 --output_dir "$out"
 
+        # Replace the 1.3 GB language encoder with the ~32 KB of tensors the
+        # decoder actually reads from it. Done here, in the derivation holding
+        # the weights, because those tensors are a pure function of the
+        # checkpoint and one fixed prompt: produced anywhere else they could
+        # drift from the checkpoint with nothing to catch it.
+        python ${./scripts/bake-language-constants.py} "$out"
+
         # The exporter exiting 0 says nothing about whether the artifacts load;
         # the corruption this guards against is silent and surfaces hours later
         # in whatever consumes them. Loading is also the only contract the Rust
         # side has with this derivation, so it is what the build should assert.
-        python ${./scripts/verify-onnx.py} "$out" \
-          image_encoder language_encoder decoder
+        python ${./scripts/verify-onnx.py} "$out" image_encoder decoder
       '';
 in
 {
