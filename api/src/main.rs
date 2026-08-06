@@ -158,10 +158,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     };
 
-    // Close both SpatiaLite-loaded pools (the app pool and the fact store's
-    // own) inside the live runtime, so each connection's dlclose completes
-    // before process exit rather than on an ungraceful drop. Nothing above
-    // short-circuits, so both run whichever way the server ended.
+    // Close both pools (the app pool and the fact store's own) inside the live
+    // runtime, so each connection's teardown — the fact store's dlclose of
+    // SpatiaLite above all — completes on a live thread before process exit.
+    // Nothing above short-circuits, so both run whichever way the server ended.
     db.close().await;
     facts_for_shutdown.close().await;
     result.map_err(Into::into)

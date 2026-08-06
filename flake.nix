@@ -252,7 +252,6 @@
             crane
             craneLib
             system
-            src
             ohmStylePath
             ;
           webSrc = deployableSrcs.web;

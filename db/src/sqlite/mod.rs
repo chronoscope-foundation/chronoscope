@@ -114,8 +114,7 @@ type Error = SqliteFactStoreError;
 /// branching. Excludes the overlay-only counters (seeded, never unioned) and
 /// the spatial shadow tables (the spatial read unions per rtree branch instead,
 /// since an rtree can't drive its index through a view). Built in
-/// [`create_pool_with_overlay`](crate::create_pool_with_overlay)'s
-/// `after_connect`.
+/// [`create_facts_pool`](crate::create_facts_pool)'s `after_connect`.
 pub(crate) const UNION_VIEW_TABLES: &[&str] = &[
     "facts",
     "fact_subjects",
@@ -326,7 +325,7 @@ impl FactStoreLocations {
 /// # Errors
 /// Returns [`DbError`](crate::DbError) if the pool or migrations fail.
 pub async fn create_facts_file(overlay_path: &str) -> crate::DbResult<()> {
-    let pool = crate::create_pool(&format!("sqlite:{overlay_path}")).await?;
+    let pool = crate::create_facts_pool(&format!("sqlite:{overlay_path}"), None).await?;
     sqlx::migrate!("./migrations/facts").run(&pool).await?;
     pool.close().await;
     Ok(())
@@ -407,7 +406,7 @@ impl SqliteFactStore {
             })?;
         }
         let has_base = locations.base_path().is_some();
-        let pool = crate::create_pool_with_overlay(
+        let pool = crate::create_facts_pool(
             &locations.app,
             Some(crate::FactMount {
                 overlay: locations.overlay_path(),

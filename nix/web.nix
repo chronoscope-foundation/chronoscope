@@ -14,7 +14,6 @@
   crane,
   craneLib,
   system,
-  src,
   # Workspace source narrowed to the crates this bundle compiles — see
   # nix/workspace-src.nix. Keeps a backend edit from rebuilding the WASM
   # pipeline and republishing a bundle that cannot have changed.

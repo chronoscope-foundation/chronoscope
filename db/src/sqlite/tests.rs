@@ -60,7 +60,7 @@ impl RefusalKinds for SqliteFactStore {
 async fn fresh_pool(overlay: &std::path::Path) -> Result<SqlitePool, DbError> {
     let overlay = super::path_string(overlay, "overlay")?;
     crate::create_facts_file(&overlay).await?;
-    crate::create_pool_with_overlay(
+    crate::create_facts_pool(
         "sqlite::memory:",
         Some(crate::FactMount {
             overlay: &overlay,

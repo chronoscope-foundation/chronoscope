@@ -106,9 +106,9 @@ impl Database {
 
     /// Close the connection pool, awaiting each connection's teardown.
     ///
-    /// sqlx runs every SQLite connection on a detached OS thread whose
-    /// `sqlite3_close` `dlclose`s the SpatiaLite extension. Awaiting the close
-    /// keeps that teardown inside the live runtime, before process exit.
+    /// sqlx runs every SQLite connection's `sqlite3_close` on a detached OS
+    /// thread. Awaiting the close keeps that teardown inside the live runtime,
+    /// before process exit.
     pub async fn close(&self) {
         self.pool.close().await;
     }
@@ -208,7 +208,7 @@ impl Database {
     /// This is used by tests that want to verify query plans themselves (to avoid circular dependency).
     pub async fn new_without_plan_verification(database_url: &str) -> DbResult<Self> {
         let registry = chronoscope_integrations::create_registry(None)?;
-        let pool = create_pool(database_url).await?;
+        let pool = create_app_pool(database_url).await?;
 
         // App tables only — the fact tables live in a separate facts database
         // (see `db/migrations/facts/` and [`SqliteFactStore`]), migrated by
@@ -283,37 +283,21 @@ pub(crate) struct FactMount<'a> {
     pub base: Option<&'a str>,
 }
 
-/// Create the SQLite connection pool with SpatiaLite loaded. A free function
-/// rather than a `Database` method so the fact-store tests can build the same
-/// pool shape without the queue/registry plumbing.
-pub(crate) async fn create_pool(database_url: &str) -> DbResult<SqlitePool> {
-    create_pool_with_overlay(database_url, None).await
-}
+/// Fact-store read views hold a connection for their lifetime (one WAL read
+/// transaction each), so the cap covers concurrent held views plus the writer
+/// and short CRUD/queue acquires — not just transient statements.
+const MAX_CONNECTIONS: u32 = 16;
 
-/// Build the pool over `database_url` as `main`, with SpatiaLite loaded. When
-/// `mount` is `Some(..)`, every connection attaches the fact-store layers: the
-/// writable overlay as schema `ovl`, and (when the mount carries one) a frozen
-/// base as `base` through a `mode=ro&immutable=1` URI — so an immutable pin, a
-/// 0444 nix-store artifact with no room for WAL/-shm sidecars, attaches with no
-/// write probe or locking. With a base attached, each connection also builds a
-/// temp union view per fact table ([`sqlite::UNION_VIEW_TABLES`]) so the
-/// unqualified reads span both layers; the overlay-only mount leaves the reads
-/// resolving straight to `ovl`. The attach and view build run in
-/// `after_connect`, alongside the SpatiaLite `.extension()` load: the extension
-/// is a connect option applied during the connect, the setup a post-connect
-/// hook, so the two coexist.
-pub(crate) async fn create_pool_with_overlay(
-    database_url: &str,
-    mount: Option<FactMount<'_>>,
-) -> DbResult<SqlitePool> {
-    let spatialite_dir = std::env::var("SPATIALITE_LIBRARY_PATH")
-        .map_err(|_| DbError::Config("SPATIALITE_LIBRARY_PATH must be set".to_string()))?;
-
-    // Pooled in-memory SQLite needs a shared-cache URI: each pooled
-    // connection opens the filename independently, and without
-    // cache=shared every connection would see its own empty database.
-    // The per-pool sequence number keeps separate pools isolated.
-    let mut options = if database_url == "sqlite::memory:" {
+/// The connect options every Chronoscope SQLite pool shares: durability
+/// settings, foreign keys, and the shared-cache handling a pooled in-memory
+/// database needs.
+///
+/// Pooled in-memory SQLite needs a shared-cache URI: each pooled connection
+/// opens the filename independently, and without cache=shared every connection
+/// would see its own empty database. The per-pool sequence number keeps
+/// separate pools isolated.
+fn connect_options(database_url: &str) -> DbResult<SqliteConnectOptions> {
+    let options = if database_url == "sqlite::memory:" {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seqno = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -322,32 +306,80 @@ pub(crate) async fn create_pool_with_overlay(
         ))
     } else {
         SqliteConnectOptions::from_str(database_url)?
-    }
-    .create_if_missing(true)
-    .foreign_keys(true)
-    .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-    // NORMAL is WAL's idiomatic pairing: one fsync per checkpoint instead of
-    // per commit, and a power cut costs at most the tail commits, never
-    // corruption.
-    .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-    .busy_timeout(Duration::from_secs(5))
-    .extension(format!("{spatialite_dir}/mod_spatialite"));
+    };
+
+    Ok(options
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        // NORMAL is WAL's idiomatic pairing: one fsync per checkpoint instead of
+        // per commit, and a power cut costs at most the tail commits, never
+        // corruption.
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
+        .busy_timeout(Duration::from_secs(5)))
+}
+
+/// Build the app pool over `database_url` as `main`: users, credentials,
+/// research URLs, media and the work queues. Stock SQLite serves all of it,
+/// since the app schema keeps coordinates as `REAL` columns beside their JSON
+/// and every spatial concern lives in the fact store. That is what lets a
+/// deployment whose fact store is elsewhere run with no spatial library
+/// present.
+pub(crate) async fn create_app_pool(database_url: &str) -> DbResult<SqlitePool> {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(MAX_CONNECTIONS)
+        .connect_with(connect_options(database_url)?)
+        .await?;
+
+    Ok(pool)
+}
+
+/// Build a fact-store pool over `database_url` as `main`, with SpatiaLite
+/// loaded.
+///
+/// The extension rides every fact-store pool, mount or no mount: the mountless
+/// pool is [`create_facts_file`]'s, which runs the fact migrations, and those
+/// call `InitSpatialMetaData` / `AddGeometryColumn` / `CreateSpatialIndex` to
+/// build the geometry column the mounted pools then read and write. So
+/// `SPATIALITE_LIBRARY_PATH` is required here, and only here.
+///
+/// When `mount` is `Some(..)`, every connection attaches the fact-store layers:
+/// the writable overlay as schema `ovl`, and (when the mount carries one) a
+/// frozen base as `base` through a `mode=ro&immutable=1` URI — so an immutable
+/// pin, a 0444 nix-store artifact with no room for WAL/-shm sidecars, attaches
+/// with no write probe or locking. With a base attached, each connection also
+/// builds a temp union view per fact table ([`sqlite::UNION_VIEW_TABLES`]) so
+/// the unqualified reads span both layers; the overlay-only mount leaves the
+/// reads resolving straight to `ovl`. The attach and view build run in
+/// `after_connect`, alongside the SpatiaLite `.extension()` load: the extension
+/// is a connect option applied during the connect, the setup a post-connect
+/// hook, so the two coexist.
+pub(crate) async fn create_facts_pool(
+    database_url: &str,
+    mount: Option<FactMount<'_>>,
+) -> DbResult<SqlitePool> {
+    let spatialite_dir = std::env::var("SPATIALITE_LIBRARY_PATH").map_err(|_| {
+        DbError::Config(
+            "SPATIALITE_LIBRARY_PATH must be set: the SQLite fact store loads mod_spatialite \
+             from it into every connection"
+                .to_string(),
+        )
+    })?;
+
+    let mut options =
+        connect_options(database_url)?.extension(format!("{spatialite_dir}/mod_spatialite"));
 
     // SpatiaLite's geometry-maintenance triggers keep the shadow rtree in sync
     // on an overlay `facts_spatial` insert; they call functions it flags as
-    // unsafe, which fire only under `trusted_schema=ON`. Every fact mount owns
-    // a writable overlay that stages those inserts, so the pragma rides the
-    // fact-store pools; the app pool holds no fact tables and never fires a
-    // maintenance trigger, so it goes without.
+    // unsafe, and `trusted_schema=ON` is what lets a trigger reach them.
+    // Staging those inserts is what a mount is for, so the pragma keys to the
+    // mount; the mountless pool only builds the schema, whose direct calls the
+    // pragma leaves alone.
     if mount.is_some() {
         options = options.pragma("trusted_schema", "ON");
     }
 
-    // Fact-store read views hold a connection for their lifetime (one WAL
-    // read transaction each), so the cap covers concurrent held views plus
-    // the writer and short CRUD/queue acquires — not just transient
-    // statements.
-    let mut builder = SqlitePoolOptions::new().max_connections(16);
+    let mut builder = SqlitePoolOptions::new().max_connections(MAX_CONNECTIONS);
     if let Some(mount) = mount {
         let overlay = mount.overlay.to_owned();
         // sqlx opens every connection with `SQLITE_OPEN_URI`, so the immutable

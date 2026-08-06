@@ -25,9 +25,11 @@ reads it via the generated ChronoscopeAPI package.
 
 The API server reads at startup:
 
-- `SPATIALITE_LIBRARY_PATH` — directory containing libspatialite. Required;
-  loaded into every SQLite connection at pool creation. Outside the shell,
-  database startup fails at runtime, not compile time.
+- `SPATIALITE_LIBRARY_PATH` — directory containing libspatialite. Required by
+  the SQLite fact store, which loads it into each of its connections at pool
+  creation; the app pool (users, URLs, media, queues) opens on stock SQLite and
+  needs it for nothing. Outside the shell, fact-store startup fails at runtime,
+  not compile time.
 - `PORT` / `BIND_ADDR` — where to listen. `PORT` (what Cloud Run injects) wins
   and binds every interface; `BIND_ADDR` carries a full address otherwise.
 

@@ -143,8 +143,8 @@ pub struct RunningDevServer {
 
     /// The fact store, kept for its graceful shutdown. It owns a separate
     /// SpatiaLite-loaded pool (the `Arc`-backed pool is shared with the copy
-    /// handed to the server), and its close must run on the live runtime for
-    /// the same reason `db.close()` does.
+    /// handed to the server), and its close must run on the live runtime so
+    /// each connection's `dlclose` lands there.
     facts: ServerFactStore,
 
     /// Send `true` to trigger graceful shutdown of workers
@@ -199,10 +199,9 @@ impl RunningDevServer {
                 "deadline_secs" => WORKER_STOP_DEADLINE.as_secs());
         }
 
-        // Close both SpatiaLite-loaded pools — the app pool and the fact
-        // store's own — while the runtime is alive, so each connection's
-        // `dlclose` completes before process exit instead of on an ungraceful
-        // drop at teardown.
+        // Close both pools — the app pool and the fact store's own — while the
+        // runtime is alive, so each connection's teardown (the fact store's
+        // SpatiaLite `dlclose` above all) completes before process exit.
         self.db.close().await;
         self.facts.close().await;
     }
