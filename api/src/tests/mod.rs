@@ -1,7 +1,9 @@
 //! Integration tests for the Chronoscope API
 //!
-//! These tests use an in-memory SQLite database and simulate WebAuthn flows
-//! using the `SoftPasskey` authenticator.
+//! These tests use an in-memory SQLite app database and simulate WebAuthn flows
+//! using the `SoftPasskey` authenticator. The fact store is whichever backend
+//! the `postgres` feature selects; `fresh_fact_store` below is the only place
+//! that differs.
 
 mod auth;
 mod entities;
@@ -49,34 +51,76 @@ use crate::state::{
     ServerFactStore, ServerImageId,
 };
 
-/// A fresh fact store per test, plus the tempdir holding its overlay facts
-/// file. Views hold read transactions on the overlay (WAL) for their
-/// lifetime, and only a file-backed overlay gives WAL's reader/writer
-/// independence — an in-memory overlay would serialize them at table locks.
+/// A test's fact store together with whatever its backend needs held alive
+/// beside it. Under SQLite that is the tempdir the overlay file lives in: views
+/// hold read transactions on the overlay (WAL) for their lifetime, so the
+/// directory has to outlive the store. Postgres has no such slot, since the
+/// harness owns one cluster for the whole test process.
+///
+/// Derefs to the store, so a fixture that commits facts or mints ids reads as
+/// if it held the store itself.
+///
+/// `Clone` keeps that reach honest: cloning a fixture yields a fixture, its
+/// directory shared through the `Arc` (see the test below).
+#[derive(Clone)]
+pub(crate) struct TestFactStore {
+    store: ServerFactStore,
+    #[cfg(not(feature = "postgres"))]
+    _dir: Arc<tempfile::TempDir>,
+}
+
+impl std::ops::Deref for TestFactStore {
+    type Target = ServerFactStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+/// A fresh fact store per test, on a file-backed overlay: only a file gives
+/// WAL's reader/writer independence, where an in-memory overlay would serialize
+/// them at table locks.
 ///
 /// This is the whole of the suite's backend dependence, so the cfg stops here
-/// and every test around it compiles and lints under both cells.
+/// and every test around it compiles, lints and runs under both cells.
 #[cfg(not(feature = "postgres"))]
-async fn fresh_fact_store()
--> Result<(ServerFactStore, tempfile::TempDir), Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) async fn fresh_fact_store()
+-> Result<TestFactStore, Box<dyn std::error::Error + Send + Sync>> {
     let dir = tempfile::tempdir()?;
     let store = ServerFactStore::open(chronoscope_db::FactStoreLocations::standalone_at(
         &dir.path().join("facts.sqlite3"),
     )?)
     .await?;
-    Ok((store, dir))
+    Ok(TestFactStore {
+        store,
+        _dir: Arc::new(dir),
+    })
 }
 
-/// The Postgres cell has no store to hand back: the only thing in the tree that
-/// stands a Postgres database up is the `cfg(test)` harness inside
-/// `chronoscope-db`, out of reach from another crate's tests. The suite still
-/// compiles and lints here, which is what keeps it inside the workspace deny
-/// lints; it *runs* in the SQLite cell, and the db crate's conformance suite is
-/// what shows the two backends answer alike.
+/// The Postgres cell's store is a clone of the harness's migrated template
+/// database, in a cluster started once per process. Every test therefore gets
+/// its own database, the same isolation the tempdir gives the SQLite cell.
 #[cfg(feature = "postgres")]
-async fn fresh_fact_store()
--> Result<(ServerFactStore, tempfile::TempDir), Box<dyn std::error::Error + Send + Sync>> {
-    Err("the api suite runs against SQLite; no Postgres store can be built here".into())
+pub(crate) async fn fresh_fact_store()
+-> Result<TestFactStore, Box<dyn std::error::Error + Send + Sync>> {
+    let (store, ()) = chronoscope_db::postgres::harness::fresh_pg_store().await?;
+    Ok(TestFactStore { store })
+}
+
+/// `Deref` puts the store's own `Clone` within reach of the wrapper, so
+/// `facts.clone()` has two candidate meanings and only one of them carries the
+/// directory the store's overlay lives in. The annotation is the assertion:
+/// this compiles only while resolution lands on the wrapper.
+#[tokio::test]
+async fn cloning_the_fixture_yields_a_fixture() -> TestResult {
+    let facts = fresh_fact_store().await?;
+    let cloned: TestFactStore = facts.clone();
+    drop(facts);
+    // And the clone is a store in its own right once the original is gone.
+    chronoscope_core::store::FactStore::now(&*cloned)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
 }
 
 // ==================== Test Utilities ====================
@@ -153,9 +197,13 @@ struct TestContext {
     /// The server runs in a background task and is dropped when `TestContext` is dropped.
     #[allow(dead_code)]
     server: dropshot::HttpServer<Arc<AppState>>,
-    /// The tempdir holding the fact store's database file, kept alive for the
-    /// test's duration.
-    _facts_dir: tempfile::TempDir,
+    /// The store the server reads. Field order is drop order, so declaring it
+    /// last keeps the store, and under SQLite the directory its overlay lives
+    /// in, alive across the server's and `AppState`'s drops. Dropping the
+    /// server signals its task to close and the task finishes on its own
+    /// schedule, which makes this an ordering of the fixture's own handles
+    /// rather than a barrier on the last one outstanding.
+    _facts: TestFactStore,
 }
 
 impl TestContext {
@@ -181,14 +229,13 @@ impl TestContext {
     async fn with_media_store()
     -> Result<(Self, Arc<InMemoryMediaStore>), Box<dyn std::error::Error + Send + Sync>> {
         let media_store = Arc::new(InMemoryMediaStore::new());
-        let (facts, facts_dir) = fresh_fact_store().await?;
+        let facts = fresh_fact_store().await?;
         let ctx = Self::with_options_and_media(
             None,
             None,
             None,
             Some(media_store.clone()),
             facts,
-            facts_dir,
             Arc::new(HashMap::new()),
         )
         .await?;
@@ -200,7 +247,7 @@ impl TestContext {
         jwt_config: Option<JwtConfig>,
         dns_resolver: Option<TestResolver>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let (facts, facts_dir) = fresh_fact_store().await?;
+        let facts = fresh_fact_store().await?;
         let image_media = Arc::new(HashMap::new());
         #[cfg(feature = "embedded-media")]
         return Self::with_options_and_media(
@@ -209,7 +256,6 @@ impl TestContext {
             dns_resolver,
             None,
             facts,
-            facts_dir,
             image_media,
         )
         .await;
@@ -219,7 +265,6 @@ impl TestContext {
             jwt_config,
             dns_resolver,
             facts,
-            facts_dir,
             image_media,
         )
         .await;
@@ -227,20 +272,17 @@ impl TestContext {
 
     /// Build a context around a pre-populated fact store and its resolved image
     /// media map. Image-resolution tests commit their facts (and mint image ids)
-    /// before the server exists, then hand the store, the tempdir holding its
-    /// database file, and a matching media map in — mirroring the startup path
-    /// where images resolve before `AppState`.
+    /// before the server exists, then hand the store and a matching media map
+    /// in — mirroring the startup path where images resolve before `AppState`.
     async fn with_facts_and_image_media(
-        facts: ServerFactStore,
-        facts_dir: tempfile::TempDir,
+        facts: TestFactStore,
         image_media: HashMap<ServerImageId, ResolvedImageMedia>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let image_media = Arc::new(image_media);
         #[cfg(feature = "embedded-media")]
-        return Self::with_options_and_media(None, None, None, None, facts, facts_dir, image_media)
-            .await;
+        return Self::with_options_and_media(None, None, None, None, facts, image_media).await;
         #[cfg(not(feature = "embedded-media"))]
-        return Self::with_options_and_media(None, None, None, facts, facts_dir, image_media).await;
+        return Self::with_options_and_media(None, None, None, facts, image_media).await;
     }
 
     async fn with_options_and_media(
@@ -248,8 +290,7 @@ impl TestContext {
         jwt_config: Option<JwtConfig>,
         dns_resolver: Option<TestResolver>,
         #[cfg(feature = "embedded-media")] media_store: Option<Arc<InMemoryMediaStore>>,
-        facts: ServerFactStore,
-        facts_dir: tempfile::TempDir,
+        facts: TestFactStore,
         image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = jwt_config.unwrap_or_else(|| {
@@ -287,6 +328,10 @@ impl TestContext {
 
         let db = Database::new(&config.database_url).await?;
 
+        // Every backend's store is Arc-backed, so the server gets a handle on
+        // the same store the fixture keeps for the test's duration.
+        let server_facts = facts.store.clone();
+
         #[cfg(feature = "embedded-media")]
         let app_state = {
             let store = media_store.unwrap_or_else(|| Arc::new(InMemoryMediaStore::new()));
@@ -296,14 +341,21 @@ impl TestContext {
                 jwt,
                 Box::new(resolver),
                 store,
-                facts,
+                server_facts,
                 image_media,
             )
             .await?
         };
         #[cfg(not(feature = "embedded-media"))]
-        let app_state =
-            AppState::new(db, config, jwt, Box::new(resolver), facts, image_media).await?;
+        let app_state = AppState::new(
+            db,
+            config,
+            jwt,
+            Box::new(resolver),
+            server_facts,
+            image_media,
+        )
+        .await?;
 
         let app_state = Arc::new(app_state);
 
@@ -336,7 +388,7 @@ impl TestContext {
             app_state,
             webauthn_origin,
             server,
-            _facts_dir: facts_dir,
+            _facts: facts,
         })
     }
 

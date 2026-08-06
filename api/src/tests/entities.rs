@@ -965,7 +965,7 @@ async fn get_entity_images_is_empty_for_an_entity_with_no_depiction() -> TestRes
 
 #[tokio::test]
 async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult {
-    let (facts, facts_dir) = super::fresh_fact_store().await?;
+    let facts = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Pantheon.jpg";
     let (id, image_id) =
         commit_entity_with_depicted_image(&facts, "Pantheon", 41.8986, 12.4769, src).await?;
@@ -974,12 +974,8 @@ async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult
     // original from our own /media/{key}, not from upstream Commons.
     let media = resolved_media(image_id);
     let expected_display = format!("{TEST_CDN_BASE_URL}/{}", media.storage_key);
-    let ctx = TestContext::with_facts_and_image_media(
-        facts,
-        facts_dir,
-        HashMap::from([(image_id, media)]),
-    )
-    .await?;
+    let ctx =
+        TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
 
     let page = ctx
         .client
@@ -1015,12 +1011,12 @@ async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult
 async fn get_entity_images_skips_a_depiction_whose_image_is_unresolved() -> TestResult {
     // The image has a Source fact but no entry in the media map — a tile that
     // can't load is worse than an absent one, so the grid drops it.
-    let (facts, facts_dir) = super::fresh_fact_store().await?;
+    let facts = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/c/c3/Unresolved.jpg";
     let (id, _image_id) =
         commit_entity_with_depicted_image(&facts, "Unresolved", 41.9, 12.5, src).await?;
 
-    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, HashMap::new()).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, HashMap::new()).await?;
 
     let page = ctx
         .client
@@ -1184,7 +1180,7 @@ async fn commit_extra_depiction_on(
 
 #[tokio::test]
 async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult {
-    let (facts, facts_dir) = super::fresh_fact_store().await?;
+    let facts = super::fresh_fact_store().await?;
     // Three depicted images inside one entity; limit=1 forces the walk across
     // cursor-linked pages, exercising the images cursor encode/decode round trip.
     let (id, image_ids) =
@@ -1196,7 +1192,7 @@ async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult
     // The wire form of a backend image id is its decimal string, the same shape
     // the tiles carry back; compare on that rather than re-parsing.
     let expected: BTreeSet<String> = image_ids.iter().map(|id| id.0.to_string()).collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, media).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
 
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
@@ -1248,7 +1244,7 @@ async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult
 
 #[tokio::test]
 async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> TestResult {
-    let (facts, facts_dir) = super::fresh_fact_store().await?;
+    let facts = super::fresh_fact_store().await?;
     // Three depicted images make ≥2 pages at limit=1. Media is registered for a
     // range past those three, so a later image would resolve into a tile *if* the
     // resume erroneously read `now()` rather than the cursor's pinned snapshot.
@@ -1261,7 +1257,7 @@ async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> 
         })
         .collect();
     let expected: BTreeSet<String> = image_ids.iter().map(|id| id.0.to_string()).collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, media).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
 
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
@@ -1436,7 +1432,7 @@ async fn get_tile_selects_a_lone_entity_in_its_container() -> TestResult {
 
 #[tokio::test]
 async fn get_tile_carries_a_thumbnail_for_a_depicted_entity() -> TestResult {
-    let (facts, facts_dir) = super::fresh_fact_store().await?;
+    let facts = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Pantheon.jpg";
     let (lat, lon) = (41.8986, 12.4769);
     let (id, image_id) =
@@ -1449,7 +1445,6 @@ async fn get_tile_carries_a_thumbnail_for_a_depicted_entity() -> TestResult {
     );
     let ctx = TestContext::with_facts_and_image_media(
         facts,
-        facts_dir,
         HashMap::from([(image_id, resolved_media(image_id))]),
     )
     .await?;
@@ -2411,7 +2406,7 @@ async fn entity_images_at_the_detail_snapshot_exclude_later_writes() -> TestResu
     // The web panel reads entity detail, then its images as a second request.
     // Pinning the images fetch to the detail's snapshot keeps the grid from
     // showing depictions committed between the two requests.
-    let (facts, facts_dir) = super::fresh_fact_store().await?;
+    let facts = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Original.jpg";
     let (id, original) =
         commit_entity_with_depicted_image(&facts, "Pantheon", 41.8986, 12.4769, src).await?;
@@ -2424,7 +2419,7 @@ async fn entity_images_at_the_detail_snapshot_exclude_later_writes() -> TestResu
             (image_id, resolved_media(image_id))
         })
         .collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, media).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
 
     // Detail read pins the snapshot the panel threads into the grid.
     let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
@@ -2479,7 +2474,7 @@ async fn entity_images_at_the_detail_snapshot_exclude_later_writes() -> TestResu
 
 #[tokio::test]
 async fn get_entity_images_cursor_and_snapshot_must_agree() -> TestResult {
-    let (facts, facts_dir) = super::fresh_fact_store().await?;
+    let facts = super::fresh_fact_store().await?;
     // Two depictions so limit=1 hands back a resume cursor pinned at S1.
     let (id, _image_ids) =
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 2).await?;
@@ -2489,7 +2484,7 @@ async fn get_entity_images_cursor_and_snapshot_must_agree() -> TestResult {
             (image_id, resolved_media(image_id))
         })
         .collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, facts_dir, media).await?;
+    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
     // Page 1 mints a cursor pinned at S1 and echoes S1.

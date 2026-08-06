@@ -48,9 +48,11 @@ mod queries;
 mod read;
 
 // Stands up a throwaway cluster by shelling out to initdb/pg_ctl, so it belongs
-// to the test build alone.
-#[cfg(test)]
-mod harness;
+// to a test build alone. `test-support` is what lets another crate's suite reach
+// it; `postgres` gates the module it sits in, so that feature alone never
+// compiles it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod harness;
 
 #[cfg(test)]
 mod tests;
@@ -186,14 +188,21 @@ impl PostgresFactStore {
     }
 }
 
-/// The fact-store pool, shared by both constructors so a store's connection
-/// budget doesn't depend on which one built it.
-async fn connect_pool(url: &str) -> Result<PgPool, sqlx::Error> {
+/// The shape of every fact-store pool: the connection budget above and the wait
+/// a caller gets for one. One definition so a store's behavior under contention
+/// doesn't depend on who built it. The two serving constructors and the
+/// `harness` module's per-test stores all start here, so a suite exercises the
+/// queueing and the timeout a deployment gets.
+fn pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(POOL_MAX_CONNECTIONS)
         .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-        .connect(url)
-        .await
+}
+
+/// The fact-store pool, shared by both constructors so a store's connection
+/// budget doesn't depend on which one built it.
+async fn connect_pool(url: &str) -> Result<PgPool, sqlx::Error> {
+    pool_options().connect(url).await
 }
 
 /// Refuse a database that this binary's migrations have not all been applied to.

@@ -323,10 +323,10 @@
           ])
           ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.libiconv ];
 
-        # PostgreSQL + PostGIS for the ephemeral-cluster smoke test: puts
-        # initdb/pg_ctl/psql on PATH with postgis loadable. Feeds both the api
-        # dev shell (local `cargo test -p chronoscope-db --features postgres`)
-        # and the hermetic `postgres-smoke` check.
+        # PostgreSQL + PostGIS for the ephemeral-cluster harness: puts
+        # initdb/pg_ctl/psql on PATH with postgis loadable. Feeds the api dev
+        # shell (local `cargo test -p chronoscope-db --features postgres`) and
+        # the hermetic `postgres-smoke` and `api-postgres` checks.
         postgresWithPostgis = pkgs.postgresql_16.withPackages (p: [ p.postgis ]);
 
         # Preload libspatialite so it and its C++ deps (PROJ/GEOS) stay mapped

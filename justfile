@@ -197,12 +197,18 @@ check target="all":
             nix build ".#checks.$SYS.nix-lint" --no-link
             ;;
         rust)
+            # The two Postgres suites each spin an ephemeral cluster, so they
+            # cost more than the rest; they belong here anyway, because they are
+            # the only place the Postgres backend and the server built on it run
+            # against a database rather than only type-check.
             nix build \
                 ".#checks.$SYS.fmt" \
                 ".#checks.$SYS.clippy" \
                 ".#checks.$SYS.doc" \
                 ".#checks.$SYS.doctest" \
                 ".#checks.$SYS.llvm-cov" \
+                ".#checks.$SYS.postgres-smoke" \
+                ".#checks.$SYS.api-postgres" \
                 --no-link
             ;;
         web)

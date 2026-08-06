@@ -168,27 +168,71 @@ let
     }
   );
 
-  # The db crate's postgres conformance suite over an ephemeral postgres+PostGIS
-  # cluster (initdb/pg_ctl on PATH via nativeBuildInputs). Compile- and
-  # cluster-heavy, so it is let-bound like the other heavy checks and ordered
-  # before `web-test` (see `CHRONOSCOPE_RUN_AFTER` there): left co-schedulable,
-  # it would starve the headless-Chrome CDP event loop the same way.
+  # What the two suites below share: they each stand up an ephemeral
+  # postgres+PostGIS cluster, which wants initdb/pg_ctl on PATH and a socket
+  # directory short enough for a unix socket address (~104 bytes on darwin).
   #
-  # `pname` is deliberately short: it lengthens the build dir, and the unix-socket
-  # path is capped at ~104 bytes on darwin. The harness keeps the socket under
-  # PG_SOCKET_BASE (default /tmp), so the build-dir depth stays off the socket
-  # path — but a short pname is cheap insurance.
+  # The harness reaps its cluster with a watchdog process, and nix kills
+  # everything the build started the moment the derivation ends, so that
+  # watchdog never runs here; at its default base (/tmp) every build then left a
+  # socket directory behind on the host. Pointing the base at the build
+  # directory hands the lifetime to nix, which removes that tree whether the
+  # build passed or failed, and puts the socket beside the PGDATA the harness
+  # already keeps there.
+  pgClusterArgs = {
+    nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ postgresWithPostgis ];
+    preBuild = ''
+      export PG_SOCKET_BASE="$NIX_BUILD_TOP"
+    '';
+  };
+
+  # libtest otherwise takes a thread per core, and each test holds a pool
+  # (`TEST_POOL_MAX_CONNECTIONS` = 5) against a cluster capped at 500 clients:
+  # uncapped, a big enough builder reaches "sorry, too many clients already" and
+  # the gate fails on the size of the machine. Sixteen tests in flight is 80
+  # connections, and the cap binds only on machines larger than that.
+  pgTestThreads = "--test-threads=16";
+
+  # The db crate's postgres conformance suite over an ephemeral cluster.
+  # Compile- and cluster-heavy, so it is let-bound like the other heavy checks
+  # and ordered before `web-test` (see `CHRONOSCOPE_RUN_AFTER` there): left
+  # co-schedulable, it would starve the headless-Chrome CDP event loop the same
+  # way.
+  #
+  # `pname` is deliberately short: it lands in the build directory's name, which
+  # the socket path now sits under.
   postgres-smoke = craneLib.cargoTest (
     checkArgs
     // testExtraEnv
+    // pgClusterArgs
     // {
       pname = "pg-smoke";
       # No name filter: a `postgres::` prefix would silently exclude any future
       # feature-gated test placed outside that module path. Running the crate's
       # whole suite under the feature costs the sqlite cases a second run and
       # needs nobody to remember a convention.
-      cargoTestExtraArgs = "-p chronoscope-db --features postgres";
-      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ postgresWithPostgis ];
+      cargoTestExtraArgs = "-p chronoscope-db --features postgres -- ${pgTestThreads}";
+    }
+  );
+
+  # The api's own integration suite against the fact-store backend production
+  # runs. `clippy` already type-checks the server under `postgres` (it lints
+  # `--all-features`); what this adds is *running* it against a live database:
+  # the handlers, the listing, the cursors and the read views they open. A
+  # serving path that compiles but does not work then fails a check rather than
+  # a deploy.
+  #
+  # Under the feature the suite's store fixtures come from `chronoscope-db`'s
+  # cluster harness (its `test-support` feature, a dev-dependency of this
+  # crate), so each test drives real requests through the handlers against a
+  # throwaway Postgres database.
+  api-postgres = craneLib.cargoTest (
+    checkArgs
+    // testExtraEnv
+    // pgClusterArgs
+    // {
+      pname = "api-pg";
+      cargoTestExtraArgs = "-p chronoscope-api --features postgres -- ${pgTestThreads}";
     }
   );
 in
@@ -201,6 +245,7 @@ in
     };
 
     inherit
+      api-postgres
       clippy
       doc
       doctest
@@ -218,16 +263,16 @@ in
     # the compile- and coverage-heavy checks under `nix flake check`, the
     # browser tests stall and time out (they pass reliably with the box to
     # themselves — cf. `just test web`). Referencing those checks' outputs
-    # (including the heavy `postgres-smoke`) orders this derivation after them,
-    # so the browser tests run unstarved; the reference only establishes build
-    # order.
+    # (including the two cluster-heavy Postgres suites) orders this derivation
+    # after them, so the browser tests run unstarved; the reference only
+    # establishes build order.
     web-test = craneLib.cargoTest (
       checkArgs
       // testExtraEnv
       // {
         pname = "chronoscope-web-tests";
         cargoTestExtraArgs = "-p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4";
-        CHRONOSCOPE_RUN_AFTER = "${clippy} ${doc} ${doctest} ${llvm-cov} ${postgres-smoke}";
+        CHRONOSCOPE_RUN_AFTER = "${clippy} ${doc} ${doctest} ${llvm-cov} ${postgres-smoke} ${api-postgres}";
       }
     );
   };

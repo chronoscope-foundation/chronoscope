@@ -28,12 +28,13 @@ use crate::jwt::JwtConfig;
 /// instantiate at this alias.
 ///
 /// The `postgres` feature picks the backend at compile time: on for the
-/// production entry point, off for dev and the tests, which run SQLite. Only
-/// construction differs between the two, since Postgres connects to a URL where
-/// SQLite mounts a base and an overlay, so the cfg reaches just this alias, the
-/// entry point's two `open` call sites, and the two test fixtures that stand a
-/// store up (`tests::fresh_fact_store` and `entities::tests::empty_fact_store`).
-/// Every other module, test code included, compiles under both.
+/// production entry point, off for dev. Only construction differs between the
+/// two, since Postgres connects to a URL where SQLite mounts a base and an
+/// overlay, so the cfg reaches just this alias, the entry point's two `open`
+/// call sites, and the one test fixture that stands a store up
+/// (`tests::fresh_fact_store`). Every other module, test code included,
+/// compiles under both, and the suite runs under both: default features against
+/// SQLite, `checks.api-postgres` against a throwaway Postgres cluster.
 pub type ServerFactStore = PickedFactStore;
 
 /// The picked backend's id scheme — what the stored commit types instantiate at.

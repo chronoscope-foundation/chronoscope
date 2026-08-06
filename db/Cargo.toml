@@ -10,12 +10,14 @@ repository.workspace = true
 workspace = true
 
 [features]
-# In-process worker-progress notifications for integration tests. NOT for
-# production: a `watch::Sender` only reaches same-process subscribers, so
-# multi-instance deployments would need a cross-host signal
-# (LISTEN/NOTIFY, a bus, etc.). The gate prevents prod code from
-# depending on it.
-test-support = []
+# What other crates' integration tests reach into this one for: in-process
+# worker-progress notifications, and the ephemeral Postgres+PostGIS cluster
+# harness (which also needs `postgres`, the feature gating the module it sits
+# in). The notifications are NOT for production: a `watch::Sender` only reaches
+# same-process subscribers, so multi-instance deployments would need a
+# cross-host signal (LISTEN/NOTIFY, a bus, etc.). The gate prevents prod code
+# from depending on any of it.
+test-support = ["dep:tempfile"]
 
 # Postgres fact-store backend. Off by default — the SQLite backend is the only
 # one wired into `Database`, and enabling this pulls sqlx's postgres driver in.
@@ -51,6 +53,10 @@ thiserror.workspace = true
 # Async traits and bytes (for MediaStore)
 async-trait = "0.1"
 bytes.workspace = true
+
+# The Postgres harness's cluster directories. Optional because the harness is
+# the only non-test code that touches it.
+tempfile = { version = "3", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

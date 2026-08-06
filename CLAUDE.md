@@ -146,6 +146,7 @@ the pre-commit hook only honors the marker.
 # Hermetic gate (writes .claude/last-check.json on success)
 just check                  # everything incl. browser tests — the commit gate
 just check rust             # workspace fmt + clippy + rustdoc + test + coverage
+                            #   + both Postgres suites (db backend, api server)
 just check web              # WASM build + browser-test build + wasm clippy
                             #   (browser tests run ONLY in the full `just check`)
 just check triton           # Python ruff + mypy (pytest is `just test triton`)

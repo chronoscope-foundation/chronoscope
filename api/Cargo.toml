@@ -16,9 +16,9 @@ default = []
 embedded-media = []
 # Back the server's fact store with Postgres instead of SQLite. Compile-time
 # selection: the dev entry points build SQLite, the production one builds
-# Postgres, and `ServerFactStore` follows. The api integration tests only stand
-# up SQLite, so their store fixture errors here; the suite still compiles and
-# lints under this feature (see `tests::fresh_fact_store`).
+# Postgres, and `ServerFactStore` follows. The integration suite runs under
+# either, standing its store up on `chronoscope-db`'s ephemeral-cluster harness
+# here (see `tests::fresh_fact_store`); `checks.api-postgres` is what runs it.
 postgres = ["chronoscope-db/postgres"]
 
 [dependencies]
@@ -89,6 +89,10 @@ tempfile = "3"
 
 # Analysis types with test helpers
 chronoscope-analysis = { path = "../analysis", features = ["testing"] }
+
+# The ephemeral Postgres+PostGIS cluster harness the store fixture builds on
+# under the `postgres` feature.
+chronoscope-db = { path = "../db", features = ["test-support"] }
 
 # Bytes (for media store tests)
 bytes = "1"

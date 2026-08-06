@@ -8,7 +8,8 @@
 //! bakes in.
 
 use super::harness::{
-    fresh_pg_store, fresh_pg_store_at_default_isolation, fresh_unmigrated_database_url,
+    IsolationLevel, fresh_pg_store, fresh_pg_store_at_default_isolation,
+    fresh_unmigrated_database_url,
 };
 use super::{PostgresFactStore, PostgresFactStoreError};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlImageId};
@@ -152,7 +153,7 @@ async fn stored_regions_carry_longitude_on_the_x_axis() -> TestResult {
 async fn write_tx_pins_read_committed_despite_a_stricter_session_default() -> TestResult {
     use super::AsConn;
 
-    let (store, _cx) = fresh_pg_store_at_default_isolation("repeatable read").await?;
+    let (store, _cx) = fresh_pg_store_at_default_isolation(IsolationLevel::RepeatableRead).await?;
     let observed = store
         .with_tx(|_s, tx| {
             Box::pin(async move {
@@ -180,7 +181,7 @@ async fn write_tx_pins_read_committed_despite_a_stricter_session_default() -> Te
 async fn read_views_pin_read_committed_despite_a_stricter_database_default() -> TestResult {
     use super::AsConn;
 
-    let (store, _cx) = fresh_pg_store_at_default_isolation("repeatable read").await?;
+    let (store, _cx) = fresh_pg_store_at_default_isolation(IsolationLevel::RepeatableRead).await?;
     for (label, mut view) in [
         ("now", store.now().await?),
         ("no_later_than", store.no_later_than(FactId::new(0)).await?),

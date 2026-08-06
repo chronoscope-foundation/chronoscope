@@ -1,4 +1,6 @@
-//! Ephemeral Postgres+PostGIS cluster harness — test support for the backend.
+//! Ephemeral Postgres+PostGIS cluster harness — test support for the backend,
+//! and for any suite elsewhere in the workspace that needs the server's
+//! production fact store stood up (behind this crate's `test-support` feature).
 //!
 //! One process-shared cluster is `initdb`'d and started on a unix socket once
 //! (behind a [`OnceCell`]), a migrated **template** database is built in it, and
@@ -14,16 +16,32 @@
 //! denies `unsafe_code`; a poll-the-parent watchdog needs no unsafe and no new
 //! dependency.
 //!
+//! The watchdog is what covers a plain `cargo test`. A nix build ends by killing
+//! every process it started, watchdog included, so the checks that run these
+//! suites point `PG_SOCKET_BASE` at the build directory and let nix reclaim the
+//! whole tree with the derivation (see `nix/rust.nix`).
+//!
 //! The one non-obvious trap is the socket path length: a unix socket address is
-//! capped at `sizeof(sockaddr_un.sun_path)` (104 bytes on macOS), and nix build
-//! directories are deep, so the socket directory must be short — pulled out to a
-//! short base (`PG_SOCKET_BASE`, default `/tmp`).
+//! capped at `sizeof(sockaddr_un.sun_path)` (104 bytes on macOS), so the socket
+//! directory gets a base of its own (`PG_SOCKET_BASE`, default `/tmp`) rather
+//! than sitting wherever the test process was launched. A base too deep for the
+//! cap fails at startup with [`PgHarnessError::SocketPathTooLong`], which names
+//! the directory to shorten.
+//!
+//! **Scratch disk.** A per-test database is a full copy of the template, which
+//! `PostGIS` alone puts at 15 MB (~25 MB on disk), and it lives until the
+//! cluster goes. Peak is therefore the count of tests that stand a store up
+//! times that, a few gigabytes for either of the two suites that run here,
+//! inside the process's temp directory. Reclaiming a database earlier means
+//! dropping it out from under sessions the fixture no longer owns (the api's
+//! server task outlives the store handle its test held), which trades the disk
+//! for a race.
 
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool};
 use sqlx::{Connection, PgConnection};
 use tokio::sync::OnceCell;
 
@@ -44,8 +62,13 @@ const TEMPLATE_DB: &str = "cf_template";
 /// Failures bringing up the shared cluster. Every arm carries the operation and,
 /// for a failed subprocess, its captured output — a legible failure, not a bare
 /// exit code.
+///
+/// The entry points below hand it back concretely, so each consuming suite
+/// boxes on its own terms: this crate's cases collect into `Box<dyn Error>` and
+/// the api's into a `Send + Sync` one, and std converts between those two in
+/// neither direction.
 #[derive(Debug, thiserror::Error)]
-pub(super) enum PgHarnessError {
+pub enum PgHarnessError {
     #[error("failed to create the {what}: {source}")]
     Io {
         what: &'static str,
@@ -198,11 +221,22 @@ async fn connect_one(socket: &Path, db: &str) -> Result<PgConnection, PgHarnessE
         })
 }
 
+/// Connections one test's store may hold. The production cap
+/// (`POOL_MAX_CONNECTIONS`) sizes a single store against an instance of its own,
+/// where a test binary runs a pool per test in flight against one cluster, so
+/// the budget here is per test: at this width the cluster's `max_connections`
+/// covers 100 tests at once, well past the parallelism the checks allow.
+const TEST_POOL_MAX_CONNECTIONS: u32 = 5;
+
 /// A pool to `db`. Only ever built for a single test's store, so it lives and
 /// dies inside that test's runtime.
-async fn connect_pool(socket: &Path, db: &str, max: u32) -> Result<PgPool, PgHarnessError> {
-    PgPoolOptions::new()
-        .max_connections(max)
+///
+/// Built from the backend's own `pool_options`, so a test's store queues and
+/// times out on a busy pool the way a deployed one does; only the connection
+/// count is a test's own business.
+async fn connect_pool(socket: &Path, db: &str) -> Result<PgPool, PgHarnessError> {
+    super::pool_options()
+        .max_connections(TEST_POOL_MAX_CONNECTIONS)
         .connect_with(conn_opts(socket, db))
         .await
         .map_err(|source| PgHarnessError::Sqlx {
@@ -328,8 +362,7 @@ async fn shared_cluster() -> Result<&'static SharedCluster, PgHarnessError> {
 /// the builder the conformance suite stamps against. The returned `()` is the
 /// suite's held-alive context slot; the store owns its pool, and the per-test
 /// database is reclaimed when the whole cluster tears down at process exit.
-pub(crate) async fn fresh_pg_store() -> Result<(PostgresFactStore, ()), Box<dyn std::error::Error>>
-{
+pub async fn fresh_pg_store() -> Result<(PostgresFactStore, ()), PgHarnessError> {
     fresh_pg_store_with(None).await
 }
 
@@ -338,7 +371,7 @@ pub(crate) async fn fresh_pg_store() -> Result<(PostgresFactStore, ()), Box<dyn 
 /// shape of a database somebody pointed the fact store at by mistake, and it
 /// exercises the constructors the way a deployment reaches them, through a
 /// connection string rather than a handed-over pool.
-pub(crate) async fn fresh_unmigrated_database_url() -> Result<String, Box<dyn std::error::Error>> {
+pub async fn fresh_unmigrated_database_url() -> Result<String, PgHarnessError> {
     let cluster = shared_cluster().await?;
     let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dbname = format!("cf_bare_{n}");
@@ -359,21 +392,44 @@ pub(crate) async fn fresh_unmigrated_database_url() -> Result<String, Box<dyn st
     ))
 }
 
+/// The four values `default_transaction_isolation` takes. The type is that
+/// whole legal domain, so [`fresh_pg_store_at_default_isolation`] names a level
+/// by construction and no caller string reaches the DDL it builds.
+#[derive(Debug, Clone, Copy)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// The spelling `SET default_transaction_isolation` accepts.
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::ReadUncommitted => "read uncommitted",
+            Self::ReadCommitted => "read committed",
+            Self::RepeatableRead => "repeatable read",
+            Self::Serializable => "serializable",
+        }
+    }
+}
+
 /// Like [`fresh_pg_store`], but the per-test database carries a session default
 /// `default_transaction_isolation` of `iso`, so every connection the pool opens
 /// begins its transactions there unless a statement overrides them. Lets a test
 /// prove the write path pins its own isolation rather than riding the default.
-pub(crate) async fn fresh_pg_store_at_default_isolation(
-    iso: &str,
-) -> Result<(PostgresFactStore, ()), Box<dyn std::error::Error>> {
+pub async fn fresh_pg_store_at_default_isolation(
+    iso: IsolationLevel,
+) -> Result<(PostgresFactStore, ()), PgHarnessError> {
     fresh_pg_store_with(Some(iso)).await
 }
 
 /// Clone the migrated template into a fresh per-test database, optionally pin its
 /// session-default isolation, then build a store over a pool to the clone.
 async fn fresh_pg_store_with(
-    default_isolation: Option<&str>,
-) -> Result<(PostgresFactStore, ()), Box<dyn std::error::Error>> {
+    default_isolation: Option<IsolationLevel>,
+) -> Result<(PostgresFactStore, ()), PgHarnessError> {
     let cluster = shared_cluster().await?;
     let n = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dbname = format!("cf_test_{n}");
@@ -394,6 +450,7 @@ async fn fresh_pg_store_with(
     // session inherits it — the startup `options` packet can't carry it, because
     // a value like `repeatable read` has a space the `-c` parser splits on.
     if let Some(iso) = default_isolation {
+        let iso = iso.as_sql();
         sqlx::query(&format!(
             "ALTER DATABASE \"{dbname}\" SET default_transaction_isolation = '{iso}'"
         ))
@@ -405,6 +462,6 @@ async fn fresh_pg_store_with(
         })?;
     }
     close(admin).await;
-    let pool = connect_pool(&cluster.socket_path, &dbname, 5).await?;
+    let pool = connect_pool(&cluster.socket_path, &dbname).await?;
     Ok((PostgresFactStore::new(pool), ()))
 }
