@@ -1,4 +1,4 @@
-"""Load every exported ONNX model and check the baked constants fit it.
+"""Verify an ONNX export and write the manifest the crate loads against.
 
 Run inside the export derivation. `torch.onnx.export` exiting 0 says nothing
 about whether the artifacts are loadable: tensors past the 2 GB protobuf limit
@@ -68,34 +68,68 @@ for name in sorted(expected):
     for spec in sessions[name].get_outputs():
         print(f"  out  {spec.name:20s} {spec.type:16s} {spec.shape}")
 
-    # A sidecar is the crate's contract for a model whose shape it cannot infer
-    # (patch grid, prefix tokens, preprocessing), so it has to agree with the
-    # graph it describes or the crate indexes a tensor that is not there.
+    # A sidecar carries what a signature cannot state. Every number in one that
+    # the graph also knows must be listed in `graph_assertions`, naming the
+    # tensor and axis it came from, and the two are held to each other here.
+    # `graph_assertions: []` is the writer's claim that the sidecar restates
+    # nothing.
     sidecar = sub / f"{name}.json"
-    if sidecar.is_file():
-        try:
-            claims = json.loads(sidecar.read_text())
-        except ValueError as exc:
-            failures.append(f"{name}.json: unreadable: {exc}")
-            continue
-        (image,) = sessions[name].get_inputs()
-        (tokens,) = sessions[name].get_outputs()
-        for label, claimed, actual in (
-            ("resolution", claims["resolution"], image.shape[-1]),
-            ("sequence_length", claims["sequence_length"], tokens.shape[1]),
-            ("hidden_size", claims["hidden_size"], tokens.shape[2]),
-        ):
-            if claimed != actual:
-                failures.append(
-                    f"{name}.json claims {label}={claimed}, graph says {actual}"
-                )
-        grid = claims["patch_grid"]
-        if claims["prefix_tokens"] + grid[0] * grid[1] != claims["sequence_length"]:
+    if not sidecar.is_file():
+        failures.append(
+            f"{name}.json is missing; every model states what its signature "
+            "cannot, even if that is only an empty assertion list"
+        )
+        continue
+    try:
+        claims = json.loads(sidecar.read_text())
+    except ValueError as exc:
+        failures.append(f"{name}.json: unreadable: {exc}")
+        continue
+    if not isinstance(claims.get("graph_assertions"), list):
+        failures.append(
+            f"{name}.json needs a graph_assertions list; state [] if it "
+            "restates nothing the graph declares"
+        )
+        continue
+
+    by_name = {s.name: s for s in sessions[name].get_inputs()}
+    by_name.update({s.name: s for s in sessions[name].get_outputs()})
+    for assertion in claims["graph_assertions"]:
+        if not isinstance(assertion, dict) or not {
+            "claim",
+            "tensor",
+            "axis",
+        } <= assertion.keys():
             failures.append(
-                f"{name}.json: {claims['prefix_tokens']} prefix + {grid} patches "
-                f"does not sum to {claims['sequence_length']}"
+                f"{name}.json: malformed assertion {assertion!r}; needs "
+                "claim, tensor and axis"
             )
-        print(f"  sidecar agrees: {claims['resolution']}px, grid {grid}")
+            continue
+        claim, tensor, axis = (
+            assertion["claim"],
+            assertion["tensor"],
+            assertion["axis"],
+        )
+        if tensor not in by_name:
+            failures.append(f"{name}.json asserts against absent tensor {tensor!r}")
+            continue
+        if claim not in claims:
+            failures.append(f"{name}.json asserts {claim!r}, which it does not state")
+            continue
+        shape = by_name[tensor].shape
+        if not -len(shape) <= axis < len(shape):
+            failures.append(
+                f"{name}.json: axis {axis} is out of range for {tensor} {shape}"
+            )
+            continue
+        if claims[claim] != shape[axis]:
+            failures.append(
+                f"{name}.json claims {claim}={claims[claim]}, "
+                f"{tensor}{shape} axis {axis} says {shape[axis]}"
+            )
+    if claims["graph_assertions"]:
+        agreed = [a["claim"] for a in claims["graph_assertions"] if isinstance(a, dict)]
+        print(f"  sidecar agrees on {agreed}")
 
 # Anything left over is an export we did not expect and do not describe.
 produced = {p.name for p in root.iterdir() if p.is_dir()}
@@ -171,4 +205,41 @@ if failures:
         print(f"  {line}", file=sys.stderr)
     sys.exit(1)
 
+# One manifest per export, written only once everything above agrees, so the
+# crate never reads a description of an artifact that failed its own checks.
+# It carries the graph signatures plus the facts a signature cannot state: the
+# baked score threshold, the baked preprocessing, the patch grid, which
+# constants feed which decoder input.
+manifest = {"models": {}}
+for name, session in sorted(sessions.items()):
+    sub = root / name
+    (graph,) = sub.glob("*.onnx")
+    entry = {
+        "graph": str(graph.relative_to(root)),
+        "inputs": [
+            {"name": s.name, "dtype": s.type, "shape": s.shape}
+            for s in session.get_inputs()
+        ],
+        "outputs": [
+            {"name": s.name, "dtype": s.type, "shape": s.shape}
+            for s in session.get_outputs()
+        ],
+    }
+    sidecar = sub / f"{name}.json"
+    if sidecar.is_file():
+        entry["metadata"] = json.loads(sidecar.read_text())
+    manifest["models"][name] = entry
+
+if described is not None:
+    manifest["language_constants"] = {
+        "directory": CONSTANTS,
+        **described,
+    }
+    # Recorded because the encoder's remaining output is unreachable: the
+    # decoder never declared it and the model that produced it is gone.
+    manifest["language_constants"]["encoder_deleted"] = True
+
+(root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
 print(f"\nverified {len(sessions)} model(s): {sorted(sessions)}")
+print(f"wrote manifest.json describing {sorted(manifest['models'])}")

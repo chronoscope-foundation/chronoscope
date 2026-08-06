@@ -1,8 +1,10 @@
 diff --git a/samexporter/export_sam3.py b/samexporter/export_sam3.py
-index 5bccd90..5ed2496 100644
+index 5bccd90..6461d26 100644
 --- a/samexporter/export_sam3.py
 +++ b/samexporter/export_sam3.py
-@@ -2,59 +2,75 @@ import argparse
+@@ -1,60 +1,77 @@
+ import argparse
++import json
  import os
  import pathlib
  import sys
@@ -121,7 +123,7 @@ index 5bccd90..5ed2496 100644
      for child in module.children():
          get_replace_freqs_cis(child)
  
-@@ -172,23 +188,42 @@ class SAM3Decoder(torch.nn.Module):
+@@ -172,23 +189,53 @@ class SAM3Decoder(torch.nn.Module):
          return result["boxes"], result["scores"], result["masks"]
  
  
@@ -141,8 +143,18 @@ index 5bccd90..5ed2496 100644
 +        d.mkdir(parents=True, exist_ok=True)
 +        return d / f"sam3_{name}.onnx"
 +
++    def _record(name: str, facts: dict) -> None:
++        # Values the trace folds into a graph, written by the code that folded
++        # them, so a consumer reads the processor's actual settings.
++        path = output_dir / name / f"{name}.json"
++        path.write_text(json.dumps(facts, indent=2))
 +
-+    device = "cuda" if torch.cuda.is_available() else "cpu"
++    # sam3's fused addmm_act path runs when `mat1.is_cuda`, and
++    # `aten::_addmm_activation` has no ONNX symbolic, so a trace on a
++    # CUDA-visible machine fails outright. Pinning also keeps this derivation's
++    # contents independent of whether the builder has a GPU, so one store path
++    # holds one trace.
++    device = "cpu"
 +    model = build_sam3_image_model(device=device)
      # Replace complex RoPE buffers with float cos/sin – required for ONNX.
      get_replace_freqs_cis(model)
@@ -161,14 +173,47 @@ index 5bccd90..5ed2496 100644
      # ── Image Encoder ────────────────────────────────────────────────────────
      print("Exporting Image Encoder...")
      image_encoder = SAM3ImageEncoder(processor)
-     # Input: uint8 (3, 1008, 1008) – normalization is baked into the model.
-     dummy_image = torch.zeros(3, 1008, 1008, dtype=torch.uint8).to(device)
+-    # Input: uint8 (3, 1008, 1008) – normalization is baked into the model.
+-    dummy_image = torch.zeros(3, 1008, 1008, dtype=torch.uint8).to(device)
 -    encoder_path = output_dir / "sam3_image_encoder.onnx"
++    # Input: uint8 (3, N, N) – normalization is baked into the model.
++    resolution = processor.resolution
++    dummy_image = torch.zeros(3, resolution, resolution, dtype=torch.uint8).to(device)
 +    encoder_path = _model_path("image_encoder")
      torch.onnx.utils.export(
          image_encoder,
          args=(dummy_image,),
-@@ -211,7 +246,7 @@ def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
+@@ -206,12 +253,37 @@ def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
+         opset_version=opset,
+     )
+     print(f"Saved Image Encoder to {encoder_path}")
++    _record(
++        "image_encoder",
++        {
++            "graph_assertions": [
++                {"claim": "resolution", "tensor": "image", "axis": -1},
++            ],
++            "resolution": resolution,
++            "preprocessing": {
++                "normalization_baked_into_graph": True,
++                # Sam3Processor resizes with v2.Resize(size=(res, res)), which
++                # does not preserve aspect ratio. A caller that letterboxes
++                # instead feeds padding the model never saw, and box prompts
++                # land off the objects they were meant to select. Under a pure
++                # stretch, normalized cxcywh is invariant between the source
++                # frame and this one, so box_coords pass through unchanged.
++                "caller_resize": {
++                    "mode": "stretch",
++                    "preserves_aspect_ratio": False,
++                    "channel_order": "rgb",
++                    "layout": "chw",
++                    "target": [resolution, resolution],
++                },
++            },
++        },
++    )
+ 
+     # ── Language Encoder ─────────────────────────────────────────────────────
      print("Exporting Language Encoder...")
      language_encoder = SAM3LanguageEncoder(processor)
      dummy_tokens = torch.zeros(1, 32, dtype=torch.long).to(device)
@@ -177,7 +222,7 @@ index 5bccd90..5ed2496 100644
      torch.onnx.utils.export(
          language_encoder,
          args=(dummy_tokens,),
-@@ -232,7 +267,7 @@ def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
+@@ -232,7 +304,7 @@ def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
      # ── Decoder ──────────────────────────────────────────────────────────────
      print("Exporting Decoder...")
      decoder = SAM3Decoder(model, processor)
@@ -186,3 +231,21 @@ index 5bccd90..5ed2496 100644
  
      box_coords = torch.zeros(1, 1, 4).to(device)
      box_labels = torch.ones(1, 1, dtype=torch.long).to(device)
+@@ -281,6 +353,17 @@ def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
+         opset_version=opset,
+     )
+     print(f"Saved Decoder to {decoder_path}")
++    _record(
++        "decoder",
++        {
++            # Nothing here restates a graph dimension.
++            "graph_assertions": [],
++            # Folded in at trace time by `keep = out_probs > threshold`, so it
++            # cannot be changed at load. A consumer applying its own threshold
++            # is redundant below this value and has no effect above it.
++            "confidence_threshold": processor.confidence_threshold,
++        },
++    )
+ 
+     # ── Simplify models conditionally ─────────────────────────────────────────
+     if simplify_model:

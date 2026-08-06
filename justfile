@@ -743,9 +743,12 @@ fetch-corpus:
     nix build .#corpus-images --no-link
     echo "Done. Corpus images will be pinned as GC roots on next analysis shell entry."
 
-# Fetch everything: model weights + corpus images.
+# Fetch the network-dependent inputs: model weights + corpus images.
 # Single nix build so all FODs fetch in parallel (different hosts —
 # HF, corpus URLs — so concurrency is a clean win).
+#
+# The ONNX exports are downstream of these and cost minutes of compute rather
+# than bandwidth, so they live in `fetch-models` and are not swept in here.
 fetch-all:
     #!/usr/bin/env bash
     set -euo pipefail

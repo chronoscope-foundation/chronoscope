@@ -69,6 +69,7 @@ OpenAPI client regen, corpus FOD layout, HF cache layout, etc.).
 
 ```bash
 HF_TOKEN=hf_... just fetch-weights        # ~2GB model weights (gated repos; needs HF token)
+just fetch-models [dinov3_resolution]      # ONNX exports the vision crate loads (224 or 448)
 just fetch-corpus                          # corpus images from external URLs
 just fetch-all                             # weights + corpus
 just fetch-wikidata                        # build+pin the architectural-entities set (bulk ingestion source)

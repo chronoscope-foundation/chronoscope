@@ -30,6 +30,18 @@ from transformers import AutoModel
 
 OPSET = 18
 
+# PIL resampling filters, by the code `preprocessor_config.json` stores. Naming
+# the filter without deriving it from the code lets a checkpoint change one and
+# leave the sidecar asserting the other.
+PIL_RESAMPLE = {
+    0: "nearest",
+    1: "lanczos",
+    2: "bilinear",
+    3: "bicubic",
+    4: "box",
+    5: "hamming",
+}
+
 # fp32 ViT-L over 24 layers; ONNX and torch accumulate differently, but a
 # mis-traced graph diverges by far more than this.
 TOLERANCE = 1e-3
@@ -38,9 +50,21 @@ model_dir, out_root = Path(sys.argv[1]), Path(sys.argv[2])
 config = json.loads((model_dir / "config.json").read_text())
 preprocess = json.loads((model_dir / "preprocessor_config.json").read_text())
 
-if preprocess["size"]["width"] != preprocess["size"]["height"]:
-    sys.exit(f"expected a square input, got {preprocess['size']}")
-resolution = int(sys.argv[3]) if len(sys.argv) > 3 else preprocess["size"]["height"]
+if len(sys.argv) > 3:
+    resolution = int(sys.argv[3])
+else:
+    # Only consulted as a fallback. HF also spells this `{"shortest_edge": N}`,
+    # which this export has no square interpretation for.
+    size = preprocess["size"]
+    if {"width", "height"} - size.keys():
+        sys.exit(f"no square default resolution in {size}; pass one explicitly")
+    if size["width"] != size["height"]:
+        sys.exit(f"default resolution {size} is not square; pass one explicitly")
+    resolution = size["height"]
+
+interpolation = PIL_RESAMPLE.get(preprocess["resample"])
+if interpolation is None:
+    sys.exit(f"unrecognized PIL resample code {preprocess['resample']}")
 
 patch = config["patch_size"]
 if resolution % patch:
@@ -128,6 +152,17 @@ if not np.isfinite(drift) or drift > TOLERANCE:
 (out_dir / "dinov3.json").write_text(
     json.dumps(
         {
+            # Where each number below also appears in the graph, so the
+            # verifier can hold the two to each other.
+            "graph_assertions": [
+                {"claim": "resolution", "tensor": "image", "axis": -1},
+                {
+                    "claim": "sequence_length",
+                    "tensor": "last_hidden_state",
+                    "axis": 1,
+                },
+                {"claim": "hidden_size", "tensor": "last_hidden_state", "axis": 2},
+            ],
             "resolution": resolution,
             "patch_size": patch,
             "patch_grid": [patch_grid, patch_grid],
@@ -144,7 +179,7 @@ if not np.isfinite(drift) or drift > TOLERANCE:
                 # and converts to RGB; nearest-neighbour or BGR here produces
                 # embeddings that look fine and are wrong.
                 "caller_resize": {
-                    "interpolation": "bilinear",
+                    "interpolation": interpolation,
                     "pil_resample_code": preprocess["resample"],
                     "antialias": True,
                     "channel_order": "rgb",

@@ -12,6 +12,7 @@ Nix build infrastructure. One derivation module per project area;
 | `openapi.nix`   | OpenAPI `spec`, ChronoscopeAPI SwiftPM package, store-path-spliced xcodegen `projectSpec` |
 | `web.nix`       | WASM build pipeline + wasm `web-build`/`web-test-build`/`web-clippy` and host `web-native-test`/`web-native-clippy` checks |
 | `python.nix`    | `analysisEnv`, model weight FODs, triton checks     |
+| `vision.nix`    | Patched sam3/samexporter packages, the ONNX export derivations and their manifests |
 | `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |
 | `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL → SQLite facts DBs) |
 | `oci.nix`       | nix2container image for the API server (Cloud Run) + the check that boots its entrypoint, Linux systems only |

@@ -1,5 +1,5 @@
 diff --git a/sam3/model/decoder.py b/sam3/model/decoder.py
-index 578a2bf..fa8b07a 100644
+index 578a2bf..1dc5cab 100644
 --- a/sam3/model/decoder.py
 +++ b/sam3/model/decoder.py
 @@ -298,7 +298,9 @@ class TransformerDecoder(nn.Module):
@@ -13,6 +13,21 @@ index 578a2bf..fa8b07a 100644
                  )
                  self.compilable_cord_cache = (coords_h, coords_w)
                  self.compilable_stored_size = (feat_size, feat_size)
+@@ -362,6 +364,14 @@ class TransformerDecoder(nn.Module):
+         ):
+             # good, hitting the cache, will be compilable
+             coords_h, coords_w = self.compilable_cord_cache
++            # A plain attribute, so nn.Module._apply never moves it and
++            # `model.to(device)` leaves it where it was built. Precompute now
++            # happens on CPU when CUDA is absent, so a later move would
++            # otherwise feed CPU coords into an accelerator graph.
++            if coords_h.device != reference_boxes.device:
++                coords_h = coords_h.to(reference_boxes.device)
++                coords_w = coords_w.to(reference_boxes.device)
++                self.compilable_cord_cache = (coords_h, coords_w)
+         else:
+             # cache miss, will create compilation issue
+             # In case we're not compiling, we'll still rely on the dict-based cache
 diff --git a/sam3/model/geometry_encoders.py b/sam3/model/geometry_encoders.py
 index f86cc97..cd69a9f 100644
 --- a/sam3/model/geometry_encoders.py
