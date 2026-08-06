@@ -703,18 +703,35 @@ fetch-weights:
 # Build the ONNX exports the vision crate loads, and pin them as GC roots.
 # Downstream of the weight FODs, so `fetch-weights` (and its HF_TOKEN
 # requirement) comes first. The export itself is pure: no token, no network.
-fetch-models: fetch-weights
+#
+# DINOv3's resolution sets the patch grid masked pooling reads from; see
+# `packages.dinov3-onnx-*` for the variants that exist.
+fetch-models dinov3_resolution="224": fetch-weights
     #!/usr/bin/env bash
     set -euo pipefail
     {{ _ensure_nix }}
     _ensure_nix
-    echo "==> Exporting SAM 3 to ONNX (several minutes on first build)..."
+    # Fail before the long export rather than with a bare "attribute not found".
+    case "{{ dinov3_resolution }}" in
+        224|448) ;;
+        *) echo "unknown dinov3 resolution: {{ dinov3_resolution }}" >&2
+           echo "valid: 224, 448 (add a variant in flake.nix to extend)" >&2
+           exit 1 ;;
+    esac
+    echo "==> Exporting models to ONNX (several minutes on first build)..."
     # --out-link pins the GC root; --print-out-paths reports the store path the
     # crate should read. Never read .nix-gc-roots/ itself — it is a keep-alive,
     # not a dependency handle.
     sam3_onnx="$(nix build .#sam3-onnx \
         --out-link .nix-gc-roots/sam3-onnx --print-out-paths)"
+    # One root per resolution: a shared name would move off the previous export
+    # and let the next `nix store gc` reclaim a multi-minute build that the
+    # printed DINOV3_ONNX_DIR still points at.
+    dinov3_onnx="$(nix build .#dinov3-onnx-{{ dinov3_resolution }} \
+        --out-link .nix-gc-roots/dinov3-onnx-{{ dinov3_resolution }} \
+        --print-out-paths)"
     echo "SAM3_ONNX_DIR=$sam3_onnx"
+    echo "DINOV3_ONNX_DIR=$dinov3_onnx"
 
 # Fetch corpus images from external URLs.
 fetch-corpus:

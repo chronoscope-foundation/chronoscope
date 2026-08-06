@@ -8,6 +8,7 @@
   pkgs,
   lib,
   sam3Cache,
+  dinov3Repo,
 }:
 
 let
@@ -154,6 +155,9 @@ let
     ps.onnxscript
     ps.pycocotools
     ps.setuptools
+    # DINOv3 loads through transformers; the nixpkgs pin is chosen partly for
+    # its version, since dinov3_vit needs >= 4.56 (see flake.nix).
+    ps.transformers
     sam3
     samexporter
   ]);
@@ -196,7 +200,31 @@ let
         # the corruption this guards against is silent and surfaces hours later
         # in whatever consumes them. Loading is also the only contract the Rust
         # side has with this derivation, so it is what the build should assert.
-        python ${./scripts/verify-onnx.py} "$out" image_encoder decoder
+        python ${./scripts/verify-onnx.py} "$out" \
+          image_encoder decoder language_constants
+      '';
+
+  # DINOv3 has no exporter to lean on, so the graph is ours. Preprocessing is
+  # baked in because the Rust side has no AutoImageProcessor to reproduce it.
+  #
+  # Resolution is the parameter because it is the only lever on patch-grid
+  # density, and the grid is what masked pooling reads: 224px gives 14x14, so an
+  # entity covering 5% of the frame lands on ~10 patches. Patch size is the
+  # 16x16 kernel of the patch-embedding conv and belongs to the checkpoint.
+  # Cost is linear in tokens, roughly 3.4x from 224 to 448.
+  mkDinov3Onnx =
+    resolution:
+    pkgs.runCommand "dinov3-onnx-${toString resolution}"
+      {
+        nativeBuildInputs = [ exportEnv ];
+        HF_HUB_OFFLINE = "1";
+        SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+      }
+      ''
+        export HOME="$TMPDIR"
+        mkdir -p "$out"
+        python ${./scripts/export-dinov3.py} ${dinov3Repo} "$out" ${toString resolution}
+        python ${./scripts/verify-onnx.py} "$out" dinov3
       '';
 in
 {
@@ -205,5 +233,6 @@ in
     samexporter
     exportEnv
     sam3Onnx
+    mkDinov3Onnx
     ;
 }

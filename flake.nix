@@ -219,7 +219,7 @@
 
         vision = import ./nix/vision.nix {
           inherit pkgs lib;
-          inherit (pythonEnvs) sam3Cache;
+          inherit (pythonEnvs) sam3Cache dinov3Repo;
         };
 
         corpus = import ./nix/corpus.nix {
@@ -555,6 +555,12 @@
             # lacks them, which a pure `nix flake check` cannot supply.
             sam3-onnx = vision.sam3Onnx;
             vision-export-env = vision.exportEnv;
+
+            # Resolution sets the patch grid masked pooling reads from, and
+            # which one the region embeddings want is an empirical question the
+            # crate answers against real images. Adding a variant is one line.
+            dinov3-onnx-224 = vision.mkDinov3Onnx 224;
+            dinov3-onnx-448 = vision.mkDinov3Onnx 448;
 
             wikidata-curated-entities = wikidata.bundles.curated.entities;
 

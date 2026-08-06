@@ -30,8 +30,14 @@ ONNX_TO_NUMPY = {
     "tensor(uint8)": "uint8",
 }
 
+CONSTANTS = "language_constants"
+
 root = Path(sys.argv[1])
+# Callers name everything the export should contain. `language_constants` is a
+# directory of baked tensors rather than a graph, so it is checked differently.
 expected = set(sys.argv[2:])
+expect_constants = CONSTANTS in expected
+expected.discard(CONSTANTS)
 
 # CPU explicitly. ORT's default provider list puts CoreML first on darwin, and
 # CoreML rejects any model using external data, which is every model here; the
@@ -62,23 +68,53 @@ for name in sorted(expected):
     for spec in sessions[name].get_outputs():
         print(f"  out  {spec.name:20s} {spec.type:16s} {spec.shape}")
 
+    # A sidecar is the crate's contract for a model whose shape it cannot infer
+    # (patch grid, prefix tokens, preprocessing), so it has to agree with the
+    # graph it describes or the crate indexes a tensor that is not there.
+    sidecar = sub / f"{name}.json"
+    if sidecar.is_file():
+        try:
+            claims = json.loads(sidecar.read_text())
+        except ValueError as exc:
+            failures.append(f"{name}.json: unreadable: {exc}")
+            continue
+        (image,) = sessions[name].get_inputs()
+        (tokens,) = sessions[name].get_outputs()
+        for label, claimed, actual in (
+            ("resolution", claims["resolution"], image.shape[-1]),
+            ("sequence_length", claims["sequence_length"], tokens.shape[1]),
+            ("hidden_size", claims["hidden_size"], tokens.shape[2]),
+        ):
+            if claimed != actual:
+                failures.append(
+                    f"{name}.json claims {label}={claimed}, graph says {actual}"
+                )
+        grid = claims["patch_grid"]
+        if claims["prefix_tokens"] + grid[0] * grid[1] != claims["sequence_length"]:
+            failures.append(
+                f"{name}.json: {claims['prefix_tokens']} prefix + {grid} patches "
+                f"does not sum to {claims['sequence_length']}"
+            )
+        print(f"  sidecar agrees: {claims['resolution']}px, grid {grid}")
+
 # Anything left over is an export we did not expect and do not describe.
 produced = {p.name for p in root.iterdir() if p.is_dir()}
-for unexpected in sorted(produced - expected - {"language_constants"}):
+for unexpected in sorted(produced - expected - {CONSTANTS}):
     failures.append(f"{unexpected}: unexpected directory in the export output")
 
-# The derivation always bakes, so a missing directory means the bake step
-# silently did nothing.
-constants_dir = root / "language_constants"
+constants_dir = root / CONSTANTS
 described = None
-if not constants_dir.is_dir():
-    failures.append("language_constants/: missing; the bake step did not run")
-else:
-    manifest = constants_dir / "language_constants.json"
-    try:
-        described = json.loads(manifest.read_text())
-    except (OSError, ValueError) as exc:
-        failures.append(f"language_constants.json: unreadable: {exc}")
+if expect_constants:
+    if not constants_dir.is_dir():
+        failures.append(f"{CONSTANTS}/: missing; the bake step did not run")
+    else:
+        manifest = constants_dir / "language_constants.json"
+        try:
+            described = json.loads(manifest.read_text())
+        except (OSError, ValueError) as exc:
+            failures.append(f"language_constants.json: unreadable: {exc}")
+elif constants_dir.is_dir():
+    failures.append(f"{CONSTANTS}/: present but the caller did not expect it")
 
 if described is not None:
     decoder = sessions.get("decoder")
