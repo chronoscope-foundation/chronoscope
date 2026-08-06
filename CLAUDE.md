@@ -148,7 +148,7 @@ just check                  # everything incl. browser tests — the commit gate
 just check rust             # workspace fmt + clippy + rustdoc + test + coverage
 just check web              # WASM build + browser-test build + wasm clippy
                             #   (browser tests run ONLY in the full `just check`)
-just check triton           # Python ruff + mypy + pytest
+just check triton           # Python ruff + mypy (pytest is `just test triton`)
 just check nix              # Nix lint (nixfmt + statix + deadnix)
 just check linux            # x86_64-linux: container boot + workspace suite
                             #   (needs a Linux builder; not part of the gate)

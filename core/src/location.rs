@@ -1995,14 +1995,6 @@ mod tests {
 
     // --- denotes_empty: geometric emptiness ---
 
-    /// A dense sampling oracle for emptiness, evaluated with the WGS84
-    /// [`Location::covers`] — the actual denotation, independent of
-    /// `denotes_empty`'s candidate routine. The feasible region, if any, sits
-    /// inside some cap, so fan a geodesic point cloud over each cap's own
-    /// neighborhood; the region is non-empty iff some sampled point is covered.
-    /// Sampling by geodesic offset (not a lat/lon box) keeps the cloud even at
-    /// every latitude, so a high-latitude or seam-straddling region isn't
-    /// under-sampled by a `cos(lat)`-compressed longitude span.
     /// Rings and spokes the emptiness oracle fans over each cap, so the sample
     /// count is `GRID_STEPS²` per cap.
     ///
@@ -2021,6 +2013,14 @@ mod tests {
     /// boundary, where the feasible region shrinks toward a point.
     const GRID_STEPS: usize = 50;
 
+    /// A dense sampling oracle for emptiness, evaluated with the WGS84
+    /// [`Location::covers`] — the actual denotation, independent of
+    /// `denotes_empty`'s candidate routine. The feasible region, if any, sits
+    /// inside some cap, so fan a geodesic point cloud over each cap's own
+    /// neighborhood; the region is non-empty iff some sampled point is covered.
+    /// Sampling by geodesic offset (not a lat/lon box) keeps the cloud even at
+    /// every latitude, so a high-latitude or seam-straddling region isn't
+    /// under-sampled by a `cos(lat)`-compressed longitude span.
     fn samples_empty(loc: &Location, grid_steps: usize) -> bool {
         match loc {
             Location::Empty => return true,
