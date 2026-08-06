@@ -217,6 +217,11 @@
 
         pythonEnvs = import ./nix/python.nix { inherit pkgs lib; };
 
+        vision = import ./nix/vision.nix {
+          inherit pkgs lib;
+          inherit (pythonEnvs) sam3Cache;
+        };
+
         corpus = import ./nix/corpus.nix {
           inherit
             pkgs
@@ -544,6 +549,12 @@
             # Model weights — built with --impure and HF_TOKEN to populate store.
             dinov3-weights = pythonEnvs.dinov3Repo;
             sam3-weights = pythonEnvs.sam3Cache;
+
+            # ONNX exports. Packages, not checks: multi-gigabyte, and the
+            # weight FODs they consume need HF_TOKEN on a machine whose store
+            # lacks them, which a pure `nix flake check` cannot supply.
+            sam3-onnx = vision.sam3Onnx;
+            vision-export-env = vision.exportEnv;
 
             wikidata-curated-entities = wikidata.bundles.curated.entities;
 

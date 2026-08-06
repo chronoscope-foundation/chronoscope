@@ -700,6 +700,22 @@ fetch-weights:
     nix build .#sam3-weights --impure --no-link
     echo "Done. Weights will be pinned as GC roots on next analysis/triton shell entry."
 
+# Build the ONNX exports the vision crate loads, and pin them as GC roots.
+# Downstream of the weight FODs, so `fetch-weights` (and its HF_TOKEN
+# requirement) comes first. The export itself is pure: no token, no network.
+fetch-models: fetch-weights
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    _ensure_nix
+    echo "==> Exporting SAM 3 to ONNX (several minutes on first build)..."
+    # --out-link pins the GC root; --print-out-paths reports the store path the
+    # crate should read. Never read .nix-gc-roots/ itself — it is a keep-alive,
+    # not a dependency handle.
+    sam3_onnx="$(nix build .#sam3-onnx \
+        --out-link .nix-gc-roots/sam3-onnx --print-out-paths)"
+    echo "SAM3_ONNX_DIR=$sam3_onnx"
+
 # Fetch corpus images from external URLs.
 fetch-corpus:
     #!/usr/bin/env bash

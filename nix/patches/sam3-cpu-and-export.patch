@@ -1,0 +1,134 @@
+diff --git a/sam3/model/decoder.py b/sam3/model/decoder.py
+index 578a2bf..fa8b07a 100644
+--- a/sam3/model/decoder.py
++++ b/sam3/model/decoder.py
+@@ -298,7 +298,9 @@ class TransformerDecoder(nn.Module):
+             if resolution is not None and stride is not None:
+                 feat_size = resolution // stride
+                 coords_h, coords_w = self._get_coords(
+-                    feat_size, feat_size, device="cuda"
++                    feat_size,
++                    feat_size,
++                    device="cuda" if torch.cuda.is_available() else "cpu",
+                 )
+                 self.compilable_cord_cache = (coords_h, coords_w)
+                 self.compilable_stored_size = (feat_size, feat_size)
+diff --git a/sam3/model/geometry_encoders.py b/sam3/model/geometry_encoders.py
+index f86cc97..cd69a9f 100644
+--- a/sam3/model/geometry_encoders.py
++++ b/sam3/model/geometry_encoders.py
+@@ -648,7 +648,15 @@ class SequenceGeometryEncoder(nn.Module):
+             # We need to denormalize, and convert to [x, y, x, y]
+             boxes_xyxy = box_cxcywh_to_xyxy(boxes)
+             scale = torch.tensor([W, H, W, H], dtype=boxes_xyxy.dtype)
+-            scale = scale.pin_memory().to(device=boxes_xyxy.device, non_blocking=True)
++            # pin_memory() pins against whatever accelerator torch found; on a
++            # darwin box that is MPS, and the resulting storage cannot be moved
++            # onto a CPU tensor. Pinning only pays off for an async H2D copy.
++            if boxes_xyxy.is_cuda:
++                scale = scale.pin_memory().to(
++                    device=boxes_xyxy.device, non_blocking=True
++                )
++            else:
++                scale = scale.to(device=boxes_xyxy.device)
+             scale = scale.view(1, 1, 4)
+             boxes_xyxy = boxes_xyxy * scale
+             sampled = torchvision.ops.roi_align(
+diff --git a/sam3/model/position_encoding.py b/sam3/model/position_encoding.py
+index f38c62b..f52e324 100644
+--- a/sam3/model/position_encoding.py
++++ b/sam3/model/position_encoding.py
+@@ -52,7 +52,8 @@ class PositionEmbeddingSine(nn.Module):
+                 (precompute_resolution // 32, precompute_resolution // 32),
+             ]
+             for size in precompute_sizes:
+-                tensors = torch.zeros((1, 1) + size, device="cuda")
++                _dev = "cuda" if torch.cuda.is_available() else "cpu"
++                tensors = torch.zeros((1, 1) + size, device=_dev)
+                 self.forward(tensors)
+                 # further clone and detach it in the cache (just to be safe)
+                 self.cache[size] = self.cache[size].clone().detach()
+@@ -98,7 +99,15 @@ class PositionEmbeddingSine(nn.Module):
+         cache_key = None
+         cache_key = (x.shape[-2], x.shape[-1])
+         if cache_key in self.cache:
+-            return self.cache[cache_key][None].repeat(x.shape[0], 1, 1, 1)
++            # self.cache is a plain dict, so nn.Module._apply never moves it and
++            # `model.to(device)` leaves these entries wherever they were built.
++            # Precompute now happens on CPU when CUDA is absent, so without this
++            # a later .to("mps") would feed CPU tensors into an MPS graph.
++            cached = self.cache[cache_key]
++            if cached.device != x.device:
++                cached = cached.to(x.device)
++                self.cache[cache_key] = cached
++            return cached[None].repeat(x.shape[0], 1, 1, 1)
+         y_embed = (
+             torch.arange(1, x.shape[-2] + 1, dtype=torch.float32, device=x.device)
+             .view(1, -1, 1)
+diff --git a/sam3/model/sam3_tracker_utils.py b/sam3/model/sam3_tracker_utils.py
+index 7b6047e..c22e2a1 100644
+--- a/sam3/model/sam3_tracker_utils.py
++++ b/sam3/model/sam3_tracker_utils.py
+@@ -6,7 +6,6 @@ import numpy as np
+ import torch
+ import torch.nn.functional as F
+ from numpy.typing import NDArray
+-from sam3.model.edt import edt_triton
+ 
+ 
+ def sample_box_points(
+@@ -178,6 +177,11 @@ def sample_one_point_from_error_center(gt_masks, pred_masks, padding=True):
+         padded_fp_masks = fp_masks
+         padded_fn_masks = fn_masks
+ 
++    # Imported here rather than at module scope: edt applies @triton.jit at import
++    # time and triton has no macOS build, so a module-level import breaks `import
++    # sam3` entirely. Only this video-tracking path needs it.
++    from sam3.model.edt import edt_triton
++
+     fn_mask_dt = edt_triton(padded_fn_masks)
+     fp_mask_dt = edt_triton(padded_fp_masks)
+     if padding:
+diff --git a/sam3/perflib/fused.py b/sam3/perflib/fused.py
+index 6800cca..64e6970 100644
+--- a/sam3/perflib/fused.py
++++ b/sam3/perflib/fused.py
+@@ -12,14 +12,29 @@ def addmm_act(activation, linear, mat1):
+         raise ValueError("Expected grad to be disabled.")
+     self = linear.bias.detach()
+     mat2 = linear.weight.detach()
+-    self = self.to(torch.bfloat16)
+-    mat1 = mat1.to(torch.bfloat16)
+-    mat2 = mat2.to(torch.bfloat16)
++    # bf16 here is a CUDA fast path that assumes the surrounding bf16 autocast
++    # context. Off CUDA there is no autocast, so forcing bf16 hands a bf16
++    # activation to the next fp32 nn.Linear and the matmul rejects it.
++    compute_dtype = torch.bfloat16 if mat1.is_cuda else mat1.dtype
++    self = self.to(compute_dtype)
++    mat1 = mat1.to(compute_dtype)
++    mat2 = mat2.to(compute_dtype)
+     mat1_flat = mat1.view(-1, mat1.shape[-1])
+     if activation in [torch.nn.functional.relu, torch.nn.ReLU]:
+-        y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=False)
+-        return y.view(mat1.shape[:-1] + (y.shape[-1],))
+-    if activation in [torch.nn.functional.gelu, torch.nn.GELU]:
+-        y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=True)
+-        return y.view(mat1.shape[:-1] + (y.shape[-1],))
+-    raise ValueError(f"Unexpected activation {activation}")
++        use_gelu = False
++    elif activation in [torch.nn.functional.gelu, torch.nn.GELU]:
++        use_gelu = True
++    else:
++        raise ValueError(f"Unexpected activation {activation}")
++
++    # aten::_addmm_activation is a fused CUDA kernel with no ONNX symbolic
++    # ("Exporting the operator 'aten::_addmm_activation' to ONNX opset 18 is
++    # not supported"), so off CUDA use the equivalent unfused ops.
++    if mat1.is_cuda:
++        y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=use_gelu)
++    else:
++        # exact erf gelu: _addmm_activation's CPU kernel matches it bit for bit,
++        # the tanh approximation is off by ~5e-4.
++        y = torch.nn.functional.linear(mat1_flat, mat2, self)
++        y = torch.nn.functional.gelu(y) if use_gelu else torch.nn.functional.relu(y)
++    return y.view(mat1.shape[:-1] + (y.shape[-1],))
