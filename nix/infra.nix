@@ -34,6 +34,7 @@ let
     orgpolicy = "orgpolicy.googleapis.com";
     run = "run.googleapis.com";
     secretmanager = "secretmanager.googleapis.com";
+    sqladmin = "sqladmin.googleapis.com";
   };
 
   # WebAuthn binds a credential to the origin that created it, so a server told
@@ -144,6 +145,167 @@ let
         secret_id = "\${google_secret_manager_secret.jwt.secret_id}";
         role = "roles/secretmanager.secretAccessor";
         member = "serviceAccount:\${google_service_account.api.email}";
+      };
+
+      # Everything the API serves comes out of here, so the instance is sized
+      # for what serving costs: a recursive retraction CTE per tile request, and
+      # GiST index maintenance in whatever heap is left while a load runs. The
+      # shared-core tier below this one offers 0.6 GB for both and caps
+      # connections under what a service and a load hold open together.
+      google_sql_database_instance.primary = {
+        inherit (settings) project region;
+        name = settings.sqlInstance;
+
+        # What `postgres-smoke` and `api-postgres` bring up: flake.nix's
+        # postgresWithPostgis is this same major, so a query the gate exercised
+        # meets the planner it will meet here. The two move together.
+        database_version = "POSTGRES_18";
+
+        # The Cloud Run service turns this off because its declaration describes
+        # it completely and it keeps nothing. Both halves fail here: this holds
+        # every submit anyone has made, and nothing in the repository can
+        # reproduce them. Terraform reads the flag out of *state* when it decides
+        # whether it may destroy, so clearing it is an apply of its own, ahead of
+        # any apply that would.
+        deletion_protection = true;
+
+        settings = {
+          tier = "db-g1-small";
+
+          # Storage only ever grows, so this asks for what the curated set needs
+          # and lets a larger load extend it unattended.
+          disk_type = "PD_SSD";
+          disk_size = 10;
+          disk_autoresize = true;
+
+          # Nothing on the internet may open a database session here. REQUIRED
+          # admits only the Cloud SQL Auth Proxy and the language connectors,
+          # which prove `cloudsql.instances.connect` against the Admin API
+          # before the handshake, so admission is an IAM decision. Cloud Run's
+          # built-in /cloudsql socket is exactly that proxy, and
+          # authorized_networks stays empty because the proxy never consulted
+          # it.
+          connector_enforcement = "REQUIRED";
+
+          # The public address it refuses on is still allocated and still
+          # completes a TCP connection, so the instance is reachable and
+          # rejecting. Unreachable is a private IP, and that brings a VPC, a
+          # reserved peering range, a service-networking connection and Direct
+          # VPC egress on the service: four networking components in front of a
+          # database with one client. Weighed at that price, and deferred.
+          ip_configuration.ipv4_enabled = true;
+
+          # Lets a connection authenticate as an IAM principal, which is what
+          # makes the server's credential a short-lived access token and leaves
+          # no password anywhere to store or rotate.
+          database_flags = [
+            {
+              name = "cloudsql.iam_authentication";
+              value = "on";
+            }
+          ];
+
+          # A corpus a job can rebuild needs no backups, and the first user
+          # submit ends that. Point-in-time recovery is what puts a bad write
+          # inside a window someone can wind back out of.
+          backup_configuration = {
+            enabled = true;
+            point_in_time_recovery_enabled = true;
+            # UTC, and early enough that the backup window has closed before
+            # maintenance opens below.
+            start_time = "04:00";
+          };
+
+          # Pinned to a known hour because shared-core carries no SLA and
+          # maintenance restarts the instance. Cloud Run holds no warm instance,
+          # so a request arriving in the window meets a cold start whose
+          # `connect` fails, spending the startup probe's budget.
+          maintenance_window = {
+            day = 7;
+            hour = 9;
+            update_track = "stable";
+          };
+        };
+
+        # The race the registry above names: nothing in these arguments
+        # mentions the API, so the first apply would reach it unenabled.
+        depends_on = [ "google_project_service.sqladmin" ];
+      };
+
+      # An instance carries several databases and a DSN selects one; this is
+      # where this deployment's data lives. Named for the deployment, since the
+      # fact store is its first tenant and the app's own state lands beside it.
+      google_sql_database.chronoscope = {
+        inherit (settings) project;
+        name = settings.sqlDatabase;
+        instance = "\${google_sql_database_instance.primary.name}";
+      };
+
+      # The loader's identity, held apart from the API's because the two want
+      # different power over the database. This one runs as a job, builds the
+      # schema and exits; the API's serves the internet for as long as a
+      # revision lives.
+      google_service_account.loader = {
+        inherit (settings) project;
+        account_id = "chronoscope-facts-loader";
+        display_name = "Chronoscope fact store loader";
+      };
+
+      # Postgres sees a service account as its email with `.gserviceaccount.com`
+      # trimmed off, and that is the username each connection URL carries; taken
+      # from the accounts here so the two spellings cannot drift.
+      #
+      # The database role is what separates them. The loader creates the PostGIS
+      # extension, which on Cloud SQL only a member of `cloudsqlsuperuser` may
+      # do, and it owns the schema it migrates; the field grants that at user
+      # creation, so no password and no privileged session is involved. The
+      # server reads and appends, and it is the process the internet reaches, so
+      # it holds the default role here and takes its privileges from grants the
+      # loader issues after migrating.
+      google_sql_user.api = {
+        inherit (settings) project;
+        instance = "\${google_sql_database_instance.primary.name}";
+        name = "\${trimsuffix(google_service_account.api.email, \".gserviceaccount.com\")}";
+        type = "CLOUD_IAM_SERVICE_ACCOUNT";
+      };
+
+      google_sql_user.loader = {
+        inherit (settings) project;
+        instance = "\${google_sql_database_instance.primary.name}";
+        name = "\${trimsuffix(google_service_account.loader.email, \".gserviceaccount.com\")}";
+        type = "CLOUD_IAM_SERVICE_ACCOUNT";
+        database_roles = [ "cloudsqlsuperuser" ];
+      };
+
+      # Reaching the instance and logging in to it are separate grants: `client`
+      # admits the connection, `instanceUser` is what makes an access token
+      # stand for this identity at the handshake. Both identities dial the same
+      # way, so both carry both; the split between them lives in the database
+      # role above.
+      google_project_iam_member = {
+        api_cloudsql_client = {
+          inherit (settings) project;
+          role = "roles/cloudsql.client";
+          member = "serviceAccount:\${google_service_account.api.email}";
+        };
+
+        api_cloudsql_instance_user = {
+          inherit (settings) project;
+          role = "roles/cloudsql.instanceUser";
+          member = "serviceAccount:\${google_service_account.api.email}";
+        };
+
+        loader_cloudsql_client = {
+          inherit (settings) project;
+          role = "roles/cloudsql.client";
+          member = "serviceAccount:\${google_service_account.loader.email}";
+        };
+
+        loader_cloudsql_instance_user = {
+          inherit (settings) project;
+          role = "roles/cloudsql.instanceUser";
+          member = "serviceAccount:\${google_service_account.loader.email}";
+        };
       };
 
       google_cloud_run_v2_service.api = {

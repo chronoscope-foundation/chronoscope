@@ -28,6 +28,13 @@
   # account and the JWT secret, which exist only to serve it.
   cloudRunService = "chronoscope-api";
 
+  # The Cloud SQL instance, and the database on it holding this deployment's
+  # data. The instance name is the last field of the connection name a client
+  # dials (`project:region:instance`); the database name is what the DSN
+  # selects, and an instance holds more than one of them.
+  sqlInstance = "chronoscope-db";
+  sqlDatabase = "chronoscope";
+
   # The Cloudflare account holding the zone, and the zone `organization` is
   # served from. Both are opaque ids the API addresses resources by.
   cloudflareAccount = "8eb131c87dedde28b0f5006b388ca800";

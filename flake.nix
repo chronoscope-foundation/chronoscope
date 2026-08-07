@@ -326,8 +326,10 @@
         # PostgreSQL + PostGIS for the ephemeral-cluster harness: puts
         # initdb/pg_ctl/psql on PATH with postgis loadable. Feeds the api dev
         # shell (local `cargo test -p chronoscope-db --features postgres`) and
-        # the hermetic `postgres-smoke` and `api-postgres` checks.
-        postgresWithPostgis = pkgs.postgresql_16.withPackages (p: [ p.postgis ]);
+        # the hermetic `postgres-smoke` and `api-postgres` checks. The major is
+        # the one nix/infra.nix declares on Cloud SQL, so what the gate
+        # exercises is the planner production runs; the two move together.
+        postgresWithPostgis = pkgs.postgresql_18.withPackages (p: [ p.postgis ]);
 
         # Preload libspatialite so it and its C++ deps (PROJ/GEOS) stay mapped
         # for the whole process. SQLite dlcloses the mod_spatialite extension at
