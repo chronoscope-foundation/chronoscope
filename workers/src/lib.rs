@@ -15,9 +15,7 @@
 //! # Available Workers
 //!
 //! - **URL Fetcher**: Fetches URLs, extracts content (HTML/images/video), discovers embedded media
-//! - **Analysis**: Analyzes images using Triton Inference Server (SAM3 segmentation + VLM)
 
-pub mod analysis;
 pub mod config;
 pub mod runner;
 pub mod url_fetcher;
@@ -30,7 +28,6 @@ pub use chronoscope_integrations::{
     ReqwestClient, ReqwestConfig, create_registry,
 };
 
-pub use analysis::{AnalysisError, AnalysisWorker};
 pub use config::WorkerConfig;
 pub use runner::{Enqueuer, NoOpEnqueuer, RetryConfig, RunnerError, UrlEnqueuer, run};
 pub use worker::{ItemResult, Worker};

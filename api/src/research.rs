@@ -271,30 +271,15 @@ fn convert_media(media: &Media, cdn_base_url: &url::Url) -> Result<MediaDossier,
 }
 
 /// Convert DB analysis state to API `MediaAnalysis`.
-fn convert_analysis(media: &Media) -> Result<MediaAnalysis, HttpError> {
+///
+/// The analysis stage reports no payload: the pipeline that produced one ran
+/// through a Triton server this repo no longer contains, and the crate
+/// replacing it defines its own result shape. The DB still tracks the stage's
+/// state; nothing surfaces it until that shape exists.
+fn convert_analysis(_media: &Media) -> Result<MediaAnalysis, HttpError> {
     use crate::research_types::AnalysisOutcome;
-    use chronoscope_db::MediaAnalysisState;
-
-    let analysis = match &media.analysis {
-        MediaAnalysisState::Pending => AnalysisOutcome::Pending,
-        MediaAnalysisState::Processing => AnalysisOutcome::InProgress,
-        MediaAnalysisState::Failed { error } => AnalysisOutcome::Failed {
-            error: error.clone(),
-        },
-        MediaAnalysisState::Complete { analysis_result } => {
-            let result: chronoscope_analysis::AnalysisResult =
-                serde_json::from_str(analysis_result).map_err(|e| {
-                    HttpError::for_internal_error(format!(
-                        "Corrupt analysis_result JSON in media {}: {}",
-                        media.id, e
-                    ))
-                })?;
-            AnalysisOutcome::Success(result)
-        }
-    };
 
     Ok(MediaAnalysis {
-        analysis,
         reverse_image_search: AnalysisOutcome::Pending,
     })
 }
@@ -303,7 +288,6 @@ fn convert_analysis(media: &Media) -> Result<MediaAnalysis, HttpError> {
 mod tests {
     use super::*;
     use crate::cdn::tests::TEST_CDN_BASE_URL;
-    use crate::research_types::AnalysisOutcome;
     use chrono::{NaiveDate, NaiveDateTime};
     use chronoscope_db::{MediaData, MediaId, MediaType};
 
@@ -512,217 +496,6 @@ mod tests {
             "Error should mention invalid dimensions, got: {}",
             err.internal_message
         );
-        Ok(())
-    }
-
-    // ==================== Analysis Conversion ====================
-
-    #[test]
-    fn test_convert_analysis_pending_status() -> TestResult {
-        let media = minimal_media(); // analysis_status = "pending"
-        let dossier = convert_media(&media, &test_cdn_base()?)?;
-
-        assert!(
-            matches!(dossier.analysis.analysis, AnalysisOutcome::Pending),
-            "Analysis should be Pending"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_convert_analysis_processing_status() -> TestResult {
-        let mut media = minimal_media();
-        media.analysis = chronoscope_db::MediaAnalysisState::Processing;
-
-        let dossier = convert_media(&media, &test_cdn_base()?)?;
-
-        assert!(
-            matches!(dossier.analysis.analysis, AnalysisOutcome::InProgress),
-            "Analysis should be InProgress"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_convert_analysis_failed_status() -> TestResult {
-        let mut media = minimal_media();
-        media.analysis = chronoscope_db::MediaAnalysisState::Failed {
-            error: "Triton server unavailable".to_string(),
-        };
-
-        let dossier = convert_media(&media, &test_cdn_base()?)?;
-
-        let AnalysisOutcome::Failed { error } = &dossier.analysis.analysis else {
-            return Err(test_err("Expected Failed outcome"));
-        };
-        assert_eq!(error, "Triton server unavailable");
-        Ok(())
-    }
-
-    fn serialize(value: &impl serde::Serialize) -> Result<String, HttpError> {
-        serde_json::to_string(value)
-            .map_err(|e| HttpError::for_internal_error(format!("serialize: {e}")))
-    }
-
-    fn test_err(msg: &str) -> HttpError {
-        HttpError::for_internal_error(msg.to_string())
-    }
-
-    #[test]
-    fn test_convert_analysis_complete_with_results() -> TestResult {
-        use chronoscope_analysis::{
-            AnalysisResult, AnalyzedMediaType, BoundingBox, Embedding, ModelVersions, PhotoColor,
-            RleCounts, RleMask, SceneAnalysis, SceneType, Subimage, SubimageAnalysis,
-            SubimageBounds,
-        };
-
-        let analysis_result = AnalysisResult::Success {
-            subimages: vec![Subimage {
-                bounds: SubimageBounds {
-                    bbox: BoundingBox {
-                        x: 0,
-                        y: 0,
-                        width: 100,
-                        height: 100,
-                    },
-                    mask: RleMask {
-                        counts: RleCounts::new("01").map_err(|e| test_err(&e.to_string()))?,
-                    },
-                },
-                analysis: SubimageAnalysis::Analyzed {
-                    scene: SceneAnalysis {
-                        media_type: AnalyzedMediaType::Photo {
-                            color: PhotoColor::Monochrome,
-                        },
-                        content_summary: "A historic building on a street corner".to_string(),
-                        scene_type: SceneType::Outdoor,
-                    },
-                    embedding: Embedding::test_default(),
-                    regions: vec![],
-                },
-            }],
-            versions: ModelVersions {
-                vlm: "test-vlm".to_string(),
-                sam3: "test-sam3".to_string(),
-                dinov3: "test-dinov3".to_string(),
-                git_sha: "test-sha".to_string(),
-            },
-        };
-
-        let mut media = minimal_media();
-        media.analysis = chronoscope_db::MediaAnalysisState::Complete {
-            analysis_result: serialize(&analysis_result)?,
-        };
-
-        let dossier = convert_media(&media, &test_cdn_base()?)?;
-
-        let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
-            return Err(test_err("Expected analysis Success"));
-        };
-        let AnalysisResult::Success { subimages, .. } = result else {
-            return Err(test_err("Expected Success variant"));
-        };
-        assert_eq!(subimages.len(), 1);
-
-        let SubimageAnalysis::Analyzed { scene, .. } = &subimages[0].analysis else {
-            return Err(test_err("Expected Analyzed subimage"));
-        };
-        assert_eq!(
-            scene.content_summary,
-            "A historic building on a street corner"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_convert_analysis_complete_with_rejected_subimage() -> TestResult {
-        use chronoscope_analysis::{
-            AnalysisResult, BoundingBox, ModelVersions, RleCounts, RleMask, Subimage,
-            SubimageAnalysis, SubimageBounds,
-        };
-
-        let analysis_result = AnalysisResult::Success {
-            subimages: vec![Subimage {
-                bounds: SubimageBounds {
-                    bbox: BoundingBox {
-                        x: 0,
-                        y: 0,
-                        width: 100,
-                        height: 100,
-                    },
-                    mask: RleMask {
-                        counts: RleCounts::new("01").map_err(|e| test_err(&e.to_string()))?,
-                    },
-                },
-                analysis: SubimageAnalysis::Rejected {
-                    reason: "portrait photo".to_string(),
-                },
-            }],
-            versions: ModelVersions {
-                vlm: "test-vlm".to_string(),
-                sam3: "test-sam3".to_string(),
-                dinov3: "test-dinov3".to_string(),
-                git_sha: "test-sha".to_string(),
-            },
-        };
-
-        let mut media = minimal_media();
-        media.analysis = chronoscope_db::MediaAnalysisState::Complete {
-            analysis_result: serialize(&analysis_result)?,
-        };
-
-        let dossier = convert_media(&media, &test_cdn_base()?)?;
-
-        let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
-            return Err(test_err("Expected analysis Success"));
-        };
-        let AnalysisResult::Success { subimages, .. } = result else {
-            return Err(test_err("Expected Success variant"));
-        };
-        assert!(matches!(
-            &subimages[0].analysis,
-            SubimageAnalysis::Rejected { reason } if reason == "portrait photo"
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn test_convert_analysis_corrupt_json_returns_error() -> TestResult {
-        let mut media = minimal_media();
-        media.analysis = chronoscope_db::MediaAnalysisState::Complete {
-            analysis_result: "not valid json {{{".to_string(),
-        };
-
-        let result = convert_media(&media, &test_cdn_base()?);
-        assert!(
-            result.is_err(),
-            "Corrupt analysis JSON should return internal error"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_convert_analysis_image_rejected() -> TestResult {
-        use chronoscope_analysis::AnalysisResult;
-
-        let analysis_result = AnalysisResult::ImageRejected {
-            reason: "image too large".to_string(),
-        };
-
-        let mut media = minimal_media();
-        media.analysis = chronoscope_db::MediaAnalysisState::Complete {
-            analysis_result: serialize(&analysis_result)?,
-        };
-
-        let dossier = convert_media(&media, &test_cdn_base()?)?;
-
-        let AnalysisOutcome::Success(result) = &dossier.analysis.analysis else {
-            return Err(test_err("Expected analysis Success"));
-        };
-        assert!(matches!(
-            result,
-            AnalysisResult::ImageRejected { reason } if reason == "image too large"
-        ));
         Ok(())
     }
 }

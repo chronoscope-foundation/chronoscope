@@ -12,10 +12,7 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chronoscope_analysis::{GrpcTritonClient, TritonService};
-use chronoscope_api::research_types::{
-    AnalysisOutcome, MediaReference, ResearchUrlDossier, ResolvedContent,
-};
+use chronoscope_api::research_types::{MediaReference, ResearchUrlDossier, ResolvedContent};
 use chronoscope_api::state::permissive_dns_resolver;
 use chronoscope_api_client::Client;
 use chronoscope_api_client::client::AuthClient;
@@ -46,8 +43,6 @@ fn init_tracing() {
 /// `Database::worker_progress`, so a worker making forward progress
 /// never hits this; only a genuinely stuck pipeline does.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
-/// Analysis can be slow (Triton inference); separate ceiling.
-const ANALYSIS_TIMEOUT: Duration = Duration::from_mins(5);
 
 fn http_fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
     // HTTP fixtures are in the integrations crate
@@ -55,14 +50,6 @@ fn http_fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
         .parent()
         .ok_or("dev crate should have parent")?
         .join("integrations/fixtures"))
-}
-
-fn triton_fixtures_dir() -> Result<std::path::PathBuf, &'static str> {
-    // Triton gRPC fixtures are in the analysis crate
-    Ok(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or("dev crate should have parent")?
-        .join("analysis/fixtures"))
 }
 
 fn vcr_mode() -> CacheMode {
@@ -89,27 +76,16 @@ struct TestServer {
 }
 
 impl TestServer {
-    /// Start a test server with VCR fixtures and default Triton endpoint.
+    /// Start a test server with VCR fixtures.
     async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::start_with_config(None).await
     }
 
-    /// Start a test server with VCR fixtures, optional Apify config, and default Triton endpoint.
+    /// Start a test server with VCR fixtures and optional Apify config.
     async fn start_with_config(
         apify_config: Option<ApifyConfig>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         init_tracing();
-
-        // Build Triton service: live+recording or offline depending on mode.
-        let triton: Option<Arc<dyn TritonService>> = if cfg!(feature = "record-fixtures") {
-            let endpoint = std::env::var("TRITON_ENDPOINT")
-                .map_err(|_| "TRITON_ENDPOINT must be set when recording fixtures")?;
-            Some(Arc::new(
-                GrpcTritonClient::recording(&endpoint, triton_fixtures_dir()?).await?,
-            ))
-        } else {
-            Some(Arc::new(GrpcTritonClient::offline(triton_fixtures_dir()?)))
-        };
 
         let http_client: Arc<dyn HttpClient> =
             Arc::new(CachingClient::new(http_fixtures_dir()?, vcr_mode())?);
@@ -151,7 +127,6 @@ impl TestServer {
             rp_origin: None,
             ios_app_id: None,
             apify_config,
-            triton,
             dns_resolver: permissive_dns_resolver(),
         })
         .await?;
@@ -250,31 +225,6 @@ impl TestServer {
         Ok(resp.bytes().await?)
     }
 
-    /// Wait until analysis is complete on at least one media item.
-    ///
-    /// Polls until the dossier has a resolved page with at least one media item
-    /// that has completed analysis.
-    async fn wait_for_analysis_complete(
-        &self,
-        url_id: &str,
-        timeout: Duration,
-    ) -> Result<ResearchUrlDossier, Box<dyn std::error::Error + Send + Sync>> {
-        self.wait_for_media_condition(
-            url_id,
-            |media| {
-                media.iter().any(|m| {
-                    if let MediaReference::Fetched(fetched) = m {
-                        matches!(fetched.analysis.analysis, AnalysisOutcome::Success(_))
-                    } else {
-                        false
-                    }
-                })
-            },
-            timeout,
-        )
-        .await
-    }
-
     /// Gracefully shut down the server and wait for workers to stop.
     async fn shutdown(self) {
         self.server.shutdown().await;
@@ -345,8 +295,6 @@ where
 /// 3. Workers attempt to fetch each media item (1 succeeds via fixture, rest fail)
 /// 4. Dossier shows correct media states (fetched vs pending/failed)
 /// 5. Successful media can be retrieved via CDN URL and is a valid image
-/// 6. Analysis worker processes the image through Triton (SAM3 + VLM)
-/// 7. Analysis results appear in the API response with valid structure
 ///
 /// Note: The Reddit gallery contains 20 images, but we intentionally only recorded
 /// a VCR fixture for one of them. This tests that the failure path works correctly:
@@ -355,14 +303,10 @@ where
 ///
 /// # Recording fixtures
 ///
-/// To record/update fixtures (including Triton), ensure Triton is running and:
+/// To record/update fixtures:
 /// ```bash
 /// cargo test -p chronoscope-dev --features record-fixtures -- test_reddit_gallery
 /// ```
-///
-/// The test uses `TRITON_ENDPOINT` env var if set, otherwise defaults to the
-/// endpoint fixtures were recorded with. To use a different Triton server,
-/// set the env var and re-record fixtures.
 #[tokio::test]
 async fn test_reddit_gallery_end_to_end() -> TestResult {
     let server = TestServer::start().await?;
@@ -449,75 +393,6 @@ async fn test_reddit_gallery_end_to_end() -> TestResult {
         thumb.width() <= img.width() && thumb.height() <= img.height(),
         "thumbnail should not be larger than original"
     );
-
-    // ==================== Analysis Verification ====================
-    // Wait for analysis to complete (may take longer due to Triton inference)
-    let dossier = server
-        .wait_for_analysis_complete(&url_id, ANALYSIS_TIMEOUT)
-        .await?;
-
-    // Re-extract the analyzed media
-    let Some(ResolvedContent::Page(page)) = dossier.resolved else {
-        return Err("expected resolved page after analysis".into());
-    };
-
-    let analyzed: Vec<_> = fetched_media(&page.media)
-        .into_iter()
-        .filter(|m| matches!(m.analysis.analysis, AnalysisOutcome::Success(_)))
-        .collect();
-
-    assert!(
-        !analyzed.is_empty(),
-        "at least one media item should have completed analysis"
-    );
-
-    let media = analyzed[0];
-
-    // Verify analysis results
-    let AnalysisOutcome::Success(result) = &media.analysis.analysis else {
-        return Err("expected successful analysis".into());
-    };
-
-    let chronoscope_analysis::AnalysisResult::Success { subimages, .. } = result else {
-        return Err("expected Success variant".into());
-    };
-
-    assert!(
-        !subimages.is_empty(),
-        "analysis should have at least one subimage"
-    );
-    let subimage = &subimages[0];
-
-    let chronoscope_analysis::SubimageAnalysis::Analyzed { scene, regions, .. } =
-        &subimage.analysis
-    else {
-        return Err("expected analyzed subimage".into());
-    };
-
-    assert!(
-        !scene.content_summary.is_empty(),
-        "analysis should produce a content summary"
-    );
-
-    // Recorded fixture should return exactly 2 regions with specific properties
-    assert_eq!(
-        regions.len(),
-        2,
-        "recorded fixture should detect exactly 2 regions"
-    );
-
-    // Both regions should have segmentation_confidence ~0.66-0.69 (from recorded fixture)
-    for (i, region) in regions.iter().enumerate() {
-        assert!(
-            !region.mask.counts.as_str().is_empty(),
-            "region {i} mask should have RLE counts"
-        );
-        assert!(
-            region.segmentation_confidence > 0.65 && region.segmentation_confidence < 0.70,
-            "region {i} confidence should be ~0.66-0.69, got {}",
-            region.segmentation_confidence
-        );
-    }
 
     server.shutdown().await;
     Ok(())

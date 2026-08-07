@@ -140,7 +140,6 @@
           api = rec {
             package = "chronoscope-api";
             crates = [
-              "analysis"
               "api"
               "api-client"
               "core"
@@ -149,7 +148,7 @@
               "macros"
             ];
             # Compile-time inputs, both: `sqlx::migrate!` embeds the .sql under
-            # db/migrations*/, and analysis/build.rs compiles analysis/proto/.
+            # db/migrations*/.
             # The .json fixtures under integrations/ are not, since the binary
             # builds with doCheck = false, so editing a test fixture leaves the
             # production image alone.
@@ -228,7 +227,6 @@
             lib
             craneLib
             ;
-          inherit pythonEnvs;
           rustCommonArgs = rust.commonArgs;
         };
 
@@ -307,8 +305,6 @@
           rustCommonArgs = rust.commonArgs;
           inherit (rust) cargoArtifacts;
         };
-
-        pythonChecks = pythonEnvs.checks;
 
         # Nix source for lint check (excludes .git/).
         nixSrc = lib.cleanSourceWith {
@@ -462,10 +458,6 @@
           }
         '';
         pinWikidataRoot = "_pin wikidata-entities ${wikidata.bundles.curated.entities}";
-        pinWeights = ''
-          _pin dinov3-weights ${pythonEnvs.dinov3Repo}
-          _pin sam3-weights ${pythonEnvs.sam3Cache}
-        '';
         pinCorpus = "_pin corpus-images ${corpus.corpusImages}";
 
         mkBanner =
@@ -480,7 +472,6 @@
         checks =
           rust.checks
           // web.checks
-          // pythonChecks
           // {
             nix-lint =
               pkgs.runCommand "nix-lint"
@@ -515,8 +506,6 @@
             # Hermetic coverage of the build-db path: a dump-free facts DB from
             # the curated bundle, self-validating that it holds facts.
             wikidata-facts-db-curated = wikidata.factsDbs.curated;
-            # corpus-tests intentionally excluded — requires GPU (run on
-            # dedicated CI runners via `nix build .#corpus-tests`).
           }
           // lib.optionalAttrs isDarwin {
             ios-project-spec = openapi.projectSpec;
@@ -543,8 +532,6 @@
 
             corpus-images = corpus.corpusImages;
             corpus-fetch = corpus.corpusFetchBin;
-            corpus-tests = corpus.corpusTests;
-            analysis-results = corpus.analysisResults;
 
             # Model weights — built with --impure and HF_TOKEN to populate store.
             dinov3-weights = pythonEnvs.dinov3Repo;
@@ -642,55 +629,31 @@
             '';
           };
 
-          # Analysis crate work: backend stack + Python analysis env +
-          # model weights + corpus images. Corpus is mandatory: iterating
-          # on analysis correctness without the corpus produces tests that
-          # don't catch real regressions.
+          # Analysis crate work: backend stack, the corpus images the pipeline
+          # develops against, and onnxruntime for `ort`. The multi-gigabyte
+          # exports are fetched by `just fetch-models` rather than pinned in a
+          # shell hook, which would make entering the shell expensive.
           analysis = pkgs.mkShell {
-            nativeBuildInputs = [
-              toolchain
-              pythonEnvs.analysisEnv
-            ]
-            ++ commonTools
-            ++ backendNativeBuildInputs;
-            buildInputs = backendBuildInputs;
+            nativeBuildInputs = [ toolchain ] ++ commonTools ++ backendNativeBuildInputs;
+            buildInputs = backendBuildInputs ++ [ pkgs.onnxruntime ];
             env =
               commonEnv
               // backendEnv
-              // pythonEnvs.modelEnv
               // {
                 CORPUS_IMAGES = corpus.corpusImages;
+                # `corpus-fetch` resolves the URL list from here; without it
+                # `just corpus-hash` cannot find the manifest.
+                CORPUS_MANIFEST = corpus.corpusManifestJson;
+                # `ort` builds with load-dynamic, so it resolves the shared
+                # library at runtime from this rather than downloading one.
+                ORT_DYLIB_PATH = "${pkgs.onnxruntime}/lib/libonnxruntime${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
               };
             shellHook = ''
               ${gcRootsPrelude}
               ${pinWikidataRoot}
-              ${pinWeights}
               ${pinCorpus}
               ${mkBanner "analysis" ''
-                echo "  python: $(python3 --version 2>/dev/null)"
-              ''}
-            '';
-          };
-
-          # Triton serving / harness work: Python analysis env + model
-          # weights + the rust toolchain (for schematool, used by Python
-          # tests for cross-language schema validation). No corpus —
-          # corpus correctness lives in `analysis`. No backend native
-          # deps — schematool comes prebuilt from rust.packages.default.
-          triton = pkgs.mkShell {
-            nativeBuildInputs = [
-              toolchain
-              pythonEnvs.analysisEnv
-              rust.packages.default
-            ]
-            ++ commonTools;
-            env = commonEnv // pythonEnvs.modelEnv;
-            shellHook = ''
-              ${gcRootsPrelude}
-              ${pinWeights}
-              ${mkBanner "triton" ''
-                echo "  python: $(python3 --version 2>/dev/null)"
-                echo "  schematool: $(command -v schematool 2>/dev/null || echo 'not found')"
+                echo "  onnxruntime: ${pkgs.onnxruntime.version}"
               ''}
             '';
           };

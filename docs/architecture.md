@@ -122,15 +122,21 @@ Fetches URLs and extracts content:
 - Exact hash for byte-identical content
 - Perceptual hash for near-duplicate images
 
-### Analysis Worker
+### Analysis
 
-Processes extracted images through a Triton Inference Server pipeline:
+**No analysis worker runs today.** The previous one drove a Triton Inference
+Server over gRPC, with the models defined in Python; both are gone, and
+extracted images sit at `Pending`.
 
-1. **SAM3** - Segments entities (buildings, landmarks) in images, produces confidence-filtered masks
-2. **VLM** - Analyzes scenes and segmented regions, extracts structured descriptions
-3. **Embeddings** - Generates embeddings for whole images and individual entities
+The replacement runs the models in-process instead of behind a server, which
+is what lets the same binary work on a laptop and in production: SAM 3 and
+DINOv3 as ONNX graphs exported by Nix (`nix/vision.nix`) and executed through
+ONNX Runtime, and a VLM through mistral.rs. The `analysis` crate is where that
+lands. It currently carries the corpus machinery — the pinned test images the
+pipeline is developed against.
 
-The `analysis` crate provides a gRPC client for the Triton server, while the Python model definitions live in `analysis/triton/`. The analysis worker uses the same work queue pattern as the URL fetcher.
+Interactive CLI invocation comes first; the queue worker follows, on the same
+work-queue pattern as the URL fetcher.
 
 ## iOS App
 

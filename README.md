@@ -37,13 +37,18 @@ The thin slice establishes the patterns for the full platform. Next steps includ
 
 ### Development Environment
 
-All Rust, Python, and native dependencies are managed by Nix. Three shell tiers provide increasing levels of data so the base shell starts fast:
+All toolchains and native dependencies are managed by Nix. There is one shell
+per project area, each sized to what that area needs, so entering the base
+shell costs nothing:
 
 | Shell | What it adds | Use case |
 |-------|-------------|----------|
-| `default` | Rust + Python + lint tools | Web dev, API work, most of the repo |
-| `analysis` | + model weights (DINOv3, SAM3) | Analysis pipeline tests |
-| `corpus` | + corpus images | Full corpus test suite |
+| `default` | Rust toolchain + just + Nix lint tools | Poking around, running `just <recipe>` |
+| `api` | + sqlite/openssl/spatialite/protobuf | Backend / API server work |
+| `web` | + wasm toolchain, trunk, tailwind, chromium | Frontend, `web-dev`, browser tests |
+| `analysis` | + onnxruntime, corpus images | Analysis pipeline work |
+| `ios` | xcodegen, swiftformat/swiftlint | Xcode project generation, Swift lint |
+| `deploy` / `infra` | gcloud, skopeo / opentofu | Shipping the image, declaring cloud resources |
 
 **Enter the dev shell:**
 
@@ -53,8 +58,7 @@ direnv allow
 
 # Option 2: manual
 nix develop              # default shell — no large downloads
-nix develop .#analysis   # requires fetch-weights (see below)
-nix develop .#corpus     # requires fetch-weights + fetch-corpus
+nix develop .#analysis   # requires fetch-corpus (see below)
 ```
 
 `just` commands auto-wrap with the appropriate shell tier, so you can always just run `just check` directly.
@@ -97,20 +101,20 @@ See [docs/development.md](docs/development.md) for detailed development practice
 
 ```bash
 # The commit gate: runs everything — Nix lint, Rust (fmt/clippy/test/coverage),
-# Python (ruff/mypy/pytest), and the headless-browser web tests. The targeted
-# `just check <rust|web|triton|nix>` subsets are for iteration and skip parts of
+# and the headless-browser web tests. The targeted
+# `just check <rust|web|nix>` subsets are for iteration and skip parts of
 # the gate (the browser suite runs only here), so run the full `just check`
 # before committing.
 just check
 
-# Auto-fix all formatting (Nix + Rust + Python)
+# Auto-fix all formatting (Nix + Rust)
 just fmt
 
 # Hermetic sandboxed checks (no GPU required)
 nix flake check
 
-# Run a single Nix check (e.g., Python tests only)
-nix build .#checks.$(nix eval --impure --expr builtins.currentSystem --raw).triton-test
+# Run a single Nix check (e.g., the Nix lint alone)
+nix build .#checks.$(nix eval --impure --expr builtins.currentSystem --raw).nix-lint
 
 # iOS UI tests
 xcodebuild test -scheme Chronoscope -destination 'platform=iOS Simulator,name=iPhone 16'
@@ -119,8 +123,7 @@ xcodebuild test -scheme Chronoscope -destination 'platform=iOS Simulator,name=iP
 ## Project Structure
 
 ```
-analysis/            Image analysis pipeline (Triton gRPC client, SAM3/VLM)
-  triton/            Python model definitions for Triton Inference Server
+analysis/            Image analysis — corpus images today; SAM3/DINOv3/VLM pipeline in progress
 api/                 Rust API server (Dropshot framework)
 db/                  Database layer (sqlx + SQLite)
 dev/                 Development server with ngrok integration

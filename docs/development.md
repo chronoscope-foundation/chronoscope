@@ -99,14 +99,16 @@ Every test should answer: "What bug would this catch?"
 - Test behavior, not implementation details
 - If refactoring breaks a test but not the behavior, the test was wrong
 
-### Cross-Language Testing
+### Model Weights
 
-Python model tests call `schematool` (Rust binary from `analysis/src/bin/schematool.rs`) to validate Python output against Rust schema definitions. This catches schema drift between the two languages at test time.
+Weights (SAM3, DINOv3) are fetched by `just fetch-weights` into the Nix store
+as fixed-output derivations — `hf download` inside a sandboxed FOD, so the one
+impure step in the chain is isolated to it. Gated repos need `HF_TOKEN` on the
+first fetch; after that the output hash pins the result and builds are pure.
 
-- In `nix flake check`: schematool comes from the Rust workspace build (`rust.packages.default`)
-- In `just check`: schematool is built by `cargo build --bin schematool` and added to `PATH`
-- Model weights (SAM3, DINOv3) are fetched via `just fetch-weights` into the Nix store as fixed-output derivations (`hf download` in a sandboxed FOD) and passed via `DINOV3_MODEL_DIR` / `HF_HOME` env vars in the `analysis` and `corpus` shells
-- `HF_HUB_OFFLINE=1` is set in those shells — any attempt to download at test time is a hard failure
+Nothing consumes them at test time. They are inputs to the ONNX exports in
+`nix/vision.nix`, which run offline against the fetched store paths and are
+deliberately outside the commit gate — see the root `CLAUDE.md`.
 
 ### Test Organization
 
@@ -114,11 +116,6 @@ Python model tests call `schematool` (Rust binary from `analysis/src/bin/schemat
 - `api/src/tests/` - API endpoint tests organized by feature
 - Workers use `record-fixtures` feature for HTTP fixture recording
 - In-memory SQLite for fast, isolated database tests
-
-**Python:**
-- `analysis/triton/test_models.py` — unit + integration tests for SAM3/DINOv3/VLM pipeline
-- `conftest.py` — session-scoped real model fixtures for integration tests
-- Tests run with real model inference (MPS/CPU), not mocked weights
 
 **Swift:**
 - `MockAPIClient` provides predictable responses for UI tests and previews
@@ -131,7 +128,7 @@ Python model tests call `schematool` (Rust binary from `analysis/src/bin/schemat
 
 | Crate | Purpose |
 |-------|---------|
-| `analysis` | Image analysis pipeline (Triton gRPC client, SAM3/VLM) |
+| `analysis` | Image analysis — corpus images today; SAM3/DINOv3/VLM pipeline in progress |
 | `api` | REST API server, authentication, endpoints |
 | `db` | Database layer, models, queries |
 | `dev` | Development server with ngrok integration |

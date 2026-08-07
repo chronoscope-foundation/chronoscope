@@ -13,8 +13,6 @@
       "Bash(just web-dev)",
       "Bash(just openapi)",
       "Bash(just corpus-hash)",
-      "Bash(just corpus-test)",
-      "Bash(just corpus-test-vlm)",
       "Bash(just fetch-weights)",
       "Bash(just fetch-corpus)",
       "Bash(just fetch-regions)",

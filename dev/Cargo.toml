@@ -38,8 +38,6 @@ postgres = ["chronoscope-api/postgres"]
 # Enable embedded-media for dev to serve media at /media/{key}
 chronoscope-api = { path = "../api", features = ["embedded-media"] }
 
-# Analysis crate (for TritonClient in analysis worker)
-chronoscope-analysis = { path = "../analysis" }
 
 # DB crate (for Database, InMemoryMediaStore, user management)
 chronoscope-db = { path = "../db" }

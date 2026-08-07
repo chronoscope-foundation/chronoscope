@@ -12,9 +12,6 @@ use chronoscope_integrations::IntegrationName;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-// Re-export analysis types for API consumers
-pub use chronoscope_analysis::AnalysisResult;
-
 // ==================== Analysis Outcome (Generic) ====================
 
 /// Outcome of an analysis stage.
@@ -50,10 +47,14 @@ pub struct DeepResearchResults {}
 // ==================== Analysis Progress ====================
 
 /// Per-media analysis stages.
+///
+/// A placeholder: the image-analysis stage lost its result type with the
+/// Triton pipeline, and the replacement in `chronoscope-analysis` will define
+/// its own. The remaining field keeps the shape a stage list wants, so adding
+/// that one back is a field rather than a new type. Every value here is
+/// currently `Pending`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MediaAnalysis {
-    /// Image analysis (segmentation + VLM + embeddings).
-    pub analysis: AnalysisOutcome<AnalysisResult>,
     pub reverse_image_search: AnalysisOutcome<ReverseImageSearchResults>,
 }
 

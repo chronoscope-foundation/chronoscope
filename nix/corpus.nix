@@ -1,16 +1,13 @@
-# Corpus pipeline as Nix derivations.
+# Corpus images as Nix derivations: one FOD per unique URL, fetched by the
+# corpus-fetch binary, assembled into a link farm keyed by entry id.
 #
-# Three layers:
-#   1. Image downloads — one FOD per unique URL via corpus-fetch binary
-#   2. Analysis runs   — sandboxed derivations with GPU access (Python + models → JSON)
-#   3. Corpus tests    — pure derivations (Rust tests over analysis results)
-#
-# Nix content-addressing handles cache invalidation: changing a model.py
-# automatically invalidates downstream derivations.
+# These are the photographs the vision pipeline develops against. The GPU
+# derivation that once ran analysis over them, and the Rust tests that asserted
+# on its output, are in git history: both were written against a schema the
+# vision crate replaces.
 {
   pkgs,
   lib,
-  pythonEnvs,
   craneLib,
   rustCommonArgs,
 }:
@@ -32,12 +29,12 @@ let
     rustCommonArgs
     // {
       pname = "corpus-fetch";
-      cargoExtraArgs = "--features corpus-test -p chronoscope-analysis --bin corpus-fetch";
+      cargoExtraArgs = "--features corpus -p chronoscope-analysis --bin corpus-fetch";
       cargoArtifacts = craneLib.buildDepsOnly (
         rustCommonArgs
         // {
           pname = "corpus-fetch-deps";
-          cargoExtraArgs = "--features corpus-test -p chronoscope-analysis";
+          cargoExtraArgs = "--features corpus -p chronoscope-analysis";
         }
       );
       doCheck = false;
@@ -83,90 +80,10 @@ let
     ) corpusManifest.images
   );
 
-  # GPU-aware analysis derivation.
-  #
-  # IMPORTANT: GPU sandbox configuration
-  # =====================================
-  # This derivation needs GPU access for SAM3/DINOv3 inference. The Nix
-  # sandbox stays intact (filesystem isolation preserved) — only GPU devices
-  # are exposed to the build:
-  #
-  # Linux builder configuration (nix.conf):
-  #   extra-sandbox-paths = /dev/nvidia0 /dev/nvidiactl /dev/nvidia-uvm /run/opengl-driver
-  #   system-features = cuda
-  #
-  # Darwin: sandbox is off by default on macOS. Metal/MPS access works without
-  # special configuration. TODO: design __sandboxProfile that enables sandbox
-  # but grants Metal/MPS GPU access for filesystem isolation.
-  analysisResults = pkgs.stdenv.mkDerivation (
-    pythonEnvs.modelEnv
-    // {
-      pname = "chronoscope-analysis-results";
-      version = "0.1.0";
-
-      nativeBuildInputs = [ pythonEnvs.analysisEnv ];
-
-      src = pythonEnvs.analysisSrc;
-
-      # On Linux, require CUDA-capable builder.
-      requiredSystemFeatures = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ "cuda" ];
-
-      buildPhase = ''
-        runHook preBuild
-
-        # stdenv may set SSL_CERT_FILE; we're fully offline so TLS is unnecessary.
-        unset SSL_CERT_FILE
-
-        # run_local.py reads paths from stdin, writes JSON lines to stdout.
-        # corpusImages is a link farm (entry-id → FOD file); find -L follows
-        # symlinks so basenames (= entry IDs) are preserved in the output.
-        find -L ${corpusImages} -type f | sort | python run_local.py > results.jsonl
-
-        runHook postBuild
-      '';
-
-      installPhase = ''
-        runHook preInstall
-        mkdir -p $out
-        cp results.jsonl $out/
-        runHook postInstall
-      '';
-    }
-  );
-
-  # Corpus test derivation — pure, no GPU needed.
-  # Runs Rust corpus tests against pre-computed analysis results.
-  # Reuses rustCommonArgs (from rust.nix) to avoid duplicating build deps.
-  corpusTests = craneLib.cargoTest (
-    let
-      commonArgs = rustCommonArgs // {
-        pname = "chronoscope-corpus-tests";
-        ANALYSIS_RESULTS = analysisResults;
-        CORPUS_MANIFEST = corpusManifestJson;
-        cargoExtraArgs = "--features corpus-test -p chronoscope-analysis --test corpus_tests";
-      };
-    in
-    commonArgs
-    // {
-      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
-      doInstallCargoArtifacts = false;
-      # Output test report instead of archiving the target directory.
-      # The test binary is fast (reads pre-computed JSON), so re-running
-      # it in the install phase is cheap.
-      installPhaseCommand = ''
-        mkdir -p $out
-        find target/release/deps -name 'corpus_tests-*' -type f -executable \
-          -exec {} --color never \; 2>&1 | tee $out/test-report.txt
-      '';
-    }
-  );
-
 in
 {
   inherit
     corpusImages
-    analysisResults
-    corpusTests
     corpusFetchBin
     corpusManifestJson
     ;

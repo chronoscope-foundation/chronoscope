@@ -11,9 +11,9 @@ Nix build infrastructure. One derivation module per project area;
 | `api.nix`       | Wrapped `chronoscope-api` binary (SpatiaLite path baked in) |
 | `openapi.nix`   | OpenAPI `spec`, ChronoscopeAPI SwiftPM package, store-path-spliced xcodegen `projectSpec` |
 | `web.nix`       | WASM build pipeline + wasm `web-build`/`web-test-build`/`web-clippy` and host `web-native-test`/`web-native-clippy` checks |
-| `python.nix`    | `analysisEnv`, model weight FODs, triton checks     |
+| `python.nix`    | Model weight FODs (the one impure step in the chain) |
 | `vision.nix`    | Patched sam3/samexporter packages, the ONNX export derivations and their manifests |
-| `corpus.nix`    | Per-URL image FODs, link farm, `analysis-results` GPU derivation |
+| `corpus.nix`    | Per-URL image FODs, the link farm they assemble into, and the `corpus-fetch` binary that hashes new URLs |
 | `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL → SQLite facts DBs) |
 | `oci.nix`       | nix2container image for the API server (Cloud Run) + the check that boots its entrypoint, Linux systems only |
 | `workspace-src.nix` | Narrowed sources for artifacts built from one workspace package, plus `workspace-closures`, the check that keeps the declared crate lists matching cargo |
@@ -104,19 +104,21 @@ snapshot) get pinned as GC roots in `.nix-gc-roots/`
 hooks:
 
 - `gcRootsPrelude` — creates `.nix-gc-roots/`
-- `pinWikidataRoot`, `pinWeights`, `pinCorpus` — each pins its
-  specific derivation
+- `pinWikidataRoot`, `pinCorpus` — each pins its specific derivation
 
-Each shell composes only the pins it actually uses (e.g. `triton`
-pins weights, not corpus). If a derivation that takes time to build is
-not pinned and not in the store, it'll be silently re-fetched/rebuilt
-the next time the shell loads.
+Each shell composes only the pins it actually uses (`api`, `web` and
+`analysis` all pin the wikidata snapshot; only `analysis` pins the
+corpus images). If a derivation that takes time to build is not
+pinned and not in the store, it'll be silently re-fetched/rebuilt the
+next time the shell loads.
 
-The bulk dump pipeline (`wikidata-arch-entities`) is the exception: building it
-downloads the ~109GB dump and runs the filter, so it must never fire from a
-shell hook. `just fetch-wikidata` builds and pins it via `--out-link` (itself
-a GC root). The dump pipeline lives in `packages`, not `checks`, so the commit
-gate never touches it.
+A shell hook can only pin what it can afford to realize on `cd`, which
+leaves out the two heaviest fetches. Building `wikidata-arch-entities`
+downloads the ~109GB dump and runs the filter; the model weights are
+gated repos that need an `HF_TOKEN` and several GB. Both are pinned by
+the recipe that fetches them — `just fetch-wikidata`, `just
+fetch-weights` — via `--out-link`, which is itself a GC root. They live
+in `packages`, not `checks`, so the commit gate never touches them.
 
 ## Lazy parameter passing
 

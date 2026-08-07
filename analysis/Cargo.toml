@@ -10,81 +10,30 @@ repository.workspace = true
 workspace = true
 
 [[bin]]
-name = "analyze"
-path = "src/bin/analyze.rs"
-
-[[bin]]
 name = "corpus-fetch"
 path = "src/bin/corpus_fetch.rs"
-required-features = ["corpus-test"]
+required-features = ["corpus"]
 
 [features]
 default = []
-testing = []
-## Corpus pipeline: manifest parsing, rate-limited downloads (for corpus-fetch
-## binary), and test suite over pre-computed analysis results.
-## Never part of `just check` or normal CI.
-corpus-test = [
+## Corpus image pipeline: manifest parsing and rate-limited downloads for the
+## `corpus-fetch` FOD binary. Not built by default, since the downloader is
+## only ever invoked from Nix.
+corpus = [
     "dep:chronoscope-integrations",
     "dep:url",
     "dep:tempfile",
+    "dep:tokio",
 ]
-## Superset: includes VLM-dependent tests (requires remote Triton with VLM).
-corpus-test-vlm = ["corpus-test"]
 
 [dependencies]
-# Internal crates
-chronoscope-core = { path = "../core" }
-
-# Serialization
 serde.workspace = true
 serde_json.workspace = true
-
-# Schema generation for OpenAPI
-schemars.workspace = true
-
-# Async runtime
-tokio.workspace = true
-
-# Error handling
 thiserror.workspace = true
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# CLI argument parsing
-clap = { version = "4", features = ["derive"] }
-
-# Base64 for image encoding
-base64.workspace = true
-
-# Async trait for trait definitions
-async-trait.workspace = true
-
-# gRPC client
-tonic = "0.14"
-tonic-prost = "0.14"
-prost = "0.14"
-
-# Hashing for fixture cache keys
-sha2 = "0.10"
-hex = "0.4"
-
-# Corpus test suite (optional, gated behind corpus-test feature)
 chronoscope-integrations = { path = "../integrations", optional = true }
 url = { workspace = true, optional = true }
-tempfile = { version = "3", optional = true } # corpus-fetch hash command (also in dev-deps for grpc tests)
-
-[build-dependencies]
-tonic-prost-build = "0.14"
-
-[dev-dependencies]
-tempfile = "3"
-libtest-mimic = "0.8"
-
-[[test]]
-name = "corpus_tests"
-path = "tests/corpus_tests.rs"
-harness = false
-required-features = ["corpus-test"]
+tempfile = { version = "3", optional = true }
+tokio = { workspace = true, optional = true }

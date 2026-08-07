@@ -48,7 +48,6 @@ chronoscope-db = { path = "../db" }
 chronoscope-integrations = { path = "../integrations" }
 
 # Analysis types
-chronoscope-analysis = { path = "../analysis" }
 
 # Serialization
 serde.workspace = true
@@ -88,7 +87,6 @@ tokio-test = "0.4"
 tempfile = "3"
 
 # Analysis types with test helpers
-chronoscope-analysis = { path = "../analysis", features = ["testing"] }
 
 # The ephemeral Postgres+PostGIS cluster harness the store fixture builds on
 # under the `postgres` feature.

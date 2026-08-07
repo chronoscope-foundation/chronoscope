@@ -29,7 +29,6 @@
 #   nix              .nix files only
 #   rust             native cargo workspace (default-members)
 #   web              chronoscope-web (wasm32 target)
-#   triton           analysis/triton/ python
 #   linux            `check` only: the x86_64-linux checks (needs a builder
 #                    for that system; outside the commit gate)
 #   analysis         chronoscope-analysis crate
@@ -58,12 +57,11 @@ _shell_for_target() {
     case "$1" in
         all|analysis) echo "analysis" ;;
         web)          echo "web" ;;
-        triton)       echo "triton" ;;
         nix)          echo "default" ;;
         rust|api|core|db|api-client|ingestion|workers|dev|integrations)
                       echo "api" ;;
         *) echo "unknown target: $1" >&2
-           echo "valid: all, nix, rust, web, triton, analysis, api, core, db, api-client, ingestion, workers, dev, integrations" >&2
+           echo "valid: all, nix, rust, web, analysis, api, core, db, api-client, ingestion, workers, dev, integrations" >&2
            return 1 ;;
     esac
 }
@@ -161,15 +159,6 @@ _cloudflare_token() {
 }
 '''
 
-# Build cached analysis-results derivation and pin as GC root.
-_build_analysis_results := '''
-_build_analysis_results() {
-    export ANALYSIS_RESULTS=$(nix build .#analysis-results --no-link --print-out-paths)
-    nix-store --realise "$ANALYSIS_RESULTS" --add-root .nix-gc-roots/analysis-results > /dev/null 2>&1 || true
-}
-'''
-
-
 # ---------------------------------------------------------------------------
 # Ground truth: hermetic checks via `nix flake check` (or focused subset).
 # Writes .claude/last-check.json on success.
@@ -224,13 +213,6 @@ check target="all":
                 ".#checks.$SYS.web-native-clippy" \
                 --no-link
             ;;
-        triton)
-            nix build \
-                ".#checks.$SYS.triton-fmt" \
-                ".#checks.$SYS.triton-lint" \
-                ".#checks.$SYS.triton-typecheck" \
-                --no-link
-            ;;
         linux)
             # x86_64-linux is what the API deploys onto, and `nix flake check`
             # only evaluates the current system, so from a darwin machine these
@@ -249,7 +231,7 @@ check target="all":
             ;;
         *)
             echo "error: \`just check\` only accepts coarse targets (hermetic)." >&2
-            echo "valid: all, nix, rust, web, triton, linux" >&2
+            echo "valid: all, nix, rust, web, linux" >&2
             echo "for per-crate iteration, use \`just clippy <crate>\` or \`just test <crate>\`." >&2
             exit 1
             ;;
@@ -288,7 +270,6 @@ fmt target="all":
               | xargs -0 nixfmt
             cargo fmt
             cargo fmt -p chronoscope-web
-            (cd analysis/triton && ruff format .)
             ;;
         nix)
             find . -name '*.nix' -not -path './.git/*' -not -path './.direnv/*' -print0 \
@@ -300,9 +281,6 @@ fmt target="all":
             ;;
         web)
             cargo fmt -p chronoscope-web
-            ;;
-        triton)
-            cd analysis/triton && ruff format .
             ;;
         *)
             cargo fmt -p chronoscope-{{ target }}
@@ -324,7 +302,6 @@ test target="all":
             cargo test
             cargo test -p chronoscope-web
             cargo test -p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4
-            (cd analysis/triton && pytest -v)
             ;;
         rust)
             cargo test
@@ -332,9 +309,6 @@ test target="all":
         web)
             cargo test -p chronoscope-web
             cargo test -p chronoscope-dev --test web --features chronoscope-dev/browser-tests -- --test-threads=4
-            ;;
-        triton)
-            cd analysis/triton && pytest -v
             ;;
         *)
             cargo test -p chronoscope-{{ target }}
@@ -366,7 +340,6 @@ clippy target="all":
             cargo clippy --all-targets --all-features -- -D warnings
             cargo clippy -p chronoscope-web --target wasm32-unknown-unknown --all-features -- -D warnings
             cargo clippy -p chronoscope-web --all-targets --all-features -- -D warnings
-            (cd analysis/triton && ruff check .)
             ;;
         rust)
             cargo clippy --all-targets --all-features -- -D warnings
@@ -377,9 +350,6 @@ clippy target="all":
             ;;
         dev)
             cargo clippy -p chronoscope-dev --all-targets --all-features -- -D warnings
-            ;;
-        triton)
-            cd analysis/triton && ruff check .
             ;;
         *)
             cargo clippy -p chronoscope-{{ target }} --all-targets --all-features -- -D warnings
@@ -695,12 +665,12 @@ fetch-weights:
     {{ _ensure_nix }}
     _ensure_nix
     echo "==> Fetching DINOv3 weights..."
-    nix build .#dinov3-weights --impure --no-link
+    nix build .#dinov3-weights --impure --out-link .nix-gc-roots/dinov3-weights
     echo "==> Fetching SAM3 weights..."
-    nix build .#sam3-weights --impure --no-link
-    echo "Done. Weights will be pinned as GC roots on next analysis/triton shell entry."
+    nix build .#sam3-weights --impure --out-link .nix-gc-roots/sam3-weights
+    echo "Done. Weights pinned as GC roots; the exports rebuild from them."
 
-# Build the ONNX exports the vision crate loads, and pin them as GC roots.
+# Build the ONNX exports the analysis crate loads, and pin them as GC roots.
 # Downstream of the weight FODs, so `fetch-weights` (and its HF_TOKEN
 # requirement) comes first. The export itself is pure: no token, no network.
 #
@@ -760,7 +730,11 @@ fetch-all:
         .#sam3-weights \
         .#corpus-images \
         --impure --no-link
-    echo "Done."
+    # Everything is realized now, so these cost a store lookup. Each recipe
+    # owns the GC root for what it fetches; delegating keeps that ownership in
+    # one place, so a weight added there can't come back unrooted here.
+    just fetch-weights
+    just fetch-corpus
 
 # Build + pin the Wikidata architectural-entities set. Runs the bulk pipeline:
 # fetch the ~109GB dump (FOD, on first run), resolve the P279 type set, and
@@ -788,8 +762,9 @@ fetch-wikidata-db size="full":
     echo "Done. Pinned at .nix-gc-roots/wikidata-facts-db-{{ size }}/facts.db"
 
 # ---------------------------------------------------------------------------
-# Corpus tooling. Live in their own world because the corpus pipeline has
-# specific feature flags and a separate analysis-results derivation.
+# Corpus tooling. The images are the development set the analysis pipeline runs
+# against; the fetcher lives in chronoscope-analysis behind the `corpus` feature
+# because it only ever runs from Nix.
 # ---------------------------------------------------------------------------
 
 # Generate / update corpus FOD hashes (fetches new URLs, skips existing).
@@ -801,30 +776,4 @@ corpus-hash:
     if [ -z "${IN_NIX_SHELL:-}" ]; then
         exec nix develop .#analysis --command just corpus-hash
     fi
-    cargo run --features corpus-test -p chronoscope-analysis --bin corpus-fetch -- hash
-
-# Run the corpus test suite (per-image + per-cluster, with known-issue tracking).
-corpus-test:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{ _ensure_nix }}
-    {{ _build_analysis_results }}
-    _ensure_nix
-    if [ -z "${IN_NIX_SHELL:-}" ]; then
-        exec nix develop .#analysis --command just corpus-test
-    fi
-    _build_analysis_results
-    cargo test --features corpus-test -p chronoscope-analysis --test corpus_tests
-
-# Run the corpus test suite with VLM (requires remote Triton).
-corpus-test-vlm:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    {{ _ensure_nix }}
-    {{ _build_analysis_results }}
-    _ensure_nix
-    if [ -z "${IN_NIX_SHELL:-}" ]; then
-        exec nix develop .#analysis --command just corpus-test-vlm
-    fi
-    _build_analysis_results
-    cargo test --features corpus-test-vlm -p chronoscope-analysis --test corpus_tests
+    cargo run --features corpus -p chronoscope-analysis --bin corpus-fetch -- hash

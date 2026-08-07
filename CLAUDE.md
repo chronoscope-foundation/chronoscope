@@ -46,24 +46,23 @@ each other beyond what they explicitly compose.
 | `default`  | rust toolchain + just + nix lint tools                           | Poking at the project, running `just <recipe>` |
 | `api`      | default + sqlite/openssl/spatialite/protobuf + WIKIDATA         | Backend / API server work                    |
 | `web`      | api + wasm toolchain + trunk + tailwind + chromium + WEB_DIST    | Frontend; running `web-dev`; browser tests   |
-| `analysis` | api + Python analysis env + weights + corpus                     | Iterating on `chronoscope-analysis` correctness |
-| `triton`   | Python analysis env + weights + rust toolchain (for schematool)  | Triton harness / serving config              |
+| `analysis` | api + onnxruntime + corpus images                                | Iterating on `chronoscope-analysis` correctness |
 | `ios`      | xcodegen + swiftformat/swiftlint/xcbeautify                      | iOS project generation & Swift lint/format   |
 | `deploy`   | gcloud + skopeo (nix: transport)                                 | Pushing the API image, rolling Cloud Run     |
 | `infra`    | opentofu (google + cloudflare providers from nixpkgs) + gcloud   | Declaring cloud resources; publishing the frontend |
 
 `just` recipes pick the smallest shell that covers their target
-(e.g. `just clippy web` enters `web`, `just check triton` runs hermetically
+(e.g. `just clippy web` enters `web`, `just check web` runs hermetically
 via Nix). The `default` shell is intentionally minimal; cargo invocations
 beyond toolchain queries will fail to link there.
 
 ### Component-specific notes
 
-Sub-CLAUDE.md files at `web/`, `api/`, `analysis/`, `analysis/triton/`,
-and `nix/` carry area-specific knowledge that auto-loads when Claude
-touches files in those subtrees. Read them when you start working in a
-new area; they cover the non-obvious bits (wasm32 target gotcha,
-OpenAPI client regen, corpus FOD layout, HF cache layout, etc.).
+Sub-CLAUDE.md files at `web/`, `api/`, and `nix/` carry area-specific
+knowledge that auto-loads when Claude touches files in those subtrees.
+Read them when you start working in a new area; they cover the
+non-obvious bits (wasm32 target gotcha, OpenAPI client regen, corpus FOD
+layout, GC root pinning, etc.).
 
 ### Fetching data
 
@@ -103,7 +102,7 @@ for commits — the complete `nix flake check`. It writes
 state at the moment of the check.
 
 **Run the full `just check` before committing.** `just check <target>`
-(rust/web/triton/nix) runs a faster scoped subset for iteration, but the
+(rust/web/nix) runs a faster scoped subset for iteration, but the
 subsets do not add up to the whole gate: the browser suite (`web-test`) is
 ordered after the heavy checks so its headless-Chrome event loop isn't
 starved, which means it runs **only** in the full `just check`. A scoped
@@ -150,7 +149,6 @@ just check rust             # workspace fmt + clippy + rustdoc + test + coverage
                             #   + both Postgres suites (db backend, api server)
 just check web              # WASM build + browser-test build + wasm clippy
                             #   (browser tests run ONLY in the full `just check`)
-just check triton           # Python ruff + mypy (pytest is `just test triton`)
 just check nix              # Nix lint (nixfmt + statix + deadnix)
 just check linux            # x86_64-linux: container boot + workspace suite
                             #   (needs a Linux builder; not part of the gate)
@@ -163,7 +161,7 @@ just test  [target]         # cargo test
 just clippy [target]        # cargo clippy
 
 # Per-crate target (test/clippy): core, db, api, api-client, ingestion,
-# workers, dev, integrations, web, triton, analysis
+# workers, dev, integrations, web, analysis
 #   e.g. just clippy core   → cargo clippy -p chronoscope-core -- -D warnings
 
 # Concrete actions
@@ -171,8 +169,6 @@ just web-dev [subset]       # integrated dev server over a facts-DB clone (defau
 just openapi                # build the raw OpenAPI spec (inspect the contract)
 just xcodegen               # splice store paths into the xcodegen spec, regenerate the Xcode project
 just corpus-hash            # add hashes for new corpus URLs
-just corpus-test            # run Rust corpus test suite
-just corpus-test-vlm        # corpus tests + VLM (needs remote Triton)
 just infra-plan             # compile the terranix modules, show what OpenTofu would change
 just infra-apply            # apply them (real cloud resources; type it yourself)
 just deploy                 # build+push the API image, deploy Cloud Run by digest

@@ -21,7 +21,6 @@ struct RGBColor: Equatable, Sendable {
 // MARK: - Region Colors
 
 /// Kelly's 22 colors of maximum contrast (1965), minus white and black = 20 colors.
-/// Matches the Python Triton implementation for consistency.
 /// Reference: https://gist.github.com/ollieglass/f6ddd781eeae1d24e391265432297538
 enum RegionColors {
     static let palette: [RGBColor] = [

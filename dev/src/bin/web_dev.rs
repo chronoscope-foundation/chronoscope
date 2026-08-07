@@ -98,7 +98,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         rp_origin: None,
         ios_app_id: None,
         apify_config: None,
-        triton: None,
         dns_resolver: permissive_dns_resolver(),
     })
     .await

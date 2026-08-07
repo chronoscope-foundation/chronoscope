@@ -12,7 +12,6 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
 use chronoscope_api::state::{
     AppState, AppStateParts, Config, FactsDatabase, ServerFactStore, ServerIds,
@@ -22,11 +21,10 @@ use chronoscope_core::submit::{Commit, commit_facts};
 use chronoscope_db::FactStoreLocations;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 use chronoscope_db::{Database, Email, Queue, ResearchUrl, UserId};
-use chronoscope_workers::analysis::AnalysisWorker;
 use chronoscope_workers::url_fetcher::{FetcherConfig, UrlFetcherWorker};
 use chronoscope_workers::{
-    ApifyConfig, HttpClient, IntegrationName, IntegrationRegistry, NoOpEnqueuer, RetryConfig,
-    UrlEnqueuer, WorkerConfig, create_registry, run,
+    ApifyConfig, HttpClient, IntegrationName, IntegrationRegistry, RetryConfig, UrlEnqueuer,
+    WorkerConfig, create_registry, run,
 };
 use dropshot::{ApiDescription, ConfigDropshot, HttpServerStarter};
 use slog::info;
@@ -340,10 +338,6 @@ pub struct DevServerConfig {
     /// If provided, an Instagram worker will be spawned.
     pub apify_config: Option<ApifyConfig>,
 
-    /// Optional: Triton service for image analysis.
-    /// If provided, an analysis worker will be spawned.
-    pub triton: Option<Arc<dyn TritonService>>,
-
     /// DNS resolver for URL security validation.
     /// Use `default_dns_resolver()` for system DNS or `permissive_dns_resolver()`
     /// for offline environments (e.g., tests).
@@ -443,49 +437,6 @@ fn spawn_url_fetcher_worker(
     WorkerTask { worker_id, handle }
 }
 
-/// Spawn an analysis worker in a background task.
-fn spawn_analysis_worker(
-    worker_id: &str,
-    triton: Arc<dyn TritonService>,
-    ctx: &WorkerContext,
-) -> WorkerTask {
-    let worker_id = worker_id.to_string();
-    let queue = ctx.db.analysis_queue.clone();
-    let worker = AnalysisWorker::new(triton, ctx.db.clone(), ctx.media_store.clone());
-    let enqueuer = NoOpEnqueuer;
-
-    let worker_config = WorkerConfig {
-        worker_id: worker_id.clone(),
-        batch_size: 1, // Process one at a time (scale via multiple workers)
-        stale_after: Duration::from_mins(10), // Analysis can take longer
-        idle_backoff: ctx.idle_backoff,
-    };
-
-    let retry_config = ctx.retry_config.clone();
-    let shutdown_rx = ctx.shutdown_rx.clone();
-    let log = ctx.log.clone();
-
-    let handle = tokio::spawn({
-        let worker_id = worker_id.clone();
-        async move {
-            info!(log, "Starting analysis worker"; "worker_id" => &worker_id);
-            if let Err(e) = run(
-                queue,
-                worker,
-                enqueuer,
-                worker_config,
-                retry_config,
-                shutdown_rx,
-            )
-            .await
-            {
-                slog::error!(log, "Analysis worker error"; "worker_id" => &worker_id, "error" => %e);
-            }
-        }
-    });
-    WorkerTask { worker_id, handle }
-}
-
 /// Start the development server with the given configuration.
 ///
 /// This sets up:
@@ -570,16 +521,6 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
             &worker_ctx,
         ));
         info!(log, "Instagram worker enabled with Apify integration");
-    }
-
-    // Spawn analysis worker if Triton service is provided
-    if let Some(triton) = config.triton {
-        worker_handles.push(spawn_analysis_worker(
-            "analysis-worker",
-            triton,
-            &worker_ctx,
-        ));
-        info!(log, "Analysis worker enabled");
     }
 
     info!(log, "Started workers"; "count" => worker_handles.len());

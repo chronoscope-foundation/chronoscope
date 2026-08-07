@@ -16,7 +16,6 @@ record-fixtures = []
 
 [dependencies]
 # Internal crates
-chronoscope-analysis = { path = "../analysis" }
 chronoscope-core = { path = "../core" }
 chronoscope-db = { path = "../db" }
 chronoscope-integrations = { path = "../integrations" }
@@ -63,5 +62,3 @@ mp4parse = "0.17"
 tempfile = "3"
 # Enable testing utilities (MockHttpClient) for unit tests
 chronoscope-integrations = { path = "../integrations", features = ["testing"] }
-# Enable MockTritonService for analysis worker tests
-chronoscope-analysis = { path = "../analysis", features = ["testing"] }

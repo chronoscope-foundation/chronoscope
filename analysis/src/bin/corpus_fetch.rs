@@ -12,7 +12,7 @@
 //!    temp directory, computes the recursive NAR hash via `nix hash path`,
 //!    and writes/updates corpus-hashes.json. Skips already-hashed URLs.
 //!
-//! Requires the `corpus-test` feature.
+//! Requires the `corpus` feature.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -108,8 +108,8 @@ fn run_hash() -> ExitCode {
         }
     };
 
-    // Output path is always in the analysis crate directory (not next to CORPUS_MANIFEST,
-    // which may point into the read-only Nix store).
+    // Written beside this crate's manifest. CORPUS_MANIFEST can point into the
+    // read-only store, so it is not a candidate.
     let hashes_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("corpus-hashes.json");
 
     // Load existing hashes.
@@ -246,11 +246,11 @@ fn nix_hash_path(path: &Path) -> Result<String, CorpusError> {
         .args(["hash", "path", "--sri", "--type", "sha256"])
         .arg(path)
         .output()
-        .map_err(|e| CorpusError::Pipeline(format!("failed to run `nix hash path`: {e}")))?;
+        .map_err(|e| CorpusError::Nix(format!("failed to run `nix hash path`: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CorpusError::Pipeline(format!(
+        return Err(CorpusError::Nix(format!(
             "`nix hash path` failed: {stderr}"
         )));
     }

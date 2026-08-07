@@ -120,10 +120,9 @@ let
   # the Chrome-driven tests with capped parallelism.
   #
   # Default features, deliberately — do not harmonize this with clippy's
-  # `--all-features`. Three features gate suites that must not run here:
-  # `browser-tests` needs the box to itself, `corpus-test` needs the fetched
-  # corpus, and `record-fixtures` hits the real network. Linting everything is
-  # free; running everything is not.
+  # `--all-features`. Two features gate suites that must not run here:
+  # `browser-tests` needs the box to itself, and `record-fixtures` hits the
+  # real network. Linting everything is free; running everything is not.
   #
   # crane's cargoLlvmCov sets installPhaseCommand="" and expects the command to
   # write $out; --output-path $out puts the LCOV report there.
