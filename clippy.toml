@@ -14,6 +14,7 @@ doc-valid-idents = [
     "IPv6",
     "MapLibre",
     "MediaWiki",
+    "OAuth",
     "OpenAPI",
     "OpenFreeMap",
     "OpenHistoricalMap",

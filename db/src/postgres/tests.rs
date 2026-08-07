@@ -7,11 +7,21 @@
 //! Nothing is ignored here beyond the suite-wide `SameEvent` cases the macro
 //! bakes in.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
+
+use sqlx::ConnectOptions;
+use tokio::sync::mpsc;
+
 use super::harness::{
     IsolationLevel, fresh_pg_store, fresh_pg_store_at_default_isolation,
     fresh_unmigrated_database_url,
 };
-use super::{PostgresFactStore, PostgresFactStoreError};
+use super::{
+    AccessToken, AccessTokenSource, PostgresAuth, PostgresFactStore, PostgresFactStoreError,
+    TokenFetchError,
+};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlImageId};
 use chronoscope_core::grammar::ids::FactId;
 use chronoscope_core::store::FactStore;
@@ -48,7 +58,7 @@ async fn connect_refuses_an_unmigrated_database_and_creates_nothing_in_it() -> T
     use sqlx::Connection;
 
     let url = fresh_unmigrated_database_url().await?;
-    let refusal = match PostgresFactStore::connect(&url).await {
+    let refusal = match PostgresFactStore::connect(&url, PostgresAuth::ConnectionString).await {
         Err(crate::DbError::Config(message)) => message,
         Err(other) => return Err(format!("expected a schema refusal, got: {other}").into()),
         Ok(store) => {
@@ -82,9 +92,10 @@ async fn connect_refuses_an_unmigrated_database_and_creates_nothing_in_it() -> T
 #[tokio::test]
 async fn connect_accepts_a_database_the_migrating_constructor_prepared() -> TestResult {
     let url = fresh_unmigrated_database_url().await?;
-    let loader = PostgresFactStore::connect_and_migrate(&url).await?;
+    let loader =
+        PostgresFactStore::connect_and_migrate(&url, PostgresAuth::ConnectionString).await?;
     loader.close().await;
-    let server = PostgresFactStore::connect(&url).await?;
+    let server = PostgresFactStore::connect(&url, PostgresAuth::ConnectionString).await?;
     server.close().await;
     Ok(())
 }
@@ -196,4 +207,109 @@ async fn read_views_pin_read_committed_despite_a_stricter_database_default() -> 
         );
     }
     Ok(())
+}
+
+/// A token issuer under the test's control. The cluster trusts the peer on its
+/// socket, so what it hands over is checked by reading it back off the pool
+/// rather than by a handshake.
+#[derive(Debug)]
+struct CountedTokens {
+    fetches: AtomicU32,
+    /// Dropped with the source, so a case can tell when its last holder let go.
+    _held: mpsc::UnboundedSender<()>,
+}
+
+/// A token source and the signal its last holder dropping closes.
+fn counted_tokens() -> (Arc<CountedTokens>, mpsc::UnboundedReceiver<()>) {
+    let (held, released) = mpsc::unbounded_channel();
+    let tokens = Arc::new(CountedTokens {
+        fetches: AtomicU32::new(0),
+        _held: held,
+    });
+    (tokens, released)
+}
+
+/// The value the source below issues. Alphanumeric, so it survives a round trip
+/// through a URL's percent encoding unchanged.
+const TEST_TOKEN: &str = "issuedtokenvalue";
+
+#[async_trait::async_trait]
+impl AccessTokenSource for CountedTokens {
+    async fn fetch(&self) -> Result<AccessToken, TokenFetchError> {
+        self.fetches.fetch_add(1, Ordering::Relaxed);
+        Ok(AccessToken::new(TEST_TOKEN, Duration::from_secs(3600))?)
+    }
+}
+
+/// The seam a deployment arrives through, which no other case reaches: naming
+/// [`PostgresAuth::IamTokens`] has to produce a pool whose handshakes carry a
+/// token this store fetched, and leave a refresher holding that pool so the next
+/// token lands before this one expires.
+///
+/// Everything downstream is asserted on a virtual clock against a lazily-built
+/// pool, so without this a store that ignored the token source, or that built the
+/// pool and started nothing, would pass the whole suite and then fail an hour
+/// into a real deployment.
+#[tokio::test]
+async fn an_iam_authenticated_store_builds_its_pool_from_a_fetched_token() -> TestResult {
+    let url = fresh_unmigrated_database_url().await?;
+    let (source, _released) = counted_tokens();
+    let store =
+        PostgresFactStore::connect_and_migrate(&url, PostgresAuth::IamTokens(source.clone()))
+            .await?;
+
+    assert_eq!(
+        source.fetches.load(Ordering::Relaxed),
+        1,
+        "the store must build its pool from a token it asked the source for"
+    );
+    assert_eq!(
+        store.pool().connect_options().to_url_lossy().password(),
+        Some(TEST_TOKEN),
+        "the pool's next handshake must carry the fetched token as its password"
+    );
+    assert!(
+        store.credentials().reporter_alive(),
+        "the store must leave a refresher keeping its token fresh"
+    );
+    assert!(
+        store.credentials().reported().is_none(),
+        "a store that just connected has lost nothing"
+    );
+
+    store.close().await;
+    Ok(())
+}
+
+/// A refused preparation must close the pool it opened. Under IAM the refresher
+/// holds a pool handle of its own, so dropping the pool closes nothing: the
+/// session stays open on the server and a task keeps fetching tokens for a store
+/// that never existed, one of each per boot attempt. Closing ends both, which
+/// shows up here as the refresher letting go of the token source.
+#[tokio::test]
+async fn a_refused_connect_closes_the_pool_it_opened() -> TestResult {
+    let url = fresh_unmigrated_database_url().await?;
+    let (source, mut released) = counted_tokens();
+    match PostgresFactStore::connect(&url, PostgresAuth::IamTokens(source.clone())).await {
+        Err(crate::DbError::Config(_)) => {}
+        Err(other) => return Err(format!("expected a schema refusal, got: {other}").into()),
+        Ok(store) => {
+            store.close().await;
+            return Err("connect must refuse a database carrying no fact schema".into());
+        }
+    }
+
+    // The refresher is the only other holder, so this resolves the moment its
+    // task ends. The bound is generous real time: a refresher the close reached
+    // never approaches it, and one it did not would otherwise hang the suite.
+    drop(source);
+    match tokio::time::timeout(Duration::from_secs(30), released.recv()).await {
+        Ok(None) => Ok(()),
+        Ok(Some(())) => Err("nothing sends on this channel".into()),
+        Err(_) => Err(
+            "the refused connect left its refresher running, so the pool it opened \
+             was dropped instead of closed and its session is still on the server"
+                .into(),
+        ),
+    }
 }

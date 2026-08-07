@@ -20,8 +20,9 @@ workspace = true
 test-support = ["dep:tempfile"]
 
 # Postgres fact-store backend. Off by default — the SQLite backend is the only
-# one wired into `Database`, and enabling this pulls sqlx's postgres driver in.
-postgres = ["sqlx/postgres"]
+# one wired into `Database`, and enabling this pulls sqlx's postgres driver in,
+# plus the HTTP client Cloud SQL IAM authentication fetches its tokens with.
+postgres = ["sqlx/postgres", "dep:reqwest"]
 
 [dependencies]
 # Internal crates
@@ -49,6 +50,7 @@ url.workspace = true
 chrono.workspace = true
 strum.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 # Async traits and bytes (for MediaStore)
 async-trait = "0.1"
@@ -58,9 +60,15 @@ bytes.workspace = true
 # the only non-test code that touches it.
 tempfile = { version = "3", optional = true }
 
+# Cloud SQL IAM tokens come from the instance metadata server, which answers
+# plain HTTP on a link-local address, so no TLS backend is asked for here.
+reqwest = { version = "0.12", default-features = false, features = ["json"], optional = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
+# `start_paused` — the IAM refresh schedule is asserted on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
 proptest = "1.4"
 # The backend-agnostic FactStore conformance suite.
 chronoscope-core = { path = "../core", features = ["sqlx", "test-support"] }

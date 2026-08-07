@@ -4,6 +4,7 @@
 //! It is used by both the API server and background workers.
 
 mod common;
+pub mod credentials;
 pub mod error;
 pub mod media_store;
 pub mod models;
@@ -29,13 +30,17 @@ use tokio::sync::watch;
 use chronoscope_integrations::IntegrationRegistry;
 
 pub use common::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
+pub use credentials::{CredentialWatch, CredentialsLost};
 pub use error::{DbError, DbResult, is_unique_violation};
 pub use models::{
     FollowedUrl, Media, MediaData, MediaSlot, Page, PageData, ResearchUrl, ResearchUrlWithResolved,
     ResolvedContent, ResolvedTarget, User,
 };
 #[cfg(feature = "postgres")]
-pub use postgres::{PostgresFactStore, PostgresFactStoreError};
+pub use postgres::{
+    AccessToken, AccessTokenSource, MalformedToken, MetadataClientError, MetadataServerTokens,
+    MetadataTokenError, PostgresAuth, PostgresFactStore, PostgresFactStoreError, TokenFetchError,
+};
 pub use queue::{ANALYSIS_QUEUE, Queue, QueueConfig, QueueItem, QueueQueries, url_queue_config};
 pub use sqlite::{
     FACTS_CODEC_VERSION, FactStoreLocations, FactsFileError, SqliteFactStore, SqliteFactStoreError,

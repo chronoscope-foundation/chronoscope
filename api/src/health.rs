@@ -35,7 +35,17 @@ fn unavailable(e: impl std::fmt::Debug) -> HttpError {
 /// surfaces here instead of in the next request handler. Reading the frontier
 /// takes a transaction spanning the frozen base and the writable overlay, which
 /// is what makes the fact-store half of the probe real.
-async fn observe(state: &AppState) -> Result<(), HttpError> {
+///
+/// `pub(crate)` so the suite can read the refusal itself: the endpoint answers
+/// with a bare status, and the reason a probe failed is only visible here.
+pub(crate) async fn observe(state: &AppState) -> Result<(), HttpError> {
+    // A pool whose credential is gone still answers from the connections it has
+    // open, so the two checks below would pass while the instance is minutes
+    // from serving nothing. The process shuts itself down on that report; this
+    // is what tells a probe arriving during the drain to route elsewhere.
+    if let Some(loss) = state.credentials.reported() {
+        return Err(unavailable(loss));
+    }
     state.db.ping().await.map_err(unavailable)?;
 
     let mut view = state.facts.now().await.map_err(unavailable)?;

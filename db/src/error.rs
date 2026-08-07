@@ -38,6 +38,13 @@ pub enum DbError {
 
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// The first IAM database access token could not be fetched, so the pool has
+    /// no credential to hand its handshakes. Fatal where a later refresh failure
+    /// is not: nothing is connected yet to keep working.
+    #[cfg(feature = "postgres")]
+    #[error("Database access token error: {0}")]
+    DatabaseToken(crate::postgres::TokenFetchError),
 }
 
 pub type DbResult<T> = Result<T, DbError>;

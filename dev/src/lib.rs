@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use chronoscope_analysis::TritonService;
 use chronoscope_api::jwt::JwtConfig;
-use chronoscope_api::state::{AppState, Config, FactsDatabase, ServerFactStore, ServerIds};
+use chronoscope_api::state::{
+    AppState, AppStateParts, Config, FactsDatabase, ServerFactStore, ServerIds,
+};
 use chronoscope_core::submit::{Commit, commit_facts};
 #[cfg(not(feature = "postgres"))]
 use chronoscope_db::FactStoreLocations;
@@ -269,7 +271,15 @@ async fn open_facts(source: &FactsDbSource) -> chronoscope_db::DbResult<ServerFa
             "the Postgres fact store connects to a URL, so the mounted SQLite artifact at \
              {base} has no meaning here; pass FactsDbSource::Writable with a connection URL"
         ))),
-        FactsDbSource::Writable(url) => ServerFactStore::connect_and_migrate(url).await,
+        FactsDbSource::Writable(url) => {
+            // The dev server reaches a database it was handed, so the URL and
+            // libpq's environment carry whatever credential there is.
+            ServerFactStore::connect_and_migrate(
+                url,
+                chronoscope_db::PostgresAuth::ConnectionString,
+            )
+            .await
+        }
     }
 }
 
@@ -660,15 +670,19 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
     let facts_for_shutdown = facts.clone();
 
     // Create AppState with our shared database, media store, and fact store
-    let app_state = AppState::new(
-        db.as_ref().clone(),
-        api_config,
-        jwt_config,
-        config.dns_resolver,
+    let app_state = AppState::new(AppStateParts {
+        db: db.as_ref().clone(),
+        config: api_config,
+        jwt: jwt_config,
+        dns_resolver: config.dns_resolver,
         media_store,
         facts,
+        // Every fact store the dev server opens authenticates from its own
+        // configuration, a file path or a connection URL, so there is no
+        // credential to lose.
+        credentials: chronoscope_db::CredentialWatch::never(),
         image_media,
-    )
+    })
     .await
     .map_err(|e| format!("Failed to create app state: {e}"))?;
     let app_state = Arc::new(app_state);

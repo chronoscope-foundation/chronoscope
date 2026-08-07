@@ -463,5 +463,10 @@ async fn fresh_pg_store_with(
     }
     close(admin).await;
     let pool = connect_pool(&cluster.socket_path, &dbname).await?;
-    Ok((PostgresFactStore::new(pool), ()))
+    // The cluster trusts the peer on its socket, so the store holds a credential
+    // nothing can take away.
+    Ok((
+        PostgresFactStore::new(pool, crate::CredentialWatch::never()),
+        (),
+    ))
 }

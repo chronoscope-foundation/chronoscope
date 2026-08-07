@@ -5,6 +5,8 @@
 //! stop passing. The saturated case pins the other half of that judgment, that
 //! a full pool is a different answer from a dead one.
 
+use std::time::Duration;
+
 use super::*;
 
 #[tokio::test]
@@ -35,6 +37,39 @@ async fn health_reports_unavailable_when_the_fact_store_is_gone() -> TestResult 
     let resp = ctx.get("/health").await?;
     assert_eq!(resp.status(), 503);
     Ok(())
+}
+
+/// What the issuer last said, so the report can be found again in the refusal.
+const ISSUER_REFUSAL: &str = "the metadata server had no token for this account";
+
+/// A pool whose credential is gone keeps answering from the connections it holds
+/// open, so every other check in the probe passes while the instance is minutes
+/// from serving nothing. The report is the only thing that sees it coming.
+#[tokio::test]
+async fn health_refuses_while_the_credential_is_reported_gone() -> TestResult {
+    let ctx = TestContext::with_lost_credentials(CredentialsLost {
+        attempts: 12,
+        retried_for: Duration::from_secs(720),
+        last_error: ISSUER_REFUSAL.to_owned(),
+    })
+    .await?;
+
+    let resp = ctx.get("/health").await?;
+    assert_eq!(resp.status(), 503);
+
+    // The status is the whole contract to a client, so the reason is asserted
+    // where it actually goes.
+    match crate::health::observe(&ctx.app_state).await {
+        Ok(()) => Err("the probe passed with the credential reported gone".into()),
+        Err(refused) => {
+            assert!(
+                refused.internal_message.contains(ISSUER_REFUSAL),
+                "the refusal must carry what the issuer last said, got: {}",
+                refused.internal_message
+            );
+            Ok(())
+        }
+    }
 }
 
 /// The instance under the heaviest load is the one whose pool runs dry, so a

@@ -2,7 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chronoscope_api::jwt::JwtConfig;
-use chronoscope_api::state::{AppState, Config, ServerFactStore, default_dns_resolver};
+use chronoscope_api::state::{
+    AppState, AppStateParts, Config, ServerFactStore, default_dns_resolver,
+};
 use chronoscope_db::Database;
 #[cfg(not(feature = "postgres"))]
 use chronoscope_db::FactStoreLocations;
@@ -10,7 +12,7 @@ use dropshot::{
     ApiDescription, ConfigDropshot, ConfigLogging, ConfigLoggingLevel, HttpServer,
     HttpServerStarter,
 };
-use slog::{Logger, info, warn};
+use slog::{Logger, error, info, warn};
 use tokio::signal::unix::{SignalKind, signal};
 
 /// How long in-flight requests get to finish once shutdown is asked for.
@@ -95,39 +97,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .to_string(),
     ))
     .await?;
+    // A facts file this process opened lasts as long as the process, so there is
+    // no credential to lose.
+    #[cfg(not(feature = "postgres"))]
+    let credentials = chronoscope_db::CredentialWatch::never();
     // Postgres: one writable database, so the configured location is a
     // connection URL. `connect` requires a schema `ingest build-db` already
     // migrated, so a location naming the wrong database fails at boot instead of
     // growing a fact schema there.
+    //
+    // How it authenticates is stated, never inferred from the absent password:
+    // the same credential-free URL describes a trust-authenticated local socket
+    // and a Cloud SQL instance reached with IAM tokens.
     #[cfg(feature = "postgres")]
-    let facts = ServerFactStore::connect(config.facts_database.as_str()).await?;
+    let facts = ServerFactStore::connect(
+        config.facts_database.as_str(),
+        chronoscope_db::PostgresAuth::ConnectionString,
+    )
+    .await?;
+    #[cfg(feature = "postgres")]
+    let credentials = facts.credentials().clone();
     let image_media = Arc::new(std::collections::HashMap::new());
 
     // Keep a handle to the fact store for graceful shutdown; the copy handed to
     // the server shares the same `Arc`-backed pool.
     let facts_for_shutdown = facts.clone();
 
-    // When embedded-media feature is enabled (e.g., dev builds), we need a media store.
-    // Production builds without the feature don't need one.
-    #[cfg(feature = "embedded-media")]
-    let app_state = {
-        use chronoscope_db::media_store::InMemoryMediaStore;
-        Arc::new(
-            AppState::new(
-                db.clone(),
-                config,
-                jwt,
-                dns_resolver,
-                std::sync::Arc::new(InMemoryMediaStore::new()),
-                facts,
-                image_media,
-            )
-            .await?,
-        )
-    };
-    #[cfg(not(feature = "embedded-media"))]
-    let app_state =
-        Arc::new(AppState::new(db.clone(), config, jwt, dns_resolver, facts, image_media).await?);
+    let app_state = Arc::new(
+        AppState::new(AppStateParts {
+            db: db.clone(),
+            config,
+            jwt,
+            dns_resolver,
+            // Dev builds serve media from memory at /media/{key}; production
+            // points browsers at the CDN and needs no store.
+            #[cfg(feature = "embedded-media")]
+            media_store: Arc::new(chronoscope_db::media_store::InMemoryMediaStore::new()),
+            facts,
+            credentials: credentials.clone(),
+            image_media,
+        })
+        .await?,
+    );
 
     // Configure Dropshot
     let config_dropshot = ConfigDropshot {
@@ -155,6 +166,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         _ = sigterm.recv() => {
             info!(log, "SIGTERM received; draining in-flight requests");
             drain(server, &log).await
+        }
+        // A pool reopens reaped connections with whatever credential is current,
+        // so one that cannot be renewed takes the instance's ability to serve
+        // with it about half an hour later. Shutting down on the report turns
+        // that slow, invisible failure into a container the runtime replaces.
+        loss = credentials.lost() => {
+            let reason = loss.to_string();
+            error!(log, "the fact store's database credential can no longer be renewed; \
+                draining and exiting so the runtime replaces this instance";
+                "reason" => &reason);
+            // The lost credential is the diagnosis; a close failing on the way
+            // out would only mask it. Exiting on the reason itself is what makes
+            // the stop read as a fault to whatever restarts the process.
+            let _ = drain(server, &log).await;
+            Err(reason)
         }
     };
 

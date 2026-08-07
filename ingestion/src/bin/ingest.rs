@@ -210,10 +210,23 @@ async fn load_postgres(
 ) -> Result<IngestStats> {
     // A Postgres URL can carry a password, so the context names the store rather
     // than the location.
-    let store = chronoscope_db::PostgresFactStore::connect_and_migrate(database_url)
-        .await
-        .context("opening the Postgres fact store")?;
-    let result = ingest_dump(&store, input, run, recorded_at, limit).await;
+    let store = chronoscope_db::PostgresFactStore::connect_and_migrate(
+        database_url,
+        chronoscope_db::PostgresAuth::ConnectionString,
+    )
+    .await
+    .context("opening the Postgres fact store")?;
+    // A load outlives any one IAM token, and a pool whose token expired opens no
+    // further connections, so the credential going gives up here with the
+    // issuer's reason. Re-running resumes: the pass already committed stands, and
+    // stopping at the report beats discovering it as a handshake failure
+    // somewhere in the middle of the next batch.
+    let result = tokio::select! {
+        result = ingest_dump(&store, input, run, recorded_at, limit) => result,
+        loss = store.credentials().lost() => Err(anyhow::anyhow!(
+            "the load stopped part way: {loss}"
+        )),
+    };
     store.close().await;
     result
 }

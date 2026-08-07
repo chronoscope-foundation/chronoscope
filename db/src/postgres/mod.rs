@@ -43,6 +43,7 @@
 //! other backends.
 
 mod error;
+mod iam;
 mod maintain;
 mod queries;
 mod read;
@@ -77,6 +78,10 @@ use chronoscope_core::store::{
 use chronoscope_core::submit::{FactLookup, StoredCommit, StoredFact, SubmitResult};
 
 pub use self::error::PostgresFactStoreError;
+pub use self::iam::{
+    AccessToken, AccessTokenSource, MalformedToken, MetadataClientError, MetadataServerTokens,
+    MetadataTokenError, PostgresAuth, TokenFetchError,
+};
 
 use crate::common::convert::{i64_to_u64, u64_to_i64};
 use crate::common::ids::{SqlEntityId, SqlEventId, SqlIds, SqlImageId};
@@ -84,6 +89,7 @@ use crate::common::storage::{
     commit_to_json, external_ref_key, facet_columns, fact_to_json, kind_tag, named_entity,
     referenced_entity, result_to_json, sourced_image, subject_rows, witness_row,
 };
+use crate::credentials::CredentialWatch;
 
 use self::error::sql;
 use self::read::{FacetKey, ReadBound};
@@ -103,6 +109,10 @@ type Error = PostgresFactStoreError;
 #[derive(Debug, Clone)]
 pub struct PostgresFactStore {
     pool: PgPool,
+    /// Where the pool's IAM refresher reports a credential it can no longer
+    /// renew. The process that owns the store watches this and shuts down on a
+    /// report, since a pool past its token's expiry opens no more connections.
+    credentials: CredentialWatch,
 }
 
 /// Connections the fact-store pool holds. A read view owns one for its whole
@@ -129,8 +139,8 @@ impl PostgresFactStore {
     /// Wrap a pool over an already-migrated fact-store database. Crate-internal
     /// because the migration precondition is unenforced; [`Self::connect`] and
     /// [`Self::connect_and_migrate`] establish it.
-    pub(crate) fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub(crate) fn new(pool: PgPool, credentials: CredentialWatch) -> Self {
+        Self { pool, credentials }
     }
 
     /// Connect to a fact-store database that already carries the schema, and
@@ -145,16 +155,10 @@ impl PostgresFactStore {
     /// # Errors
     /// Returns [`DbError::Config`](crate::DbError::Config) if the database
     /// carries no fact schema or one older than this binary's migrations, and
-    /// [`DbError`](crate::DbError) if the connection fails.
-    pub async fn connect(url: &str) -> crate::DbResult<Self> {
-        let pool = connect_pool(url).await?;
-        if let Err(absent) = require_migrated(&pool).await {
-            // Drop the pool inside the caller's runtime, so its connections end
-            // their server sessions before the refusal propagates.
-            pool.close().await;
-            return Err(absent);
-        }
-        Ok(Self::new(pool))
+    /// [`DbError`](crate::DbError) if the connection or the first IAM token
+    /// fails.
+    pub async fn connect(url: &str, auth: PostgresAuth) -> crate::DbResult<Self> {
+        Self::prepared(url, auth, require_migrated).await
     }
 
     /// Connect to the fact-store database at `url`, apply the fact schema's
@@ -167,12 +171,44 @@ impl PostgresFactStore {
     /// privileged to do so.
     ///
     /// # Errors
-    /// Returns [`DbError`](crate::DbError) if the connection or a migration
-    /// fails.
-    pub async fn connect_and_migrate(url: &str) -> crate::DbResult<Self> {
-        let pool = connect_pool(url).await?;
-        MIGRATOR.run(&pool).await?;
-        Ok(Self::new(pool))
+    /// Returns [`DbError`](crate::DbError) if the connection, the first IAM
+    /// token, or a migration fails.
+    pub async fn connect_and_migrate(url: &str, auth: PostgresAuth) -> crate::DbResult<Self> {
+        Self::prepared(url, auth, run_migrations).await
+    }
+
+    /// The body both constructors share: open the pool, let `prepare` have the
+    /// database, and give the store back over it.
+    ///
+    /// A `prepare` that fails closes the pool before its error propagates, so
+    /// every server session the attempt opened ends inside the caller's runtime
+    /// and an IAM refresher ends its task. Dropping would do neither: the
+    /// refresher holds a pool handle of its own, so the last strong reference
+    /// outlives this frame, and a caller retrying its boot leaks a session and a
+    /// task per attempt. Both constructors run through here so the two paths
+    /// cannot drift on that.
+    async fn prepared(
+        url: &str,
+        auth: PostgresAuth,
+        prepare: impl AsyncFnOnce(&PgPool) -> crate::DbResult<()>,
+    ) -> crate::DbResult<Self> {
+        let (pool, credentials) = connect_pool(url, auth).await?;
+        if let Err(refused) = prepare(&pool).await {
+            pool.close().await;
+            return Err(refused);
+        }
+        Ok(Self::new(pool, credentials))
+    }
+
+    /// Where the pool's credential loss is reported.
+    ///
+    /// A [`PostgresAuth::IamTokens`] pool holds a credential that expires, and
+    /// the refresher gives up once it can no longer renew it. Whoever runs the
+    /// process is expected to watch this: a report means the pool serves only
+    /// what it has open, so the work in flight should finish and the process
+    /// should exit. Every other authentication reports nothing, ever.
+    pub fn credentials(&self) -> &CredentialWatch {
+        &self.credentials
     }
 
     /// The underlying pool, for the harness smoke test.
@@ -200,9 +236,23 @@ fn pool_options() -> PgPoolOptions {
 }
 
 /// The fact-store pool, shared by both constructors so a store's connection
-/// budget doesn't depend on which one built it.
-async fn connect_pool(url: &str) -> Result<PgPool, sqlx::Error> {
-    pool_options().connect(url).await
+/// budget doesn't depend on which one built it, and so a long load authenticates
+/// the same way a long-running server does.
+async fn connect_pool(url: &str, auth: PostgresAuth) -> crate::DbResult<(PgPool, CredentialWatch)> {
+    match auth {
+        PostgresAuth::ConnectionString => {
+            Ok((pool_options().connect(url).await?, CredentialWatch::never()))
+        }
+        PostgresAuth::IamTokens(source) => {
+            iam::pool_with_refreshed_tokens(pool_options(), url, source).await
+        }
+    }
+}
+
+/// Bring the fact schema up to this binary's migrations, creating it if the
+/// database carries none.
+async fn run_migrations(pool: &PgPool) -> crate::DbResult<()> {
+    Ok(MIGRATOR.run(pool).await?)
 }
 
 /// Refuse a database that this binary's migrations have not all been applied to.

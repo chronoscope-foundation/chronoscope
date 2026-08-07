@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chronoscope_core::store::{EntityIdOf, EventIdOf, FactStore, ImageIdOf};
-use chronoscope_db::Database;
 #[cfg(feature = "postgres")]
 use chronoscope_db::PostgresFactStore as PickedFactStore;
 #[cfg(not(feature = "postgres"))]
 use chronoscope_db::SqliteFactStore as PickedFactStore;
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::MediaStore;
+use chronoscope_db::{CredentialWatch, Database};
 use dropshot::HttpError;
 use hickory_resolver::Resolver;
 use hickory_resolver::name_server::TokioConnectionProvider;
@@ -358,9 +358,37 @@ pub struct AppState {
     /// [`ServerFactStore`] backend over its own pool, a separate database from
     /// the app `db` above.
     pub facts: ServerFactStore,
+    /// Where the loss of a credential this process needs is reported.
+    ///
+    /// A fact-store pool authenticated with short-lived tokens keeps answering
+    /// from the connections it has open once renewal stops working, so both
+    /// store checks in the readiness probe can pass while the instance is
+    /// minutes from serving nothing. Taken from the store at startup, so the
+    /// probe and the shutdown path read the same signal.
+    pub credentials: CredentialWatch,
     /// Resolved media keys for every fact-store image, keyed by image id. The
     /// entity read path serves thumbnails and detail images from these keys; an
     /// image absent from the map is unresolved and contributes no thumbnail/tile.
+    pub image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
+}
+
+/// Everything [`AppState`] is assembled from: its fields, minus the WebAuthn
+/// setup that [`AppState::new`] derives from `config`.
+///
+/// Named fields because the list is long enough that positional arguments stop
+/// being readable, and because the one field a caller can get wrong,
+/// `credentials`, reads next to the `facts` it was taken from. The
+/// `embedded-media` field is `cfg`'d here instead of at every call site, so a
+/// caller states its parts once whichever way the feature lands.
+pub struct AppStateParts {
+    pub db: Database,
+    pub config: Config,
+    pub jwt: JwtConfig,
+    pub dns_resolver: Box<dyn DnsResolver>,
+    #[cfg(feature = "embedded-media")]
+    pub media_store: Arc<dyn MediaStore>,
+    pub facts: ServerFactStore,
+    pub credentials: CredentialWatch,
     pub image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
 }
 
@@ -370,34 +398,27 @@ impl AppState {
     /// # Errors
     /// Returns `AppStateError` if `WebAuthn` initialization fails.
     #[allow(clippy::unused_async)]
-    pub async fn new(
-        db: Database,
-        config: Config,
-        jwt: JwtConfig,
-        dns_resolver: Box<dyn DnsResolver>,
-        #[cfg(feature = "embedded-media")] media_store: Arc<dyn MediaStore>,
-        facts: ServerFactStore,
-        image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
-    ) -> Result<Self, AppStateError> {
-        let rp_origin = Url::parse(&config.rp_origin)
+    pub async fn new(parts: AppStateParts) -> Result<Self, AppStateError> {
+        let rp_origin = Url::parse(&parts.config.rp_origin)
             .map_err(|e| AppStateError::InvalidOrigin(format!("{e}")))?;
 
-        let webauthn = WebauthnBuilder::new(&config.rp_id, &rp_origin)
+        let webauthn = WebauthnBuilder::new(&parts.config.rp_id, &rp_origin)
             .map_err(|e| AppStateError::WebAuthn(format!("{e}")))?
             .rp_name("Chronoscope")
             .build()
             .map_err(|e| AppStateError::WebAuthn(format!("{e}")))?;
 
         Ok(Self {
-            db,
-            jwt,
+            db: parts.db,
+            jwt: parts.jwt,
             webauthn,
-            dns_resolver,
-            config,
+            dns_resolver: parts.dns_resolver,
+            config: parts.config,
             #[cfg(feature = "embedded-media")]
-            media_store,
-            facts,
-            image_media,
+            media_store: parts.media_store,
+            facts: parts.facts,
+            credentials: parts.credentials,
+            image_media: parts.image_media,
         })
     }
 }

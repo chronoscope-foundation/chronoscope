@@ -25,8 +25,8 @@ use chronoscope_api_client::client::{ApiError, AuthClient};
 #[cfg(feature = "embedded-media")]
 use chronoscope_db::media_store::InMemoryMediaStore;
 use chronoscope_db::{
-    Database, Email, MediaData, MediaId, MediaSlot, MediaType, PageData, PageId, ResearchUrlId,
-    ResearchUrlStatus, UserId,
+    CredentialWatch, CredentialsLost, Database, Email, MediaData, MediaId, MediaSlot, MediaType,
+    PageData, PageId, ResearchUrlId, ResearchUrlStatus, UserId,
 };
 use chronoscope_integrations::IntegrationName;
 use dropshot::{
@@ -47,8 +47,8 @@ use crate::jwt::JwtConfig;
 use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
 use crate::research_types::{FollowedUrlSummary, ResearchUrlDossier, ResearchUrlSummary};
 use crate::state::{
-    AppState, Config, DnsResolver, FactsDatabase, ResolvedImageMedia, SAFE_PUBLIC_IP,
-    ServerFactStore, ServerImageId,
+    AppState, AppStateParts, Config, DnsResolver, FactsDatabase, ResolvedImageMedia,
+    SAFE_PUBLIC_IP, ServerFactStore, ServerImageId,
 };
 
 /// A test's fact store together with whatever its backend needs held alive
@@ -236,6 +236,7 @@ impl TestContext {
             None,
             Some(media_store.clone()),
             facts,
+            CredentialWatch::never(),
             Arc::new(HashMap::new()),
         )
         .await?;
@@ -247,6 +248,30 @@ impl TestContext {
         jwt_config: Option<JwtConfig>,
         dns_resolver: Option<TestResolver>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::with_credentials(
+            ios_app_id,
+            jwt_config,
+            dns_resolver,
+            CredentialWatch::never(),
+        )
+        .await
+    }
+
+    /// A context whose fact store's credential is already reported gone. The
+    /// server takes the watch from its store at startup, so handing one in is
+    /// the same input the production path builds.
+    async fn with_lost_credentials(
+        loss: CredentialsLost,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::with_credentials(None, None, None, CredentialWatch::already_lost(loss)).await
+    }
+
+    async fn with_credentials(
+        ios_app_id: Option<String>,
+        jwt_config: Option<JwtConfig>,
+        dns_resolver: Option<TestResolver>,
+        credentials: CredentialWatch,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let facts = fresh_fact_store().await?;
         let image_media = Arc::new(HashMap::new());
         #[cfg(feature = "embedded-media")]
@@ -256,6 +281,7 @@ impl TestContext {
             dns_resolver,
             None,
             facts,
+            credentials,
             image_media,
         )
         .await;
@@ -265,6 +291,7 @@ impl TestContext {
             jwt_config,
             dns_resolver,
             facts,
+            credentials,
             image_media,
         )
         .await;
@@ -279,10 +306,21 @@ impl TestContext {
         image_media: HashMap<ServerImageId, ResolvedImageMedia>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let image_media = Arc::new(image_media);
+        let credentials = CredentialWatch::never();
         #[cfg(feature = "embedded-media")]
-        return Self::with_options_and_media(None, None, None, None, facts, image_media).await;
+        return Self::with_options_and_media(
+            None,
+            None,
+            None,
+            None,
+            facts,
+            credentials,
+            image_media,
+        )
+        .await;
         #[cfg(not(feature = "embedded-media"))]
-        return Self::with_options_and_media(None, None, None, facts, image_media).await;
+        return Self::with_options_and_media(None, None, None, facts, credentials, image_media)
+            .await;
     }
 
     async fn with_options_and_media(
@@ -291,6 +329,7 @@ impl TestContext {
         dns_resolver: Option<TestResolver>,
         #[cfg(feature = "embedded-media")] media_store: Option<Arc<InMemoryMediaStore>>,
         facts: TestFactStore,
+        credentials: CredentialWatch,
         image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = jwt_config.unwrap_or_else(|| {
@@ -332,32 +371,20 @@ impl TestContext {
         // the same store the fixture keeps for the test's duration.
         let server_facts = facts.store.clone();
 
-        #[cfg(feature = "embedded-media")]
-        let app_state = {
-            let store = media_store.unwrap_or_else(|| Arc::new(InMemoryMediaStore::new()));
-            AppState::new(
+        let app_state = Arc::new(
+            AppState::new(AppStateParts {
                 db,
                 config,
                 jwt,
-                Box::new(resolver),
-                store,
-                server_facts,
+                dns_resolver: Box::new(resolver),
+                #[cfg(feature = "embedded-media")]
+                media_store: media_store.unwrap_or_else(|| Arc::new(InMemoryMediaStore::new())),
+                facts: server_facts,
+                credentials,
                 image_media,
-            )
-            .await?
-        };
-        #[cfg(not(feature = "embedded-media"))]
-        let app_state = AppState::new(
-            db,
-            config,
-            jwt,
-            Box::new(resolver),
-            server_facts,
-            image_media,
-        )
-        .await?;
-
-        let app_state = Arc::new(app_state);
+            })
+            .await?,
+        );
 
         let config_dropshot = ConfigDropshot {
             bind_address: addr,
