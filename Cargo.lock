@@ -910,6 +910,7 @@ dependencies = [
  "futures-util",
  "hex",
  "md-5",
+ "percent-encoding",
  "reqwest 0.12.28",
  "schemars 0.8.22",
  "serde",

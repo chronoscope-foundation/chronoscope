@@ -24,6 +24,8 @@ async-trait = "0.1"
 # URL handling
 url.workspace = true
 urlencoding = "2"
+# Decoding Commons filenames out of media URLs; already in the tree under `url`.
+percent-encoding = "2"
 
 # Serialization
 serde.workspace = true

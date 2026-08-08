@@ -16,6 +16,7 @@
 pub mod content;
 pub mod http;
 pub mod instagram;
+pub mod media;
 pub mod reddit;
 mod registry;
 pub mod wikidata;
@@ -28,6 +29,7 @@ pub use http::{
 #[cfg(feature = "testing")]
 pub use http::{MockHttpClient, MockHttpError};
 pub use instagram::{ApifyConfig, InstagramIntegration};
+pub use media::{DisplayableKey, MirrorKey, MirrorKeyError, SourceId, displayable};
 pub use reddit::RedditIntegration;
 pub use registry::{IntegrationRegistry, RegistrationError};
 

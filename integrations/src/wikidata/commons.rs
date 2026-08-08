@@ -13,9 +13,43 @@ use super::{ApiTimestamp, WikidataClient, WikidataError};
 use crate::http::{HttpClient, HttpRequest};
 
 /// Base URL for Wikimedia Commons file uploads.
+///
+/// Shared with [`crate::media`], which classifies the URLs this mints: the
+/// host that names a Commons file and the host that mints one are the same
+/// fact, and two spellings of it would drift into keying Commons images as
+/// unclaimed web URLs.
 #[allow(clippy::expect_used)]
-static COMMONS_UPLOAD_BASE: LazyLock<Url> =
+pub(crate) static COMMONS_UPLOAD_BASE: LazyLock<Url> =
     LazyLock::new(|| Url::parse("https://upload.wikimedia.org").expect("hardcoded URL is valid"));
+
+/// Path segments that locate the Commons repository on the upload host.
+///
+/// The upload host also serves each project's local uploads under sibling
+/// prefixes (`/wikipedia/en/`, …), so this prefix is what says "Commons file".
+/// [`url_for_filename`] writes it into every upload URL and [`crate::media`]
+/// matches it to recognize one, so a single definition keeps the mint and read
+/// sides from drifting.
+pub(crate) const COMMONS_REPOSITORY_PREFIX: &[&str] = &["wikipedia", "commons"];
+
+/// Widths of the two shard directories in a Commons upload path.
+///
+/// MediaWiki shards an upload by the first hex digit of its filename's MD5 and
+/// then by the first two, so the file lands at `/{h0}/{h0..2}/{title}`.
+/// [`url_for_filename`] slices the hash to these widths; [`crate::media`] checks
+/// that the two shard segments have them. One definition keeps the shape agreed.
+pub(crate) const COMMONS_SHARD_WIDTHS: [usize; 2] = [1, 2];
+
+/// Canonicalize a Commons title's whitespace.
+///
+/// MediaWiki treats a space and an underscore as one character in a title and
+/// stores the underscore form, so both the mint side ([`url_for_filename`]) and
+/// the read side ([`crate::media`]) fold spaces to underscores before anything
+/// downstream compares titles. Fuller MediaWiki title normalization (collapsing
+/// runs of whitespace, trimming, first-letter capitalization) would extend this
+/// one function.
+pub(crate) fn canonical_title(title: &str) -> String {
+    title.replace(' ', "_")
+}
 
 /// Maximum response size for API requests (1 MB).
 const MAX_RESPONSE_SIZE: usize = 1024 * 1024;
@@ -141,17 +175,19 @@ fn extract_gallery_media(json: &serde_json::Value) -> Vec<CommonsFilename> {
 /// this function is infallible.
 #[must_use]
 pub fn url_for_filename(filename: &CommonsFilename) -> Url {
-    let filename_underscored = filename.as_str().replace(' ', "_");
+    let filename_underscored = canonical_title(filename.as_str());
     let mut hasher = Md5::new();
     hasher.update(filename_underscored.as_bytes());
     let hash = hasher.finalize();
     let hash_hex = format!("{hash:x}");
 
+    let [shard_width, subshard_width] = COMMONS_SHARD_WIDTHS;
+    let prefix = COMMONS_REPOSITORY_PREFIX.join("/");
     let mut url = COMMONS_UPLOAD_BASE.clone();
     url.set_path(&format!(
-        "/wikipedia/commons/{}/{}/{}",
-        &hash_hex[0..1],
-        &hash_hex[0..2],
+        "/{prefix}/{}/{}/{}",
+        &hash_hex[0..shard_width],
+        &hash_hex[0..subshard_width],
         urlencode(&filename_underscored)
     ));
     url
