@@ -244,7 +244,12 @@ let
   # dump scan, which already happened upstream.
 
   mkFactsDb =
-    name: source: recordedAt: limit:
+    name:
+    {
+      entities,
+      recordedAt,
+      limit,
+    }:
     pkgs.stdenvNoCC.mkDerivation (
       {
         name = "wikidata-facts-db-${name}";
@@ -256,7 +261,7 @@ let
         buildCommand = ''
           mkdir -p $out
           ingest build-db \
-            --input ${source}/entities.jsonl \
+            --input ${entities}/entities.jsonl \
             --database-url sqlite:$out/facts.db \
             --recorded-at ${lib.escapeShellArg recordedAt} \
             ${lib.optionalString (limit != null) "--limit ${toString limit}"}
@@ -274,18 +279,45 @@ let
 
   bulkRecordedAt = "${dumpPin.date}T00:00:00Z";
 
-  factsDbs = {
-    # Dump-free DB from the curated bundle — always buildable, and the
-    # validation instance for the build-db path.
-    curated = mkFactsDb "curated" bundles.curated.entities bundleDefs.curated.timestamp null;
-    "1k" = mkFactsDb "1k" wikidataArchEntities bulkRecordedAt 1000;
-    "100k" = mkFactsDb "100k" wikidataArchEntities bulkRecordedAt 100000;
-    full = mkFactsDb "full" wikidataArchEntities bulkRecordedAt null;
+  # What a load of each name is made of. Every consumer builds from here: the
+  # SQLite artifacts below, and the Postgres loader image (nix/ingest.nix).
+  # Commits content-address over the snapshot timestamp, so a subset loaded
+  # either way holds the same commits only while both read this table.
+  subsets = {
+    # Dump-free, from the curated bundle — always buildable, and the validation
+    # instance for the build-db path.
+    curated = {
+      inherit (bundles.curated) entities;
+      recordedAt = bundleDefs.curated.timestamp;
+      limit = null;
+    };
+    "1k" = {
+      entities = wikidataArchEntities;
+      recordedAt = bulkRecordedAt;
+      limit = 1000;
+    };
+    "100k" = {
+      entities = wikidataArchEntities;
+      recordedAt = bulkRecordedAt;
+      limit = 100000;
+    };
+    full = {
+      entities = wikidataArchEntities;
+      recordedAt = bulkRecordedAt;
+      limit = null;
+    };
   };
+
+  factsDbs = lib.mapAttrs mkFactsDb subsets;
 
 in
 {
-  inherit bundles factsDbs dumpToolBin;
+  inherit
+    bundles
+    factsDbs
+    dumpToolBin
+    subsets
+    ;
   dump = {
     full = dumpFull;
     archTypes = wikidataArchTypes;
