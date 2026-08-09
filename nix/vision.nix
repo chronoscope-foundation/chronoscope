@@ -9,6 +9,9 @@
   lib,
   sam3Cache,
   dinov3Repo,
+  # Entry ID → image file, from nix/corpus.nix. Only the reference set below is
+  # ever selected from it, so the other FODs are never realized.
+  corpusImageFiles,
 }:
 
 let
@@ -149,7 +152,6 @@ let
     ps.torch
     ps.torchvision
     ps.numpy
-    ps.pillow
     ps.onnx
     ps.onnxruntime
     ps.onnxscript
@@ -204,8 +206,10 @@ let
           image_encoder decoder language_constants
       '';
 
-  # DINOv3 has no exporter to lean on, so the graph is ours. Preprocessing is
-  # baked in because the Rust side has no AutoImageProcessor to reproduce it.
+  # DINOv3 has no exporter to lean on, so the graph is ours. Normalization is
+  # baked in because the Rust side has no AutoImageProcessor to reproduce it;
+  # the rescale and resize ahead of it stay with the caller, which is where the
+  # checkpoint's own processor puts them.
   #
   # Resolution is the parameter because it is the only lever on patch-grid
   # density, and the grid is what masked pooling reads: 224px gives 14x14, so an
@@ -226,6 +230,69 @@ let
         python ${./scripts/export-dinov3.py} ${dinov3Repo} "$out" ${toString resolution}
         python ${./scripts/verify-onnx.py} "$out" dinov3
       '';
+
+  # The images the ingest path is compared on. Chosen against three criteria,
+  # in priority order:
+  #
+  #   Hosting stability. These are build inputs, so a rotted URL breaks the
+  #   model pipeline rather than just `just fetch-corpus`. Reddit-resolved
+  #   entries are disqualified; these are Wikimedia, the Library of Congress
+  #   and NYPL.
+  #
+  #   A spread of reduction factors. Against a 224px square these run from
+  #   2.2x/1.3x to 40.9x/18.5x, and angkor-wat-moat's 3.3:1 frame reduces its
+  #   two axes by 12.4x and 3.8x, so a squash applied to the wrong axis shows.
+  #
+  #   Colour. The corpus is dominated by monochrome 1880s-1900s photographs
+  #   where an RGB/BGR swap barely moves the embedding; round-window-church is
+  #   the most saturated image in it. guggenheim-construction is the opposite
+  #   end and a single-channel JPEG besides, so grayscale-to-RGB expansion is
+  #   exercised rather than assumed.
+  #
+  # Whole-image upscaling is out of scope: nothing this pipeline receives will
+  # be under 224px. Per-axis upscaling is not, since the resize squashes to a
+  # square rather than letterboxing, and shekar-dzong-1921 is what carries it —
+  # at 448 its 300px short axis upsamples by 1.5x while its long axis reduces.
+  # guggenheim-construction crosses the same line at 1.07x, too near unity to
+  # rest on.
+  referenceImages = [
+    "shekar-dzong-1921" # 500x300, near-monochrome, upsamples its short axis at 448
+    "guggenheim-construction" # 532x420, single-channel JPEG
+    "round-window-church" # 1280x960, most saturated in the corpus
+    "angkor-wat-moat" # 2777x843, 3.3:1
+    "nyc-1909-balloon" # 9155x4136, progressive JPEG
+  ];
+
+  # The reference embeddings the cordoned tests compare against. A package
+  # rather than a check: its closure reaches the HF-token weight FODs, and
+  # `nix flake check` runs pure.
+  #
+  # The reference runs the checkpoint's own AutoImageProcessor and AutoModel, so
+  # the weights are an input here as much as the graph is; the graph comes along
+  # to fix the resolution and to sit in the fixture's closure.
+  mkDinov3Fixture =
+    resolution:
+    pkgs.runCommand "dinov3-fixture-${toString resolution}"
+      {
+        nativeBuildInputs = [ exportEnv ];
+        # Same offline discipline as the export: the weights are already in the
+        # store, and a sandboxed build must not reach for the hub.
+        HF_HUB_OFFLINE = "1";
+        SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        images = builtins.toJSON (
+          map (id: {
+            inherit id;
+            path = corpusImageFiles.${id};
+          }) referenceImages
+        );
+        passAsFile = [ "images" ];
+      }
+      ''
+        export HOME="$TMPDIR"
+        mkdir -p "$out"
+        python ${./scripts/dinov3-fixture.py} \
+          ${dinov3Repo} ${mkDinov3Onnx resolution} "$imagesPath" "$out"
+      '';
 in
 {
   inherit
@@ -234,5 +301,6 @@ in
     exportEnv
     sam3Onnx
     mkDinov3Onnx
+    mkDinov3Fixture
     ;
 }

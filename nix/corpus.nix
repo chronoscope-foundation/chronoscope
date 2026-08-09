@@ -63,21 +63,21 @@ let
   # Deduplicated URL → derivation map.
   urlDerivations = lib.mapAttrs fetchCorpusUrl corpusHashes;
 
-  # Link farm: entry ID → specific file within URL's FOD.
-  # Reddit gallery entries index into a multi-file FOD (0, 1, 2, ...);
-  # direct URL entries always use index 0.
+  # Entry ID → the one file it names. Reddit gallery entries index into a
+  # multi-file FOD (0, 1, 2, ...); direct URL entries always use index 0.
+  #
+  # Per-attribute laziness is what makes this usable on its own: a consumer that
+  # names five entries realizes five FODs, where going through the link farm
+  # below would realize every URL in the manifest.
+  imageFiles = lib.mapAttrs (
+    _id: entry: "${urlDerivations.${entry.url}}/${toString (entry.reddit_index or 0)}"
+  ) corpusManifest.images;
+
   corpusImages = pkgs.linkFarm "chronoscope-corpus-images" (
-    lib.mapAttrsToList (
-      id: entry:
-      let
-        fod = urlDerivations.${entry.url};
-        index = entry.reddit_index or 0;
-      in
-      {
-        name = id;
-        path = "${fod}/${toString index}";
-      }
-    ) corpusManifest.images
+    lib.mapAttrsToList (id: path: {
+      name = id;
+      inherit path;
+    }) imageFiles
   );
 
 in
@@ -86,5 +86,6 @@ in
     corpusImages
     corpusFetchBin
     corpusManifestJson
+    imageFiles
     ;
 }

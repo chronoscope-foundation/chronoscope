@@ -1,14 +1,18 @@
-"""Export DINOv3 ViT-L/16 to ONNX with preprocessing baked into the graph.
+"""Export DINOv3 ViT-L/16 to ONNX with normalization baked into the graph.
 
-There is no `AutoImageProcessor` on the Rust side, so the rescale and
-normalization constants have to live somewhere. Baking them into the graph
-keeps them tied to the checkpoint they belong to; the alternative is
-transcribing ImageNet statistics into Rust, where a wrong digit yields
-plausible-looking embeddings that are quietly wrong and that nothing downstream
-can detect.
+There is no `AutoImageProcessor` on the Rust side, so the ImageNet mean and
+standard deviation have to live somewhere. Baking them into the graph keeps them
+tied to the checkpoint they belong to; the alternative is transcribing them into
+Rust, where a wrong digit yields plausible-looking embeddings that are quietly
+wrong and that nothing downstream can detect.
 
-Resizing stays with the caller, matching the SAM 3 image encoder's contract:
-both graphs take a uint8 CHW image already at the model's native resolution.
+Where the split falls is the checkpoint's own choice.
+`DINOv3ViTImageProcessorFast` overrides `_preprocess` to run rescale before
+resize, so its resize sees float32 in [0, 1] and the graph starts at normalize.
+Handing the graph uint8 instead would quantize the resize output to 1/255 steps,
+which moves an embedding by a good fraction of the distance between bilinear and
+bicubic. The SAM 3 encoder keeps its uint8 contract because its own processor
+resizes in uint8 (`v2.ToDtype(uint8)` ahead of `v2.Resize`).
 
 Resolution is a parameter because it is the only lever on patch-grid density:
 patch size is the 16x16 kernel of the patch-embedding conv, so it belongs to the
@@ -30,9 +34,16 @@ from transformers import AutoModel
 
 OPSET = 18
 
-# PIL resampling filters, by the code `preprocessor_config.json` stores. Naming
-# the filter without deriving it from the code lets a checkpoint change one and
-# leave the sidecar asserting the other.
+# The caller rescales and resizes, so the graph starts from float. Written into
+# the sidecar from here, which is also what the trace sees, so the claim cannot
+# describe a different graph than the one exported.
+INPUT_DTYPE = torch.float32
+
+# PIL resampling filters, by the code `preprocessor_config.json` stores.
+# transformers maps that code onto the torchvision `InterpolationMode` of the
+# same name, which is the filter the caller has to implement. Naming it without
+# deriving it from the code lets a checkpoint change one and leave the sidecar
+# asserting the other.
 PIL_RESAMPLE = {
     0: "nearest",
     1: "lanczos",
@@ -77,7 +88,7 @@ prefix_tokens = 1 + config["num_register_tokens"]
 
 
 class Dinov3Encoder(torch.nn.Module):
-    """uint8 CHW image in, last_hidden_state out."""
+    """Rescaled, resized float32 CHW image in, last_hidden_state out."""
 
     def __init__(self, model: torch.nn.Module) -> None:
         super().__init__()
@@ -86,14 +97,14 @@ class Dinov3Encoder(torch.nn.Module):
             "mean", torch.tensor(preprocess["image_mean"]).view(3, 1, 1)
         )
         self.register_buffer("std", torch.tensor(preprocess["image_std"]).view(3, 1, 1))
-        self.rescale = preprocess["rescale_factor"]
 
     def forward(self, image: torch.Tensor) -> torch.Tensor:
-        pixels = (image.to(torch.float32) * self.rescale - self.mean) / self.std
-        return self.model(pixel_values=pixels.unsqueeze(0)).last_hidden_state
+        return self.model(
+            pixel_values=((image - self.mean) / self.std).unsqueeze(0)
+        ).last_hidden_state
 
 
-model = AutoModel.from_pretrained(model_dir, torch_dtype=torch.float32)
+model = AutoModel.from_pretrained(model_dir, dtype=torch.float32)
 model.eval()
 for parameter in model.parameters():
     parameter.requires_grad_(False)
@@ -107,17 +118,19 @@ graph_path = out_dir / "dinov3.onnx"
 # Resizing stays with the caller, so the graph's fixed input resolution is a
 # contract the Rust side has to honour; the sidecar carries it.
 
-# Deterministic and structured. An all-zero image drives degenerate activations
-# that can hide a lowering bug, and a seeded RNG would make the build's own
-# reproducibility depend on torch's generator.
+# Deterministic and structured, over the rescaled range the graph now takes. An
+# all-zero image drives degenerate activations that can hide a lowering bug, and
+# a seeded RNG would make the build's own reproducibility depend on torch's
+# generator.
 probe = (
     torch.arange(3 * resolution * resolution, dtype=torch.int64)
     .remainder(251)
-    .to(torch.uint8)
+    .to(INPUT_DTYPE)
+    .mul(preprocess["rescale_factor"])
     .view(3, resolution, resolution)
 )
 
-dummy = torch.zeros(3, resolution, resolution, dtype=torch.uint8)
+dummy = torch.zeros(3, resolution, resolution, dtype=INPUT_DTYPE)
 with torch.no_grad():
     torch.onnx.export(
         encoder,
@@ -156,6 +169,7 @@ if not np.isfinite(drift) or drift > TOLERANCE:
             # verifier can hold the two to each other.
             "graph_assertions": [
                 {"claim": "resolution", "tensor": "image", "axis": -1},
+                {"claim": "input_dtype", "tensor": "image", "dtype": True},
                 {
                     "claim": "sequence_length",
                     "tensor": "last_hidden_state",
@@ -164,21 +178,24 @@ if not np.isfinite(drift) or drift > TOLERANCE:
                 {"claim": "hidden_size", "tensor": "last_hidden_state", "axis": 2},
             ],
             "resolution": resolution,
+            "input_dtype": str(INPUT_DTYPE).removeprefix("torch."),
             "patch_size": patch,
             "patch_grid": [patch_grid, patch_grid],
             "prefix_tokens": prefix_tokens,
             "hidden_size": config["hidden_size"],
             "sequence_length": expected_sequence,
             "preprocessing": {
-                "rescale_factor": preprocess["rescale_factor"],
                 "image_mean": preprocess["image_mean"],
                 "image_std": preprocess["image_std"],
-                "baked_into_graph": True,
-                # The caller resizes, so it owns these. The HF processor for
-                # this checkpoint resizes to a square with PIL resample code 2
-                # and converts to RGB; nearest-neighbour or BGR here produces
-                # embeddings that look fine and are wrong.
+                "normalization_baked_into_graph": True,
+                # Everything ahead of normalize, in the order the checkpoint's
+                # processor runs it: multiply by `rescale_factor`, then resize
+                # the float image to a square with an antialiased kernel.
+                # Resizing first, or in uint8, quantizes the result; nearest
+                # neighbour or BGR produces embeddings that look fine and are
+                # wrong.
                 "caller_resize": {
+                    "rescale_factor": preprocess["rescale_factor"],
                     "interpolation": interpolation,
                     "pil_resample_code": preprocess["resample"],
                     "antialias": True,

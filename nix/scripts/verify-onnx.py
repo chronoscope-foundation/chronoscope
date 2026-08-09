@@ -68,9 +68,10 @@ for name in sorted(expected):
     for spec in sessions[name].get_outputs():
         print(f"  out  {spec.name:20s} {spec.type:16s} {spec.shape}")
 
-    # A sidecar carries what a signature cannot state. Every number in one that
-    # the graph also knows must be listed in `graph_assertions`, naming the
-    # tensor and axis it came from, and the two are held to each other here.
+    # A sidecar carries what a signature cannot state. Every fact in one that the
+    # graph also declares must be listed in `graph_assertions`, naming the tensor
+    # it came from and what it reads off it — a shape `axis`, or `dtype` for the
+    # element type — and the two are held to each other here.
     # `graph_assertions: []` is the writer's claim that the sidecar restates
     # nothing.
     sidecar = sub / f"{name}.json"
@@ -98,25 +99,40 @@ for name in sorted(expected):
         if not isinstance(assertion, dict) or not {
             "claim",
             "tensor",
-            "axis",
         } <= assertion.keys():
             failures.append(
                 f"{name}.json: malformed assertion {assertion!r}; needs "
-                "claim, tensor and axis"
+                "claim, tensor, and one of axis or dtype"
             )
             continue
-        claim, tensor, axis = (
-            assertion["claim"],
-            assertion["tensor"],
-            assertion["axis"],
-        )
+        claim, tensor = assertion["claim"], assertion["tensor"]
         if tensor not in by_name:
             failures.append(f"{name}.json asserts against absent tensor {tensor!r}")
             continue
         if claim not in claims:
             failures.append(f"{name}.json asserts {claim!r}, which it does not state")
             continue
-        shape = by_name[tensor].shape
+        spec = by_name[tensor]
+        if assertion.get("dtype"):
+            declared = ONNX_TO_NUMPY.get(spec.type)
+            if declared is None:
+                failures.append(
+                    f"{name}.json: {tensor} is {spec.type}, which this script "
+                    "has no numpy name for; add it to ONNX_TO_NUMPY"
+                )
+            elif claims[claim] != declared:
+                failures.append(
+                    f"{name}.json claims {claim}={claims[claim]!r}, "
+                    f"{tensor} is {declared}"
+                )
+            continue
+        if "axis" not in assertion:
+            failures.append(
+                f"{name}.json: assertion {assertion!r} reads neither an axis "
+                f"nor a dtype off {tensor}"
+            )
+            continue
+        axis, shape = assertion["axis"], spec.shape
         if not -len(shape) <= axis < len(shape):
             failures.append(
                 f"{name}.json: axis {axis} is out of range for {tensor} {shape}"
@@ -131,7 +147,10 @@ for name in sorted(expected):
         agreed = [a["claim"] for a in claims["graph_assertions"] if isinstance(a, dict)]
         print(f"  sidecar agrees on {agreed}")
 
-# Anything left over is an export we did not expect and do not describe.
+# Anything left over is an export we did not expect and do not describe. Scoped
+# to directories because one directory per model is the layout being checked;
+# the root-level files are this script's own manifest and whatever a downstream
+# derivation lays beside it, and widening the sweep would reject both.
 produced = {p.name for p in root.iterdir() if p.is_dir()}
 for unexpected in sorted(produced - expected - {CONSTANTS}):
     failures.append(f"{unexpected}: unexpected directory in the export output")

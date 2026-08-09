@@ -219,6 +219,7 @@
         vision = import ./nix/vision.nix {
           inherit pkgs lib;
           inherit (pythonEnvs) sam3Cache dinov3Repo;
+          corpusImageFiles = corpus.imageFiles;
         };
 
         corpus = import ./nix/corpus.nix {
@@ -548,6 +549,12 @@
             # crate answers against real images. Adding a variant is one line.
             dinov3-onnx-224 = vision.mkDinov3Onnx 224;
             dinov3-onnx-448 = vision.mkDinov3Onnx 448;
+
+            # Reference embeddings for the tests `just model-test` runs, one per
+            # export. Each holds its export in its own closure, so realizing a
+            # fixture realizes the graph it describes.
+            dinov3-fixture-224 = vision.mkDinov3Fixture 224;
+            dinov3-fixture-448 = vision.mkDinov3Fixture 448;
 
             wikidata-curated-entities = wikidata.bundles.curated.entities;
 

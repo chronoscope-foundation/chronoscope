@@ -47,8 +47,8 @@ impl ImageDownloader {
     /// Reddit posts are resolved via `RedditIntegration` and each media item
     /// is saved as `0`, `1`, `2`, ... Direct URLs are saved as `0`.
     ///
-    /// No file extensions — PIL reads by magic bytes, and the deterministic
-    /// naming keeps `corpus-hashes.json` simple.
+    /// No file extensions — decoders read by magic bytes, and the
+    /// deterministic naming keeps `corpus-hashes.json` simple.
     pub async fn download_fod(&self, url: &Url, output_dir: &Path) -> Result<(), CorpusError> {
         std::fs::create_dir_all(output_dir).map_err(CorpusError::Io)?;
 

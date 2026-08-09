@@ -12,10 +12,10 @@
 #                            satisfy the pre-commit gate — only `just check` does.
 #
 #   Everything else        — concrete actions (web-dev, fetch-*, corpus-*,
-#                            openapi, infra-plan). Each is safe-by-construction
-#                            so it can be allowlisted in .claude/settings.json
-#                            without opening a permission hole the way
-#                            `nix develop` would.
+#                            model-test, openapi, infra-plan). Each is
+#                            safe-by-construction so it can be allowlisted in
+#                            .claude/settings.json without opening a permission
+#                            hole the way `nix develop` would.
 #
 #   `deploy`, `deploy-web`, `infra-apply`
 #                          — the exceptions to that: the first two publish an
@@ -777,3 +777,38 @@ corpus-hash:
         exec nix develop .#analysis --command just corpus-hash
     fi
     cargo run --features corpus -p chronoscope-analysis --bin corpus-fetch -- hash
+
+# ---------------------------------------------------------------------------
+# Model-dependent tests. Cordoned out of `just check` for the reason `check
+# linux` is: they need inputs not every contributor can obtain — a
+# multi-hundred-MB export hanging off HF-token weight FODs. The tests are
+# `#[ignore]`d rather than feature-gated, so they compile in every build and
+# their count stays visible in the ordinary test output.
+# ---------------------------------------------------------------------------
+
+# Run the tests that load a real model, against freshly realized artifacts.
+model-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    {{ _ensure_nix }}
+    _ensure_nix
+    if [ -z "${IN_NIX_SHELL:-}" ]; then
+        exec nix develop .#analysis --command just model-test
+    fi
+    # Realized here rather than read from the environment, so a test whose
+    # artifact is missing fails naming this recipe instead of skipping green.
+    # --out-link pins the GC root; --print-out-paths gives the path the tests
+    # read. Never read .nix-gc-roots/ itself — it is a keep-alive, not a handle.
+    #
+    # Each fixture names its own export and holds it in its closure, so
+    # realizing the fixtures realizes the graphs they describe.
+    mkdir -p .nix-gc-roots
+    fixtures=""
+    for resolution in 224 448; do
+        fixture="$(nix build ".#dinov3-fixture-$resolution" \
+            --out-link ".nix-gc-roots/dinov3-fixture-$resolution" \
+            --print-out-paths)"
+        fixtures="${fixtures:+$fixtures:}$fixture"
+    done
+    export DINOV3_FIXTURES="$fixtures"
+    cargo test -p chronoscope-analysis -- --ignored

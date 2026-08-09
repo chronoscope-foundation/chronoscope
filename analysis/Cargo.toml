@@ -33,6 +33,38 @@ thiserror.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# ONNX Runtime, resolved at runtime from ORT_DYLIB_PATH rather than linked or
+# downloaded, which is what lets nixpkgs own the library. Exact pin because the
+# release-candidate series changes API between candidates.
+#
+# `api-23` selects the ONNX Runtime C API version to request, matching the
+# nixpkgs onnxruntime the `analysis` shell provides. The crate's default is
+# `api-27`, and it refuses to load a library older than the version it asks
+# for, so the default would fail at dlopen against 1.23.2.
+#
+# Not feature-gated: this crate is in `default-members`, so a gated model path
+# would compile nowhere in the commit gate and rot the way `corpus-test` did.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "tracing",
+    "load-dynamic",
+    "api-23",
+] }
+
+# The resize the checkpoint's processor leaves to the caller. Its convolution
+# path is float-native and antialiases by scaling kernel support with the
+# reduction factor, which is what torchvision does; the `image` crate's
+# resampler is neither.
+fast_image_resize = "6.1"
+
+# `embed` takes a decoded `DynamicImage` and converts it with `to_rgb8`, so this
+# crate sits on the public boundary. jpeg/png decode the corpus in the reference
+# test; the other default decoders are dead weight here.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+] }
+
 chronoscope-integrations = { path = "../integrations", optional = true }
 url = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }

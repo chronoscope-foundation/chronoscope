@@ -26,7 +26,6 @@ import numpy as np
 import onnxruntime as ort
 import pkg_resources
 import torch
-from PIL import Image
 
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model.tokenizer_ve import SimpleTokenizer
@@ -92,7 +91,9 @@ baked = dict(zip(OUTPUTS.values(), produced))
 reference = build_sam3_image_model(device="cpu")
 processor = Sam3Processor(reference, device="cpu")
 with torch.inference_mode():
-    state = processor.set_image(Image.new("RGB", (64, 64)))
+    # The image only has to exist: the sentinel comes from the prompt branch and
+    # nothing below reads a pixel.
+    state = processor.set_image(torch.zeros(3, 64, 64, dtype=torch.uint8))
     processor.add_geometric_prompt([0.5, 0.5, 0.5, 0.5], True, state)
 expected = state["backbone_out"]
 

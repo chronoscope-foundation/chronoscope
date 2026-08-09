@@ -1,12 +1,14 @@
 //! Chronoscope image analysis.
 //!
-//! Currently only the corpus: the pinned development image set the pipeline
-//! is built against, behind the `corpus` feature since the downloader runs
-//! from Nix. The models it will run — SAM 3 and DINOv3 as ONNX graphs from
-//! `nix/vision.nix`, a VLM through mistral.rs — are not here yet.
-
-#![deny(clippy::unwrap_used)]
-#![deny(unsafe_code)]
+//! DINOv3 runs here, over the ONNX graphs `nix/vision.nix` exports. SAM 3 and
+//! a VLM through mistral.rs are not here yet.
+//!
+//! The corpus — the pinned development image set the pipeline is built
+//! against — sits behind the `corpus` feature, since its downloader runs from
+//! Nix.
 
 #[cfg(feature = "corpus")]
 pub mod corpus;
+pub mod dinov3;
+mod manifest;
+pub mod onnx;

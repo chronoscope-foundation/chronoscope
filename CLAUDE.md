@@ -135,6 +135,19 @@ It is deliberately **outside** `just check`, so passing the commit gate says
 nothing about it: a cross-platform builder is not something every contributor
 has, and CI will carry this later.
 
+### Model tests: `just model-test`
+
+Outside the gate for the same reason: the tests that load a real model need a
+multi-hundred-MB ONNX export hanging off HF-token weight FODs, which a pure
+`nix flake check` cannot realize. The recipe builds the reference fixtures,
+pins them, and runs the suite; each fixture holds its export in its own
+closure, so realizing one realizes the graph it describes.
+
+Those tests are `#[ignore]`d rather than feature-gated, so they compile in
+every build and their count stays visible in ordinary test output. The
+deterministic half of the same comparison — the torchvision resize golden — is
+pure and stays in `just check`.
+
 `just test`, `just clippy`, `just fmt` are the **fast inner loop**:
 cargo direct, dev shell, incremental compilation. They are deliberately
 **not** a substitute for `just check` — they don't write the marker, and
@@ -169,6 +182,8 @@ just web-dev [subset]       # integrated dev server over a facts-DB clone (defau
 just openapi                # build the raw OpenAPI spec (inspect the contract)
 just xcodegen               # splice store paths into the xcodegen spec, regenerate the Xcode project
 just corpus-hash            # add hashes for new corpus URLs
+just model-test             # tests that load a real model, against realized artifacts
+                            #   (needs the ONNX exports; not part of the gate)
 just infra-plan             # compile the terranix modules, show what OpenTofu would change
 just infra-apply            # apply them (real cloud resources; type it yourself)
 just deploy                 # build+push the API image, deploy Cloud Run by digest
