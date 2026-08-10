@@ -20,10 +20,13 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
-/// ViT-L/16's hidden width, the sole value tied to the DINOv3 variant: grid,
-/// prefix, and resolution flow from the manifest, so a different variant (ViT-B
-/// 768, ViT-g 1536) changes this constant and its assertion, nothing else.
-const HIDDEN_SIZE: usize = 1024;
+/// The model's embedding width, the size `Embedding` is fixed to, and the sole
+/// value tied to the DINOv3 variant: grid, prefix, and resolution all flow from
+/// the manifest, so a different variant (ViT-B is 768, ViT-g 1536) changes this
+/// constant and its assertion and nothing else. A checkpoint declaring a
+/// different width fails at manifest load, and `forward` rechecks it against the
+/// actual output tensor.
+pub(crate) const EMBEDDING_DIM: usize = 1024;
 
 /// One DINOv3 export's manifest: the graph and the numbers for feeding it, each
 /// held to its assertion at [`load`](Self::load).
@@ -31,11 +34,12 @@ const HIDDEN_SIZE: usize = 1024;
 pub(crate) struct Dinov3Manifest {
     pub(crate) graph: PathBuf,
     pub(crate) resolution: usize,
-    /// Patch rows and columns, which masked pooling walks past the prefix.
-    #[expect(dead_code, reason = "masked pooling reads the grid once SAM lands")]
-    pub(crate) patch_grid: (usize, usize),
-    /// Leading tokens (CLS then registers) ahead of the patch grid.
-    #[expect(dead_code, reason = "pooling skips the prefix once SAM lands")]
+    /// Tokens the graph emits per image: the prefix then the patch grid.
+    /// `forward` holds its output to this count, which is what makes slicing the
+    /// patches out of it total.
+    pub(crate) sequence_length: usize,
+    /// Leading tokens (CLS then registers) before the patch grid; patches begin
+    /// at this index.
     pub(crate) prefix_tokens: usize,
     /// Per-byte scale, held so `255` times it stays in `[0, 1]`.
     pub(crate) rescale_factor: f32,
@@ -96,10 +100,17 @@ impl Dinov3Manifest {
             });
         }
 
-        if meta.hidden_size != HIDDEN_SIZE {
-            return Err(ManifestInvalid::HiddenSize {
-                hidden_size: meta.hidden_size,
-                expected: HIDDEN_SIZE,
+        // CLS lives at index 0 by DINOv3 convention, so the prefix cannot be
+        // empty. Without this, a prefix-less export would validate and the top-
+        // left patch would masquerade as the CLS token.
+        if meta.prefix_tokens == 0 {
+            return Err(ManifestInvalid::PrefixTokens);
+        }
+
+        if meta.hidden_size != EMBEDDING_DIM {
+            return Err(ManifestInvalid::EmbeddingDim {
+                embedding_dim: meta.hidden_size,
+                expected: EMBEDDING_DIM,
             });
         }
 
@@ -146,7 +157,7 @@ impl Dinov3Manifest {
         Ok(Self {
             graph: export.join(model.graph),
             resolution: meta.resolution,
-            patch_grid: (rows, columns),
+            sequence_length: meta.sequence_length,
             prefix_tokens: meta.prefix_tokens,
             rescale_factor: parse_rescale_factor(resize.rescale_factor)?,
         })
@@ -226,8 +237,14 @@ pub enum ManifestInvalid {
         columns: usize,
     },
 
-    #[error("hidden size {hidden_size} is not the {expected} this crate is built for")]
-    HiddenSize { hidden_size: usize, expected: usize },
+    #[error("the export declares zero prefix tokens, so there is no CLS token at index 0")]
+    PrefixTokens,
+
+    #[error("embedding dimension {embedding_dim} is not the {expected} this crate is built for")]
+    EmbeddingDim {
+        embedding_dim: usize,
+        expected: usize,
+    },
 
     #[error("input dtype `{dtype}` is not the `float32` the model takes")]
     InputDtype { dtype: String },

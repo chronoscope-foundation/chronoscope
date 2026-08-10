@@ -29,11 +29,26 @@ const FIXTURES: &str = "DINOV3_FIXTURES";
 /// drifts only ~1e-4, the JPEG decoder and float rounding disagreeing between
 /// the two ecosystems. 1e-3 sits ~10x above that noise and ~10x below any real
 /// bug. Loosen it if a decoder swap ever pushes the honest drift up.
-const DRIFT_MAX: f64 = 1e-3;
+const CLS_DRIFT_MAX: f64 = 1e-3;
+
+/// The most a single patch may drift, kept separate from the CLS bound: CLS
+/// averages the decode/resample disagreement across the whole frame, while one
+/// patch sees a single 16x16 window where that disagreement does not average
+/// out. The first `model-test` run put the worst honest patch at 5.8e-3
+/// (shekar-dzong-1921 at 224px, near-monochrome at a modest downscale); every
+/// patch carries a norm near 8, so cosine has no low-norm tail to inflate. This
+/// sits ~2.6x above that worst and well below the ~1e-1 a swapped channel order
+/// or transposed layout drives every patch to.
+const PATCH_DRIFT_MAX: f64 = 1.5e-2;
 
 #[derive(Deserialize)]
 struct Reference {
     resolution: usize,
+    /// Patch rows and columns; their product is the count the sidecar and the
+    /// model must both produce, guarded before any per-patch zip.
+    patch_grid: [usize; 2],
+    /// Token width, so the flat sidecar chunks without the test conjuring 1024.
+    hidden_size: usize,
     /// The export these embeddings were measured against, which is also in this
     /// fixture's closure.
     export: PathBuf,
@@ -44,6 +59,8 @@ struct Reference {
 struct ReferenceImage {
     id: String,
     file: PathBuf,
+    /// The raw patch grid, `patch_count * hidden_size` little-endian f32.
+    patches: PathBuf,
     cls: Vec<f32>,
 }
 
@@ -81,6 +98,9 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
         format!("{path:?} is not shaped the way this comparison reads it: {source}")
     })?;
     let resolution = reference.resolution;
+    let [rows, columns] = reference.patch_grid;
+    let expected_patches = rows * columns;
+    let hidden = reference.hidden_size;
 
     let mut model = Dinov3::open(&reference.export).map_err(|source| {
         format!(
@@ -96,7 +116,7 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             fs::read(&path).map_err(|source| format!("could not read {path:?}: {source}"))?;
         let image = image::load_from_memory(&bytes)
             .map_err(|source| format!("could not decode {path:?}: {source}"))?;
-        let tokens = model.embed(&image).map_err(|source| {
+        let features = model.embed(&image).map_err(|source| {
             format!(
                 "{} at {resolution}px: could not embed the image: {}",
                 entry.id,
@@ -104,12 +124,7 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             )
         })?;
 
-        let cls = tokens.token(0).ok_or_else(|| {
-            format!(
-                "{} at {resolution}px: the model produced no prefix token to read a CLS from",
-                entry.id
-            )
-        })?;
+        let cls = features.cls.as_slice();
         assert_eq!(
             cls.len(),
             entry.cls.len(),
@@ -119,12 +134,64 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             cls.len(),
         );
 
-        let drift = cosine_distance(&entry.cls, cls);
+        let cls_drift = cosine_distance(&entry.cls, cls);
         assert!(
-            drift <= DRIFT_MAX,
-            "{} at {resolution}px: CLS drifted {drift:.3e} from the reference, past the \
-             {DRIFT_MAX:.0e} a correct pipeline stays under. A drift this large is a wiring \
+            cls_drift <= CLS_DRIFT_MAX,
+            "{} at {resolution}px: CLS drifted {cls_drift:.3e} from the reference, past the \
+             {CLS_DRIFT_MAX:.0e} a correct pipeline stays under. A drift this large is a wiring \
              fault: a swapped channel order, the wrong resample kernel, or a transposed layout.",
+            entry.id,
+        );
+
+        // Guard both counts before the per-patch zip: `cosine_distance` zips, so
+        // a dropped trailing patch on either side would shorten the comparison
+        // rather than fail it.
+        let sidecar_path = fixture.join(&entry.patches);
+        let sidecar = fs::read(&sidecar_path)
+            .map_err(|source| format!("could not read {sidecar_path:?}: {source}"))?;
+        assert_eq!(
+            sidecar.len(),
+            expected_patches * hidden * 4,
+            "{} at {resolution}px: the reference patch sidecar is {} bytes, not the \
+             {expected_patches} x {hidden} x 4 the grid declares",
+            entry.id,
+            sidecar.len(),
+        );
+        assert_eq!(
+            features.patches.len(),
+            expected_patches,
+            "{} at {resolution}px: the model produced {} patches, not the {expected_patches} \
+             the grid declares",
+            entry.id,
+            features.patches.len(),
+        );
+
+        let (quads, _rest) = sidecar.as_chunks::<4>();
+        let reference_patches: Vec<f32> =
+            quads.iter().map(|quad| f32::from_le_bytes(*quad)).collect();
+
+        let mut max_drift = 0.0_f64;
+        for (reference_patch, produced_patch) in reference_patches
+            .chunks_exact(hidden)
+            .zip(&features.patches)
+        {
+            assert_eq!(
+                produced_patch.as_slice().len(),
+                reference_patch.len(),
+                "{} at {resolution}px: the model produced {}-wide patches, the reference is \
+                 {}-wide",
+                entry.id,
+                produced_patch.as_slice().len(),
+                reference_patch.len(),
+            );
+            max_drift = max_drift.max(cosine_distance(reference_patch, produced_patch.as_slice()));
+        }
+        assert!(
+            max_drift <= PATCH_DRIFT_MAX,
+            "{} at {resolution}px: a patch drifted {max_drift:.3e} from the reference, past the \
+             {PATCH_DRIFT_MAX:.1e} a correct pipeline stays under. The CLS bound averages this \
+             disagreement over the frame, so a per-patch drift this large is a wiring fault \
+             reaching the patch grid.",
             entry.id,
         );
     }

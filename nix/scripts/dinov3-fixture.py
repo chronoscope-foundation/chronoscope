@@ -51,6 +51,7 @@ manifest = json.loads((export_dir / "manifest.json").read_text())
 metadata = manifest["models"]["dinov3"]["metadata"]
 resolution = metadata["resolution"]
 prefix_tokens = metadata["prefix_tokens"]
+hidden_size = metadata["hidden_size"]
 grid_rows, grid_columns = metadata["patch_grid"]
 
 torch.set_num_threads(NUM_THREADS)
@@ -66,17 +67,12 @@ def unit(vector: torch.Tensor) -> torch.Tensor:
     return vector / vector.norm()
 
 
-def embed(
-    image: torch.Tensor, weights: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """CLS and weighted-pooled embeddings of one image."""
+def embed(image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The normalized CLS embedding and the raw patch grid of one image."""
     batch = processor(image, size=size, return_tensors="pt")
     with torch.no_grad():
         tokens = model(pixel_values=batch["pixel_values"]).last_hidden_state[0]
-    patches = tokens[prefix_tokens:]
-    # The weighted mean and the weighted sum differ by a positive scalar, which
-    # normalizing removes.
-    return unit(tokens[0]), unit(weights @ patches)
+    return unit(tokens[0]), tokens[prefix_tokens:]
 
 
 def digits(vector: torch.Tensor) -> list[float]:
@@ -87,9 +83,11 @@ def digits(vector: torch.Tensor) -> list[float]:
 images_dir = out_dir / "images"
 images_dir.mkdir(parents=True)
 
-# There are no entity masks until SAM arrives, so uniform full-frame weights are
-# what exercises pooling on real image data at all.
-uniform_weights = torch.ones(grid_rows * grid_columns)
+# The full patch grid rides along as a binary sidecar per image rather than in
+# reference.json: at 784 patches x 1024 it is megabytes of floats, and the Rust
+# side compares it as raw bytes anyway.
+patches_dir = out_dir / "patches"
+patches_dir.mkdir(parents=True)
 
 references = []
 for source in json.loads(images_json.read_text()):
@@ -99,20 +97,27 @@ for source in json.loads(images_json.read_text()):
     decoded = decode_image(str(source_path))
     channels, height, width = decoded.shape
 
-    reference_cls, reference_pooled = embed(decoded, uniform_weights)
+    reference_cls, reference_patches = embed(decoded)
+
+    # Explicit little-endian: torch/numpy `tofile` writes native order, which is
+    # LE by coincidence on today's hosts, not by contract. `<f4` pins it so the
+    # Rust reader's `from_le_bytes` is always right.
+    patches_file = f"patches/{source['id']}.f32"
+    (out_dir / patches_file).write_bytes(
+        reference_patches.numpy().astype("<f4").tobytes()
+    )
 
     references.append(
         {
             "id": source["id"],
             "file": f"images/{source['id']}",
+            "patches": patches_file,
             "source": {
                 "width": width,
                 "height": height,
                 "channels": channels,
             },
-            "pooling": "uniform",
             "cls": digits(reference_cls),
-            "pooled": digits(reference_pooled),
         }
     )
 
@@ -121,6 +126,7 @@ for source in json.loads(images_json.read_text()):
         {
             "resolution": resolution,
             "patch_grid": [grid_rows, grid_columns],
+            "hidden_size": hidden_size,
             "export": str(export_dir),
             # What produced the numbers, so a later disagreement can be read
             # against the implementation it was measured on.

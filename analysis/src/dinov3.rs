@@ -1,4 +1,4 @@
-//! DINOv3 through `ort`: pixels in, `last_hidden_state` out.
+//! DINOv3 through `ort`: pixels in, the CLS embedding and patch grid out.
 //!
 //! Mean/std normalization is baked into the graph by
 //! `nix/scripts/export-dinov3.py`, since there is no `AutoImageProcessor` in
@@ -21,7 +21,7 @@ use ort::{session::Session, value::TensorRef};
 use thiserror::Error;
 
 use crate::{
-    manifest::Dinov3Manifest,
+    manifest::{Dinov3Manifest, EMBEDDING_DIM},
     onnx::{self, SessionError},
 };
 
@@ -148,28 +148,38 @@ pub enum ResizeError {
     },
 }
 
-/// `last_hidden_state` for one image: `sequence_length` rows of `hidden_size`,
-/// prefix tokens first.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Tokens {
-    hidden_size: usize,
-    values: Vec<f32>,
+/// A raw `EMBEDDING_DIM`-d embedding in the model's output space, carried as the
+/// graph produced it.
+///
+/// Normalization is the consumer's concern: cosine similarity normalizes at the
+/// comparison, and region pooling takes a coverage-weighted mean of raw patch
+/// embeddings before L2-normalizing the pooled result. Only the crate mints
+/// these, from tokens `forward` has already held to finite.
+#[derive(Debug, Clone)]
+pub struct Embedding([f32; EMBEDDING_DIM]);
+
+impl Embedding {
+    pub(crate) fn new(components: [f32; EMBEDDING_DIM]) -> Self {
+        Self(components)
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        &self.0
+    }
 }
 
-impl Tokens {
-    pub fn hidden_size(&self) -> usize {
-        self.hidden_size
-    }
-
-    pub fn sequence_length(&self) -> usize {
-        self.values.len() / self.hidden_size
-    }
-
-    /// The `index`th token, `None` past the end of the sequence.
-    pub fn token(&self, index: usize) -> Option<&[f32]> {
-        let start = index.checked_mul(self.hidden_size)?;
-        self.values.get(start..start.checked_add(self.hidden_size)?)
-    }
+/// DINOv3's output for one image: the CLS embedding and the patch grid, both raw
+/// model-space vectors the pipeline normalizes where it compares or pools them.
+#[derive(Debug, Clone)]
+pub struct Features {
+    /// The whole-image embedding: DINOv3's global summary of the frame, for
+    /// image-level similarity, distinct from any mean of the patches.
+    pub cls: Embedding,
+    /// One feature vector per 16x16-pixel image patch, row-major over the patch
+    /// grid: `patches[i]` is grid cell `(i / cols, i % cols)`, left-to-right
+    /// then top-to-bottom, with `cols = resolution / patch_size`. This is the
+    /// ordering region pooling reads to map a patch back to an image location.
+    pub patches: Vec<Embedding>,
 }
 
 /// Why a forward pass did not produce tokens.
@@ -187,8 +197,11 @@ pub enum ForwardError {
     #[error("`{OUTPUT}` is not an f32 tensor")]
     OutputType(#[source] ort::Error),
 
-    #[error("`{OUTPUT}` has shape {shape:?}, expected one batch of tokens")]
+    #[error("`{OUTPUT}` has shape {shape:?}, not the one batch of manifest-declared tokens")]
     OutputShape { shape: Vec<i64> },
+
+    #[error("`{OUTPUT}` holds a non-finite token, which would poison the patch reduction")]
+    NonFiniteToken,
 }
 
 /// Why `embed` could not turn a decoded image into tokens.
@@ -227,11 +240,11 @@ impl Dinov3 {
     }
 
     /// Preprocesses a decoded image the way the checkpoint's processor does and
-    /// runs the model, returning its `last_hidden_state`.
+    /// runs the model, returning its CLS embedding and patch grid.
     ///
     /// `to_rgb8` fixes the channel count at three, broadcasting a grayscale
     /// frame to three planes the way the processor does when it converts to RGB.
-    pub fn embed(&mut self, image: &DynamicImage) -> Result<Tokens, EmbedError> {
+    pub fn embed(&mut self, image: &DynamicImage) -> Result<Features, EmbedError> {
         let planar = ChwImage::from_rgb(&image.to_rgb8(), self.manifest.rescale_factor);
         let square = planar
             .resize(self.manifest.resolution)
@@ -239,7 +252,7 @@ impl Dinov3 {
         self.forward(&square).map_err(EmbedError::Forward)
     }
 
-    fn forward(&mut self, image: &ChwImage) -> Result<Tokens, ForwardError> {
+    fn forward(&mut self, image: &ChwImage) -> Result<Features, ForwardError> {
         let shape = vec![CHANNELS as i64, image.height as i64, image.width as i64];
         let input = TensorRef::from_array_view((shape, image.samples.as_slice()))
             .map_err(ForwardError::Input)?;
@@ -253,12 +266,43 @@ impl Dinov3 {
             .try_extract_tensor::<f32>()
             .map_err(ForwardError::OutputType)?;
 
+        // The boundary: hold the output to the manifest's exact shape and length
+        // so every downstream slice is in-bounds, and reject a non-finite token
+        // before it can poison the patch reduction.
+        let expected = self.manifest.sequence_length;
         let dimensions: &[i64] = shape;
         match *dimensions {
-            [1, sequence_length, hidden_size] if sequence_length > 0 && hidden_size > 0 => {
-                Ok(Tokens {
-                    hidden_size: hidden_size as usize,
-                    values: values.to_vec(),
+            [1, sequence_length, dim]
+                if sequence_length == expected as i64
+                    && dim == EMBEDDING_DIM as i64
+                    && values.len() == expected * EMBEDDING_DIM =>
+            {
+                let (tokens, _rest) = values.as_chunks::<EMBEDDING_DIM>();
+                if tokens
+                    .iter()
+                    .any(|token| token.iter().any(|value| !value.is_finite()))
+                {
+                    return Err(ForwardError::NonFiniteToken);
+                }
+
+                // The guard forces `sequence_length == expected`, which manifest
+                // validation keeps `>= 1`, so `tokens` is non-empty and this
+                // always binds. The else is unreachable; a runtime length just
+                // keeps the compiler from seeing it.
+                let [cls, ..] = tokens else {
+                    return Err(ForwardError::OutputShape {
+                        shape: dimensions.to_vec(),
+                    });
+                };
+                let patches = tokens
+                    .iter()
+                    .skip(self.manifest.prefix_tokens)
+                    .map(|token| Embedding::new(*token))
+                    .collect();
+
+                Ok(Features {
+                    cls: Embedding::new(*cls),
+                    patches,
                 })
             }
             _ => Err(ForwardError::OutputShape {
