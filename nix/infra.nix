@@ -42,6 +42,16 @@ let
   # from the organization, which is spelled with the domain the site serves.
   webOrigin = "https://${settings.organization}";
 
+  # The three transform option strings the API mints, duplicated from
+  # Rendition::cloudflare_options in api/src/cdn.rs across the Rust/terranix
+  # boundary. The firewall rule below allows exactly these and blocks the rest,
+  # so a rendition-size change must land on both sides or the new size 403s.
+  cdnRenditionOptions = [
+    "width=320,format=auto,fit=scale-down"
+    "width=640,format=auto,fit=scale-down"
+    "width=1600,format=auto,fit=scale-down"
+  ];
+
   gcp = {
     terraform = {
       required_providers = {
@@ -546,25 +556,145 @@ let
         comment = "Redirected to the apex; see the redirects ruleset";
       };
 
-      cloudflare_ruleset.redirects = {
+      # Mirrored fact-store media lives in R2, keyed by the content address the
+      # API derives. Served under the zone rather than the r2.dev URL so the
+      # transform path and the header rules below apply to it.
+      cloudflare_r2_bucket.media = {
+        account_id = settings.cloudflareAccount;
+        name = settings.cdnBucket;
+      };
+
+      # Binds the CDN host to the bucket and mints the host's own DNS record and
+      # TLS certificate. There is deliberately no cloudflare_dns_record for the
+      # name: this resource owns it, and a hand-made record would collide.
+      # bucket_name references the bucket resource rather than the settings
+      # literal, so tofu orders the bucket's creation ahead of the binding.
+      cloudflare_r2_custom_domain.media = {
+        account_id = settings.cloudflareAccount;
         zone_id = settings.cloudflareZone;
-        name = "redirects";
-        kind = "zone";
-        phase = "http_request_dynamic_redirect";
-        rules = [
-          {
-            description = "www to the apex";
-            expression = "http.host eq \"www.${settings.organization}\"";
-            action = "redirect";
-            action_parameters.from_value = {
-              status_code = 301;
-              # The path carries over, so a link someone wrote with www still
-              # lands where it meant to.
-              target_url.expression = "concat(\"https://${settings.organization}\", http.request.uri.path)";
-              preserve_query_string = true;
-            };
-          }
-        ];
+        domain = settings.cdnHost;
+        enabled = true;
+        bucket_name = "\${cloudflare_r2_bucket.media.name}";
+      };
+
+      # Enables Image Resizing (transformations) for the zone, which is what
+      # makes the /cdn-cgi/image/ path render a rendition instead of 404ing.
+      # The provider does not validate setting_id, so a typo passes validate and
+      # fails only at apply; and whether it took is confirmed by rendering a
+      # transform URL, not by a clean apply. The newer lever may be
+      # `transformations`.
+      cloudflare_zone_setting.image_resizing = {
+        zone_id = settings.cloudflareZone;
+        setting_id = "image_resizing";
+        value = "on";
+      };
+
+      # One ruleset entrypoint per phase, so the three zone rulesets share one
+      # key: www redirects, CDN response headers, and the transform guard each
+      # own a different phase.
+      cloudflare_ruleset = {
+        redirects = {
+          zone_id = settings.cloudflareZone;
+          name = "redirects";
+          kind = "zone";
+          phase = "http_request_dynamic_redirect";
+          rules = [
+            {
+              description = "www to the apex";
+              expression = "http.host eq \"www.${settings.organization}\"";
+              action = "redirect";
+              action_parameters.from_value = {
+                status_code = 301;
+                # The path carries over, so a link someone wrote with www still
+                # lands where it meant to.
+                target_url.expression = "concat(\"https://${settings.organization}\", http.request.uri.path)";
+                preserve_query_string = true;
+              };
+            }
+          ];
+        };
+
+        # Response headers on the CDN host, split by path so each lands where
+        # it belongs. Response-phase rules are non-terminating, so all three
+        # apply their ops in order, and they read request fields to tell the
+        # transform path from the raw-master path.
+        cdn_response_headers = {
+          zone_id = settings.cloudflareZone;
+          name = "cdn-response-headers";
+          kind = "zone";
+          phase = "http_response_headers_transform";
+          rules = [
+            # Defense in depth against active content in the WebAuthn RP scope,
+            # on originals and transforms alike.
+            {
+              description = "nosniff on every CDN response";
+              expression = "http.host eq \"${settings.cdnHost}\"";
+              action = "rewrite";
+              action_parameters.headers."X-Content-Type-Options" = {
+                operation = "set";
+                value = "nosniff";
+              };
+            }
+            # Only the map canvas readback needs CORS, and it reads only
+            # transform URLs. Narrowing the wildcard off the raw-master path
+            # keeps it here rather than on a bucket-CORS resource, which also
+            # sidesteps R2's Origin-conditional cache behavior.
+            {
+              description = "CORS on the transform path only";
+              expression = "http.host eq \"${settings.cdnHost}\" and starts_with(http.request.uri.path, \"/cdn-cgi/image/\")";
+              action = "rewrite";
+              action_parameters.headers."Access-Control-Allow-Origin" = {
+                operation = "set";
+                value = "*";
+              };
+            }
+            # Direct navigation to a raw master downloads instead of rendering,
+            # so a scriptable master (SVG/PDF) that ever slipped the write-time
+            # gate cannot execute in the RP scope. Analysis fetches originals
+            # server-side, which ignores this, and no browser surface loads an
+            # original inline (the lightbox uses the Detail transform).
+            {
+              description = "Force download on the original path";
+              expression = "http.host eq \"${settings.cdnHost}\" and not starts_with(http.request.uri.path, \"/cdn-cgi/image/\")";
+              action = "rewrite";
+              action_parameters.headers."Content-Disposition" = {
+                operation = "set";
+                value = "attachment";
+              };
+            }
+          ];
+        };
+
+        # Caps the billable-transformation surface: a /cdn-cgi/image/ request
+        # whose options segment is not one of our fixed renditions is blocked,
+        # so no caller can mint an unbounded set of sizes. Whether this firewall
+        # phase intercepts /cdn-cgi/image/ ahead of the transformation is a
+        # runtime check at apply, not something validate confirms.
+        #
+        # No host predicate here, unlike the response-header rules, and the
+        # asymmetry is deliberate: this is cost and abuse protection that must
+        # apply wherever transforms are enabled in the zone, the apex included.
+        # The header rules scope to the cdn host because they describe the
+        # images we serve, which live only there.
+        cdn_transform_guard = {
+          zone_id = settings.cloudflareZone;
+          name = "cdn-transform-guard";
+          kind = "zone";
+          phase = "http_request_firewall_custom";
+          rules = [
+            {
+              description = "Block transform options outside our renditions";
+              expression =
+                let
+                  allowed = lib.concatMapStringsSep " or " (
+                    opts: "starts_with(http.request.uri.path, \"/cdn-cgi/image/${opts}/\")"
+                  ) cdnRenditionOptions;
+                in
+                "starts_with(http.request.uri.path, \"/cdn-cgi/image/\") and not (${allowed})";
+              action = "block";
+            }
+          ];
+        };
       };
     };
   };

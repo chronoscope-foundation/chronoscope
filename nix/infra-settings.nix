@@ -4,7 +4,11 @@
 # reads the same file back with `nix eval --file`, so the registry a deploy
 # pushes to is the registry that was declared. There is no second copy to
 # update.
-{
+#
+# `rec` so a coordinate can be spelled from another: the CDN host is a
+# subdomain of the served domain, and writing it as `cdn.${organization}`
+# keeps the two from drifting.
+rec {
   # The id is what gcloud and the console take; the number is how IAM
   # principals and service agent addresses are spelled.
   project = "chronoscope-io-prod";
@@ -39,6 +43,12 @@
   # served from. Both are opaque ids the API addresses resources by.
   cloudflareAccount = "8eb131c87dedde28b0f5006b388ca800";
   cloudflareZone = "f2bfc494c8eb03fd4472a56b3f05598f";
+
+  # Mirrored fact-store media. The bucket name is global to the R2 account;
+  # the host is the subdomain a browser fetches an image from, where the
+  # zone's transform path and header rules apply.
+  cdnBucket = "chronoscope-media";
+  cdnHost = "cdn.${organization}";
 
   # Worker in front of everything: it serves the web bundle as static assets
   # and proxies /api to the Cloud Run service.
