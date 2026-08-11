@@ -42,7 +42,7 @@ use crate::grammar::depiction::{self, Perspective};
 use crate::grammar::event;
 use crate::grammar::existence;
 use crate::grammar::features::Feature;
-use crate::grammar::geometry::{ImageGeometry, ProportionalPolyline};
+use crate::grammar::geometry::{Dimensions, ImageGeometry, ProportionalPolyline, Region};
 use crate::grammar::identity;
 use crate::grammar::ids::{AnalyzerProcess, AnalyzerVersion, FactId, UserId};
 use crate::grammar::image::{self, ImageMedium};
@@ -529,6 +529,21 @@ fn golden_image_geometry_polyline_locks_proportional_trace() -> Result<()> {
     assert_golden_roundtrip(
         &geometry,
         r#"{"polyline":{"points":[{"x":0.1,"y":0.2},{"x":0.3,"y":0.4}]},"type":"polyline"}"#,
+    )
+}
+
+#[test]
+fn golden_image_geometry_region_locks_run_length_mask() -> Result<()> {
+    // `ImageGeometry::Region` nests a `Region`'s grid and row-major run lengths
+    // under the named `region` field, and its validating `Deserialize` round-
+    // trips. The 2x2 diagonal encodes as background 1, foreground 2, background
+    // 1.
+    let geometry = ImageGeometry::Region {
+        region: Region::from_dense(Dimensions::new(2, 2)?, &[false, true, true, false])?,
+    };
+    assert_golden_roundtrip(
+        &geometry,
+        r#"{"region":{"dimensions":{"height":2,"width":2},"runs":[1,2,1]},"type":"region"}"#,
     )
 }
 
