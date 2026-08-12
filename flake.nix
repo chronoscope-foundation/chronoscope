@@ -216,7 +216,7 @@
 
         pythonEnvs = import ./nix/python.nix { inherit pkgs lib; };
 
-        vision = import ./nix/vision.nix {
+        analysis = import ./nix/analysis.nix {
           inherit pkgs lib;
           inherit (pythonEnvs) sam3Cache dinov3Repo;
           corpusImageFiles = corpus.imageFiles;
@@ -541,20 +541,21 @@
             # ONNX exports. Packages, not checks: multi-gigabyte, and the
             # weight FODs they consume need HF_TOKEN on a machine whose store
             # lacks them, which a pure `nix flake check` cannot supply.
-            sam3-onnx = vision.sam3Onnx;
-            vision-export-env = vision.exportEnv;
+            sam3-onnx = analysis.sam3Onnx;
+            sam3-fixture = analysis.sam3Fixture;
+            vision-export-env = analysis.exportEnv;
 
             # Resolution sets the patch grid masked pooling reads from, and
             # which one the region embeddings want is an empirical question the
             # crate answers against real images. Adding a variant is one line.
-            dinov3-onnx-224 = vision.mkDinov3Onnx 224;
-            dinov3-onnx-448 = vision.mkDinov3Onnx 448;
+            dinov3-onnx-224 = analysis.mkDinov3Onnx 224;
+            dinov3-onnx-448 = analysis.mkDinov3Onnx 448;
 
             # Reference embeddings for the tests `just model-test` runs, one per
             # export. Each holds its export in its own closure, so realizing a
             # fixture realizes the graph it describes.
-            dinov3-fixture-224 = vision.mkDinov3Fixture 224;
-            dinov3-fixture-448 = vision.mkDinov3Fixture 448;
+            dinov3-fixture-224 = analysis.mkDinov3Fixture 224;
+            dinov3-fixture-448 = analysis.mkDinov3Fixture 448;
 
             wikidata-curated-entities = wikidata.bundles.curated.entities;
 

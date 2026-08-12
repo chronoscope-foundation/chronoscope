@@ -65,6 +65,10 @@ image = { version = "0.25", default-features = false, features = [
     "png",
 ] }
 
+# SAM 3 masks are `core`'s `Region`, and box prompts are its `ProportionalRect`,
+# so the analysis pipeline speaks the grammar's geometry directly.
+chronoscope-core = { path = "../core" }
+
 chronoscope-integrations = { path = "../integrations", optional = true }
 url = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }

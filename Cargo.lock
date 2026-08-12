@@ -705,6 +705,7 @@ dependencies = [
 name = "chronoscope-analysis"
 version = "0.1.0"
 dependencies = [
+ "chronoscope-core",
  "chronoscope-integrations",
  "fast_image_resize",
  "image",

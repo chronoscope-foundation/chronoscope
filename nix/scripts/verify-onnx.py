@@ -6,11 +6,6 @@ spill into sibling files named after graph nodes, and node numbering restarts
 per export, so exports sharing a directory overwrite each other's weights. The
 model exported last still loads while an earlier one is quietly corrupt.
 
-It also cross-checks the baked language constants against the decoder's own
-declared inputs, since those constants replace a model that is deleted here and
-nothing downstream would otherwise notice a shape or dtype mismatch until ORT
-rejected the feed at runtime.
-
 Usage: verify-onnx.py <dir> [expected-model-name ...]
 """
 
@@ -30,14 +25,9 @@ ONNX_TO_NUMPY = {
     "tensor(uint8)": "uint8",
 }
 
-CONSTANTS = "language_constants"
-
 root = Path(sys.argv[1])
-# Callers name everything the export should contain. `language_constants` is a
-# directory of baked tensors rather than a graph, so it is checked differently.
+# Callers name every model directory the export should contain.
 expected = set(sys.argv[2:])
-expect_constants = CONSTANTS in expected
-expected.discard(CONSTANTS)
 
 # CPU explicitly. ORT's default provider list puts CoreML first on darwin, and
 # CoreML rejects any model using external data, which is every model here; the
@@ -152,71 +142,8 @@ for name in sorted(expected):
 # the root-level files are this script's own manifest and whatever a downstream
 # derivation lays beside it, and widening the sweep would reject both.
 produced = {p.name for p in root.iterdir() if p.is_dir()}
-for unexpected in sorted(produced - expected - {CONSTANTS}):
+for unexpected in sorted(produced - expected):
     failures.append(f"{unexpected}: unexpected directory in the export output")
-
-constants_dir = root / CONSTANTS
-described = None
-if expect_constants:
-    if not constants_dir.is_dir():
-        failures.append(f"{CONSTANTS}/: missing; the bake step did not run")
-    else:
-        manifest = constants_dir / "language_constants.json"
-        try:
-            described = json.loads(manifest.read_text())
-        except (OSError, ValueError) as exc:
-            failures.append(f"language_constants.json: unreadable: {exc}")
-elif constants_dir.is_dir():
-    failures.append(f"{CONSTANTS}/: present but the caller did not expect it")
-
-if described is not None:
-    decoder = sessions.get("decoder")
-    if decoder is None:
-        failures.append("language_constants present but the decoder did not load")
-    else:
-        decoder_inputs = {spec.name: spec for spec in decoder.get_inputs()}
-
-        # `language_embeds` is a parameter of SAM3Decoder.forward and an entry
-        # in its input_names, absent from the graph only because
-        # _forward_grounding never reads it and the tracer pruned it. Should it
-        # become live, the encoder that could supply it is already deleted.
-        for name in sorted(decoder_inputs):
-            if name.startswith("language_") and name not in described["tensors"]:
-                failures.append(
-                    f"{name}: decoder declares it but nothing baked it; the "
-                    "language encoder is deleted, so it cannot be produced later"
-                )
-
-        print(f"\n=== language_constants (prompt {described['prompt']!r}) ===")
-        for input_name, spec in described["tensors"].items():
-            target = decoder_inputs.get(input_name)
-            if target is None:
-                failures.append(f"{input_name}: no such decoder input")
-                continue
-            want_dtype = ONNX_TO_NUMPY.get(target.type)
-            if want_dtype is None:
-                failures.append(
-                    f"{input_name}: decoder wants {target.type}, which this "
-                    "script has no numpy equivalent for; add it to ONNX_TO_NUMPY"
-                )
-            elif spec["dtype"] != want_dtype:
-                failures.append(
-                    f"{input_name}: baked {spec['dtype']}, decoder wants {want_dtype}"
-                )
-            if spec["shape"] != list(target.shape):
-                failures.append(
-                    f"{input_name}: baked {spec['shape']}, decoder wants {target.shape}"
-                )
-            blob = constants_dir / spec["file"]
-            if not blob.is_file():
-                failures.append(f"{input_name}: {spec['file']} is missing")
-            elif blob.stat().st_size != spec["bytes"]:
-                failures.append(
-                    f"{input_name}: {spec['file']} is {blob.stat().st_size} bytes, "
-                    f"described as {spec['bytes']}"
-                )
-            else:
-                print(f"  {input_name:20s} {spec['dtype']:8s} {spec['shape']} ok")
 
 if failures:
     print("\nVERIFICATION FAILED", file=sys.stderr)
@@ -227,8 +154,7 @@ if failures:
 # One manifest per export, written only once everything above agrees, so the
 # crate never reads a description of an artifact that failed its own checks.
 # It carries the graph signatures plus the facts a signature cannot state: the
-# baked score threshold, the baked preprocessing, the patch grid, which
-# constants feed which decoder input.
+# baked score threshold, the baked preprocessing, the patch grid.
 manifest = {"models": {}}
 for name, session in sorted(sessions.items()):
     sub = root / name
@@ -248,15 +174,6 @@ for name, session in sorted(sessions.items()):
     if sidecar.is_file():
         entry["metadata"] = json.loads(sidecar.read_text())
     manifest["models"][name] = entry
-
-if described is not None:
-    manifest["language_constants"] = {
-        "directory": CONSTANTS,
-        **described,
-    }
-    # Recorded because the encoder's remaining output is unreachable: the
-    # decoder never declared it and the model that produced it is gone.
-    manifest["language_constants"]["encoder_deleted"] = True
 
 (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
 

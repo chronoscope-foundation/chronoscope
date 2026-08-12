@@ -1,4 +1,4 @@
-# Vision model export toolchain and ONNX artifacts.
+# Vision model export toolchain and ONNX artifacts for the analysis crate.
 #
 # Python exists here to *produce* artifacts and never to consume them: the
 # runtime closure is the `ort` crate plus a `.onnx` file. Exports are ordinary
@@ -164,12 +164,16 @@ let
     samexporter
   ]);
 
-  # Two ONNX models plus baked language constants, each in its own directory.
-  # The exporter emits three; the language encoder is consumed and deleted
-  # below. Torch spills tensors past the 2 GB protobuf limit into sibling files
-  # named after graph nodes (Constant_823_attr__value), and node numbering
-  # restarts per export, so a shared directory silently overwrites weights: the
-  # decoder exports last and loads fine while the image encoder is corrupt.
+  # The full SAM 3 image model, every head kept, each graph in its own
+  # directory. One merged image encoder emits both the grounding feature pyramid
+  # and the SAM-style interactive features from a single backbone pass; the
+  # language encoder, the grounding decoder, and the interactive single-object
+  # decoder all stay. Keeping it whole makes the prompt style a runtime choice
+  # (concept text, box exemplar, or interactive box/point) rather than a
+  # re-export. The per-graph directories are because torch spills tensors past
+  # the 2 GB protobuf limit into sibling files named after graph nodes, and node
+  # numbering restarts per export, so a shared directory silently overwrites
+  # weights.
   sam3Onnx =
     pkgs.runCommand "sam3-onnx"
       {
@@ -189,21 +193,14 @@ let
       ''
         export HOME="$TMPDIR"
         mkdir -p "$out"
-        python -m samexporter.export_sam3 --output_dir "$out"
+        python ${./scripts/export-sam3.py} "$out"
 
-        # Replace the 1.3 GB language encoder with the ~32 KB of tensors the
-        # decoder actually reads from it. Done here, in the derivation holding
-        # the weights, because those tensors are a pure function of the
-        # checkpoint and one fixed prompt: produced anywhere else they could
-        # drift from the checkpoint with nothing to catch it.
-        python ${./scripts/bake-language-constants.py} "$out"
-
-        # The exporter exiting 0 says nothing about whether the artifacts load;
-        # the corruption this guards against is silent and surfaces hours later
-        # in whatever consumes them. Loading is also the only contract the Rust
-        # side has with this derivation, so it is what the build should assert.
+        # The export exiting 0 says nothing about whether the artifacts load; the
+        # corruption this guards against is silent and surfaces hours later in
+        # whatever consumes them. Loading is the only contract the Rust side has
+        # with this derivation, so it is what the build asserts.
         python ${./scripts/verify-onnx.py} "$out" \
-          image_encoder decoder language_constants
+          image_encoder language_encoder decoder decoder_interactive
       '';
 
   # DINOv3 has no exporter to lean on, so the graph is ours. Normalization is
@@ -293,6 +290,121 @@ let
         python ${./scripts/dinov3-fixture.py} \
           ${dinov3Repo} ${mkDinov3Onnx resolution} "$imagesPath" "$out"
       '';
+
+  # The interactive box prompts the cordoned SAM 3 test compares against, one per
+  # corpus image. Seeded from the text-prompted grounding head and judged by hand:
+  # a tight, unambiguous box is a clean prompt for the interactive decoder, so the
+  # mask it returns is a meaningful reference rather than a degenerate one. Each is
+  # normalized xyxy over the frame, chosen across a spread of aspect ratios and
+  # object scales so a squash or an off-frame upscale has somewhere to show.
+  sam3ReferenceBoxes = [
+    {
+      id = "guggenheim-construction";
+      prompt = "car";
+      box = [
+        0.340
+        0.687
+        0.980
+        0.969
+      ];
+    }
+    {
+      id = "cape-hatteras-lighthouse";
+      prompt = "lighthouse";
+      box = [
+        0.510
+        0.170
+        0.703
+        0.786
+      ];
+    }
+    {
+      id = "itsukushima-torii";
+      prompt = "torii gate";
+      box = [
+        0.294
+        0.078
+        0.827
+        0.823
+      ];
+    }
+    {
+      id = "fire-hydrant-scene";
+      prompt = "fire hydrant";
+      box = [
+        0.261
+        0.332
+        0.710
+        0.909
+      ];
+    }
+    {
+      id = "bicycle-amsterdam";
+      prompt = "bicycle";
+      box = [
+        0.303
+        0.307
+        0.992
+        0.995
+      ];
+    }
+    {
+      id = "arc-de-triomphe";
+      prompt = "car";
+      box = [
+        0.729
+        0.830
+        0.866
+        0.904
+      ];
+    }
+    {
+      id = "st-basils-wide";
+      prompt = "building";
+      box = [
+        0.366
+        0.165
+        0.976
+        0.952
+      ];
+    }
+    {
+      id = "taj-mahal-front";
+      prompt = "building";
+      box = [
+        0.204
+        0.056
+        0.777
+        0.490
+      ];
+    }
+  ];
+
+  # The reference masks the cordoned SAM 3 test compares against. A package rather
+  # than a check for the same reason as the DINOv3 fixture: its closure reaches the
+  # HF-token weight FOD, and `nix flake check` runs pure. Holds the export in its
+  # closure, so realizing the fixture realizes the graph it describes.
+  sam3Fixture =
+    pkgs.runCommand "sam3-fixture"
+      {
+        nativeBuildInputs = [ exportEnv ];
+        HF_HOME = sam3Cache;
+        HF_HUB_OFFLINE = "1";
+        SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+        boxes = builtins.toJSON (
+          map (entry: {
+            inherit (entry) id prompt;
+            box_xyxy_norm = entry.box;
+            path = corpusImageFiles.${entry.id};
+          }) sam3ReferenceBoxes
+        );
+        passAsFile = [ "boxes" ];
+      }
+      ''
+        export HOME="$TMPDIR"
+        mkdir -p "$out"
+        python ${./scripts/sam3-fixture.py} ${sam3Onnx} "$boxesPath" "$out"
+      '';
 in
 {
   inherit
@@ -300,6 +412,7 @@ in
     samexporter
     exportEnv
     sam3Onnx
+    sam3Fixture
     mkDinov3Onnx
     mkDinov3Fixture
     ;

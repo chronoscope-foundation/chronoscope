@@ -811,4 +811,8 @@ model-test:
         fixtures="${fixtures:+$fixtures:}$fixture"
     done
     export DINOV3_FIXTURES="$fixtures"
+    # The SAM 3 fixture holds its export in its closure, so this realizes the
+    # interactive graph the comparison runs against too.
+    export SAM3_FIXTURE="$(nix build .#sam3-fixture \
+        --out-link .nix-gc-roots/sam3-fixture --print-out-paths)"
     cargo test -p chronoscope-analysis -- --ignored
