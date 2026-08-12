@@ -21,10 +21,11 @@ workspace = true
 leptos = { version = "0.8", features = ["csr"] }
 leptos_router = "0.8"
 console_error_panic_hook = "0.1"
-# Exact pin: must match wasm-bindgen-cli version in nix/rust.nix devShell.
-# A mismatch causes cryptic link-time errors. Cargo resolves this independently
-# of Nix, so the pin prevents `cargo update` from drifting past what Nix provides.
-wasm-bindgen = "= 0.2.108"
+# Exact pin: must match nixpkgs' wasm-bindgen-cli (flake.nix / nix/web.nix), which
+# floats with the nixpkgs pin. A mismatch causes cryptic schema-version errors. Cargo
+# resolves this independently of Nix, so the pin prevents `cargo update` from drifting
+# past what Nix provides.
+wasm-bindgen = "= 0.2.121"
 web-sys = { version = "0.3", features = ["AddEventListenerOptions", "CanvasRenderingContext2d", "CssStyleDeclaration", "CustomEvent", "CustomEventInit", "Document", "DomRect", "Element", "ErrorEvent", "Event", "EventTarget", "HtmlCanvasElement", "HtmlDivElement", "HtmlElement", "HtmlImageElement", "ImageData", "KeyboardEvent", "KeyboardEventInit", "Location", "MouseEvent", "MouseEventInit", "MutationObserver", "MutationObserverInit", "Navigator", "Node", "NodeList", "PromiseRejectionEvent", "Response", "Storage", "Window"] }
 send_wrapper = "0.6"
 wasm-bindgen-futures = "0.4"

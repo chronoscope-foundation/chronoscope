@@ -2,12 +2,12 @@
   description = "Chronoscope — temporal and spatial analysis platform";
 
   inputs = {
-    # Pinned to a nixpkgs-unstable commit with:
-    #   torch 2.10.0 (cached on aarch64-darwin; 2.9.x has MPS torch.cat crash)
-    #   transformers 5.2.0 (>= 4.56.0 required for dinov3_vit model type)
-    #   huggingface-hub 1.4.1 (has `hf` CLI for model downloads)
-    #   setuptools 80.10.1 (< 81; SAM3 needs pkg_resources)
-    nixpkgs.url = "github:NixOS/nixpkgs/d5a3c4d6c0b82a89b9b6a32a4d6036e762fbca3f";
+    # nixpkgs-unstable. The model-export stack's needs are lower bounds unstable
+    # keeps satisfying (torch >= 2.10 to dodge the 2.9.x MPS torch.cat crash,
+    # transformers >= 4.56 for dinov3_vit, the `hf` CLI). onnxruntime is bumped past
+    # unstable's 1.27.1 to 1.29 via the `onnxruntimeLatest` overlay below: its CoreML
+    # external-data load path is broken before 1.28.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     fenix = {
       url = "github:nix-community/fenix";
@@ -82,13 +82,36 @@
           buildInputs = builtins.filter (p: !(prev.lib.hasInfix "libxml2" (toString p))) old.buildInputs;
         });
       };
+
+      # nixpkgs' onnxruntime (1.27.1) already enables the CoreML EP on darwin, but its
+      # external-data load path is broken before 1.28: the EP resolves a model's
+      # external weight files against the model *file* path rather than its directory,
+      # so any weights-out-of-line model (the SAM/DINO encoders) fails to load under
+      # CoreML. Fixed in >= 1.28; bump the source to the latest release. Only src +
+      # version change is needed — unstable's abseil/onnx/protobuf already satisfy 1.29.
+      # An overlay so every consumer resolves the same lib: the `ort` crate's
+      # ORT_DYLIB_PATH, the analysis stack, and the python export/verify scripts.
+      onnxruntimeLatest = _final: prev: {
+        onnxruntime = prev.onnxruntime.overrideAttrs (_old: {
+          version = "1.29.0";
+          src = prev.fetchFromGitHub {
+            owner = "microsoft";
+            repo = "onnxruntime";
+            rev = "v1.29.0";
+            sha256 = "0dhvn6g9bva5pkqk59ldxwvsz2z9ghx352qfnz3m1dh7k4qphr8l";
+          };
+        });
+      };
     in
     flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [ spatialiteWithoutLibxml2 ];
+          overlays = [
+            spatialiteWithoutLibxml2
+            onnxruntimeLatest
+          ];
         };
         inherit (pkgs) lib;
         inherit (pkgs.stdenv.hostPlatform) isDarwin isLinux;
