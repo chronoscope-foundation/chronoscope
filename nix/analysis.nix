@@ -25,64 +25,70 @@ let
   # because it has `use_rope_real` in vitdet.py, added so the complex RoPE
   # buffer can be traced; the fork predates it and would need a hand-written
   # complex-to-real patch to export at all.
-  sam3 =
-    assert lib.versionOlder python.pkgs.setuptools.version "81";
-    python.pkgs.buildPythonPackage {
-      pname = "sam3";
-      version = "unstable-2026-07-30";
-      pyproject = true;
+  sam3 = python.pkgs.buildPythonPackage {
+    pname = "sam3";
+    version = "unstable-2026-07-30";
+    pyproject = true;
 
-      src = pkgs.fetchFromGitHub {
-        owner = "facebookresearch";
-        repo = "sam3";
-        rev = "96914d2425f90a64f45ca977c2b5165418099543";
-        hash = "sha256-1enI51bQfmgGhZ2Ra380syglBjBR/4kqqOdjLsdipec=";
-      };
-
-      # Five fixes, four of which are not macOS-specific:
-      #   position_encoding.py, decoder.py  — hardcoded device="cuda", breaks
-      #                                       any CUDA-less machine
-      #   geometry_encoders.py              — pin_memory() pins against MPS
-      #   perflib/fused.py                  — bf16 cast assuming ambient CUDA
-      #                                       autocast; fp32 unfused off-GPU
-      #   sam3_tracker_utils.py             — edt applies @triton.jit at import
-      #                                       and triton has no macOS build, so
-      #                                       the import moves into the one
-      #                                       video function that needs it
-      patches = [ ./patches/sam3-cpu-and-export.patch ];
-
-      build-system = with python.pkgs; [
-        setuptools
-        wheel
-      ];
-
-      # numpy: upstream pins <2, nixpkgs ships 2.x. ftfy: upstream pins ==6.1.1.
-      pythonRelaxDeps = [
-        "numpy"
-        "ftfy"
-      ];
-
-      dependencies = with python.pkgs; [
-        torch
-        torchvision
-        numpy
-        pillow
-        timm
-        tqdm
-        ftfy
-        regex
-        iopath
-        huggingface-hub
-        typing-extensions
-        einops
-        pycocotools
-        psutil
-        setuptools # pkg_resources at runtime
-      ];
-
-      doCheck = false;
-      pythonImportsCheck = [ "sam3" ];
+    src = pkgs.fetchFromGitHub {
+      owner = "facebookresearch";
+      repo = "sam3";
+      rev = "96914d2425f90a64f45ca977c2b5165418099543";
+      hash = "sha256-1enI51bQfmgGhZ2Ra380syglBjBR/4kqqOdjLsdipec=";
     };
+
+    # Five fixes, four of which are not macOS-specific:
+    #   position_encoding.py, decoder.py  — hardcoded device="cuda", breaks
+    #                                       any CUDA-less machine
+    #   geometry_encoders.py              — pin_memory() pins against MPS
+    #   perflib/fused.py                  — bf16 cast assuming ambient CUDA
+    #                                       autocast; fp32 unfused off-GPU
+    #   sam3_tracker_utils.py             — edt applies @triton.jit at import
+    #                                       and triton has no macOS build, so
+    #                                       the import moves into the one
+    #                                       video function that needs it
+    patches = [ ./patches/sam3-cpu-and-export.patch ];
+
+    # setuptools 81 removed pkg_resources; sam3 imports it only for
+    # resource_filename, so shim that one call onto importlib.resources rather
+    # than pin an ancient setuptools the rest of the toolchain has moved past.
+    postPatch = ''
+      substituteInPlace sam3/model_builder.py --replace-fail \
+        'import pkg_resources' \
+        'import importlib.resources; pkg_resources = type("_pr", (), {"resource_filename": staticmethod(lambda p, r: str(importlib.resources.files(p) / r))})()'
+    '';
+
+    build-system = with python.pkgs; [
+      setuptools
+      wheel
+    ];
+
+    # numpy: upstream pins <2, nixpkgs ships 2.x. ftfy: upstream pins ==6.1.1.
+    pythonRelaxDeps = [
+      "numpy"
+      "ftfy"
+    ];
+
+    dependencies = with python.pkgs; [
+      torch
+      torchvision
+      numpy
+      pillow
+      timm
+      tqdm
+      ftfy
+      regex
+      iopath
+      huggingface-hub
+      typing-extensions
+      einops
+      pycocotools
+      psutil
+    ];
+
+    doCheck = false;
+    pythonImportsCheck = [ "sam3" ];
+  };
 
   # ONNX exporter. No tagged release carries the SAM 3 path, so it is packaged
   # from the revision the export was proven against.
