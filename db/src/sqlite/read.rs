@@ -1224,7 +1224,7 @@ async fn witness_groups(
         groups.push(fids.into_iter().map(|fid| (fid, date.clone())).collect());
     }
     for (_event, mut rows) in event_groups {
-        rows.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        rows.sort_by_key(|a| (a.0, a.1));
         groups.push(rows.into_iter().map(|(_, fid, date)| (fid, date)).collect());
     }
     Ok(groups)

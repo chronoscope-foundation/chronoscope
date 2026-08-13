@@ -1026,8 +1026,8 @@ async fn cluster_tile_and_viewport_agree_across_a_mounted_base() -> TestResult {
         .filter(|c| in_container(&c.point))
         .collect();
 
-    tile_cells.sort_by(|a, b| a.representative.cmp(&b.representative));
-    vp_cells.sort_by(|a, b| a.representative.cmp(&b.representative));
+    tile_cells.sort_by_key(|a| a.representative);
+    vp_cells.sort_by_key(|a| a.representative);
     assert_eq!(
         tile_cells.len(),
         3,

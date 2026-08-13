@@ -110,7 +110,9 @@ pub(crate) fn session(
     let mut builder = Session::builder()
         .map_err(SessionError::Options)?
         .with_execution_providers(providers)
-        .and_then(|builder| builder.with_intra_threads(INTRA_OP_THREADS))
+        .map_err(|error| SessionError::Options(error.into()))?;
+    builder = builder
+        .with_intra_threads(INTRA_OP_THREADS)
         .map_err(|error| SessionError::Options(error.into()))?;
 
     for &(name, size) in dims {

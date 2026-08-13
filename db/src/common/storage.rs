@@ -330,7 +330,7 @@ where
         .iter()
         .map(|(idx, resolution)| (*idx, resolution.into()))
         .collect();
-    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_by_key(|(a, _)| *a);
     entries
 }
 

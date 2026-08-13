@@ -110,7 +110,7 @@ async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
             else {
                 continue;
             };
-            for (image, _entry) in projected.depictions.iter() {
+            for image in projected.depictions.keys() {
                 let rep = view
                     .image_representative(image)
                     .await
