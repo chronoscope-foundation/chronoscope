@@ -4,6 +4,7 @@
 # These are product/protocol/format names, not code identifiers.
 doc-valid-idents = [
     "AdGuard",
+    "CoreML",
     "DBpedia",
     "DINOv3",
     "EdDSA",

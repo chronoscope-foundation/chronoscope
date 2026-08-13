@@ -121,7 +121,7 @@ impl Dinov3 {
     pub fn open(export: &Path, accel: Accel) -> Result<Self, OpenError> {
         let manifest = Dinov3Manifest::load(export).map_err(OpenError::Manifest)?;
         let session =
-            onnx::session_for(&manifest.graph, accel, "dinov3").map_err(OpenError::Session)?;
+            onnx::session_for(&manifest.graph, accel, "dinov3", &[]).map_err(OpenError::Session)?;
         Ok(Self { session, manifest })
     }
 

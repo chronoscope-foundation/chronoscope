@@ -45,6 +45,19 @@ const IMAGE_EMBED: &str = "image_embed";
 const HIGH_RES_FEAT_0: &str = "high_res_feat_0";
 const HIGH_RES_FEAT_1: &str = "high_res_feat_1";
 
+/// Pins the decoder's `num_points` axis (the export left it symbolic) to the two
+/// the box path always sends: its corners, labels 2 and 3.
+///
+/// This is the flag that puts the whole decoder on CoreML. Left symbolic, the
+/// mask-decode tail has dynamic shapes CoreML's compiler cannot build an
+/// execution plan for, so that partition falls back to CPU; pinning the axis
+/// makes those shapes static and CoreML takes the graph. The other prompt kinds
+/// SAM offers, point clicks and click-by-click refinement, are a variable number
+/// of typed hints (`1`/`0` for include/exclude), not more box corners; serving
+/// them means opening the decoder without this override, dynamic and on CPU. The
+/// two here must match [`Sam3::segment_rect`]'s two prompt points.
+const DECODER_DIMS: &[(&str, i64)] = &[("num_points", 2)];
+
 /// One decoder-side feature map, held as the encoder produced it: a shape and
 /// its row-major `f32` data.
 struct FeatureMap {
@@ -83,10 +96,10 @@ impl Sam3 {
     /// interactive decoder, ready to encode and prompt.
     pub fn open(export: &Path, accel: Accel) -> Result<Self, OpenError> {
         let manifest = SamManifest::load(export).map_err(OpenError::Manifest)?;
-        let encoder = onnx::session_for(&manifest.image_encoder, accel, "image_encoder")
+        let encoder = onnx::session_for(&manifest.image_encoder, accel, "image_encoder", &[])
             .map_err(OpenError::Session)?;
-        let decoder =
-            onnx::session_for(&manifest.decoder, accel, "decoder").map_err(OpenError::Session)?;
+        let decoder = onnx::session_for(&manifest.decoder, accel, "decoder", DECODER_DIMS)
+            .map_err(OpenError::Session)?;
         Ok(Self {
             encoder,
             decoder,
