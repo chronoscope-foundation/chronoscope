@@ -11,8 +11,25 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ort::{ep::CPU, session::Session};
+use ort::{
+    ep::{CPU, CoreML, coreml::ModelFormat},
+    session::Session,
+};
 use thiserror::Error;
+
+/// Which execution backend a session runs on.
+///
+/// [`Cpu`](Backend::Cpu) is the portable path. [`CoreML`](Backend::CoreML)
+/// offloads the graph to the ANE/GPU; `cache_dir` holds onnxruntime's compiled
+/// `CoreML` models, so the minutes-long compile is paid once rather than on every
+/// session. It reads fine from a read-only path (a Nix store path), but the cache
+/// keys on the model path as given: the compile that populated it and the load
+/// that reuses it must name the model identically, or the load silently recompiles.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Backend<'a> {
+    Cpu,
+    CoreML { cache_dir: &'a Path },
+}
 
 /// Where `load-dynamic` resolves ONNX Runtime from. The `analysis` dev shell
 /// points it at the nixpkgs build.
@@ -51,13 +68,14 @@ pub enum SessionError {
     },
 }
 
-/// Builds a session over `graph` with the provider and thread count that every
-/// recorded reference was measured under.
+/// Builds a session over `graph` on the chosen [`Backend`].
 ///
-/// The CPU provider is pinned rather than left to ORT's auto-selection so the
-/// result is a property of the graph rather than of whatever the runtime
-/// decides it has available.
-pub(crate) fn session(graph: &Path) -> Result<Session, SessionError> {
+/// The provider is selected explicitly rather than left to ORT's auto-selection,
+/// so a session's backend is the caller's decision rather than whatever the
+/// runtime happens to find available. `CoreML` lists a CPU provider after it so the
+/// ops `CoreML` can't take (the windowed-attention reshuffles) fall back rather
+/// than fail the whole graph.
+pub(crate) fn session(graph: &Path, backend: Backend) -> Result<Session, SessionError> {
     // An empty value carries no path to resolve, so it earns the unset guidance
     // over a missing-path error. The `DINOV3_FIXTURES` check in the reference
     // test reads its own empty value the same way.
@@ -69,9 +87,20 @@ pub(crate) fn session(graph: &Path) -> Result<Session, SessionError> {
         return Err(SessionError::LibraryMissing { path: library });
     }
 
+    let providers = match backend {
+        Backend::Cpu => vec![CPU::default().build()],
+        Backend::CoreML { cache_dir } => vec![
+            CoreML::default()
+                .with_model_format(ModelFormat::MLProgram)
+                .with_model_cache_dir(cache_dir.to_string_lossy())
+                .build(),
+            CPU::default().build(),
+        ],
+    };
+
     let mut builder = Session::builder()
         .map_err(SessionError::Options)?
-        .with_execution_providers([CPU::default().build()])
+        .with_execution_providers(providers)
         .and_then(|builder| builder.with_intra_threads(INTRA_OP_THREADS))
         .map_err(|error| SessionError::Options(error.into()))?;
 
@@ -81,4 +110,31 @@ pub(crate) fn session(graph: &Path) -> Result<Session, SessionError> {
             path: graph.to_path_buf(),
             source: error,
         })
+}
+
+/// Caller-facing backend choice for an export whose several models share one
+/// acceleration decision. `CoreML` names a single cache root; each model within the
+/// export caches under its own subdirectory of it, so a decoder's compiled models
+/// never collide with the encoder's.
+#[derive(Debug, Clone, Copy)]
+pub enum Accel<'a> {
+    Cpu,
+    CoreML { cache_root: &'a Path },
+}
+
+/// Opens `graph` on `accel`. For `CoreML` the compiled-model cache lives at
+/// `cache_root/name`, keeping this model's cache distinct from its siblings'.
+pub(crate) fn session_for(graph: &Path, accel: Accel, name: &str) -> Result<Session, SessionError> {
+    match accel {
+        Accel::Cpu => session(graph, Backend::Cpu),
+        Accel::CoreML { cache_root } => {
+            let cache_dir = cache_root.join(name);
+            session(
+                graph,
+                Backend::CoreML {
+                    cache_dir: &cache_dir,
+                },
+            )
+        }
+    }
 }

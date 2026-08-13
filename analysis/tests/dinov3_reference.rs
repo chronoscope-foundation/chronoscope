@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chronoscope_analysis::dinov3::Dinov3;
+use chronoscope_analysis::{dinov3::Dinov3, onnx::Accel};
 use serde::Deserialize;
 
 /// Fixture directories, `PATH`-style, one per exported resolution.
@@ -102,7 +102,14 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
     let expected_patches = rows * columns;
     let hidden = reference.hidden_size;
 
-    let mut model = Dinov3::open(&reference.export).map_err(|source| {
+    // `COREML_CACHE`, when set to a precompiled cache root, runs this comparison
+    // on the CoreML backend instead of CPU, so the recorded fixtures double as a
+    // CoreML-against-CPU numeric check. Unset (the gate, `just model-test`) is CPU.
+    let coreml_cache = env::var_os("COREML_CACHE").map(PathBuf::from);
+    let accel = coreml_cache
+        .as_deref()
+        .map_or(Accel::Cpu, |root| Accel::CoreML { cache_root: root });
+    let mut model = Dinov3::open(&reference.export, accel).map_err(|source| {
         format!(
             "could not open the model under {:?}: {}",
             reference.export,

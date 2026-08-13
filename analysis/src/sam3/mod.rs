@@ -29,7 +29,7 @@ use ort::{session::Session, value::TensorRef};
 use thiserror::Error;
 
 use crate::{
-    onnx::{self, SessionError},
+    onnx::{self, Accel, SessionError},
     preprocess::{CHANNELS, ChwImage, ResizeError, positive_extent},
 };
 use manifest::SamManifest;
@@ -81,10 +81,12 @@ pub struct Sam3 {
 impl Sam3 {
     /// Loads the export's manifest and opens the image encoder and the
     /// interactive decoder, ready to encode and prompt.
-    pub fn open(export: &Path) -> Result<Self, OpenError> {
+    pub fn open(export: &Path, accel: Accel) -> Result<Self, OpenError> {
         let manifest = SamManifest::load(export).map_err(OpenError::Manifest)?;
-        let encoder = onnx::session(&manifest.image_encoder).map_err(OpenError::Session)?;
-        let decoder = onnx::session(&manifest.decoder).map_err(OpenError::Session)?;
+        let encoder = onnx::session_for(&manifest.image_encoder, accel, "image_encoder")
+            .map_err(OpenError::Session)?;
+        let decoder =
+            onnx::session_for(&manifest.decoder, accel, "decoder").map_err(OpenError::Session)?;
         Ok(Self {
             encoder,
             decoder,

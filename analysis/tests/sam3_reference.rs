@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chronoscope_analysis::sam3::Sam3;
+use chronoscope_analysis::{onnx::Accel, sam3::Sam3};
 use chronoscope_core::grammar::geometry::{Dimensions, ProportionalRect, Region};
 use serde::Deserialize;
 
@@ -98,7 +98,14 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
         format!("{path:?} is not shaped the way this comparison reads it: {source}")
     })?;
 
-    let mut sam = Sam3::open(&reference.export).map_err(|source| {
+    // `COREML_CACHE`, when set to a precompiled cache root, runs this comparison
+    // on the CoreML backend instead of CPU, so the recorded fixtures double as a
+    // CoreML-against-CPU numeric check. Unset (the gate, `just model-test`) is CPU.
+    let coreml_cache = env::var_os("COREML_CACHE").map(PathBuf::from);
+    let accel = coreml_cache
+        .as_deref()
+        .map_or(Accel::Cpu, |root| Accel::CoreML { cache_root: root });
+    let mut sam = Sam3::open(&reference.export, accel).map_err(|source| {
         format!(
             "could not open the model under {:?}: {}",
             reference.export,

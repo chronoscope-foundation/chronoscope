@@ -18,7 +18,7 @@ use ort::{session::Session, value::TensorRef};
 use thiserror::Error;
 
 use crate::{
-    onnx::{self, SessionError},
+    onnx::{self, Accel, SessionError},
     preprocess::{CHANNELS, ChwImage},
 };
 use manifest::{Dinov3Manifest, EMBEDDING_DIM};
@@ -118,9 +118,10 @@ pub struct Dinov3 {
 impl Dinov3 {
     /// Loads the export's manifest and opens the model it names, ready to embed
     /// against its contract.
-    pub fn open(export: &Path) -> Result<Self, OpenError> {
+    pub fn open(export: &Path, accel: Accel) -> Result<Self, OpenError> {
         let manifest = Dinov3Manifest::load(export).map_err(OpenError::Manifest)?;
-        let session = onnx::session(&manifest.graph).map_err(OpenError::Session)?;
+        let session =
+            onnx::session_for(&manifest.graph, accel, "dinov3").map_err(OpenError::Session)?;
         Ok(Self { session, manifest })
     }
 
