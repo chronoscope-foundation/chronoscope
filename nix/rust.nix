@@ -24,8 +24,27 @@ let
     # Nix-provided protoc — tonic-prost-build finds it via this env var.
     PROTOC = "${pkgs.protobuf}/bin/protoc";
 
+    # mistral.rs (the analysis crate's VLM runtime, macOS-target only for now)
+    # compiles its Metal kernels at runtime through the framework instead of
+    # shelling out to `xcrun metal` at build time. This box has Command Line
+    # Tools, not full Xcode, so build-time metallib compilation is impossible;
+    # the runtime path needs no Xcode. A no-op off macOS.
+    MISTRALRS_METAL_PRECOMPILE = "0";
+
+    # Git dependencies crane must vendor as fixed-output derivations, keyed by
+    # the exact `source` string in Cargo.lock: mistral.rs and the candle rev it
+    # pins. Without these crane falls back to an impure `builtins.fetchGit`.
+    outputHashes = {
+      "git+https://github.com/EricLBuehler/mistral.rs?rev=8010b6a0578e416120b590ed72fd46ed5f24ee85#8010b6a0578e416120b590ed72fd46ed5f24ee85" =
+        "sha256-3+AylFb8fER6dgTc65WfnrqfRs0biisoj1PSLd2krjE=";
+      "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e" =
+        "sha256-nEfVe2YEpfBPPX8wKkQ5c2rzGJsOX2asrAbac/s/t1w=";
+    };
+
     nativeBuildInputs = with pkgs; [
       pkg-config
+      # aws-lc-sys (pulled transitively by mistral.rs) builds libcrypto via cmake.
+      cmake
     ];
 
     # openssl: webauthn-rs depends on openssl-sys unconditionally (all platforms).

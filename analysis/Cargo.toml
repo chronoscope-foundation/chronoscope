@@ -76,3 +76,13 @@ chronoscope-integrations = { path = "../integrations", optional = true }
 url = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
 tokio = { workspace = true, optional = true }
+
+# Qwen 3.6 runs through mistral.rs, the analysis pipeline's VLM runtime, pinned
+# to the rev the crane build was proven against. metal on darwin; cuda joins
+# under a not-macos target when Linux prod is wired. Its Metal kernels compile
+# at runtime (MISTRALRS_METAL_PRECOMPILE=0 in the build) rather than through
+# xcrun, so the build needs no Xcode.
+[target.'cfg(target_os = "macos")'.dependencies]
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "8010b6a0578e416120b590ed72fd46ed5f24ee85", default-features = false, features = [
+    "metal",
+] }
