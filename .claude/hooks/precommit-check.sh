@@ -12,10 +12,11 @@ MARKER="$PROJECT_DIR/.claude/last-check.json"
 
 # Bail out for non-git-commit commands using bash builtins only — this hook
 # fires on every Bash tool call, so avoid forking grep/sed in the hot path.
+# Match `git commit` anywhere in the call so `cd <dir> && git commit`, the
+# normal shape in a worktree, still triggers the gate check.
 INPUT="$(cat)"
 case "$INPUT" in
-    *'"command":"git commit'*) ;;
-    *'"command": "git commit'*) ;;
+    *"git commit"*) ;;
     *) exit 0 ;;
 esac
 
