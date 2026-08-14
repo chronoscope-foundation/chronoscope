@@ -233,6 +233,10 @@ let
         deletion_protection = true;
 
         settings = {
+          # POSTGRES_18 defaults to the ENTERPRISE_PLUS edition, which admits
+          # only perf-optimized machine types. The shared-core tier below is an
+          # ENTERPRISE machine, so the edition is named to match the tier.
+          edition = "ENTERPRISE";
           tier = "db-g1-small";
 
           # Storage only ever grows, so this asks for what the curated set needs
