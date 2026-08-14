@@ -3,7 +3,7 @@
 # Python exists here to *produce* artifacts and never to consume them: the
 # runtime closure is the `ort` crate plus a `.onnx` file. Exports are ordinary
 # pure derivations because the impurity (gated, authenticated HF fetches) is
-# already quarantined in the weight FODs in python.nix, which are hash-pinned.
+# already quarantined in the weight FODs in models.nix, which are hash-pinned.
 {
   pkgs,
   lib,
@@ -15,12 +15,12 @@
 }:
 
 let
-  # Matches python.nix: chosen for aarch64-darwin binary-cache coverage of
+  # Matches models.nix: chosen for aarch64-darwin binary-cache coverage of
   # torch/torchvision. sam3 still declares `requires-python = ">=3.8"`; its
   # classifier list stopping at 3.12 is staleness, not a ceiling.
   python = pkgs.python313;
 
-  # Upstream Meta SAM 3, not the macOS fork python.nix packages for the
+  # Upstream Meta SAM 3, not the macOS fork models.nix packages for the
   # runtime MPS path. Upstream is the right base for export specifically
   # because it has `use_rope_real` in vitdet.py, added so the complex RoPE
   # buffer can be traced; the fork predates it and would need a hand-written

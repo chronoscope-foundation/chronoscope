@@ -11,7 +11,7 @@ Nix build infrastructure. One derivation module per project area;
 | `api.nix`       | Wrapped `chronoscope-api` binary (SpatiaLite path baked in) |
 | `openapi.nix`   | OpenAPI `spec`, ChronoscopeAPI SwiftPM package, store-path-spliced xcodegen `projectSpec` |
 | `web.nix`       | WASM build pipeline + wasm `web-build`/`web-test-build`/`web-clippy` and host `web-native-test`/`web-native-clippy` checks |
-| `python.nix`    | Model weight FODs (the one impure step in the chain) |
+| `models.nix`    | Model weight FODs (the one impure step in the chain) |
 | `analysis.nix`  | Patched sam3/samexporter packages, the ONNX export derivations and their manifests, and the per-resolution reference fixtures |
 | `corpus.nix`    | Per-URL image FODs, the per-entry `imageFiles` map that selects one of them, the link farm they assemble into, and the `corpus-fetch` binary that hashes new URLs |
 | `wikidata.nix`  | Curated entity fetch FOD + bulk dump pipeline (aria2 torrent FOD → arch-types → arch-entities JSONL → SQLite facts DBs) |

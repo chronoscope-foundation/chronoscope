@@ -68,6 +68,11 @@ syn = "2"
 quote = "1"
 proc-macro2 = "1"
 
+# VLM runtime, used only by the analysis crate. CPU base here; the analysis
+# crate adds the metal feature on darwin. Pinned to the rev the crane build is
+# proven against.
+mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "8010b6a0578e416120b590ed72fd46ed5f24ee85", default-features = false }
+
 # WASM size optimizations — applied to all release builds but the savings
 # primarily matter for the wasm32 target. LTO and codegen-units=1 let LLVM
 # eliminate dead code across crate boundaries; opt-level "z" and strip

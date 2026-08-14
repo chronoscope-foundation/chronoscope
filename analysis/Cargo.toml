@@ -77,12 +77,22 @@ url = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
 tokio = { workspace = true, optional = true }
 
-# Qwen 3.6 runs through mistral.rs, the analysis pipeline's VLM runtime, pinned
-# to the rev the crane build was proven against. metal on darwin; cuda joins
-# under a not-macos target when Linux prod is wired. Its Metal kernels compile
-# at runtime (MISTRALRS_METAL_PRECOMPILE=0 in the build) rather than through
-# xcrun, so the build needs no Xcode.
+# Qwen 3.6's VLM runtime. CPU base on every platform; the darwin target below
+# adds the Metal GPU backend. Its Metal kernels compile at runtime
+# (MISTRALRS_METAL_PRECOMPILE=0 in the build) rather than through xcrun, so the
+# build needs no Xcode.
+mistralrs = { workspace = true }
+
+# `qwen3::ask` derives the sampling constraint from the caller's type via
+# schemars, and `generate_structured` bounds it on schemars' `JsonSchema`. The
+# 1.x pin makes that bound satisfiable: mistralrs is on schemars 1, a different
+# major and a different trait than the workspace's 0.8.
+schemars = "1"
+
 [target.'cfg(target_os = "macos")'.dependencies]
-mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "8010b6a0578e416120b590ed72fd46ed5f24ee85", default-features = false, features = [
-    "metal",
-] }
+# The Metal GPU backend, on Apple hardware only; other platforms run on CPU.
+mistralrs = { workspace = true, features = ["metal"] }
+
+[dev-dependencies]
+# The reference test drives the async `open`/`ask` on a tokio runtime.
+tokio = { workspace = true }

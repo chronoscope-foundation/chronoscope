@@ -1,12 +1,14 @@
-# Model weights, fetched via `hf download` in sandboxed FODs.
+# Model weights, fetched via `hf download` in sandboxed FODs — the one impure
+# step of the build chain, kept in a single module.
 #
-# The export toolchain that consumes them lives in vision.nix; this module is
-# only the fetch, so the one impure step in the chain stays in one place.
+# DINOv3 and SAM 3 weights feed the ONNX export toolchain in analysis.nix; the
+# Qwen VLM weights are loaded straight by the analysis crate's mistral.rs runtime
+# with no export step. Python appears below only as the vehicle for the `hf` CLI.
 { pkgs, lib }:
 
 let
   # Only needs the HF CLI. The torch/transformers environment the exports run
-  # in is built in vision.nix, against these outputs.
+  # in is built in analysis.nix, against these outputs.
   python = pkgs.python313;
   # ---------------------------------------------------------------------------
   # Model weights — fetched via `hf download` in sandboxed FODs.
@@ -31,6 +33,9 @@ let
       repo,
       rev,
       hash ? lib.fakeHash,
+      # Gated repos hard-fail without a token; ungated ones (the Qwen VLM is
+      # apache-2.0) download fine without one, so the check would only lie.
+      gated ? true,
     }:
     pkgs.stdenvNoCC.mkDerivation {
       inherit name;
@@ -59,13 +64,15 @@ let
 
       buildCommand = ''
         export HOME="$TMPDIR"
-        if [ -z "$HF_TOKEN" ]; then
-          echo "error: HF_TOKEN is not set." >&2
-          echo "" >&2
-          echo "  This is a gated model repo that requires a Hugging Face token." >&2
-          echo "  Run: HF_TOKEN=hf_... just fetch-weights" >&2
-          exit 1
-        fi
+        ${lib.optionalString gated ''
+          if [ -z "$HF_TOKEN" ]; then
+            echo "error: HF_TOKEN is not set." >&2
+            echo "" >&2
+            echo "  This is a gated model repo that requires a Hugging Face token." >&2
+            echo "  Run: HF_TOKEN=hf_... just fetch-weights" >&2
+            exit 1
+          fi
+        ''}
         hf download "${repo}" \
           --revision "${rev}" \
           --local-dir "$out"
@@ -109,11 +116,32 @@ let
     done
   '';
 
+  # The Qwen vision-language MoE mistral.rs runs as the VLM: the base BF16
+  # safetensors repo (~67 GiB, 26 shards), which mistral.rs ISQ-quantizes at
+  # load. Nothing smaller substitutes — this version ships no UQFF, and
+  # mistral.rs cannot load GGUF for the qwen3_5_moe arch (upstream issues #2049
+  # text, #1714 vision). The base repo also carries the vision tower and loads
+  # from config.json's `Qwen3_5MoeForConditionalGeneration` with no override.
+  # Ungated (apache-2.0): no HF_TOKEN.
+  #
+  # Version is the swap knob: 3.6 → 3.8 is the string below, plus its matching
+  # rev and content hash — both identify the model, so both move with it.
+  qwenVlmVersion = "3.6";
+
+  qwenVlm = fetchHfRepo {
+    name = "qwen${qwenVlmVersion}-35b-a3b-vlm-weights";
+    repo = "Qwen/Qwen${qwenVlmVersion}-35B-A3B";
+    rev = "995ad96eacd98c81ed38be0c5b274b04031597b0";
+    gated = false;
+    hash = "sha256-I2OTeT7X+HA124JAXWL1gGbHoT4ng3SSYIDV6v0RzEI=";
+  };
+
 in
 {
   inherit
     dinov3Repo
     sam3Repo
     sam3Cache
+    qwenVlm
     ;
 }

@@ -237,11 +237,11 @@
           testExtraEnv = apiRuntimeEnv // webEnv;
         };
 
-        pythonEnvs = import ./nix/python.nix { inherit pkgs lib; };
+        models = import ./nix/models.nix { inherit pkgs lib; };
 
         analysis = import ./nix/analysis.nix {
           inherit pkgs lib;
-          inherit (pythonEnvs) sam3Cache dinov3Repo;
+          inherit (models) sam3Cache dinov3Repo;
           corpusImageFiles = corpus.imageFiles;
         };
 
@@ -339,7 +339,13 @@
 
         # webauthn-rs links openssl-sys unconditionally; libspatialite is
         # loaded at runtime via SELECT load_extension.
-        backendNativeBuildInputs = with pkgs; [ pkg-config ];
+        backendNativeBuildInputs = with pkgs; [
+          pkg-config
+          # aws-lc-sys (pulled transitively by mistral.rs on macOS) builds
+          # libcrypto via cmake, so any backend shell that compiles the
+          # workspace needs it, the same way nix/rust.nix's crane build does.
+          cmake
+        ];
         backendBuildInputs =
           (with pkgs; [
             sqlite
@@ -385,6 +391,12 @@
           apiRuntimeEnv
           // {
             PROTOC = "${pkgs.protobuf}/bin/protoc";
+            # mistral.rs (the macOS/metal VLM path) precompiles its Metal kernels
+            # through `xcrun metal` at build time unless deferred to runtime. A
+            # Command-Line-Tools box has no `xcrun metal`, so any backend shell
+            # that compiles the workspace needs this. A no-op off macOS, matching
+            # nix/rust.nix's crane build.
+            MISTRALRS_METAL_PRECOMPILE = "0";
           }
           // lib.optionalAttrs isLinux {
             # Carries nix/rust.nix's reason into the shells: cargo here links the
@@ -558,8 +570,11 @@
             corpus-fetch = corpus.corpusFetchBin;
 
             # Model weights — built with --impure and HF_TOKEN to populate store.
-            dinov3-weights = pythonEnvs.dinov3Repo;
-            sam3-weights = pythonEnvs.sam3Cache;
+            dinov3-weights = models.dinov3Repo;
+            sam3-weights = models.sam3Cache;
+            # The Qwen VLM mistral.rs ISQ-quantizes at load. Ungated, so this one
+            # needs no HF_TOKEN and no --impure.
+            qwen-vlm-weights = models.qwenVlm;
 
             # ONNX exports. Packages, not checks: multi-gigabyte, and the
             # weight FODs they consume need HF_TOKEN on a machine whose store

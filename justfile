@@ -668,6 +668,10 @@ fetch-weights:
     nix build .#dinov3-weights --impure --out-link .nix-gc-roots/dinov3-weights
     echo "==> Fetching SAM3 weights..."
     nix build .#sam3-weights --impure --out-link .nix-gc-roots/sam3-weights
+    # Qwen is ungated (apache-2.0): no HF_TOKEN, no --impure. ~67 GiB, so it is
+    # the long pole here. mistral.rs ISQ-quantizes it at load.
+    echo "==> Fetching Qwen VLM weights (~67 GiB)..."
+    nix build .#qwen-vlm-weights --out-link .nix-gc-roots/qwen-vlm-weights
     echo "Done. Weights pinned as GC roots; the exports rebuild from them."
 
 # Build the ONNX exports the analysis crate loads, and pin them as GC roots.
@@ -815,4 +819,8 @@ model-test:
     # interactive graph the comparison runs against too.
     export SAM3_FIXTURE="$(nix build .#sam3-fixture \
         --out-link .nix-gc-roots/sam3-fixture --print-out-paths)"
+    # Qwen 3.6's base weights (config, tokenizer, safetensors), realized so the
+    # reference test loads them from the store instead of a runtime download.
+    export QWEN_MODEL_DIR="$(nix build .#qwen-vlm-weights \
+        --out-link .nix-gc-roots/qwen-vlm-weights --print-out-paths)"
     cargo test -p chronoscope-analysis -- --ignored
