@@ -50,14 +50,17 @@ rec {
   cdnBucket = "chronoscope-media";
   cdnHost = "cdn.${organization}";
 
+  # The mirror pipeline that fills that bucket. The mirror-dispatch binary POSTs
+  # one fetch per image to the queue; the consumer Worker drains it into R2. A
+  # message that exhausts its retries lands in the dead-letter queue, where a
+  # persistent failure is visible until the queue's retention window elapses
+  # (24h on the free plan) rather than silently lost.
+  mirrorQueue = "chronoscope-mirror";
+  mirrorDlq = "chronoscope-mirror-dlq";
+  mirrorConsumerScript = "chronoscope-mirror-consumer";
+
   # Worker in front of everything: it serves the web bundle as static assets
   # and proxies /api to the Cloud Run service.
   workerScript = "chronoscope-front-door";
 
-  # Secret Manager secret holding the Cloudflare API token. Created by hand,
-  # like the state bucket, since the credential that declares infrastructure
-  # cannot be declared by it. The infra recipes read it at run time and hand it
-  # to the provider through the environment, so it stays out of the state and
-  # off every command line.
-  cloudflareTokenSecret = "cloudflare-api-token";
 }

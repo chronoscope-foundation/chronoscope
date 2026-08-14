@@ -145,16 +145,17 @@ _hold_stdin() {
 }
 '''
 
-# Put the Cloudflare credential in the environment the provider reads it from.
-# Fetched per run out of Secret Manager rather than kept in a file, a variable
-# in the config, or an argument: it never lands in the state, in the repo, or in
-# the process table.
+# Load the Cloudflare API token the provider reads, from the login keychain
+# unless CLOUDFLARE_API_TOKEN is already set (CI).
 _cloudflare_token := '''
 _cloudflare_token() {
     if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then return 0; fi
-    CLOUDFLARE_API_TOKEN=$(gcloud secrets versions access latest \
-        --secret="$(nix eval --file nix/infra-settings.nix cloudflareTokenSecret --raw)" \
-        --project="$(nix eval --file nix/infra-settings.nix project --raw)")
+    CLOUDFLARE_API_TOKEN="$(security find-generic-password -s chronoscope-cloudflare-token -w 2>/dev/null)" || true
+    if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+        echo "No Cloudflare token. Set CLOUDFLARE_API_TOKEN, or store the infra-runner token in the login keychain:" >&2
+        echo "  security add-generic-password -U -a \"\$USER\" -s chronoscope-cloudflare-token -w \"\$(pbpaste)\"" >&2
+        return 1
+    fi
     export CLOUDFLARE_API_TOKEN
 }
 '''
@@ -422,10 +423,8 @@ xcodegen:
 # credentials:
 #   gcloud auth application-default login
 #
-# Cloudflare authenticates with an API token instead, read out of Secret Manager
-# at run time and handed to the provider through CLOUDFLARE_API_TOKEN. That
-# keeps it out of the state, the repo and the process table; reading it needs
-# the same Google credentials as everything else here.
+# Cloudflare authenticates with an API token instead, loaded per run from the
+# login keychain (or CLOUDFLARE_API_TOKEN if already set).
 #
 # An apply prints its plan and waits for a typed confirmation before it touches
 # anything.

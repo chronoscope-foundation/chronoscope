@@ -42,6 +42,12 @@ let
   # from the organization, which is spelled with the domain the site serves.
   webOrigin = "https://${settings.organization}";
 
+  # A Worker's script, read at apply time via Terraform's file(), which returns
+  # file contents raw. A JS template literal like ${req.url} then survives
+  # instead of reading as an OpenTofu interpolation. The nix path coerces to the
+  # script's store path, which config.tf.json references so nix keeps it realized.
+  workerContent = path: "\${file(\"${path}\")}";
+
   # The three transform option strings the API mints, duplicated from
   # Rendition::cloudflare_options in api/src/cdn.rs across the Rust/terranix
   # boundary. The firewall rule below allows exactly these and blocks the rest,
@@ -116,29 +122,23 @@ let
         depends_on = [ "google_project_service.artifactregistry" ];
       };
 
-      # The key every session and challenge token is signed with. Generated
-      # here so there is no bootstrap step where a human mints a secret and
-      # pastes it somewhere, and so a later apply finds it in state and leaves
-      # it alone. Its value lives in that state, which is the trade taken:
-      # whoever can read the state can already read the secret it describes.
-      random_password.jwt = {
-        # The server refuses anything under 32 bytes. Alphanumeric only, since
-        # this travels through environment plumbing and the odd copy-paste, and
-        # 64 of those clear the floor either way.
-        length = 64;
-        special = false;
-      };
-
-      google_secret_manager_secret.jwt = {
-        inherit (settings) project;
-        secret_id = "${settings.cloudRunService}-jwt";
-        replication.auto = { };
-        depends_on = [ "google_project_service.secretmanager" ];
-      };
-
-      google_secret_manager_secret_version.jwt = {
-        secret = "\${google_secret_manager_secret.jwt.id}";
-        secret_data = "\${random_password.jwt.result}";
+      # Secrets generated here so no human mints or pastes one, and a later apply
+      # finds them in state and leaves them alone. Their values live in that
+      # state, the trade taken: whoever can read the state can already read the
+      # secret it holds. The JWT key signs sessions; the sweep token is the shared
+      # secret `/mirror/sweep` matches its header against.
+      random_password = {
+        jwt = {
+          # The server refuses anything under 32 bytes. Alphanumeric only, since
+          # this travels through environment plumbing and the odd copy-paste, and
+          # 64 of those clear the floor either way.
+          length = 64;
+          special = false;
+        };
+        mirror_sweep_token = {
+          length = 48;
+          special = false;
+        };
       };
 
       # The service runs as its own identity rather than the default compute
@@ -150,11 +150,64 @@ let
         display_name = "Chronoscope API runtime";
       };
 
-      google_secret_manager_secret_iam_member.api_jwt = {
-        inherit (settings) project;
-        secret_id = "\${google_secret_manager_secret.jwt.secret_id}";
-        role = "roles/secretmanager.secretAccessor";
-        member = "serviceAccount:\${google_service_account.api.email}";
+      # The three secrets the API server reads at startup: the JWT signing key,
+      # the Queues Write token minted in the cloudflare module, and the sweep
+      # endpoint's shared secret.
+      google_secret_manager_secret = {
+        jwt = {
+          inherit (settings) project;
+          secret_id = "${settings.cloudRunService}-jwt";
+          replication.auto = { };
+          depends_on = [ "google_project_service.secretmanager" ];
+        };
+        mirror_cf_token = {
+          inherit (settings) project;
+          secret_id = "${settings.cloudRunService}-mirror-cf-token";
+          replication.auto = { };
+          depends_on = [ "google_project_service.secretmanager" ];
+        };
+        mirror_sweep_token = {
+          inherit (settings) project;
+          secret_id = "${settings.cloudRunService}-mirror-sweep-token";
+          replication.auto = { };
+          depends_on = [ "google_project_service.secretmanager" ];
+        };
+      };
+
+      google_secret_manager_secret_version = {
+        jwt = {
+          secret = "\${google_secret_manager_secret.jwt.id}";
+          secret_data = "\${random_password.jwt.result}";
+        };
+        mirror_cf_token = {
+          secret = "\${google_secret_manager_secret.mirror_cf_token.id}";
+          secret_data = "\${cloudflare_api_token.mirror.value}";
+        };
+        mirror_sweep_token = {
+          secret = "\${google_secret_manager_secret.mirror_sweep_token.id}";
+          secret_data = "\${random_password.mirror_sweep_token.result}";
+        };
+      };
+
+      google_secret_manager_secret_iam_member = {
+        api_jwt = {
+          inherit (settings) project;
+          secret_id = "\${google_secret_manager_secret.jwt.secret_id}";
+          role = "roles/secretmanager.secretAccessor";
+          member = "serviceAccount:\${google_service_account.api.email}";
+        };
+        api_mirror_cf_token = {
+          inherit (settings) project;
+          secret_id = "\${google_secret_manager_secret.mirror_cf_token.secret_id}";
+          role = "roles/secretmanager.secretAccessor";
+          member = "serviceAccount:\${google_service_account.api.email}";
+        };
+        api_mirror_sweep_token = {
+          inherit (settings) project;
+          secret_id = "\${google_secret_manager_secret.mirror_sweep_token.secret_id}";
+          role = "roles/secretmanager.secretAccessor";
+          member = "serviceAccount:\${google_service_account.api.email}";
+        };
       };
 
       # Everything the API serves comes out of here, so the instance is sized
@@ -371,6 +424,31 @@ let
                   version = "latest";
                 };
               }
+              # The mirror sweep's coordinates: the account and queue it enqueues
+              # to (plain), and the two tokens (references, kept out of the
+              # revision's readable config). Absent, the endpoint refuses.
+              {
+                name = "CLOUDFLARE_ACCOUNT_ID";
+                value = settings.cloudflareAccount;
+              }
+              {
+                name = "MIRROR_QUEUE_ID";
+                value = "\${cloudflare_queue.mirror.id}";
+              }
+              {
+                name = "CLOUDFLARE_API_TOKEN";
+                value_source.secret_key_ref = {
+                  secret = "\${google_secret_manager_secret.mirror_cf_token.secret_id}";
+                  version = "latest";
+                };
+              }
+              {
+                name = "MIRROR_SWEEP_TOKEN";
+                value_source.secret_key_ref = {
+                  secret = "\${google_secret_manager_secret.mirror_sweep_token.secret_id}";
+                  version = "latest";
+                };
+              }
             ];
 
             # The default TCP probe passes the moment the port is bound, which
@@ -393,6 +471,10 @@ let
           "google_project_service.run"
           "google_secret_manager_secret_version.jwt"
           "google_secret_manager_secret_iam_member.api_jwt"
+          "google_secret_manager_secret_version.mirror_cf_token"
+          "google_secret_manager_secret_iam_member.api_mirror_cf_token"
+          "google_secret_manager_secret_version.mirror_sweep_token"
+          "google_secret_manager_secret_iam_member.api_mirror_sweep_token"
         ];
       };
 
@@ -440,9 +522,8 @@ let
       inherit (cloudflareProvider) version;
     };
 
-    # No provider block: the token comes from CLOUDFLARE_API_TOKEN, which the
-    # recipes read out of Secret Manager. Naming it here would put it in the
-    # config and, on the next apply, in the state.
+    # No provider block: the token comes from CLOUDFLARE_API_TOKEN in the
+    # environment tofu runs in.
 
     # The other half of what a deploy moves. Unlike the image, this is a
     # directory the provider reads while planning — it hashes every file to
@@ -454,55 +535,118 @@ let
       description = "Directory the Worker serves as static assets (a dist/ build of the web bundle)";
     };
 
-    output.web_dist.value = "\${var.web_dist}";
+    output = {
+      web_dist.value = "\${var.web_dist}";
+
+      # The queue's opaque id, which the send REST API takes (not the name). The
+      # dispatcher recipe reads it back from state rather than the operator
+      # copying it from the dashboard.
+      mirror_queue_id.value = "\${cloudflare_queue.mirror.id}";
+    };
 
     resource = {
-      cloudflare_workers_script.front_door = {
-        account_id = settings.cloudflareAccount;
-        script_name = settings.workerScript;
-
-        # Read in rather than pointed at: a module's name and its file's name
-        # have to agree, and a store path's basename carries a hash.
-        main_module = "front-door.js";
-        content = builtins.readFile ./front-door.js;
-
-        # Pinned so a change in runtime semantics arrives when someone moves
-        # this line, rather than on whichever redeploy happens to follow one.
-        compatibility_date = "2026-07-01";
-
-        bindings = [
-          # What the Worker answers asset misses from, so a 404 is the one the
-          # assets config describes rather than a string this script invents.
+      # A token scoped to Queues Write on the account and nothing else: the API
+      # server presents it to enqueue mirror fetches. Minted by the tofu identity
+      # (itself a user token with API Tokens Write), so no human pastes it; its
+      # value goes to a Secret Manager secret and into the Cloud Run env. That
+      # value lives in the state, the trade the JWT secret also takes.
+      cloudflare_api_token.mirror = {
+        name = "${settings.cloudRunService}-mirror-queues";
+        policies = [
           {
-            name = "ASSETS";
-            type = "assets";
-          }
-          # The API's hostname, taken from the service declared above. The
-          # Worker never has it written down, and a Cloud Run recreate carries
-          # a new URL into the Worker on the same apply.
-          {
-            name = "API_ORIGIN";
-            type = "plain_text";
-            text = "\${google_cloud_run_v2_service.api.uri}";
+            effect = "allow";
+            # "Queues Write" permission group, a stable global id hardcoded rather
+            # than looked up. The dashboard table labels it "Edit", but the API
+            # name is "Queues Write", so a by-name lookup is easy to get wrong.
+            permission_groups = [ { id = "366f57075ffc42689627bcf8242a1b6d"; } ];
+            resources = builtins.toJSON {
+              "com.cloudflare.api.account.${settings.cloudflareAccount}" = "*";
+            };
           }
         ];
+      };
 
-        assets = {
-          directory = "\${var.web_dist}";
+      cloudflare_workers_script = {
+        front_door = {
+          account_id = settings.cloudflareAccount;
+          script_name = settings.workerScript;
 
-          config = {
-            # The frontend routes /about, /faq and /related-work in the client,
-            # so a reload or a shared link on one of those has to arrive as
-            # index.html instead of a 404.
-            not_found_handling = "single-page-application";
+          # Read in rather than pointed at: a module's name and its file's name
+          # have to agree, and a store path's basename carries a hash.
+          main_module = "front-door.js";
+          content = workerContent ./front-door.js;
 
-            # A list, not `true`: only /api/* runs the Worker before the assets
-            # are consulted, so everything in the bundle is still served with no
-            # code in the path. Naming it is what keeps the line above from
-            # swallowing the API — single-page-application answers *navigation*
-            # requests from index.html, so without this, opening an /api URL in
-            # a browser would return the app instead of the endpoint.
-            run_worker_first = [ "/api/*" ];
+          # Pinned so a change in runtime semantics arrives when someone moves
+          # this line, rather than on whichever redeploy happens to follow one.
+          compatibility_date = "2026-07-01";
+
+          bindings = [
+            # What the Worker answers asset misses from, so a 404 is the one the
+            # assets config describes rather than a string this script invents.
+            {
+              name = "ASSETS";
+              type = "assets";
+            }
+            # The API's hostname, taken from the service declared above. The
+            # Worker never has it written down, and a Cloud Run recreate carries
+            # a new URL into the Worker on the same apply.
+            {
+              name = "API_ORIGIN";
+              type = "plain_text";
+              text = "\${google_cloud_run_v2_service.api.uri}";
+            }
+          ];
+
+          assets = {
+            directory = "\${var.web_dist}";
+
+            config = {
+              # The frontend routes /about, /faq and /related-work in the client,
+              # so a reload or a shared link on one of those has to arrive as
+              # index.html instead of a 404.
+              not_found_handling = "single-page-application";
+
+              # Only /api/* runs the Worker before the assets are consulted, so
+              # everything in the bundle is served with no code in the path.
+              # Naming it keeps the line above from swallowing the API:
+              # single-page-application answers *navigation* requests from
+              # index.html, so without this, opening an /api URL in a browser
+              # returns the app instead of the endpoint.
+              run_worker_first = [ "/api/*" ];
+            };
+          };
+        };
+
+        # It fetches each upstream image and puts it in R2 through the binding,
+        # so no R2 credential lives anywhere but the edge. A queue consumer
+        # serves no HTTP, so it needs no route or custom domain.
+        mirror_consumer = {
+          account_id = settings.cloudflareAccount;
+          script_name = settings.mirrorConsumerScript;
+
+          main_module = "mirror-consumer.js";
+          content = workerContent ../integrations/mirror-consumer.js;
+
+          # Pinned like front_door: the runtime moves when this line does, not on
+          # whichever redeploy happens to follow one.
+          compatibility_date = "2026-07-01";
+
+          bindings = [
+            # The R2 sink, named off the bucket resource so tofu orders its
+            # creation ahead of the script that writes to it.
+            {
+              name = "MEDIA_BUCKET";
+              type = "r2_bucket";
+              bucket_name = "\${cloudflare_r2_bucket.media.name}";
+            }
+          ];
+
+          # A queue consumer has no HTTP request to leave a trace, and its only
+          # record of an image it refused (a bad content type, an oversize) is a
+          # console line. Persist those so a drop is diagnosable after the fact
+          # rather than only during a live tail.
+          observability = {
+            enabled = true;
           };
         };
       };
@@ -511,10 +655,55 @@ let
       # That is a second public origin serving the same app, which the API
       # refuses to authenticate against (its RP_ORIGIN is the apex) and search
       # engines would happily index alongside the real one.
-      cloudflare_workers_script_subdomain.front_door = {
+      cloudflare_workers_script_subdomain = {
+        front_door = {
+          account_id = settings.cloudflareAccount;
+          script_name = "\${cloudflare_workers_script.front_door.script_name}";
+          enabled = false;
+        };
+
+        # No workers.dev origin for the consumer either; it is reached only by
+        # the queue, never over HTTP.
+        mirror_consumer = {
+          account_id = settings.cloudflareAccount;
+          script_name = "\${cloudflare_workers_script.mirror_consumer.script_name}";
+          enabled = false;
+        };
+      };
+
+      # The mirror pipeline's transport. Two queues so a message that exhausts
+      # its retries has somewhere to land: the consumer wiring below points the
+      # main queue's dead letters at the dlq.
+      cloudflare_queue = {
+        mirror = {
+          account_id = settings.cloudflareAccount;
+          queue_name = settings.mirrorQueue;
+        };
+
+        mirror_dlq = {
+          account_id = settings.cloudflareAccount;
+          queue_name = settings.mirrorDlq;
+        };
+      };
+
+      # Binds mirror_consumer to the mirror queue. Bounded max_concurrency is the
+      # politeness lever against Wikimedia: the per-location rate-limit binding
+      # would multiply it by PoP, so the ceiling is set here instead. A message
+      # that exhausts max_retries is dead-lettered.
+      #
+      # dead_letter_queue takes the dlq's name, not its id (which is what
+      # infra-validate accepts against this provider's schema).
+      cloudflare_queue_consumer.mirror = {
         account_id = settings.cloudflareAccount;
-        script_name = "\${cloudflare_workers_script.front_door.script_name}";
-        enabled = false;
+        queue_id = "\${cloudflare_queue.mirror.id}";
+        script_name = "\${cloudflare_workers_script.mirror_consumer.script_name}";
+        type = "worker";
+        dead_letter_queue = "\${cloudflare_queue.mirror_dlq.queue_name}";
+        settings = {
+          max_concurrency = 4;
+          max_retries = 4;
+          retry_delay = 30;
+        };
       };
 
       # Creates the apex record and the certificate along with the binding, so
