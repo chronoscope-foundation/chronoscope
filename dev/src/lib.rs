@@ -547,6 +547,11 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         ios_app_id: config.ios_app_id,
         cdn_base_url: url::Url::parse(&config.cdn_base_url)
             .map_err(|e| format!("Invalid CDN base URL: {e}"))?,
+        // web-dev serves the map for browsing, not corpus warms; the sweep
+        // endpoint refuses. A warm runs the api binary, which reads the queue
+        // and sweep token from the environment.
+        mirror_queue: None,
+        mirror_sweep_token: None,
     };
 
     // Generate a random JWT secret for this session

@@ -10,9 +10,14 @@ mod entities;
 mod health;
 #[cfg(feature = "embedded-media")]
 mod media;
+mod mirror;
 mod research;
 mod user;
 mod well_known;
+
+/// The sweep secret the test harness configures, so the mirror endpoint tests
+/// can present a matching (and a mismatching) header.
+const TEST_SWEEP_TOKEN: &str = "test-mirror-sweep-token";
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -363,6 +368,10 @@ impl TestContext {
             bind_addr: addr,
             ios_app_id,
             cdn_base_url: Url::parse(crate::cdn::tests::TEST_CDN_BASE_URL)?,
+            // No queue in tests, so the sweep still refuses at the queue check;
+            // the token is set so the auth gate can be exercised past it.
+            mirror_queue: None,
+            mirror_sweep_token: Some(TEST_SWEEP_TOKEN.to_string()),
         };
 
         let db = Database::new(&config.database_url).await?;
@@ -441,6 +450,14 @@ impl TestContext {
         self.client
             .reqwest_client()
             .get(self.url(path))
+            .send()
+            .await
+    }
+
+    async fn post(&self, path: &str) -> reqwest::Result<Response> {
+        self.client
+            .reqwest_client()
+            .post(self.url(path))
             .send()
             .await
     }

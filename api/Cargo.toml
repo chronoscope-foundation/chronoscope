@@ -79,6 +79,14 @@ slog = "2"
 # HTTP client (used by dev binary for ngrok API, and tests)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Stream helpers for the `/mirror/sweep` sweep: async-stream builds the paged
+# image-class walk as a lazy stream, futures-util batches and drains it.
+async-stream = "0.3"
+futures-util.workspace = true
+
+# The mirror sweep warns on a cited URL it cannot key.
+tracing.workspace = true
+
 [dev-dependencies]
 # Testing framework
 tokio-test = "0.4"

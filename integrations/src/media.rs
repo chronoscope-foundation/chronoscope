@@ -432,20 +432,39 @@ impl std::fmt::Display for DisplayableKey {
     }
 }
 
-/// Extensions we can both transform at the edge and decode locally.
+/// The formats a browser can render, each as the extensions that name it and
+/// the content type its bytes carry. `displayable()` gates on the extensions;
+/// the mirror consumer re-checks the fetched bytes against the content type. One
+/// source for both encodings so they cannot drift: a format added here widens
+/// the display gate and the consumer's accept list in one edit.
 ///
-/// The intersection of two constraints, which is why it is an allowlist rather
-/// than a list of exclusions. Cloudflare accepts PNG, JPEG, GIF, WebP, SVG,
-/// HEIC, and AVIF as transform input, with AVIF restricted to Enterprise
-/// plans. The `image` crate is built here with `jpeg`, `png`, `gif`, and
-/// `webp` only, so anything else would transform in production and fail in the
-/// dev route.
+/// The set is the intersection of two constraints, which is why it is an
+/// allowlist rather than a list of exclusions. Cloudflare accepts PNG, JPEG,
+/// GIF, WebP, SVG, HEIC, and AVIF as transform input, with AVIF restricted to
+/// Enterprise plans. The `image` crate is built here with `jpeg`, `png`, `gif`,
+/// and `webp` only, so anything else would transform in production and fail in
+/// the dev route.
 ///
 /// SVG is excluded on both counts: transforms deliver it unresized, so a
 /// thumbnail URL would serve a full-size SVG, and a direct original URL
 /// bypasses Cloudflare's sanitization entirely, putting `image/svg+xml` inside
 /// the WebAuthn RP scope.
-const DISPLAYABLE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp"];
+const DISPLAYABLE_FORMATS: &[(&[&str], &str)] = &[
+    (&["jpg", "jpeg"], "image/jpeg"),
+    (&["png"], "image/png"),
+    (&["gif"], "image/gif"),
+    (&["webp"], "image/webp"),
+];
+
+/// The content types the displayable formats carry, for the mirror consumer's
+/// fetch-time re-check of the bytes. Drawn from the same `DISPLAYABLE_FORMATS`
+/// the extension gate reads, so an accept list a dispatcher stamps cannot omit a
+/// format the gate admits.
+pub fn displayable_content_types() -> impl Iterator<Item = &'static str> {
+    DISPLAYABLE_FORMATS
+        .iter()
+        .map(|(_, content_type)| *content_type)
+}
 
 /// Whether a browser-renderable rendition can be derived from this URL.
 ///
@@ -478,7 +497,7 @@ fn web_url_displays(url: &Url) -> bool {
         .is_some_and(renderable_extension)
 }
 
-/// Whether a filename ends in one of [`DISPLAYABLE_EXTENSIONS`].
+/// Whether a filename ends in an extension of one of [`DISPLAYABLE_FORMATS`].
 ///
 /// Case-insensitive on the extension: Commons carries `.JPG`, and neither
 /// source folds a name's case when it keys, so the fold has to happen here.
@@ -486,7 +505,10 @@ fn renderable_extension(name: &str) -> bool {
     let Some((_, extension)) = name.rsplit_once('.') else {
         return false;
     };
-    DISPLAYABLE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+    let extension = extension.to_ascii_lowercase();
+    DISPLAYABLE_FORMATS
+        .iter()
+        .any(|(extensions, _)| extensions.contains(&extension.as_str()))
 }
 
 #[cfg(test)]

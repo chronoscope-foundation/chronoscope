@@ -176,6 +176,19 @@ pub struct Config {
 
     /// CDN base URL for media assets (e.g., `https://cdn.chronoscope.io`)
     pub cdn_base_url: Url,
+
+    /// The Cloudflare queue a mirror sweep enqueues to, when configured. Present
+    /// only when the account, queue, and API token are all set in the
+    /// environment — locally, to warm the corpus. Its absence is what keeps the
+    /// unauthenticated `/mirror/sweep` endpoint from doing anything where no
+    /// token is set (production today), since it refuses before touching the
+    /// store.
+    pub mirror_queue: Option<crate::mirror::sweep::QueueTarget>,
+
+    /// The shared secret `/mirror/sweep` matches its header against, from
+    /// `MIRROR_SWEEP_TOKEN`. Absent, the endpoint refuses every request: with
+    /// nothing to match, there is no one it can let through.
+    pub mirror_sweep_token: Option<String>,
 }
 
 impl Config {
@@ -234,7 +247,46 @@ impl Config {
             bind_addr,
             ios_app_id,
             cdn_base_url,
+            mirror_queue: mirror_queue_from_env(),
+            mirror_sweep_token: std::env::var("MIRROR_SWEEP_TOKEN")
+                .ok()
+                .filter(|value| !value.is_empty()),
         })
+    }
+}
+
+/// The mirror queue target, built from the environment when the account, queue,
+/// and token are all set and non-empty. All three or nothing: a partial set
+/// leaves it `None`, so the sweep endpoint refuses rather than half-run. An
+/// empty value counts as unset, so `CLOUDFLARE_API_TOKEN=` does not build a
+/// target with an empty bearer token that would fail every send. A partial set
+/// is logged, since it is a misconfiguration a local warm needs to see.
+fn mirror_queue_from_env() -> Option<crate::mirror::sweep::QueueTarget> {
+    let present = |key: &str| std::env::var(key).ok().filter(|value| !value.is_empty());
+    let account_id = present("CLOUDFLARE_ACCOUNT_ID");
+    let queue_id = present("MIRROR_QUEUE_ID");
+    let token = present("CLOUDFLARE_API_TOKEN");
+    match (account_id, queue_id, token) {
+        (Some(account_id), Some(queue_id), Some(token)) => {
+            Some(crate::mirror::sweep::QueueTarget {
+                account_id,
+                queue_id,
+                token,
+            })
+        }
+        (account_id, queue_id, token) => {
+            if account_id.is_some() || queue_id.is_some() || token.is_some() {
+                // Straight to stderr: `Config::from_env` runs before the slog
+                // logger exists, and a startup misconfiguration should be loud.
+                eprintln!(
+                    "warning: mirror queue partially configured (account_id={}, queue_id={}, token={}); /mirror/sweep will refuse until CLOUDFLARE_ACCOUNT_ID, MIRROR_QUEUE_ID, and CLOUDFLARE_API_TOKEN are all set and non-empty",
+                    account_id.is_some(),
+                    queue_id.is_some(),
+                    token.is_some(),
+                );
+            }
+            None
+        }
     }
 }
 
