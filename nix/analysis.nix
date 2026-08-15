@@ -7,11 +7,22 @@
 {
   pkgs,
   lib,
+  craneLib,
   sam3Cache,
   dinov3Repo,
   # Entry ID → image file, from nix/corpus.nix. Only the reference set below is
   # ever selected from it, so the other FODs are never realized.
   corpusImageFiles,
+  # Workspace commonArgs + shared dependency artifact, for the `qwen-quantize`
+  # bin built below (see nix/rust.nix).
+  rustCommonArgs,
+  cargoArtifacts,
+  # Source narrowed to the `qwen-quantize` bin's crate closure — see
+  # `deployables` in flake.nix.
+  quantizeSrc,
+  # The Qwen 3.6 base BF16 safetensors FOD (nix/models.nix), the input the AFQ4
+  # UQFF is quantized from.
+  qwenVlm,
 }:
 
 let
@@ -411,6 +422,60 @@ let
         mkdir -p "$out"
         python ${./scripts/sam3-fixture.py} ${sam3Onnx} "$boxesPath" "$out"
       '';
+
+  # The AFQ4 UQFF pre-quantizer, built from the `chronoscope-quantize` crate over
+  # its narrowed source, sharing the workspace dependency artifact. Its closure is
+  # itself on mistral.rs alone, so no onnxruntime is involved.
+  qwenQuantizeBin = craneLib.buildPackage (
+    rustCommonArgs
+    // {
+      inherit cargoArtifacts;
+      src = quantizeSrc;
+      pname = "qwen-quantize";
+      cargoExtraArgs = "-p chronoscope-quantize --bin qwen-quantize";
+      doCheck = false;
+    }
+  );
+
+  # The prequantized AFQ4 UQFF the analysis crate loads: a plain (non-FOD)
+  # derivation over the base BF16 weights FOD. mistral.rs forces the quantize
+  # onto CPU whenever `write_uqff` is set, so this produces the artifact with no
+  # GPU; the runtime loads it back with the fast Metal MoE kernel and no ISQ
+  # pass. Network-free given the FOD.
+  #
+  # The contract check asserts the loader's inputs exist rather than trusting the
+  # write's exit code — the same discipline the ONNX exports above apply, since a
+  # silently short write surfaces only hours later in whatever consumes it.
+  qwenVlmUqff =
+    let
+      # The first shard the qwen-quantize bin writes (its `afq4` stem, sharded by
+      # mistral.rs). Named once here: the contract check asserts it and the
+      # `firstShard` passthru points callers straight at it, so the loader carries
+      # no layout knowledge of its own.
+      firstShardName = "afq4-0.uqff";
+    in
+    pkgs.runCommand "qwen-vlm-uqff"
+      {
+        nativeBuildInputs = [ qwenQuantizeBin ];
+        # The base FOD holds every file the loader reads; keep a local-directory
+        # load from reaching the hub for siblings.
+        HF_HUB_OFFLINE = "1";
+        # Full path to the first shard, so a caller names the load target with a
+        # nix expression rather than assuming the filename.
+        passthru.firstShard = "${qwenVlmUqff}/${firstShardName}";
+      }
+      ''
+        export HOME="$TMPDIR"
+        mkdir -p "$out"
+        qwen-quantize ${qwenVlm} "$out"
+
+        for f in ${firstShardName} residual.safetensors config.json tokenizer.json preprocessor_config.json; do
+          if [ ! -f "$out/$f" ]; then
+            echo "error: qwen-quantize did not produce $out/$f" >&2
+            exit 1
+          fi
+        done
+      '';
 in
 {
   inherit
@@ -421,5 +486,7 @@ in
     sam3Fixture
     mkDinov3Onnx
     mkDinov3Fixture
+    qwenQuantizeBin
+    qwenVlmUqff
     ;
 }

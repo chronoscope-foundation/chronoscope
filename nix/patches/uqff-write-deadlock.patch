@@ -1,0 +1,150 @@
+diff -ruN a/mistralrs-core/src/pipeline/isq.rs b/mistralrs-core/src/pipeline/isq.rs
+--- a/mistralrs-core/src/pipeline/isq.rs	2026-08-14 23:09:03
++++ b/mistralrs-core/src/pipeline/isq.rs	2026-08-14 23:09:59
+@@ -571,7 +571,7 @@
+         Some(quant_report.clone()),
+     )?;
+     let guard = mistralrs_quant::QuantizeOntoGuard::new();
+-    for (module, rx) in layers.iter().zip(handles.receivers) {
++    for (module, rx) in layers.iter().zip(handles.receivers()) {
+         bar.set_message(module.key.clone());
+         bar.tick();
+         let resolved_ty = module.resolve_type(ty);
+diff -ruN a/mistralrs-core/src/pipeline/isq_flow/mod.rs b/mistralrs-core/src/pipeline/isq_flow/mod.rs
+--- a/mistralrs-core/src/pipeline/isq_flow/mod.rs	2026-08-14 23:09:04
++++ b/mistralrs-core/src/pipeline/isq_flow/mod.rs	2026-08-14 23:10:01
+@@ -38,7 +38,7 @@
+     )?;
+     // drain everything; failed layers keep their prior resident, so a partial swap stays consistent
+     let mut errors: Vec<String> = Vec::new();
+-    for (module, rx) in modules.iter().zip(handles.receivers) {
++    for (module, rx) in modules.iter().zip(handles.receivers()) {
+         match rx.recv() {
+             Ok(Ok(output)) => module.ct.replace(output.value),
+             Ok(Err(e)) => errors.push(format!("{}: {e}", module.key)),
+diff -ruN a/mistralrs-quant/src/utils/isq.rs b/mistralrs-quant/src/utils/isq.rs
+--- a/mistralrs-quant/src/utils/isq.rs	2026-08-14 23:09:00
++++ b/mistralrs-quant/src/utils/isq.rs	2026-08-14 23:09:48
+@@ -1,4 +1,5 @@
+-use std::sync::{atomic::AtomicUsize, Arc};
++use std::sync::{atomic::AtomicUsize, mpsc, Arc};
++use std::thread::JoinHandle;
+ 
+ use candle_core::{quantized::GgmlDType, Device, Result, Tensor};
+ 
+@@ -111,13 +112,46 @@
+     Arc::new(PendingIsqLayer::new(rx))
+ }
+ 
+-/// In-flight parallel requantization; receivers are in the same order as the input modules.
+-/// Holds the pool so spawned jobs outlive the call.
++/// In-flight parallel requantization. `receivers()` yields one receiver per input module in
++/// order; submission runs on its own thread so the caller's drain can release the host budget
++/// the submit backpressure waits on. Holds the pool so spawned jobs outlive the call.
+ pub struct RequantizeHandles {
++    receivers: mpsc::Receiver<pending_layer::IsqReceiver>,
++    submitter: Option<JoinHandle<()>>,
+     _executor: crate::IsqExecutor,
+-    pub receivers: Vec<pending_layer::IsqReceiver>,
+ }
+ 
++impl RequantizeHandles {
++    /// Per-module receivers in input order. Consuming this drives the drain that keeps the
++    /// submit-side host-budget backpressure relievable.
++    pub fn receivers(&self) -> mpsc::Iter<'_, pending_layer::IsqReceiver> {
++        self.receivers.iter()
++    }
++}
++
++impl Drop for RequantizeHandles {
++    fn drop(&mut self) {
++        // A caller that stops early leaves the submitter parked on the host budget. Draining the
++        // rest releases each retained output, so the submitter finishes and the pool can join.
++        while let Ok(rx) = self.receivers.recv() {
++            let _ = rx.recv();
++        }
++        if let Some(submitter) = self.submitter.take() {
++            let _ = submitter.join();
++        }
++    }
++}
++
++/// A module resolved and planned on the caller thread, ready to hand to the submit thread.
++struct PreparedRequant {
++    plan: crate::IsqPlanParams,
++    layer: Arc<dyn QuantMethod>,
++    ty: IsqType,
++    device: Device,
++    imatrix: Option<Vec<f32>>,
++    guard: crate::QuantizeOntoGuard,
++}
++
+ /// Quantize a rebuilt `[E, out, in]` expert stack to `ty`: GGML types go slab-by-slab so each
+ /// expert can take its own importance vector; other types quantize the whole stack.
+ pub fn quantize_expert_stack(
+@@ -163,7 +197,11 @@
+         .with_external_reserved_host_bytes(extra_host_reserve_bytes);
+     let (executor, _) = crate::create_isq_executor(config);
+     let guard = crate::QuantizeOntoGuard::new();
+-    let mut receivers = Vec::with_capacity(modules.len());
++
++    // Resolve and plan every module up front on the caller thread: this fails fast on a bad
++    // module before any job is queued, and keeps `ty_for`/`imatrix_for` off the submit thread so
++    // they need no `Send` bound.
++    let mut prepared = Vec::with_capacity(modules.len());
+     for module in modules {
+         let layer = module.ct.resolve()?;
+         let ty = ty_for(module);
+@@ -194,16 +232,46 @@
+             module_key: module.key.clone(),
+         };
+         let plan = layer.plan_isq(&request)?;
+-        let rx = executor.submit(plan, consumer, move || {
+-            layer
+-                .clone()
+-                .apply_isq(Some(ty), device, &AtomicUsize::new(0), imatrix, guard)
++        prepared.push(PreparedRequant {
++            plan,
++            layer,
++            ty,
++            device,
++            imatrix,
++            guard,
+         });
+-        receivers.push(rx);
+     }
++
++    // Submit from a separate thread: `enqueue` parks here once the host budget fills, and only
++    // the caller draining `receivers()` frees it again. On one thread the submit-all-before-drain
++    // order self-deadlocks, since the drain that would relieve the budget never begins.
++    let submit_executor = executor.clone();
++    let (receiver_tx, receiver_rx) = mpsc::channel();
++    let submitter = std::thread::spawn(move || {
++        for job in prepared {
++            let PreparedRequant {
++                plan,
++                layer,
++                ty,
++                device,
++                imatrix,
++                guard,
++            } = job;
++            let rx = submit_executor.submit(plan, consumer, move || {
++                layer
++                    .clone()
++                    .apply_isq(Some(ty), device, &AtomicUsize::new(0), imatrix, guard)
++            });
++            if receiver_tx.send(rx).is_err() {
++                break;
++            }
++        }
++    });
++
+     Ok(RequantizeHandles {
++        receivers: receiver_rx,
++        submitter: Some(submitter),
+         _executor: executor,
+-        receivers,
+     })
+ }
+ 

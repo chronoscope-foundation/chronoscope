@@ -2,22 +2,24 @@
 //! out.
 //!
 //! Unlike the SAM 3 and DINOv3 reference tests, this one reproduces no numeric
-//! reference: it proves the mechanism, not a match. The model loads,
-//! ISQ-quantizes to AFQ4, and answers a prompt about an image as a caller-defined
-//! type, so load, constrain, decode, and deserialize each have somewhere to fail.
-//! A non-empty field on the parsed value signals the round trip closed.
+//! reference: it proves the mechanism, not a match. The model loads the
+//! prequantized AFQ4 UQFF and answers a prompt about an image as a
+//! caller-defined type, so load, constrain, decode, and deserialize each have
+//! somewhere to fail. A non-empty field on the parsed value signals the round
+//! trip closed.
 //!
-//! Ignored by default: it loads tens of gigabytes of weights the commit gate
-//! cannot realize. `QWEN_MODEL_DIR` names a Hugging Face snapshot directory of
-//! Qwen 3.6; `just model-test` is where that gets wired.
+//! Ignored by default: it loads a multi-gigabyte UQFF the commit gate cannot
+//! realize. `QWEN_MODEL_DIR` names the UQFF directory the `qwen-quantize` bin
+//! wrote; `just model-test` is where that gets wired.
 
 use std::{env, error, path::Path};
 
 use chronoscope_analysis::qwen3::Qwen3;
 use image::{Rgb, RgbImage};
 
-/// The weight directory, a Hugging Face snapshot of Qwen 3.6.
-const MODEL_DIR: &str = "QWEN_MODEL_DIR";
+/// The env var naming the model's first UQFF shard (its `afq4-0.uqff`), as the
+/// `qwen-vlm-uqff` derivation's `firstShard` exposes it.
+const FIRST_SHARD_ENV: &str = "QWEN_MODEL_FIRST_SHARD";
 
 /// The tiny type the model must fill. That a caller-defined Rust value comes back
 /// populated is the whole proof: schema-constrained decoding parsed into it.
@@ -57,12 +59,12 @@ fn red_disk() -> image::DynamicImage {
     image::DynamicImage::ImageRgb8(pixels)
 }
 
-fn run(model_dir: &Path) -> Result<(), Box<dyn error::Error>> {
+fn run(first_shard: &Path) -> Result<(), Box<dyn error::Error>> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let model = Qwen3::open(model_dir).await.map_err(|source| {
+        let model = Qwen3::open(first_shard).await.map_err(|source| {
             format!(
-                "could not open the model under {model_dir:?}: {}",
+                "could not open the model from {first_shard:?}: {}",
                 describe(&source)
             )
         })?;
@@ -87,14 +89,14 @@ fn run(model_dir: &Path) -> Result<(), Box<dyn error::Error>> {
 #[test]
 #[ignore = "needs the Qwen 3.6 weights; run `just model-test`"]
 fn structured_answer_round_trips_from_an_image() -> Result<(), Box<dyn error::Error>> {
-    let model_dir = env::var_os(MODEL_DIR)
+    let first_shard = env::var_os(FIRST_SHARD_ENV)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             format!(
-                "{MODEL_DIR} is unset. Set it to a Hugging Face snapshot directory of \
-                 Qwen 3.6 (config, tokenizer, and safetensors shards); the ignored test \
+                "{FIRST_SHARD_ENV} is unset. Set it to the model's `afq4-0.uqff` shard \
+                 path (the `qwen-vlm-uqff` derivation's `firstShard`); the ignored test \
                  cannot find the weights any other way."
             )
         })?;
-    run(Path::new(&model_dir))
+    run(Path::new(&first_shard))
 }

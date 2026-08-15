@@ -7,16 +7,18 @@
 //! type, and the result deserializes straight into it: an ill-typed answer is
 //! unrepresentable, not a parse that might fail afterward.
 //!
-//! `open` is the expensive call. mistral.rs can't load Qwen 3.6's GGUF export, so
-//! we load the full-precision safetensors and quantize them in place (ISQ) to
-//! AFQ4, the mixture-of-experts kernel; that reads tens of gigabytes and rewrites
-//! them to four bits once, leaving `ask` cheap against the resident model.
+//! `open` loads a prequantized AFQ4 UQFF. mistral.rs can't load Qwen 3.6's GGUF
+//! export, so the weights are quantized ahead of time to the AFQ4
+//! mixture-of-experts format (the `qwen-quantize` bin, built by the
+//! `qwen-vlm-uqff` Nix derivation) and this reads that self-contained directory
+//! back: no ISQ pass, just a load of the four-bit shards, leaving `ask` cheap
+//! against the resident model.
 //!
 //! mistral.rs runs the Metal GPU backend on Apple hardware and CPU elsewhere.
 
 use std::path::{Path, PathBuf};
 
-use mistralrs::{IsqType, Model, MultimodalModelBuilder, RequestBuilder, TextMessageRole};
+use mistralrs::{Model, RequestBuilder, TextMessageRole, UqffMultimodalModelBuilder};
 use thiserror::Error;
 
 /// A loaded Qwen 3.6, quantized to AFQ4 and ready to answer prompts over images.
@@ -25,27 +27,30 @@ pub struct Qwen3 {
 }
 
 impl Qwen3 {
-    /// Loads the base safetensors under `model_dir` and quantizes them to AFQ4.
+    /// Loads the prequantized AFQ4 UQFF whose first shard is `first_shard`.
     ///
-    /// `model_dir` is a local directory of Hugging Face weights (config,
-    /// tokenizer, and safetensors shards), not a repo id. The directory check
-    /// keeps a missing path from reaching `MultimodalModelBuilder`, which would
-    /// otherwise read a non-existent local path as a repo id and fail against the
-    /// network instead of naming the real problem.
-    pub async fn open(model_dir: &Path) -> Result<Self, OpenError> {
-        if !model_dir.is_dir() {
-            return Err(OpenError::NotADirectory {
-                path: model_dir.to_path_buf(),
-            });
-        }
-        let model = MultimodalModelBuilder::new(model_dir.to_string_lossy())
-            .with_isq(IsqType::AFQ4)
-            .build()
-            .await
-            .map_err(|source| OpenError::Build {
-                path: model_dir.to_path_buf(),
-                source: source.into(),
+    /// `first_shard` is the path to the model's `afq4-0.uqff`, as the
+    /// `qwen-vlm-uqff` derivation exposes it. mistral.rs takes the containing
+    /// directory plus the shard's name and discovers the sibling shards, the
+    /// residual, config, and tokenizer from that directory itself, so the loader
+    /// owns no layout knowledge beyond the path it is handed.
+    pub async fn open(first_shard: &Path) -> Result<Self, OpenError> {
+        let dir = first_shard.parent().ok_or_else(|| OpenError::ShardPath {
+            path: first_shard.to_path_buf(),
+        })?;
+        let name = first_shard
+            .file_name()
+            .ok_or_else(|| OpenError::ShardPath {
+                path: first_shard.to_path_buf(),
             })?;
+        let model =
+            UqffMultimodalModelBuilder::new(dir.to_string_lossy(), vec![PathBuf::from(name)])
+                .build()
+                .await
+                .map_err(|source| OpenError::Build {
+                    path: first_shard.to_path_buf(),
+                    source: source.into(),
+                })?;
         Ok(Self { model })
     }
 
@@ -67,13 +72,13 @@ impl Qwen3 {
     }
 }
 
-/// Why the model could not be opened from its weight directory.
+/// Why the model could not be opened from its first UQFF shard.
 #[derive(Debug, Error)]
 pub enum OpenError {
-    #[error("`{path}` is not a directory of Qwen 3.6 weights")]
-    NotADirectory { path: PathBuf },
+    #[error("`{path}` is not a shard file with a parent directory")]
+    ShardPath { path: PathBuf },
 
-    #[error("mistral.rs could not load and quantize the model at `{path}`")]
+    #[error("mistral.rs could not load the prequantized AFQ4 UQFF from `{path}`")]
     Build {
         path: PathBuf,
         #[source]

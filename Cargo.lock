@@ -1328,6 +1328,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "chronoscope-quantize"
+version = "0.1.0"
+dependencies = [
+ "mistralrs",
+ "tokio",
+]
+
+[[package]]
 name = "chronoscope-web"
 version = "0.1.0"
 dependencies = [

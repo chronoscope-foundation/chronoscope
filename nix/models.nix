@@ -117,8 +117,9 @@ let
   '';
 
   # The Qwen vision-language MoE mistral.rs runs as the VLM: the base BF16
-  # safetensors repo (~67 GiB, 26 shards), which mistral.rs ISQ-quantizes at
-  # load. Nothing smaller substitutes — this version ships no UQFF, and
+  # safetensors repo (~67 GiB, 26 shards), the input the `qwen-vlm-uqff`
+  # derivation prequantizes to AFQ4. Nothing smaller substitutes: this version
+  # ships no UQFF, and
   # mistral.rs cannot load GGUF for the qwen3_5_moe arch (upstream issues #2049
   # text, #1714 vision). The base repo also carries the vision tower and loads
   # from config.json's `Qwen3_5MoeForConditionalGeneration` with no override.

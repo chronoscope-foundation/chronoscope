@@ -181,6 +181,17 @@
             ]) (map (crate: ./. + "/${crate}") crates);
           };
 
+          # The AFQ4 UQFF pre-quantizer, its own crate so editing any product
+          # crate leaves the multi-gigabyte quantize untouched; only its closure
+          # (itself, on mistral.rs alone) re-keys the derivation.
+          quantize = {
+            package = "chronoscope-quantize";
+            crates = [
+              "tools/quantize"
+            ];
+            extra = [ ];
+          };
+
           web = {
             package = "chronoscope-web";
             crates = [
@@ -240,9 +251,12 @@
         models = import ./nix/models.nix { inherit pkgs lib; };
 
         analysis = import ./nix/analysis.nix {
-          inherit pkgs lib;
-          inherit (models) sam3Cache dinov3Repo;
+          inherit pkgs lib craneLib;
+          inherit (models) sam3Cache dinov3Repo qwenVlm;
           corpusImageFiles = corpus.imageFiles;
+          rustCommonArgs = rust.commonArgs;
+          inherit (rust) cargoArtifacts;
+          quantizeSrc = deployableSrcs.quantize;
         };
 
         corpus = import ./nix/corpus.nix {
@@ -572,9 +586,15 @@
             # Model weights — built with --impure and HF_TOKEN to populate store.
             dinov3-weights = models.dinov3Repo;
             sam3-weights = models.sam3Cache;
-            # The Qwen VLM mistral.rs ISQ-quantizes at load. Ungated, so this one
-            # needs no HF_TOKEN and no --impure.
+            # The Qwen VLM base BF16 safetensors. Ungated, so this one needs no
+            # HF_TOKEN and no --impure. `qwen-vlm-uqff` prequantizes it.
             qwen-vlm-weights = models.qwenVlm;
+
+            # The prequantized AFQ4 UQFF the analysis crate loads: a pure
+            # derivation over the base weights FOD, produced by the
+            # `qwen-quantize` bin. Realized on demand by `just model-test`; the
+            # CPU quantize keeps the fast Metal MoE kernel on load.
+            qwen-vlm-uqff = analysis.qwenVlmUqff;
 
             # ONNX exports. Packages, not checks: multi-gigabyte, and the
             # weight FODs they consume need HF_TOKEN on a machine whose store

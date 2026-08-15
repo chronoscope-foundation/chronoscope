@@ -26,11 +26,14 @@ let
     meta = json.load(open(sys.argv[1]))
     expected = json.load(open(sys.argv[2]))
 
-    # Cargo names packages, the registry names directories, and manifest_path is
-    # what relates the two.
+    # Cargo names packages; deployable crate lists name directories relative to
+    # the workspace root; manifest_path relates the two. Root-relative, not the
+    # basename, so a crate nested under a grouping dir (tools/quantize) maps to
+    # its real path. Top-level crates are unaffected: their relpath is the base.
     members = {p["name"]: p for p in meta["packages"]}
+    root = meta["workspace_root"]
     directory = {
-        name: os.path.basename(os.path.dirname(p["manifest_path"]))
+        name: os.path.relpath(os.path.dirname(p["manifest_path"]), root)
         for name, p in members.items()
     }
 

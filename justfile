@@ -669,7 +669,7 @@ fetch-weights:
     echo "==> Fetching SAM3 weights..."
     nix build .#sam3-weights --impure --out-link .nix-gc-roots/sam3-weights
     # Qwen is ungated (apache-2.0): no HF_TOKEN, no --impure. ~67 GiB, so it is
-    # the long pole here. mistral.rs ISQ-quantizes it at load.
+    # the long pole here. The `qwen-vlm-uqff` derivation prequantizes it to AFQ4.
     echo "==> Fetching Qwen VLM weights (~67 GiB)..."
     nix build .#qwen-vlm-weights --out-link .nix-gc-roots/qwen-vlm-weights
     echo "Done. Weights pinned as GC roots; the exports rebuild from them."
@@ -819,8 +819,11 @@ model-test:
     # interactive graph the comparison runs against too.
     export SAM3_FIXTURE="$(nix build .#sam3-fixture \
         --out-link .nix-gc-roots/sam3-fixture --print-out-paths)"
-    # Qwen 3.6's base weights (config, tokenizer, safetensors), realized so the
-    # reference test loads them from the store instead of a runtime download.
-    export QWEN_MODEL_DIR="$(nix build .#qwen-vlm-weights \
-        --out-link .nix-gc-roots/qwen-vlm-weights --print-out-paths)"
+    # Qwen 3.6's prequantized AFQ4 UQFF, realized on demand: its derivation
+    # quantizes the base BF16 weights on CPU, so the test loads the four-bit
+    # shards with the fast Metal kernel instead of running an ISQ pass. The build
+    # realizes and pins the dir; `firstShard` names the load target, so the shard
+    # filename lives only in the derivation.
+    nix build .#qwen-vlm-uqff --out-link .nix-gc-roots/qwen-vlm-uqff
+    export QWEN_MODEL_FIRST_SHARD="$(nix eval --raw .#qwen-vlm-uqff.firstShard)"
     cargo test -p chronoscope-analysis -- --ignored

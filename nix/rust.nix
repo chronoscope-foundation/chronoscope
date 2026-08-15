@@ -15,6 +15,35 @@
 }:
 
 let
+  # The git deps crane vendors as fixed-output derivations, by their Cargo.lock
+  # source string (mistral.rs and the candle rev it pins). Without these crane
+  # falls back to an impure `builtins.fetchGit`.
+  gitOutputHashes = {
+    "git+https://github.com/EricLBuehler/mistral.rs?rev=8010b6a0578e416120b590ed72fd46ed5f24ee85#8010b6a0578e416120b590ed72fd46ed5f24ee85" =
+      "sha256-3+AylFb8fER6dgTc65WfnrqfRs0biisoj1PSLd2krjE=";
+    "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e" =
+      "sha256-nEfVe2YEpfBPPX8wKkQ5c2rzGJsOX2asrAbac/s/t1w=";
+  };
+
+  # Vendor the workspace deps with the mistral.rs UQFF-write deadlock fix applied
+  # to its git checkout (nix/patches/uqff-write-deadlock.patch; submitted
+  # upstream). The patch lands after the fixed-output fetch, so the hashes above
+  # stay the unpatched fetch. Writing a UQFF whose in-flight footprint exceeds the
+  # host memory budget hangs upstream: submission blocks on the budget before the
+  # drain that would release it starts. Drop the patch when it merges upstream.
+  cargoVendorDir = craneLib.vendorCargoDeps {
+    inherit src;
+    outputHashes = gitOutputHashes;
+    overrideVendorGitCheckout =
+      ps: drv:
+      if lib.any (p: lib.hasPrefix "git+https://github.com/EricLBuehler/mistral.rs" p.source) ps then
+        drv.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [ ./patches/uqff-write-deadlock.patch ];
+        })
+      else
+        drv;
+  };
+
   commonArgs = {
     inherit src;
     pname = "chronoscope";
@@ -31,15 +60,10 @@ let
     # the runtime path needs no Xcode. A no-op off macOS.
     MISTRALRS_METAL_PRECOMPILE = "0";
 
-    # Git dependencies crane must vendor as fixed-output derivations, keyed by
-    # the exact `source` string in Cargo.lock: mistral.rs and the candle rev it
-    # pins. Without these crane falls back to an impure `builtins.fetchGit`.
-    outputHashes = {
-      "git+https://github.com/EricLBuehler/mistral.rs?rev=8010b6a0578e416120b590ed72fd46ed5f24ee85#8010b6a0578e416120b590ed72fd46ed5f24ee85" =
-        "sha256-3+AylFb8fER6dgTc65WfnrqfRs0biisoj1PSLd2krjE=";
-      "git+https://github.com/huggingface/candle.git?rev=27f20fea993c81ea6d32ce44018f42b68466525e#27f20fea993c81ea6d32ce44018f42b68466525e" =
-        "sha256-nEfVe2YEpfBPPX8wKkQ5c2rzGJsOX2asrAbac/s/t1w=";
-    };
+    # Deps vendored with the mistral.rs UQFF-write deadlock fix applied (see the
+    # `cargoVendorDir` binding above); providing the vendor dir makes every build
+    # use the patched checkout.
+    inherit cargoVendorDir;
 
     nativeBuildInputs = with pkgs; [
       pkg-config
