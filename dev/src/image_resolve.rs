@@ -1,48 +1,45 @@
-//! Resolve fact-store images into our own media store.
+//! Warm fact-store images into our own media store, keyed for the dev CDN.
 //!
-//! **Temporary bridge — delete, don't refine.** This exists only so the
-//! fact-store read-path flip didn't have to rework the research-URL fetcher
-//! queue: it resolves fact-store image facts directly instead of routing them
-//! through that queue. When the ingestion queues are unified this whole module goes
-//! away — including its hand-rolled paced/retrying fetch and the two
+//! **Temporary bridge — delete, don't refine.** This is the dev-only stand-in
+//! for the R2 mirror that warms production: it fetches (or fakes) each
+//! fact-store image and stores its bytes under the `local_media_key` the dev
+//! `LocalCdn` builds its URLs from (both in `chronoscope_api::cdn`), so the
+//! `embedded-media` `/media/{key}` route can serve them locally. When dev runs
+//! the real mirror consumer this whole module goes away — including its
+//! hand-rolled paced/retrying fetch and the two
 //! `#[expect(clippy::disallowed_methods)]` sleeps. Don't swap those sleeps for a
 //! rate-limit/backoff crate; the worker's queue-level retry replaces them then.
 //!
 //! Every fact-store image cites an upstream source URL (a Wikimedia Commons
-//! file, typically). Rather than pointing browsers at that upstream host, we
-//! serve each image — original and thumbnail — from our own `GET /media/{key}`
-//! endpoint. This module walks every image in the store, resolves
-//! each one into a pair of media-store keys, and returns the map the API's
-//! read path consumes (`AppState::image_media`).
+//! file, typically). The read path derives each image's CDN URL from that source
+//! URL, so this walks every image and warms every displayable source URL,
+//! mirroring the production sweep's key-per-URL policy so whichever displayable
+//! URL the read path picks is warmed.
 //!
 //! Two modes share one store layout:
-//! - [`ImageResolveMode::Fetch`] downloads the source URL over the SSRF-guarded
-//!   [`HttpClient`], content-addresses it, and stores the original plus a
-//!   generated JPEG thumbnail — reusing the url-fetcher primitives so the key
-//!   scheme matches the research pipeline. It fetches politely: a descriptive
-//!   User-Agent and paced request starts keep the resolver under
-//!   `upload.wikimedia.org`'s burst rate limit, with retry as the safety net.
-//! - [`ImageResolveMode::Placeholder`] stores one small deterministic JPEG at
-//!   both keys, hitting no network. Browser tests use this: it gives every
-//!   image a same-origin, CORS-serveable URL the map can draw to a canvas.
+//! - [`ImageResolveMode::Fetch`] downloads each displayable source URL over the
+//!   SSRF-guarded [`HttpClient`] and stores the bytes under its dev media key. It
+//!   fetches politely: a descriptive User-Agent and paced request starts keep it
+//!   under `upload.wikimedia.org`'s burst rate limit, with retry as the safety
+//!   net.
+//! - [`ImageResolveMode::Placeholder`] stores one small deterministic JPEG under
+//!   each key, hitting no network. Browser tests use this: it gives every image a
+//!   same-origin, CORS-serveable URL the map can draw to a canvas.
 //!
-//! Resolution is best-effort. A single image that fails to fetch, decode, or
-//! store is logged and skipped; it never fails server startup.
+//! Warming is best-effort. A single image that fails to fetch, decode, or store
+//! is logged and skipped; it never fails server startup.
 
-use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chronoscope_api::state::{
-    ResolvedImageMedia, placeholder_storage_key, placeholder_thumbnail_key,
-};
 use chronoscope_core::projection::{member_lineage, project_image};
 use chronoscope_core::store::schema::ImageStream;
 use chronoscope_core::store::{FactStore, ImageIdOf, ImageView};
 use chronoscope_core::typed;
 use chronoscope_db::media_store::MediaStore;
-use chronoscope_workers::url_fetcher::{ContentType, detect_content_type, store_image};
+use chronoscope_integrations::DisplayableKey;
+use chronoscope_workers::url_fetcher::{ContentType, detect_content_type};
 use chronoscope_workers::{HttpClient, HttpRequest, HttpResponse};
 use reqwest::header::{CONTENT_TYPE, HeaderValue, RETRY_AFTER, USER_AGENT};
 use url::Url;
@@ -89,66 +86,60 @@ const WALK_PAGE: NonZeroUsize = match NonZeroUsize::new(256) {
     None => NonZeroUsize::MIN,
 };
 
-/// Walk every image in `store`, resolve each into media-store keys per `mode`,
-/// and return the `image id -> keys` map for the API read path.
+/// Walk every image in `store` and warm its displayable source URLs into
+/// `media_store` under their dev media keys per `mode`, returning how many keys
+/// were warmed.
 ///
 /// `http_client` is consulted only in [`ImageResolveMode::Fetch`]. Failures for
-/// individual images are logged and skipped, so the returned map may be smaller
-/// than the store's image count; the call itself never errors.
-pub async fn resolve_fact_store_images<S>(
+/// individual images are logged and skipped; the call itself never errors.
+pub async fn warm_fact_store_media<S>(
     store: &S,
     media_store: &Arc<dyn MediaStore>,
     http_client: &Arc<dyn HttpClient>,
     mode: ImageResolveMode,
-) -> HashMap<ImageIdOf<S>, ResolvedImageMedia>
+) -> usize
 where
     S: FactStore,
     ImageIdOf<S>: Copy + std::fmt::Display,
 {
-    let mut resolved = HashMap::new();
-
     let mut view = match store.now().await {
         Ok(view) => view,
         Err(e) => {
-            tracing::warn!(error = ?e, "fact-store image resolve: snapshot unavailable");
-            return resolved;
+            tracing::warn!(error = ?e, "fact-store media warm: snapshot unavailable");
+            return 0;
         }
     };
 
     let image_ids = match image_representatives(&mut view).await {
         Ok(ids) => ids,
         Err(e) => {
-            tracing::warn!(error = ?e, "fact-store image resolve: enumeration failed");
-            return resolved;
+            tracing::warn!(error = ?e, "fact-store media warm: enumeration failed");
+            return 0;
         }
     };
 
     let enumerated = image_ids.len();
-    let mut no_source = 0usize;
+    let mut warmed = 0usize;
     let mut failed = 0usize;
     for image_id in image_ids {
-        match resolve_one(&mut view, image_id, media_store, http_client, mode).await {
-            Ok(Some(media)) => {
-                resolved.insert(image_id, media);
-            }
-            Ok(None) => no_source += 1,
+        match warm_one(&mut view, image_id, media_store, http_client, mode).await {
+            Ok(n) => warmed += n,
             Err(e) => {
                 failed += 1;
-                tracing::warn!(image = %image_id, error = %e, "fact-store image resolve: skipped");
+                tracing::warn!(image = %image_id, error = %e, "fact-store media warm: skipped");
             }
         }
     }
 
     tracing::info!(
         enumerated,
-        resolved = resolved.len(),
-        no_source,
+        warmed,
         failed,
         ?mode,
-        "fact-store image resolution complete"
+        "fact-store media warm complete"
     );
 
-    resolved
+    warmed
 }
 
 /// Every image's `SameArtifact` representative, deduplicated. Paging by
@@ -179,15 +170,16 @@ where
     Ok(ids)
 }
 
-/// Resolve one image to its media keys, or `None` when it carries no source URL
-/// to serve.
-async fn resolve_one<S, V>(
+/// Warm one image's displayable source URLs into the media store under their
+/// dev media keys, returning how many were warmed (`0` for an image with no
+/// displayable source).
+async fn warm_one<S, V>(
     view: &mut V,
     image_id: ImageIdOf<S>,
     media_store: &Arc<dyn MediaStore>,
     http_client: &Arc<dyn HttpClient>,
     mode: ImageResolveMode,
-) -> Result<Option<ResolvedImageMedia>, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
 where
     S: FactStore,
     ImageIdOf<S>: Copy + std::fmt::Display,
@@ -197,33 +189,44 @@ where
         .await
         .map_err(|e| format!("{e:?}"))?
     else {
-        return Ok(None);
+        return Ok(0);
     };
     let image = typed::Image::parse(&projected, &class);
-    let Some(source_url) = image
-        .urls
-        .first()
-        .map(|attributed| attributed.value.clone())
-    else {
-        return Ok(None);
-    };
 
-    let media = match mode {
+    let mut warmed = 0usize;
+    for attributed in &image.urls {
+        let url = &attributed.value;
+        // Only a URL a browser can render has a key the read path will request;
+        // one that mirrors but does not display, or cannot be keyed at all, has
+        // no rendition to warm.
+        let Some(key) = DisplayableKey::for_url(url).ok().flatten() else {
+            continue;
+        };
+        // Store under the same key `LocalCdn` builds its URL from, so the dev
+        // `/media/{key}` route serves exactly what the read path requests.
+        let store_key = chronoscope_api::cdn::local_media_key(&key);
+        warm_key(media_store, http_client, &store_key, url, mode).await?;
+        warmed += 1;
+    }
+    Ok(warmed)
+}
+
+/// Store the bytes for one displayable source URL under `store_key`.
+async fn warm_key(
+    media_store: &Arc<dyn MediaStore>,
+    http_client: &Arc<dyn HttpClient>,
+    store_key: &str,
+    url: &Url,
+    mode: ImageResolveMode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match mode {
         ImageResolveMode::Placeholder => {
-            let bytes = crate::placeholder_jpeg()?;
-            let storage_key = placeholder_storage_key(image_id);
-            let thumbnail_key = placeholder_thumbnail_key(image_id);
             media_store
-                .put(&storage_key, bytes.clone(), "image/jpeg")
+                .put(store_key, crate::placeholder_jpeg()?, "image/jpeg")
                 .await?;
-            media_store.put(&thumbnail_key, bytes, "image/jpeg").await?;
-            ResolvedImageMedia {
-                storage_key,
-                thumbnail_key,
-            }
         }
         ImageResolveMode::Fetch => {
-            // Space fetch starts so a bulk resolve stays under Wikimedia's burst
+            // Space fetch starts so a bulk warm stays under Wikimedia's burst
             // rate limit rather than tripping it and relying on retry recovery.
             #[expect(
                 clippy::disallowed_methods,
@@ -231,7 +234,7 @@ where
             )]
             tokio::time::sleep(FETCH_SPACING).await;
 
-            let response = fetch_with_retry(http_client, &source_url).await?;
+            let response = fetch_with_retry(http_client, url).await?;
             let body = response.body;
 
             let content_type_header = response
@@ -240,24 +243,12 @@ where
                 .and_then(|value| value.to_str().ok());
             let format = match detect_content_type(content_type_header, &body) {
                 ContentType::Image(format) => format,
-                other => return Err(format!("{source_url} is not an image ({other:?})").into()),
+                other => return Err(format!("{url} is not an image ({other:?})").into()),
             };
-
-            let stored = store_image(media_store, &body, format).await?;
-            // A best-effort thumbnail may have failed; fall back to the stored
-            // original so the marker still shows this image rather than a broken
-            // key. The browser downscales the full-resolution original.
-            let thumbnail_key = stored
-                .thumbnail_key
-                .unwrap_or_else(|| stored.storage_key.clone());
-            ResolvedImageMedia {
-                storage_key: stored.storage_key,
-                thumbnail_key,
-            }
+            media_store.put(store_key, body, format.mime_type()).await?;
         }
-    };
-
-    Ok(Some(media))
+    }
+    Ok(())
 }
 
 /// Fetch `url`, retrying transient throttling. `upload.wikimedia.org` answers a
@@ -478,26 +469,39 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fetch_mode_paces_request_starts() -> TestResult {
+    async fn fetch_mode_warms_a_key_per_image_and_paces_starts() -> TestResult {
         use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
 
         let store = two_image_store().await?;
         let media_store: Arc<dyn MediaStore> = Arc::new(InMemoryMediaStore::new());
-        // A real (tiny) JPEG so decode + thumbnail succeed and both images
-        // resolve; the resolver's only sleeps are then the pacing gaps.
+        // A real (tiny) JPEG so decode succeeds and both images warm; the warm's
+        // only sleeps are then the pacing gaps.
         let jpeg = crate::placeholder_jpeg()?;
         let client: Arc<dyn HttpClient> = mock(vec![jpeg_response(&jpeg)?, jpeg_response(&jpeg)?]);
 
         let start = tokio::time::Instant::now();
-        let resolved =
-            resolve_fact_store_images(&store, &media_store, &client, ImageResolveMode::Fetch).await;
+        let warmed =
+            warm_fact_store_media(&store, &media_store, &client, ImageResolveMode::Fetch).await;
         let elapsed = start.elapsed();
 
         assert_eq!(
-            resolved.len(),
-            2,
-            "both images resolve from the JPEG responses"
+            warmed, 2,
+            "both images warm one key from their JPEG responses"
         );
+        // The bytes land under the dev media key `LocalCdn` builds its URL from
+        // (`media/{hash}`), served by the existing `/media/{key}` route.
+        for url in [
+            "https://upload.wikimedia.org/a.jpg",
+            "https://upload.wikimedia.org/b.jpg",
+        ] {
+            let key =
+                DisplayableKey::for_url(&Url::parse(url)?)?.ok_or("the url is displayable")?;
+            let store_key = chronoscope_api::cdn::local_media_key(&key);
+            assert!(
+                media_store.get(&store_key).await?.is_some(),
+                "the fetched bytes are stored under {store_key}"
+            );
+        }
         assert!(
             elapsed >= FETCH_SPACING,
             "paced fetch starts advance virtual time by at least one gap; elapsed {elapsed:?}"

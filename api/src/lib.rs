@@ -63,7 +63,9 @@ pub fn register_api(
     // Readiness probe
     api.register(health::health)?;
 
-    // Media endpoint (embedded CDN for development)
+    // Media endpoint (embedded serving for development): `/media/{key}` serves
+    // both the research-pipeline originals and the mirrored fact-store images the
+    // dev CDN points at (both `media/`-prefixed keys in the store).
     #[cfg(feature = "embedded-media")]
     api.register(media::get_media)?;
 

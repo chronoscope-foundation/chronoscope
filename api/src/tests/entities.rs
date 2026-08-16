@@ -6,7 +6,7 @@
 //! `ServerEntityId` path-param round trip (decimal-string wire form vs. the
 //! `entity-{n}` `Display` form).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
@@ -37,12 +37,12 @@ use chronoscope_core::submit::{
 };
 use chronoscope_core::typed::{Consensus, Derivation, EventDetail, InteriorEvent, distinct_rivals};
 
+use chronoscope_integrations::DisplayableKey;
+
 use super::TestContext;
 use crate::cdn::tests::TEST_CDN_BASE_URL;
-use crate::state::{
-    ResolvedImageMedia, ServerEntityId, ServerFactStore, ServerIds, ServerImageId,
-    placeholder_storage_key, placeholder_thumbnail_key,
-};
+use crate::cdn::{Cdn, EdgeCdn, Rendition};
+use crate::state::{ServerEntityId, ServerFactStore, ServerIds, ServerImageId};
 
 type TestResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -927,14 +927,19 @@ async fn get_entity_defaults_display_name_to_english_without_accept_language() -
     Ok(())
 }
 
-/// Media keys a fact-store image resolves to — the `dev` resolver's actual
-/// placeholder layout, through the shared key functions, so the fixture
-/// cannot drift from what the resolver writes.
-fn resolved_media(image_id: ServerImageId) -> ResolvedImageMedia {
-    ResolvedImageMedia {
-        storage_key: placeholder_storage_key(image_id),
-        thumbnail_key: placeholder_thumbnail_key(image_id),
-    }
+/// The CDN URL the read path emits for a source URL at a rendition — built the
+/// same way the server does under test (the `TEST_CDN_BASE_URL` [`EdgeCdn`] over
+/// the source's [`DisplayableKey`]), so a wiring assertion pins that the read
+/// path routed the right (source, rendition) pair rather than re-deriving the
+/// URL shape (which `cdn.rs` already pins).
+fn expected_cdn_url(
+    src: &str,
+    rendition: Rendition,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let cdn = EdgeCdn::new(url::Url::parse(TEST_CDN_BASE_URL)?)?;
+    let key =
+        DisplayableKey::for_url(&url::Url::parse(src)?)?.ok_or("the source url is displayable")?;
+    Ok(cdn.url(&key, rendition).to_string())
 }
 
 // ==================== get_entity_images ====================
@@ -967,15 +972,12 @@ async fn get_entity_images_is_empty_for_an_entity_with_no_depiction() -> TestRes
 async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult {
     let facts = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Pantheon.jpg";
-    let (id, image_id) =
+    let (id, _image_id) =
         commit_entity_with_depicted_image(&facts, "Pantheon", 41.8986, 12.4769, src).await?;
 
-    // The depicted image is resolved into media; the read path serves its
-    // original from our own /media/{key}, not from upstream Commons.
-    let media = resolved_media(image_id);
-    let expected_display = format!("{TEST_CDN_BASE_URL}/{}", media.storage_key);
-    let ctx =
-        TestContext::with_facts_and_image_media(facts, HashMap::from([(image_id, media)])).await?;
+    // The read path derives per-surface CDN renditions from the image's source
+    // URL: a small tile for the grid, a larger one for the lightbox.
+    let ctx = TestContext::with_facts(facts).await?;
 
     let page = ctx
         .client
@@ -989,9 +991,18 @@ async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult
         "source_url preserves the real Commons URL for the lightbox link"
     );
     assert_eq!(
-        image.display_url.as_str(),
-        expected_display.as_str(),
-        "display_url serves the resolved original from our own media host"
+        image.tile_url.as_str(),
+        expected_cdn_url(src, Rendition::Tile)?,
+        "tile_url is the grid rendition derived from the source URL"
+    );
+    assert_eq!(
+        image.detail_url.as_str(),
+        expected_cdn_url(src, Rendition::Detail)?,
+        "detail_url is the larger lightbox rendition of the same source URL"
+    );
+    assert_ne!(
+        image.tile_url, image.detail_url,
+        "the grid and lightbox load different-sized renditions"
     );
     assert_eq!(
         image.perspective,
@@ -1008,15 +1019,16 @@ async fn get_entity_images_resolves_a_depicted_image_into_a_tile() -> TestResult
 }
 
 #[tokio::test]
-async fn get_entity_images_skips_a_depiction_whose_image_is_unresolved() -> TestResult {
-    // The image has a Source fact but no entry in the media map — a tile that
-    // can't load is worse than an absent one, so the grid drops it.
+async fn get_entity_images_skips_a_depiction_whose_image_has_no_displayable_source() -> TestResult {
+    // The image's only Source is an SVG: it mirrors but no browser renders it
+    // through the edge, so no rendition URL can be built and the grid drops the
+    // tile — a tile that can't load is worse than an absent one.
     let facts = super::fresh_fact_store().await?;
-    let src = "https://upload.wikimedia.org/wikipedia/commons/c/c3/Unresolved.jpg";
+    let src = "https://upload.wikimedia.org/wikipedia/commons/c/c3/Floorplan.svg";
     let (id, _image_id) =
-        commit_entity_with_depicted_image(&facts, "Unresolved", 41.9, 12.5, src).await?;
+        commit_entity_with_depicted_image(&facts, "Floorplan", 41.9, 12.5, src).await?;
 
-    let ctx = TestContext::with_facts_and_image_media(facts, HashMap::new()).await?;
+    let ctx = TestContext::with_facts(facts).await?;
 
     let page = ctx
         .client
@@ -1024,7 +1036,7 @@ async fn get_entity_images_skips_a_depiction_whose_image_is_unresolved() -> Test
         .await?;
     assert!(
         page.images.is_empty(),
-        "an unresolved depiction contributes no grid tile, got {:?}",
+        "a depiction whose only source is undisplayable contributes no grid tile, got {:?}",
         page.images
     );
     Ok(())
@@ -1185,14 +1197,10 @@ async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult
     // cursor-linked pages, exercising the images cursor encode/decode round trip.
     let (id, image_ids) =
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 3).await?;
-    let media: HashMap<ServerImageId, ResolvedImageMedia> = image_ids
-        .iter()
-        .map(|&image_id| (image_id, resolved_media(image_id)))
-        .collect();
     // The wire form of a backend image id is its decimal string, the same shape
     // the tiles carry back; compare on that rather than re-parsing.
     let expected: BTreeSet<String> = image_ids.iter().map(|id| id.0.to_string()).collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    let ctx = TestContext::with_facts(facts).await?;
 
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
@@ -1245,19 +1253,13 @@ async fn get_entity_images_cursor_walks_every_image_exactly_once() -> TestResult
 #[tokio::test]
 async fn get_entity_images_resume_reads_the_pinned_snapshot_despite_writes() -> TestResult {
     let facts = super::fresh_fact_store().await?;
-    // Three depicted images make ≥2 pages at limit=1. Media is registered for a
-    // range past those three, so a later image would resolve into a tile *if* the
-    // resume erroneously read `now()` rather than the cursor's pinned snapshot.
+    // Three depicted images make ≥2 pages at limit=1. A later-written image
+    // carries its own source URL, so it would resolve into a tile *if* the resume
+    // erroneously read `now()` rather than the cursor's pinned snapshot.
     let (id, image_ids) =
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 3).await?;
-    let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..8i64)
-        .map(|i| {
-            let image_id = chronoscope_db::SqlImageId(i);
-            (image_id, resolved_media(image_id))
-        })
-        .collect();
     let expected: BTreeSet<String> = image_ids.iter().map(|id| id.0.to_string()).collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    let ctx = TestContext::with_facts(facts).await?;
 
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
@@ -1435,19 +1437,12 @@ async fn get_tile_carries_a_thumbnail_for_a_depicted_entity() -> TestResult {
     let facts = super::fresh_fact_store().await?;
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Pantheon.jpg";
     let (lat, lon) = (41.8986, 12.4769);
-    let (id, image_id) =
+    let (id, _image_id) =
         commit_entity_with_depicted_image(&facts, "Pantheon", lat, lon, src).await?;
-    // The marker thumbnail serves the resolved image's *thumbnail* key from our
-    // own media host, not the upstream Commons original.
-    let expected_thumb = format!(
-        "{TEST_CDN_BASE_URL}/{}",
-        placeholder_thumbnail_key(image_id)
-    );
-    let ctx = TestContext::with_facts_and_image_media(
-        facts,
-        HashMap::from([(image_id, resolved_media(image_id))]),
-    )
-    .await?;
+    // The marker thumbnail is the small marker rendition derived from the
+    // depicted image's source URL through the CDN.
+    let expected_thumb = expected_cdn_url(src, Rendition::Marker)?;
+    let ctx = TestContext::with_facts(facts).await?;
 
     let (x, y) = container_tile(lat, lon, 14);
     let response: TileResponse<EntityId> = ctx.client.fetch_tile(14, x, y, None, None).await?;
@@ -2410,16 +2405,9 @@ async fn entity_images_at_the_detail_snapshot_exclude_later_writes() -> TestResu
     let src = "https://upload.wikimedia.org/wikipedia/commons/a/a1/Original.jpg";
     let (id, original) =
         commit_entity_with_depicted_image(&facts, "Pantheon", 41.8986, 12.4769, src).await?;
-    // Media for a range past the first image, so a later intruder *would* resolve
-    // into a tile if the read weren't pinned — making the pin the sole reason it
-    // doesn't.
-    let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..4i64)
-        .map(|i| {
-            let image_id = chronoscope_db::SqlImageId(i);
-            (image_id, resolved_media(image_id))
-        })
-        .collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    // A later intruder carries its own source URL, so it *would* resolve into a
+    // tile if the read weren't pinned — making the pin the sole reason it doesn't.
+    let ctx = TestContext::with_facts(facts).await?;
 
     // Detail read pins the snapshot the panel threads into the grid.
     let detail = ctx.client.get_entity(&wire_entity_id(id)).await?;
@@ -2478,13 +2466,7 @@ async fn get_entity_images_cursor_and_snapshot_must_agree() -> TestResult {
     // Two depictions so limit=1 hands back a resume cursor pinned at S1.
     let (id, _image_ids) =
         commit_entity_with_depicted_images(&facts, "Colosseum", 41.8902, 12.4922, 2).await?;
-    let media: HashMap<ServerImageId, ResolvedImageMedia> = (0..8i64)
-        .map(|i| {
-            let image_id = chronoscope_db::SqlImageId(i);
-            (image_id, resolved_media(image_id))
-        })
-        .collect();
-    let ctx = TestContext::with_facts_and_image_media(facts, media).await?;
+    let ctx = TestContext::with_facts(facts).await?;
     let one = NonZeroU32::new(1).ok_or("nonzero")?;
 
     // Page 1 mints a cursor pinned at S1 and echoes S1.

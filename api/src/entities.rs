@@ -35,7 +35,10 @@ use chronoscope_core::store::{
 };
 use chronoscope_core::typed;
 
-use crate::cdn;
+use chronoscope_integrations::DisplayableKey;
+use url::Url;
+
+use crate::cdn::Rendition;
 use crate::entity_types;
 use crate::limits;
 use crate::state::{
@@ -268,6 +271,24 @@ where
     Ok(Some(typed::Image::parse(&projected, &class)))
 }
 
+/// The first source URL a browser can render, paired with its
+/// [`DisplayableKey`]. Skips a URL that mirrors but does not display (`Ok(None)`
+/// — svg/pdf/tiff) or cannot be keyed at all (`Err` — a bad scheme or a cited
+/// thumbnail), so an image whose lexically-first URL is undisplayable still
+/// renders from a later one. `None` when no URL is displayable, which is the
+/// read path's "no thumbnail / no tile".
+///
+/// Returns the chosen URL alongside the key so the caller can serve it as the
+/// "open original" link — the exact upstream the shown rendition is built from.
+fn first_displayable<'a>(urls: impl IntoIterator<Item = &'a Url>) -> Option<(Url, DisplayableKey)> {
+    urls.into_iter().find_map(|url| {
+        DisplayableKey::for_url(url)
+            .ok()
+            .flatten()
+            .map(|key| (url.clone(), key))
+    })
+}
+
 // ==================== Path params ====================
 
 // EntityIdPath is required by Dropshot — Path<T> needs a struct with named
@@ -477,11 +498,12 @@ pub struct EntityImagesQueryParams {
 
 /// Page the images depicting an entity (public, no authentication required).
 ///
-/// Each depicted image serves its full-resolution original from our own
-/// `/media/{key}` as `display_url`, keeping the upstream source URL as
-/// `source_url` for the "open original" link. A depiction whose image lacks a
-/// `Source` fact, or whose image the resolver never stored, contributes no grid
-/// tile — a tile that can't load is worse than an absent one.
+/// Each depicted image serves a grid `tile_url` and a lightbox `detail_url`,
+/// both CDN renditions derived from the image's first displayable source URL,
+/// with that URL kept as `source_url` for the "open original" link. A depiction
+/// whose image has no displayable source URL (none at all, or only formats no
+/// browser renders) contributes no grid tile — a tile that can't load is worse
+/// than an absent one.
 ///
 /// The cursor is snapshot-pinned, mirroring `/entities`: a resume re-opens the
 /// view at the cursor's snapshot, so the whole walk reads one stable state. The
@@ -555,16 +577,15 @@ pub async fn get_entity_images(
         let Some(image) = typed_image(&mut view, dep.other).await? else {
             continue;
         };
-        let Some(source_url) = image.urls.first().map(|a| a.value.clone()) else {
+        // No displayable source URL means no rendition can be built, the same
+        // skip a missing image produced before the read path derived URLs.
+        let Some((source_url, key)) = first_displayable(image.urls.iter().map(|a| &a.value)) else {
             continue;
         };
-        let Some(media) = state.image_media.get(&image.id) else {
-            continue;
-        };
-        let display_url = cdn::full_url(&state.config.cdn_base_url, &media.storage_key);
         images.push(DetailImage {
             id: dep.other,
-            display_url,
+            tile_url: state.cdn.url(&key, Rendition::Tile),
+            detail_url: state.cdn.url(&key, Rendition::Detail),
             source_url,
             perspective: dep.perspective.settled().copied(),
             medium: image.medium.settled().copied(),
@@ -585,9 +606,9 @@ pub async fn get_entity_images(
 // ==================== Per-tile clustering ====================
 
 /// One cell's marker before its thumbnail resolves: the wire [`Marker`] with an
-/// empty `thumbnail_url`, paired with the representative-image class member
-/// (`None` for a cluster cell or an undepicted entity) whose `SameArtifact`
-/// representative the batch pass looks the thumbnail up under.
+/// empty `thumbnail_url`, paired with the depicted image id (`None` for a
+/// cluster cell or an undepicted entity) whose source URL the batch pass builds
+/// the thumbnail from.
 struct PendingMarker {
     marker: Marker<ServerEntityId>,
     thumbnail: Option<ServerImageId>,
@@ -600,8 +621,7 @@ struct PendingMarker {
 #[derive(Default)]
 struct Pin {
     name: Option<String>,
-    /// The representative-image class member; its thumbnail resolves later in
-    /// the batch pass.
+    /// The depicted image id; its thumbnail URL resolves later in the batch pass.
     thumbnail: Option<ServerImageId>,
     existence: Option<ExistenceState>,
 }
@@ -644,11 +664,11 @@ where
 /// Existence is reported at `as_of` for the cells that project an entity; a
 /// cluster stands for many and carries none.
 ///
-/// Thumbnails resolve in one batch: pass one projects the cells and collects each
-/// representative-image class member, pass two resolves every member to its
-/// `SameArtifact` representative in a single `image_representatives` call, and
-/// pass three attaches the URL each representative's stored media
-/// yields — so a tile's thumbnails cost one image read regardless of cell count.
+/// Thumbnails resolve in two passes: pass one projects the cells and collects
+/// each depicted image id, pass two projects each distinct image and builds a
+/// marker rendition from its first displayable source URL — the same read the
+/// detail grid does, deduplicated so colocated markers sharing a thumbnail cost
+/// one projection.
 ///
 /// The `/tiles/{z}/{x}/{y}` handler folds its `ClusterCell`s through this.
 async fn cells_to_markers<V>(
@@ -744,21 +764,23 @@ where
         });
     }
 
-    // One batched image read for the whole tile: each pending thumbnail is a
-    // class member; resolving it to the `SameArtifact` representative matches the
-    // key the resolver stored under, and a distinct set collapses colocated
-    // markers sharing a thumbnail to a single resolution. An unresolved
-    // representative or missing media leaves the marker with no thumbnail.
-    let thumbnail_ids: Vec<ServerImageId> = pending
-        .iter()
-        .filter_map(|p| p.thumbnail)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let representatives = view
-        .image_representatives(&thumbnail_ids)
-        .await
-        .map_err(fact_store_err)?;
+    // Resolve each distinct thumbnail image to a marker rendition by projecting
+    // it — the same read the detail grid does — and taking its first displayable
+    // source URL through the CDN. A distinct id set collapses colocated markers
+    // sharing a thumbnail; an image with no displayable source leaves the marker
+    // with none.
+    let thumbnail_ids: std::collections::BTreeSet<ServerImageId> =
+        pending.iter().filter_map(|p| p.thumbnail).collect();
+    let mut thumbnails: std::collections::HashMap<ServerImageId, DisplayableKey> =
+        std::collections::HashMap::new();
+    for image_id in thumbnail_ids {
+        let Some(image) = typed_image(&mut *view, image_id).await? else {
+            continue;
+        };
+        if let Some((_, key)) = first_displayable(image.urls.iter().map(|a| &a.value)) {
+            thumbnails.insert(image_id, key);
+        }
+    }
 
     Ok(pending
         .into_iter()
@@ -767,14 +789,8 @@ where
                  mut marker,
                  thumbnail,
              }| {
-                if let Some(media) = thumbnail
-                    .and_then(|image_id| representatives.get(&image_id))
-                    .and_then(|representative| state.image_media.get(representative))
-                {
-                    marker.thumbnail_url = Some(cdn::full_url(
-                        &state.config.cdn_base_url,
-                        &media.thumbnail_key,
-                    ));
+                if let Some(key) = thumbnail.and_then(|image_id| thumbnails.get(&image_id)) {
+                    marker.thumbnail_url = Some(state.cdn.url(key, Rendition::Marker));
                 }
                 marker
             },

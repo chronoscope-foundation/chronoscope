@@ -35,7 +35,7 @@ mod factstore;
 mod image_resolve;
 
 pub use factstore::{LoadError, load_curated_fact_store};
-pub use image_resolve::{ImageResolveMode, resolve_fact_store_images};
+pub use image_resolve::{ImageResolveMode, warm_fact_store_media};
 
 /// The pixel dimension of the shared placeholder JPEG — an 8x8 solid-copper tile.
 const PLACEHOLDER_DIM: u32 = 8;
@@ -597,23 +597,28 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
             .map_err(|e| DevServerError(format!("seeding fact store: {e:?}")))?;
     }
 
-    // Resolve every fact-store image into the media store, so the read path
-    // serves thumbnails and detail images from our own `/media/{key}` rather
+    // Warm every fact-store image into the media store under its mirror key, so
+    // the CDN-transform stand-in serves the URLs the read path derives rather
     // than pointing browsers at upstream Commons.
-    let image_media = Arc::new(
-        resolve_fact_store_images(
-            &facts,
-            &media_store,
-            &config.http_client,
-            config.image_resolve,
-        )
-        .await,
-    );
-    info!(log, "Resolved fact-store images"; "count" => image_media.len());
+    let warmed = warm_fact_store_media(
+        &facts,
+        &media_store,
+        &config.http_client,
+        config.image_resolve,
+    )
+    .await;
+    info!(log, "Warmed fact-store media"; "keys" => warmed);
 
     // Keep a handle to the fact store for graceful shutdown; the copy handed to
     // the server shares the same `Arc`-backed pool.
     let facts_for_shutdown = facts.clone();
+
+    // Dev serves the mirrored bytes from its own `/media` route, unresized —
+    // there is no edge to resize against.
+    let cdn: Box<dyn chronoscope_api::cdn::Cdn> = Box::new(
+        chronoscope_api::cdn::LocalCdn::new(api_config.cdn_base_url.clone())
+            .map_err(|e| format!("invalid CDN base URL: {e}"))?,
+    );
 
     // Create AppState with our shared database, media store, and fact store
     let app_state = AppState::new(AppStateParts {
@@ -627,7 +632,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         // configuration, a file path or a connection URL, so there is no
         // credential to lose.
         credentials: chronoscope_db::CredentialWatch::never(),
-        image_media,
+        cdn,
     })
     .await
     .map_err(|e| format!("Failed to create app state: {e}"))?;

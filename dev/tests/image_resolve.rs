@@ -1,29 +1,32 @@
-//! The resolver must resolve every fact-store image that carries a source URL.
+//! The warm must store bytes under the dev media key `LocalCdn` builds its URLs
+//! from, for every depicted image that carries a displayable source URL.
 //!
-//! (`resolve_fact_store_images` is a temporary bridge — see its module doc in
-//! `dev/src/image_resolve.rs`; this test guards it only while it exists.)
+//! (`warm_fact_store_media` is a temporary dev-only stand-in for the R2 mirror —
+//! see its module doc in `dev/src/image_resolve.rs`; this test guards it only
+//! while it exists.)
 //!
 //! Ingests the curated Wikidata snapshot (via `WIKIDATA_ENTITIES_JSONL`, set by
 //! the api/web dev shells; skipped when unset, like
-//! `ingestion/tests/real_entity_ingest.rs`) and runs `resolve_fact_store_images`
-//! in Placeholder mode — deterministic, no network. It then asserts the resolved
-//! map covers exactly the images that carry a source URL, and in particular every
-//! depicted image the read path will look up. This guards the enumeration /
-//! projection / key-alignment that `resolve_fact_store_images` and the read path
-//! must agree on: an under-enumeration or representative-key drift would drop the
-//! count below the url-bearing total.
+//! `ingestion/tests/real_entity_ingest.rs`) and runs `warm_fact_store_media` in
+//! Placeholder mode — deterministic, no network. It then asserts the media store
+//! holds a stored object under the `local_media_key` of every displayable source
+//! URL of every depicted image — the exact keys the `/media/{key}` route serves.
+//! This guards the enumeration / projection / key-alignment the warm and the read
+//! path must agree on: an under-enumeration or a key-derivation drift would leave
+//! a depicted image's key unwarmed and its tile broken.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use chronoscope_core::projection::{member_lineage, project_entity, project_image};
-use chronoscope_core::store::memory::{MemoryFactStore, MemoryImageId};
-use chronoscope_core::store::schema::{EntityStream, ImageStream};
-use chronoscope_core::store::{EntityView, FactStore, ImageView};
+use chronoscope_core::store::memory::MemoryFactStore;
+use chronoscope_core::store::schema::EntityStream;
+use chronoscope_core::store::{EntityView, FactStore};
 use chronoscope_core::typed;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
-use chronoscope_dev::{ImageResolveMode, load_curated_fact_store, resolve_fact_store_images};
+use chronoscope_dev::{ImageResolveMode, load_curated_fact_store, warm_fact_store_media};
+use chronoscope_integrations::DisplayableKey;
 use chronoscope_workers::{HttpClient, ReqwestClient};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -31,7 +34,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// The curated store, or `None` when `WIKIDATA_ENTITIES_JSONL` is unset.
 async fn curated() -> Result<Option<MemoryFactStore>, BoxError> {
     let Ok(path) = std::env::var("WIKIDATA_ENTITIES_JSONL") else {
-        eprintln!("WIKIDATA_ENTITIES_JSONL unset — skipping resolver coverage test");
+        eprintln!("WIKIDATA_ENTITIES_JSONL unset — skipping warm coverage test");
         return Ok(None);
     };
     let store = MemoryFactStore::new();
@@ -43,51 +46,14 @@ fn page() -> Result<NonZeroUsize, BoxError> {
     NonZeroUsize::new(1024).ok_or_else(|| "nonzero page size".into())
 }
 
-/// Every image representative in the store that projects to at least one source
-/// URL — the set the resolver is expected to serve.
-async fn image_reps_with_url(store: &MemoryFactStore) -> Result<BTreeSet<MemoryImageId>, BoxError> {
+/// The dev media-store key of every displayable source URL of every depicted
+/// image across all entities — the exact keys `LocalCdn` builds its URLs from,
+/// and so the keys the warm must store bytes under.
+async fn depicted_displayable_keys(store: &MemoryFactStore) -> Result<BTreeSet<String>, BoxError> {
     let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
     let limit = page()?;
 
-    let mut reps = BTreeSet::new();
-    let mut after = None;
-    loop {
-        let p = view
-            .walk_image_classes(&ImageStream::All, after, limit)
-            .await
-            .map_err(|e| format!("{e:?}"))?;
-        for row in &p.rows {
-            reps.insert(row.representative);
-        }
-        match p.next_class {
-            None => break,
-            Some(n) => after = Some(n),
-        }
-    }
-
-    let mut with_url = BTreeSet::new();
-    for rep in reps {
-        let Some((class, projected)) =
-            project_image::<MemoryFactStore, _, _>(&mut view, rep, member_lineage)
-                .await
-                .map_err(|e| format!("{e:?}"))?
-        else {
-            continue;
-        };
-        if !typed::Image::parse(&projected, &class).urls.is_empty() {
-            with_url.insert(rep);
-        }
-    }
-    Ok(with_url)
-}
-
-/// The `SameArtifact` representative of every depicted image across all
-/// entities — the exact keys the marker/detail read path looks images up by.
-async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryImageId>, BoxError> {
-    let mut view = store.now().await.map_err(|e| format!("{e:?}"))?;
-    let limit = page()?;
-
-    let mut reps = BTreeSet::new();
+    let mut keys = BTreeSet::new();
     let mut after = None;
     loop {
         let p = view
@@ -110,12 +76,21 @@ async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
             else {
                 continue;
             };
-            for image in projected.depictions.keys() {
-                let rep = view
-                    .image_representative(image)
-                    .await
-                    .map_err(|e| format!("{e:?}"))?;
-                reps.insert(rep);
+            let depicted: Vec<_> = projected.depictions.keys().copied().collect();
+            for image in depicted {
+                let Some((class, img_proj)) =
+                    project_image::<MemoryFactStore, _, _>(&mut view, image, member_lineage)
+                        .await
+                        .map_err(|e| format!("{e:?}"))?
+                else {
+                    continue;
+                };
+                let typed = typed::Image::parse(&img_proj, &class);
+                for attributed in &typed.urls {
+                    if let Some(key) = DisplayableKey::for_url(&attributed.value)? {
+                        keys.insert(chronoscope_api::cdn::local_media_key(&key));
+                    }
+                }
             }
         }
         match p.next_class {
@@ -123,48 +98,50 @@ async fn depicted_image_reps(store: &MemoryFactStore) -> Result<BTreeSet<MemoryI
             Some(n) => after = Some(n),
         }
     }
-    Ok(reps)
+    Ok(keys)
 }
 
 #[tokio::test]
-async fn resolves_every_image_with_a_source_url() -> Result<(), BoxError> {
+async fn warms_the_media_key_of_every_depicted_displayable_image() -> Result<(), BoxError> {
     let Some(store) = curated().await? else {
         return Ok(());
     };
 
-    let expected = image_reps_with_url(&store).await?;
+    let expected = depicted_displayable_keys(&store).await?;
     assert!(
         !expected.is_empty(),
-        "the curated snapshot carries source-bearing images"
+        "the curated snapshot depicts images with displayable sources"
     );
 
     let media_store: Arc<dyn MediaStore> = Arc::new(InMemoryMediaStore::new());
     // Placeholder mode never touches the client, but the signature wants one.
     let http_client: Arc<dyn HttpClient> = Arc::new(ReqwestClient::new()?);
-    let resolved = resolve_fact_store_images(
+    let warmed = warm_fact_store_media(
         &store,
         &media_store,
         &http_client,
         ImageResolveMode::Placeholder,
     )
     .await;
+    assert!(warmed > 0, "the warm stored at least one key");
 
-    let resolved_keys: BTreeSet<MemoryImageId> = resolved.keys().copied().collect();
-    assert_eq!(
-        resolved_keys, expected,
-        "resolver must cover exactly the images that carry a source URL"
-    );
-
-    // The user-facing guarantee: every image the read path can look up resolves.
-    let depicted = depicted_image_reps(&store).await?;
+    // Every key the read path can request for a depicted image is warmed, so no
+    // depicted tile can 404 against the store — the enumeration/key-alignment the
+    // warm and the read path must agree on.
+    let mut unwarmed = Vec::new();
+    for key in &expected {
+        if media_store
+            .get(key)
+            .await
+            .map_err(|e| format!("{e:?}"))?
+            .is_none()
+        {
+            unwarmed.push(key.clone());
+        }
+    }
     assert!(
-        !depicted.is_empty(),
-        "the curated snapshot depicts images on its entities"
-    );
-    let unresolved: Vec<_> = depicted.difference(&resolved_keys).collect();
-    assert!(
-        unresolved.is_empty(),
-        "every depicted image with a source URL must resolve; unresolved: {unresolved:?}"
+        unwarmed.is_empty(),
+        "every depicted displayable image's media key must be warmed; unwarmed: {unwarmed:?}"
     );
 
     Ok(())

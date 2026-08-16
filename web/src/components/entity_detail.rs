@@ -14,7 +14,7 @@ use crate::components::motion::SLIDE;
 /// Content currently displayed in the lightbox overlay.
 #[derive(Clone, Debug)]
 pub struct LightboxContent {
-    /// URL the overlay `<img>` loads (the resolved `display_url`).
+    /// URL the overlay `<img>` loads (the image's `detail_url` rendition).
     pub url: String,
     /// Alt text for accessibility.
     pub alt: String,
@@ -474,7 +474,7 @@ fn ImageTile(media: MediaInfo) -> impl IntoView {
     let alt = format!("{} view", media.label);
     let aria = format!("{alt} \u{2014} opens preview");
     let content = LightboxContent {
-        url: media.display_url.clone(),
+        url: media.detail_url.clone(),
         alt: alt.clone(),
         source_url: media.source_url.clone(),
     };
@@ -493,7 +493,7 @@ fn ImageTile(media: MediaInfo) -> impl IntoView {
                 // Loading placeholder (visible until image loads)
                 <div class="w-full aspect-square bg-sepia/10 animate-pulse absolute inset-0"/>
                 <img
-                    src={media.display_url.clone()}
+                    src={media.tile_url.clone()}
                     alt=alt
                     loading="lazy"
                     class="w-full aspect-square object-cover relative"
@@ -722,12 +722,13 @@ struct LinkInfo {
     citations: Option<CitationLines>,
 }
 
-/// One image in the detail grid: the URL the grid/lightbox load
-/// (`display_url`), the real upstream URL for the "Open original" link
-/// (`source_url`), and a short caption.
+/// One image in the detail grid: the grid tile's URL (`tile_url`), the larger
+/// lightbox URL (`detail_url`), the real upstream URL for the "Open original"
+/// link (`source_url`), and a short caption.
 #[derive(Debug, Clone)]
 struct MediaInfo {
-    display_url: String,
+    tile_url: String,
+    detail_url: String,
     source_url: String,
     label: String,
 }
@@ -853,7 +854,8 @@ async fn fetch_entity_images_page(
         .images
         .into_iter()
         .map(|img| MediaInfo {
-            display_url: img.display_url.into(),
+            tile_url: img.tile_url.into(),
+            detail_url: img.detail_url.into(),
             source_url: img.source_url.into(),
             label: api::image_caption(img.perspective, img.medium),
         })

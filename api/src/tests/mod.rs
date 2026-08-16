@@ -52,8 +52,7 @@ use crate::jwt::JwtConfig;
 use crate::research::{SubmitResearchRequest, SubmitResearchResponse};
 use crate::research_types::{FollowedUrlSummary, ResearchUrlDossier, ResearchUrlSummary};
 use crate::state::{
-    AppState, AppStateParts, Config, DnsResolver, FactsDatabase, ResolvedImageMedia,
-    SAFE_PUBLIC_IP, ServerFactStore, ServerImageId,
+    AppState, AppStateParts, Config, DnsResolver, FactsDatabase, SAFE_PUBLIC_IP, ServerFactStore,
 };
 
 /// A test's fact store together with whatever its backend needs held alive
@@ -242,7 +241,6 @@ impl TestContext {
             Some(media_store.clone()),
             facts,
             CredentialWatch::never(),
-            Arc::new(HashMap::new()),
         )
         .await?;
         Ok((ctx, media_store))
@@ -278,7 +276,6 @@ impl TestContext {
         credentials: CredentialWatch,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let facts = fresh_fact_store().await?;
-        let image_media = Arc::new(HashMap::new());
         #[cfg(feature = "embedded-media")]
         return Self::with_options_and_media(
             ios_app_id,
@@ -287,7 +284,6 @@ impl TestContext {
             None,
             facts,
             credentials,
-            image_media,
         )
         .await;
         #[cfg(not(feature = "embedded-media"))]
@@ -297,35 +293,22 @@ impl TestContext {
             dns_resolver,
             facts,
             credentials,
-            image_media,
         )
         .await;
     }
 
-    /// Build a context around a pre-populated fact store and its resolved image
-    /// media map. Image-resolution tests commit their facts (and mint image ids)
-    /// before the server exists, then hand the store and a matching media map
-    /// in — mirroring the startup path where images resolve before `AppState`.
-    async fn with_facts_and_image_media(
+    /// Build a context around a pre-populated fact store. Image tests commit
+    /// their facts (and mint image ids) before the server exists, then hand the
+    /// store in; the read path derives image URLs from their source URLs, so no
+    /// media map is threaded.
+    async fn with_facts(
         facts: TestFactStore,
-        image_media: HashMap<ServerImageId, ResolvedImageMedia>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let image_media = Arc::new(image_media);
         let credentials = CredentialWatch::never();
         #[cfg(feature = "embedded-media")]
-        return Self::with_options_and_media(
-            None,
-            None,
-            None,
-            None,
-            facts,
-            credentials,
-            image_media,
-        )
-        .await;
+        return Self::with_options_and_media(None, None, None, None, facts, credentials).await;
         #[cfg(not(feature = "embedded-media"))]
-        return Self::with_options_and_media(None, None, None, facts, credentials, image_media)
-            .await;
+        return Self::with_options_and_media(None, None, None, facts, credentials).await;
     }
 
     async fn with_options_and_media(
@@ -335,7 +318,6 @@ impl TestContext {
         #[cfg(feature = "embedded-media")] media_store: Option<Arc<InMemoryMediaStore>>,
         facts: TestFactStore,
         credentials: CredentialWatch,
-        image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let jwt = jwt_config.unwrap_or_else(|| {
             JwtConfig::new(
@@ -380,6 +362,11 @@ impl TestContext {
         // the same store the fixture keeps for the test's duration.
         let server_facts = facts.store.clone();
 
+        // Exercise the production URL scheme: the edge CDN's per-rendition
+        // transform URLs are what the read-path assertions check.
+        let cdn: Box<dyn crate::cdn::Cdn> =
+            Box::new(crate::cdn::EdgeCdn::new(config.cdn_base_url.clone())?);
+
         let app_state = Arc::new(
             AppState::new(AppStateParts {
                 db,
@@ -390,7 +377,7 @@ impl TestContext {
                 media_store: media_store.unwrap_or_else(|| Arc::new(InMemoryMediaStore::new())),
                 facts: server_facts,
                 credentials,
-                image_media,
+                cdn,
             })
             .await?,
         );

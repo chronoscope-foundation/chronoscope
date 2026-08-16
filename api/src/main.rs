@@ -76,8 +76,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let jwt = JwtConfig::from_env()?;
     let dns_resolver = default_dns_resolver()?;
 
-    // The fact store owns its own pool. No boot-time resolver runs here, so the
-    // media map starts empty either way.
+    // The fact store owns its own pool. Image URLs are derived from source URLs
+    // on the read path, so there is no boot-time media resolution here.
     //
     // SQLite: a throwaway in-memory `main` with the fact-store layers attached.
     // The configured facts DB pins as the frozen read-only `base` — `open`
@@ -117,11 +117,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await?;
     #[cfg(feature = "postgres")]
     let credentials = facts.credentials().clone();
-    let image_media = Arc::new(std::collections::HashMap::new());
 
     // Keep a handle to the fact store for graceful shutdown; the copy handed to
     // the server shares the same `Arc`-backed pool.
     let facts_for_shutdown = facts.clone();
+
+    // Production points browsers at the Cloudflare edge, which resizes.
+    let cdn: Box<dyn chronoscope_api::cdn::Cdn> = Box::new(chronoscope_api::cdn::EdgeCdn::new(
+        config.cdn_base_url.clone(),
+    )?);
 
     let app_state = Arc::new(
         AppState::new(AppStateParts {
@@ -135,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             media_store: Arc::new(chronoscope_db::media_store::InMemoryMediaStore::new()),
             facts,
             credentials: credentials.clone(),
-            image_media,
+            cdn,
         })
         .await?,
     );

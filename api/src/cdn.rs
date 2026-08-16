@@ -9,7 +9,7 @@
 //! They coexist deliberately: the two pipelines converge later, and until then
 //! deleting either would break the surfaces the other feeds.
 
-use chronoscope_integrations::{DisplayableKey, MirrorKey};
+use chronoscope_integrations::DisplayableKey;
 use thiserror::Error;
 use url::Url;
 
@@ -56,9 +56,8 @@ pub fn thumbnail_url(base: &Url, storage_key: &str) -> Url {
 /// makes adding a fourth a visible decision, and makes the blast radius of
 /// changing a size obvious.
 ///
-/// Every variant transforms. The untransformed object is not a rendition:
-/// only analysis reads it, and it reaches that through
-/// [`Cdn::original_url`].
+/// The size a browser sees at the edge; [`LocalCdn`] serves the same bytes for
+/// every rendition, since dev has no resizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Rendition {
     /// Map marker thumbnails, drawn at 96 CSS px and up to 3x device ratio.
@@ -106,69 +105,120 @@ pub enum CdnError {
     },
 }
 
-/// Builds public URLs for mirrored media.
+/// Builds the browser-facing URL for a mirrored image at a given size.
 ///
-/// URL construction is total, infallible, and does no I/O: a URL can be
-/// produced for an image nobody has fetched, which is what lets the read path
-/// emit one without a lookup. Not a trait, because production and local emit
-/// the same URL *shape*: the dev server serves the Cloudflare transform path
-/// itself rather than a parallel format, so nothing branches on environment.
+/// One implementation per environment, constructed by the entry point and held
+/// on [`AppState`](crate::state::AppState): [`EdgeCdn`] points browsers at the
+/// Cloudflare edge, which resizes per rendition against the R2 object;
+/// [`LocalCdn`] points them at the dev server's own `/media` route, which serves
+/// the stored bytes unresized. The read path calls [`url`](Cdn::url) the same
+/// way for both — the size only shapes the URL where an edge is there to honor
+/// it, so in dev every rendition of an image resolves to one URL.
 ///
-/// The one thing that can go wrong is the base, so it is settled once at
-/// construction: a `Cdn` that exists can address a key.
+/// URL construction is total, infallible, and does no I/O: a URL can be produced
+/// for an image nobody has fetched, which is what lets the read path emit one
+/// without a lookup. The one thing that can go wrong is the base, so each
+/// implementation settles it once at construction.
+pub trait Cdn: std::fmt::Debug + Send + Sync {
+    /// The public URL for a displayable image at a given size.
+    ///
+    /// Takes a [`DisplayableKey`] rather than a bare
+    /// [`MirrorKey`](chronoscope_integrations::MirrorKey) so the format check
+    /// cannot be skipped: a PDF at a sized rendition builds a URL the edge
+    /// rejects, and an SVG served untransformed puts a scriptable document
+    /// inside the WebAuthn RP scope.
+    fn url(&self, key: &DisplayableKey, rendition: Rendition) -> Url;
+}
+
+/// A base URL that can carry a path, so a key can be appended to it.
+///
+/// # Errors
+/// [`CdnError::NotABaseUrl`] for a URL whose path cannot be extended — rejected
+/// here rather than at each use, because by then the only choices are a panic or
+/// serving every image at one broken URL.
+fn checked_base(base: Url) -> Result<Url, CdnError> {
+    if base.cannot_be_a_base() {
+        return Err(CdnError::NotABaseUrl { url: base });
+    }
+    Ok(base)
+}
+
+/// Production: the Cloudflare edge resizes at request time, so each rendition is
+/// its own `/cdn-cgi/image/<opts>/<key>` transform URL against the R2 object.
 #[derive(Debug, Clone)]
-pub struct Cdn {
+pub struct EdgeCdn {
     base: Url,
 }
 
-impl Cdn {
-    /// Build over a base URL, which may carry a path prefix: dev and test
-    /// serve same-origin through an `/api` front-door mount.
+impl EdgeCdn {
+    /// Build over the CDN base (e.g. `https://cdn.chronoscope.io`).
     ///
     /// # Errors
-    /// [`CdnError::NotABaseUrl`] for a URL whose path cannot be extended.
-    /// Rejected here rather than at each use, because by then the only choices
-    /// are a panic or dropping the key and serving every image at one broken URL.
+    /// [`CdnError::NotABaseUrl`] for a base whose path cannot be extended.
     pub fn new(base: Url) -> Result<Self, CdnError> {
-        if base.cannot_be_a_base() {
-            return Err(CdnError::NotABaseUrl { url: base });
-        }
-        Ok(Self { base })
+        Ok(Self {
+            base: checked_base(base)?,
+        })
     }
+}
 
-    /// The public URL for a mirrored image at a given size.
-    ///
-    /// Takes a [`DisplayableKey`] rather than a bare [`MirrorKey`] so the
-    /// format check cannot be skipped: a PDF at a sized rendition builds a
-    /// URL the edge rejects, and an SVG served untransformed puts a
-    /// scriptable document inside the WebAuthn RP scope.
-    #[must_use]
-    pub fn url(&self, key: &DisplayableKey, rendition: Rendition) -> Url {
-        self.at(key.key(), Some(rendition.cloudflare_options()))
-    }
-
-    /// The URL of the untransformed mirrored object.
-    ///
-    /// Not browser-facing. The key can address an SVG, a PDF or a TIFF, and
-    /// this URL is same-origin, so pointing a browser at one either hands the
-    /// WebAuthn RP scope a scriptable document or serves bytes no browser can
-    /// render. Analysis reads the master here, which costs no transformations;
-    /// browser surfaces go through [`Cdn::url`].
-    #[must_use]
-    pub fn original_url(&self, key: &MirrorKey) -> Url {
-        self.at(key, None)
-    }
-
-    fn at(&self, key: &MirrorKey, options: Option<&str>) -> Url {
+impl Cdn for EdgeCdn {
+    fn url(&self, key: &DisplayableKey, rendition: Rendition) -> Url {
         let mut url = self.base.clone();
-        // `Ok` for every `Cdn` that exists: `path_segments_mut` refuses only a
-        // cannot-be-a-base URL, and `Cdn::new` rejects those.
+        // `Ok` for every `EdgeCdn` that exists: `path_segments_mut` refuses only
+        // a cannot-be-a-base URL, and `new` rejects those.
         if let Ok(mut segments) = url.path_segments_mut() {
-            let mut segments = segments.pop_if_empty();
-            if let Some(options) = options {
-                segments = segments.extend(["cdn-cgi", "image", options]);
-            }
-            segments.extend(key.as_str().split('/'));
+            segments
+                .pop_if_empty()
+                .extend(["cdn-cgi", "image", rendition.cloudflare_options()])
+                .extend(key.key().as_str().split('/'));
+        }
+        url
+    }
+}
+
+/// The dev media-store key, and `/media/{key}` path tail, for a displayable
+/// image: its globally-unique hash under the `media/` prefix.
+///
+/// A mirror key is `{source}/{hash}`, but the source prefix only organizes keys
+/// in R2; dev's media store is flat and the hash alone is unique (a SHA-256 of
+/// the image identity), so dev drops the prefix and reuses the research
+/// pipeline's single-segment `get_media` route. One
+/// derivation so [`LocalCdn`] (which builds the URL) and the dev warm (which
+/// stores the bytes) cannot disagree on the key.
+#[must_use]
+pub fn local_media_key(key: &DisplayableKey) -> String {
+    let hash = key.key().as_str().rsplit('/').next().unwrap_or_default();
+    format!("media/{hash}")
+}
+
+/// Dev/test: the `embedded-media` server serves the mirrored bytes unresized
+/// from its `/media/{key}` route (via [`local_media_key`]), so the rendition
+/// never shapes the URL — there is no edge to resize against.
+#[derive(Debug, Clone)]
+pub struct LocalCdn {
+    base: Url,
+}
+
+impl LocalCdn {
+    /// Build over the dev base (the same-origin `/api` front-door mount).
+    ///
+    /// # Errors
+    /// [`CdnError::NotABaseUrl`] for a base whose path cannot be extended.
+    pub fn new(base: Url) -> Result<Self, CdnError> {
+        Ok(Self {
+            base: checked_base(base)?,
+        })
+    }
+}
+
+impl Cdn for LocalCdn {
+    fn url(&self, key: &DisplayableKey, _rendition: Rendition) -> Url {
+        let mut url = self.base.clone();
+        if let Ok(mut segments) = url.path_segments_mut() {
+            segments
+                .pop_if_empty()
+                .extend(local_media_key(key).split('/'));
         }
         url
     }
@@ -226,83 +276,99 @@ pub mod tests {
 
     const COMMONS_JPEG: &str = "https://upload.wikimedia.org/wikipedia/commons/a/ab/Foo.jpg";
 
-    fn commons_key() -> Result<MirrorKey, Box<dyn std::error::Error>> {
-        Ok(MirrorKey::for_url(&Url::parse(COMMONS_JPEG)?)?)
-    }
-
     fn commons_displayable_key() -> Result<DisplayableKey, Box<dyn std::error::Error>> {
         DisplayableKey::for_url(&Url::parse(COMMONS_JPEG)?)?
             .ok_or_else(|| "a Commons JPEG is displayable".into())
     }
 
     #[test]
-    fn the_original_serves_the_bare_key() -> TestResult {
-        let cdn = Cdn::new(Url::parse(TEST_CDN_BASE_URL)?)?;
-        let key = commons_key()?;
-        assert_eq!(
-            cdn.original_url(&key).as_str(),
-            format!("{TEST_CDN_BASE_URL}/{key}")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn renditions_go_through_the_transform_path() -> TestResult {
-        let cdn = Cdn::new(Url::parse(TEST_CDN_BASE_URL)?)?;
+    fn edge_renditions_go_through_the_transform_path() -> TestResult {
+        let cdn = EdgeCdn::new(Url::parse(TEST_CDN_BASE_URL)?)?;
         let key = commons_displayable_key()?;
         assert_eq!(
             cdn.url(&key, Rendition::Marker).as_str(),
-            format!("{TEST_CDN_BASE_URL}/cdn-cgi/image/width=320,format=auto,fit=scale-down/{key}")
+            format!(
+                "{TEST_CDN_BASE_URL}/cdn-cgi/image/width=320,format=auto,fit=scale-down/{}",
+                key.key()
+            )
         );
         Ok(())
     }
 
     #[test]
-    fn each_rendition_and_the_original_have_distinct_urls() -> TestResult {
-        let cdn = Cdn::new(Url::parse(TEST_CDN_BASE_URL)?)?;
+    fn edge_renditions_have_distinct_urls() -> TestResult {
+        let cdn = EdgeCdn::new(Url::parse(TEST_CDN_BASE_URL)?)?;
         let key = commons_displayable_key()?;
-        let mut urls: std::collections::BTreeSet<String> =
+        let urls: std::collections::BTreeSet<String> =
             [Rendition::Marker, Rendition::Tile, Rendition::Detail]
                 .into_iter()
                 .map(|rendition| cdn.url(&key, rendition).to_string())
                 .collect();
-        urls.insert(cdn.original_url(key.key()).to_string());
-        // Two of these sharing a URL would silently serve one at the other's
-        // size, and would also make the billing story wrong.
-        assert_eq!(urls.len(), 4);
+        // Two sharing a URL would silently serve one at the other's size, and
+        // would make the billing story wrong.
+        assert_eq!(urls.len(), 3);
         Ok(())
     }
 
     #[test]
-    fn renditions_append_under_a_front_door_api_mount() -> TestResult {
-        // Dev and test serve same-origin through an `/api` proxy, so the
-        // transform path must land *under* the mount, not replace it.
-        let cdn = Cdn::new(Url::parse("http://127.0.0.1:8080/api")?)?;
+    fn edge_renditions_append_under_a_front_door_api_mount() -> TestResult {
+        // The transform path must land *under* a base that carries a path, not
+        // replace it.
+        let cdn = EdgeCdn::new(Url::parse("http://127.0.0.1:8080/api")?)?;
         let key = commons_displayable_key()?;
         assert_eq!(
             cdn.url(&key, Rendition::Tile).as_str(),
             format!(
-                "http://127.0.0.1:8080/api/cdn-cgi/image/width=640,format=auto,fit=scale-down/{key}"
+                "http://127.0.0.1:8080/api/cdn-cgi/image/width=640,format=auto,fit=scale-down/{}",
+                key.key()
             )
         );
-        assert_eq!(
-            cdn.original_url(key.key()).as_str(),
-            format!("http://127.0.0.1:8080/api/{key}")
-        );
+        Ok(())
+    }
+
+    #[test]
+    fn local_serves_one_media_url_for_every_size() -> TestResult {
+        // The dev server has no edge to resize against, so every rendition of an
+        // image resolves to the one `/media/{hash}` URL `get_media` serves.
+        let cdn = LocalCdn::new(Url::parse("http://127.0.0.1:8080/api")?)?;
+        let key = commons_displayable_key()?;
+        let expected = format!("http://127.0.0.1:8080/api/{}", local_media_key(&key));
+        for rendition in [Rendition::Marker, Rendition::Tile, Rendition::Detail] {
+            assert_eq!(cdn.url(&key, rendition).as_str(), expected, "{rendition:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_media_key_is_the_hash_under_media_without_the_source() -> TestResult {
+        // Dev serves single-segment keys through the existing `/media/{key}`
+        // route, so the mirror key's source prefix is dropped and the unique hash
+        // stands alone under `media/`.
+        let key = commons_displayable_key()?;
+        let mirror = key.key().as_str().to_string(); // `commons/<hash>`
+        let hash = mirror.rsplit('/').next().unwrap_or_default();
+        assert_eq!(local_media_key(&key), format!("media/{hash}"));
+        assert!(!local_media_key(&key).contains("commons"));
         Ok(())
     }
 
     #[test]
     fn a_base_that_cannot_carry_a_path_is_rejected() -> TestResult {
         // These parse, and appending a key to one does nothing: taking them
-        // would leave every image resolving to the same base URL, with no
-        // error anywhere to say which images were lost.
+        // would leave every image resolving to the same base URL, with no error
+        // anywhere to say which images were lost.
         for spelling in ["mailto:ops@chronoscope.io", "data:text/plain,cdn"] {
             let url = Url::parse(spelling)?;
-            let error = Cdn::new(url.clone())
-                .err()
-                .ok_or_else(|| format!("{spelling} is no base for a CDN"))?;
-            assert_eq!(error, CdnError::NotABaseUrl { url });
+            assert_eq!(
+                EdgeCdn::new(url.clone()).err(),
+                Some(CdnError::NotABaseUrl { url: url.clone() }),
+                "{spelling} is no base for an edge CDN"
+            );
+            assert_eq!(
+                LocalCdn::new(url.clone()).err(),
+                Some(CdnError::NotABaseUrl { url }),
+                "{spelling} is no base for a local CDN"
+            );
         }
         Ok(())
     }
@@ -311,10 +377,9 @@ pub mod tests {
     fn the_key_survives_url_construction_unescaped() -> TestResult {
         // The key's `/` separates path segments rather than being encoded;
         // a percent-encoded slash would not match the stored object.
-        let cdn = Cdn::new(Url::parse(TEST_CDN_BASE_URL)?)?;
-        let key = commons_key()?;
-        let url = cdn.original_url(&key);
-        assert!(url.as_str().ends_with(key.as_str()));
+        let key = commons_displayable_key()?;
+        let url = EdgeCdn::new(Url::parse(TEST_CDN_BASE_URL)?)?.url(&key, Rendition::Detail);
+        assert!(url.as_str().ends_with(key.key().as_str()));
         assert!(!url.as_str().contains("%2F"));
         Ok(())
     }

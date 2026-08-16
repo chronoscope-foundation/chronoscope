@@ -60,16 +60,16 @@ pub struct EntityDetail<E: Ord, V, I> {
     pub snapshot: Snapshot,
 }
 
-/// One image in an entity's detail grid: the id it is keyed by, the URL the
-/// client actually loads (`display_url`), the real provenance URL for the
-/// lightbox's "open original" link (`source_url`), and the structured view
-/// classification the client renders a caption from.
+/// One image in an entity's detail grid: the id it is keyed by, a per-surface
+/// CDN URL for the grid tile (`tile_url`) and the lightbox (`detail_url`), the
+/// real provenance URL for the lightbox's "open original" link (`source_url`),
+/// and the structured view classification the client renders a caption from.
 ///
-/// `display_url` always loads from our own `/media/{key}` host — same-origin,
-/// so the canvas thumbnail draw stays CORS-safe — while `source_url` keeps the
-/// upstream provenance URL for the lightbox's "open original". In placeholder
-/// mode (dev/test) `display_url` is one shared local placeholder; otherwise
-/// it's the resolver's stored copy of the source.
+/// `tile_url` and `detail_url` are the same image at two sizes — a small grid
+/// rendition and a larger lightbox rendition — both derived deterministically
+/// from `source_url` through the media CDN, so a browser fetching either pays
+/// one edge transform. `source_url` keeps the upstream provenance URL the
+/// renditions were built from, for the lightbox's "open original".
 ///
 /// `perspective` and `medium` are the depiction's settled perspective and the
 /// image's settled medium, each `None` when the underlying claim is absent or
@@ -78,8 +78,12 @@ pub struct EntityDetail<E: Ord, V, I> {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DetailImage<I> {
     pub id: I,
+    /// The grid-tile rendition — a small size for the thumbnail `<img>`.
     #[schemars(with = "String")]
-    pub display_url: Url,
+    pub tile_url: Url,
+    /// The lightbox rendition — a larger size for the full-panel view.
+    #[schemars(with = "String")]
+    pub detail_url: Url,
     #[schemars(with = "String")]
     pub source_url: Url,
     pub perspective: Option<Perspective>,
@@ -251,9 +255,10 @@ pub struct Marker<E> {
     /// request's `Accept-Language`. `None` when the entity has no name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// The representative entity's thumbnail URL, when it has a depicted image.
-    /// Same `display_url` semantics as [`DetailImage`]: served from our own
-    /// `/media/{key}` host, or the shared placeholder in dev/test.
+    /// The representative entity's thumbnail URL, when it has a depicted image
+    /// with a displayable source: a small marker rendition through the media
+    /// CDN, derived deterministically from that image's source URL. `None` when
+    /// the entity has no depicted image, or none whose source a browser renders.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<String>")]
     pub thumbnail_url: Option<Url>,

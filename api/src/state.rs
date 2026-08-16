@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
@@ -290,32 +289,6 @@ fn mirror_queue_from_env() -> Option<crate::mirror::sweep::QueueTarget> {
     }
 }
 
-/// The media-store keys a fact-store image resolved to: the full-resolution
-/// original and its JPEG thumbnail. Both are served from our own host via
-/// `GET /media/{key}`, so the read path builds `display_url`/`thumbnail_url`
-/// with [`crate::cdn::full_url`] over these keys rather than pointing the
-/// browser at the upstream source. Built at startup (see the `dev` crate's
-/// resolver) and shared read-only through [`AppState::image_media`].
-#[derive(Debug, Clone)]
-pub struct ResolvedImageMedia {
-    pub storage_key: String,
-    pub thumbnail_key: String,
-}
-
-/// Placeholder-mode media key for a fact-store image's original — the layout
-/// the dev resolver writes and `GET /media/{key}` serves back. A single path
-/// segment under `media/`, so the route matches it. Exported so the resolver
-/// and its test mirrors share one definition.
-pub fn placeholder_storage_key(image_id: impl std::fmt::Display) -> String {
-    format!("media/factimg-{image_id}.jpg")
-}
-
-/// Placeholder-mode media key for a fact-store image's thumbnail — the twin
-/// of [`placeholder_storage_key`].
-pub fn placeholder_thumbnail_key(image_id: impl std::fmt::Display) -> String {
-    format!("media/factimg-{image_id}-thumb.jpg")
-}
-
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("Invalid bind address: {0}")]
@@ -418,10 +391,14 @@ pub struct AppState {
     /// minutes from serving nothing. Taken from the store at startup, so the
     /// probe and the shutdown path read the same signal.
     pub credentials: CredentialWatch,
-    /// Resolved media keys for every fact-store image, keyed by image id. The
-    /// entity read path serves thumbnails and detail images from these keys; an
-    /// image absent from the map is unresolved and contributes no thumbnail/tile.
-    pub image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
+    /// Builds the public URL for a mirrored image at a given size. The entity
+    /// read path derives every thumbnail / tile / detail URL from an image's
+    /// source URL through this, with no lookup or state. The implementation is
+    /// the one environment difference the entry point supplies: production hands
+    /// in an [`EdgeCdn`](crate::cdn::EdgeCdn) that points at the Cloudflare edge,
+    /// dev a [`LocalCdn`](crate::cdn::LocalCdn) that points at the embedded
+    /// `/media/{key}` route.
+    pub cdn: Box<dyn crate::cdn::Cdn>,
 }
 
 /// Everything [`AppState`] is assembled from: its fields, minus the WebAuthn
@@ -441,7 +418,8 @@ pub struct AppStateParts {
     pub media_store: Arc<dyn MediaStore>,
     pub facts: ServerFactStore,
     pub credentials: CredentialWatch,
-    pub image_media: Arc<HashMap<ServerImageId, ResolvedImageMedia>>,
+    /// The environment's URL builder: `EdgeCdn` in production, `LocalCdn` in dev.
+    pub cdn: Box<dyn crate::cdn::Cdn>,
 }
 
 impl AppState {
@@ -470,7 +448,7 @@ impl AppState {
             media_store: parts.media_store,
             facts: parts.facts,
             credentials: parts.credentials,
-            image_media: parts.image_media,
+            cdn: parts.cdn,
         })
     }
 }
