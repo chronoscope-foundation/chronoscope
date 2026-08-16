@@ -35,9 +35,14 @@ impl Qwen3 {
     /// residual, config, and tokenizer from that directory itself, so the loader
     /// owns no layout knowledge beyond the path it is handed.
     pub async fn open(first_shard: &Path) -> Result<Self, OpenError> {
-        let dir = first_shard.parent().ok_or_else(|| OpenError::ShardPath {
-            path: first_shard.to_path_buf(),
-        })?;
+        // `Path::parent` yields `Some("")` for a bare filename, not `None`, so an
+        // empty parent is rejected the same as a missing one.
+        let dir = first_shard
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .ok_or_else(|| OpenError::ShardPath {
+                path: first_shard.to_path_buf(),
+            })?;
         let name = first_shard
             .file_name()
             .ok_or_else(|| OpenError::ShardPath {
