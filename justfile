@@ -183,7 +183,11 @@ check target="all":
             nix flake check
             ;;
         nix)
-            nix build ".#checks.$SYS.nix-lint" --no-link
+            nix build \
+                ".#checks.$SYS.nix-lint" \
+                ".#checks.$SYS.python-scripts-lint" \
+                ".#checks.$SYS.python-scripts-typecheck" \
+                --no-link
             ;;
         rust)
             # The two Postgres suites each spin an ephemeral cluster, so they

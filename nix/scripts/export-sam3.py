@@ -26,16 +26,15 @@ import sys
 from pathlib import Path
 
 import torch
-
+from sam3.model.sam3_image import Sam3Image
+from sam3.model.sam3_image_processor import Sam3Processor
+from sam3.model_builder import build_sam3_image_model
 from samexporter.export_sam3 import (
     SAM3Decoder,
     SAM3ImageEncoder,
     SAM3LanguageEncoder,
     get_replace_freqs_cis,
 )
-from sam3.model.sam3_image import Sam3Image
-from sam3.model.sam3_image_processor import Sam3Processor
-from sam3.model_builder import build_sam3_image_model
 
 OPSET = 18
 
@@ -72,7 +71,9 @@ class MergedImageEncoder(SAM3ImageEncoder):
         vision_feats[-1] = vision_feats[-1] + tracker.no_mem_embed
         feats = [
             feat.permute(1, 2, 0).view(1, -1, *feat_size)
-            for feat, feat_size in zip(vision_feats[::-1], predictor._bb_feat_sizes[::-1])
+            for feat, feat_size in zip(
+                vision_feats[::-1], predictor._bb_feat_sizes[::-1]
+            )
         ][::-1]
         image_embed, high_res_feat_0, high_res_feat_1 = feats[-1], feats[0], feats[1]
 
@@ -177,7 +178,9 @@ def export_sam3(output_dir: Path) -> None:
     record(
         "image_encoder",
         {
-            "graph_assertions": [{"claim": "resolution", "tensor": "image", "axis": -1}],
+            "graph_assertions": [
+                {"claim": "resolution", "tensor": "image", "axis": -1}
+            ],
             "resolution": resolution,
             "preprocessing": {
                 "normalization_baked_into_graph": True,
@@ -266,7 +269,9 @@ def export_sam3(output_dir: Path) -> None:
     # A box is its two corners with labels 2 (top-left) and 3 (bottom-right), in
     # the [0, resolution] model frame. point_labels must be float32: the prompt
     # encoder concatenates a float padding label.
-    pt_coords = torch.tensor([[[252.0, 252.0], [756.0, 756.0]]], dtype=torch.float32).to(device)
+    pt_coords = torch.tensor(
+        [[[252.0, 252.0], [756.0, 756.0]]], dtype=torch.float32
+    ).to(device)
     pt_labels = torch.tensor([[2.0, 3.0]], dtype=torch.float32).to(device)
     torch.onnx.utils.export(
         SAM3InteractiveDecoder(model),

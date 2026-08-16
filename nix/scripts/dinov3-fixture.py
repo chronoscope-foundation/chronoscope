@@ -149,4 +149,6 @@ print(f"dinov3 fixture at {resolution}px, patch grid {grid_rows}x{grid_columns}"
 print(f"  {type(processor).__name__}, transformers {transformers.__version__}")
 for entry in references:
     source = entry["source"]
-    print(f"  {entry['id']:34s} {source['width']}x{source['height']} x{source['channels']}")
+    print(
+        f"  {entry['id']:34s} {source['width']}x{source['height']} x{source['channels']}"
+    )

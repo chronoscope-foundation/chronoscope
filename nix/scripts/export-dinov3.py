@@ -90,6 +90,12 @@ prefix_tokens = 1 + config["num_register_tokens"]
 class Dinov3Encoder(torch.nn.Module):
     """Rescaled, resized float32 CHW image in, last_hidden_state out."""
 
+    # register_buffer sets these at runtime; declaring the types keeps attribute
+    # access off Module.__getattr__'s Tensor | Module return so the arithmetic
+    # below typechecks as tensor ops.
+    mean: torch.Tensor
+    std: torch.Tensor
+
     def __init__(self, model: torch.nn.Module) -> None:
         super().__init__()
         self.model = model

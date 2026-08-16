@@ -351,6 +351,15 @@
           name = "nix-source";
         };
 
+        # Python export/fixture scripts, narrowed for their own lint check. They
+        # produce the manifests the Rust startup asserts against, so they run in
+        # the derivations everything downstream trusts and earn a gate.
+        scriptsSrc = lib.cleanSourceWith {
+          src = lib.cleanSource ./nix/scripts;
+          filter = path: type: (type == "directory") || (lib.hasSuffix ".py" path);
+          name = "nix-scripts-source";
+        };
+
         # webauthn-rs links openssl-sys unconditionally; libspatialite is
         # loaded at runtime via SELECT load_extension.
         backendNativeBuildInputs = with pkgs; [
@@ -538,6 +547,37 @@
                   find . -name '*.nix' -print0 | xargs -0 nixfmt --check
                   statix check .
                   find . -name '*.nix' -print0 | xargs -0 deadnix --fail -L
+                  touch $out
+                '';
+
+            python-scripts-lint =
+              pkgs.runCommand "python-scripts-lint"
+                {
+                  nativeBuildInputs = [ pkgs.ruff ];
+                  src = scriptsSrc;
+                }
+                ''
+                  export RUFF_CACHE_DIR="$TMPDIR/ruff-cache"
+                  cd $src
+                  ruff format --check .
+                  ruff check .
+                  touch $out
+                '';
+
+            # Typechecking torch/onnx glue only means something with the real
+            # torch stubs resolved, so it borrows the export env's interpreter;
+            # the untyped sam3/samexporter fall back to Any.
+            python-scripts-typecheck =
+              pkgs.runCommand "python-scripts-typecheck"
+                {
+                  nativeBuildInputs = [ pkgs.mypy ];
+                  src = scriptsSrc;
+                }
+                ''
+                  export MYPY_CACHE_DIR="$TMPDIR/mypy-cache"
+                  cd $src
+                  mypy --python-executable ${analysis.exportEnv}/bin/python \
+                    --ignore-missing-imports *.py
                   touch $out
                 '';
 

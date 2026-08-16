@@ -86,10 +86,14 @@ for name in sorted(expected):
     by_name = {s.name: s for s in sessions[name].get_inputs()}
     by_name.update({s.name: s for s in sessions[name].get_outputs()})
     for assertion in claims["graph_assertions"]:
-        if not isinstance(assertion, dict) or not {
-            "claim",
-            "tensor",
-        } <= assertion.keys():
+        if (
+            not isinstance(assertion, dict)
+            or not {
+                "claim",
+                "tensor",
+            }
+            <= assertion.keys()
+        ):
             failures.append(
                 f"{name}.json: malformed assertion {assertion!r}; needs "
                 "claim, tensor, and one of axis or dtype"
@@ -155,7 +159,7 @@ if failures:
 # crate never reads a description of an artifact that failed its own checks.
 # It carries the graph signatures plus the facts a signature cannot state: the
 # baked score threshold, the baked preprocessing, the patch grid.
-manifest = {"models": {}}
+manifest: dict[str, dict[str, object]] = {"models": {}}
 for name, session in sorted(sessions.items()):
     sub = root / name
     (graph,) = sub.glob("*.onnx")
