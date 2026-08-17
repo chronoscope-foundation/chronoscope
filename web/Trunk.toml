@@ -27,7 +27,7 @@ stage = "post_build"
 command = "sh"
 command_arguments = [
   "-c",
-  "mkdir -p \"$TRUNK_STAGING_DIR/fonts\" && cp \"$CHRONOSCOPE_WEB_FONTS\"/* \"$TRUNK_STAGING_DIR/fonts/\"",
+  "set -u; mkdir -p \"$TRUNK_STAGING_DIR/fonts\" && cp \"$CHRONOSCOPE_WEB_FONTS\"/* \"$TRUNK_STAGING_DIR/fonts/\"",
 ]
 
 # Same staging for the pinned basemap style. Both the document and the path it
@@ -40,4 +40,16 @@ command = "sh"
 command_arguments = [
   "-c",
   "set -u; mkdir -p \"$TRUNK_STAGING_DIR/$(dirname \"$CHRONOSCOPE_OHM_STYLE_PATH\")\" && cp \"$CHRONOSCOPE_OHM_STYLE\" \"$TRUNK_STAGING_DIR/$CHRONOSCOPE_OHM_STYLE_PATH\"",
+]
+
+# Same staging for the self-hosted MapLibre engine, at the maplibre/ path the
+# dist puts it at, so the dev server serves the same pinned js+css the
+# production dist and the browser tests do. `set -u` fails cleanly if the var
+# is unset (trunk run outside the nix shell) rather than running `cp /*`.
+[[hooks]]
+stage = "post_build"
+command = "sh"
+command_arguments = [
+  "-c",
+  "set -u; mkdir -p \"$TRUNK_STAGING_DIR/maplibre\" && cp \"$CHRONOSCOPE_MAPLIBRE\"/* \"$TRUNK_STAGING_DIR/maplibre/\"",
 ]

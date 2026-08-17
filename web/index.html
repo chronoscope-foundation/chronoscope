@@ -25,16 +25,13 @@
     <link rel="preload" href="fonts/dm-sans-latin.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="fonts/cormorant-latin.woff2" as="font" type="font/woff2" crossorigin />
 
-    <!-- MapLibre GL JS -->
-    <script src="https://unpkg.com/maplibre-gl@5.1.0/dist/maplibre-gl.js"
-      integrity="sha384-TVqWxbDHWILsUUzJNOvfZ9KwUw3sPdYRiGed9YeAkFlxMjTG8vRl2HDuYAsTh11I"
-      crossorigin="anonymous"></script>
-    <link
-      rel="stylesheet"
-      href="https://unpkg.com/maplibre-gl@5.1.0/dist/maplibre-gl.css"
-      integrity="sha384-Nq6PQ+9vJPvw7U/VfDELyrWoGQMsy0gi6QShhaSrGzkpF5KkM40csg2leky+YMTd"
-      crossorigin="anonymous"
-    />
+    <!-- MapLibre GL JS, self-hosted same-origin. nix/web.nix pins the exact
+         js+css bytes and stages them at maplibre/ for the production dist and
+         the browser tests; a Trunk post_build hook does the same for the dev
+         server. No SRI: the file is same-origin and byte-pinned by nix, so an
+         integrity hash would only duplicate that pin and drift on a bump. -->
+    <script src="maplibre/maplibre-gl.js"></script>
+    <link rel="stylesheet" href="maplibre/maplibre-gl.css" />
 
     <!-- Tailwind CSS (processed by Trunk) -->
     <link data-trunk rel="css" href="tailwind.css" />

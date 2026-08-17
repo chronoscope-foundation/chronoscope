@@ -281,6 +281,33 @@ let
         } > $out/fonts.css
       '';
 
+  # MapLibre GL JS + CSS, self-hosted same-origin.
+  #
+  # These loaded from unpkg at runtime before. Serving the engine from our own
+  # bundle keeps it off the public internet, so the browser tests' map-idle gate
+  # depends on neither unpkg's reachability nor its latency.
+  #
+  # Pinned by sha256, nix's content pin and the single source of truth for these
+  # bytes: the engine is served same-origin from our own bundle, so a browser
+  # SRI would only duplicate this pin and drift from it on a version bump.
+  maplibre =
+    let
+      version = "5.1.0";
+      js = pkgs.fetchurl {
+        url = "https://unpkg.com/maplibre-gl@${version}/dist/maplibre-gl.js";
+        hash = "sha256-kbBDPLLbuRusq5w1rY9qWLCpsaenwDCkPAj4DSs8WTs=";
+      };
+      css = pkgs.fetchurl {
+        url = "https://unpkg.com/maplibre-gl@${version}/dist/maplibre-gl.css";
+        hash = "sha256-eSrJl9z2rm9kPrTi3uRjDIXnBWUmvY+4X/6Dxn1sQbQ=";
+      };
+    in
+    pkgs.runCommand "chronoscope-maplibre" { } ''
+      mkdir -p $out
+      cp ${js} $out/maplibre-gl.js
+      cp ${css} $out/maplibre-gl.css
+    '';
+
   # Post-process and assemble a final dist/ output from a wasm build.
   mkDist =
     {
@@ -337,6 +364,12 @@ let
         # URL are still fetched from OHM.
         mkdir -p "$(dirname "$out/${ohmStylePath}")"
         cp ${ohmStyle} "$out/${ohmStylePath}"
+
+        # The MapLibre engine, same-origin at maplibre/. index.html's raw
+        # <script>/<link> reference these paths; the sed below only rewrites the
+        # two data-trunk lines, so those tags pass through untouched.
+        mkdir -p $out/maplibre
+        cp ${maplibre}/* $out/maplibre/
 
         # Process index.html — replace Trunk data attributes with direct references
         sed \
@@ -427,6 +460,8 @@ in
     # Exposed so the dev shell can point Trunk at the same subsetted files the
     # production dist ships, rather than the two paths drifting.
     web-fonts = fonts;
+    # Likewise, so Trunk stages the same pinned MapLibre engine the dist ships.
+    web-maplibre = maplibre;
   };
 
   checks = {

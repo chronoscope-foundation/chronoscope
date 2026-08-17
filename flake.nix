@@ -477,6 +477,9 @@
           # hook stages the document at the path the dist puts it at.
           CHRONOSCOPE_OHM_STYLE = "${ohm-style}";
           CHRONOSCOPE_OHM_STYLE_PATH = ohmStylePath;
+          # The MapLibre engine, self-hosted same-origin. Trunk's post_build
+          # hook stages the js+css at the maplibre/ path the dist puts them at.
+          CHRONOSCOPE_MAPLIBRE = web.packages.web-maplibre;
           # chromiumoxide picks up CHROME as the executable path.
           CHROME = chromeHeadlessBin;
           # The read-only facts DB the dev servers and browser tests mount (a
