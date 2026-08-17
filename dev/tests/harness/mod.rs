@@ -14,9 +14,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Response};
 use chromiumoxide::Page;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
@@ -142,6 +143,11 @@ async fn launch_browser() -> Result<
         .no_sandbox()
         .window_size(1280, 800)
         .request_timeout(CDP_REQUEST_TIMEOUT)
+        // Fail every hostname lookup so a map test reaches only the frontend and
+        // API on 127.0.0.1 (literal IPs skip the resolver); a still-remote
+        // basemap or engine asset fails loudly here instead of hanging the
+        // idle wait on a slow OHM/unpkg fetch.
+        .arg("--host-resolver-rules=MAP * ~NOTFOUND")
         .build()
         .map_err(|e| format!("failed to build browser config: {e}"))?;
 
@@ -211,6 +217,53 @@ async fn proxy_api(State(api_base): State<String>, req: Request) -> Result<Respo
     builder
         .body(Body::from(bytes))
         .map_err(|_| StatusCode::BAD_GATEWAY)
+}
+
+/// A freshly encoded 1x1 transparent PNG for the basemap's raster tile and
+/// sprite stubs, regenerated per request (microseconds) rather than baked as a
+/// byte array. It must decode: `map.loaded()` gates on `style.loaded()`, which
+/// waits on the sprite/image manager, so an image that fails to decode can
+/// stall idle indefinitely.
+fn one_px_png() -> Response {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    let pixel = image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0]));
+    match image::DynamicImage::ImageRgba8(pixel).write_to(&mut buf, image::ImageFormat::Png) {
+        Ok(()) => ([(CONTENT_TYPE, "image/png")], buf.into_inner()).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Stub the basemap's tiles same-origin, keyed by the extension the rewritten
+/// style doc requests. A raster `.png` gets a 1x1 PNG; a vector `.pbf` gets an
+/// empty body: MapLibre counts an empty or errored tile as loaded for
+/// `areTilesLoaded()`, so the tile only needs an instant same-origin 200, not
+/// real bytes.
+async fn basemap_tile(Path(rest): Path<String>) -> Response {
+    if rest.ends_with(".png") {
+        one_px_png()
+    } else {
+        ([(CONTENT_TYPE, "application/x-protobuf")], Vec::<u8>::new()).into_response()
+    }
+}
+
+/// Stub the basemap's sprite same-origin. The `.png` sheet gets a 1x1 PNG;
+/// everything else (the `.json` manifest, including the `@2x` variant) gets an
+/// empty sprite object. The sprite is the one basemap asset that must be valid:
+/// `map.loaded()` gates on the image manager, so a sprite that errors or
+/// SPA-falls-back to HTML can stall idle.
+async fn basemap_sprite(Path(rest): Path<String>) -> Response {
+    if rest.ends_with(".png") {
+        one_px_png()
+    } else {
+        ([(CONTENT_TYPE, "application/json")], "{}").into_response()
+    }
+}
+
+/// Stub the basemap's glyph ranges same-origin with an empty range. Glyphs are
+/// lazy and never gate `style.loaded()`, so an empty body suffices; they exist
+/// only so a glyph fetch stays on the page origin rather than reaching OHM.
+async fn basemap_glyph() -> Response {
+    ([(CONTENT_TYPE, "application/x-protobuf")], Vec::<u8>::new()).into_response()
 }
 
 /// Build the single JS expression used to invoke a `window.__test.<hook>(...)`
@@ -420,8 +473,20 @@ impl WebTest {
         // route is registered ahead of `fallback_service`, so `/api/*` never
         // falls through to the SPA index.html (which would answer JSON requests
         // with an HTML 200 and break parsing).
+        // Basemap stub routes, registered ahead of `fallback_service` so the
+        // SPA index.html never answers them with HTML. The webTest bundle
+        // rewrites the pinned style doc's tiles, glyphs and sprite to these
+        // `/basemap/...` paths, so map-idle is reached from same-origin stubs
+        // rather than fetching OHM. The style doc itself still falls through to
+        // ServeDir at `/basemap/ohm-historical.json`.
         let app = axum::Router::new()
             .route("/api/{*rest}", axum::routing::any(proxy_api))
+            .route("/basemap/tiles/{*rest}", axum::routing::get(basemap_tile))
+            .route(
+                "/basemap/sprite/{*rest}",
+                axum::routing::get(basemap_sprite),
+            )
+            .route("/basemap/fonts/{*rest}", axum::routing::get(basemap_glyph))
             .fallback_service(serve_dir)
             .with_state(base_url.clone());
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{frontend_port}")).await?;

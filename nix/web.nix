@@ -309,18 +309,27 @@ let
     '';
 
   # Post-process and assemble a final dist/ output from a wasm build.
+  #
+  # `rewriteBasemapForTests` repoints the staged basemap style's
+  # network-bearing fields (glyphs, sprite, every source's tiles) at the
+  # same-origin `/basemap/...` stubs the browser-test harness serves, so
+  # map-idle is reached without fetching OHM over the public internet. Only the
+  # `webTest` bundle sets it; the prod `web` bundle keeps the real OHM URLs.
   mkDist =
     {
       name,
       wasmBuild,
+      rewriteBasemapForTests ? false,
     }:
     pkgs.runCommand name
       {
-        nativeBuildInputs = with pkgs; [
-          wasm-bindgen-cli
-          binaryen
-          tailwindcss_4
-        ];
+        nativeBuildInputs =
+          (with pkgs; [
+            wasm-bindgen-cli
+            binaryen
+            tailwindcss_4
+          ])
+          ++ lib.optional rewriteBasemapForTests pkgs.jq;
       }
       ''
         mkdir -p $out work
@@ -360,10 +369,40 @@ let
         # The basemap style, at the path flake.nix names for it, which is also
         # what the dev server stages it at and what the map asks for. Pinned in
         # flake.nix and served from here, so the map draws the style this build
-        # was made against; the tiles, glyphs and sprites it names by absolute
-        # URL are still fetched from OHM.
+        # was made against. In the prod bundle the tiles, glyphs and sprites it
+        # names by absolute URL stay OHM's own; the test bundle rewrites them to
+        # same-origin stubs just below.
         mkdir -p "$(dirname "$out/${ohmStylePath}")"
         cp ${ohmStyle} "$out/${ohmStylePath}"
+
+        ${lib.optionalString rewriteBasemapForTests ''
+          # Repoint only the network-bearing fields at the harness's same-origin
+          # stubs, keyed by each tile's existing extension so the raster source
+          # stays .png while the vector sources become .pbf. Layers, filters and
+          # fonts are left untouched — the browser tests read the layer structure.
+          jq '
+            .glyphs = "/basemap/fonts/{fontstack}/{range}.pbf"
+            | .sprite = "/basemap/sprite/historical_spritesheet"
+            | .sources |= map_values(
+                if has("tiles") and (.tiles != null)
+                then .tiles |= map("/basemap/tiles/{z}/{x}/{y}." + capture("\\.(?<e>[A-Za-z0-9]+)$").e)
+                else . end
+              )
+          ' "$out/${ohmStylePath}" > "$out/${ohmStylePath}.tmp"
+          mv "$out/${ohmStylePath}.tmp" "$out/${ohmStylePath}"
+
+          # Fail the build if any network-bearing field escaped the rewrite (a
+          # future style bump could add a `url`-based source the map() above
+          # skips), rather than shipping a test bundle that still names OHM.
+          jq -e '
+            (.glyphs | startswith("/basemap/"))
+            and (.sprite | startswith("/basemap/"))
+            and all(.sources[];
+                  ((.tiles // []) | all(startswith("/basemap/")))
+                  and ((.url // "/basemap/") | startswith("/basemap/")))
+          ' "$out/${ohmStylePath}" > /dev/null \
+            || { echo "basemap rewrite left a non-same-origin source; extend the jq in mkDist" >&2; exit 1; }
+        ''}
 
         # The MapLibre engine, same-origin at maplibre/. index.html's raw
         # <script>/<link> reference these paths; the sed below only rewrites the
@@ -392,6 +431,7 @@ let
   webTest = mkDist {
     name = "chronoscope-web-dist-test";
     wasmBuild = wasmBuildTest;
+    rewriteBasemapForTests = true;
   };
 
   # Clippy against the wasm32 target with -D warnings, covering the code that
