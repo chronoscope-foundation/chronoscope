@@ -62,8 +62,9 @@ extern "C" {
 
     /// Replace a layout property on an existing style layer. A layer the style
     /// no longer carries, or a value the style spec rejects, arrives as an
-    /// `error` event; the throw is the removed-map case. `options` takes
-    /// [`skip_validation`].
+    /// `error` event. A throw means either the map is gone or the style has not
+    /// finished loading (MapLibre's `_checkLoaded`), so a caller must not read
+    /// it as map-gone alone. `options` takes [`skip_validation`].
     #[wasm_bindgen(method, js_name = setLayoutProperty, catch)]
     pub fn set_layout_property(
         this: &Map,
@@ -98,9 +99,10 @@ extern "C" {
     pub fn get_style(this: &Map) -> JsValue;
 
     /// Replace a style layer's filter. A layer the style no longer carries, or a
-    /// filter the style spec rejects, arrives as an `error` event; the throw is
-    /// the removed-map case, which is how a caller driving a torn-down map finds
-    /// out. `options` takes [`skip_validation`].
+    /// filter the style spec rejects, arrives as an `error` event. A throw means
+    /// either the map is gone or the style has not finished loading, so latch on
+    /// success rather than treat the throw as terminal. `options` takes
+    /// [`skip_validation`].
     #[wasm_bindgen(method, js_name = setFilter, catch)]
     pub fn set_filter(
         this: &Map,

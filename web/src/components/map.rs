@@ -1778,19 +1778,23 @@ fn reveal_held_labels(map: &maplibre::Map, state: &MapState) {
     if state.disposed.get() || state.labels_revealed.get() {
         return;
     }
-    state.labels_revealed.set(true);
 
-    let held = std::mem::take(&mut *state.held_labels.borrow_mut());
     let visible = JsValue::from_str("visible");
     let options = maplibre::skip_validation();
-    for id in held {
-        // A throw is the map having been removed, so the layers behind this one
-        // belong to the same gone map.
-        if let Err(e) = map.set_layout_property(&id, "visibility", &visible, &options) {
+    // Borrow rather than take: a write throws when the style has not loaded yet
+    // (a backgrounded tab keeps it unloaded past the backstop timer), so leaving
+    // the held set and the latch untouched lets a later pass put the labels up.
+    for id in state.held_labels.borrow().iter() {
+        if let Err(e) = map.set_layout_property(id, "visibility", &visible, &options) {
             web_sys::console::warn_1(&format!("the label reveal stopped at '{id}': {e:?}").into());
             return;
         }
     }
+
+    // Latch and drop the held set only once every layer is up, so a pass that
+    // could not finish loses nothing.
+    state.labels_revealed.set(true);
+    state.held_labels.borrow_mut().clear();
 }
 
 /// How long the labels wait for markers before going up regardless. Long enough
@@ -1809,8 +1813,16 @@ fn arm_label_reveal_backstop(map: &maplibre::Map, state: &MapState) {
     let state = state.clone();
     let mount = state.mount_generation.get();
     let backstop = Closure::once_into_js(move || {
-        if state.mount_generation.get() == mount {
+        if state.disposed.get() || state.mount_generation.get() != mount {
+            return;
+        }
+        // A write to a not-yet-loaded style throws (a backgrounded tab keeps it
+        // unloaded past the timer), so re-arm and wait rather than fire a reveal
+        // that can only fail; foregrounding loads the style within a frame.
+        if map.is_style_loaded() {
             reveal_held_labels(&map, &state);
+        } else {
+            arm_label_reveal_backstop(&map, &state);
         }
     });
     if let Some(w) = web_sys::window() {
