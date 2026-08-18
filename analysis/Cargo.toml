@@ -30,6 +30,12 @@ corpus = [
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# The ask's schema render parses the schema JSON `Value` into a typed model once
+# (`ask::render`); `IndexMap` deserializes the `properties`/`definitions` objects
+# preserving the order the schema wrote them in, so the rendered prompt matches
+# the order the grammar enforces.
+indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -84,10 +90,11 @@ tokio = { workspace = true, optional = true }
 mistralrs = { workspace = true }
 
 # `qwen3::ask` derives the sampling constraint from the caller's type via
-# schemars, and `generate_structured` bounds it on schemars' `JsonSchema`. The
-# 1.x pin makes that bound satisfiable: mistralrs is on schemars 1, a different
-# major and a different trait than the workspace's 0.8.
-schemars = "1"
+# schemars and hands it to mistral.rs as a raw JSON-schema `Value`, so nothing
+# forces mistralrs's own schemars 1: the workspace 0.8 produces a schema
+# llguidance compiles just as well, and it lets the ask reuse core's grammar
+# types (`ImageMedium`, `Text`) instead of mirroring them.
+schemars.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The Metal GPU backend, on Apple hardware only; other platforms run on CPU.

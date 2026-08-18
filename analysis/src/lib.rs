@@ -7,6 +7,7 @@
 //! against — sits behind the `corpus` feature, since its downloader runs from
 //! Nix.
 
+pub mod ask;
 #[cfg(feature = "corpus")]
 pub mod corpus;
 pub mod dinov3;
