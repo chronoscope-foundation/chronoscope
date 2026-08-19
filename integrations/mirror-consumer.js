@@ -6,6 +6,14 @@
 // domain knowledge of its own. Move it to Rust/WASM via workers-rs if it grows
 // past that.
 //
+// Conceptual twin: `consume` in dev/src/mirror_consumer.rs is the same
+// fetch-check-put for the dev in-process queue (Rust, no Cloudflare). Two trivial
+// implementations because one runs here in a Worker and one runs in-process;
+// while both stay this small the duplication is cheaper than a shared core, so a
+// change to one is a prompt to check the other. The dev twin retries in-job
+// instead of re-injecting, and skips the redirect/RP-scope guards it has no
+// boundary to defend.
+//
 // Bindings (declared in nix/infra.nix): MEDIA_BUCKET is the R2 bucket; the
 // queue consumer config points this script at the mirror queue.
 

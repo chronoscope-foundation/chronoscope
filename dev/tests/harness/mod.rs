@@ -461,6 +461,11 @@ impl WebTest {
         })
         .await?;
 
+        // Startup dispatches the media warm without blocking; wait for the
+        // background consumer to drain it so every test's thumbnails are present
+        // before it asserts.
+        server.await_media_warmed().await;
+
         // Serve the prebuilt dist directly (nothing per-test is injected into
         // it any more) with an SPA fallback: any path that doesn't match a file
         // serves index.html so client-side routing works.

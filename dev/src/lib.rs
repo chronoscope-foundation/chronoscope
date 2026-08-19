@@ -32,10 +32,10 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 mod factstore;
-mod image_resolve;
+mod mirror_consumer;
 
 pub use factstore::{LoadError, load_curated_fact_store};
-pub use image_resolve::{ImageResolveMode, warm_fact_store_media};
+pub use mirror_consumer::{ImageResolveMode, warm_and_drain};
 
 /// The pixel dimension of the shared placeholder JPEG — an 8x8 solid-copper tile.
 const PLACEHOLDER_DIM: u32 = 8;
@@ -156,6 +156,15 @@ pub struct RunningDevServer {
     /// The server's logger, kept so shutdown can report workers that overran
     /// [`WORKER_STOP_DEADLINE`].
     log: slog::Logger,
+
+    /// Count of media-warm requests the consumer has processed, for
+    /// [`Self::await_media_warmed`]. The startup sweep dispatches without blocking
+    /// and the consumer drains in the background; this watches its progress.
+    media_warmed: watch::Receiver<usize>,
+
+    /// How many requests the startup sweep dispatched — the target the processed
+    /// count must reach for the warm to be fully drained.
+    media_dispatched: usize,
 }
 
 impl RunningDevServer {
@@ -166,6 +175,22 @@ impl RunningDevServer {
     #[must_use]
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// Resolve once the one-shot media warm has fully drained — every dispatched
+    /// request consumed. A live dev server never calls this: images stream in as
+    /// the consumer fetches them. The browser-test harness calls it so thumbnails
+    /// are present before a test asserts.
+    pub async fn await_media_warmed(&self) {
+        let mut processed = self.media_warmed.clone();
+        // Wait until the consumer has processed every dispatched request, or its
+        // sender drops (it finished, or the server is shutting down) — either way
+        // nothing more is coming.
+        while *processed.borrow_and_update() < self.media_dispatched {
+            if processed.changed().await.is_err() {
+                break;
+            }
+        }
     }
 
     /// Gracefully shut down the server and wait for all workers to stop.
@@ -597,17 +622,21 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
             .map_err(|e| DevServerError(format!("seeding fact store: {e:?}")))?;
     }
 
-    // Warm every fact-store image into the media store under its mirror key, so
-    // the CDN-transform stand-in serves the URLs the read path derives rather
-    // than pointing browsers at upstream Commons.
-    let warmed = warm_fact_store_media(
-        &facts,
-        &media_store,
-        &config.http_client,
+    // Spawn the decoupled media consumer and dispatch the one-shot sweep onto its
+    // queue. Dispatch hands every image off and returns; the consumer fetches in
+    // the background, so startup never blocks on the warm — images stream into the
+    // `/media` stand-in as they land, serving the URLs the read path derives
+    // rather than pointing browsers at upstream Commons. Browser tests await
+    // `RunningDevServer::await_media_warmed` for determinism.
+    let (media_tx, media_warmed) = mirror_consumer::spawn_media_consumer(
+        media_store.clone(),
+        config.http_client.clone(),
         config.image_resolve,
-    )
-    .await;
-    info!(log, "Warmed fact-store media"; "keys" => warmed);
+    );
+    let media_dispatched = mirror_consumer::dispatch_media_warm(&facts, &media_tx).await;
+    // Close the queue so the one-shot consumer finishes once it has drained.
+    drop(media_tx);
+    info!(log, "Dispatched fact-store media warm"; "dispatched" => media_dispatched);
 
     // Keep a handle to the fact store for graceful shutdown; the copy handed to
     // the server shares the same `Arc`-backed pool.
@@ -669,5 +698,7 @@ pub async fn start_dev_server(config: DevServerConfig) -> Result<RunningDevServe
         shutdown_tx,
         worker_handles,
         log: log.clone(),
+        media_warmed,
+        media_dispatched,
     })
 }

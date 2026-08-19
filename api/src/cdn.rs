@@ -183,12 +183,24 @@ impl Cdn for EdgeCdn {
 /// A mirror key is `{source}/{hash}`, but the source prefix only organizes keys
 /// in R2; dev's media store is flat and the hash alone is unique (a SHA-256 of
 /// the image identity), so dev drops the prefix and reuses the research
-/// pipeline's single-segment `get_media` route. One
-/// derivation so [`LocalCdn`] (which builds the URL) and the dev warm (which
-/// stores the bytes) cannot disagree on the key.
+/// pipeline's single-segment `get_media` route. One derivation so [`LocalCdn`]
+/// (which builds the URL) and the dev warm (which stores the bytes) cannot
+/// disagree on the key.
 #[must_use]
 pub fn local_media_key(key: &DisplayableKey) -> String {
-    let hash = key.key().as_str().rsplit('/').next().unwrap_or_default();
+    local_media_key_for_mirror_key(key.key().as_str())
+}
+
+/// [`local_media_key`] from the raw mirror-key string a queue message carries.
+///
+/// The dev warm holds `MirrorRequest::key` (the `{source}/{hash}` string), not a
+/// [`DisplayableKey`], so it derives the dev store key here rather than
+/// re-deriving from the URL. Same `rsplit` as [`local_media_key`], kept single so
+/// the URL the read path builds and the key the warm stores under stay in
+/// lockstep.
+#[must_use]
+pub fn local_media_key_for_mirror_key(mirror_key: &str) -> String {
+    let hash = mirror_key.rsplit('/').next().unwrap_or_default();
     format!("media/{hash}")
 }
 
@@ -349,6 +361,25 @@ pub mod tests {
         let hash = mirror.rsplit('/').next().unwrap_or_default();
         assert_eq!(local_media_key(&key), format!("media/{hash}"));
         assert!(!local_media_key(&key).contains("commons"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_media_key_drops_the_source_prefix_to_a_flat_media_key() -> TestResult {
+        // The read path derives the dev key from a `DisplayableKey`; the dev warm
+        // derives it from the mirror-key string in the queue message. Both must
+        // land on the same flat `media/{hash}` key `get_media` reconstructs, or a
+        // warmed image 404s at serve time. Pin the shape to a literal so a change
+        // to the prefix or the split fails here, not silently at serve time.
+        assert_eq!(
+            local_media_key_for_mirror_key("commons/deadbeefhash"),
+            "media/deadbeefhash"
+        );
+        let key = commons_displayable_key()?;
+        assert_eq!(
+            local_media_key(&key),
+            local_media_key_for_mirror_key(key.key().as_str())
+        );
         Ok(())
     }
 

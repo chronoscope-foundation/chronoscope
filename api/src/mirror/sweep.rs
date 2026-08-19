@@ -19,9 +19,9 @@ use chronoscope_integrations::{DisplayableKey, MirrorRequest, displayable_conten
 use url::Url;
 
 /// Identifies the fetcher to upstream hosts. Wikimedia's User-Agent policy asks
-/// automated clients to name themselves with a contact URL; this is the string
-/// the dev-time resolver (`dev/src/image_resolve.rs`) already presents, so the
-/// two fetch paths speak to Commons under one identity.
+/// automated clients to name themselves with a contact URL. It rides in every
+/// `MirrorRequest`, so the production Worker and the dev consumer
+/// (`dev/src/mirror_consumer.rs`) both speak to Commons under this one identity.
 const COMMONS_USER_AGENT: &str =
     "Chronoscope/0.1 (https://github.com/copumpkin/chronoscope; fact-store image resolver)";
 

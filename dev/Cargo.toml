@@ -61,6 +61,10 @@ serde.workspace = true
 # Async runtime
 tokio.workspace = true
 
+# StreamExt, to drive the reused mirror walk (`stream_mirror_requests`) as the
+# in-process queue's producer.
+futures-util.workspace = true
+
 # Utilities
 url.workspace = true
 uuid.workspace = true

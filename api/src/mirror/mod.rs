@@ -18,6 +18,12 @@ use crate::state::AppState;
 
 pub(crate) mod sweep;
 
+/// The mirror store walk, reused by the dev-time in-process mirror consumer
+/// (`chronoscope-dev`) as its producer. The Cloudflare dispatch (`sweep_mirror`,
+/// `QueueTarget`, `SweepReport`) stays crate-private: it is the one part dev does
+/// not share, since dev drains an in-process channel rather than a queue.
+pub use self::sweep::stream_mirror_requests;
+
 /// The header the shared sweep secret rides in. The secret itself is read from
 /// the environment into the config (`mirror_sweep_token`), not hardcoded here.
 pub(crate) const SWEEP_TOKEN_HEADER: &str = "x-mirror-sweep-token";

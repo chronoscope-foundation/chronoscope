@@ -1,13 +1,13 @@
 //! The warm must store bytes under the dev media key `LocalCdn` builds its URLs
 //! from, for every depicted image that carries a displayable source URL.
 //!
-//! (`warm_fact_store_media` is a temporary dev-only stand-in for the R2 mirror —
-//! see its module doc in `dev/src/image_resolve.rs`; this test guards it only
-//! while it exists.)
+//! (`warm_and_drain` runs the dev mirror pipeline to completion: the reused
+//! production walk dispatching onto an in-process queue drained by the Rust
+//! consumer twin — see its module doc in `dev/src/mirror_consumer.rs`.)
 //!
 //! Ingests the curated Wikidata snapshot (via `WIKIDATA_ENTITIES_JSONL`, set by
 //! the api/web dev shells; skipped when unset, like
-//! `ingestion/tests/real_entity_ingest.rs`) and runs `warm_fact_store_media` in
+//! `ingestion/tests/real_entity_ingest.rs`) and runs `warm_and_drain` in
 //! Placeholder mode — deterministic, no network. It then asserts the media store
 //! holds a stored object under the `local_media_key` of every displayable source
 //! URL of every depicted image — the exact keys the `/media/{key}` route serves.
@@ -25,7 +25,7 @@ use chronoscope_core::store::schema::EntityStream;
 use chronoscope_core::store::{EntityView, FactStore};
 use chronoscope_core::typed;
 use chronoscope_db::media_store::{InMemoryMediaStore, MediaStore};
-use chronoscope_dev::{ImageResolveMode, load_curated_fact_store, warm_fact_store_media};
+use chronoscope_dev::{ImageResolveMode, load_curated_fact_store, warm_and_drain};
 use chronoscope_integrations::DisplayableKey;
 use chronoscope_workers::{HttpClient, ReqwestClient};
 
@@ -116,14 +116,14 @@ async fn warms_the_media_key_of_every_depicted_displayable_image() -> Result<(),
     let media_store: Arc<dyn MediaStore> = Arc::new(InMemoryMediaStore::new());
     // Placeholder mode never touches the client, but the signature wants one.
     let http_client: Arc<dyn HttpClient> = Arc::new(ReqwestClient::new()?);
-    let warmed = warm_fact_store_media(
+    let dispatched = warm_and_drain(
         &store,
         &media_store,
         &http_client,
         ImageResolveMode::Placeholder,
     )
     .await;
-    assert!(warmed > 0, "the warm stored at least one key");
+    assert!(dispatched > 0, "the warm dispatched at least one image");
 
     // Every key the read path can request for a depicted image is warmed, so no
     // depicted tile can 404 against the store — the enumeration/key-alignment the
