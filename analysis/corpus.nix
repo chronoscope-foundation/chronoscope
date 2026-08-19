@@ -215,7 +215,6 @@
       count = 2;
       description = "Restored Art Deco gas station - before/after";
       expect_similar = false;
-      known_issue = "vertical composite subimage split not detected yet";
       layout = "vertical";
       reddit_index = 0;
       subimages = {
@@ -568,7 +567,6 @@
     };
     "newcom-tavern.3" = {
       description = "Newcom Tavern, Dayton, OH - built 1796, still standing";
-      known_issue = "algorithm identifies historical plaque as separate entity — undecided whether to accept";
       reddit_index = 3;
       regions = 1;
       type = "single";
@@ -667,7 +665,6 @@
       count = 2;
       description = "Porticus Octaviae, Rome - then and now composite";
       expect_similar = false;
-      known_issue = "side-by-side composite subimage split not detected yet";
       layout = "side_by_side";
       reddit_index = 0;
       type = "composite";
@@ -712,7 +709,6 @@
     };
     "san-francisco-convent.0" = {
       description = "Casa Grande de San Francisco Convent, 1411–1843";
-      known_issue = "algorithm misidentifies ornate caption box as a separate building — expect 3 regions until fixed";
       reddit_index = 0;
       regions = 2;
       type = "single";
@@ -839,7 +835,6 @@
       count = 2;
       description = "St. Thomas' Church, 5th Ave, NYC — stereograph showing the pre-1905 church. NYPL.";
       expect_similar = true;
-      known_issue = "stereograph not split into subimages (count 1 vs expected 2)";
       layout = "side_by_side";
       type = "composite";
       url = "https://iiif.nypl.org/iiif/3/G91F200_058F/full/max/0/default.jpg";
@@ -930,7 +925,6 @@
       count = 2;
       description = "Cornelius Vanderbilt II House - stereograph, Alfred S. Campbell, 1896";
       expect_similar = true;
-      known_issue = "stereograph subimage split not detected — regions correct (2 per half) but merged into single subimage";
       layout = "side_by_side";
       subimages = {
         "0" = {
