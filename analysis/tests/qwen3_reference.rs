@@ -17,17 +17,16 @@
 //! cannot realize. `QWEN_MODEL_FIRST_SHARD` names the UQFF's `afq4-0.uqff`;
 //! `just model-test` is where that gets wired.
 
-use std::{env, error, path::Path};
+use std::{error, path::Path};
 
 use chronoscope_analysis::{
-    ask::{Outcome, Rect},
+    ask::{Outcome, Prompt, Rect},
     qwen3::Qwen3,
 };
 use image::{Rgb, RgbImage};
 
-/// The env var naming the model's first UQFF shard (its `afq4-0.uqff`), as the
-/// `qwen-vlm-uqff` derivation's `firstShard` exposes it.
-const FIRST_SHARD_ENV: &str = "QWEN_MODEL_FIRST_SHARD";
+mod common;
+use common::{describe, first_shard};
 
 /// The tiny type the model must fill. A caller-defined Rust value coming back
 /// populated is the whole proof: schema-constrained decoding parsed into it.
@@ -42,18 +41,6 @@ struct Described {
 struct Boxed {
     #[serde(rename = "box")]
     bbox: Rect,
-}
-
-/// One line carrying an error's whole cause chain, since the boxed error a
-/// failing test prints shows only the outermost message otherwise.
-fn describe(error: &dyn error::Error) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(&format!(": {cause}"));
-        source = cause.source();
-    }
-    message
 }
 
 /// A recognizable synthetic image so the description has something to name: a red
@@ -110,11 +97,13 @@ fn run_round_trip(first_shard: &Path) -> Result<(), Box<dyn error::Error>> {
                 describe(&source)
             )
         })?;
+        let prompt = Prompt {
+            preamble: "Describe what is in this image in one sentence.".to_owned(),
+            images: vec![red_disk()],
+            postamble: "Describe the image.".to_owned(),
+        };
         let outcome: Outcome<Described> = model
-            .ask(
-                red_disk(),
-                "Describe what is in this image in one sentence.",
-            )
+            .ask(prompt)
             .await
             .map_err(|source| format!("could not answer the prompt: {}", describe(&source)))?;
 
@@ -159,7 +148,7 @@ fn run_coordinate_probe(first_shard: &Path) -> Result<(), Box<dyn error::Error>>
         // make absolute coordinates look resolution-invariant. Two positions: one
         // near the left edge, one pushed right so absolute and 0-1000 diverge in x
         // at both resolutions, not just at 512 wide.
-        let prompt = "Locate the red rectangle and give its bounding box as an \
+        let instruction = "Locate the red rectangle and give its bounding box as an \
              upper_left corner and a lower_right corner, each with an x and a y on \
              a 0 to 1000 grid where 0 is the left or top edge and 1000 is the right \
              or bottom edge.";
@@ -172,12 +161,14 @@ fn run_coordinate_probe(first_shard: &Path) -> Result<(), Box<dyn error::Error>>
                 (y1 * 1000.0) as i32,
             );
             for (width, height) in [(512u32, 768u32), (1024u32, 1536u32)] {
-                let outcome: Outcome<Boxed> = model
-                    .ask(red_rectangle(width, height, x0, x1, y0, y1), prompt)
-                    .await
-                    .map_err(|source| {
-                        format!("could not answer the probe: {}", describe(&source))
-                    })?;
+                let prompt = Prompt {
+                    preamble: instruction.to_owned(),
+                    images: vec![red_rectangle(width, height, x0, x1, y0, y1)],
+                    postamble: "Give the bounding box of the red rectangle.".to_owned(),
+                };
+                let outcome: Outcome<Boxed> = model.ask(prompt).await.map_err(|source| {
+                    format!("could not answer the probe: {}", describe(&source))
+                })?;
                 match outcome {
                     Outcome::Parsed(boxed) => {
                         println!("  {width}x{height} -> box {:?}", boxed.bbox);
@@ -195,26 +186,14 @@ fn run_coordinate_probe(first_shard: &Path) -> Result<(), Box<dyn error::Error>>
     })
 }
 
-fn first_shard() -> Result<std::ffi::OsString, String> {
-    env::var_os(FIRST_SHARD_ENV)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "{FIRST_SHARD_ENV} is unset. Set it to the model's `afq4-0.uqff` shard \
-                 path (the `qwen-vlm-uqff` derivation's `firstShard`); the ignored test \
-                 cannot find the weights any other way."
-            )
-        })
-}
-
 #[test]
 #[ignore = "needs the Qwen 3.6 weights; run `just model-test`"]
 fn structured_answer_round_trips_from_an_image() -> Result<(), Box<dyn error::Error>> {
-    run_round_trip(Path::new(&first_shard()?))
+    run_round_trip(&first_shard()?)
 }
 
 #[test]
 #[ignore = "coordinate probe; prints Qwen's box numbers, run `just model-test`"]
 fn box_coordinate_convention_probe() -> Result<(), Box<dyn error::Error>> {
-    run_coordinate_probe(Path::new(&first_shard()?))
+    run_coordinate_probe(&first_shard()?)
 }

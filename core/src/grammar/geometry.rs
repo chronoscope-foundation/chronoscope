@@ -483,6 +483,18 @@ impl ProportionalRect {
         }
     }
 
+    /// The whole image: the unit rect from `(0, 0)` to `(1, 1)`. Infallible,
+    /// since the unit square's corners are known valid, so it is the natural way
+    /// to name a subimage that is the entire frame.
+    pub fn full() -> Self {
+        let zero = ProportionalCoord(Finite::new_unchecked(0.0));
+        let one = ProportionalCoord(Finite::new_unchecked(1.0));
+        Self {
+            min: ProportionalPoint { x: zero, y: zero },
+            max: ProportionalPoint { x: one, y: one },
+        }
+    }
+
     /// Construct a rect from two corners given as raw floats, in any order.
     /// Each coordinate routes through [`ProportionalCoord::new`] for the
     /// finite + range check and the `-0.0` normalization, so an invalid
@@ -1031,6 +1043,17 @@ mod tests {
             ProportionalRect::new(0.0, 0.0, 1.5, 0.5),
             Err(ProportionalCoordError::OutOfBounds { .. })
         ));
+    }
+
+    #[test]
+    fn full_is_the_validated_unit_rect() -> TestResult {
+        // `full` mints the unit square unchecked; this pins it to the value the
+        // validating constructor produces, catching a swapped or mistyped corner.
+        assert_eq!(
+            ProportionalRect::full(),
+            ProportionalRect::new(0.0, 0.0, 1.0, 1.0)?
+        );
+        Ok(())
     }
 
     #[test]

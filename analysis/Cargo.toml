@@ -14,6 +14,13 @@ name = "corpus-fetch"
 path = "src/bin/corpus_fetch.rs"
 required-features = ["corpus"]
 
+# The pipeline entry over a batch of images. Not feature-gated: this crate is in
+# `default-members`, so a gated model-path binary would compile nowhere in the
+# commit gate and rot the way `corpus-test` did.
+[[bin]]
+name = "analyze"
+path = "src/bin/analyze.rs"
+
 [features]
 default = []
 ## Corpus image pipeline: manifest parsing and rate-limited downloads for the
@@ -23,7 +30,6 @@ corpus = [
     "dep:chronoscope-integrations",
     "dep:url",
     "dep:tempfile",
-    "dep:tokio",
 ]
 
 [dependencies]
@@ -81,7 +87,12 @@ chronoscope-core = { path = "../core" }
 chronoscope-integrations = { path = "../integrations", optional = true }
 url = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
-tokio = { workspace = true, optional = true }
+
+# The async runtime. The `analyze` binary drives the async `open`/`ask` on it,
+# and the reference test does the same; the lib's own async fns are driven by the
+# caller's runtime. Already in the closure via mistral.rs, so a direct default
+# dependency is free, and the binary must build in the default gate.
+tokio = { workspace = true }
 
 # Qwen 3.6's VLM runtime. CPU base on every platform; the darwin target below
 # adds the Metal GPU backend. Its Metal kernels compile at runtime
@@ -99,7 +110,3 @@ schemars.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 # The Metal GPU backend, on Apple hardware only; other platforms run on CPU.
 mistralrs = { workspace = true, features = ["metal"] }
-
-[dev-dependencies]
-# The reference test drives the async `open`/`ask` on a tokio runtime.
-tokio = { workspace = true }

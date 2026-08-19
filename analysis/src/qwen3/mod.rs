@@ -1,5 +1,5 @@
-//! Qwen 3.6 through mistral.rs: an image and a prompt in, a value shaped like the
-//! caller's schema type out.
+//! Qwen 3.6 through mistral.rs: a prompt and its images in, a value shaped like
+//! the caller's schema type out.
 //!
 //! DINOv3 and SAM 3 turn an image into vectors or a mask; this turns one into a
 //! schema-constrained answer. [`crate::ask::constraint_value`] derives the JSON
@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use mistralrs::{Constraint, Model, RequestBuilder, TextMessageRole, UqffMultimodalModelBuilder};
 use thiserror::Error;
 
-use crate::ask::{self, Outcome};
+use crate::ask::{self, Outcome, Prompt};
 
 /// Sequences held in the prefix cache. The multimodal builder disables prefix
 /// caching by default (`prefix_cache_n: None`); a small window matches the text
@@ -37,6 +37,12 @@ const PREFIX_CACHE_SEQS: usize = 16;
 /// legitimate answer finishes rather than tripping the cap and reading as
 /// [`Outcome::Incomplete`].
 const MAX_ANSWER_TOKENS: usize = 16_384;
+
+/// The env var naming the model's first UQFF shard (its `afq4-0.uqff`), as the
+/// `qwen-vlm-uqff` derivation's `firstShard` exposes it. The `analyze` binary and
+/// the model tests read it; this is the single definition of that Nix-contract
+/// name.
+pub const MODEL_SHARD_ENV: &str = "QWEN_MODEL_FIRST_SHARD";
 
 /// A loaded Qwen 3.6, quantized to AFQ4 and ready to answer prompts over images.
 pub struct Qwen3 {
@@ -88,28 +94,29 @@ impl Qwen3 {
         Ok(Self { model })
     }
 
-    /// Answers `prompt` about `image`, constrained to `T`'s schema.
+    /// Answers `prompt` about its images, constrained to `T`'s schema.
     ///
-    /// `prompt` is the caller-assembled instruction; placing
-    /// [`crate::ask::render_schema`]'s type text ahead of the decode to prime the
-    /// model is the prompt-assembly step's job, not done here.
+    /// The schema is derived from `T` once and used for both the sampling
+    /// constraint and the type text placed in the prompt, so what the model is
+    /// told and what it is held to are the one value and cannot desync. The
+    /// preamble leads as the system message with that rendered schema appended;
+    /// the images and postamble form the user turn after it.
     ///
-    /// The schema is derived from `T`, compiled into a grammar the sampler is
-    /// held to, so the completion is a valid `T` when it finishes. The returned
-    /// [`Outcome`] carries either the parsed value or the model stopping early;
-    /// the finish reason is what separates a token-cap truncation (an invalid
-    /// prefix) from a genuine parse failure.
-    pub async fn ask<T>(
-        &self,
-        image: image::DynamicImage,
-        prompt: &str,
-    ) -> Result<Outcome<T>, AskError>
+    /// The schema is compiled into a grammar the sampler is held to, so the
+    /// completion is a valid `T` when it finishes. The returned [`Outcome`]
+    /// carries either the parsed value or the model stopping early; the finish
+    /// reason is what separates a token-cap truncation (an invalid prefix) from a
+    /// genuine parse failure.
+    pub async fn ask<T>(&self, prompt: Prompt) -> Result<Outcome<T>, AskError>
     where
         T: serde::de::DeserializeOwned + schemars::JsonSchema,
     {
         let schema = ask::constraint_value::<T>().map_err(AskError::Constraint)?;
+        let rendered = ask::render_schema(&schema).map_err(AskError::Render)?;
+        let system = format!("{}\n\n{}", prompt.preamble, rendered);
         let request = RequestBuilder::new()
-            .add_image_message(TextMessageRole::User, prompt, vec![image])
+            .add_message(TextMessageRole::System, system)
+            .add_image_message(TextMessageRole::User, prompt.postamble, prompt.images)
             .set_constraint(Constraint::JsonSchema(schema))
             .set_sampler_max_len(MAX_ANSWER_TOKENS);
         let response = self
@@ -152,6 +159,9 @@ pub enum OpenError {
 pub enum AskError {
     #[error("the schema constraint could not be built from the requested type")]
     Constraint(#[source] ask::ConstraintError),
+
+    #[error("the schema could not be rendered into the prompt")]
+    Render(#[source] ask::RenderError),
 
     #[error("mistral.rs could not run the constrained request")]
     Send(#[source] mistralrs::error::Error),

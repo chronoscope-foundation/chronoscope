@@ -15,10 +15,12 @@
 pub mod constraint;
 pub mod convert;
 pub mod outcome;
+pub mod prompt;
 pub mod render;
 pub mod types;
 
 pub use constraint::{ConstraintError, constraint_value};
 pub use outcome::{DecodeError, Outcome, decode};
+pub use prompt::Prompt;
 pub use render::{RenderError, render_schema};
 pub use types::{CompositeOutcome, Entity, Rect, RelevanceOutcome};

@@ -13,6 +13,7 @@ pub mod corpus;
 pub mod dinov3;
 mod model_manifest;
 pub mod onnx;
+pub mod pipeline;
 mod preprocess;
 pub mod qwen3;
 pub mod sam3;
