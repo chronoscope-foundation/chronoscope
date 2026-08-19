@@ -7,12 +7,14 @@
 //! the image encoder and the interactive single-object decoder — and validates
 //! the parts that silently corrupt those if wrong. The grounding decoder and
 //! language encoder ride along for concept/text prompting, unread here until a
-//! caller wants them.
+//! caller wants them, so the wire names only the two driven graphs and serde
+//! drops the rest.
 //!
 //! [`load`](SamManifest::load) is the validation, mirroring the DINOv3
 //! manifest's decline-to-trust stance: a resize that letterboxes instead of
-//! stretching (box prompts land off their objects), a BGR or HWC caller, or a
-//! float input dtype (the caller would owe a rescale the graph already bakes).
+//! stretching (box prompts land off their objects), a BGR caller, an input shape
+//! that is not the channel-first square, or a float input dtype (the caller
+//! would owe a rescale the graph already bakes).
 
 use std::{
     fs,
@@ -22,11 +24,14 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::model_manifest::Signature;
+
 /// The encoder's one image input, named by the export.
 const INPUT: &str = "image";
 
 /// RGB planes, the only channel count the encoder takes and what `to_rgb8`
-/// produces.
+/// produces. Its position first in the input shape is what makes the shape
+/// channel-first.
 const CHANNELS: i64 = 3;
 
 /// One `sam3-onnx` export's manifest, reduced to what the interactive runner
@@ -36,7 +41,8 @@ const CHANNELS: i64 = 3;
 pub(crate) struct SamManifest {
     pub(crate) image_encoder: PathBuf,
     pub(crate) decoder: PathBuf,
-    /// The square side the encoder takes; the caller stretches to it.
+    /// The square side the encoder takes, derived from its input shape; the
+    /// caller stretches to it.
     pub(crate) resolution: usize,
     /// The side of the square low-resolution masks the decoder emits, which the
     /// caller upsamples to the original grid.
@@ -62,12 +68,7 @@ impl SamManifest {
     }
 
     fn validate(export: &Path, wire: Wire) -> Result<Self, ManifestInvalid> {
-        let encoder = wire.models.image_encoder;
-        let resize = encoder.metadata.preprocessing.caller_resize;
-        let resolution = encoder.metadata.resolution;
-        if resolution == 0 {
-            return Err(ManifestInvalid::Resolution { resolution });
-        }
+        let encoder = wire.image_encoder;
 
         // The encoder takes one uint8 RGB square and the caller feeds it raw:
         // the graph owns rescale and normalize. The dtype is a preprocessing
@@ -83,41 +84,37 @@ impl SamManifest {
                 dtype: image.dtype.clone(),
             });
         }
-        if image.shape != [CHANNELS, resolution as i64, resolution as i64] {
-            return Err(ManifestInvalid::InputShape {
-                shape: image.shape.clone(),
-                resolution,
+
+        // The channel-first square input carries the resolution: a [3, res, res]
+        // shape both fixes the layout and names the side the caller stretches to.
+        let resolution = match image.shape.as_slice() {
+            &[CHANNELS, height, width] if height == width && height > 0 => height as usize,
+            _ => {
+                return Err(ManifestInvalid::InputShape {
+                    shape: image.shape.clone(),
+                });
+            }
+        };
+
+        // The caller owes only the resize: a pure RGB stretch to the square. A
+        // letterbox feeds padding the model never saw and lands box prompts off
+        // their objects; BGR corrupts silently.
+        if encoder.resize_mode != "stretch" {
+            return Err(ManifestInvalid::ResizeMode {
+                mode: encoder.resize_mode,
             });
         }
-
-        // The caller owes only the resize: a pure RGB CHW stretch to the square.
-        // A letterbox feeds padding the model never saw and lands box prompts off
-        // their objects; BGR or HWC corrupts silently.
-        if resize.mode != "stretch" {
-            return Err(ManifestInvalid::ResizeMode { mode: resize.mode });
-        }
-        if resize.channel_order != "rgb" {
+        if encoder.channel_order != "rgb" {
             return Err(ManifestInvalid::ChannelOrder {
-                channel_order: resize.channel_order,
-            });
-        }
-        if resize.layout != "chw" {
-            return Err(ManifestInvalid::Layout {
-                layout: resize.layout,
-            });
-        }
-        if resize.target != [resolution, resolution] {
-            return Err(ManifestInvalid::Target {
-                target: resize.target,
-                resolution,
+                channel_order: encoder.channel_order,
             });
         }
 
-        let decoder = wire.models.decoder_interactive;
-        if decoder.metadata.low_res_mask_size == 0 {
+        let decoder = wire.decoder_interactive;
+        if decoder.low_res_mask_size == 0 {
             return Err(ManifestInvalid::LowResMaskSize);
         }
-        if decoder.metadata.num_candidates == 0 {
+        if decoder.candidates == 0 {
             return Err(ManifestInvalid::Candidates);
         }
 
@@ -125,8 +122,8 @@ impl SamManifest {
             image_encoder: export.join(encoder.graph),
             decoder: export.join(decoder.graph),
             resolution,
-            low_res_mask_size: decoder.metadata.low_res_mask_size,
-            candidates: decoder.metadata.num_candidates,
+            low_res_mask_size: decoder.low_res_mask_size,
+            candidates: decoder.candidates,
         })
     }
 }
@@ -160,32 +157,20 @@ pub enum ManifestError {
 /// re-export trips one.
 #[derive(Debug, Error)]
 pub enum ManifestInvalid {
-    #[error("resolution must be positive, got {resolution}")]
-    Resolution { resolution: usize },
-
     #[error("the encoder declares no `{name}` input")]
     MissingInput { name: &'static str },
 
     #[error("encoder input dtype `{dtype}` is not the `tensor(uint8)` the caller feeds raw")]
     InputDtype { dtype: String },
 
-    #[error("encoder input shape {shape:?} is not the [3, {resolution}, {resolution}] square")]
-    InputShape { shape: Vec<i64>, resolution: usize },
+    #[error("encoder input shape {shape:?} is not a channel-first [3, N, N] square")]
+    InputShape { shape: Vec<i64> },
 
     #[error("caller resize mode `{mode}` is not the `stretch` box prompts assume")]
     ResizeMode { mode: String },
 
     #[error("caller channel order `{channel_order}` is not the `rgb` the caller decodes")]
     ChannelOrder { channel_order: String },
-
-    #[error("caller layout `{layout}` is not the `chw` the caller feeds the encoder")]
-    Layout { layout: String },
-
-    #[error("caller resize target {target:?} is not the {resolution}px square")]
-    Target {
-        target: [usize; 2],
-        resolution: usize,
-    },
 
     #[error("the interactive decoder declares a zero low-resolution mask size")]
     LowResMaskSize,
@@ -194,63 +179,33 @@ pub enum ManifestInvalid {
     Candidates,
 }
 
-/// The manifest fields this crate reads. Every other key the export writes (the
-/// grounding decoder and language encoder signatures, the graph assertions) is
-/// ignored, since serde drops unknown fields.
+/// The two graphs this crate drives. The catalog's other graphs (the grounding
+/// decoder and language encoder) are dropped, since the wire does not
+/// `deny_unknown_fields`.
 #[derive(Deserialize)]
 struct Wire {
-    models: WireModels,
+    image_encoder: Encoder,
+    decoder_interactive: Decoder,
 }
 
+/// The image encoder: its graph, its input signature, and the preprocessing the
+/// caller performs that the tensor shape does not encode.
 #[derive(Deserialize)]
-struct WireModels {
-    image_encoder: WireEncoder,
-    decoder_interactive: WireDecoder,
-}
-
-#[derive(Deserialize)]
-struct WireEncoder {
+struct Encoder {
     graph: PathBuf,
-    inputs: Vec<WireInput>,
-    metadata: WireEncoderMeta,
-}
-
-#[derive(Deserialize)]
-struct WireInput {
-    name: String,
-    dtype: String,
-    shape: Vec<i64>,
-}
-
-#[derive(Deserialize)]
-struct WireEncoderMeta {
-    resolution: usize,
-    preprocessing: WirePreprocessing,
-}
-
-#[derive(Deserialize)]
-struct WirePreprocessing {
-    caller_resize: WireCallerResize,
-}
-
-#[derive(Deserialize)]
-struct WireCallerResize {
-    mode: String,
+    inputs: Vec<Signature>,
     channel_order: String,
-    layout: String,
-    target: [usize; 2],
+    resize_mode: String,
 }
 
+/// The interactive decoder: its graph and the two numbers the caller reads its
+/// output with. Its own input signature stays catalog — an input drift is caught
+/// at runtime by the session rejecting a wrong-named feed.
 #[derive(Deserialize)]
-struct WireDecoder {
+struct Decoder {
     graph: PathBuf,
-    metadata: WireDecoderMeta,
-}
-
-#[derive(Deserialize)]
-struct WireDecoderMeta {
     low_res_mask_size: usize,
-    num_candidates: usize,
+    candidates: usize,
 }
 
 #[cfg(test)]
@@ -264,26 +219,16 @@ mod tests {
     /// real export's values. Tests mutate one field to exercise each assertion.
     fn valid() -> Value {
         json!({
-            "models": {
-                "image_encoder": {
-                    "graph": "image_encoder/sam3_image_encoder.onnx",
-                    "inputs": [{ "name": "image", "dtype": "tensor(uint8)", "shape": [3, 1008, 1008] }],
-                    "metadata": {
-                        "resolution": 1008,
-                        "preprocessing": {
-                            "caller_resize": {
-                                "mode": "stretch",
-                                "channel_order": "rgb",
-                                "layout": "chw",
-                                "target": [1008, 1008]
-                            }
-                        }
-                    }
-                },
-                "decoder_interactive": {
-                    "graph": "decoder_interactive/sam3_decoder_interactive.onnx",
-                    "metadata": { "low_res_mask_size": 288, "num_candidates": 3 }
-                }
+            "image_encoder": {
+                "graph": "image_encoder/sam3_image_encoder.onnx",
+                "inputs": [{ "name": "image", "dtype": "tensor(uint8)", "shape": [3, 1008, 1008] }],
+                "channel_order": "rgb",
+                "resize_mode": "stretch"
+            },
+            "decoder_interactive": {
+                "graph": "decoder_interactive/sam3_decoder_interactive.onnx",
+                "low_res_mask_size": 288,
+                "candidates": 3
             }
         })
     }
@@ -309,7 +254,7 @@ mod tests {
     #[test]
     fn rejects_a_non_uint8_input() -> TestResult {
         let mut value = valid();
-        value["models"]["image_encoder"]["inputs"][0]["dtype"] = json!("tensor(float)");
+        value["image_encoder"]["inputs"][0]["dtype"] = json!("tensor(float)");
         assert!(matches!(
             validate(value)?,
             Err(ManifestInvalid::InputDtype { .. })
@@ -318,9 +263,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_shape_that_disagrees_with_resolution() -> TestResult {
+    fn rejects_a_non_square_input_shape() -> TestResult {
         let mut value = valid();
-        value["models"]["image_encoder"]["inputs"][0]["shape"] = json!([3, 512, 512]);
+        value["image_encoder"]["inputs"][0]["shape"] = json!([3, 1008, 512]);
         assert!(matches!(
             validate(value)?,
             Err(ManifestInvalid::InputShape { .. })
@@ -331,8 +276,7 @@ mod tests {
     #[test]
     fn rejects_a_letterbox_resize() -> TestResult {
         let mut value = valid();
-        value["models"]["image_encoder"]["metadata"]["preprocessing"]["caller_resize"]["mode"] =
-            json!("letterbox");
+        value["image_encoder"]["resize_mode"] = json!("letterbox");
         assert!(matches!(
             validate(value)?,
             Err(ManifestInvalid::ResizeMode { .. })
@@ -343,8 +287,7 @@ mod tests {
     #[test]
     fn rejects_a_bgr_caller() -> TestResult {
         let mut value = valid();
-        value["models"]["image_encoder"]["metadata"]["preprocessing"]["caller_resize"]["channel_order"] =
-            json!("bgr");
+        value["image_encoder"]["channel_order"] = json!("bgr");
         assert!(matches!(
             validate(value)?,
             Err(ManifestInvalid::ChannelOrder { .. })
@@ -355,7 +298,7 @@ mod tests {
     #[test]
     fn rejects_a_zero_candidate_decoder() -> TestResult {
         let mut value = valid();
-        value["models"]["decoder_interactive"]["metadata"]["num_candidates"] = json!(0);
+        value["decoder_interactive"]["candidates"] = json!(0);
         assert!(matches!(validate(value)?, Err(ManifestInvalid::Candidates)));
         Ok(())
     }

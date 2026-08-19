@@ -178,20 +178,13 @@ def export_sam3(output_dir: Path) -> None:
     record(
         "image_encoder",
         {
-            "graph_assertions": [
-                {"claim": "resolution", "tensor": "image", "axis": -1}
-            ],
-            "resolution": resolution,
-            "preprocessing": {
-                "normalization_baked_into_graph": True,
-                "caller_resize": {
-                    "mode": "stretch",
-                    "preserves_aspect_ratio": False,
-                    "channel_order": "rgb",
-                    "layout": "chw",
-                    "target": [resolution, resolution],
-                },
-            },
+            # Empty: resolution is read back off the input signature, so the
+            # sidecar restates nothing the graph already declares.
+            "graph_assertions": [],
+            # The preprocessing the input shape does not encode: a pure RGB
+            # stretch to the square, no letterbox and no aspect preservation.
+            "channel_order": "rgb",
+            "resize_mode": "stretch",
         },
     )
 
@@ -256,13 +249,7 @@ def export_sam3(output_dir: Path) -> None:
         output_names=["boxes", "scores", "masks"],
         opset_version=OPSET,
     )
-    record(
-        "decoder",
-        {
-            "graph_assertions": [],
-            "confidence_threshold": processor.confidence_threshold,
-        },
-    )
+    record("decoder", {"graph_assertions": []})
 
     # ── Interactive decoder (box/point -> the one object) ────────────────────
     print("Exporting interactive decoder...")
@@ -296,23 +283,11 @@ def export_sam3(output_dir: Path) -> None:
         "decoder_interactive",
         {
             "graph_assertions": [],
-            "task": "interactive_single_object",
-            # multimask_output=True is baked; the caller keeps argmax(iou_predictions).
-            "num_candidates": 3,
+            # The mask size the caller upsamples from, and the candidate count it
+            # keeps the best of (multimask_output=True is baked; the caller keeps
+            # argmax(iou_predictions)).
             "low_res_mask_size": model.inst_interactive_predictor.model.low_res_mask_size,
-            "mask_threshold": model.inst_interactive_predictor.mask_threshold,
-            "prompt": {
-                "box_encoding": "two_corners_labels_2_3",
-                "coord_frame": "model_pixels",
-                "coord_range": [0, resolution],
-            },
-            "mask_upscale": {
-                "where": "caller",
-                "mode": "bilinear",
-                "align_corners": False,
-                "target": "original_hw",
-                "then_threshold_gt": 0.0,
-            },
+            "candidates": 3,
         },
     )
 

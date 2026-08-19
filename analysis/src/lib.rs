@@ -10,6 +10,7 @@
 #[cfg(feature = "corpus")]
 pub mod corpus;
 pub mod dinov3;
+mod model_manifest;
 pub mod onnx;
 mod preprocess;
 pub mod qwen3;

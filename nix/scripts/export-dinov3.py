@@ -34,9 +34,9 @@ from transformers import AutoModel
 
 OPSET = 18
 
-# The caller rescales and resizes, so the graph starts from float. Written into
-# the sidecar from here, which is also what the trace sees, so the claim cannot
-# describe a different graph than the one exported.
+# The caller rescales and resizes, so the graph starts from float; the probe and
+# the trace both feed this dtype. verify-onnx records the input dtype off the real
+# session, so the manifest cannot describe a different graph than the one exported.
 INPUT_DTYPE = torch.float32
 
 # PIL resampling filters, by the code `preprocessor_config.json` stores.
@@ -122,7 +122,8 @@ out_dir = out_root / "dinov3"
 out_dir.mkdir(parents=True, exist_ok=True)
 graph_path = out_dir / "dinov3.onnx"
 # Resizing stays with the caller, so the graph's fixed input resolution is a
-# contract the Rust side has to honour; the sidecar carries it.
+# contract the Rust side honours; the input signature verify-onnx records carries
+# it, so the sidecar need not.
 
 # Deterministic and structured, over the rescaled range the graph now takes. An
 # all-zero image drives degenerate activations that can hide a lowering bug, and
@@ -171,45 +172,24 @@ if not np.isfinite(drift) or drift > TOLERANCE:
 (out_dir / "dinov3.json").write_text(
     json.dumps(
         {
-            # Where each number below also appears in the graph, so the
-            # verifier can hold the two to each other.
-            "graph_assertions": [
-                {"claim": "resolution", "tensor": "image", "axis": -1},
-                {"claim": "input_dtype", "tensor": "image", "dtype": True},
-                {
-                    "claim": "sequence_length",
-                    "tensor": "last_hidden_state",
-                    "axis": 1,
-                },
-                {"claim": "hidden_size", "tensor": "last_hidden_state", "axis": 2},
-            ],
-            "resolution": resolution,
-            "input_dtype": str(INPUT_DTYPE).removeprefix("torch."),
-            "patch_size": patch,
-            "patch_grid": [patch_grid, patch_grid],
+            # Empty: resolution and dtype are read back off the input signature,
+            # and the token count is rechecked at runtime against prefix + grid,
+            # so the sidecar restates nothing the graph already declares.
+            "graph_assertions": [],
+            # Everything ahead of the baked normalize, in the order the
+            # checkpoint's processor runs it: multiply by rescale_factor, then
+            # resize the float image to a square with an antialiased bilinear
+            # kernel. Resizing first, or in uint8, quantizes the result; nearest
+            # neighbour or BGR produces embeddings that look fine and are wrong.
+            "channel_order": "rgb",
+            "interpolation": interpolation,
+            "antialias": True,
+            "rescale_factor": preprocess["rescale_factor"],
+            # Where the patch grid starts (CLS then registers), its shape, and the
+            # embedding width the crate pools over and is built for.
             "prefix_tokens": prefix_tokens,
+            "patch_grid": [patch_grid, patch_grid],
             "hidden_size": config["hidden_size"],
-            "sequence_length": expected_sequence,
-            "preprocessing": {
-                "image_mean": preprocess["image_mean"],
-                "image_std": preprocess["image_std"],
-                "normalization_baked_into_graph": True,
-                # Everything ahead of normalize, in the order the checkpoint's
-                # processor runs it: multiply by `rescale_factor`, then resize
-                # the float image to a square with an antialiased kernel.
-                # Resizing first, or in uint8, quantizes the result; nearest
-                # neighbour or BGR produces embeddings that look fine and are
-                # wrong.
-                "caller_resize": {
-                    "rescale_factor": preprocess["rescale_factor"],
-                    "interpolation": interpolation,
-                    "pil_resample_code": preprocess["resample"],
-                    "antialias": True,
-                    "channel_order": "rgb",
-                    "layout": "chw",
-                    "target": [resolution, resolution],
-                },
-            },
         },
         indent=2,
     )

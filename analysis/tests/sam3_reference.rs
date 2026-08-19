@@ -10,14 +10,17 @@
 //! Ignored by default: it needs a multi-gigabyte export and fixture hanging off
 //! the gated weight fetches, which the commit gate cannot realize.
 
+mod support;
+
 use std::{
     env, error, fs,
     path::{Path, PathBuf},
 };
 
-use chronoscope_analysis::{onnx::Accel, sam3::Sam3};
+use chronoscope_analysis::sam3::Sam3;
 use chronoscope_core::grammar::geometry::{Dimensions, ProportionalRect, Region};
 use serde::Deserialize;
+use support::{accel, coreml_cache_root, describe};
 
 /// The fixture directory. `just model-test` realizes it and sets this.
 const FIXTURE: &str = "SAM3_FIXTURE";
@@ -61,18 +64,6 @@ struct Source {
     height: u32,
 }
 
-/// One line carrying an error's whole cause chain, since the boxed error a
-/// failing test prints shows only the outermost message otherwise.
-fn describe(error: &dyn error::Error) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(&format!(": {cause}"));
-        source = cause.source();
-    }
-    message
-}
-
 /// The torch reference mask as a [`Region`] on the source grid: a grayscale PNG
 /// whose foreground pixels the fixture wrote as 255.
 fn reference_region(path: &Path, width: u32, height: u32) -> Result<Region, Box<dyn error::Error>> {
@@ -98,20 +89,15 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
         format!("{path:?} is not shaped the way this comparison reads it: {source}")
     })?;
 
-    // `COREML_CACHE`, when set to a precompiled cache root, runs this comparison
-    // on the CoreML backend instead of CPU, so the recorded fixtures double as a
-    // CoreML-against-CPU numeric check. Unset (the gate, `just model-test`) is CPU.
-    let coreml_cache = env::var_os("COREML_CACHE").map(PathBuf::from);
-    let accel = coreml_cache
-        .as_deref()
-        .map_or(Accel::Cpu, |root| Accel::CoreML { cache_root: root });
-    let mut sam = Sam3::open(&reference.export, accel).map_err(|source| {
-        format!(
-            "could not open the model under {:?}: {}",
-            reference.export,
-            describe(&source)
-        )
-    })?;
+    let cache_root = coreml_cache_root();
+    let mut sam =
+        Sam3::open(&reference.export, accel(cache_root.as_deref())).map_err(|source| {
+            format!(
+                "could not open the model under {:?}: {}",
+                reference.export,
+                describe(&source)
+            )
+        })?;
 
     let mut worst: Option<(String, f64)> = None;
     for entry in &reference.entries {

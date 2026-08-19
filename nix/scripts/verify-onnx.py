@@ -156,30 +156,36 @@ if failures:
     sys.exit(1)
 
 # One manifest per export, written only once everything above agrees, so the
-# crate never reads a description of an artifact that failed its own checks.
-# It carries the graph signatures plus the facts a signature cannot state: the
-# baked score threshold, the baked preprocessing, the patch grid.
-manifest: dict[str, dict[str, object]] = {"models": {}}
+# crate never reads a description of an artifact that failed its own checks. Each
+# graph sits at the top level: its input signature plus the flat facts its
+# sidecar states that a signature cannot (the baked preprocessing, the patch
+# grid). graph_assertions were verified above against the real tensors and add
+# nothing the signature does not carry, so they do not travel into the manifest.
+manifest: dict[str, dict[str, object]] = {}
 for name, session in sorted(sessions.items()):
     sub = root / name
     (graph,) = sub.glob("*.onnx")
-    entry = {
+    entry: dict[str, object] = {
         "graph": str(graph.relative_to(root)),
         "inputs": [
             {"name": s.name, "dtype": s.type, "shape": s.shape}
             for s in session.get_inputs()
         ],
-        "outputs": [
-            {"name": s.name, "dtype": s.type, "shape": s.shape}
-            for s in session.get_outputs()
-        ],
     }
-    sidecar = sub / f"{name}.json"
-    if sidecar.is_file():
-        entry["metadata"] = json.loads(sidecar.read_text())
-    manifest["models"][name] = entry
+    # Every session that reached here has a valid sidecar; a missing or malformed
+    # one was a failure above and never gets this far.
+    facts = json.loads((sub / f"{name}.json").read_text())
+    facts.pop("graph_assertions", None)
+    for key, value in facts.items():
+        if key in entry:
+            sys.exit(
+                f"{name}.json states {key!r}, which collides with the signature "
+                "the manifest already carries; rename the sidecar fact"
+            )
+        entry[key] = value
+    manifest[name] = entry
 
 (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 print(f"\nverified {len(sessions)} model(s): {sorted(sessions)}")
-print(f"wrote manifest.json describing {sorted(manifest['models'])}")
+print(f"wrote manifest.json describing {sorted(manifest)}")

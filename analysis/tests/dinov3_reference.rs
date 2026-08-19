@@ -11,13 +11,16 @@
 //! Ignored by default: it needs a multi-hundred-megabyte export hanging off the
 //! gated weight fetches, which the commit gate cannot realize.
 
+mod support;
+
 use std::{
     env, error, fs,
     path::{Path, PathBuf},
 };
 
-use chronoscope_analysis::{dinov3::Dinov3, onnx::Accel};
+use chronoscope_analysis::dinov3::Dinov3;
 use serde::Deserialize;
+use support::{accel, coreml_cache_root, describe};
 
 /// Fixture directories, `PATH`-style, one per exported resolution.
 /// `just model-test` realizes them and sets this.
@@ -43,12 +46,6 @@ const PATCH_DRIFT_MAX: f64 = 1.5e-2;
 
 #[derive(Deserialize)]
 struct Reference {
-    resolution: usize,
-    /// Patch rows and columns; their product is the count the sidecar and the
-    /// model must both produce, guarded before any per-patch zip.
-    patch_grid: [usize; 2],
-    /// Token width, so the flat sidecar chunks without the test conjuring 1024.
-    hidden_size: usize,
     /// The export these embeddings were measured against, which is also in this
     /// fixture's closure.
     export: PathBuf,
@@ -62,18 +59,6 @@ struct ReferenceImage {
     /// The raw patch grid, `patch_count * hidden_size` little-endian f32.
     patches: PathBuf,
     cls: Vec<f32>,
-}
-
-/// One line carrying an error's whole cause chain, since the boxed error a
-/// failing test prints shows only the outermost message otherwise.
-fn describe(error: &dyn error::Error) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(&format!(": {cause}"));
-        source = cause.source();
-    }
-    message
 }
 
 /// Cosine distance, accumulated in f64 so the subtraction from 1.0 keeps the
@@ -97,25 +82,19 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
     let reference: Reference = serde_json::from_slice(&bytes).map_err(|source| {
         format!("{path:?} is not shaped the way this comparison reads it: {source}")
     })?;
-    let resolution = reference.resolution;
-    let [rows, columns] = reference.patch_grid;
-    let expected_patches = rows * columns;
-    let hidden = reference.hidden_size;
 
-    // `COREML_CACHE`, when set to a precompiled cache root, runs this comparison
-    // on the CoreML backend instead of CPU, so the recorded fixtures double as a
-    // CoreML-against-CPU numeric check. Unset (the gate, `just model-test`) is CPU.
-    let coreml_cache = env::var_os("COREML_CACHE").map(PathBuf::from);
-    let accel = coreml_cache
-        .as_deref()
-        .map_or(Accel::Cpu, |root| Accel::CoreML { cache_root: root });
-    let mut model = Dinov3::open(&reference.export, accel).map_err(|source| {
-        format!(
-            "could not open the model under {:?}: {}",
-            reference.export,
-            describe(&source)
-        )
-    })?;
+    let cache_root = coreml_cache_root();
+    let mut model =
+        Dinov3::open(&reference.export, accel(cache_root.as_deref())).map_err(|source| {
+            format!(
+                "could not open the model under {:?}: {}",
+                reference.export,
+                describe(&source)
+            )
+        })?;
+    // The one shape fact the messages need, off the opened model: the fixture no
+    // longer states it.
+    let resolution = model.resolution();
 
     for entry in &reference.images {
         let path = fixture.join(&entry.file);
@@ -150,9 +129,21 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             entry.id,
         );
 
-        // Guard both counts before the per-patch zip: `cosine_distance` zips, so
-        // a dropped trailing patch on either side would shorten the comparison
-        // rather than fail it.
+        // The patch count and token width come off the model's own output, not
+        // the fixture: the reference sidecar must reproduce what this model
+        // produces, so it is measured against that.
+        let expected_patches = features.patches.len();
+        let hidden = features
+            .patches
+            .first()
+            .map(|patch| patch.as_slice().len())
+            .ok_or_else(|| {
+                format!(
+                    "{} at {resolution}px: the model produced no patches",
+                    entry.id
+                )
+            })?;
+
         let sidecar_path = fixture.join(&entry.patches);
         let sidecar = fs::read(&sidecar_path)
             .map_err(|source| format!("could not read {sidecar_path:?}: {source}"))?;
@@ -160,17 +151,9 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             sidecar.len(),
             expected_patches * hidden * 4,
             "{} at {resolution}px: the reference patch sidecar is {} bytes, not the \
-             {expected_patches} x {hidden} x 4 the grid declares",
+             {expected_patches} x {hidden} x 4 the model produces",
             entry.id,
             sidecar.len(),
-        );
-        assert_eq!(
-            features.patches.len(),
-            expected_patches,
-            "{} at {resolution}px: the model produced {} patches, not the {expected_patches} \
-             the grid declares",
-            entry.id,
-            features.patches.len(),
         );
 
         let (quads, _rest) = sidecar.as_chunks::<4>();

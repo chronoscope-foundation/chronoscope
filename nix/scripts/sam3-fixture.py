@@ -8,9 +8,9 @@ feature-prep divergence, or a mask upscale off by a convention has somewhere to
 show. Whatever `predict_inst` produces is the target.
 
 The boxes come from the text-prompted grounding head (a human judged them once);
-here they only drive the geometric prompt, so the text prompt rides along as
-provenance and is not replayed. Each box is normalized xyxy and scaled to the
-image's own pixels, the frame `predict_inst` expects with `normalize_coords`.
+here only the box geometry drives the prompt, and the text prompt is not
+replayed. Each box is normalized xyxy and scaled to the image's own pixels, the
+frame `predict_inst` expects with `normalize_coords`.
 
 The export's store path goes into the output for the same reason the DINOv3
 fixture records it: the export is input-addressed and `torch.onnx.export` is not
@@ -27,7 +27,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torchvision
 from PIL import Image
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
@@ -38,9 +37,6 @@ from sam3.model_builder import build_sam3_image_model
 NUM_THREADS = 1
 
 export_dir, boxes_json, out_dir = (Path(argument) for argument in sys.argv[1:4])
-
-manifest = json.loads((export_dir / "manifest.json").read_text())
-decoder_meta = manifest["models"]["decoder_interactive"]["metadata"]
 
 torch.set_num_threads(NUM_THREADS)
 
@@ -77,7 +73,6 @@ for box in json.loads(boxes_json.read_text()):
     entries.append(
         {
             "id": entry_id,
-            "prompt": box["prompt"],
             "file": f"images/{entry_id}",
             "mask": f"masks/{entry_id}.png",
             "box_xyxy_norm": box["box_xyxy_norm"],
@@ -94,18 +89,6 @@ for box in json.loads(boxes_json.read_text()):
     json.dumps(
         {
             "export": str(export_dir),
-            "num_candidates": decoder_meta["num_candidates"],
-            "low_res_mask_size": decoder_meta["low_res_mask_size"],
-            # What produced the masks, so a later disagreement reads against the
-            # implementation it was measured on.
-            "reference": {
-                "predictor": "Sam3Image.predict_inst",
-                "decoder": "PIL.Image",
-                "torch": torch.__version__,
-                "torchvision": torchvision.__version__,
-                "num_threads": NUM_THREADS,
-                "mask_threshold": decoder_meta["mask_threshold"],
-            },
             "entries": entries,
         },
         indent=2,

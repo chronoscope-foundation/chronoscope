@@ -125,6 +125,12 @@ impl Dinov3 {
         Ok(Self { session, manifest })
     }
 
+    /// The square input side the model takes, for a caller that wants to name
+    /// the resolution in its own diagnostics.
+    pub fn resolution(&self) -> usize {
+        self.manifest.resolution
+    }
+
     /// Preprocesses a decoded image the way the checkpoint's processor does and
     /// runs the model, returning its CLS embedding and patch grid.
     ///

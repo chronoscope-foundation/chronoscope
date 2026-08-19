@@ -115,13 +115,18 @@ let
       hash = "sha256-MW7N3ihZaI5vTkY2MSrGXpYWDevaWvXnjedd/2b9UjA=";
     };
 
-    # Seven fixes. The SAM 3 path appears never to have been run against
-    # upstream facebookresearch/sam3: its RoPE monkeypatch targets buffer names
+    # The SAM 3 path appears never to have been run against upstream
+    # facebookresearch/sam3: samexporter's RoPE monkeypatch targets buffer names
     # that exist in no upstream revision while ignoring upstream's own
-    # `use_rope_real`. The rest cover a MagicMock triton shim that breaks
-    # torch >= 2.9, a CUDA-default processor, a requires_grad constant-folding
-    # failure, a missing no_grad, external-data filename collisions between the
-    # three exports, and CoreML being auto-selected at inference.
+    # `use_rope_real`, so it is rewritten onto that real-valued path. The rest of
+    # the patch keeps this module importable as a library of reusable wrappers:
+    # dropping a MagicMock triton shim that breaks torch >= 2.9, fixing a sys.path
+    # namespace-package trap, and making the sam3 imports loud rather than the
+    # silent try/except that hid a missing dependency (which also drops the dead
+    # osam tokenizer). samexporter's own export_sam3() CLI is dropped;
+    # nix/scripts/export-sam3.py drives the export off these wrappers and owns the
+    # device pinning, no_grad, requires_grad, and per-graph output directories
+    # that lived in it.
     patches = [ ./patches/samexporter-sam3-export.patch ];
 
     build-system = with python.pkgs; [

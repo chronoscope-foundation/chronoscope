@@ -33,8 +33,6 @@ import sys
 from pathlib import Path
 
 import torch
-import torchvision
-import transformers
 from torchvision.io import decode_image
 from transformers import AutoImageProcessor, AutoModel
 
@@ -48,11 +46,16 @@ model_dir, export_dir, images_json, out_dir = (
 )
 
 manifest = json.loads((export_dir / "manifest.json").read_text())
-metadata = manifest["models"]["dinov3"]["metadata"]
-resolution = metadata["resolution"]
-prefix_tokens = metadata["prefix_tokens"]
-hidden_size = metadata["hidden_size"]
-grid_rows, grid_columns = metadata["patch_grid"]
+dinov3 = manifest["dinov3"]
+# The square side the export fixed, off the input signature by name the way the
+# crate reads it, so a reordered input fails here instead of sizing the fixture
+# wrong. The processor resizes to it. prefix_tokens is where the patch grid
+# begins, so the patch slice below skips it.
+image = next((i for i in dinov3["inputs"] if i["name"] == "image"), None)
+if image is None:
+    sys.exit("dinov3 manifest declares no 'image' input")
+resolution = image["shape"][-1]
+prefix_tokens = dinov3["prefix_tokens"]
 
 torch.set_num_threads(NUM_THREADS)
 
@@ -112,43 +115,21 @@ for source in json.loads(images_json.read_text()):
             "id": source["id"],
             "file": f"images/{source['id']}",
             "patches": patches_file,
-            "source": {
-                "width": width,
-                "height": height,
-                "channels": channels,
-            },
             "cls": digits(reference_cls),
         }
     )
+    print(f"  {source['id']:34s} {width}x{height} x{channels}")
 
 (out_dir / "reference.json").write_text(
     json.dumps(
         {
-            "resolution": resolution,
-            "patch_grid": [grid_rows, grid_columns],
-            "hidden_size": hidden_size,
             "export": str(export_dir),
-            # What produced the numbers, so a later disagreement can be read
-            # against the implementation it was measured on.
-            "reference": {
-                "processor": type(processor).__name__,
-                "resample": int(processor.resample),
-                "decoder": "torchvision.io.decode_image",
-                "transformers": transformers.__version__,
-                "torch": torch.__version__,
-                "torchvision": torchvision.__version__,
-                "num_threads": NUM_THREADS,
-            },
             "images": references,
         },
         indent=2,
     )
 )
 
-print(f"dinov3 fixture at {resolution}px, patch grid {grid_rows}x{grid_columns}")
-print(f"  {type(processor).__name__}, transformers {transformers.__version__}")
-for entry in references:
-    source = entry["source"]
-    print(
-        f"  {entry['id']:34s} {source['width']}x{source['height']} x{source['channels']}"
-    )
+print(
+    f"dinov3 fixture at {resolution}px: {len(references)} images, {type(processor).__name__}"
+)

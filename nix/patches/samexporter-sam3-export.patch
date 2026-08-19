@@ -1,16 +1,14 @@
 diff --git a/samexporter/export_sam3.py b/samexporter/export_sam3.py
-index 5bccd90..6461d26 100644
 --- a/samexporter/export_sam3.py
 +++ b/samexporter/export_sam3.py
-@@ -1,60 +1,77 @@
- import argparse
-+import json
+@@ -1,60 +1,73 @@
+-import argparse
  import os
- import pathlib
+-import pathlib
  import sys
 -from unittest.mock import MagicMock
  
- import onnx
+-import onnx
  import torch
  from torchvision.transforms import v2
  
@@ -19,10 +17,6 @@ index 5bccd90..6461d26 100644
 -sys.modules["triton"] = mock_triton
 -sys.modules["triton.language"] = MagicMock()
 -sys.modules["torch._inductor.runtime.triton_helpers"] = MagicMock()
--
--# Ensure sam3 is in PYTHONPATH
--
--# This file is at samexporter/samexporter/export_sam3.py
 +# NOTE on triton: sam3/model/edt.py does a bare `import triton`, which has no
 +# macOS wheel. That is fixed in the sam3 package itself, by moving the import
 +# into the single video-tracking function that uses it. Do not re-add a
@@ -31,7 +25,10 @@ index 5bccd90..6461d26 100644
 +# torch/_inductor/runtime/hints.py sees it in sys.modules, takes the "triton
 +# available" branch, and then fails importing triton.backends.compiler against
 +# a MagicMock.)
-+
+ 
+-# Ensure sam3 is in PYTHONPATH
+-
+-# This file is at samexporter/samexporter/export_sam3.py
 +# samexporter expects sam3 as a git submodule at samexporter/sam3 and puts the
 +# repo root on sys.path to reach it. With sam3 installed as a package instead,
 +# that root is actively harmful: an un-initialised submodule leaves an EMPTY
@@ -45,7 +42,9 @@ index 5bccd90..6461d26 100644
 -# So we add samexporter/sam3 to sys.path.
 -sys.path.append(os.path.join(samexporter_root, "sam3"))
 -sys.path.append(samexporter_root)
--
++if os.path.isdir(os.path.join(samexporter_root, "sam3", "sam3")):
++    sys.path.append(os.path.join(samexporter_root, "sam3"))
+ 
 -try:
 -    from osam._models.yoloworld.clip import tokenize
 -    from sam3.model.sam3_image import Sam3Image
@@ -56,15 +55,6 @@ index 5bccd90..6461d26 100644
 -    print("Please make sure the sam3 submodule inside samexporter is available.")
 -    Sam3Image = object
 -    Sam3Processor = object
--
--    def build_sam3_image_model():
--        return None
--
--    def tokenize(x):
--        return None
-+if os.path.isdir(os.path.join(samexporter_root, "sam3", "sam3")):
-+    sys.path.append(os.path.join(samexporter_root, "sam3"))
-+
 +# Imported unguarded on purpose. The original wrapped these in a try/except
 +# that substituted `object` for the model classes and a None-returning stub for
 +# build_sam3_image_model, so a missing dependency produced a module that
@@ -80,15 +70,20 @@ index 5bccd90..6461d26 100644
 +from sam3.model.sam3_image_processor import Sam3Processor
 +from sam3.model_builder import build_sam3_image_model
  
+-    def build_sam3_image_model():
+-        return None
  
+-    def tokenize(x):
+-        return None
+-
+-
  def get_replace_freqs_cis(module: torch.nn.Module) -> None:
 -    """Replace complex freqs_cis buffers with separate real/imag float buffers.
--
++    """Switch every RoPE attention over to upstream's real-valued path.
+ 
 -    ONNX does not support complex-valued tensors, so the complex RoPE
 -    (rotary positional embedding) buffer must be split into its real
 -    (cosine) and imaginary (sine) components before export.
-+    """Switch every RoPE attention over to upstream's real-valued path.
-+
 +    ONNX has no complex tensors, so the complex RoPE buffer cannot be traced.
 +    Upstream sam3 already carries a real-valued RoPE implementation for exactly
 +    this reason (``use_rope_real`` -> ``apply_rotary_enc_real``), gated by a
@@ -123,129 +118,147 @@ index 5bccd90..6461d26 100644
      for child in module.children():
          get_replace_freqs_cis(child)
  
-@@ -172,23 +189,53 @@ class SAM3Decoder(torch.nn.Module):
+@@ -170,143 +183,3 @@
+         }
+         result = self._processor._forward_grounding(state)
          return result["boxes"], result["scores"], result["masks"]
- 
- 
-+@torch.no_grad()
- def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
-     output_dir = pathlib.Path(output_dir)
-     output_dir.mkdir(parents=True, exist_ok=True)
- 
+-
+-
+-def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
+-    output_dir = pathlib.Path(output_dir)
+-    output_dir.mkdir(parents=True, exist_ok=True)
+-
 -    model = build_sam3_image_model()
-+    def _model_path(name: str) -> pathlib.Path:
-+        # Each model gets its own directory. torch spills tensors past the 2GB
-+        # protobuf limit into sibling files named after the graph node
-+        # (Constant_823_attr__value); node numbering restarts per export, so
-+        # three models sharing one directory silently overwrite each other's
-+        # weights and the earlier models then fail to load.
-+        d = output_dir / name
-+        d.mkdir(parents=True, exist_ok=True)
-+        return d / f"sam3_{name}.onnx"
-+
-+    def _record(name: str, facts: dict) -> None:
-+        # Values the trace folds into a graph, written by the code that folded
-+        # them, so a consumer reads the processor's actual settings.
-+        path = output_dir / name / f"{name}.json"
-+        path.write_text(json.dumps(facts, indent=2))
-+
-+    # sam3's fused addmm_act path runs when `mat1.is_cuda`, and
-+    # `aten::_addmm_activation` has no ONNX symbolic, so a trace on a
-+    # CUDA-visible machine fails outright. Pinning also keeps this derivation's
-+    # contents independent of whether the builder has a GPU, so one store path
-+    # holds one trace.
-+    device = "cpu"
-+    model = build_sam3_image_model(device=device)
-     # Replace complex RoPE buffers with float cos/sin – required for ONNX.
-     get_replace_freqs_cis(model)
+-    # Replace complex RoPE buffers with float cos/sin – required for ONNX.
+-    get_replace_freqs_cis(model)
 -    processor = Sam3Processor(model)
 -    device = "cuda" if torch.cuda.is_available() else "cpu"
-+    # Sam3Processor defaults to device="cuda"; it allocates tensors eagerly.
-+    processor = Sam3Processor(model, device=device)
-     model.to(device)
-+    # The export wrappers hold the model on a plain attribute (self._processor),
-+    # so the tracer never sees it as a submodule and tries to inline its weights
-+    # as graph constants -- which it refuses to do for tensors that require
-+    # grad ("Cannot insert a Tensor that requires grad as a constant").
-+    for p in model.parameters():
-+        p.requires_grad_(False)
- 
-     # ── Image Encoder ────────────────────────────────────────────────────────
-     print("Exporting Image Encoder...")
-     image_encoder = SAM3ImageEncoder(processor)
+-    model.to(device)
+-
+-    # ── Image Encoder ────────────────────────────────────────────────────────
+-    print("Exporting Image Encoder...")
+-    image_encoder = SAM3ImageEncoder(processor)
 -    # Input: uint8 (3, 1008, 1008) – normalization is baked into the model.
 -    dummy_image = torch.zeros(3, 1008, 1008, dtype=torch.uint8).to(device)
 -    encoder_path = output_dir / "sam3_image_encoder.onnx"
-+    # Input: uint8 (3, N, N) – normalization is baked into the model.
-+    resolution = processor.resolution
-+    dummy_image = torch.zeros(3, resolution, resolution, dtype=torch.uint8).to(device)
-+    encoder_path = _model_path("image_encoder")
-     torch.onnx.utils.export(
-         image_encoder,
-         args=(dummy_image,),
-@@ -206,12 +253,37 @@ def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
-         opset_version=opset,
-     )
-     print(f"Saved Image Encoder to {encoder_path}")
-+    _record(
-+        "image_encoder",
-+        {
-+            "graph_assertions": [
-+                {"claim": "resolution", "tensor": "image", "axis": -1},
-+            ],
-+            "resolution": resolution,
-+            "preprocessing": {
-+                "normalization_baked_into_graph": True,
-+                # Sam3Processor resizes with v2.Resize(size=(res, res)), which
-+                # does not preserve aspect ratio. A caller that letterboxes
-+                # instead feeds padding the model never saw, and box prompts
-+                # land off the objects they were meant to select. Under a pure
-+                # stretch, normalized cxcywh is invariant between the source
-+                # frame and this one, so box_coords pass through unchanged.
-+                "caller_resize": {
-+                    "mode": "stretch",
-+                    "preserves_aspect_ratio": False,
-+                    "channel_order": "rgb",
-+                    "layout": "chw",
-+                    "target": [resolution, resolution],
-+                },
-+            },
-+        },
-+    )
- 
-     # ── Language Encoder ─────────────────────────────────────────────────────
-     print("Exporting Language Encoder...")
-     language_encoder = SAM3LanguageEncoder(processor)
-     dummy_tokens = torch.zeros(1, 32, dtype=torch.long).to(device)
+-    torch.onnx.utils.export(
+-        image_encoder,
+-        args=(dummy_image,),
+-        f=str(encoder_path),
+-        export_params=True,
+-        input_names=["image"],
+-        output_names=[
+-            "vision_pos_enc_0",
+-            "vision_pos_enc_1",
+-            "vision_pos_enc_2",
+-            "backbone_fpn_0",
+-            "backbone_fpn_1",
+-            "backbone_fpn_2",
+-        ],
+-        opset_version=opset,
+-    )
+-    print(f"Saved Image Encoder to {encoder_path}")
+-
+-    # ── Language Encoder ─────────────────────────────────────────────────────
+-    print("Exporting Language Encoder...")
+-    language_encoder = SAM3LanguageEncoder(processor)
+-    dummy_tokens = torch.zeros(1, 32, dtype=torch.long).to(device)
 -    language_path = output_dir / "sam3_language_encoder.onnx"
-+    language_path = _model_path("language_encoder")
-     torch.onnx.utils.export(
-         language_encoder,
-         args=(dummy_tokens,),
-@@ -232,7 +304,7 @@ def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
-     # ── Decoder ──────────────────────────────────────────────────────────────
-     print("Exporting Decoder...")
-     decoder = SAM3Decoder(model, processor)
+-    torch.onnx.utils.export(
+-        language_encoder,
+-        args=(dummy_tokens,),
+-        f=str(language_path),
+-        export_params=True,
+-        input_names=["tokens"],
+-        # Names match the actual ONNX model output names used by inference code.
+-        output_names=["text_attention_mask", "text_memory", "text_embeds"],
+-        opset_version=opset,
+-    )
+-    print(f"Saved Language Encoder to {language_path}")
+-
+-    # Get dummy feature tensors for decoder export
+-    with torch.no_grad():
+-        vpe0, vpe1, vpe2, fpn0, fpn1, fpn2 = image_encoder(dummy_image)
+-        l_mask, l_feat, l_embed = language_encoder(dummy_tokens)
+-
+-    # ── Decoder ──────────────────────────────────────────────────────────────
+-    print("Exporting Decoder...")
+-    decoder = SAM3Decoder(model, processor)
 -    decoder_path = output_dir / "sam3_decoder.onnx"
-+    decoder_path = _model_path("decoder")
- 
-     box_coords = torch.zeros(1, 1, 4).to(device)
-     box_labels = torch.ones(1, 1, dtype=torch.long).to(device)
-@@ -281,6 +353,17 @@ def export_sam3(output_dir: str, opset: int = 18, simplify_model: bool = False):
-         opset_version=opset,
-     )
-     print(f"Saved Decoder to {decoder_path}")
-+    _record(
-+        "decoder",
-+        {
-+            # Nothing here restates a graph dimension.
-+            "graph_assertions": [],
-+            # Folded in at trace time by `keep = out_probs > threshold`, so it
-+            # cannot be changed at load. A consumer applying its own threshold
-+            # is redundant below this value and has no effect above it.
-+            "confidence_threshold": processor.confidence_threshold,
-+        },
-+    )
- 
-     # ── Simplify models conditionally ─────────────────────────────────────────
-     if simplify_model:
+-
+-    box_coords = torch.zeros(1, 1, 4).to(device)
+-    box_labels = torch.ones(1, 1, dtype=torch.long).to(device)
+-    # box_masks=True means "no real box" (dummy / masked out).
+-    box_masks = torch.ones(1, 1, dtype=torch.bool).to(device)
+-    orig_h = torch.tensor(1008).to(device)
+-    orig_w = torch.tensor(1008).to(device)
+-
+-    torch.onnx.utils.export(
+-        decoder,
+-        args=(
+-            orig_h,
+-            orig_w,
+-            vpe0,
+-            vpe1,
+-            vpe2,
+-            fpn0,
+-            fpn1,
+-            fpn2,
+-            l_mask,
+-            l_feat,
+-            l_embed,
+-            box_coords,
+-            box_labels,
+-            box_masks,
+-        ),
+-        f=str(decoder_path),
+-        export_params=True,
+-        input_names=[
+-            "original_height",
+-            "original_width",
+-            "vision_pos_enc_0",
+-            "vision_pos_enc_1",
+-            "vision_pos_enc_2",
+-            "backbone_fpn_0",
+-            "backbone_fpn_1",
+-            "backbone_fpn_2",
+-            "language_mask",
+-            "language_features",
+-            "language_embeds",
+-            "box_coords",
+-            "box_labels",
+-            "box_masks",
+-        ],
+-        output_names=["boxes", "scores", "masks"],
+-        opset_version=opset,
+-    )
+-    print(f"Saved Decoder to {decoder_path}")
+-
+-    # ── Simplify models conditionally ─────────────────────────────────────────
+-    if simplify_model:
+-        from onnxsim import simplify
+-
+-        for path in [encoder_path, language_path, decoder_path]:
+-            print(f"Simplifying {path}...")
+-            try:
+-                onnx_model = onnx.load(str(path))
+-                model_simp, check = simplify(onnx_model)
+-                assert check, "Simplified ONNX model could not be validated"
+-                onnx.save(model_simp, str(path))
+-                print("  → simplified OK")
+-            except Exception as e:
+-                print(f"  → simplification failed ({e}), keeping original")
+-
+-
+-if __name__ == "__main__":
+-    parser = argparse.ArgumentParser(description="Export SAM3 to ONNX")
+-    parser.add_argument(
+-        "--output_dir",
+-        type=str,
+-        default="output_models/sam3",
+-        help="Output directory for ONNX models",
+-    )
+-    parser.add_argument("--opset", type=int, default=18, help="ONNX opset version")
+-    parser.add_argument("--simplify", action="store_true", help="Simplify ONNX models")
+-    args = parser.parse_args()
+-    export_sam3(args.output_dir, args.opset, args.simplify)

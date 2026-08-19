@@ -3,8 +3,8 @@
 //! `nix/scripts/export-dinov3.py` writes every number the caller owes into the
 //! manifest so the ingest honours the checkpoint it loaded instead of a
 //! transcription: the rescale factor, the resample kernel, and the square the
-//! model takes. `nix/scripts/verify-onnx.py` embeds each sidecar under
-//! `models.<name>.metadata` and writes the manifest only once every check has
+//! model takes. `nix/scripts/verify-onnx.py` merges each graph's flat facts in
+//! beside its input signature and writes the manifest only once every check has
 //! passed, so this is the single file the Rust side reads.
 //!
 //! [`load`](Dinov3Manifest::load) is the validation: a [`Dinov3Manifest`] exists
@@ -20,6 +20,15 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::model_manifest::Signature;
+
+/// The graph's one image input, named by the export.
+const INPUT: &str = "image";
+
+/// RGB planes first, the layout the caller feeds and what a channel-first square
+/// input shape declares.
+const CHANNELS: i64 = 3;
+
 /// The model's embedding width, the size `Embedding` is fixed to, and the sole
 /// value tied to the DINOv3 variant: grid, prefix, and resolution all flow from
 /// the manifest, so a different variant (ViT-B is 768, ViT-g 1536) changes this
@@ -33,10 +42,11 @@ pub(crate) const EMBEDDING_DIM: usize = 1024;
 #[derive(Debug)]
 pub(crate) struct Dinov3Manifest {
     pub(crate) graph: PathBuf,
+    /// The square input side, derived from the graph's input shape.
     pub(crate) resolution: usize,
-    /// Tokens the graph emits per image: the prefix then the patch grid.
-    /// `forward` holds its output to this count, which is what makes slicing the
-    /// patches out of it total.
+    /// Tokens the graph emits per image: the prefix then the patch grid, summed
+    /// from `prefix_tokens` and the grid. `forward` holds its output to this
+    /// count, which is what makes slicing the patches out of it total.
     pub(crate) sequence_length: usize,
     /// Leading tokens (CLS then registers) before the patch grid; patches begin
     /// at this index.
@@ -61,105 +71,85 @@ impl Dinov3Manifest {
     }
 
     fn validate(export: &Path, wire: Wire) -> Result<Self, ManifestInvalid> {
-        let model = wire.models.dinov3;
-        let meta = model.metadata;
-        let resize = meta.preprocessing.caller_resize;
+        let model = wire.dinov3;
 
-        // `is_multiple_of` reports false for a zero patch size on a non-zero
-        // resolution, so a zero patch size is rejected without a separate guard.
-        if meta.resolution == 0 || !meta.resolution.is_multiple_of(meta.patch_size) {
-            return Err(ManifestInvalid::Resolution {
-                resolution: meta.resolution,
-                patch_size: meta.patch_size,
+        // The caller rescales to float and hands the graph the rescaled square,
+        // so the input is `tensor(float)`; a `tensor(uint8)` here would mean the
+        // graph still owes the rescale the caller already spent.
+        let image = model
+            .inputs
+            .iter()
+            .find(|input| input.name == INPUT)
+            .ok_or(ManifestInvalid::MissingInput { name: INPUT })?;
+        if image.dtype != "tensor(float)" {
+            return Err(ManifestInvalid::InputDtype {
+                dtype: image.dtype.clone(),
             });
         }
 
-        // Pooling indexes the grid the resolution lays out, so a grid that
-        // disagrees with `resolution / patch_size` would pool over the wrong
-        // shape. The division is exact by the check above.
-        let [rows, columns] = meta.patch_grid;
-        let side = meta.resolution / meta.patch_size;
-        if rows != side || columns != side {
-            return Err(ManifestInvalid::PatchGridShape {
-                rows,
-                columns,
-                expected: side,
-                resolution: meta.resolution,
-                patch_size: meta.patch_size,
-            });
-        }
+        // The channel-first square input carries the resolution: a [3, res, res]
+        // shape both fixes the layout and names the side the caller resizes to.
+        let resolution = match image.shape.as_slice() {
+            &[CHANNELS, height, width] if height == width && height > 0 => height as usize,
+            _ => {
+                return Err(ManifestInvalid::InputShape {
+                    shape: image.shape.clone(),
+                });
+            }
+        };
 
-        if meta.prefix_tokens.checked_add(rows.saturating_mul(columns))
-            != Some(meta.sequence_length)
-        {
-            return Err(ManifestInvalid::SequenceLength {
-                sequence_length: meta.sequence_length,
-                prefix_tokens: meta.prefix_tokens,
-                rows,
-                columns,
-            });
+        // Pooling indexes the grid row-major, so a non-square grid would pool
+        // over the wrong shape and a zero grid would name no patch tokens at all.
+        // Whether a well-formed grid matches `resolution / patch` is left to
+        // `forward`'s token recount, since patch size is not on the wire.
+        let [rows, columns] = model.patch_grid;
+        if rows != columns || rows == 0 {
+            return Err(ManifestInvalid::PatchGridShape { rows, columns });
         }
 
         // CLS lives at index 0 by DINOv3 convention, so the prefix cannot be
         // empty. Without this, a prefix-less export would validate and the top-
         // left patch would masquerade as the CLS token.
-        if meta.prefix_tokens == 0 {
+        if model.prefix_tokens == 0 {
             return Err(ManifestInvalid::PrefixTokens);
         }
 
-        if meta.hidden_size != EMBEDDING_DIM {
+        if model.hidden_size != EMBEDDING_DIM {
             return Err(ManifestInvalid::EmbeddingDim {
-                embedding_dim: meta.hidden_size,
+                embedding_dim: model.hidden_size,
                 expected: EMBEDDING_DIM,
             });
         }
 
-        if meta.input_dtype != "float32" {
-            return Err(ManifestInvalid::InputDtype {
-                dtype: meta.input_dtype,
-            });
-        }
-
-        if resize.target != [meta.resolution, meta.resolution] {
-            return Err(ManifestInvalid::Target {
-                target: resize.target,
-                resolution: meta.resolution,
-            });
-        }
-
-        // The caller decodes RGB into a CHW float plane, filters every downscale
-        // with an antialiased bilinear kernel. A checkpoint declaring any other
-        // order, layout, resample, or an unfiltered resize would be honoured on
+        // The caller decodes RGB into a CHW float plane and filters every
+        // downscale with an antialiased bilinear kernel. A checkpoint declaring
+        // any other order, resample, or an unfiltered resize would be honoured on
         // paper and ignored in code, so it fails here rather than preprocessing
         // wrong.
-        if resize.interpolation != "bilinear" {
+        if model.interpolation != "bilinear" {
             return Err(ManifestInvalid::Interpolation {
-                value: resize.interpolation,
+                value: model.interpolation,
             });
         }
 
-        if resize.channel_order != "rgb" {
+        if model.channel_order != "rgb" {
             return Err(ManifestInvalid::ChannelOrder {
-                channel_order: resize.channel_order,
+                channel_order: model.channel_order,
             });
         }
 
-        if resize.layout != "chw" {
-            return Err(ManifestInvalid::Layout {
-                layout: resize.layout,
-            });
-        }
-
-        if !resize.antialias {
+        if !model.antialias {
             return Err(ManifestInvalid::Antialias);
         }
 
         Ok(Self {
             graph: export.join(model.graph),
-            resolution: meta.resolution,
-            sequence_length: meta.sequence_length,
-            prefix_tokens: meta.prefix_tokens,
-            rescale_factor: parse_rescale_factor(resize.rescale_factor)?,
+            resolution,
+            sequence_length: model
+                .prefix_tokens
+                .saturating_add(rows.saturating_mul(columns)),
+            prefix_tokens: model.prefix_tokens,
+            rescale_factor: parse_rescale_factor(model.rescale_factor)?,
         })
     }
 }
@@ -208,34 +198,17 @@ pub enum ManifestError {
 /// a checkpoint change trips one.
 #[derive(Debug, Error)]
 pub enum ManifestInvalid {
-    #[error("resolution {resolution} is not a positive multiple of patch size {patch_size}")]
-    Resolution {
-        resolution: usize,
-        patch_size: usize,
-    },
+    #[error("the graph declares no `{name}` input")]
+    MissingInput { name: &'static str },
 
-    #[error(
-        "patch grid {rows}x{columns} is not the {expected}x{expected} square a \
-         {resolution}px input at patch size {patch_size} lays out"
-    )]
-    PatchGridShape {
-        rows: usize,
-        columns: usize,
-        expected: usize,
-        resolution: usize,
-        patch_size: usize,
-    },
+    #[error("input dtype `{dtype}` is not the `tensor(float)` the model takes")]
+    InputDtype { dtype: String },
 
-    #[error(
-        "sequence length {sequence_length} is not {prefix_tokens} prefix + \
-         {rows}x{columns} patches"
-    )]
-    SequenceLength {
-        sequence_length: usize,
-        prefix_tokens: usize,
-        rows: usize,
-        columns: usize,
-    },
+    #[error("input shape {shape:?} is not a channel-first [3, N, N] square")]
+    InputShape { shape: Vec<i64> },
+
+    #[error("patch grid {rows}x{columns} is not a positive square")]
+    PatchGridShape { rows: usize, columns: usize },
 
     #[error("the export declares zero prefix tokens, so there is no CLS token at index 0")]
     PrefixTokens,
@@ -244,15 +217,6 @@ pub enum ManifestInvalid {
     EmbeddingDim {
         embedding_dim: usize,
         expected: usize,
-    },
-
-    #[error("input dtype `{dtype}` is not the `float32` the model takes")]
-    InputDtype { dtype: String },
-
-    #[error("caller resize target {target:?} is not the {resolution}px square")]
-    Target {
-        target: [usize; 2],
-        resolution: usize,
     },
 
     #[error("rescale factor {factor} would let a decoded byte leave `[0, 1]`")]
@@ -264,54 +228,27 @@ pub enum ManifestInvalid {
     #[error("caller channel order `{channel_order}` is not the `rgb` the caller decodes")]
     ChannelOrder { channel_order: String },
 
-    #[error("caller layout `{layout}` is not the `chw` the caller feeds the model")]
-    Layout { layout: String },
-
     #[error("caller resize declares antialias off, but the caller filters every downscale")]
     Antialias,
 }
 
-/// The manifest fields this crate reads. Every other key the export writes
-/// (graph signatures, baked normalization) is left for its own reader.
+/// The one graph this crate drives, flattened to the facts the caller feeds it
+/// with. Its input signature carries the resolution and dtype; the rest is
+/// preprocessing the tensor shape does not encode.
 #[derive(Deserialize)]
 struct Wire {
-    models: WireModels,
+    dinov3: Graph,
 }
 
 #[derive(Deserialize)]
-struct WireModels {
-    dinov3: WireModel,
-}
-
-#[derive(Deserialize)]
-struct WireModel {
+struct Graph {
     graph: PathBuf,
-    metadata: WireMetadata,
-}
-
-#[derive(Deserialize)]
-struct WireMetadata {
-    resolution: usize,
-    input_dtype: String,
-    patch_size: usize,
-    patch_grid: [usize; 2],
-    prefix_tokens: usize,
-    hidden_size: usize,
-    sequence_length: usize,
-    preprocessing: WirePreprocessing,
-}
-
-#[derive(Deserialize)]
-struct WirePreprocessing {
-    caller_resize: WireCallerResize,
-}
-
-#[derive(Deserialize)]
-struct WireCallerResize {
-    rescale_factor: f64,
-    interpolation: String,
-    target: [usize; 2],
+    inputs: Vec<Signature>,
     channel_order: String,
-    layout: String,
+    interpolation: String,
     antialias: bool,
+    rescale_factor: f64,
+    prefix_tokens: usize,
+    patch_grid: [usize; 2],
+    hidden_size: usize,
 }
