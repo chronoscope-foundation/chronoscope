@@ -7,8 +7,13 @@
 //! and the VLM describes it by number, so both want a tidy, bounded, ordered set.
 //! This resolves the raw regions geometrically, with no notion of entity type —
 //! the VLM assigns type and description later, over the overlay.
+//!
+//! Grouping contained regions into a parent with sub-features (the writeup's
+//! `SUBORDINATE_PROMPTS` layer) is deliberately not done here: it keys on which
+//! concept prompt found each region, and [`ScoredRegion`] carries no such label
+//! yet. That is a conscious gap, not another silent drop.
 
-use chronoscope_core::grammar::geometry::GridMismatch;
+use chronoscope_core::grammar::geometry::{GridMismatch, Region, RegionError};
 
 use crate::sam3::ScoredRegion;
 
@@ -22,6 +27,17 @@ const DEDUP_IOU: f64 = 0.7;
 /// double-counted.
 const SURVIVAL: f64 = 0.1;
 
+/// Why [`postprocess_regions`] could not resolve its input.
+#[derive(Debug, thiserror::Error)]
+pub enum PostprocessError {
+    /// Two input regions declared different pixel grids.
+    #[error(transparent)]
+    Grid(#[from] GridMismatch),
+    /// Rebuilding a survivor from its exclusively-claimed pixels failed.
+    #[error(transparent)]
+    Region(#[from] RegionError),
+}
+
 /// Reduce raw per-instance regions to the clean, ordered set to overlay and
 /// describe: drop near-duplicates, resolve overlaps by exclusive area, keep the
 /// most confident `max_regions`, and order them left to right by centroid.
@@ -33,7 +49,7 @@ const SURVIVAL: f64 = 0.1;
 pub fn postprocess_regions(
     regions: Vec<ScoredRegion>,
     max_regions: usize,
-) -> Result<Vec<ScoredRegion>, GridMismatch> {
+) -> Result<Vec<ScoredRegion>, PostprocessError> {
     let Some(first) = regions.first() else {
         return Ok(Vec::new());
     };
@@ -43,7 +59,8 @@ pub fn postprocess_regions(
             return Err(GridMismatch {
                 a: grid,
                 b: scored.region.dimensions(),
-            });
+            }
+            .into());
         }
     }
 
@@ -68,24 +85,40 @@ pub fn postprocess_regions(
         }
     }
 
-    // Claim each foreground pixel for the highest-scored region covering it —
-    // `kept` is score-ordered, so a region claims only pixels no higher-scored
-    // region already took — then keep it only if that exclusive share of its own
-    // area clears the survival floor. `claimed` is one byte per pixel and each
-    // region walks only the pixels it covers, so nothing densifies the grid.
+    // Give each foreground pixel to the highest-scored *surviving* region
+    // covering it: walk `kept` score-first, tentatively take the pixels no
+    // surviving region already holds, and commit that claim only when the region
+    // clears the survival floor. A dropped region leaves no claim, so it cannot
+    // steal pixels from a lower-scored survivor. A survivor is rebuilt from
+    // exactly the pixels it owns, so the masks are disjoint. `claimed` is one
+    // byte per pixel and each region walks only the pixels it covers, so nothing
+    // densifies the grid.
     let extent = (grid.width() as usize) * (grid.height() as usize);
     let mut claimed = vec![false; extent];
     let mut survivors: Vec<ScoredRegion> = Vec::new();
     for scored in kept {
-        let mut exclusive: u64 = 0;
+        let mut mine: Vec<usize> = Vec::new();
         for pixel in scored.region.foreground_pixels() {
+            // Tentative — not claimed yet. A region that fails the survival floor
+            // must leave no claim behind, or it steals pixels from a lower-scored
+            // survivor while never appearing in the output. `foreground_pixels`
+            // is ascending, so `mine` stays ascending — the shape
+            // `Region::from_pixels` requires.
             if !claimed[pixel] {
-                claimed[pixel] = true;
-                exclusive += 1;
+                mine.push(pixel);
             }
         }
-        if exclusive as f64 >= SURVIVAL * scored.region.area() as f64 {
-            survivors.push(scored);
+        if mine.len() as f64 >= SURVIVAL * scored.region.area() as f64
+            && let Some(region) = Region::from_pixels(grid, &mine)?
+        {
+            // Commit the claim only now that the region survives.
+            for &pixel in &mine {
+                claimed[pixel] = true;
+            }
+            survivors.push(ScoredRegion {
+                region,
+                score: scored.score,
+            });
         }
     }
 
@@ -153,6 +186,28 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_region_does_not_steal_pixels_from_a_survivor() -> TestResult {
+        // A (0.9) owns 0..20. B (0.7) is 10..21 — ten pixels inside A and one
+        // exclusive (pixel 20), below the survival floor, so B drops. C (0.5)
+        // owns 20..25, sharing pixel 20 with B's sliver. B must not keep pixel 20
+        // claimed on its way out, or C loses it to a region that never reaches
+        // the output.
+        let grid = Dimensions::new(25, 1)?;
+        let a = scored(grid, &run(25, 0, 20), 0.9)?;
+        let b = scored(grid, &run(25, 10, 11), 0.7)?;
+        let c = scored(grid, &run(25, 20, 5), 0.5)?;
+
+        let out = postprocess_regions(vec![a, b, c], 32)?;
+
+        assert_eq!(out.len(), 2, "A and C survive, B drops");
+        assert!(
+            out.iter().any(|s| s.region.to_dense()[20]),
+            "pixel 20 stays with a survivor, not stolen by the dropped B"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn output_is_ordered_left_to_right_by_centroid() -> TestResult {
         // Three disjoint columns on a 6x1 grid: pixel 5 (right), 0 (left), 2..4
         // (middle). Distinct scores keep them all through dedup and exclusivity.
@@ -192,6 +247,48 @@ mod tests {
     #[test]
     fn empty_input_is_empty_output() -> TestResult {
         assert!(postprocess_regions(Vec::new(), 32)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn surviving_masks_are_disjoint() -> TestResult {
+        // Pixels 0..10 @0.9 and 5..15 @0.8 overlap at IoU 5/15 = 0.33, under the
+        // dedup threshold, so both clear dedup; each owns >= 10% exclusively, so
+        // both survive. Their output masks must share no pixel — the overlap went
+        // to the higher score. This is the case the half-port left overlapping.
+        let grid = Dimensions::new(20, 1)?;
+        let higher = scored(grid, &run(20, 0, 10), 0.9)?;
+        let lower = scored(grid, &run(20, 5, 10), 0.8)?;
+        let out = postprocess_regions(vec![higher, lower], 32)?;
+        assert_eq!(out.len(), 2);
+        let a = out[0].region.to_dense();
+        let b = out[1].region.to_dense();
+        for pixel in 0..20 {
+            assert!(
+                !(a[pixel] && b[pixel]),
+                "pixel {pixel} is claimed by both survivors"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_survivor_reduced_around_a_claim_keeps_the_hole() -> TestResult {
+        // The higher region sits in the middle of the lower one and claims those
+        // pixels first, so the lower survivor's reduced mask is non-contiguous:
+        // foreground everywhere it covered except the punched-out middle.
+        let grid = Dimensions::new(10, 1)?;
+        let higher = scored(grid, &run(10, 4, 2), 0.9)?;
+        let lower = scored(grid, &run(10, 0, 10), 0.5)?;
+        let out = postprocess_regions(vec![higher, lower], 32)?;
+        assert_eq!(out.len(), 2);
+        let holey = out
+            .iter()
+            .find(|s| s.score == 0.5)
+            .ok_or("the lower region survives")?;
+        let dense = holey.region.to_dense();
+        assert!(!dense[4] && !dense[5], "the claimed middle is excluded");
+        assert!(dense[3] && dense[6], "the surrounding pixels remain");
         Ok(())
     }
 }

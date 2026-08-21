@@ -178,6 +178,69 @@ impl Region {
         Ok((!region.is_empty()).then_some(region))
     }
 
+    /// Assemble a region from its foreground pixels' linear (row-major) indices,
+    /// the inverse of [`Region::foreground_pixels`]. `pixels` must be strictly
+    /// ascending and each below the grid's pixel count. An empty slice is
+    /// `Ok(None)`, mirroring [`Region::from_dense`]: a `Region` always holds at
+    /// least one pixel.
+    ///
+    /// This lets a caller carve a subset of one region's pixels and rebuild a
+    /// region from exactly those, staying proportional to that subset rather than
+    /// densifying the grid. It is a `pub` boundary crossed from outside the crate,
+    /// so it validates the indices rather than trusting them, then hands the
+    /// assembled runs to `Region::new` for the canonical-form backstop.
+    pub fn from_pixels(
+        dimensions: Dimensions,
+        pixels: &[usize],
+    ) -> Result<Option<Self>, RegionError> {
+        if pixels.is_empty() {
+            return Ok(None);
+        }
+        // Strictly ascending, each in range: the invariant that makes the run
+        // build below sound — every background gap and the trailing gap are
+        // non-negative, and consecutive indices merge into one foreground run so
+        // no interior gap is zero-length.
+        for i in 1..pixels.len() {
+            if pixels[i] <= pixels[i - 1] {
+                return Err(RegionError::PixelsNotAscending {
+                    pixel: pixels[i],
+                    previous: pixels[i - 1],
+                });
+            }
+        }
+        let count = dimensions.pixel_count() as usize;
+        let last = pixels[pixels.len() - 1];
+        if last >= count {
+            return Err(RegionError::PixelOutOfRange {
+                pixel: last,
+                pixel_count: dimensions.pixel_count(),
+            });
+        }
+
+        // A background gap then a foreground run per maximal consecutive group,
+        // the canonical alternating form `from_dense` produces.
+        let mut runs: Vec<u32> = Vec::new();
+        let mut cursor = 0usize;
+        let mut i = 0usize;
+        while i < pixels.len() {
+            let start = pixels[i];
+            runs.push((start - cursor) as u32);
+            let mut j = i;
+            while j + 1 < pixels.len() && pixels[j + 1] == pixels[j] + 1 {
+                j += 1;
+            }
+            runs.push((pixels[j] - start + 1) as u32);
+            cursor = pixels[j] + 1;
+            i = j + 1;
+        }
+        let trailing = count - cursor;
+        if trailing > 0 {
+            runs.push(trailing as u32);
+        }
+
+        Ok(Some(Self::new(dimensions, runs)?))
+    }
+
     /// The mask's pixel grid.
     pub fn dimensions(&self) -> Dimensions {
         self.dimensions
@@ -444,6 +507,15 @@ pub enum RegionError {
     /// region.
     #[error("region has no foreground pixels")]
     NoForeground,
+    /// A pixel index slice given to [`Region::from_pixels`] was not strictly
+    /// ascending, so it does not name a canonical run list.
+    #[error(
+        "region pixel {pixel} does not exceed the previous {previous}; indices must strictly ascend"
+    )]
+    PixelsNotAscending { pixel: usize, previous: usize },
+    /// A pixel index given to [`Region::from_pixels`] lay outside the grid.
+    #[error("region pixel {pixel} is outside the {pixel_count}-pixel grid")]
+    PixelOutOfRange { pixel: usize, pixel_count: u32 },
 }
 
 /// Two [`Region`]s compared across different grids, where `IoU` is undefined.
@@ -1006,6 +1078,74 @@ mod tests {
             region.foreground_pixels().collect::<Vec<_>>(),
             vec![1, 2, 4]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn region_from_pixels_matches_from_dense_on_a_holey_set() -> TestResult {
+        // Foreground at 1, 2, 4 on a 6-pixel grid: an interior gap at 3 and a
+        // trailing gap at 5. The run form must be the exact one `from_dense`
+        // builds from the equivalent dense mask.
+        let grid = Dimensions::new(6, 1)?;
+        let dense = vec![false, true, true, false, true, false];
+        let from_pixels = Region::from_pixels(grid, &[1, 2, 4])?.ok_or("non-empty")?;
+        assert_eq!(from_pixels.to_dense(), dense);
+        assert_eq!(
+            from_pixels,
+            Region::from_dense(grid, &dense)?.ok_or("non-empty")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn region_from_pixels_round_trips_leading_and_trailing_edges() -> TestResult {
+        let grid = Dimensions::new(6, 1)?;
+        // Pixel 0 foreground: the leading background run is zero-length, the one
+        // place a zero run is canonical.
+        let leading = vec![true, true, false, false, false, false];
+        assert_eq!(
+            Region::from_pixels(grid, &[0, 1])?.ok_or("non-empty")?,
+            Region::from_dense(grid, &leading)?.ok_or("non-empty")?
+        );
+        // Foreground ends at the last pixel: no trailing background run.
+        let trailing = vec![false, false, false, false, true, true];
+        assert_eq!(
+            Region::from_pixels(grid, &[4, 5])?.ok_or("non-empty")?,
+            Region::from_dense(grid, &trailing)?.ok_or("non-empty")?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn region_from_pixels_empty_is_none() -> TestResult {
+        assert!(Region::from_pixels(Dimensions::new(6, 1)?, &[])?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn region_from_pixels_rejects_malformed_indices() -> TestResult {
+        let grid = Dimensions::new(6, 1)?;
+        assert!(matches!(
+            Region::from_pixels(grid, &[2, 1]),
+            Err(RegionError::PixelsNotAscending {
+                pixel: 1,
+                previous: 2
+            })
+        ));
+        assert!(matches!(
+            Region::from_pixels(grid, &[1, 1]),
+            Err(RegionError::PixelsNotAscending {
+                pixel: 1,
+                previous: 1
+            })
+        ));
+        assert!(matches!(
+            Region::from_pixels(grid, &[10]),
+            Err(RegionError::PixelOutOfRange {
+                pixel: 10,
+                pixel_count: 6
+            })
+        ));
         Ok(())
     }
 
