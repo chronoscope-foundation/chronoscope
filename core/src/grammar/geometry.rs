@@ -143,7 +143,15 @@ impl Region {
 
     /// Encode a dense row-major mask, one `bool` per pixel with foreground
     /// `true`. The slice length must be the grid's pixel count.
-    pub fn from_dense(dimensions: Dimensions, pixels: &[bool]) -> Result<Self, RegionError> {
+    ///
+    /// A mask with no foreground is `Ok(None)`, not a region: a `Region` always
+    /// holds at least one pixel, so callers filter the empty case here rather than
+    /// carrying an empty mask that has no centroid and no bounding box. A length
+    /// that does not match the grid stays a loud `Err` at this boundary.
+    pub fn from_dense(
+        dimensions: Dimensions,
+        pixels: &[bool],
+    ) -> Result<Option<Self>, RegionError> {
         if pixels.len() != dimensions.pixel_count() as usize {
             return Err(RegionError::LengthMismatch {
                 dimensions,
@@ -166,7 +174,8 @@ impl Region {
             }
         }
         runs.push(run);
-        Ok(Self { dimensions, runs })
+        let region = Self { dimensions, runs };
+        Ok((!region.is_empty()).then_some(region))
     }
 
     /// The mask's pixel grid.
@@ -214,9 +223,9 @@ impl Region {
     }
 
     /// Intersection over union with another mask on the same grid (`IoU`: shared
-    /// foreground area over combined foreground area). `1.0` for equal masks
-    /// (including two empty ones, which are equal), `0.0` for disjoint ones.
-    /// Errors if the grids differ, since the metric is undefined across grids.
+    /// foreground area over combined foreground area). `1.0` for equal masks,
+    /// `0.0` for disjoint ones. Errors if the grids differ, since the metric is
+    /// undefined across grids.
     pub fn intersection_over_union(&self, other: &Region) -> Result<f64, GridMismatch> {
         if self.dimensions != other.dimensions {
             return Err(GridMismatch {
@@ -225,12 +234,8 @@ impl Region {
             });
         }
         let (self_area, other_area) = (self.area(), other.area());
-        // Union is zero only when both masks are empty, which would force a 0/0.
-        // Two empty masks are identical, so they score 1 like any mask does
-        // against itself; past this guard at least one area is positive.
-        if self_area == 0 && other_area == 0 {
-            return Ok(1.0);
-        }
+        // A `Region` is never empty, so both areas are positive and the union
+        // below is never zero.
         let intersection = self.foreground_overlap(other);
         let union = self_area + other_area - intersection;
         Ok(intersection as f64 / union as f64)
@@ -279,6 +284,45 @@ impl Region {
         .ok()
     }
 
+    /// The foreground centroid as a [`ProportionalPoint`], the mean of the
+    /// foreground pixel positions.
+    pub fn centroid(&self) -> ProportionalPoint {
+        let width = u64::from(self.width());
+        let (mut sum_col, mut sum_row) = (0u64, 0u64);
+        let mut cursor: u64 = 0;
+        for (index, &run) in self.runs.iter().enumerate() {
+            let len = u64::from(run);
+            // Foreground runs sit at odd indices. Sum each pixel's column and row
+            // over the linear span `[cursor, cursor + len)`, split at row
+            // boundaries so the column arithmetic stays inside one row.
+            if index % 2 == 1 {
+                let (mut i, end) = (cursor, cursor + len);
+                while i < end {
+                    let row = i / width;
+                    let col_start = i % width;
+                    let seg_end = end.min((row + 1) * width);
+                    let seg_len = seg_end - i;
+                    // Columns `col_start .. col_start + seg_len`: a `seg_len`-term
+                    // arithmetic series. The product is of consecutive integers, so
+                    // the halving is exact.
+                    sum_col += seg_len * col_start + seg_len * (seg_len - 1) / 2;
+                    sum_row += row * seg_len;
+                    i = seg_end;
+                }
+            }
+            cursor += len;
+        }
+        // Mean pixel over the grid extent. A column is in `[0, width)`, so the
+        // ratio is in `[0, 1)`; rows likewise.
+        let area = self.area() as f64;
+        let x = sum_col as f64 / (area * f64::from(self.width()));
+        let y = sum_row as f64 / (area * f64::from(self.height()));
+        ProportionalPoint {
+            x: ProportionalCoord::new_unchecked(x),
+            y: ProportionalCoord::new_unchecked(y),
+        }
+    }
+
     /// Shared foreground pixel count with `other`, assuming equal grids: merge
     /// the two foreground interval lists, which are sorted by linear index.
     fn foreground_overlap(&self, other: &Region) -> u64 {
@@ -298,6 +342,16 @@ impl Region {
             }
         }
         overlap
+    }
+
+    /// The foreground pixels' linear (row-major) indices, in raster order,
+    /// without densifying the whole grid: the runs already carry the foreground
+    /// as intervals, so a caller assigning per-pixel ownership walks only the
+    /// pixels a region actually covers.
+    pub fn foreground_pixels(&self) -> impl Iterator<Item = usize> {
+        self.foreground_intervals()
+            .into_iter()
+            .flat_map(|(start, end)| (start as usize)..(end as usize))
     }
 
     /// Foreground runs as half-open `[start, end)` intervals in linear index
@@ -327,6 +381,20 @@ impl Region {
         let sum: u64 = runs.iter().map(|&run| u64::from(run)).sum();
         if sum != area {
             return Err(RegionError::RunSumMismatch { sum, area });
+        }
+        // Foreground runs sit at the odd indices. A run list with none is an
+        // all-background mask, which is no region: a `Region` always holds at
+        // least one pixel, so `centroid` and `intersection_over_union` divide by a
+        // positive area. Reject it here so no construction path — `from_dense`
+        // aside, which returns `None` — can mint an empty one.
+        let foreground: u64 = runs
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(|&run| u64::from(run))
+            .sum();
+        if foreground == 0 {
+            return Err(RegionError::NoForeground);
         }
         Ok(())
     }
@@ -372,6 +440,10 @@ pub enum RegionError {
     /// The runs did not sum to the grid's pixel count.
     #[error("region runs sum to {sum}, not the {area} the grid declares")]
     RunSumMismatch { sum: u64, area: u64 },
+    /// The run list has no foreground, so it is an empty mask, which is not a
+    /// region.
+    #[error("region has no foreground pixels")]
+    NoForeground,
 }
 
 /// Two [`Region`]s compared across different grids, where `IoU` is undefined.
@@ -422,6 +494,19 @@ impl ProportionalCoord {
             return Err(ProportionalCoordError::OutOfBounds { value });
         }
         Ok(Self(finite))
+    }
+
+    /// Mint a coordinate from trusted arithmetic already known finite and in
+    /// `0.0..=1.0` — a ratio of a foreground count to a grid extent. Mirrors
+    /// [`Finite::new_unchecked`]; the `debug_assert` catches a broken promise in
+    /// dev. Module-private, so external construction still validates through
+    /// [`new`](Self::new).
+    fn new_unchecked(value: f64) -> Self {
+        debug_assert!(
+            (0.0..=1.0).contains(&value),
+            "ProportionalCoord::new_unchecked outside 0.0..=1.0"
+        );
+        Self(Finite::new_unchecked(value))
     }
 
     /// The coordinate value, in `0.0..=1.0`.
@@ -790,8 +875,13 @@ mod tests {
             vec![false, false, false, false],
             vec![true, true, true, true],
         ] {
-            let region = Region::from_dense(grid, &pixels)?;
-            assert_eq!(region.to_dense(), pixels);
+            match Region::from_dense(grid, &pixels)? {
+                Some(region) => assert_eq!(region.to_dense(), pixels),
+                None => assert!(
+                    pixels.iter().all(|&pixel| !pixel),
+                    "from_dense is None only for an all-background mask"
+                ),
+            }
         }
         Ok(())
     }
@@ -811,6 +901,19 @@ mod tests {
         assert!(matches!(
             Region::new(Dimensions::new(2, 2)?, vec![1, 1]),
             Err(RegionError::RunSumMismatch { sum: 2, area: 4 })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn region_rejects_an_all_background_run_list() -> TestResult {
+        // A single background run over the whole grid has no foreground: an empty
+        // mask, which is not a region. `Deserialize` routes through `new`, so the
+        // wire boundary rejects it too, keeping every `Region` non-empty for
+        // `centroid` and `intersection_over_union`.
+        assert!(matches!(
+            Region::new(Dimensions::new(2, 2)?, vec![4]),
+            Err(RegionError::NoForeground)
         ));
         Ok(())
     }
@@ -839,13 +942,13 @@ mod tests {
     #[test]
     fn region_iou_scores_overlap() -> TestResult {
         let grid = Dimensions::new(2, 2)?;
-        let full = Region::from_dense(grid, &[true, true, true, true])?;
-        let empty = Region::from_dense(grid, &[false, false, false, false])?;
-        let left = Region::from_dense(grid, &[true, false, true, false])?;
-        let right = Region::from_dense(grid, &[false, true, false, true])?;
+        let full = Region::from_dense(grid, &[true, true, true, true])?.ok_or("non-empty")?;
+        let left = Region::from_dense(grid, &[true, false, true, false])?.ok_or("non-empty")?;
+        let right = Region::from_dense(grid, &[false, true, false, true])?.ok_or("non-empty")?;
+        // An all-background mask is not a region.
+        assert!(Region::from_dense(grid, &[false, false, false, false])?.is_none());
 
         assert_eq!(full.intersection_over_union(&full)?, 1.0);
-        assert_eq!(empty.intersection_over_union(&empty)?, 1.0);
         assert_eq!(left.intersection_over_union(&right)?, 0.0);
         // left is 2 of full's 4 pixels: intersection 2, union 4.
         assert_eq!(left.intersection_over_union(&full)?, 0.5);
@@ -854,8 +957,10 @@ mod tests {
 
     #[test]
     fn region_iou_rejects_grid_mismatch() -> TestResult {
-        let a = Region::from_dense(Dimensions::new(2, 2)?, &[true, true, true, true])?;
-        let b = Region::from_dense(Dimensions::new(1, 4)?, &[true, true, true, true])?;
+        let a = Region::from_dense(Dimensions::new(2, 2)?, &[true, true, true, true])?
+            .ok_or("non-empty")?;
+        let b = Region::from_dense(Dimensions::new(1, 4)?, &[true, true, true, true])?
+            .ok_or("non-empty")?;
         assert!(matches!(
             a.intersection_over_union(&b),
             Err(GridMismatch { .. })
@@ -864,19 +969,43 @@ mod tests {
     }
 
     #[test]
-    fn region_bounding_rect_is_tight_or_none() -> TestResult {
+    fn region_bounding_rect_is_tight() -> TestResult {
         // One foreground pixel at row 1, col 1 of a 4x4 grid: the tight box is
         // that single quarter-by-quarter cell.
         let grid = Dimensions::new(4, 4)?;
         let mut pixels = vec![false; 16];
         pixels[5] = true;
-        let region = Region::from_dense(grid, &pixels)?;
+        let region = Region::from_dense(grid, &pixels)?.ok_or("non-empty")?;
         let rect = region.bounding_rect().ok_or("expected a box")?;
         assert_eq!((rect.x(), rect.y()), (0.25, 0.25));
         assert_eq!((rect.width(), rect.height()), (0.25, 0.25));
+        Ok(())
+    }
 
-        let empty = Region::from_dense(grid, &[false; 16])?;
-        assert!(empty.bounding_rect().is_none());
+    #[test]
+    fn region_centroid_is_the_foreground_mean() -> TestResult {
+        // Two pixels: (col 0, row 0) and (col 2, row 1) on a 4x2 grid. Mean pixel
+        // is (col 1, row 0.5); proportional over the 4x2 grid, (0.25, 0.25).
+        let grid = Dimensions::new(4, 2)?;
+        let mut pixels = vec![false; 8];
+        pixels[0] = true;
+        pixels[6] = true;
+        let region = Region::from_dense(grid, &pixels)?.ok_or("non-empty")?;
+        let centroid = region.centroid();
+        assert_eq!((centroid.x(), centroid.y()), (0.25, 0.25));
+        Ok(())
+    }
+
+    #[test]
+    fn region_foreground_pixels_lists_only_foreground_indices() -> TestResult {
+        // 3x2 grid, foreground at linear indices 1, 2, 4.
+        let grid = Dimensions::new(3, 2)?;
+        let region = Region::from_dense(grid, &[false, true, true, false, true, false])?
+            .ok_or("non-empty")?;
+        assert_eq!(
+            region.foreground_pixels().collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
         Ok(())
     }
 
@@ -885,9 +1014,10 @@ mod tests {
         /// grid and content: the run form is a total, faithful codec.
         #[test]
         fn region_dense_round_trips((grid, pixels) in arb_dense()) {
-            let region = Region::from_dense(grid, &pixels)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            prop_assert_eq!(region.to_dense(), pixels);
+            match Region::from_dense(grid, &pixels).map_err(|e| TestCaseError::fail(e.to_string()))? {
+                Some(region) => prop_assert_eq!(region.to_dense(), pixels),
+                None => prop_assert!(pixels.iter().all(|&pixel| !pixel)),
+            }
         }
 
         /// IoU is symmetric, lands in `[0, 1]`, and scores a mask against itself
@@ -896,10 +1026,18 @@ mod tests {
         fn region_iou_symmetric_and_unit_ranged(
             (grid, a_bits, b_bits) in arb_two_masks(),
         ) {
-            let a = Region::from_dense(grid, &a_bits)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let b = Region::from_dense(grid, &b_bits)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            // A region is never empty; an all-background sample has no region and
+            // no IoU to check, so skip it.
+            let Some(a) = Region::from_dense(grid, &a_bits)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+            else {
+                return Ok(());
+            };
+            let Some(b) = Region::from_dense(grid, &b_bits)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+            else {
+                return Ok(());
+            };
             let ab = a
                 .intersection_over_union(&b)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
@@ -921,17 +1059,21 @@ mod tests {
         fn region_iou_matches_dense_oracle(
             (grid, a_bits, b_bits) in arb_two_masks(),
         ) {
-            let a = Region::from_dense(grid, &a_bits)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let b = Region::from_dense(grid, &b_bits)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let intersection = a_bits.iter().zip(&b_bits).filter(|(x, y)| **x && **y).count();
-            let union = a_bits.iter().zip(&b_bits).filter(|(x, y)| **x || **y).count();
-            let expected = if union == 0 {
-                1.0
-            } else {
-                intersection as f64 / union as f64
+            // A region is never empty; skip an all-background sample.
+            let Some(a) = Region::from_dense(grid, &a_bits)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+            else {
+                return Ok(());
             };
+            let Some(b) = Region::from_dense(grid, &b_bits)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+            else {
+                return Ok(());
+            };
+            let intersection = a_bits.iter().zip(&b_bits).filter(|(x, y)| **x && **y).count();
+            // Both masks are non-empty, so the union is positive.
+            let union = a_bits.iter().zip(&b_bits).filter(|(x, y)| **x || **y).count();
+            let expected = intersection as f64 / union as f64;
             let actual = a
                 .intersection_over_union(&b)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;

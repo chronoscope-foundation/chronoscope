@@ -277,7 +277,7 @@ impl Sam3 {
         let logits = &masks[best * low * low..(best + 1) * low * low];
         let region = upsample_mask(logits, low, encoded.original).map_err(RectError::Mask)?;
 
-        Ok((!region.is_empty()).then_some(ScoredRegion {
+        Ok(region.map(|region| ScoredRegion {
             region,
             score: ious[best],
         }))
@@ -368,12 +368,14 @@ impl Sam3 {
         }
 
         // A kept instance whose thresholded mask is nonetheless empty carries no
-        // pixels to segment, so it is dropped the way an empty box mask is.
+        // pixels to segment: `from_dense` returns `None` and it is dropped the way
+        // an empty box mask is.
         let mut regions = Vec::with_capacity(scores.len());
         for (index, &score) in scores.iter().enumerate() {
             let plane = &masks[index * pixels..(index + 1) * pixels];
-            let region = Region::from_dense(encoded.original, plane).map_err(ConceptError::Mask)?;
-            if !region.is_empty() {
+            if let Some(region) =
+                Region::from_dense(encoded.original, plane).map_err(ConceptError::Mask)?
+            {
                 regions.push(ScoredRegion { region, score });
             }
         }
@@ -480,8 +482,13 @@ fn extract_bool(
 
 /// Bilinearly upsamples the decoder's square low-resolution mask logits to the
 /// original grid and thresholds at zero, the finish `Sam3Processor` applies. The
-/// mask decode is resolution-independent, so the caller owns this step.
-fn upsample_mask(logits: &[f32], low: usize, grid: Dimensions) -> Result<Region, MaskError> {
+/// mask decode is resolution-independent, so the caller owns this step. `None`
+/// when the thresholded mask is empty, since an empty mask is not a region.
+fn upsample_mask(
+    logits: &[f32],
+    low: usize,
+    grid: Dimensions,
+) -> Result<Option<Region>, MaskError> {
     let (Some(low_side), Some(width), Some(height)) = (
         positive_extent(low),
         positive_extent(grid.width() as usize),

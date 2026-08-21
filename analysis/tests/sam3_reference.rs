@@ -104,7 +104,8 @@ fn reference_region(path: &Path, width: u32, height: u32) -> Result<Region, Box<
         .into());
     }
     let dense: Vec<bool> = luma.pixels().map(|pixel| pixel.0[0] > 127).collect();
-    Ok(Region::from_dense(Dimensions::new(width, height)?, &dense)?)
+    Region::from_dense(Dimensions::new(width, height)?, &dense)?
+        .ok_or_else(|| format!("{path:?} reference mask has no foreground").into())
 }
 
 /// Reads the fixture's `reference.json` and opens the export it names.
@@ -185,11 +186,12 @@ fn compare(
 
 /// The union of every region's pixels on the source grid, the shape the concept
 /// comparison reads: the torch reference records one union mask per prompt, so
-/// the Rust instances are OR'd to match it.
+/// the Rust instances are OR'd to match it. `None` when there are no regions, so
+/// the union has no foreground.
 fn union(
     regions: &[ScoredRegion],
     dimensions: Dimensions,
-) -> Result<Region, Box<dyn error::Error>> {
+) -> Result<Option<Region>, Box<dyn error::Error>> {
     let extent = (dimensions.width() as usize) * (dimensions.height() as usize);
     let mut dense = vec![false; extent];
     for scored in regions {
@@ -256,13 +258,13 @@ fn compare_concept(
             entry.source.height,
         )?;
 
-        // Two empty unions agree perfectly on "nothing here"; the IoU of a pair of
-        // empty masks is otherwise undefined.
-        let iou = if ours.is_empty() && torch.is_empty() {
-            1.0
-        } else {
-            ours.intersection_over_union(&torch)
-                .map_err(|source| format!("{}: {source}", entry.id))?
+        // `torch` is non-empty (reference_region rejects an empty mask); if the
+        // Rust side produced no regions, that is a miss and scores 0.
+        let iou = match &ours {
+            Some(region) => region
+                .intersection_over_union(&torch)
+                .map_err(|source| format!("{}: {source}", entry.id))?,
+            None => 0.0,
         };
 
         let mut ours_scores: Vec<f64> = regions

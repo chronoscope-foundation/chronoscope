@@ -539,7 +539,8 @@ fn golden_image_geometry_region_locks_run_length_mask() -> Result<()> {
     // trips. The 2x2 diagonal encodes as background 1, foreground 2, background
     // 1.
     let geometry = ImageGeometry::Region {
-        region: Region::from_dense(Dimensions::new(2, 2)?, &[false, true, true, false])?,
+        region: Region::from_dense(Dimensions::new(2, 2)?, &[false, true, true, false])?
+            .ok_or("non-empty")?,
     };
     assert_golden_roundtrip(
         &geometry,

@@ -14,6 +14,7 @@ pub mod dinov3;
 mod model_manifest;
 pub mod onnx;
 pub mod pipeline;
+pub mod postprocess;
 mod preprocess;
 pub mod qwen3;
 pub mod sam3;
