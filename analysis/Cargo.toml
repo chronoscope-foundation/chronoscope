@@ -80,6 +80,13 @@ image = { version = "0.25", default-features = false, features = [
     "png",
 ] }
 
+# SAM 3's concept/text prompt tokenizes with the standard CLIP BPE. The
+# `facebook/sam3` `tokenizer.json` (pinned in the export's closure) loads through
+# this crate byte-identically to sam3's own `SimpleTokenizer`; the runner only
+# owes the pad-to-32-with-0 the graph's `(tokens != 0)` mask reads. Already in the
+# closure via mistral.rs, so a direct dependency is free.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
 # SAM 3 masks are `core`'s `Region`, and box prompts are its `ProportionalRect`,
 # so the analysis pipeline speaks the grammar's geometry directly.
 chronoscope-core = { path = "../core" }

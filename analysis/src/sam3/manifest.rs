@@ -29,6 +29,10 @@ use crate::model_manifest::Signature;
 /// The encoder's one image input, named by the export.
 const INPUT: &str = "image";
 
+/// The CLIP tokenizer the export lays in its root, beside the per-graph
+/// directories, for the concept prompt.
+const TOKENIZER_FILE: &str = "tokenizer.json";
+
 /// RGB planes, the only channel count the encoder takes and what `to_rgb8`
 /// produces. Its position first in the input shape is what makes the shape
 /// channel-first.
@@ -41,6 +45,18 @@ const CHANNELS: i64 = 3;
 pub(crate) struct SamManifest {
     pub(crate) image_encoder: PathBuf,
     pub(crate) decoder: PathBuf,
+    /// The grounding decoder — the concept/text path: it reads the encoder's
+    /// grounding pyramid plus the language encoder's features and emits every
+    /// instance of the prompted concept, where the interactive `decoder` reads
+    /// point/box prompts for one object.
+    pub(crate) grounding_decoder: PathBuf,
+    /// The language encoder: token ids in, the text features + mask the grounding
+    /// decoder conditions on out.
+    pub(crate) language_encoder: PathBuf,
+    /// The CLIP BPE `tokenizer.json` the export lays beside its graphs. Not a
+    /// graph, so no signature to validate; the concept tokenizer surfaces a
+    /// missing or malformed file when it loads.
+    pub(crate) tokenizer: PathBuf,
     /// The square side the encoder takes, derived from its input shape; the
     /// caller stretches to it.
     pub(crate) resolution: usize,
@@ -121,6 +137,9 @@ impl SamManifest {
         Ok(Self {
             image_encoder: export.join(encoder.graph),
             decoder: export.join(decoder.graph),
+            grounding_decoder: export.join(wire.decoder.graph),
+            language_encoder: export.join(wire.language_encoder.graph),
+            tokenizer: export.join(TOKENIZER_FILE),
             resolution,
             low_res_mask_size: decoder.low_res_mask_size,
             candidates: decoder.candidates,
@@ -179,13 +198,24 @@ pub enum ManifestInvalid {
     Candidates,
 }
 
-/// The two graphs this crate drives. The catalog's other graphs (the grounding
-/// decoder and language encoder) are dropped, since the wire does not
-/// `deny_unknown_fields`.
+/// The graphs this crate drives. The interactive path reads the encoder and the
+/// interactive decoder; the concept path adds the grounding decoder and the
+/// language encoder. Only their signatures the caller reads with are validated;
+/// the rest of the catalog is dropped (no `deny_unknown_fields`).
 #[derive(Deserialize)]
 struct Wire {
     image_encoder: Encoder,
     decoder_interactive: Decoder,
+    decoder: GraphOnly,
+    language_encoder: GraphOnly,
+}
+
+/// A graph whose input/output signature stays catalog: a drift is caught at
+/// runtime by the session rejecting a wrong-named feed, so the manifest reads
+/// only its path.
+#[derive(Deserialize)]
+struct GraphOnly {
+    graph: PathBuf,
 }
 
 /// The image encoder: its graph, its input signature, and the preprocessing the
@@ -229,7 +259,9 @@ mod tests {
                 "graph": "decoder_interactive/sam3_decoder_interactive.onnx",
                 "low_res_mask_size": 288,
                 "candidates": 3
-            }
+            },
+            "decoder": { "graph": "decoder/sam3_decoder.onnx" },
+            "language_encoder": { "graph": "language_encoder/sam3_language_encoder.onnx" }
         })
     }
 
@@ -248,6 +280,15 @@ mod tests {
             manifest.decoder,
             Path::new("/export/decoder_interactive/sam3_decoder_interactive.onnx")
         );
+        assert_eq!(
+            manifest.grounding_decoder,
+            Path::new("/export/decoder/sam3_decoder.onnx")
+        );
+        assert_eq!(
+            manifest.language_encoder,
+            Path::new("/export/language_encoder/sam3_language_encoder.onnx")
+        );
+        assert_eq!(manifest.tokenizer, Path::new("/export/tokenizer.json"));
         Ok(())
     }
 

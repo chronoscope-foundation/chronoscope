@@ -252,7 +252,12 @@
 
         analysis = import ./nix/analysis.nix {
           inherit pkgs lib craneLib;
-          inherit (models) sam3Cache dinov3Repo qwenVlm;
+          inherit (models)
+            sam3Cache
+            sam3Repo
+            dinov3Repo
+            qwenVlm
+            ;
           corpusImageFiles = corpus.imageFiles;
           rustCommonArgs = rust.commonArgs;
           inherit (rust) cargoArtifacts;

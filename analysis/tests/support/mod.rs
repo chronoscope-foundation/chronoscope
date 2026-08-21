@@ -21,17 +21,18 @@ pub fn describe(error: &dyn error::Error) -> String {
     message
 }
 
-/// The CoreML cache root the comparison runs against, if any. Held by the caller
+/// The CoreML compiled-model cache root, from `COREML_CACHE`. Held by the caller
 /// because [`Accel::CoreML`] borrows it; pair with [`accel`].
 ///
-/// `COREML_CACHE`, when set to a precompiled cache root, runs the comparison on
-/// the CoreML backend instead of CPU, so the recorded fixtures double as a
-/// CoreML-against-CPU numeric check. Unset (the gate, `just model-test`) is CPU.
+/// `just model-test` sets it, so the comparisons run on CoreML, the backend the
+/// pipeline runs. It is `Option` only so the tests still run on a platform
+/// without CoreML (no cache set, CPU fallback).
 pub fn coreml_cache_root() -> Option<PathBuf> {
     env::var_os("COREML_CACHE").map(PathBuf::from)
 }
 
-/// The [`Accel`] a cache root selects: CoreML when present, CPU otherwise.
+/// The [`Accel`] a cache root selects: CoreML when set, CPU where CoreML is
+/// unavailable.
 pub fn accel(cache_root: Option<&Path>) -> Accel<'_> {
     cache_root.map_or(Accel::Cpu, |root| Accel::CoreML { cache_root: root })
 }

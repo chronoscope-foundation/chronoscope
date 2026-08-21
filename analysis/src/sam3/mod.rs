@@ -15,6 +15,7 @@
 //! thing that differs between the two.
 
 mod manifest;
+mod tokenizer;
 
 use std::path::Path;
 
@@ -33,17 +34,62 @@ use crate::{
     preprocess::{CHANNELS, ChwImage, ResizeError, positive_extent},
 };
 use manifest::SamManifest;
+use tokenizer::{CONTEXT_LEN, ConceptTokenizer};
 
 pub use manifest::{ManifestError, ManifestInvalid};
+pub use tokenizer::TokenizerError;
 
 /// The encoder's one input, named by the export.
 const IMAGE_INPUT: &str = "image";
 
 /// The interactive features the encoder emits (alongside the grounding pyramid
-/// the concept head would read) and the decoder consumes.
+/// the concept head reads) and the interactive decoder consumes.
 const IMAGE_EMBED: &str = "image_embed";
 const HIGH_RES_FEAT_0: &str = "high_res_feat_0";
 const HIGH_RES_FEAT_1: &str = "high_res_feat_1";
+
+/// The grounding pyramid the same encoder pass emits and the concept decoder
+/// reads. The export names six (`vision_pos_enc_0/1/2`, `backbone_fpn_0/1/2`),
+/// but the traced grounding graph consumes only the coarsest positional encoding
+/// and all three feature maps; `torch.onnx.export` const-folds the two unread
+/// encodings away, so these four are the graph's real grounding inputs.
+const VISION_POS_ENC_2: &str = "vision_pos_enc_2";
+const BACKBONE_FPN_0: &str = "backbone_fpn_0";
+const BACKBONE_FPN_1: &str = "backbone_fpn_1";
+const BACKBONE_FPN_2: &str = "backbone_fpn_2";
+
+/// The language encoder's one input and the two outputs the grounding decoder
+/// conditions on. Its third output (`text_embeds`) is named at export but unread
+/// by the traced graph, so the runner never extracts it.
+const TOKENS: &str = "tokens";
+const TEXT_ATTENTION_MASK: &str = "text_attention_mask";
+const TEXT_MEMORY: &str = "text_memory";
+
+/// The grounding decoder's inputs the interactive path does not share: the
+/// original grid its masks are resized to, the language conditioning, and the
+/// box-exemplar triple. A text-only prompt sends the export's "no real box"
+/// convention — zero coords, label 1, and `box_masks = true` (true masks the
+/// exemplar out).
+const ORIGINAL_HEIGHT: &str = "original_height";
+const ORIGINAL_WIDTH: &str = "original_width";
+const LANGUAGE_MASK: &str = "language_mask";
+const LANGUAGE_FEATURES: &str = "language_features";
+const BOX_COORDS: &str = "box_coords";
+const BOX_LABELS: &str = "box_labels";
+const BOX_MASKS: &str = "box_masks";
+
+/// The grounding decoder's outputs the runner reads: the per-instance
+/// probabilities and the boolean masks. `boxes` is emitted too but the mask is
+/// the region, so it goes unread.
+const SCORES: &str = "scores";
+const MASKS: &str = "masks";
+
+/// The four graphs' names, shared by `session_for` and `GraphError` so a graph's
+/// label — the one an error names — is defined once.
+const IMAGE_ENCODER: &str = "image_encoder";
+const DECODER: &str = "decoder";
+const LANGUAGE_ENCODER: &str = "language_encoder";
+const GROUNDING_DECODER: &str = "grounding_decoder";
 
 /// Pins the decoder's `num_points` axis (the export left it symbolic) to the two
 /// the box path always sends: its corners, labels 2 and 3.
@@ -71,38 +117,64 @@ impl FeatureMap {
     }
 }
 
-/// The image encoder's output, run once and reused across every prompt: the
-/// SAM-style interactive features the decoder consumes and the original image's
-/// grid, which the decoder's masks are scaled to.
+/// The image encoder's output, run once and reused across every prompt: the two
+/// feature families the one backbone pass emits — the SAM-style interactive
+/// features [`segment_rect`](Sam3::segment_rect) consumes and the grounding
+/// pyramid [`segment_concept`](Sam3::segment_concept) reads — plus the original
+/// image's grid, which either decoder's masks are scaled to.
 pub struct EncodedImage {
     original: Dimensions,
     image_embed: FeatureMap,
     high_res_feat_0: FeatureMap,
     high_res_feat_1: FeatureMap,
+    vision_pos_enc_2: FeatureMap,
+    backbone_fpn_0: FeatureMap,
+    backbone_fpn_1: FeatureMap,
+    backbone_fpn_2: FeatureMap,
 }
 
-/// One loaded SAM 3 model, driven through its interactive head: the two graphs,
-/// the square to feed the encoder, and the mask-decode shape.
+/// One loaded SAM 3 model, driven through both its heads: the four graphs and
+/// the CLIP tokenizer the concept prompt needs, the square to feed the encoder,
+/// and the interactive mask-decode shape.
 pub struct Sam3 {
     encoder: Session,
     decoder: Session,
+    grounding_decoder: Session,
+    language_encoder: Session,
+    tokenizer: ConceptTokenizer,
     resolution: usize,
     low_res_mask_size: usize,
     candidates: usize,
 }
 
 impl Sam3 {
-    /// Loads the export's manifest and opens the image encoder and the
-    /// interactive decoder, ready to encode and prompt.
+    /// Loads the export's manifest and opens all four graphs plus the concept
+    /// tokenizer, ready to encode and prompt through either head.
+    ///
+    /// The grounding decoder is opened without the interactive decoder's static
+    /// `num_points` pin: its instance count and its original-grid mask size are
+    /// both dynamic, so it partitions to CPU regardless, and there is no axis to
+    /// fix. The image encode it reads still runs on `accel`.
     pub fn open(export: &Path, accel: Accel) -> Result<Self, OpenError> {
         let manifest = SamManifest::load(export).map_err(OpenError::Manifest)?;
-        let encoder = onnx::session_for(&manifest.image_encoder, accel, "image_encoder", &[])
+        let encoder = onnx::session_for(&manifest.image_encoder, accel, IMAGE_ENCODER, &[])
             .map_err(OpenError::Session)?;
-        let decoder = onnx::session_for(&manifest.decoder, accel, "decoder", DECODER_DIMS)
+        let decoder = onnx::session_for(&manifest.decoder, accel, DECODER, DECODER_DIMS)
             .map_err(OpenError::Session)?;
+        let grounding_decoder =
+            onnx::session_for(&manifest.grounding_decoder, accel, GROUNDING_DECODER, &[])
+                .map_err(OpenError::Session)?;
+        let language_encoder =
+            onnx::session_for(&manifest.language_encoder, accel, LANGUAGE_ENCODER, &[])
+                .map_err(OpenError::Session)?;
+        let tokenizer =
+            ConceptTokenizer::load(&manifest.tokenizer).map_err(OpenError::Tokenizer)?;
         Ok(Self {
             encoder,
             decoder,
+            grounding_decoder,
+            language_encoder,
+            tokenizer,
             resolution: manifest.resolution,
             low_res_mask_size: manifest.low_res_mask_size,
             candidates: manifest.candidates,
@@ -127,19 +199,23 @@ impl Sam3 {
             square.height() as i64,
             square.width() as i64,
         ];
-        let input =
-            TensorRef::from_array_view((shape, square.samples())).map_err(EncodeError::Input)?;
+        let tensor =
+            TensorRef::from_array_view((shape, square.samples())).map_err(input(IMAGE_ENCODER))?;
 
         let outputs = self
             .encoder
-            .run(ort::inputs![IMAGE_INPUT => input])
-            .map_err(EncodeError::Run)?;
+            .run(ort::inputs![IMAGE_INPUT => tensor])
+            .map_err(run(IMAGE_ENCODER))?;
 
         Ok(EncodedImage {
             original,
-            image_embed: feature_map(&outputs, IMAGE_EMBED)?,
-            high_res_feat_0: feature_map(&outputs, HIGH_RES_FEAT_0)?,
-            high_res_feat_1: feature_map(&outputs, HIGH_RES_FEAT_1)?,
+            image_embed: feature_map(&outputs, IMAGE_ENCODER, IMAGE_EMBED)?,
+            high_res_feat_0: feature_map(&outputs, IMAGE_ENCODER, HIGH_RES_FEAT_0)?,
+            high_res_feat_1: feature_map(&outputs, IMAGE_ENCODER, HIGH_RES_FEAT_1)?,
+            vision_pos_enc_2: feature_map(&outputs, IMAGE_ENCODER, VISION_POS_ENC_2)?,
+            backbone_fpn_0: feature_map(&outputs, IMAGE_ENCODER, BACKBONE_FPN_0)?,
+            backbone_fpn_1: feature_map(&outputs, IMAGE_ENCODER, BACKBONE_FPN_1)?,
+            backbone_fpn_2: feature_map(&outputs, IMAGE_ENCODER, BACKBONE_FPN_2)?,
         })
     }
 
@@ -156,7 +232,7 @@ impl Sam3 {
         &mut self,
         encoded: &EncodedImage,
         rect: &ProportionalRect,
-    ) -> Result<Option<ScoredRegion>, SegmentError> {
+    ) -> Result<Option<ScoredRegion>, RectError> {
         let side = self.resolution as f32;
         let point_coords = [
             rect.x() as f32 * side,
@@ -169,16 +245,16 @@ impl Sam3 {
         let outputs = self
             .decoder
             .run(ort::inputs![
-                IMAGE_EMBED => encoded.image_embed.tensor().map_err(SegmentError::Input)?,
-                HIGH_RES_FEAT_0 => encoded.high_res_feat_0.tensor().map_err(SegmentError::Input)?,
-                HIGH_RES_FEAT_1 => encoded.high_res_feat_1.tensor().map_err(SegmentError::Input)?,
-                "point_coords" => TensorRef::from_array_view((vec![1_i64, 2, 2], point_coords.as_slice())).map_err(SegmentError::Input)?,
-                "point_labels" => TensorRef::from_array_view((vec![1_i64, 2], point_labels.as_slice())).map_err(SegmentError::Input)?,
+                IMAGE_EMBED => encoded.image_embed.tensor().map_err(input(DECODER))?,
+                HIGH_RES_FEAT_0 => encoded.high_res_feat_0.tensor().map_err(input(DECODER))?,
+                HIGH_RES_FEAT_1 => encoded.high_res_feat_1.tensor().map_err(input(DECODER))?,
+                "point_coords" => TensorRef::from_array_view((vec![1_i64, 2, 2], point_coords.as_slice())).map_err(input(DECODER))?,
+                "point_labels" => TensorRef::from_array_view((vec![1_i64, 2], point_labels.as_slice())).map_err(input(DECODER))?,
             ])
-            .map_err(SegmentError::Run)?;
+            .map_err(run(DECODER))?;
 
-        let ious = extract(&outputs, "iou_predictions")?;
-        let masks = extract(&outputs, "low_res_masks")?;
+        let ious = extract(&outputs, DECODER, "iou_predictions")?;
+        let masks = extract(&outputs, DECODER, "low_res_masks")?;
 
         // The decoder emits `candidates` low-resolution mask logits and one IoU
         // each: `low_res_masks` is `[1, candidates, low, low]`, `iou_predictions`
@@ -186,7 +262,7 @@ impl Sam3 {
         // bounds.
         let low = self.low_res_mask_size;
         if ious.len() != self.candidates || masks.len() != self.candidates * low * low {
-            return Err(SegmentError::OutputShape {
+            return Err(RectError::OutputShape {
                 ious: ious.len(),
                 masks: masks.len(),
             });
@@ -197,31 +273,146 @@ impl Sam3 {
             .enumerate()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(index, _)| index)
-            .ok_or(SegmentError::NoCandidates)?;
+            .ok_or(RectError::NoCandidates)?;
         let logits = &masks[best * low * low..(best + 1) * low * low];
-        let region = upsample_mask(logits, low, encoded.original).map_err(SegmentError::Mask)?;
+        let region = upsample_mask(logits, low, encoded.original).map_err(RectError::Mask)?;
 
         Ok((!region.is_empty()).then_some(ScoredRegion {
             region,
             score: ious[best],
         }))
     }
+
+    /// Detects and segments every instance of a text concept — the concept
+    /// head's task, where [`segment_rect`](Self::segment_rect) segments the one
+    /// object a box points at.
+    ///
+    /// The prompt tokenizes to the CLIP context and conditions the grounding
+    /// decoder through the language encoder; the box-exemplar inputs carry the
+    /// export's "no real box" convention (`box_masks = true` masks the exemplar
+    /// out) so the detection is text-only. The graph applies its own 0.5
+    /// confidence filter and resizes each surviving mask to the original grid
+    /// already thresholded, so the runner reads instances straight out — no
+    /// candidate pick and no upsample. An empty result means the model found none
+    /// of the concept.
+    pub fn segment_concept(
+        &mut self,
+        encoded: &EncodedImage,
+        prompt: &str,
+    ) -> Result<Vec<ScoredRegion>, ConceptError> {
+        let tokens = self
+            .tokenizer
+            .encode(prompt)
+            .map_err(ConceptError::Tokenize)?;
+        let encoded_text = self
+            .language_encoder
+            .run(ort::inputs![
+                TOKENS => TensorRef::from_array_view((vec![1_i64, CONTEXT_LEN as i64], tokens.as_slice())).map_err(input(LANGUAGE_ENCODER))?,
+            ])
+            .map_err(run(LANGUAGE_ENCODER))?;
+
+        // The grounding run reuses these, so both language outputs are lifted to
+        // owned buffers and the language session's outputs dropped before it.
+        let language_mask = extract_bool(&encoded_text, LANGUAGE_ENCODER, TEXT_ATTENTION_MASK)?;
+        let language_features = feature_map(&encoded_text, LANGUAGE_ENCODER, TEXT_MEMORY)?;
+        drop(encoded_text);
+
+        let height = i64::from(encoded.original.height());
+        let width = i64::from(encoded.original.width());
+        // The export's text-only exemplar: zero coords, label 1, masked out.
+        let box_coords = [0.0_f32; 4];
+        let box_labels = [1_i64];
+        let box_masks = [true];
+
+        let outputs = self
+            .grounding_decoder
+            .run(ort::inputs![
+                ORIGINAL_HEIGHT => TensorRef::from_array_view((Vec::<i64>::new(), [height].as_slice())).map_err(input(GROUNDING_DECODER))?,
+                ORIGINAL_WIDTH => TensorRef::from_array_view((Vec::<i64>::new(), [width].as_slice())).map_err(input(GROUNDING_DECODER))?,
+                VISION_POS_ENC_2 => encoded.vision_pos_enc_2.tensor().map_err(input(GROUNDING_DECODER))?,
+                BACKBONE_FPN_0 => encoded.backbone_fpn_0.tensor().map_err(input(GROUNDING_DECODER))?,
+                BACKBONE_FPN_1 => encoded.backbone_fpn_1.tensor().map_err(input(GROUNDING_DECODER))?,
+                BACKBONE_FPN_2 => encoded.backbone_fpn_2.tensor().map_err(input(GROUNDING_DECODER))?,
+                LANGUAGE_MASK => TensorRef::from_array_view((language_mask.shape, language_mask.data.as_slice())).map_err(input(GROUNDING_DECODER))?,
+                LANGUAGE_FEATURES => language_features.tensor().map_err(input(GROUNDING_DECODER))?,
+                BOX_COORDS => TensorRef::from_array_view((vec![1_i64, 1, 4], box_coords.as_slice())).map_err(input(GROUNDING_DECODER))?,
+                BOX_LABELS => TensorRef::from_array_view((vec![1_i64, 1], box_labels.as_slice())).map_err(input(GROUNDING_DECODER))?,
+                BOX_MASKS => TensorRef::from_array_view((vec![1_i64, 1], box_masks.as_slice())).map_err(input(GROUNDING_DECODER))?,
+            ])
+            .map_err(run(GROUNDING_DECODER))?;
+
+        let scores = extract(&outputs, GROUNDING_DECODER, SCORES)?;
+        let (_, masks) = outputs
+            .get(MASKS)
+            .ok_or(GraphError::MissingOutput {
+                graph: GROUNDING_DECODER,
+                name: MASKS,
+            })?
+            .try_extract_tensor::<bool>()
+            .map_err(|source| GraphError::OutputType {
+                graph: GROUNDING_DECODER,
+                name: MASKS,
+                source,
+            })?;
+
+        // The graph resizes every kept instance's mask to the original grid, so
+        // each is one `original`-sized boolean plane; the channel axis it carries
+        // is a singleton and folds into the per-instance stride.
+        let pixels = (height as usize) * (width as usize);
+        if masks.len() != scores.len() * pixels {
+            return Err(ConceptError::OutputShape {
+                scores: scores.len(),
+                masks: masks.len(),
+                pixels,
+            });
+        }
+
+        // A kept instance whose thresholded mask is nonetheless empty carries no
+        // pixels to segment, so it is dropped the way an empty box mask is.
+        let mut regions = Vec::with_capacity(scores.len());
+        for (index, &score) in scores.iter().enumerate() {
+            let plane = &masks[index * pixels..(index + 1) * pixels];
+            let region = Region::from_dense(encoded.original, plane).map_err(ConceptError::Mask)?;
+            if !region.is_empty() {
+                regions.push(ScoredRegion { region, score });
+            }
+        }
+        Ok(regions)
+    }
 }
 
-/// Extracts one named encoder output as an owned [`FeatureMap`], rejecting a
-/// non-finite value that would poison the decoder.
+/// Curries a graph label into a `GraphError::Input` / `::Run` constructor, for a
+/// tidy `map_err` at the many tensor-build and graph-run call sites.
+fn input(graph: &'static str) -> impl Fn(ort::Error) -> GraphError {
+    move |source| GraphError::Input { graph, source }
+}
+
+fn run(graph: &'static str) -> impl Fn(ort::Error) -> GraphError {
+    move |source| GraphError::Run { graph, source }
+}
+
+/// Extracts one named f32 output as an owned [`FeatureMap`], rejecting a
+/// non-finite value that would poison a downstream graph. Owned because the
+/// encoder's features outlive their `outputs`, and the language features re-feed
+/// the grounding decoder after its own outputs drop.
 fn feature_map(
     outputs: &ort::session::SessionOutputs,
+    graph: &'static str,
     name: &'static str,
-) -> Result<FeatureMap, EncodeError> {
+) -> Result<FeatureMap, GraphError> {
     let output = outputs
         .get(name)
-        .ok_or(EncodeError::MissingOutput { name })?;
-    let (shape, data) = output
-        .try_extract_tensor::<f32>()
-        .map_err(|source| EncodeError::OutputType { name, source })?;
+        .ok_or(GraphError::MissingOutput { graph, name })?;
+    let (shape, data) =
+        output
+            .try_extract_tensor::<f32>()
+            .map_err(|source| GraphError::OutputType {
+                graph,
+                name,
+                source,
+            })?;
     if data.iter().any(|value| !value.is_finite()) {
-        return Err(EncodeError::NonFinite { name });
+        return Err(GraphError::NonFinite { graph, name });
     }
     Ok(FeatureMap {
         shape: shape.to_vec(),
@@ -229,26 +420,62 @@ fn feature_map(
     })
 }
 
-/// Extracts a named f32 decoder output as a slice, rejecting a non-finite value.
+/// Extracts a named f32 output as a slice, rejecting a non-finite value.
 ///
-/// Symmetric with [`feature_map`] on the encoder side: a `NaN` `iou_predictions`
-/// sorts as the maximum under `total_cmp`, so an unchecked `NaN` would be picked
-/// as the best candidate and silently thresholded to an empty mask rather than
-/// surfacing the corrupt decode.
+/// A `NaN` `iou_predictions` sorts as the maximum under `total_cmp`, so an
+/// unchecked `NaN` would be picked as the best candidate and silently thresholded
+/// to an empty mask rather than surfacing the corrupt decode.
 fn extract<'a>(
     outputs: &'a ort::session::SessionOutputs,
+    graph: &'static str,
     name: &'static str,
-) -> Result<&'a [f32], SegmentError> {
+) -> Result<&'a [f32], GraphError> {
     let output = outputs
         .get(name)
-        .ok_or(SegmentError::MissingOutput { name })?;
-    let (_, data) = output
-        .try_extract_tensor::<f32>()
-        .map_err(|source| SegmentError::OutputType { name, source })?;
+        .ok_or(GraphError::MissingOutput { graph, name })?;
+    let (_, data) =
+        output
+            .try_extract_tensor::<f32>()
+            .map_err(|source| GraphError::OutputType {
+                graph,
+                name,
+                source,
+            })?;
     if data.iter().any(|value| !value.is_finite()) {
-        return Err(SegmentError::NonFinite { name });
+        return Err(GraphError::NonFinite { graph, name });
     }
     Ok(data)
+}
+
+/// One owned boolean tensor: the language mask, lifted off the language session
+/// so it survives into the grounding run.
+struct BoolTensor {
+    shape: Vec<i64>,
+    data: Vec<bool>,
+}
+
+/// Lifts a named boolean output to an owned [`BoolTensor`]. No finiteness check:
+/// a bool has no non-finite value to reject.
+fn extract_bool(
+    outputs: &ort::session::SessionOutputs,
+    graph: &'static str,
+    name: &'static str,
+) -> Result<BoolTensor, GraphError> {
+    let output = outputs
+        .get(name)
+        .ok_or(GraphError::MissingOutput { graph, name })?;
+    let (shape, data) =
+        output
+            .try_extract_tensor::<bool>()
+            .map_err(|source| GraphError::OutputType {
+                graph,
+                name,
+                source,
+            })?;
+    Ok(BoolTensor {
+        shape: shape.to_vec(),
+        data: data.to_vec(),
+    })
 }
 
 /// Bilinearly upsamples the decoder's square low-resolution mask logits to the
@@ -325,60 +552,73 @@ pub enum OpenError {
 
     #[error("a graph could not be opened")]
     Session(#[source] SessionError),
+
+    #[error("the concept tokenizer could not be loaded")]
+    Tokenizer(#[source] TokenizerError),
+}
+
+/// The failure modes of feeding an ONNX graph and reading its tensors, shared by
+/// every model op. Each names the graph it happened on, so one `Run` serves the
+/// encoder, either decoder, and the language encoder while still saying which.
+#[derive(Debug, Error)]
+pub enum GraphError {
+    #[error("could not build a `{graph}` input tensor")]
+    Input {
+        graph: &'static str,
+        #[source]
+        source: ort::Error,
+    },
+
+    #[error("the `{graph}` graph failed to run")]
+    Run {
+        graph: &'static str,
+        #[source]
+        source: ort::Error,
+    },
+
+    #[error("`{graph}` produced no `{name}` output")]
+    MissingOutput {
+        graph: &'static str,
+        name: &'static str,
+    },
+
+    #[error("`{graph}` output `{name}` is not the expected tensor type")]
+    OutputType {
+        graph: &'static str,
+        name: &'static str,
+        #[source]
+        source: ort::Error,
+    },
+
+    #[error("`{graph}` output `{name}` holds a non-finite value")]
+    NonFinite {
+        graph: &'static str,
+        name: &'static str,
+    },
 }
 
 /// Why `encode` could not turn a decoded image into features.
 #[derive(Debug, Error)]
 pub enum EncodeError {
+    #[error(transparent)]
+    Graph(#[from] GraphError),
+
     #[error("the image grid is not one the model can localize into")]
     Original(#[source] RegionError),
 
     #[error("could not resample the image to the encoder's square")]
     Resize(#[source] ResizeError),
-
-    #[error("could not build the encoder input tensor")]
-    Input(#[source] ort::Error),
-
-    #[error("the image encoder failed to run")]
-    Run(#[source] ort::Error),
-
-    #[error("the encoder produced no `{name}` output")]
-    MissingOutput { name: &'static str },
-
-    #[error("encoder output `{name}` is not an f32 tensor")]
-    OutputType {
-        name: &'static str,
-        #[source]
-        source: ort::Error,
-    },
-
-    #[error("encoder output `{name}` holds a non-finite value")]
-    NonFinite { name: &'static str },
 }
 
 /// Why `segment_rect` could not turn a box into a region.
 #[derive(Debug, Error)]
-pub enum SegmentError {
-    #[error("could not build a decoder input tensor")]
-    Input(#[source] ort::Error),
+pub enum RectError {
+    #[error(transparent)]
+    Graph(#[from] GraphError),
 
-    #[error("the decoder failed to run")]
-    Run(#[source] ort::Error),
-
-    #[error("the decoder produced no `{name}` output")]
-    MissingOutput { name: &'static str },
-
-    #[error("decoder output `{name}` is not an f32 tensor")]
-    OutputType {
-        name: &'static str,
-        #[source]
-        source: ort::Error,
-    },
-
-    #[error("decoder output `{name}` holds a non-finite value")]
-    NonFinite { name: &'static str },
-
-    #[error("decoder returned {ious} scores and {masks} mask values, not the declared candidates")]
+    #[error(
+        "the decoder returned {ious} scores and {masks} mask values, not the declared candidates"
+    )]
     OutputShape { ious: usize, masks: usize },
 
     #[error("the decoder returned no candidates to choose from")]
@@ -386,4 +626,27 @@ pub enum SegmentError {
 
     #[error("the decoder mask could not be resolved")]
     Mask(#[source] MaskError),
+}
+
+/// Why `segment_concept` could not turn a text prompt into regions.
+#[derive(Debug, Error)]
+pub enum ConceptError {
+    #[error(transparent)]
+    Graph(#[from] GraphError),
+
+    #[error("the prompt could not be tokenized")]
+    Tokenize(#[source] TokenizerError),
+
+    #[error(
+        "the grounding decoder returned {scores} scores but {masks} mask values, \
+         not a whole number of {pixels}-pixel planes"
+    )]
+    OutputShape {
+        scores: usize,
+        masks: usize,
+        pixels: usize,
+    },
+
+    #[error("a grounding mask could not be resolved into a region")]
+    Mask(#[source] RegionError),
 }

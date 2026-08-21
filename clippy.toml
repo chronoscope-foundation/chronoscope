@@ -11,6 +11,7 @@ doc-valid-idents = [
     "GeoJSON",
     "GeoNames",
     "IPv4",
+    "IoU",
     "JsonSchema",
     "IPv6",
     "MapLibre",

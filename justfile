@@ -829,4 +829,12 @@ model-test:
     # filename lives only in the derivation.
     nix build .#qwen-vlm-uqff --out-link .nix-gc-roots/qwen-vlm-uqff
     export QWEN_MODEL_FIRST_SHARD="$(nix eval --raw .#qwen-vlm-uqff.firstShard)"
+    # CoreML is the backend the pipeline runs, so the comparisons run on it. A
+    # stable cache dir lets a rerun reuse the compiled models rather than
+    # recompiling each graph; target/ is gitignored. Set only where CoreML exists,
+    # so the tests fall back to CPU on a platform without it.
+    if [ "$(uname)" = "Darwin" ]; then
+        export COREML_CACHE="$PWD/target/coreml-cache"
+        mkdir -p "$COREML_CACHE"
+    fi
     cargo test -p chronoscope-analysis -- --ignored

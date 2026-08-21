@@ -9,6 +9,9 @@
   lib,
   craneLib,
   sam3Cache,
+  # The SAM 3 HF repo itself, for the CLIP `tokenizer.json` the concept prompt
+  # needs; the export lays it beside its graphs so the crate's closure carries it.
+  sam3Repo,
   dinov3Repo,
   # Entry ID → image file, from nix/corpus.nix. Only the reference set below is
   # ever selected from it, so the other FODs are never realized.
@@ -216,6 +219,12 @@ let
         export HOME="$TMPDIR"
         mkdir -p "$out"
         python ${./scripts/export-sam3.py} "$out"
+
+        # The concept prompt tokenizes with SAM 3's CLIP BPE. Laying the repo's
+        # tokenizer.json in the export root (beside the per-graph directories, so
+        # verify-onnx's directory sweep ignores it) makes the graphs and the
+        # tokenizer that feeds them one self-contained closure the crate reads.
+        cp ${sam3Repo}/tokenizer.json "$out/tokenizer.json"
 
         # The export exiting 0 says nothing about whether the artifacts load; the
         # corruption this guards against is silent and surfaces hours later in
