@@ -87,6 +87,13 @@ image = { version = "0.25", default-features = false, features = [
 # closure via mistral.rs, so a direct dependency is free.
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
+# Set-of-Mark draws each region as a filled/hollow circle marker over the
+# subimage; imageproc 0.25 tracks the `image` 0.25 pin.
+imageproc = "0.25"
+
+# The glyph rasterizer imageproc's text drawing renders the marker numbers with.
+ab_glyph = "0.2"
+
 # SAM 3 masks are `core`'s `Region`, and box prompts are its `ProportionalRect`,
 # so the analysis pipeline speaks the grammar's geometry directly.
 chronoscope-core = { path = "../core" }

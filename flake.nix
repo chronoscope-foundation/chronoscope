@@ -244,8 +244,14 @@
             postgresWithPostgis
             ;
           # Lazy: only `test`/`llvm-cov` force these, so the wikidata/web
-          # cycle stays unresolved at eval time.
-          testExtraEnv = apiRuntimeEnv // webEnv;
+          # cycle stays unresolved at eval time. ANNOTATE_FONT lets the
+          # Set-of-Mark overlay tests load the marker font from nixpkgs.
+          testExtraEnv =
+            apiRuntimeEnv
+            // webEnv
+            // {
+              ANNOTATE_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans-Bold.ttf";
+            };
         };
 
         models = import ./nix/models.nix { inherit pkgs lib; };
@@ -761,6 +767,10 @@
                 # `ort` builds with load-dynamic, so it resolves the shared
                 # library at runtime from this rather than downloading one.
                 ORT_DYLIB_PATH = "${pkgs.onnxruntime}/lib/libonnxruntime${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
+                # The Set-of-Mark overlay reads its marker font from here, so
+                # `just test analysis` and the `analyze` binary render numbers
+                # without a font vendored into the repo.
+                ANNOTATE_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans-Bold.ttf";
               };
             shellHook = ''
               ${gcRootsPrelude}

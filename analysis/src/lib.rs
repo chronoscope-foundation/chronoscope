@@ -18,3 +18,4 @@ pub mod postprocess;
 mod preprocess;
 pub mod qwen3;
 pub mod sam3;
+pub mod setofmark;
