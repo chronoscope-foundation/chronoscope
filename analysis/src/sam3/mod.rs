@@ -151,19 +151,25 @@ impl Sam3 {
     /// Loads the export's manifest and opens all four graphs plus the concept
     /// tokenizer, ready to encode and prompt through either head.
     ///
-    /// The grounding decoder is opened without the interactive decoder's static
-    /// `num_points` pin: its instance count and its original-grid mask size are
-    /// both dynamic, so it partitions to CPU regardless, and there is no axis to
-    /// fix. The image encode it reads still runs on `accel`.
+    /// The grounding decoder is opened with no static dimensions to pin — its
+    /// instance count and mask grid are both dynamic. That variable-sized output
+    /// is one CoreML can't handle as of onnxruntime 1.29.0 (a no-match makes it
+    /// zero-element, which trips a CoreML guard), so it runs on the CPU EP rather
+    /// than `accel`: cheap, since the grounding decoder is small, and it prevents a
+    /// crash on the CoreML backend. The image encode it reads still runs on `accel`.
     pub fn open(export: &Path, accel: Accel) -> Result<Self, OpenError> {
         let manifest = SamManifest::load(export).map_err(OpenError::Manifest)?;
         let encoder = onnx::session_for(&manifest.image_encoder, accel, IMAGE_ENCODER, &[])
             .map_err(OpenError::Session)?;
         let decoder = onnx::session_for(&manifest.decoder, accel, DECODER, DECODER_DIMS)
             .map_err(OpenError::Session)?;
-        let grounding_decoder =
-            onnx::session_for(&manifest.grounding_decoder, accel, GROUNDING_DECODER, &[])
-                .map_err(OpenError::Session)?;
+        let grounding_decoder = onnx::session_for(
+            &manifest.grounding_decoder,
+            Accel::Cpu,
+            GROUNDING_DECODER,
+            &[],
+        )
+        .map_err(OpenError::Session)?;
         let language_encoder =
             onnx::session_for(&manifest.language_encoder, accel, LANGUAGE_ENCODER, &[])
                 .map_err(OpenError::Session)?;

@@ -305,6 +305,36 @@ fn compare_concept(
     Ok(())
 }
 
+/// A concept absent from the image segments to an empty region set rather than
+/// crashing — the case the grounding decoder's CPU placement exists for (see
+/// `Sam3::open`). A flat frame has no structure, so `building` matches nothing.
+/// This reproduces the original crash only on the CoreML backend (`COREML_CACHE`
+/// set); on CPU it runs the same empty path with nothing to trip.
+fn absent_concept_segments_to_empty(sam: &mut Sam3) -> Result<(), Box<dyn error::Error>> {
+    let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        512,
+        512,
+        image::Rgb([128, 128, 128]),
+    ));
+    let encoded = sam
+        .encode(&image)
+        .map_err(|source| format!("could not encode the flat frame: {}", describe(&source)))?;
+    let regions = sam
+        .segment_concept(&encoded, "building")
+        .map_err(|source| {
+            format!(
+                "an absent concept crashed instead of segmenting to empty: {}",
+                describe(&source)
+            )
+        })?;
+    assert!(
+        regions.is_empty(),
+        "a `building` concept absent from a flat frame must yield no regions; got {}",
+        regions.len()
+    );
+    Ok(())
+}
+
 /// The fixture directory `just model-test` realizes and names, or the reason the
 /// ignored tests cannot find it.
 fn fixture_dir() -> Result<PathBuf, Box<dyn error::Error>> {
@@ -339,5 +369,8 @@ fn reference_paths_reproduce_torch() -> Result<(), Box<dyn error::Error>> {
     );
     compare(&reference, &mut sam, &fixture)?;
     compare_concept(&reference, &mut sam, &fixture)?;
+    // Shares this test's one open model: a second test opening the same export
+    // would race the CoreML cache package the encoder builds.
+    absent_concept_segments_to_empty(&mut sam)?;
     Ok(())
 }
