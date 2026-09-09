@@ -54,26 +54,31 @@
   --color-selected: #ffffff;
 }
 
-/* Prose styling for pulldown-cmark rendered markdown */
+/* Prose styling for pulldown-cmark rendered markdown.
+
+   One colour for the whole column: paragraphs, list items, bold runs, and
+   headings. Headings separate by size and weight, and links are the only
+   thing that changes colour. */
+.prose-chronoscope {
+  color: var(--color-body);
+}
+
 .prose-chronoscope p {
-  color: var(--color-secondary);
   line-height: 1.7;
   margin-bottom: 1rem;
 }
 
 .prose-chronoscope h2 {
-  color: var(--color-accent);
   font-size: 1.25rem;
   font-weight: 600;
   margin-top: 2.5rem;
   margin-bottom: 1rem;
 }
 
-/* Subsections under an h2. Without this they inherit the body's size, weight,
-   and colour, which makes a heading read as a stray first line of the
-   paragraph under it. */
+/* Subsections under an h2. Without this they inherit the body's size and
+   weight, which makes a heading read as a stray first line of the paragraph
+   under it. */
 .prose-chronoscope h3 {
-  color: var(--color-body);
   font-size: 1.0625rem;
   font-weight: 600;
   margin-top: 1.75rem;
@@ -88,10 +93,6 @@
 
 .prose-chronoscope li {
   margin-bottom: 0.5rem;
-}
-
-.prose-chronoscope strong {
-  color: var(--color-body);
 }
 
 .prose-chronoscope a {

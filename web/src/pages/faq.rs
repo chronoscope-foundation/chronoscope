@@ -53,7 +53,7 @@ fn FaqItem(entry: &'static FaqEntry) -> impl IntoView {
                 style=move || if open.get() { "grid-template-rows: 1fr" } else { "grid-template-rows: 0fr" }
             >
                 <div class="overflow-hidden">
-                    <div class="pb-5 text-sepia leading-relaxed prose-chronoscope" inner_html=entry.answer_html().as_str()></div>
+                    <div class="pb-5 leading-relaxed prose-chronoscope" inner_html=entry.answer_html().as_str()></div>
                 </div>
             </div>
         </div>
