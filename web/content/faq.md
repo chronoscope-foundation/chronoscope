@@ -36,7 +36,7 @@ A **badge** is a cluster: several places too close together to draw separately a
 
 AI models work over each image in focused steps. A segmentation model outlines the individual buildings in a photo, drawing, or map so each can be studied separately. An embedding model indexes how each one looks, so a building in one image can surface candidates in others. A vision-language model reads what the image says about them and how they sit relative to each other, such as one building standing next to another.
 
-None of those steps decides identity on its own. It all arrives at the reasoning engine as evidence, weighed alongside dates and locations, and that's where "have we seen this building before?" actually gets settled. Keeping the decision there rather than inside an image model makes the reasoning traceable: every conclusion points back to the evidence behind it. For the specific models we use, see our [GitHub documentation](https://github.com/copumpkin/chronoscope).
+None of those steps decides identity on its own. It all arrives at the reasoning engine as evidence, weighed alongside dates and locations, and that's where "have we seen this building before?" actually gets settled. Keeping the decision there rather than inside an image model makes the reasoning traceable: every conclusion points back to the evidence behind it. For the specific models we use, see our [GitHub documentation](https://github.com/chronoscope-foundation/chronoscope).
 
 ## Why not just ask Claude or GPT to do the research?
 
@@ -65,7 +65,7 @@ Most of those projects are organized around a map, a gazetteer, or a structured 
 
 ## Can historians, archivists, and researchers get involved?
 
-Yes, and we'd like to hear from you. Chronoscope is meant to complement existing research, not replace it. We're especially interested in whole collections: photo archives, institutional datasets, anything that would otherwise take years of manual annotation to make usable. The ingestion pipeline is built to take them in as they are and keep their metadata and citations intact. If you have a collection you think belongs here, [reach out on GitHub](https://github.com/copumpkin/chronoscope/issues).
+Yes, and we'd like to hear from you. Chronoscope is meant to complement existing research, not replace it. We're especially interested in whole collections: photo archives, institutional datasets, anything that would otherwise take years of manual annotation to make usable. The ingestion pipeline is built to take them in as they are and keep their metadata and citations intact. If you have a collection you think belongs here, [reach out on GitHub](https://github.com/chronoscope-foundation/chronoscope/issues).
 
 ## Is it open source?
 
@@ -77,4 +77,4 @@ Chronoscope is a project of the Chronoscope Foundation, formed to keep the proje
 
 ## How can I contribute?
 
-We're working on the first full release of the site, which will let you contribute to the knowledge graph directly: linking photos to locations, adding historical context, and settling conflicts in the data. Until then, code contributions are welcome. The [GitHub repository](https://github.com/copumpkin/chronoscope) has the codebase, the ingestion pipelines, and the discussion in Issues.
+We're working on the first full release of the site, which will let you contribute to the knowledge graph directly: linking photos to locations, adding historical context, and settling conflicts in the data. Until then, code contributions are welcome. The [GitHub repository](https://github.com/chronoscope-foundation/chronoscope) has the codebase, the ingestion pipelines, and the discussion in Issues.

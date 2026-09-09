@@ -23,7 +23,7 @@ use url::Url;
 /// `MirrorRequest`, so the production Worker and the dev consumer
 /// (`dev/src/mirror_consumer.rs`) both speak to Commons under this one identity.
 const COMMONS_USER_AGENT: &str =
-    "Chronoscope/0.1 (https://github.com/copumpkin/chronoscope; fact-store image resolver)";
+    "Chronoscope/0.1 (https://github.com/chronoscope-foundation/chronoscope)";
 
 /// A safety cap on the fetched response: a larger object dead-letters, bounding
 /// what one message can write to paid storage. Archival sizing is a later phase.

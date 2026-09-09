@@ -7,7 +7,7 @@ default-members = ["analysis", "api", "api-client", "core", "db", "dev", "ingest
 edition = "2024"
 authors = ["Chronoscope Contributors"]
 license = "MIT"
-repository = "https://github.com/copumpkin/chronoscope"
+repository = "https://github.com/chronoscope-foundation/chronoscope"
 
 # Workspace-wide lint configuration
 # All crates inherit these via `[lints] workspace = true`

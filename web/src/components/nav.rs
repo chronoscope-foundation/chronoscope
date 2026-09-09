@@ -265,7 +265,7 @@ pub fn Nav() -> impl IntoView {
                     // Footer area
                     <div class="px-5 py-4 border-t border-sepia/15">
                         <a
-                            href="https://github.com/copumpkin/chronoscope"
+                            href="https://github.com/chronoscope-foundation/chronoscope"
                             class="text-sepia/60 hover:text-ink text-xs font-sans transition-colors"
                             target="_blank"
                             rel="noopener noreferrer"
