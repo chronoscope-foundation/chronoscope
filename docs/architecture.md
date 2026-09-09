@@ -5,24 +5,33 @@ This document describes the technical architecture of Chronoscope.
 ## Overview
 
 ```
-┌─────────────┐     OpenAPI      ┌─────────────┐
-│   iOS App   │ ←───(generated)──│  Rust API   │
-│  (SwiftUI)  │                  │ (Dropshot)  │
-└─────────────┘                  └─────────────┘
-       │                                │
-       │ WebAuthn                       │ SQLite
-       ▼                                ▼
-   [Passkeys]                      [SQLite]
-                                        │
-                                        ▼
-                                   [Workers]
-                                   (URL fetch,
-                                    content
-                                    extraction,
-                                    image analysis)
+                      ┌───────────────────┐
+   browser ──────────>│ Cloudflare Worker │  static assets, /api/* proxy
+                      └─────────┬─────────┘
+                                │
+   iOS app ────────────────────>│
+  (unmaintained)                v
+                      ┌───────────────────┐
+                      │     Rust API      │  Dropshot, OpenAPI-first
+                      │    (Cloud Run)    │
+                      └─────────┬─────────┘
+                                │
+                 ┌──────────────┴──────────────┐
+                 v                             v
+         [app database]                 [facts database]
+         users, research,               the fact store
+         media, work queue              (attached as `ovl`)
+                 │
+                 v
+           [Workers]
+           URL fetch, content extraction
 ```
 
-All clients communicate with the Rust API over HTTPS. The API is the single source of truth for business logic. Background workers process asynchronous tasks like URL fetching and content extraction.
+The API is the single source of truth for business logic. The frontend and the
+API share one origin: the Worker answers for static assets and forwards
+`/api/*` to Cloud Run with the mount stripped, so the browser never makes a
+cross-origin request. Background workers process asynchronous tasks like URL
+fetching and content extraction.
 
 ## API Server
 
@@ -30,6 +39,10 @@ All clients communicate with the Rust API over HTTPS. The API is the single sour
 
 **Key modules:**
 - `auth.rs` - WebAuthn registration and login
+- `entities.rs` - The entity read surface: listing, detail, depicting images, and the `/tiles/{z}/{x}/{y}` clustering endpoint
+- `entity_types.rs` - Wire types for that surface, shared with the client
+- `mirror/` - Copying source images into owned storage, and the sweep that drives it
+- `media.rs`, `cdn.rs` - Media serving and cache headers
 - `research.rs` - URL submission, listing, details
 - `users.rs` - Profile management, following URLs
 - `jwt.rs` - Session token generation and validation
@@ -62,9 +75,16 @@ Passwordless authentication using WebAuthn passkeys:
 
 ## Database
 
-**Engine**: SQLite via sqlx (API compatible with Postgres for future migration)
+**Engine**: SQLite via sqlx, with SpatiaLite for the spatial index. A Postgres
+fact-store backend is in progress; `db/src/sqlite/` and `db/src/postgres/`
+implement the same store behind one interface.
 
-### Schema Highlights
+There are two schemas, migrated separately under `db/migrations/`. The app
+schema is `main` at serve time and the fact store attaches beside it as `ovl`,
+so ingestion can build a facts database offline and have it swapped in without
+touching the app's tables.
+
+### App schema (`db/migrations/app/`)
 
 **Users & Credentials:**
 - `users` - id, username, email, created_at
@@ -78,6 +98,13 @@ Passwordless authentication using WebAuthn passkeys:
 
 **Social:**
 - `follows` - Users following research URLs
+
+### Fact schema (`db/migrations/facts/`)
+
+- `fact_commits`, `facts` - Content-addressed commits and the facts they carry. Rows are never deleted; a retraction is another fact.
+- `fact_counters`, `fact_subjects`, `subject_reps` - Subject id minting, and the representative a subject resolves to after merges and splits
+- `facts_spatial` - The SpatiaLite index behind marker and tile queries
+- `existence_witness`, `event_witness`, `has_event`, `construction_start`, `demolition_completed` - Witness tables the read path scans per entity, each row carrying the fact it came from so liveness is decided per edge
 
 ### Query Safety
 
@@ -131,14 +158,18 @@ extracted images sit at `Pending`.
 The replacement runs the models in-process instead of behind a server, which
 is what lets the same binary work on a laptop and in production: SAM 3 and
 DINOv3 as ONNX graphs exported by Nix (`nix/vision.nix`) and executed through
-ONNX Runtime, and a VLM through mistral.rs. The `analysis` crate is where that
-lands. It currently carries the corpus machinery — the pinned test images the
-pipeline is developed against.
+ONNX Runtime, and Qwen 3.6 through mistral.rs. That work lives in the
+`analysis` crate, which carries the model runners, the detection pipeline, and
+the corpus machinery: the pinned test images the pipeline is developed against.
 
-Interactive CLI invocation comes first; the queue worker follows, on the same
-work-queue pattern as the URL fetcher.
+The `analyze` binary is how it runs today. The queue worker follows, on the
+same work-queue pattern as the URL fetcher.
 
 ## iOS App
+
+**Not currently maintained.** The app has not been updated since the fact store
+landed, so what follows describes its shape rather than a working client. The
+README carries the revival plan.
 
 **Framework**: SwiftUI with Swift 6
 
@@ -185,9 +216,34 @@ The API contract flows from Rust to Swift:
 
 The spec is content-addressed in the store; `just openapi` builds the raw contract when you want to inspect it. After changing the Rust API (or the hand-written sources under `ios/ChronoscopeAPI/`), re-run `just xcodegen`.
 
+## Deployment
+
+The API ships as an OCI image built by nix2container (`packages.oci-api`),
+layered by rate of change so a push moves only what changed: the C runtime
+closure, then the baked curated facts DB, then the rootfs, then the binary.
+`checks.oci-api-boots` runs the entrypoint under the image's own environment,
+so a container that cannot start fails a check rather than a deploy.
+
+`chronoscope.io` is a Cloudflare Worker serving the web bundle as static assets
+and proxying `/api/*` to Cloud Run. Assets matching a file in the bundle are
+answered before the script runs, so only `/api` costs an invocation. That
+single origin is what removes CORS from the app and gives a passkey one
+hostname to bind to.
+
+Both the service and the Worker are declared with terranix in `nix/infra.nix`
+and applied with OpenTofu. The image digest is the one part a deploy moves:
+`just deploy` builds it, pushes it, and hands the digest to `tofu apply`, so a
+single tool owns the service and the declaration keeps describing what is
+running.
+
 ## Development Server
 
-`cargo run -p chronoscope-dev` provides an integrated development environment:
+`just web-dev` is the loop for the web frontend. It realizes a facts database,
+starts the API on a free port, and runs Trunk in front of it with `/api`
+proxied through, giving the dev server the same single-origin shape the
+production front door has.
+
+`cargo run -p chronoscope-dev` is the iOS-facing variant:
 
 1. Finds available port
 2. Starts ngrok tunnel (required for passkeys - must be HTTPS with stable domain)

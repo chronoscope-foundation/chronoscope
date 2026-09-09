@@ -52,18 +52,19 @@ Chronoscope is an API with clients, not an app with an API bolted on:
 - Third-party tools and integrations are first-class use cases
 - The API contract (OpenAPI) is the source of truth
 
-## Data Model (Vision)
+## Data Model
 
-The full platform will include:
+The fact-store grammar implements this shape:
 
 - **Entities**: Abstract representations of places (buildings, streets, landmarks)
 - **Transitions**: Events that change entities (construction, modification, demolition)
 - **Evidence**: Photos, documents, maps linked to assertions about entities
 - **Citations**: Sources for all evidence, with varying levels of machine-checkability
 
-## Integrations (Planned)
+## Integrations
 
-- Wikidata for structured knowledge
-- Library of Congress for historical materials
-- OpenStreetMap for geographic data
-- archive.org for web archives and historical documents
+- Wikidata for structured knowledge: bulk ingestion of architectural entities
+- OpenHistoricalMap as the basemap the entity layer draws over
+- OpenStreetMap for geographic data (planned)
+- Library of Congress for historical materials (planned)
+- archive.org for web archives and historical documents (planned)

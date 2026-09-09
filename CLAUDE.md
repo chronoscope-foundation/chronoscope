@@ -323,19 +323,24 @@ macros.
 See [docs/architecture.md](docs/architecture.md) for details.
 
 ```
-┌─────────────┐     OpenAPI      ┌─────────────┐
-│   iOS App   │ ←───(generated)──│  Rust API   │
-│  (SwiftUI)  │                  │ (Dropshot)  │
-└─────────────┘                  └─────────────┘
-       │                                │
-       │ WebAuthn                       │ SQLite
-       ▼                                ▼
-   [Passkeys]                      [SQLite]
-                                        │
-                                        ▼
-                                   [Workers]
-                                   (URL fetch,
-                                    content
-                                    extraction,
-                                    image analysis)
+                      ┌───────────────────┐
+   browser ──────────>│ Cloudflare Worker │  static assets, /api/* proxy
+                      └─────────┬─────────┘
+                                │
+   iOS app ────────────────────>│
+  (unmaintained)                v
+                      ┌───────────────────┐
+                      │     Rust API      │  Dropshot, OpenAPI-first
+                      │    (Cloud Run)    │
+                      └─────────┬─────────┘
+                                │
+                 ┌──────────────┴──────────────┐
+                 v                             v
+         [app database]                 [facts database]
+         users, research,               the fact store
+         media, work queue              (attached as `ovl`)
+                 │
+                 v
+           [Workers]
+           URL fetch, content extraction
 ```

@@ -33,20 +33,19 @@ Swift uses SwiftFormat and SwiftLint, enforced via Xcode build phases.
 
 - API tests use real databases (in-memory SQLite) and simulated passkeys via `webauthn-authenticator-rs`
 - Worker tests use VCR-style HTTP fixtures for reproducible network behavior
-- iOS UI tests exercise the full app with mock API clients
+- iOS UI tests exercise the full app with mock API clients, though nothing runs them while the app is unmaintained
 - Tests verify behavior, not implementation details
 - Tests are real code, and we strive to keep them well factored and readable with similar standards to other code
 
 ### Fast Local Iteration
 
-One terminal command and one Xcode shortcut for a fully functioning system:
+One command brings up the whole web stack:
 
 ```bash
-cargo run -p chronoscope-dev  # Starts ngrok + API + workers
-# Then Cmd+R in Xcode
+just web-dev   # facts DB + API + Trunk, all on free ports
 ```
 
-The dev server automatically updates `ios/Local.xcconfig` with the ngrok URL, so Xcode rebuilds pick up the current tunnel automatically. The dependency between the two is necessary because iOS's passkey implementation needs the API domain to be registered in the app's signed entitlements.
+The iOS variant is `cargo run -p chronoscope-dev`, which starts ngrok alongside the API and writes the tunnel URL into `ios/Local.xcconfig`, so Xcode rebuilds pick it up. The tunnel is necessary because iOS's passkey implementation needs the API domain registered in the app's signed entitlements. The app itself is not currently maintained; see the README.
 
 ## Predictable Performance
 
@@ -128,9 +127,15 @@ deliberately outside the commit gate — see the root `CLAUDE.md`.
 
 | Crate | Purpose |
 |-------|---------|
-| `analysis` | Image analysis — corpus images today; SAM3/DINOv3/VLM pipeline in progress |
+| `analysis` | Image analysis: SAM 3, DINOv3, Qwen 3.6 through ONNX Runtime and mistral.rs |
 | `api` | REST API server, authentication, endpoints |
-| `db` | Database layer, models, queries |
-| `dev` | Development server with ngrok integration |
+| `api-client` | Typed HTTP client and the shared contract types the web frontend uses |
+| `core` | The fact store: grammar, solvers, projections |
+| `db` | Database layer: app schema, fact-store backends, queries |
+| `dev` | Development servers (`web-dev`, and the ngrok flow for iOS) |
+| `ingestion` | Bulk ingestion from external knowledge bases (Wikidata) |
 | `integrations` | Domain-specific integrations (Reddit, Instagram), HTTP client abstraction |
+| `macros` | Procedural macros for the fact-store grammar |
+| `tools/quantize` | Pre-quantizes Qwen to a UQFF the analysis crate loads |
+| `web` | WASM frontend (Leptos) |
 | `workers` | Background processing, URL fetching, content extraction |
