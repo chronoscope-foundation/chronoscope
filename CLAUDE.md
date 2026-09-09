@@ -242,8 +242,11 @@ The Worker is declared alongside Cloud Run in `nix/infra.nix`, with the script
 itself in `nix/front-door.js` and the bundle arriving as a variable the way the
 image digest does. `just deploy-web` builds `packages.web` and applies; the
 provider uploads the directory, sending only the files that changed. The
-Cloudflare API token lives in Secret Manager and is read into the environment
-per run, so it never reaches the state or the repo.
+Cloudflare API token `tofu` authenticates with is read per run from
+`CLOUDFLARE_API_TOKEN`, falling back to the `chronoscope-cloudflare-token`
+entry in the macOS login keychain, so it never reaches the state or the repo.
+The separate Queues-Write token the API server presents is minted by that
+identity and kept in Secret Manager.
 
 ### Workflow examples
 
