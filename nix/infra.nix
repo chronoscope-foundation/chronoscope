@@ -648,9 +648,16 @@ let
           # A queue consumer has no HTTP request to leave a trace, and its only
           # record of an image it refused (a bad content type, an oversize) is a
           # console line. Persist those so a drop is diagnosable after the fact
-          # rather than only during a live tail.
+          # rather than only during a live tail. Spelled out down to `persist`,
+          # which is computed: left unset, the server decides whether a log
+          # survives the tail it was written to.
           observability = {
             enabled = true;
+            logs = {
+              enabled = true;
+              invocation_logs = true;
+              persist = true;
+            };
           };
         };
       };
