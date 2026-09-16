@@ -391,6 +391,11 @@
       type = "single";
       url = "https://tile.loc.gov/storage-services/service/pnp/highsm/17100/17179v.jpg";
     };
+    "food-irrelevant" = {
+      description = "NCI 'Good Food Display' - table spread of produce, bread, and fish; no architecture. Deliberately irrelevant gate test.";
+      type = "single";
+      url = "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6d/Good_Food_Display_-_NCI_Visuals_Online.jpg/1280px-Good_Food_Display_-_NCI_Visuals_Online.jpg";
+    };
     fountains-abbey = {
       description = "Fountains Abbey, Yorkshire";
       regions = 1;
@@ -486,6 +491,11 @@
       description = "Church of Saint George (Bete Giyorgis), Lalibela, Ethiopia - rock-hewn monolith";
       type = "single";
       url = "https://upload.wikimedia.org/wikipedia/commons/a/a4/Bete_Giyorgis_01.jpg";
+    };
+    "landscape-irrelevant" = {
+      description = "Moraine Lake, Banff - snow peaks, conifer forest, and still water; no built structures. Deliberately irrelevant gate test.";
+      type = "single";
+      url = "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/Moraine_Lake_17092005.jpg/1280px-Moraine_Lake_17092005.jpg";
     };
     loc-architectural-drawing = {
       description = "US Capitol architectural drawing - William Thornton, 1793";
@@ -670,6 +680,11 @@
       type = "composite";
       url = "https://www.reddit.com/r/rome/comments/1ontxzb/porticus_octaviae/";
     };
+    "portrait-irrelevant" = {
+      description = "Vermeer's 'Girl with a Pearl Earring' - a single figure on a plain dark ground, no architecture. Deliberately irrelevant gate test.";
+      type = "single";
+      url = "https://upload.wikimedia.org/wikipedia/commons/thumb/0/0f/1665_Girl_with_a_Pearl_Earring.jpg/1280px-1665_Girl_with_a_Pearl_Earring.jpg";
+    };
     potala-palace-front = {
       description = "Potala Palace frontal view with stairway approach, Lhasa, Tibet";
       type = "single";
@@ -764,6 +779,11 @@
       description = "Orion Building with scaffolding during renovation";
       type = "single";
       url = "https://upload.wikimedia.org/wikipedia/commons/thumb/4/41/Orion_Building_scaffolding.JPG/1280px-Orion_Building_scaffolding.JPG";
+    };
+    "scale-model-irrelevant" = {
+      description = "Museum architectural scale model of Budapest - depicts real buildings but reads unmistakably as a white scale model. Tests the gate's scale-model clause.";
+      type = "single";
+      url = "https://upload.wikimedia.org/wikipedia/commons/thumb/6/60/Budapest_scale_model_01.jpg/1280px-Budapest_scale_model_01.jpg";
     };
     "schwerin-palace.0" = {
       description = "Schwerin Palace, Germany - UNESCO World Heritage";

@@ -11,10 +11,7 @@
 //! loads a multi-gigabyte model the commit gate cannot realize.
 
 use std::collections::BTreeSet;
-use std::{
-    env, error,
-    path::{Path, PathBuf},
-};
+use std::{env, error};
 
 use chronoscope_analysis::ask::{CompositeOutcome, Outcome};
 use chronoscope_analysis::pipeline::{detect_composite, draw_subimages, subimages};
@@ -25,6 +22,8 @@ use image::{DynamicImage, Rgb, RgbImage, imageops::FilterType};
 
 mod common;
 use common::{describe, first_shard};
+mod corpus;
+use corpus::{corpus_dir, load_corpus};
 
 /// A table of source images, one inner list per row, composed left to right then
 /// top to bottom.
@@ -492,40 +491,10 @@ fn empty_and_sliver_grids_are_rejected() -> Result<(), Box<dyn error::Error>> {
 // End-to-end model test (needs the Qwen weights and the corpus)
 // ---------------------------------------------------------------------------
 
-/// The env var naming the corpus link farm the `analysis` shell sets, keyed by
-/// bare entry id with no file extension.
-const CORPUS_ENV: &str = "CORPUS_IMAGES";
-
 /// The largest a detected panel edge may sit from ground truth, in proportional
 /// units. The per-edge error is printed for every layout regardless, so a model
 /// bump reads as a number rather than only a pass or fail.
 const SEAM_TOLERANCE: f64 = 0.02;
-
-fn corpus_dir() -> Result<PathBuf, String> {
-    env::var_os(CORPUS_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            format!(
-                "{CORPUS_ENV} is unset. It names the corpus link farm the `analysis` shell \
-                 exports; enter that shell (or run `just model-test`) so the panel sources resolve."
-            )
-        })
-}
-
-/// Loads a corpus single by its bare id. The files carry no extension, so the
-/// format is sniffed from the bytes rather than guessed from the path.
-fn load_corpus(dir: &Path, id: &str) -> Result<DynamicImage, Box<dyn error::Error>> {
-    let path = dir.join(id);
-    let reader = image::ImageReader::open(&path)
-        .map_err(|e| format!("could not open corpus image {}: {e}", path.display()))?
-        .with_guessed_format()
-        .map_err(|e| format!("could not sniff the format of {}: {e}", path.display()))?;
-    let image = reader
-        .decode()
-        .map_err(|e| format!("could not decode {}: {e}", path.display()))?;
-    Ok(image)
-}
 
 /// Diagnostics for a failed panel count or seam check: the ground truth, the raw
 /// outcome (a collapsed one-panel composite and a genuine single are otherwise

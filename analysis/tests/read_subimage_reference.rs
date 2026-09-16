@@ -1,18 +1,18 @@
-//! The image gate through the real Qwen 3.6: a synthetic scene it should reject.
+//! The image gate through the real Qwen 3.6: scenes it should reject.
 //!
-//! A red disk on white is not a real built structure, so the gate should judge
-//! it `Irrelevant` — this exercises the relevance short-circuit end to end against
-//! the live model, the way `qwen3_reference` exercises the bare `ask`. The
-//! describe and triage paths, and the full medium / view / relevance range
-//! (a map, a pictorial map, an exterior building, an interior, other
-//! irrelevants), need real labeled corpus fixtures — a follow-up, since a
-//! synthetic scene cannot stand in for them once a relevance gate fronts the flow.
+//! A synthetic red disk and four curated corpus images (food, a landscape, a
+//! portrait, an architectural scale model) are all things the gate should judge
+//! `Irrelevant`: none is a real built structure, and the scale model exercises
+//! the gate's scale-model clause specifically. Together they exercise the
+//! relevance short-circuit end to end against the live model, the way
+//! `qwen3_reference` exercises the bare `ask`. The relevant range (a map, a
+//! pictorial map, an exterior building, an interior) still wants its own fixtures.
 //!
 //! Ignored by default: it loads the multi-gigabyte UQFF the commit gate cannot
 //! realize (and `ANNOTATE_FONT` is present under `model-test` for the gated
 //! signature). `just model-test` wires it.
 
-use std::{error, path::Path};
+use std::error;
 
 use chronoscope_analysis::{
     pipeline::{SubimageReading, read_subimage},
@@ -23,6 +23,8 @@ use image::{DynamicImage, Rgb, RgbImage};
 
 mod common;
 use common::{describe, first_shard};
+mod corpus;
+use corpus::{corpus_dir, load_corpus};
 
 /// A red disk on white — a synthetic non-structure the gate should reject.
 fn red_disk_scene(side: u32) -> DynamicImage {
@@ -39,18 +41,21 @@ fn red_disk_scene(side: u32) -> DynamicImage {
     DynamicImage::ImageRgb8(pixels)
 }
 
-fn run_gate_rejects(first_shard: &Path) -> Result<(), Box<dyn error::Error>> {
+#[test]
+#[ignore = "needs the Qwen 3.6 weights; run `just model-test`"]
+fn the_gate_rejects_a_synthetic_non_structure() -> Result<(), Box<dyn error::Error>> {
+    let first_shard = first_shard()?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let model = Qwen3::open(first_shard).await.map_err(|source| {
+        let model = Qwen3::open(&first_shard).await.map_err(|source| {
             format!(
                 "could not open the model from {first_shard:?}: {}",
                 describe(&source)
             )
         })?;
-        // No regions: the gate runs, judges relevance, and short-circuits before
-        // any describe/triage work. The font goes unused on the reject path but
-        // the signature asks for one, and `ANNOTATE_FONT` is present under model-test.
+        // No regions: the gate judges relevance and short-circuits before any
+        // describe/triage work. The font goes unused on the reject path but the
+        // signature asks for one, and `ANNOTATE_FONT` is present under model-test.
         let font = font_from_env()?;
         let scene = red_disk_scene(256);
 
@@ -71,8 +76,49 @@ fn run_gate_rejects(first_shard: &Path) -> Result<(), Box<dyn error::Error>> {
     })
 }
 
+/// Curated corpus negatives the gate must reject, each a scene with no real
+/// built structure. `scale-model-irrelevant` is the pointed one: it depicts real
+/// buildings, so it exercises the gate's scale-model clause specifically.
+const IRRELEVANT_CORPUS: &[&str] = &[
+    "food-irrelevant",
+    "landscape-irrelevant",
+    "portrait-irrelevant",
+    "scale-model-irrelevant",
+];
+
 #[test]
-#[ignore = "needs the Qwen 3.6 weights; run `just model-test`"]
-fn the_gate_rejects_a_synthetic_non_structure() -> Result<(), Box<dyn error::Error>> {
-    run_gate_rejects(&first_shard()?)
+#[ignore = "needs the Qwen 3.6 weights and the corpus; run `just model-test`"]
+fn the_gate_rejects_real_irrelevant_images() -> Result<(), Box<dyn error::Error>> {
+    let first_shard = first_shard()?;
+    let corpus = corpus_dir()?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        // One model, reused across the images: the load dominates, and each image
+        // is read with no regions, so the gate is the only call per image.
+        let model = Qwen3::open(&first_shard).await.map_err(|source| {
+            format!(
+                "could not open the model from {first_shard:?}: {}",
+                describe(&source)
+            )
+        })?;
+        let font = font_from_env()?;
+        for id in IRRELEVANT_CORPUS {
+            let image = load_corpus(&corpus, id)?;
+            let reading = read_subimage(&model, image, Vec::new(), &font)
+                .await
+                .map_err(|source| format!("could not read {id}: {}", describe(&source)))?;
+            match reading {
+                SubimageReading::Irrelevant { reason } => {
+                    println!("gate rejected {id}: {}", reason.as_str());
+                }
+                other => {
+                    return Err(format!(
+                        "expected the gate to reject {id} as irrelevant; got {other:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    })
 }
