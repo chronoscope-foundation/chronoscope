@@ -26,15 +26,19 @@ use thiserror::Error;
 use crate::ask::{self, Outcome, Prompt};
 
 /// Sequences held in the prefix cache. The multimodal builder disables prefix
-/// caching by default (`prefix_cache_n: None`); a small window matches the text
-/// builder's default and is enough for the two-pass, one-image reuse the
-/// pipeline leans on.
-const PREFIX_CACHE_SEQS: usize = 16;
+/// caching by default (`prefix_cache_n: None`). The image-first read issues
+/// several calls per subimage over one shared image prefill (gate, then a
+/// per-entity describe loop or a triage), and many subimages run concurrently, so
+/// the window holds enough completed sequences that a subimage's prefixes stay
+/// resident across its serial calls. Eviction is a count, not memory, and the KV
+/// here is tiny, so this is generous headroom.
+const PREFIX_CACHE_SEQS: usize = 64;
 
 /// Ceiling on an answer's generated tokens: the runaway guard for a constrained
-/// decode that never reaches a stop, not a length target. Set well above a dense
-/// multi-entity `RelevanceOutcome` (a summary plus many described entities), so a
-/// legitimate answer finishes rather than tripping the cap and reading as
+/// decode that never reaches a stop, not a length target. Every answer is now a
+/// single small value — a gate judgment, one entity's description, or a triage —
+/// so this sits well above the longest free-text description and a legitimate
+/// answer finishes rather than tripping the cap and reading as
 /// [`Outcome::Incomplete`].
 const MAX_ANSWER_TOKENS: usize = 16_384;
 
@@ -98,9 +102,11 @@ impl Qwen3 {
     ///
     /// The schema is derived from `T` once and used for both the sampling
     /// constraint and the type text placed in the prompt, so what the model is
-    /// told and what it is held to are the one value and cannot desync. The
-    /// preamble leads as the system message with that rendered schema appended;
-    /// the images and postamble form the user turn after it.
+    /// told and what it is held to are the one value and cannot desync. The read
+    /// is image-first: the images lead the user turn and the framing, the rendered
+    /// schema, and the trigger ([`Prompt::user_text`]) follow them, so a
+    /// subimage's calls share a byte-identical `[images][framing + schema]` prefix
+    /// the prefix cache reuses.
     ///
     /// The schema is compiled into a grammar the sampler is held to, so the
     /// completion is a valid `T` when it finishes. The returned [`Outcome`]
@@ -113,10 +119,9 @@ impl Qwen3 {
     {
         let schema = ask::constraint_value::<T>().map_err(AskError::Constraint)?;
         let rendered = ask::render_schema(&schema).map_err(AskError::Render)?;
-        let system = format!("{}\n\n{}", prompt.preamble, rendered);
+        let content = prompt.user_text(&rendered);
         let request = RequestBuilder::new()
-            .add_message(TextMessageRole::System, system)
-            .add_image_message(TextMessageRole::User, prompt.postamble, prompt.images)
+            .add_image_message(TextMessageRole::User, content, prompt.images)
             .set_constraint(Constraint::JsonSchema(schema))
             .set_sampler_max_len(MAX_ANSWER_TOKENS);
         let response = self

@@ -1,12 +1,11 @@
 //! Rendering the ask schema as compact BAML-style type text for the prompt.
 //!
-//! The prompt-assembly step places this ahead of the constrained decode, to
-//! prime the model with the shape and narrow the gap where llguidance forcing an
-//! unexpected token degrades adherence. `Qwen3::ask` takes a caller-assembled
-//! prompt, so wiring this into it is that step's job, not done yet. It renders
-//! from the **same** schema value the constraint compiles (`schema_for!(T)`), so
-//! a field rename or reorder cannot desync what the model is told from what it is
-//! held to. JSON Schema is the wrong text for that job: verbose, its boilerplate
+//! `Qwen3::ask` renders the schema and places the text in the user turn between
+//! the framing and the trigger, ahead of the constrained decode, to prime the
+//! model with the shape and narrow the gap where llguidance forcing an unexpected
+//! token degrades adherence. It renders from the **same** schema value the
+//! constraint compiles (`schema_for!(T)`), so a field rename or reorder cannot
+//! desync what the model is told from what it is held to. JSON Schema is the wrong text for that job: verbose, its boilerplate
 //! read as signal, so this is the compact syntax the POC used. It reads whatever
 //! draft schemars emits: the workspace 0.8's draft-07 (`definitions`, a
 //! single-value `enum` for a variant tag) as well as 1's draft-2020-12 (`$defs`,
@@ -89,8 +88,8 @@ struct Discriminator {
 }
 
 impl SchemaNode {
-    /// The last path segment of this node's `$ref`, e.g. `#/$defs/Entity` ->
-    /// `Entity`.
+    /// The last path segment of this node's `$ref`, e.g. `#/$defs/Rect` ->
+    /// `Rect`.
     fn ref_name(&self) -> Option<&str> {
         self.reference
             .as_deref()
@@ -443,58 +442,69 @@ fn push_variant_line(lines: &mut Vec<String>, value: &str, spec: &SchemaNode) {
 #[cfg(test)]
 mod tests {
     use super::super::constraint;
-    use super::super::types::{CompositeOutcome, RelevanceOutcome};
+    use super::super::types::{CompositeOutcome, ImageOutcome, TriageOutcome};
     use super::*;
 
-    /// The pass-2 render, exactly. A field rename or reorder moves this string,
-    /// which is the desync tripwire the render exists to be. The ask types carry
-    /// no `x-vlm`, so no field or variant `@description` appears; only the
-    /// hard-coded discriminant label survives. Adding real guidance to a type
-    /// moves this golden, which is the point. `media` reuses core's `ImageMedium`
-    /// directly, and fields render in schemars 0.8's alphabetical order.
-    const RELEVANCE_RENDER: &str = "\
-class Entity {
-  box Rect
-  description string
-}
+    #[test]
+    fn renders_the_image_gate_shape() -> Result<(), Box<dyn std::error::Error>> {
+        // The gate is a nested tagged union: `ImageOutcome`, whose `Relevant` arm
+        // carries `RelevantMedium`, itself a union whose `Picture` arm carries the
+        // `Perspective` leaf enum. Rather than pin the whole rendering, assert the
+        // shape invariants that steer the model and that the grammar enforces.
+        let rendered = render_schema(&constraint::constraint_value::<ImageOutcome>()?)?;
 
-enum ImageMedium {
-  picture
-  map
-  plan
-  pictorial_map
-}
+        // The leaf enum renders its variants — its only coverage in this module.
+        assert!(rendered.contains("enum Perspective {"));
+        assert!(rendered.contains("  exterior"));
+        assert!(rendered.contains("  interior"));
 
-class Point {
-  x float
-  y float
-}
+        // Each union announces the tag field the variants are distinguished by.
+        assert!(rendered.contains(
+            "// RelevantMedium: output ONE of the following (distinguished by \"_type\" field):"
+        ));
+        assert!(rendered.contains(
+            "// ImageOutcome: output ONE of the following (distinguished by \"_type\" field):"
+        ));
 
-class Rect {
-  lower_right Point
-  upper_left Point
-}
+        // Tag-first: each variant class opens with its `_type` discriminant, the
+        // order llguidance forces, so the primed shape mirrors the grammar.
+        for (class, tag) in [
+            ("ImageOutcome_irrelevant", "irrelevant"),
+            ("ImageOutcome_relevant", "relevant"),
+            ("RelevantMedium_picture", "picture"),
+        ] {
+            assert!(
+                rendered.contains(&format!(
+                    "class {class} {{\n  _type \"{tag}\" @description(\"discriminant\")"
+                )),
+                "{class} should lead with its discriminant:\n{rendered}"
+            );
+        }
 
-// RelevanceOutcome: output ONE of the following (distinguished by \"_type\" field):
-
-// When _type = \"analyzed\":
-class RelevanceOutcome_analyzed {
-  _type \"analyzed\" @description(\"discriminant\")
-  entities Entity[]
-  media ImageMedium
-  summary string
-}
-
-// When _type = \"irrelevant\":
-class RelevanceOutcome_irrelevant {
-  _type \"irrelevant\" @description(\"discriminant\")
-  reason string
-}";
+        // Payloads render their fields with resolved types: a struct-ref, a leaf
+        // enum, and a scalar.
+        assert!(rendered.contains("medium RelevantMedium"));
+        assert!(rendered.contains("view Perspective"));
+        assert!(rendered.contains("reason string"));
+        Ok(())
+    }
 
     #[test]
-    fn renders_the_pass_two_shape() -> Result<(), Box<dyn std::error::Error>> {
-        let rendered = render_schema(&constraint::constraint_value::<RelevanceOutcome>()?)?;
-        assert_eq!(rendered, RELEVANCE_RENDER);
+    fn renders_the_triage_shape() -> Result<(), Box<dyn std::error::Error>> {
+        // A two-variant union exercising both variant shapes. The payload-less
+        // variant is the invariant worth pinning: it must render as its `_type`
+        // discriminant alone, with no trailing fields before the closing brace.
+        let rendered = render_schema(&constraint::constraint_value::<TriageOutcome>()?)?;
+
+        assert!(rendered.contains(
+            "// TriageOutcome: output ONE of the following (distinguished by \"_type\" field):"
+        ));
+        assert!(rendered.contains(
+            "class TriageOutcome_missed_structures {\n  _type \"missed_structures\" @description(\"discriminant\")\n  description string\n}"
+        ));
+        assert!(rendered.contains(
+            "class TriageOutcome_nothing_here {\n  _type \"nothing_here\" @description(\"discriminant\")\n}"
+        ));
         Ok(())
     }
 

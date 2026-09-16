@@ -3,7 +3,7 @@
 //!
 //! The grounding head emits one region per detected instance, but the raw set
 //! duplicates and overlaps: the same building is found more than once, a small
-//! detection sits mostly inside a larger one. Set-of-Mark then colors each region
+//! detection sits mostly inside a larger one. Set-of-Mark then marks each region
 //! and the VLM describes it by number, so both want a tidy, bounded, ordered set.
 //! This resolves the raw regions geometrically, with no notion of entity type —
 //! the VLM assigns type and description later, over the overlay.

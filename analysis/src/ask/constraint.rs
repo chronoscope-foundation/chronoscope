@@ -52,7 +52,9 @@ fn inject_x_guidance(value: &mut Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::types::{CompositeOutcome, RelevanceOutcome};
+    use super::super::types::{
+        CompositeOutcome, EntityReading, ImageOutcome, RelevantMedium, TriageOutcome,
+    };
     use super::*;
 
     /// The internal discriminant key the ask's tagged enums carry.
@@ -92,9 +94,18 @@ mod tests {
     fn tag_leads_every_variant() -> Result<(), ConstraintError> {
         // Alphabetical ordering puts `_type` first with no reordering; assert the
         // count so a schemars shape change that moved the tag out of `properties`
-        // fails loudly instead of passing vacuously.
+        // fails loudly instead of passing vacuously. `CompositeOutcome` and
+        // `TriageOutcome` are tagged unions of two variants each. `ImageOutcome`'s
+        // `Relevant` variant nests `RelevantMedium`, itself a four-variant tagged
+        // union (each unit variant still renders a `_type`-only class), so the gate
+        // counts its own two plus that four. The `Perspective` leaf enum is
+        // tag-less. An untagged struct like `EntityReading` carries no `_type`, so
+        // it counts none.
         assert_eq!(count_tag_leads(&constraint_value::<CompositeOutcome>()?), 2);
-        assert_eq!(count_tag_leads(&constraint_value::<RelevanceOutcome>()?), 2);
+        assert_eq!(count_tag_leads(&constraint_value::<RelevantMedium>()?), 4);
+        assert_eq!(count_tag_leads(&constraint_value::<ImageOutcome>()?), 6);
+        assert_eq!(count_tag_leads(&constraint_value::<TriageOutcome>()?), 2);
+        assert_eq!(count_tag_leads(&constraint_value::<EntityReading>()?), 0);
         Ok(())
     }
 }

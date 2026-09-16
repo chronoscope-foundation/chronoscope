@@ -1,13 +1,20 @@
-//! The ask schema: the shape Qwen emits under constrained decode.
+//! The ask schemas: the shapes Qwen emits under constrained decode.
 //!
-//! The structural types (the outcome enums, [`Entity`]) are ask-local because a
-//! VLM emits a flat box array in the model's own coordinate convention, not
-//! core's nested proportional rect. The leaf vocabulary is core's: `media` is
-//! [`ImageMedium`] and the free-text fields are [`Text`], reused directly since
-//! the ask and core share the workspace schemars. [`super::convert`] bridges the
-//! box back into core's geometry.
+//! Composite detection ([`CompositeOutcome`]) localizes a picture's panels as
+//! boxes ([`Rect`] over [`Point`]) in the model's own 0-1000 coordinate
+//! convention, which [`super::convert`] reads into core's proportional geometry.
+//!
+//! The per-subimage read is a small family of image-first calls. An image-level
+//! gate ([`ImageOutcome`]) judges relevance and, when relevant, the image's
+//! [`RelevantMedium`] — which carries the [`Perspective`] viewpoint only for a
+//! photograph, since a map has none. With regions to read, a per-entity call
+//! names each numbered Set-of-Mark region ([`EntityReading`]); with none, a
+//! recall backstop ([`TriageOutcome`]) says whether the detector missed a real
+//! structure. The leaf vocabulary is core's [`Text`] and [`Perspective`], reused
+//! directly since the ask and core share the workspace schemars.
 
-use chronoscope_core::grammar::{image::ImageMedium, text::Text};
+use chronoscope_core::grammar::depiction::Perspective;
+use chronoscope_core::grammar::text::Text;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -33,20 +40,6 @@ pub struct Rect {
     pub upper_left: Point,
     /// The bottom-right corner.
     pub lower_right: Point,
-}
-
-/// One entity the model localized: its box and a short description.
-///
-/// `box` is declared first so the model commits the box before any prose. `box`
-/// is a Rust keyword, so the field is `bbox` renamed to the wire key `box`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Entity {
-    /// Where the entity sits, in the model's coordinate convention.
-    #[serde(rename = "box")]
-    pub bbox: Rect,
-    /// What the entity is, in the model's words.
-    pub description: Text,
 }
 
 /// Pass 1: whether the image is a composite and, if so, its panels.
@@ -83,22 +76,85 @@ impl CompositeOutcome {
     }
 }
 
-/// Pass 2: whether the (sub)image is relevant and, if so, its reading.
+/// The image gate: whether a subimage belongs in the pipeline and, when it does,
+/// how to read it. Always the first call over a subimage, on the raw image alone.
+///
+/// Relevance is a nuanced judgment, not "the segmenter found a region": a real
+/// structure behind unsuitable content, or a scale model, is irrelevant despite a
+/// region, so an `Irrelevant` verdict short-circuits the read regardless of region
+/// count. `Relevant` carries the image's [`RelevantMedium`], which pins the
+/// viewpoint onto a photograph and leaves the abstract media without one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "_type", rename_all = "snake_case")]
-pub enum RelevanceOutcome {
-    /// The image is relevant: its medium, a summary, and the entities in it.
-    Analyzed {
-        /// The kind of image.
-        media: ImageMedium,
-        /// A short account of what the image shows.
-        summary: Text,
-        /// The entities the model localized.
-        entities: Vec<Entity>,
-    },
-    /// The image is not relevant to the pipeline, with the model's reason.
+pub enum ImageOutcome {
+    /// The image carries nothing the pipeline should read.
     Irrelevant {
         /// Why the image was set aside.
         reason: Text,
     },
+    /// The image is worth reading, classified by its medium (which carries the
+    /// viewpoint when it is a photograph).
+    Relevant {
+        /// What kind of image this is, and — for a photograph — its viewpoint.
+        medium: RelevantMedium,
+    },
+}
+
+/// The medium of a relevant image, carrying a viewpoint only where one applies.
+///
+/// A photograph is taken from a viewpoint (exterior or interior); a map or plan
+/// is not, so `view` rides on [`Self::Picture`] alone and "an exterior map"
+/// cannot be spelled. A pictorial map depicts buildings pictorially, so the
+/// region flow reads it like a picture — but it still has no single viewpoint, so
+/// it carries none. This is the ask-layer counterpart to core's flat
+/// `ImageMedium` hint; the two differ deliberately (one gates a viewpoint, the
+/// other does not), and the fact-emission mapping bridges them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "_type", rename_all = "snake_case")]
+pub enum RelevantMedium {
+    /// A photograph, taken from outside a structure or from within one.
+    Picture {
+        /// The image-level viewpoint: an exterior scene, or an interior subject.
+        view: Perspective,
+    },
+    /// A pictorial map: buildings drawn pictorially, segmentable like a picture.
+    PictorialMap,
+    /// A cartographic map — an orthographic representation of terrain.
+    Map,
+    /// An orthographic plan of a structure's own layout.
+    Plan,
+}
+
+/// One numbered mark's reading: what the marked object is, in the model's words.
+///
+/// The mark number is the loop index the pipeline drives, so it rides the trigger
+/// rather than the schema; the reading carries only the description.
+///
+/// The field is `description_from_raw_image`, not `description`, on purpose: under
+/// constrained JSON decode the model is forced to emit the key before its value,
+/// so the key doubles as a just-in-time reminder — at the moment of generation — to
+/// read the object's true appearance from the first (unmarked) image rather than
+/// the marked overlay.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EntityReading {
+    /// What the numbered object truly is, read from the unmarked image.
+    pub description_from_raw_image: Text,
+}
+
+/// The recall backstop over a subimage the segmenter marked nothing in: whether a
+/// real structure was there to mark after all.
+///
+/// Relevance, medium, and view are the gate's job, so triage only reports a missed
+/// structure or its absence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "_type", rename_all = "snake_case")]
+pub enum TriageOutcome {
+    /// A real built structure the detector failed to mark.
+    MissedStructures {
+        /// What the detector missed.
+        description: Text,
+    },
+    /// Nothing the detector should have marked.
+    NothingHere,
 }
