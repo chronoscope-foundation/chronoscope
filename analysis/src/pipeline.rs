@@ -215,12 +215,6 @@ Respond with JSON conforming to this type:";
 /// The user-turn trigger after the triage image.
 const TRIAGE_POSTAMBLE: &str = "Report what the detector missed.";
 
-/// The per-entity trigger naming which numbered mark to read. Only this varies
-/// across the describe loop's calls, so their shared prefix stays byte-identical.
-fn entity_trigger(index: usize) -> String {
-    format!("Describe object {index}.")
-}
-
 /// One segmented region carrying the model's reading of it. Per-entity coverage
 /// gives every region a reading, so the description is unconditional.
 #[derive(Debug, Clone)]
@@ -425,12 +419,15 @@ fn gate_prompt(subimage: DynamicImage) -> Prompt {
 
 /// The per-entity describe prompt: the raw scene first for honest color and
 /// detail, the numbered overlay second so the model can tie the number to its
-/// region, and the trigger naming which mark to read.
+/// region, and the trigger naming which mark to read. The trigger is 1-based to
+/// match the overlay's disc labels, and is the only part that varies across the
+/// describe loop, so the shared image and framing prefix stays byte-identical for
+/// cache reuse.
 fn entity_prompt(subimage: DynamicImage, overlay: DynamicImage, index: usize) -> Prompt {
     Prompt {
         preamble: ENTITY_PREAMBLE.to_owned(),
         images: vec![subimage, overlay],
-        postamble: entity_trigger(index),
+        postamble: format!("Describe object {}.", index + 1),
     }
 }
 

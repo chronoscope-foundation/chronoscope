@@ -234,7 +234,8 @@ fn draw_marker(
     draw_filled_circle_mut(canvas, center, radius, color);
     draw_hollow_circle_mut(canvas, center, radius, WHITE);
 
-    let label = index.to_string();
+    // 1-based disc labels: the first region reads as 1, matching the describe trigger.
+    let label = (index + 1).to_string();
     let scale = (LABEL_EM_PER_RADIUS * r) as f32;
     let (text_w, text_h) = text_size(scale, font, &label);
     let x = center.0 - (text_w as i32) / 2;
