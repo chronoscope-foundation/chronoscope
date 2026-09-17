@@ -1,11 +1,16 @@
 //! Set-of-Mark overlay: the second image a "describe by number" VLM call reads.
 //!
-//! A subimage's post-processed SAM 3 regions are painted as translucent colored
-//! masks, each stamped with a numbered marker at a point guaranteed to sit inside
-//! the region. The VLM then names each entity by its number, so the overlay's job
-//! is to keep each number readable and tied to its region: distinct colors, a
-//! disc placed inside the region (its radius bounded by the inscribed circle),
-//! and a label legible against its own fill, sized to read rather than to fit.
+//! A subimage's post-processed SAM 3 regions are marked so the VLM can name each
+//! by its number without hiding what it is describing. Each region is drawn as a
+//! colored **hatch** — opaque lines over the region, its gaps left as the true
+//! pixels — plus a bold boundary **contour** and a numbered **disc**. A solid
+//! translucent fill was measured to leak its color into the model's color read
+//! (the described color tracked the mark, not the object), so the fill is opaque
+//! lines covering only part of the surface, leaving the true color and detail
+//! visible between them. Identity rides three redundant channels — the region's
+//! Kelly color, its hatch angle, and the number — so a pale color stays legible by
+//! its angle and disc alone. The disc sits at a point guaranteed inside the
+//! region, its radius bounded by the inscribed circle, its label sized to read.
 
 use ab_glyph::Font;
 use chronoscope_core::grammar::geometry::Region;
@@ -47,9 +52,19 @@ const KELLY_COLORS: [Rgb<u8>; 20] = [
     Rgb([43, 61, 38]),    // dark olive green
 ];
 
-/// Mask fill opacity: enough to read the color, light enough to keep the
-/// underlying pixels visible so the VLM still sees what it is describing.
-const MASK_ALPHA: f32 = 0.3;
+/// Hatch geometry: a colored line every `HATCH_PERIOD` px, `HATCH_LINE_WIDTH` px
+/// wide, so roughly a third of the region's pixels carry the mark color and the
+/// rest stay true. `HATCH_ANGLES` is how many distinct line directions the angle
+/// channel cycles through (diagonal both ways, horizontal, vertical, cross), so a
+/// region's pattern identifies it even when its color is pale.
+const HATCH_PERIOD: i32 = 10;
+const HATCH_LINE_WIDTH: i32 = 3;
+const HATCH_ANGLES: usize = 5;
+
+/// Boundary contour half-thickness: a filled dot of this radius stamped at each
+/// edge pixel, so the region's extent reads at a glance even where the hatch is
+/// sparse.
+const CONTOUR_RADIUS: i32 = 2;
 
 /// Marker radius floor and ceiling, in pixels. The floor keeps a tiny region's
 /// mark legible; the ceiling stops a large region from carrying an oversized
@@ -65,12 +80,20 @@ const LABEL_EM_PER_RADIUS: f64 = 1.4;
 const WHITE: Rgb<u8> = Rgb([255, 255, 255]);
 const BLACK: Rgb<u8> = Rgb([0, 0, 0]);
 
-/// Per-channel `round((1-alpha)*base + alpha*color)`.
-fn blend(base: Rgb<u8>, color: Rgb<u8>, alpha: f32) -> Rgb<u8> {
-    let Rgb([br, bg, bb]) = base;
-    let Rgb([cr, cg, cb]) = color;
-    let mix = |b: u8, c: u8| ((1.0 - alpha) * f32::from(b) + alpha * f32::from(c)).round() as u8;
-    Rgb([mix(br, cr), mix(bg, cg), mix(bb, cb)])
+/// Whether pixel `(x, y)` lies on a hatch line for a region drawn at `angle`
+/// (`index % HATCH_ANGLES`): diagonal both ways, horizontal, vertical, or cross.
+/// The angle is the second identity channel, so two adjacent regions read apart
+/// even if their colors are close.
+fn hatch_hit(x: u32, y: u32, angle: usize) -> bool {
+    let (x, y) = (x as i32, y as i32);
+    let on = |coord: i32| coord.rem_euclid(HATCH_PERIOD) < HATCH_LINE_WIDTH;
+    match angle {
+        0 => on(x + y),
+        1 => on(x - y),
+        2 => on(y),
+        3 => on(x),
+        _ => on(x + y) || on(x - y),
+    }
 }
 
 /// Black or white, whichever reads against `background`. Rec. 601 luma splits
@@ -119,16 +142,20 @@ pub fn font_from_env() -> Result<ab_glyph::FontVec, FontError> {
     })
 }
 
-/// Paint `regions` over `image` as numbered Set-of-Mark overlays: a translucent
-/// colored fill per region and a numbered disc at its pole of inaccessibility.
-/// Colors follow the input order (already ranked by the postprocess step) and
-/// cycle through the twenty-color Kelly palette.
+/// Paint `regions` over `image` as numbered Set-of-Mark overlays: a colored hatch
+/// and boundary contour per region, plus a numbered disc at its pole of
+/// inaccessibility. Colors follow the input order (already ranked by the
+/// postprocess step) and cycle through the twenty-color Kelly palette.
 ///
 /// A region whose grid disagrees with the image dimensions denotes pixels of a
 /// different frame, so it is skipped rather than drawn at the wrong scale.
 pub fn annotate(image: &RgbImage, regions: &[ScoredRegion], font: &impl Font) -> RgbImage {
     let mut out = image.clone();
     let (width, height) = (image.width(), image.height());
+    // One foreground mask reused across regions: each region marks and clears
+    // only its own pixels, so the contour's neighbor test stays an O(1) lookup
+    // without densifying the whole grid once per region.
+    let mut mask = vec![false; width as usize * height as usize];
 
     for (index, scored) in regions.iter().enumerate() {
         let region = &scored.region;
@@ -138,15 +165,52 @@ pub fn annotate(image: &RgbImage, regions: &[ScoredRegion], font: &impl Font) ->
         let color = KELLY_COLORS[index % KELLY_COLORS.len()];
 
         let w = width as usize;
+        let angle = index % HATCH_ANGLES;
         for pixel in region.foreground_pixels() {
             let (x, y) = ((pixel % w) as u32, (pixel / w) as u32);
-            let base = *out.get_pixel(x, y);
-            out.put_pixel(x, y, blend(base, color, MASK_ALPHA));
+            if hatch_hit(x, y, angle) {
+                out.put_pixel(x, y, color);
+            }
         }
-
+        draw_contour(&mut out, region, color, &mut mask);
         draw_marker(&mut out, region, index, color, font);
     }
     out
+}
+
+/// Stamps the region's boundary in its color: a filled dot of `CONTOUR_RADIUS` at
+/// each edge pixel (a foreground pixel with a background 4-neighbor), so the
+/// region's extent reads at a glance even where the hatch is sparse.
+///
+/// `mask` is a shared scratch buffer sized to the image; the region's foreground
+/// is written into it for the neighbor test and cleared again on the way out, so
+/// it arrives and leaves all-false.
+fn draw_contour(canvas: &mut RgbImage, region: &Region, color: Rgb<u8>, mask: &mut [bool]) {
+    let (width, height) = (region.width(), region.height());
+    let w = width as usize;
+    for pixel in region.foreground_pixels() {
+        mask[pixel] = true;
+    }
+    let foreground = |x: i32, y: i32| {
+        x >= 0
+            && y >= 0
+            && (x as u32) < width
+            && (y as u32) < height
+            && mask[(y as usize) * w + (x as usize)]
+    };
+    for pixel in region.foreground_pixels() {
+        let (x, y) = ((pixel % w) as i32, (pixel / w) as i32);
+        if !foreground(x - 1, y)
+            || !foreground(x + 1, y)
+            || !foreground(x, y - 1)
+            || !foreground(x, y + 1)
+        {
+            draw_filled_circle_mut(canvas, (x, y), CONTOUR_RADIUS, color);
+        }
+    }
+    for pixel in region.foreground_pixels() {
+        mask[pixel] = false;
+    }
 }
 
 /// Stamp region `index`'s numbered disc at its pole of inaccessibility.
@@ -225,20 +289,6 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    #[test]
-    fn blend_interpolates_each_channel_and_rounds() {
-        // Alpha 0 returns the base untouched; alpha 1 returns the color.
-        assert_eq!(blend(BLACK, WHITE, 0.0), BLACK);
-        assert_eq!(blend(BLACK, WHITE, 1.0), WHITE);
-        // 0.5 * 255 = 127.5, which rounds up.
-        assert_eq!(blend(BLACK, WHITE, 0.5), Rgb([128, 128, 128]));
-        // Mixed base and color, resolved per channel.
-        assert_eq!(
-            blend(Rgb([10, 20, 30]), Rgb([200, 100, 0]), 0.5),
-            Rgb([105, 60, 15])
-        );
-    }
-
     /// A rectangular mask `cols` x `rows` on a `dims` grid.
     fn rectangle(
         dims: Dimensions,
@@ -254,14 +304,12 @@ mod tests {
     }
 
     #[test]
-    fn annotate_blends_the_mask_and_stamps_the_pole() -> TestResult {
+    fn annotate_hatches_the_region_and_stamps_the_pole() -> TestResult {
         let font = font_from_env()?;
         let (width, height) = (40u32, 40u32);
         let base = Rgb([100u8, 110, 120]);
         let image = RgbImage::from_pixel(width, height, base);
 
-        // A rectangle whose pole is near the center, so the corner we probe for
-        // the plain blend sits well outside the disc.
         let dims = Dimensions::new(width, height)?;
         let dense = rectangle(dims, 5..35, 10..30);
         let region = Region::from_dense(dims, &dense)?.ok_or("non-empty region")?;
@@ -271,18 +319,30 @@ mod tests {
         }];
 
         let out = annotate(&image, &regions, &font);
-
         let color = KELLY_COLORS[0];
-        let blended = blend(base, color, MASK_ALPHA);
+        let w = width as usize;
 
-        // A foreground corner, far from the marker, takes the blended color.
-        let corner = *out.get_pixel(5, 10);
-        assert_eq!(corner, blended);
-        assert_ne!(corner, base);
+        // The hatch is partial: some region pixels take the mark color (hatch
+        // lines, contour, disc), and some keep the true pixel (the gaps between
+        // lines), so the object stays visible — the whole point over a solid fill.
+        let (mut marked, mut untouched) = (0u32, 0u32);
+        for pixel in region.foreground_pixels() {
+            let (x, y) = ((pixel % w) as u32, (pixel / w) as u32);
+            match *out.get_pixel(x, y) {
+                p if p == color => marked += 1,
+                p if p == base => untouched += 1,
+                _ => {} // disc ring / label pixels are neither the mark nor the base
+            }
+        }
+        assert!(marked > 0, "the mark color appears on the region");
+        assert!(untouched > 0, "gaps keep the true pixel");
 
-        // The pole pixel is under the drawn marker, so it is not the plain blend.
+        // A pixel well outside the region is untouched.
+        assert_eq!(*out.get_pixel(2, 2), base);
+
+        // The pole pixel is under the drawn disc, so it is no longer the base.
         let ((cx, cy), _) = pole_of_inaccessibility(&region);
-        assert_ne!(*out.get_pixel(cx, cy), blended);
+        assert_ne!(*out.get_pixel(cx, cy), base);
         Ok(())
     }
 
