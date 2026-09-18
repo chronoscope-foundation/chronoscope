@@ -18,6 +18,7 @@
 //!
 //! mistral.rs runs the Metal GPU backend on Apple hardware and CPU elsewhere.
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use mistralrs::{Constraint, Model, RequestBuilder, TextMessageRole, UqffMultimodalModelBuilder};
@@ -117,13 +118,68 @@ impl Qwen3 {
     where
         T: serde::de::DeserializeOwned + schemars::JsonSchema,
     {
+        let completion = self.complete::<T>(prompt, 0).await?;
+        ask::decode(&completion.finish_reason, completion.content).map_err(AskError::Decode)
+    }
+
+    /// The thinking twin of [`ask`](Self::ask): the model reasons in its native
+    /// thinking region before the constrained JSON, so it works through what it sees
+    /// before it commits to the answer. Unused in the pipeline today; a knob for a
+    /// read where reasoning first earns its cost over a one-shot answer.
+    ///
+    /// mistral.rs renders the chat template with thinking on (its default), so the
+    /// prompt already opens a `<think>` block; a Lark grammar (`think_grammar`) then
+    /// caps the reasoning at `think_budget` tokens, forces the closing `</think>`,
+    /// and holds the answer to the `%json` schema. Because the reasoning rides the
+    /// model's trained thinking tokens, mistral.rs's reasoning parser splits it out:
+    /// [`Answer::reasoning`] carries the transcript for traceability, and the decoded
+    /// [`Outcome`] carries the answer.
+    pub async fn ask_thinking<T>(
+        &self,
+        prompt: Prompt,
+        think_budget: NonZeroUsize,
+    ) -> Result<Answer<T>, AskError>
+    where
+        T: serde::de::DeserializeOwned + schemars::JsonSchema,
+    {
+        let completion = self.complete::<T>(prompt, think_budget.get()).await?;
+        let outcome =
+            ask::decode(&completion.finish_reason, completion.content).map_err(AskError::Decode)?;
+        Ok(Answer {
+            outcome,
+            reasoning: completion.reasoning.unwrap_or_default(),
+        })
+    }
+
+    /// The one completion choice for `prompt`, the shared body of [`ask`](Self::ask)
+    /// and [`ask_thinking`](Self::ask_thinking): derive and render the schema, lead
+    /// the user turn with the images, cap the length, and pull the single choice. A
+    /// zero `think_budget` holds the model to the plain JSON schema with the chat
+    /// template's thinking off; a positive one turns thinking on and wraps the answer
+    /// in a budget-capped `think_grammar` reasoning region.
+    async fn complete<T>(&self, prompt: Prompt, think_budget: usize) -> Result<Completion, AskError>
+    where
+        T: schemars::JsonSchema,
+    {
         let schema = ask::constraint_value::<T>().map_err(AskError::Constraint)?;
         let rendered = ask::render_schema(&schema).map_err(AskError::Render)?;
         let content = prompt.user_text(&rendered);
+        let constraint = if think_budget == 0 {
+            Constraint::JsonSchema(schema)
+        } else {
+            Constraint::Lark(think_grammar(&schema, think_budget))
+        };
         let request = RequestBuilder::new()
             .add_image_message(TextMessageRole::User, content, prompt.images)
-            .set_constraint(Constraint::JsonSchema(schema))
-            .set_sampler_max_len(MAX_ANSWER_TOKENS);
+            .set_constraint(constraint)
+            // The length cap covers reasoning and answer together, so add the budget
+            // back: the answer keeps its full MAX_ANSWER_TOKENS after the reasoning
+            // spends up to `think_budget` (which is 0 for a plain ask).
+            .set_sampler_max_len(MAX_ANSWER_TOKENS + think_budget)
+            // mistral.rs defaults enable_thinking to true, which opens a `<think>`
+            // block in the prompt. A plain ask forces the JSON answer at once, so it
+            // must not be primed to reason; only a thinking call opens the block.
+            .enable_thinking(think_budget > 0);
         let response = self
             .model
             .send_chat_request(request)
@@ -134,8 +190,54 @@ impl Qwen3 {
             .into_iter()
             .next()
             .ok_or(AskError::NoChoices)?;
-        ask::decode(&choice.finish_reason, choice.message.content).map_err(AskError::Decode)
+        Ok(Completion {
+            finish_reason: choice.finish_reason,
+            content: choice.message.content,
+            reasoning: choice.message.reasoning_content,
+        })
     }
+}
+
+/// The one completion choice's raw pieces before decoding: the finish reason, the
+/// answer content, and the reasoning mistral.rs's parser split off a thinking call.
+struct Completion {
+    finish_reason: String,
+    content: Option<String>,
+    reasoning: Option<String>,
+}
+
+/// A thinking answer: the decoded [`Outcome`], plus the reasoning the model
+/// produced before it. The reasoning is kept for traceability and is empty when
+/// the model answered without reasoning first.
+#[derive(Debug, Clone)]
+pub struct Answer<T> {
+    /// The decoded answer, or the model stopping short.
+    pub outcome: Outcome<T>,
+    /// The model's reasoning transcript, empty when it reasoned nothing.
+    pub reasoning: String,
+}
+
+/// Builds the Lark grammar for [`Qwen3::ask_thinking`]: free reasoning capped at
+/// `budget` tokens, then the model's native `</think>` token, then the `%json`
+/// schema. mistral.rs renders the chat template with thinking on (its default), so
+/// the prompt already ends with an open `<think>`; the generation picks up inside
+/// that block, which is what actually primes the model to reason. The grammar must
+/// not re-open `<think>`, which produces a double block the model closes empty; it
+/// generates the reasoning, then forces the closing `</think>` (an unquoted
+/// special-token terminal, mandatory, not a stop a budget cap could skip), then the
+/// answer. The special token sits outside the regex's byte-space, so the reasoning
+/// needs no exclusions. The `%json` schema is embedded inline; llguidance honors its
+/// `x-guidance` overrides the same as the plain [`ask::constraint_value`] path, so a
+/// thinking call and a plain call hold the model to the identical answer shape.
+fn think_grammar(schema: &serde_json::Value, budget: usize) -> String {
+    // `Value`'s Display serializes it as compact JSON and cannot fail, unlike the
+    // general `serde_json::to_string`.
+    let schema_json = schema.to_string();
+    format!(
+        "start: reasoning </think> body\n\
+         reasoning[max_tokens={budget}]: /[\\s\\S]*/\n\
+         body: %json {schema_json}"
+    )
 }
 
 /// Why the model could not be opened from its first UQFF shard.
@@ -176,4 +278,30 @@ pub enum AskError {
 
     #[error("the model's answer could not be decoded")]
     Decode(#[source] ask::DecodeError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ask::EntityReading;
+
+    #[test]
+    fn think_grammar_wraps_a_native_think_region_then_the_schema()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let schema = ask::constraint_value::<EntityReading>()?;
+        let grammar = think_grammar(&schema, 50);
+        // The start rule is the reasoning (picked up inside the prompt's already-open
+        // <think>), then the native </think> special token (unquoted, resolved against
+        // the tokenizer; a required terminal, not a stop a budget cap could skip),
+        // then the JSON body.
+        assert!(grammar.starts_with("start: reasoning </think> body\n"));
+        // The reasoning is free text hard-capped at the budget, with no exclusions
+        // since the special tokens sit outside the regex's byte-space.
+        assert!(grammar.contains(r"reasoning[max_tokens=50]: /[\s\S]*/"));
+        // The body embeds exactly the schema value the plain constraint compiles,
+        // so a thinking call and a plain call hold the model to the identical shape.
+        let embedded = serde_json::to_string(&schema)?;
+        assert!(grammar.ends_with(&format!("body: %json {embedded}")));
+        Ok(())
+    }
 }

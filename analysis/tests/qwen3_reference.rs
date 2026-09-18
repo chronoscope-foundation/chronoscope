@@ -17,16 +17,26 @@
 //! cannot realize. `QWEN_MODEL_FIRST_SHARD` names the UQFF's `afq4-0.uqff`;
 //! `just model-test` is where that gets wired.
 
-use std::{error, path::Path};
+use std::{error, num::NonZeroUsize, path::Path};
 
 use chronoscope_analysis::{
     ask::{Outcome, Prompt, Rect},
-    qwen3::Qwen3,
+    qwen3::{Answer, Qwen3},
 };
 use image::{Rgb, RgbImage};
 
 mod common;
 use common::{describe, first_shard};
+mod corpus;
+use corpus::{corpus_dir, load_corpus};
+
+/// A count the model must reason its way to: a schema simple enough that the
+/// answer is trivial to emit, so any thinking shows up in the reasoning region.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct FloorCount {
+    /// The number of floors the building has.
+    floors: u32,
+}
 
 /// The tiny type the model must fill. A caller-defined Rust value coming back
 /// populated is the whole proof: schema-constrained decoding parsed into it.
@@ -186,6 +196,54 @@ fn run_coordinate_probe(first_shard: &Path) -> Result<(), Box<dyn error::Error>>
     })
 }
 
+fn run_thinking_round_trip(first_shard: &Path) -> Result<(), Box<dyn error::Error>> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let model = Qwen3::open(first_shard).await.map_err(|source| {
+            format!(
+                "could not open the model from {first_shard:?}: {}",
+                describe(&source)
+            )
+        })?;
+        let prompt = Prompt {
+            preamble: "Describe what is in this image in one sentence.".to_owned(),
+            images: vec![red_disk()],
+            postamble: "Describe the image.".to_owned(),
+        };
+        // A small budget is the case the native-thinking grammar exists for: the
+        // reasoning region caps out fast, yet `</think>` is still forced, so
+        // mistral.rs splits the reasoning off and the answer that follows is clean JSON.
+        let budget = NonZeroUsize::new(48).ok_or("think budget must be nonzero")?;
+        let answer: Answer<Described> = model
+            .ask_thinking(prompt, budget)
+            .await
+            .map_err(|source| format!("could not answer the prompt: {}", describe(&source)))?;
+
+        println!("reasoning: {:?}", answer.reasoning);
+        match answer.outcome {
+            Outcome::Parsed(described) => {
+                println!("description: {}", described.description);
+                // Parsing at all proves the split worked: an unsplit `</think>` would
+                // leave the reasoning ahead of the JSON in one blob, which does not
+                // deserialize into Described.
+                let text = described.description.to_lowercase();
+                assert!(
+                    text.contains("red") && text.contains("circle"),
+                    "expected a red-circle description; got {:?}",
+                    described.description
+                );
+            }
+            Outcome::Incomplete { finish, raw_prefix } => {
+                return Err(format!(
+                    "the model stopped early ({finish}) with prefix: {raw_prefix}"
+                )
+                .into());
+            }
+        }
+        Ok::<(), Box<dyn error::Error>>(())
+    })
+}
+
 #[test]
 #[ignore = "needs the Qwen 3.6 weights; run `just model-test`"]
 fn structured_answer_round_trips_from_an_image() -> Result<(), Box<dyn error::Error>> {
@@ -193,7 +251,74 @@ fn structured_answer_round_trips_from_an_image() -> Result<(), Box<dyn error::Er
 }
 
 #[test]
+#[ignore = "needs the Qwen 3.6 weights; run `just model-test`"]
+fn thinking_answer_splits_reasoning_from_the_answer() -> Result<(), Box<dyn error::Error>> {
+    run_thinking_round_trip(&first_shard()?)
+}
+
+#[test]
 #[ignore = "coordinate probe; prints Qwen's box numbers, run `just model-test`"]
 fn box_coordinate_convention_probe() -> Result<(), Box<dyn error::Error>> {
     run_coordinate_probe(&first_shard()?)
+}
+
+/// Native thinking over a real building and a counting task, which genuinely needs
+/// reasoning (unlike the red disk, which needs none and gets an empty think block).
+/// The prompt's open `<think>` primes the model, so the transcript comes back
+/// substantial; the regression this guards is the empty `<think>\n\n` block a grammar
+/// that re-opens `<think>` produces.
+fn run_native_thinking_reasons(first_shard: &Path) -> Result<(), Box<dyn error::Error>> {
+    let corpus = corpus_dir()?;
+    let image = load_corpus(&corpus, "seagram-building")?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let model = Qwen3::open(first_shard).await.map_err(|source| {
+            format!(
+                "could not open the model from {first_shard:?}: {}",
+                describe(&source)
+            )
+        })?;
+        let prompt = Prompt {
+            preamble: "Count how many floors this building has. Look carefully at the \
+                       facade, find the repeating rows of windows, and count them from \
+                       the ground up."
+                .to_owned(),
+            images: vec![image],
+            postamble: "How many floors does the building have?".to_owned(),
+        };
+        let budget = NonZeroUsize::new(256).ok_or("think budget must be nonzero")?;
+        let answer: Answer<FloorCount> = model
+            .ask_thinking(prompt, budget)
+            .await
+            .map_err(|source| format!("could not answer the prompt: {}", describe(&source)))?;
+        println!(
+            "reasoning ({} chars): {}",
+            answer.reasoning.len(),
+            answer.reasoning
+        );
+        // A generous floor, far above the ~9-char empty-block case and far below the
+        // ~1000 chars real reasoning produces, so it catches a broken think region
+        // without tracking model-specific verbosity.
+        assert!(
+            answer.reasoning.len() > 100,
+            "expected substantial reasoning on a counting task, not an empty think \
+             block; got {:?}",
+            answer.reasoning
+        );
+        match answer.outcome {
+            Outcome::Parsed(count) => println!("floors: {}", count.floors),
+            Outcome::Incomplete { finish, raw_prefix } => {
+                return Err(
+                    format!("thinking answer stopped early ({finish}): {raw_prefix}").into(),
+                );
+            }
+        }
+        Ok::<(), Box<dyn error::Error>>(())
+    })
+}
+
+#[test]
+#[ignore = "needs the Qwen 3.6 weights and the corpus; run `just model-test`"]
+fn native_thinking_reasons_about_a_counting_task() -> Result<(), Box<dyn error::Error>> {
+    run_native_thinking_reasons(&first_shard()?)
 }
