@@ -151,8 +151,15 @@ async fn launch_browser() -> Result<
         .build()
         .map_err(|e| format!("failed to build browser config: {e}"))?;
 
-    let (browser, mut handler) = Browser::launch(config)
+    let (browser, mut handler) = tokio::time::timeout(SETUP_TIMEOUT, Browser::launch(config))
         .await
+        .map_err(|_| {
+            format!(
+                "Chrome did not open its CDP endpoint within {SETUP_TIMEOUT:?} \
+                 (launch stalled before the browser was usable){}",
+                contention_note()
+            )
+        })?
         .map_err(|e| format!("failed to launch browser: {e}"))?;
 
     let handle = tokio::spawn(async move {
@@ -464,7 +471,15 @@ impl WebTest {
         // Startup dispatches the media warm without blocking; wait for the
         // background consumer to drain it so every test's thumbnails are present
         // before it asserts.
-        server.await_media_warmed().await;
+        tokio::time::timeout(SETUP_TIMEOUT, server.await_media_warmed())
+            .await
+            .map_err(|_| {
+                format!(
+                    "media warm never drained within {SETUP_TIMEOUT:?} \
+                     (server setup stalled before serving){}",
+                    contention_note()
+                )
+            })?;
 
         // Serve the prebuilt dist directly (nothing per-test is injected into
         // it any more) with an SPA fallback: any path that doesn't match a file
@@ -1089,6 +1104,13 @@ async fn run_web_test(
 /// genuine hang. Wait helpers short-circuit the instant their condition is met,
 /// so this only bounds the failure path — the happy path stays fast.
 pub const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Bounds the one-time per-test setup (browser launch and the server's media
+/// warm) so a stall there fails fast and named. Neither await is otherwise
+/// bounded and cargo emits nothing between tests, so without this bound a
+/// stalled setup hangs with no output, surfacing as a silent, unattributed
+/// stall rather than a named error.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// chromiumoxide's per-command eviction budget. Held above [`TIMEOUT`] so the
 /// harness wrapper is what fires first: a timeout then names the hook and its
