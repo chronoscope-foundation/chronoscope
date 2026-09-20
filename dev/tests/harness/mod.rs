@@ -73,11 +73,10 @@ fn screenshot_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>>
 /// How many test browsers were already running when this suite started,
 /// sampled once.
 ///
-/// A `Timeout` from a wait hook says nothing about *why* the page stalled, and
-/// the usual why is contention: another suite competing for the CPU starves the
-/// headless event loop. That has cost real diagnosis time more than once (see
-/// `chronoscope-learnings/web-test-timeout-flakes-*.md`), so the count rides
-/// along in every timeout message.
+/// A `Timeout` from a wait hook says nothing about *why* the page stalled, so
+/// the count rides along in every timeout message as one fact the reader would
+/// otherwise have to go collect by hand. It is not a diagnosis: nothing here
+/// measures whether other browsers bear on a stall.
 ///
 /// Counted whoever owns them. A browser stranded by a killed run and a browser
 /// belonging to another worktree's gate cost the same cores, and this machine
@@ -113,9 +112,8 @@ fn contention_note() -> String {
         0 => String::new(),
         n => format!(
             " ({n} test browser process(es) were already running when this \
-             suite started, from a concurrent run or a stranded one, which \
-             starves the headless event loop; re-run on a quiet machine \
-             before suspecting the code)"
+             suite started, from a concurrent run or a stranded one; whether \
+             that bears on this failure is unmeasured)"
         ),
     }
 }
@@ -1086,14 +1084,30 @@ async fn run_web_test(
             .to_string();
         eprintln!("--- Test {test_name} failed — capturing diagnostics ---");
         t.dump_console_logs().await;
-        match t.screenshot(&format!("{test_name}_FAILED")).await {
-            Ok(path) => eprintln!("  Failure screenshot: {}", path.display()),
-            Err(e) => eprintln!("  Failed to capture screenshot: {e}"),
+        // A renderer wedged badly enough to fail the test is wedged badly enough
+        // to answer no screenshot, and this runs after the failure is already
+        // decided, so the capture is bounded and its loss reported rather than
+        // waited on.
+        match tokio::time::timeout(
+            DIAGNOSTICS_TIMEOUT,
+            t.screenshot(&format!("{test_name}_FAILED")),
+        )
+        .await
+        {
+            Ok(Ok(path)) => eprintln!("  Failure screenshot: {}", path.display()),
+            Ok(Err(e)) => eprintln!("  Failed to capture screenshot: {e}"),
+            Err(_) => eprintln!("  Screenshot timed out after {DIAGNOSTICS_TIMEOUT:?}"),
         }
         eprintln!("--- End diagnostics ---");
     }
 
-    let close_result = t.close().await;
+    // Closing drives the browser too, so it is bounded on the same reasoning.
+    // Generously, since a healthy close is immediate and the bound exists for a
+    // browser that has stopped answering.
+    let close_result = match tokio::time::timeout(SETUP_TIMEOUT, t.close()).await {
+        Ok(closed) => closed,
+        Err(_) => Err(format!("browser close did not finish within {SETUP_TIMEOUT:?}").into()),
+    };
     // Prefer the test error over the close error
     result.and(close_result)
 }
