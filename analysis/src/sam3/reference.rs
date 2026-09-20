@@ -11,17 +11,40 @@
 //! Ignored by default: they need a multi-gigabyte export and fixture hanging off
 //! the gated weight fetches, which the commit gate cannot realize.
 
-mod support;
-
 use std::{
     env, error, fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use chronoscope_analysis::sam3::{Sam3, ScoredRegion};
+use super::{Sam3, ScoredRegion};
+use crate::scene::{Region as Branded, with_scene_sync};
+use crate::test_support::{accel, coreml_cache_root, describe};
 use chronoscope_core::grammar::geometry::{Dimensions, ProportionalRect, Region};
+use image::DynamicImage;
 use serde::Deserialize;
-use support::{accel, coreml_cache_root, describe};
+
+/// The overlap between a mask we produced and the torch reference mask beside
+/// it, both cut from `image`.
+///
+/// Stamping them into one scene is the claim this comparison makes: the
+/// fixture's mask was recorded from this very image, on its grid. A fixture
+/// whose declared dimensions disagree with the image it names fails here rather
+/// than scoring a meaningless overlap.
+fn agreement(image: &Arc<DynamicImage>, ours: Region, torch: Region) -> Result<f64, String> {
+    with_scene_sync(Arc::clone(image), |scene| {
+        let brand = |mask: Region, whose: &str| {
+            Branded::new(scene, mask).ok_or_else(|| {
+                format!(
+                    "the {whose} mask is not on the {}x{} grid of the image it was recorded from",
+                    scene.image().width(),
+                    scene.image().height(),
+                )
+            })
+        };
+        Ok(brand(ours, "Rust")?.iou(&brand(torch, "torch")?))
+    })
+}
 
 /// The fixture directory. `just model-test` realizes it and sets this.
 const FIXTURE: &str = "SAM3_FIXTURE";
@@ -127,7 +150,7 @@ fn open_reference(fixture: &Path) -> Result<(Reference, Sam3), Box<dyn error::Er
     Ok((reference, sam))
 }
 
-fn compare(
+async fn compare(
     reference: &Reference,
     sam: &mut Sam3,
     fixture: &Path,
@@ -137,16 +160,20 @@ fn compare(
         let image_path = fixture.join(&entry.file);
         let image_bytes = fs::read(&image_path)
             .map_err(|source| format!("could not read {image_path:?}: {source}"))?;
-        let image = image::load_from_memory(&image_bytes)
-            .map_err(|source| format!("could not decode {image_path:?}: {source}"))?;
+        let image = Arc::new(
+            image::load_from_memory(&image_bytes)
+                .map_err(|source| format!("could not decode {image_path:?}: {source}"))?,
+        );
 
         let encoded = sam
             .encode(&image)
+            .await
             .map_err(|source| format!("{}: could not encode: {}", entry.id, describe(&source)))?;
         let [x0, y0, x1, y1] = entry.box_xyxy_norm;
         let rect = ProportionalRect::new(x0, y0, x1, y1)?;
         let scored = sam
             .segment_rect(&encoded, &rect)
+            .await
             .map_err(|source| format!("{}: could not segment: {}", entry.id, describe(&source)))?
             .ok_or_else(|| format!("{}: the box produced an empty mask", entry.id))?;
 
@@ -155,14 +182,11 @@ fn compare(
             entry.source.width,
             entry.source.height,
         )?;
-        let iou = scored
-            .region
-            .intersection_over_union(&torch)
-            .map_err(|source| format!("{}: {source}", entry.id))?;
 
         let id = &entry.id;
         let ours_area = scored.region.area();
         let torch_area = torch.area();
+        let iou = agreement(&image, scored.region, torch)?;
         let score = scored.score;
         let pred = entry.predicted_iou;
         println!(
@@ -224,7 +248,7 @@ fn scores_line(scores: &[f64]) -> String {
         .join(", ")
 }
 
-fn compare_concept(
+async fn compare_concept(
     reference: &Reference,
     sam: &mut Sam3,
     fixture: &Path,
@@ -234,14 +258,18 @@ fn compare_concept(
         let image_path = fixture.join(&entry.file);
         let image_bytes = fs::read(&image_path)
             .map_err(|source| format!("could not read {image_path:?}: {source}"))?;
-        let image = image::load_from_memory(&image_bytes)
-            .map_err(|source| format!("could not decode {image_path:?}: {source}"))?;
+        let image = Arc::new(
+            image::load_from_memory(&image_bytes)
+                .map_err(|source| format!("could not decode {image_path:?}: {source}"))?,
+        );
 
         let encoded = sam
             .encode(&image)
+            .await
             .map_err(|source| format!("{}: could not encode: {}", entry.id, describe(&source)))?;
         let regions = sam
             .segment_concept(&encoded, &entry.prompt)
+            .await
             .map_err(|source| {
                 format!(
                     "{}: could not segment concept: {}",
@@ -260,10 +288,8 @@ fn compare_concept(
 
         // `torch` is non-empty (reference_region rejects an empty mask); if the
         // Rust side produced no regions, that is a miss and scores 0.
-        let iou = match &ours {
-            Some(region) => region
-                .intersection_over_union(&torch)
-                .map_err(|source| format!("{}: {source}", entry.id))?,
+        let iou = match ours {
+            Some(region) => agreement(&image, region, torch)?,
             None => 0.0,
         };
 
@@ -310,7 +336,7 @@ fn compare_concept(
 /// `Sam3::open`). A flat frame has no structure, so `building` matches nothing.
 /// This reproduces the original crash only on the CoreML backend (`COREML_CACHE`
 /// set); on CPU it runs the same empty path with nothing to trip.
-fn absent_concept_segments_to_empty(sam: &mut Sam3) -> Result<(), Box<dyn error::Error>> {
+async fn absent_concept_segments_to_empty(sam: &mut Sam3) -> Result<(), Box<dyn error::Error>> {
     let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
         512,
         512,
@@ -318,9 +344,11 @@ fn absent_concept_segments_to_empty(sam: &mut Sam3) -> Result<(), Box<dyn error:
     ));
     let encoded = sam
         .encode(&image)
+        .await
         .map_err(|source| format!("could not encode the flat frame: {}", describe(&source)))?;
     let regions = sam
         .segment_concept(&encoded, "building")
+        .await
         .map_err(|source| {
             format!(
                 "an absent concept crashed instead of segmenting to empty: {}",
@@ -353,9 +381,9 @@ fn fixture_dir() -> Result<PathBuf, Box<dyn error::Error>> {
 /// compiled graph by path, so two tests opening the same export at once collide
 /// creating the same package. Opening once also loads the multi-gigabyte export
 /// a single time.
-#[test]
+#[tokio::test]
 #[ignore = "needs the SAM 3 export and its fixture; run `just model-test`"]
-fn reference_paths_reproduce_torch() -> Result<(), Box<dyn error::Error>> {
+async fn reference_paths_reproduce_torch() -> Result<(), Box<dyn error::Error>> {
     let fixture = fixture_dir()?;
     let (reference, mut sam) = open_reference(&fixture)?;
     // An empty reference set would let every assertion below be vacuously skipped,
@@ -367,10 +395,10 @@ fn reference_paths_reproduce_torch() -> Result<(), Box<dyn error::Error>> {
         reference.entries.len(),
         reference.concept.len(),
     );
-    compare(&reference, &mut sam, &fixture)?;
-    compare_concept(&reference, &mut sam, &fixture)?;
+    compare(&reference, &mut sam, &fixture).await?;
+    compare_concept(&reference, &mut sam, &fixture).await?;
     // Shares this test's one open model: a second test opening the same export
     // would race the CoreML cache package the encoder builds.
-    absent_concept_segments_to_empty(&mut sam)?;
+    absent_concept_segments_to_empty(&mut sam).await?;
     Ok(())
 }

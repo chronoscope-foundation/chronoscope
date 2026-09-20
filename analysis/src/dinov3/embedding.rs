@@ -40,6 +40,27 @@ impl Embedding {
     pub fn as_slice(&self) -> &[f32] {
         &self.0
     }
+
+    /// Cosine similarity with `other`. Both are unit-length, so the dot product
+    /// is the cosine itself, with no norms left to divide by.
+    ///
+    /// Accumulated in f64 so a caller subtracting the result from 1 keeps the
+    /// digits that distinguish rounding from a fault.
+    #[cfg(test)]
+    pub(crate) fn cosine(&self, other: &Self) -> f64 {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .map(|(&left, &right)| f64::from(left) * f64::from(right))
+            .sum()
+    }
+
+    /// The direction of a raw model-space vector: the CLS token a forward pass
+    /// produced, or a stored reference a comparison holds beside one, which
+    /// cosine needs on the same footing.
+    pub(crate) fn from_raw(components: &super::Token) -> Result<Self, DegenerateEmbedding> {
+        normalize(&components.map(f64::from), super::magnitude(components))
+    }
 }
 
 /// Scales `sum` to unit length, or refuses it when it keeps too little of
@@ -155,6 +176,36 @@ mod tests {
             Ok(_) => Err("the stored vector was accepted".into()),
             Err(error) => Ok(error.to_string()),
         }
+    }
+
+    /// A raw vector along `axes`, each axis carrying `scale`, so a wrong
+    /// normalization shows up as a cosine off the hand-computed angle.
+    fn along(axes: &[usize], scale: f32) -> Result<Embedding, DegenerateEmbedding> {
+        let mut raw = [0.0_f32; EMBEDDING_DIM];
+        for &axis in axes {
+            if let Some(slot) = raw.get_mut(axis) {
+                *slot = scale;
+            }
+        }
+        Embedding::from_raw(&raw)
+    }
+
+    #[test]
+    fn cosine_is_the_angle_between_two_directions() -> TestResult {
+        let x = along(&[0], 2.0)?;
+        let diagonal = along(&[0, 1], 1.0)?;
+
+        // A one-hot vector normalizes to exactly 1 on its axis whatever its
+        // scale, so these three products are exact.
+        assert_eq!(x.cosine(&x), 1.0);
+        assert_eq!(x.cosine(&along(&[0], -5.0)?), -1.0);
+        assert_eq!(x.cosine(&along(&[1], 3.0)?), 0.0);
+
+        // Half a right angle: the f32 rounding of each component is all that
+        // separates this from the exact value.
+        let drift = (x.cosine(&diagonal) - 0.5_f64.sqrt()).abs();
+        assert!(drift < 1e-7, "45 degrees came out {drift:e} off");
+        Ok(())
     }
 
     #[test]

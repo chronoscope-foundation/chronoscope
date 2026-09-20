@@ -36,9 +36,10 @@ import torch
 from torchvision.io import decode_image
 from transformers import AutoImageProcessor, AutoModel
 
-# Thread count partitions GEMM reductions, making it the largest same-machine
-# source of drift in these numbers. The Rust side pins its own runtime to one
-# thread for the same reason.
+# One thread so a recording is reproducible from this script alone. The Rust
+# side runs its own count (four, for ONNX Runtime's async pool) and reproduces
+# these numbers regardless: both comparisons were measured at 1 and at 8 threads
+# on either backend and matched to four significant figures.
 NUM_THREADS = 1
 
 model_dir, export_dir, images_json, out_dir = (

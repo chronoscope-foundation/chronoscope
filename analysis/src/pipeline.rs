@@ -5,30 +5,29 @@
 //! the panels become the subimages the later passes read; a single image yields
 //! one full-frame subimage, so the downstream passes have one shape to handle.
 //!
-//! The per-subimage reading pass ([`read_subimage`]) opens with an image-level
-//! gate — is the subimage relevant, and if so its medium, with a viewpoint when
-//! it is a photograph. A photograph or a pictorial map is then read by region
-//! count: with regions, it draws the numbered Set-of-Mark overlay and asks Qwen to
-//! describe each mark in turn; with none, it asks whether the segmenter missed a
-//! whole structure. A cartographic map or a plan is left for the map-analysis
-//! path. Every call leads with the same raw image, so they share one image
-//! prefill. Each pass is exercised in isolation — cropping the parent frame and
-//! threading the segmenter between the two is a later wiring stage.
+//! The per-subimage reading pass opens with [`gate`] over the raw image — is the
+//! subimage relevant, and if so its medium, with a viewpoint when it is a
+//! photograph. A photograph or a pictorial map is then read by [`read_content`],
+//! by region count: with regions, it draws the numbered Set-of-Mark overlay and
+//! asks Qwen to describe each mark in turn; with none, it asks whether the
+//! segmenter missed a whole structure. A cartographic map or a plan is left for
+//! the map-analysis path. Every call leads with the same raw image, so they share
+//! one image prefill. Each pass is exercised in isolation — cropping the parent
+//! frame and threading the segmenter between the two is a later wiring stage.
 
 use ab_glyph::Font;
 use chronoscope_core::grammar::composites::SubimageRegion;
-use chronoscope_core::grammar::depiction::Perspective;
-use chronoscope_core::grammar::geometry::{ProportionalCoordError, ProportionalRect};
+use chronoscope_core::grammar::geometry::{
+    ProportionalCoordError, ProportionalRect, Region as Mask,
+};
 use chronoscope_core::grammar::text::Text;
 use image::{DynamicImage, Rgb, RgbImage};
 use thiserror::Error;
 
 use crate::ask::convert::bbox_to_proportional;
-use crate::ask::{
-    CompositeOutcome, EntityReading, ImageOutcome, Outcome, Prompt, RelevantMedium, TriageOutcome,
-};
+use crate::ask::{CompositeOutcome, EntityReading, ImageOutcome, Outcome, Prompt, TriageOutcome};
 use crate::qwen3::{AskError, Qwen3};
-use crate::sam3::ScoredRegion;
+use crate::scene::{Region, Scene};
 use crate::setofmark;
 
 /// The fixed framing for pass 1. `Qwen3::ask` appends the rendered schema.
@@ -219,8 +218,8 @@ const TRIAGE_POSTAMBLE: &str = "Report what the detector missed.";
 /// gives every region a reading, so the description is unconditional.
 #[derive(Debug, Clone)]
 pub struct DescribedRegion {
-    /// The region the segmenter found.
-    pub region: ScoredRegion,
+    /// The region the segmenter found, as a mask over the subimage.
+    pub region: Mask,
     /// What the model said the region is.
     pub description: Text,
 }
@@ -233,37 +232,6 @@ pub enum Content {
     Described(Vec<DescribedRegion>),
     /// The subimage had no regions; whether the detector missed a real structure.
     Triaged(TriageOutcome),
-}
-
-/// The result of reading one subimage: set aside by the gate, or read by medium.
-///
-/// A photograph and a pictorial map both carry [`Content`] — the region flow reads
-/// them the same way — but only a photograph has a viewpoint. A cartographic map or
-/// a plan is an abstract depiction the building flow does not read; it carries the
-/// medium alone now, to be adorned with its own analysis when that path exists.
-#[derive(Debug, Clone)]
-pub enum SubimageReading {
-    /// The gate judged the subimage irrelevant; nothing was read.
-    Irrelevant {
-        /// Why the gate set it aside.
-        reason: Text,
-    },
-    /// A photograph: its viewpoint, and its regions read (or the recall backstop).
-    Picture {
-        /// The image-level viewpoint.
-        view: Perspective,
-        /// The regions read, or the recall backstop for a region-less subimage.
-        content: Content,
-    },
-    /// A pictorial map: read like a picture, but with no viewpoint.
-    PictorialMap {
-        /// The regions read, or the recall backstop for a region-less subimage.
-        content: Content,
-    },
-    /// A cartographic map, routed to the map-analysis path (not yet built).
-    Map,
-    /// An orthographic plan, routed to the map-analysis path (not yet built).
-    Plan,
 }
 
 /// Why a subimage could not be read.
@@ -284,47 +252,11 @@ pub enum ReadError {
         /// The partial output emitted before stopping.
         raw_prefix: String,
     },
-    /// A region's grid disagrees with the subimage it is read against. Rejected
-    /// at the boundary: `annotate` skips a mismatched region while the describe
-    /// loop still asks about its index, which would desync the marks from the
-    /// questions.
-    #[error(
-        "a region on a {region_width}x{region_height} grid does not match the \
-         {image_width}x{image_height} subimage"
-    )]
-    RegionGrid {
-        region_width: u32,
-        region_height: u32,
-        image_width: u32,
-        image_height: u32,
-    },
-}
-
-/// Rejects any region whose grid disagrees with the subimage, so the overlay
-/// marks (which `annotate` skips on a mismatch) can't desync from the describe
-/// loop's per-index questions. The two consumers must not own numbering
-/// independently.
-fn require_matching_grids(
-    regions: &[ScoredRegion],
-    image_width: u32,
-    image_height: u32,
-) -> Result<(), ReadError> {
-    for scored in regions {
-        if scored.region.width() != image_width || scored.region.height() != image_height {
-            return Err(ReadError::RegionGrid {
-                region_width: scored.region.width(),
-                region_height: scored.region.height(),
-                image_width,
-                image_height,
-            });
-        }
-    }
-    Ok(())
 }
 
 /// Requires a completed answer, mapping an early stop to a labeled
 /// [`ReadError::Incomplete`]. The one place [`Outcome`] is unwrapped, so it never
-/// leaks past [`read_subimage`].
+/// leaks past [`gate`] or [`read_content`].
 fn require_complete<T>(outcome: Outcome<T>, call: impl Into<String>) -> Result<T, ReadError> {
     match outcome {
         Outcome::Parsed(value) => Ok(value),
@@ -336,64 +268,38 @@ fn require_complete<T>(outcome: Outcome<T>, call: impl Into<String>) -> Result<T
     }
 }
 
-/// Reads one subimage. The image-level gate runs first over the raw image; an
-/// irrelevant verdict short-circuits regardless of region count, and a
-/// cartographic map or plan short-circuits too — the building flow does not read
-/// the abstract media. A photograph or a pictorial map is read by region count via
-/// `read_content`: with regions, the numbered Set-of-Mark overlay is drawn once
-/// and each mark described in a serial loop over the shared `[raw][overlay]`
-/// prefill; with none, the recall backstop asks whether a whole structure was
-/// missed. The mark number is internal — the loop index the trigger names — so it
-/// never leaves the stage.
-pub async fn read_subimage(
-    qwen: &Qwen3,
-    subimage: DynamicImage,
-    regions: Vec<ScoredRegion>,
-    font: &impl Font,
-) -> Result<SubimageReading, ReadError> {
-    let gate = qwen
-        .ask::<ImageOutcome>(gate_prompt(subimage.clone()))
-        .await?;
-    // The match is total by design: adding a medium is a compile error here, so
-    // the taxonomy can't drift out of sync with the ask gate.
-    match require_complete(gate, "gate")? {
-        ImageOutcome::Irrelevant { reason } => Ok(SubimageReading::Irrelevant { reason }),
-        ImageOutcome::Relevant { medium } => match medium {
-            RelevantMedium::Picture { view } => Ok(SubimageReading::Picture {
-                view,
-                content: read_content(qwen, &subimage, regions, font).await?,
-            }),
-            RelevantMedium::PictorialMap => Ok(SubimageReading::PictorialMap {
-                content: read_content(qwen, &subimage, regions, font).await?,
-            }),
-            RelevantMedium::Map => Ok(SubimageReading::Map),
-            RelevantMedium::Plan => Ok(SubimageReading::Plan),
-        },
-    }
+/// The image-level gate: whether an image is relevant at all, and if so its
+/// medium, with a viewpoint when it is a photograph.
+///
+/// Qwen alone reads it, over the raw image, so relevance is decided before any
+/// segmenter runs and a caller can gate an image it has no regions for.
+pub async fn gate(qwen: &Qwen3, image: &DynamicImage) -> Result<ImageOutcome, ReadError> {
+    let outcome = qwen.ask::<ImageOutcome>(gate_prompt(image.clone())).await?;
+    require_complete(outcome, "gate")
 }
 
 /// Reads a content-bearing subimage (a photograph or a pictorial map) by region
 /// count: describe each numbered region over the shared `[raw][overlay]` prefill,
 /// or — with no regions — run the recall backstop. Shared so a photograph and a
 /// pictorial map read identically; only their carried viewpoint differs.
-async fn read_content(
+///
+/// The regions are `scene`'s own, so the overlay's marks and the describe loop's
+/// per-index questions number one set of masks on one grid. The mark number is
+/// internal — the loop index the trigger names — so it never leaves the stage.
+pub async fn read_content<'b>(
     qwen: &Qwen3,
-    subimage: &DynamicImage,
-    regions: Vec<ScoredRegion>,
+    scene: &Scene<'b>,
+    regions: Vec<Region<'b>>,
     font: &impl Font,
 ) -> Result<Content, ReadError> {
+    let subimage = scene.image();
     if regions.is_empty() {
         let triage = qwen
             .ask::<TriageOutcome>(triage_prompt(subimage.clone()))
             .await?;
         return Ok(Content::Triaged(require_complete(triage, "triage")?));
     }
-    // The grid check guards numbering, which only the describe loop does; the gate,
-    // triage, and map/plan paths read no marks. Checked here at the point the marks
-    // are built, not at the stage boundary, so a map with off-grid regions still
-    // classifies rather than erroring.
-    require_matching_grids(&regions, subimage.width(), subimage.height())?;
-    let overlay: DynamicImage = setofmark::annotate(&subimage.to_rgb8(), &regions, font).into();
+    let overlay: DynamicImage = setofmark::annotate(scene, &regions, font).into();
     let mut described = Vec::with_capacity(regions.len());
     for (index, region) in regions.into_iter().enumerate() {
         let reading = qwen
@@ -401,7 +307,8 @@ async fn read_content(
             .await?;
         let reading = require_complete(reading, format!("entity {index}"))?;
         described.push(DescribedRegion {
-            region,
+            // Plain data on its way out of the scene's scope.
+            region: region.mask().clone(),
             description: reading.description_from_raw_image,
         });
     }
@@ -451,22 +358,6 @@ mod tests {
             upper_left: Point { x: x1, y: y1 },
             lower_right: Point { x: x2, y: y2 },
         }
-    }
-
-    #[test]
-    fn a_region_off_the_subimage_grid_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
-        use chronoscope_core::grammar::geometry::{Dimensions, Region};
-        let region = Region::from_dense(Dimensions::new(2, 2)?, &[true, false, false, false])?
-            .ok_or("non-empty")?;
-        let regions = vec![ScoredRegion { region, score: 0.9 }];
-        // A matching grid passes; a region on a different grid is rejected at the
-        // boundary, before any ask, so marks and describe questions can't desync.
-        assert!(require_matching_grids(&regions, 2, 2).is_ok());
-        assert!(matches!(
-            require_matching_grids(&regions, 4, 4),
-            Err(ReadError::RegionGrid { .. })
-        ));
-        Ok(())
     }
 
     #[test]

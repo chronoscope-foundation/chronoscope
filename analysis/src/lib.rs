@@ -11,6 +11,7 @@ pub mod ask;
 #[cfg(feature = "corpus")]
 pub mod corpus;
 pub mod dinov3;
+mod geometry;
 mod model_manifest;
 pub mod onnx;
 pub mod pipeline;
@@ -18,4 +19,7 @@ pub mod postprocess;
 mod preprocess;
 pub mod qwen3;
 pub mod sam3;
+pub mod scene;
 pub mod setofmark;
+#[cfg(test)]
+mod test_support;

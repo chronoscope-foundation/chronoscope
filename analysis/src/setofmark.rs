@@ -13,7 +13,7 @@
 //! region, its radius bounded by the inscribed circle, its label sized to read.
 
 use ab_glyph::Font;
-use chronoscope_core::grammar::geometry::Region;
+use chronoscope_core::grammar::geometry::Region as Mask;
 use image::{GrayImage, Luma, Rgb, RgbImage};
 use imageproc::distance_transform::euclidean_squared_distance_transform;
 use imageproc::drawing::{
@@ -21,7 +21,7 @@ use imageproc::drawing::{
 };
 use thiserror::Error;
 
-use crate::sam3::ScoredRegion;
+use crate::scene::{Region, Scene};
 
 /// Kelly's maximally-contrasting colors (the 1965 sequence, dropping the white
 /// and black that serve as fill background and text). We assume colors a human
@@ -142,26 +142,24 @@ pub fn font_from_env() -> Result<ab_glyph::FontVec, FontError> {
     })
 }
 
-/// Paint `regions` over `image` as numbered Set-of-Mark overlays: a colored hatch
-/// and boundary contour per region, plus a numbered disc at its pole of
-/// inaccessibility. Colors follow the input order (already ranked by the
+/// Paint `regions` over `scene`'s image as numbered Set-of-Mark overlays: a
+/// colored hatch and boundary contour per region, plus a numbered disc at its
+/// pole of inaccessibility. Colors follow the input order (already ranked by the
 /// postprocess step) and cycle through the twenty-color Kelly palette.
 ///
-/// A region whose grid disagrees with the image dimensions denotes pixels of a
-/// different frame, so it is skipped rather than drawn at the wrong scale.
-pub fn annotate(image: &RgbImage, regions: &[ScoredRegion], font: &impl Font) -> RgbImage {
-    let mut out = image.clone();
-    let (width, height) = (image.width(), image.height());
+/// The brand is what lets every region be drawn: each is a mask on this scene's
+/// own grid, so the marks and the describe loop's per-index questions number the
+/// same set.
+pub fn annotate<'b>(scene: &Scene<'b>, regions: &[Region<'b>], font: &impl Font) -> RgbImage {
+    let mut out = scene.image().to_rgb8();
+    let (width, height) = (out.width(), out.height());
     // One foreground mask reused across regions: each region marks and clears
     // only its own pixels, so the contour's neighbor test stays an O(1) lookup
     // without densifying the whole grid once per region.
     let mut mask = vec![false; width as usize * height as usize];
 
-    for (index, scored) in regions.iter().enumerate() {
-        let region = &scored.region;
-        if region.width() != width || region.height() != height {
-            continue;
-        }
+    for (index, branded) in regions.iter().enumerate() {
+        let region = branded.mask();
         let color = KELLY_COLORS[index % KELLY_COLORS.len()];
 
         let angle = index % HATCH_ANGLES;
@@ -185,7 +183,7 @@ pub fn annotate(image: &RgbImage, regions: &[ScoredRegion], font: &impl Font) ->
 /// `mask` is a shared scratch buffer sized to the image; the region's foreground
 /// is written into it for the neighbor test and cleared again on the way out, so
 /// it arrives and leaves all-false.
-fn draw_contour(canvas: &mut RgbImage, region: &Region, color: Rgb<u8>, mask: &mut [bool]) {
+fn draw_contour(canvas: &mut RgbImage, region: &Mask, color: Rgb<u8>, mask: &mut [bool]) {
     let (width, height) = (region.width(), region.height());
     let w = width as usize;
     for pixel in region.foreground_pixels() {
@@ -219,7 +217,7 @@ fn draw_contour(canvas: &mut RgbImage, region: &Region, color: Rgb<u8>, mask: &m
 /// Stamp region `index`'s numbered disc at its pole of inaccessibility.
 fn draw_marker(
     canvas: &mut RgbImage,
-    region: &Region,
+    region: &Mask,
     index: usize,
     color: Rgb<u8>,
     font: &impl Font,
@@ -256,7 +254,7 @@ fn draw_marker(
 /// non-zero: a region pixel's value is then its distance to the boundary, and
 /// the deepest such pixel is the pole. A one-cell border around the bounding
 /// box is background, so a region pixel touching an edge measures to that edge.
-fn pole_of_inaccessibility(region: &Region) -> ((u32, u32), f64) {
+fn pole_of_inaccessibility(region: &Mask) -> ((u32, u32), f64) {
     let (mut min_col, mut min_row, mut max_col, mut max_row) = (u32::MAX, u32::MAX, 0u32, 0u32);
     for (row, columns) in region.foreground_row_runs() {
         min_col = min_col.min(columns.start);
@@ -286,9 +284,13 @@ fn pole_of_inaccessibility(region: &Region) -> ((u32, u32), f64) {
 
 #[cfg(test)]
 mod tests {
-    use chronoscope_core::grammar::geometry::{Dimensions, Region};
+    use std::sync::Arc;
+
+    use chronoscope_core::grammar::geometry::Dimensions;
+    use image::DynamicImage;
 
     use super::*;
+    use crate::scene::with_scene_sync;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -311,42 +313,43 @@ mod tests {
         let font = font_from_env()?;
         let (width, height) = (40u32, 40u32);
         let base = Rgb([100u8, 110, 120]);
-        let image = RgbImage::from_pixel(width, height, base);
+        let image = Arc::new(DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            width, height, base,
+        )));
 
         let dims = Dimensions::new(width, height)?;
         let dense = rectangle(dims, 5..35, 10..30);
-        let region = Region::from_dense(dims, &dense)?.ok_or("non-empty region")?;
-        let regions = vec![ScoredRegion {
-            region: region.clone(),
-            score: 0.9,
-        }];
+        let mask = Mask::from_dense(dims, &dense)?.ok_or("non-empty region")?;
 
-        let out = annotate(&image, &regions, &font);
-        let color = KELLY_COLORS[0];
+        with_scene_sync(image, |scene| {
+            let region = Region::new(scene, mask).ok_or("on the scene's grid")?;
+            let out = annotate(scene, std::slice::from_ref(&region), &font);
+            let color = KELLY_COLORS[0];
 
-        // The hatch is partial: some region pixels take the mark color (hatch
-        // lines, contour, disc), and some keep the true pixel (the gaps between
-        // lines), so the object stays visible — the whole point over a solid fill.
-        let (mut marked, mut untouched) = (0u32, 0u32);
-        for (y, columns) in region.foreground_row_runs() {
-            for x in columns {
-                match *out.get_pixel(x, y) {
-                    p if p == color => marked += 1,
-                    p if p == base => untouched += 1,
-                    _ => {} // disc ring / label pixels are neither the mark nor the base
+            // The hatch is partial: some region pixels take the mark color (hatch
+            // lines, contour, disc), and some keep the true pixel (the gaps between
+            // lines), so the object stays visible — the whole point over a solid fill.
+            let (mut marked, mut untouched) = (0u32, 0u32);
+            for (y, columns) in region.mask().foreground_row_runs() {
+                for x in columns {
+                    match *out.get_pixel(x, y) {
+                        p if p == color => marked += 1,
+                        p if p == base => untouched += 1,
+                        _ => {} // disc ring / label pixels are neither the mark nor the base
+                    }
                 }
             }
-        }
-        assert!(marked > 0, "the mark color appears on the region");
-        assert!(untouched > 0, "gaps keep the true pixel");
+            assert!(marked > 0, "the mark color appears on the region");
+            assert!(untouched > 0, "gaps keep the true pixel");
 
-        // A pixel well outside the region is untouched.
-        assert_eq!(*out.get_pixel(2, 2), base);
+            // A pixel well outside the region is untouched.
+            assert_eq!(*out.get_pixel(2, 2), base);
 
-        // The pole pixel is under the drawn disc, so it is no longer the base.
-        let ((cx, cy), _) = pole_of_inaccessibility(&region);
-        assert_ne!(*out.get_pixel(cx, cy), base);
-        Ok(())
+            // The pole pixel is under the drawn disc, so it is no longer the base.
+            let ((cx, cy), _) = pole_of_inaccessibility(region.mask());
+            assert_ne!(*out.get_pixel(cx, cy), base);
+            Ok(())
+        })
     }
 
     #[test]
@@ -355,7 +358,7 @@ mod tests {
         // between them, but the pole lands on the region.
         let grid = Dimensions::new(5, 1)?;
         let region =
-            Region::from_dense(grid, &[true, false, false, false, true])?.ok_or("non-empty")?;
+            Mask::from_dense(grid, &[true, false, false, false, true])?.ok_or("non-empty")?;
         let dense = region.to_dense();
 
         let centroid_col = (region.centroid().x() * 5.0) as usize;

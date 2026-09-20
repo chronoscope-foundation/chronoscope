@@ -9,16 +9,11 @@
 //! pictorial map, an exterior building, an interior) still wants its own fixtures.
 //!
 //! Ignored by default: it loads the multi-gigabyte UQFF the commit gate cannot
-//! realize (and `ANNOTATE_FONT` is present under `model-test` for the gated
-//! signature). `just model-test` wires it.
+//! realize. `just model-test` wires it.
 
 use std::error;
 
-use chronoscope_analysis::{
-    pipeline::{SubimageReading, read_subimage},
-    qwen3::Qwen3,
-    setofmark::font_from_env,
-};
+use chronoscope_analysis::{ask::ImageOutcome, pipeline::gate, qwen3::Qwen3};
 use image::{DynamicImage, Rgb, RgbImage};
 
 mod common;
@@ -53,18 +48,14 @@ fn the_gate_rejects_a_synthetic_non_structure() -> Result<(), Box<dyn error::Err
                 describe(&source)
             )
         })?;
-        // No regions: the gate judges relevance and short-circuits before any
-        // describe/triage work. The font goes unused on the reject path but the
-        // signature asks for one, and `ANNOTATE_FONT` is present under model-test.
-        let font = font_from_env()?;
         let scene = red_disk_scene(256);
 
-        let reading = read_subimage(&model, scene, Vec::new(), &font)
+        let reading = gate(&model, &scene)
             .await
-            .map_err(|source| format!("could not read the subimage: {}", describe(&source)))?;
+            .map_err(|source| format!("could not gate the subimage: {}", describe(&source)))?;
 
         match reading {
-            SubimageReading::Irrelevant { reason } => {
+            ImageOutcome::Irrelevant { reason } => {
                 println!("gate rejected the red disk: {}", reason.as_str());
                 Ok(())
             }
@@ -93,22 +84,21 @@ fn the_gate_rejects_real_irrelevant_images() -> Result<(), Box<dyn error::Error>
     let corpus = corpus_dir()?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        // One model, reused across the images: the load dominates, and each image
-        // is read with no regions, so the gate is the only call per image.
+        // One model, reused across the images: the load dominates, and the gate
+        // is the only call per image.
         let model = Qwen3::open(&first_shard).await.map_err(|source| {
             format!(
                 "could not open the model from {first_shard:?}: {}",
                 describe(&source)
             )
         })?;
-        let font = font_from_env()?;
         for id in IRRELEVANT_CORPUS {
             let image = load_corpus(&corpus, id)?;
-            let reading = read_subimage(&model, image, Vec::new(), &font)
+            let reading = gate(&model, &image)
                 .await
-                .map_err(|source| format!("could not read {id}: {}", describe(&source)))?;
+                .map_err(|source| format!("could not gate {id}: {}", describe(&source)))?;
             match reading {
-                SubimageReading::Irrelevant { reason } => {
+                ImageOutcome::Irrelevant { reason } => {
                     println!("gate rejected {id}: {}", reason.as_str());
                 }
                 other => {

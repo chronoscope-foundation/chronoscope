@@ -121,6 +121,11 @@ mistralrs = { workspace = true }
 # types (`ImageMedium`, `Text`) instead of mirroring them.
 schemars.workspace = true
 
+[dev-dependencies]
+# The mask-comparison proptests: IoU's laws and its dense-mask oracle, which
+# sample grids and mask content rather than naming cases.
+proptest = "1.4"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # The Metal GPU backend, on Apple hardware only; other platforms run on CPU.
 mistralrs = { workspace = true, features = ["metal"] }

@@ -11,16 +11,14 @@
 //! Ignored by default: it needs a multi-hundred-megabyte export hanging off the
 //! gated weight fetches, which the commit gate cannot realize.
 
-mod support;
-
 use std::{
     env, error, fs,
     path::{Path, PathBuf},
 };
 
-use chronoscope_analysis::dinov3::Dinov3;
+use super::{Dinov3, Embedding, manifest::EMBEDDING_DIM};
+use crate::test_support::{accel, coreml_cache_root, describe};
 use serde::Deserialize;
-use support::{accel, coreml_cache_root, describe};
 
 /// Fixture directories, `PATH`-style, one per exported resolution.
 /// `just model-test` realizes them and sets this.
@@ -61,22 +59,19 @@ struct ReferenceImage {
     cls: Vec<f32>,
 }
 
-/// Cosine distance, accumulated in f64 so the subtraction from 1.0 keeps the
-/// digits that distinguish rounding from a fault.
-fn cosine_distance(reference: &[f32], produced: &[f32]) -> f64 {
-    let mut dot = 0.0_f64;
-    let mut reference_norm = 0.0_f64;
-    let mut produced_norm = 0.0_f64;
-    for (&left, &right) in reference.iter().zip(produced) {
-        let (left, right) = (f64::from(left), f64::from(right));
-        dot += left * right;
-        reference_norm += left * left;
-        produced_norm += right * right;
-    }
-    1.0 - dot / (reference_norm.sqrt() * produced_norm.sqrt())
+/// The reference vector as an [`Embedding`], so the comparison runs between two
+/// directions: the fixture records raw model output, which carries a norm near 8.
+fn reference_embedding(components: &[f32], what: &str) -> Result<Embedding, Box<dyn error::Error>> {
+    let raw = <&[f32; EMBEDDING_DIM]>::try_from(components).map_err(|_| {
+        format!(
+            "{what}: the reference is {}-wide, not the {EMBEDDING_DIM} the model produces",
+            components.len()
+        )
+    })?;
+    Ok(Embedding::from_raw(raw)?)
 }
 
-fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
+async fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
     let path = fixture.join("reference.json");
     let bytes = fs::read(&path).map_err(|source| format!("could not read {path:?}: {source}"))?;
     let reference: Reference = serde_json::from_slice(&bytes).map_err(|source| {
@@ -102,7 +97,7 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             fs::read(&path).map_err(|source| format!("could not read {path:?}: {source}"))?;
         let image = image::load_from_memory(&bytes)
             .map_err(|source| format!("could not decode {path:?}: {source}"))?;
-        let features = model.embed(&image).map_err(|source| {
+        let features = model.embed(&image).await.map_err(|source| {
             format!(
                 "{} at {resolution}px: could not embed the image: {}",
                 entry.id,
@@ -110,26 +105,17 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             )
         })?;
 
-        // Cosine distance ignores length, so the normalized CLS compares against
-        // the reference's raw one directly.
-        let image = features.image().map_err(|source| {
+        let produced = features.image().map_err(|source| {
             format!(
                 "{} at {resolution}px: the CLS has no direction: {}",
                 entry.id,
                 describe(&source)
             )
         })?;
-        let cls = image.as_slice();
-        assert_eq!(
-            cls.len(),
-            entry.cls.len(),
-            "{} at {resolution}px: the reference CLS has {} components, the model produced {}",
-            entry.id,
-            entry.cls.len(),
-            cls.len(),
-        );
+        let reference_cls =
+            reference_embedding(&entry.cls, &format!("{} at {resolution}px CLS", entry.id))?;
 
-        let cls_drift = cosine_distance(&entry.cls, cls);
+        let cls_drift = 1.0 - reference_cls.cosine(&produced);
         assert!(
             cls_drift <= CLS_DRIFT_MAX,
             "{} at {resolution}px: CLS drifted {cls_drift:.3e} from the reference, past the \
@@ -169,16 +155,10 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
         let mut max_drift = 0.0_f64;
         for (reference_patch, produced_patch) in reference_patches.chunks_exact(hidden).zip(patches)
         {
-            assert_eq!(
-                produced_patch.as_slice().len(),
-                reference_patch.len(),
-                "{} at {resolution}px: the model produced {}-wide patches, the reference is \
-                 {}-wide",
-                entry.id,
-                produced_patch.as_slice().len(),
-                reference_patch.len(),
-            );
-            max_drift = max_drift.max(cosine_distance(reference_patch, produced_patch.as_slice()));
+            let reference_patch =
+                reference_embedding(reference_patch, &format!("{} at {resolution}px", entry.id))?;
+            let produced_patch = Embedding::from_raw(produced_patch)?;
+            max_drift = max_drift.max(1.0 - reference_patch.cosine(&produced_patch));
         }
         assert!(
             max_drift <= PATCH_DRIFT_MAX,
@@ -188,14 +168,20 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
              reaching the patch grid.",
             entry.id,
         );
+
+        // The headroom under each bound, which is what says whether a session
+        // setting has moved the comparison rather than merely passed it.
+        let id = &entry.id;
+        println!("{id:28} at {resolution}px  cls {cls_drift:.3e}  worst patch {max_drift:.3e}");
     }
 
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs the DINOv3 export and its fixture; run `just model-test`"]
-fn cls_embeddings_reproduce_the_checkpoints_own_processor() -> Result<(), Box<dyn error::Error>> {
+async fn cls_embeddings_reproduce_the_checkpoints_own_processor()
+-> Result<(), Box<dyn error::Error>> {
     let fixtures = env::var_os(FIXTURES)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -206,7 +192,7 @@ fn cls_embeddings_reproduce_the_checkpoints_own_processor() -> Result<(), Box<dy
         })?;
 
     for fixture in env::split_paths(&fixtures) {
-        compare(&fixture)?;
+        compare(&fixture).await?;
     }
     Ok(())
 }

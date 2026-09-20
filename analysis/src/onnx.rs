@@ -35,11 +35,20 @@ pub(crate) enum Backend<'a> {
 /// points it at the nixpkgs build.
 const LIBRARY_VAR: &str = "ORT_DYLIB_PATH";
 
-/// Thread count partitions GEMM reductions, making it the largest same-machine
-/// source of drift between a recorded reference and a session reproducing it.
-/// `nix/scripts/dinov3-fixture.py` pins the same number and writes it into the
-/// reference, so the two agree by comparison rather than by convention.
-const INTRA_OP_THREADS: usize = 1;
+/// Intra-op threads per session. `run_async` hands inference to this pool, so a
+/// session that inferred with one thread has nowhere to run and errors.
+///
+/// Four rather than the machine's width: a model runs one inference at a time
+/// (its mutex is held across the await), so the pool serves that one run, and
+/// the machine's remaining cores are what the other models and the rest of the
+/// pipeline run on.
+///
+/// The count does not move the numbers. Both reference comparisons were run at
+/// 1 and at 8 threads, on CoreML and on the CPU provider, and every CLS drift,
+/// worst-patch drift and mask `IoU` matched to four significant figures, while
+/// the CPU run halved in wall-clock; the DINOv3 fixtures pin torch to one thread
+/// on the recording side regardless.
+const INTRA_OP_THREADS: usize = 4;
 
 /// Why a session could not be built.
 #[derive(Debug, Error)]

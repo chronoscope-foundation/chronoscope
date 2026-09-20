@@ -15,6 +15,8 @@
 //! thing that differs between the two.
 
 mod manifest;
+#[cfg(test)]
+mod reference;
 mod tokenizer;
 
 use std::path::Path;
@@ -26,7 +28,10 @@ use fast_image_resize::{
     pixels::F32,
 };
 use image::{DynamicImage, GenericImageView};
-use ort::{session::Session, value::TensorRef};
+use ort::{
+    session::{RunOptions, Session},
+    value::Tensor,
+};
 use thiserror::Error;
 
 use crate::{
@@ -104,16 +109,19 @@ const GROUNDING_DECODER: &str = "grounding_decoder";
 /// two here must match [`Sam3::segment_rect`]'s two prompt points.
 const DECODER_DIMS: &[(&str, i64)] = &[("num_points", 2)];
 
-/// One decoder-side feature map, held as the encoder produced it: a shape and
-/// its row-major `f32` data.
-struct FeatureMap {
-    shape: Vec<i64>,
-    data: Vec<f32>,
-}
+/// One decoder-side feature map, lifted off the encoder's outputs into a tensor
+/// ONNX Runtime owns.
+///
+/// Ownership is what lets a prompt be cancelled safely. A borrowed input view is
+/// sound only while the inference future lives, and dropping that future ends the
+/// borrow while a runtime thread may still be reading it. An owned value's
+/// backing is held by the run itself, so passing `&tensor` to each prompt keeps
+/// the encode's features reusable without copying them per prompt.
+struct FeatureMap(Tensor<f32>);
 
 impl FeatureMap {
-    fn tensor(&self) -> Result<TensorRef<'_, f32>, ort::Error> {
-        TensorRef::from_array_view((self.shape.clone(), self.data.as_slice()))
+    fn tensor(&self) -> &Tensor<f32> {
+        &self.0
     }
 }
 
@@ -193,7 +201,7 @@ impl Sam3 {
     /// `to_rgb8` fixes the channel count at three. The original grid is held so
     /// the decoder's masks scale back to it, so it is capped like any [`Region`]
     /// grid.
-    pub fn encode(&mut self, image: &DynamicImage) -> Result<EncodedImage, EncodeError> {
+    pub async fn encode(&mut self, image: &DynamicImage) -> Result<EncodedImage, EncodeError> {
         let (width, height) = image.dimensions();
         let original = Dimensions::new(width, height).map_err(EncodeError::Original)?;
 
@@ -206,11 +214,14 @@ impl Sam3 {
             square.width() as i64,
         ];
         let tensor =
-            TensorRef::from_array_view((shape, square.samples())).map_err(input(IMAGE_ENCODER))?;
+            Tensor::from_array((shape, square.into_samples())).map_err(input(IMAGE_ENCODER))?;
 
+        let options = RunOptions::new().map_err(run(IMAGE_ENCODER))?;
         let outputs = self
             .encoder
-            .run(ort::inputs![IMAGE_INPUT => tensor])
+            .run_async(ort::inputs![IMAGE_INPUT => tensor], &options)
+            .map_err(run(IMAGE_ENCODER))?
+            .await
             .map_err(run(IMAGE_ENCODER))?;
 
         Ok(EncodedImage {
@@ -234,7 +245,7 @@ impl Sam3 {
     /// predicted `IoU` each; the best is upsampled from the decoder's low
     /// resolution to the original grid and thresholded. The score is that
     /// predicted `IoU`.
-    pub fn segment_rect(
+    pub async fn segment_rect(
         &mut self,
         encoded: &EncodedImage,
         rect: &ProportionalRect,
@@ -248,15 +259,18 @@ impl Sam3 {
         ];
         let point_labels = [2.0_f32, 3.0];
 
+        let options = RunOptions::new().map_err(run(DECODER))?;
         let outputs = self
             .decoder
-            .run(ort::inputs![
-                IMAGE_EMBED => encoded.image_embed.tensor().map_err(input(DECODER))?,
-                HIGH_RES_FEAT_0 => encoded.high_res_feat_0.tensor().map_err(input(DECODER))?,
-                HIGH_RES_FEAT_1 => encoded.high_res_feat_1.tensor().map_err(input(DECODER))?,
-                "point_coords" => TensorRef::from_array_view((vec![1_i64, 2, 2], point_coords.as_slice())).map_err(input(DECODER))?,
-                "point_labels" => TensorRef::from_array_view((vec![1_i64, 2], point_labels.as_slice())).map_err(input(DECODER))?,
-            ])
+            .run_async(ort::inputs![
+                IMAGE_EMBED => encoded.image_embed.tensor(),
+                HIGH_RES_FEAT_0 => encoded.high_res_feat_0.tensor(),
+                HIGH_RES_FEAT_1 => encoded.high_res_feat_1.tensor(),
+                "point_coords" => Tensor::from_array((vec![1_i64, 2, 2], point_coords.to_vec())).map_err(input(DECODER))?,
+                "point_labels" => Tensor::from_array((vec![1_i64, 2], point_labels.to_vec())).map_err(input(DECODER))?,
+            ], &options)
+            .map_err(run(DECODER))?
+            .await
             .map_err(run(DECODER))?;
 
         let ious = extract(&outputs, DECODER, "iou_predictions")?;
@@ -301,7 +315,7 @@ impl Sam3 {
     /// already thresholded, so the runner reads instances straight out — no
     /// candidate pick and no upsample. An empty result means the model found none
     /// of the concept.
-    pub fn segment_concept(
+    pub async fn segment_concept(
         &mut self,
         encoded: &EncodedImage,
         prompt: &str,
@@ -310,11 +324,14 @@ impl Sam3 {
             .tokenizer
             .encode(prompt)
             .map_err(ConceptError::Tokenize)?;
+        let language_options = RunOptions::new().map_err(run(LANGUAGE_ENCODER))?;
         let encoded_text = self
             .language_encoder
-            .run(ort::inputs![
-                TOKENS => TensorRef::from_array_view((vec![1_i64, CONTEXT_LEN as i64], tokens.as_slice())).map_err(input(LANGUAGE_ENCODER))?,
-            ])
+            .run_async(ort::inputs![
+                TOKENS => Tensor::from_array((vec![1_i64, CONTEXT_LEN as i64], tokens.to_vec())).map_err(input(LANGUAGE_ENCODER))?,
+            ], &language_options)
+            .map_err(run(LANGUAGE_ENCODER))?
+            .await
             .map_err(run(LANGUAGE_ENCODER))?;
 
         // The grounding run reuses these, so both language outputs are lifted to
@@ -326,25 +343,28 @@ impl Sam3 {
         let height = i64::from(encoded.original.height());
         let width = i64::from(encoded.original.width());
         // The export's text-only exemplar: zero coords, label 1, masked out.
-        let box_coords = [0.0_f32; 4];
-        let box_labels = [1_i64];
-        let box_masks = [true];
+        let box_coords = vec![0.0_f32; 4];
+        let box_labels = vec![1_i64];
+        let box_masks = vec![true];
 
+        let grounding_options = RunOptions::new().map_err(run(GROUNDING_DECODER))?;
         let outputs = self
             .grounding_decoder
-            .run(ort::inputs![
-                ORIGINAL_HEIGHT => TensorRef::from_array_view((Vec::<i64>::new(), [height].as_slice())).map_err(input(GROUNDING_DECODER))?,
-                ORIGINAL_WIDTH => TensorRef::from_array_view((Vec::<i64>::new(), [width].as_slice())).map_err(input(GROUNDING_DECODER))?,
-                VISION_POS_ENC_2 => encoded.vision_pos_enc_2.tensor().map_err(input(GROUNDING_DECODER))?,
-                BACKBONE_FPN_0 => encoded.backbone_fpn_0.tensor().map_err(input(GROUNDING_DECODER))?,
-                BACKBONE_FPN_1 => encoded.backbone_fpn_1.tensor().map_err(input(GROUNDING_DECODER))?,
-                BACKBONE_FPN_2 => encoded.backbone_fpn_2.tensor().map_err(input(GROUNDING_DECODER))?,
-                LANGUAGE_MASK => TensorRef::from_array_view((language_mask.shape, language_mask.data.as_slice())).map_err(input(GROUNDING_DECODER))?,
-                LANGUAGE_FEATURES => language_features.tensor().map_err(input(GROUNDING_DECODER))?,
-                BOX_COORDS => TensorRef::from_array_view((vec![1_i64, 1, 4], box_coords.as_slice())).map_err(input(GROUNDING_DECODER))?,
-                BOX_LABELS => TensorRef::from_array_view((vec![1_i64, 1], box_labels.as_slice())).map_err(input(GROUNDING_DECODER))?,
-                BOX_MASKS => TensorRef::from_array_view((vec![1_i64, 1], box_masks.as_slice())).map_err(input(GROUNDING_DECODER))?,
-            ])
+            .run_async(ort::inputs![
+                ORIGINAL_HEIGHT => Tensor::from_array((Vec::<i64>::new(), vec![height])).map_err(input(GROUNDING_DECODER))?,
+                ORIGINAL_WIDTH => Tensor::from_array((Vec::<i64>::new(), vec![width])).map_err(input(GROUNDING_DECODER))?,
+                VISION_POS_ENC_2 => encoded.vision_pos_enc_2.tensor(),
+                BACKBONE_FPN_0 => encoded.backbone_fpn_0.tensor(),
+                BACKBONE_FPN_1 => encoded.backbone_fpn_1.tensor(),
+                BACKBONE_FPN_2 => encoded.backbone_fpn_2.tensor(),
+                LANGUAGE_MASK => &language_mask,
+                LANGUAGE_FEATURES => language_features.tensor(),
+                BOX_COORDS => Tensor::from_array((vec![1_i64, 1, 4], box_coords)).map_err(input(GROUNDING_DECODER))?,
+                BOX_LABELS => Tensor::from_array((vec![1_i64, 1], box_labels)).map_err(input(GROUNDING_DECODER))?,
+                BOX_MASKS => Tensor::from_array((vec![1_i64, 1], box_masks)).map_err(input(GROUNDING_DECODER))?,
+            ], &grounding_options)
+            .map_err(run(GROUNDING_DECODER))?
+            .await
             .map_err(run(GROUNDING_DECODER))?;
 
         let scores = extract(&outputs, GROUNDING_DECODER, SCORES)?;
@@ -422,10 +442,9 @@ fn feature_map(
     if data.iter().any(|value| !value.is_finite()) {
         return Err(GraphError::NonFinite { graph, name });
     }
-    Ok(FeatureMap {
-        shape: shape.to_vec(),
-        data: data.to_vec(),
-    })
+    Tensor::from_array((shape.to_vec(), data.to_vec()))
+        .map(FeatureMap)
+        .map_err(input(graph))
 }
 
 /// Extracts a named f32 output as a slice, rejecting a non-finite value.
@@ -455,20 +474,14 @@ fn extract<'a>(
     Ok(data)
 }
 
-/// One owned boolean tensor: the language mask, lifted off the language session
-/// so it survives into the grounding run.
-struct BoolTensor {
-    shape: Vec<i64>,
-    data: Vec<bool>,
-}
-
-/// Lifts a named boolean output to an owned [`BoolTensor`]. No finiteness check:
-/// a bool has no non-finite value to reject.
+/// Lifts a named boolean output into a tensor ONNX Runtime owns, so the language
+/// mask survives both its own session's outputs and a cancelled grounding run.
+/// No finiteness check: a bool has no non-finite value to reject.
 fn extract_bool(
     outputs: &ort::session::SessionOutputs,
     graph: &'static str,
     name: &'static str,
-) -> Result<BoolTensor, GraphError> {
+) -> Result<Tensor<bool>, GraphError> {
     let output = outputs
         .get(name)
         .ok_or(GraphError::MissingOutput { graph, name })?;
@@ -480,10 +493,7 @@ fn extract_bool(
                 name,
                 source,
             })?;
-    Ok(BoolTensor {
-        shape: shape.to_vec(),
-        data: data.to_vec(),
-    })
+    Tensor::from_array((shape.to_vec(), data.to_vec())).map_err(input(graph))
 }
 
 /// Bilinearly upsamples the decoder's square low-resolution mask logits to the

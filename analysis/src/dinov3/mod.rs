@@ -12,12 +12,17 @@
 mod embedding;
 mod manifest;
 mod pool;
+#[cfg(test)]
+mod reference;
 
 use std::{num::NonZeroUsize, path::Path};
 
 use chronoscope_core::grammar::geometry::Region;
 use image::DynamicImage;
-use ort::{session::Session, value::TensorRef};
+use ort::{
+    session::{RunOptions, Session},
+    value::Tensor,
+};
 use thiserror::Error;
 
 use crate::{
@@ -43,7 +48,9 @@ const OUTPUT: &str = "last_hidden_state";
 type Token = [f32; EMBEDDING_DIM];
 
 /// DINOv3's output for one image, read as unit-length [`Embedding`]s through
-/// [`image`](Self::image) and [`region`](Self::region).
+/// [`image`](Self::image) for the whole frame and, within the crate, a pooled
+/// region; [`scene::Features`](crate::scene::Features) is the branded way to the
+/// latter.
 ///
 /// The tokens stay raw because a region's embedding is the normalized mean of
 /// raw patches, the masked-average-pooling recipe DINO region descriptors use;
@@ -64,7 +71,7 @@ pub struct Features {
 impl Features {
     /// The whole-image embedding: the CLS token, normalized.
     pub fn image(&self) -> Result<Embedding, DegenerateEmbedding> {
-        normalize(&self.cls.map(f64::from), magnitude(&self.cls))
+        Embedding::from_raw(&self.cls)
     }
 
     /// The embedding of the part of the image `region` covers: the mean of the
@@ -75,8 +82,12 @@ impl Features {
     /// `embed` squashes the whole frame into the model's square, so a fraction of
     /// the mask's width is the same fraction of the patch grid's.
     ///
+    /// Crate-visible because that precondition is unstated here and unenforceable:
+    /// [`scene::Features::region`](crate::scene::Features::region) is the way in,
+    /// and its brand carries the proof.
+    ///
     /// Errors only when the covered patches cancel, leaving no direction.
-    pub fn region(&self, region: &Region) -> Result<Embedding, DegenerateEmbedding> {
+    pub(crate) fn region(&self, region: &Region) -> Result<Embedding, DegenerateEmbedding> {
         let weights = pool::patch_weights(region, self.cols);
         let mut sum = [0.0_f64; EMBEDDING_DIM];
         let mut mass = 0.0;
@@ -93,9 +104,10 @@ impl Features {
 
     /// The raw patch grid, row-major as `patches` is, for the reference
     /// comparison that holds each patch against the checkpoint's own output.
-    /// The pipeline reads patches through [`region`](Self::region).
-    #[doc(hidden)]
-    pub fn raw_patches(&self) -> &[[f32; EMBEDDING_DIM]] {
+    /// The pipeline reads patches through [`region`](Self::region), so that
+    /// comparison is the only caller.
+    #[cfg(test)]
+    pub(crate) fn raw_patches(&self) -> &[Token] {
         &self.patches
     }
 }
@@ -178,23 +190,31 @@ impl Dinov3 {
     ///
     /// `to_rgb8` fixes the channel count at three, broadcasting a grayscale
     /// frame to three planes the way the processor does when it converts to RGB.
-    pub fn embed(&mut self, image: &DynamicImage) -> Result<Features, EmbedError> {
+    pub async fn embed(&mut self, image: &DynamicImage) -> Result<Features, EmbedError> {
         let factor = self.manifest.rescale_factor;
         let planar = ChwImage::from_rgb(&image.to_rgb8(), |byte| f32::from(byte) * factor);
         let square = planar
             .resize(self.manifest.resolution)
             .map_err(EmbedError::Resize)?;
-        self.forward(&square).map_err(EmbedError::Forward)
+        self.forward(square).await.map_err(EmbedError::Forward)
     }
 
-    fn forward(&mut self, image: &ChwImage<f32>) -> Result<Features, ForwardError> {
+    /// The input tensor owns its samples rather than viewing them. A borrowed
+    /// view is sound only while the inference future lives, and dropping that
+    /// future (a timeout, a `select!`) ends the borrow while a runtime thread
+    /// may still be reading it; an owned value's backing is held by the run
+    /// itself.
+    async fn forward(&mut self, image: ChwImage<f32>) -> Result<Features, ForwardError> {
         let shape = vec![CHANNELS as i64, image.height() as i64, image.width() as i64];
         let input =
-            TensorRef::from_array_view((shape, image.samples())).map_err(ForwardError::Input)?;
+            Tensor::from_array((shape, image.into_samples())).map_err(ForwardError::Input)?;
 
+        let options = RunOptions::new().map_err(ForwardError::Run)?;
         let outputs = self
             .session
-            .run(ort::inputs![INPUT => input])
+            .run_async(ort::inputs![INPUT => input], &options)
+            .map_err(ForwardError::Run)?
+            .await
             .map_err(ForwardError::Run)?;
         let output = outputs.get(OUTPUT).ok_or(ForwardError::MissingOutput)?;
         let (shape, values) = output

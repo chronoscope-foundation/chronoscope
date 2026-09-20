@@ -141,8 +141,12 @@ impl<T: Sample> ChwImage<T> {
     }
 
     /// The planar samples, channel-major, for the encoder input tensor.
-    pub(crate) fn samples(&self) -> &[T] {
-        &self.samples
+    ///
+    /// By value because ONNX Runtime owns what it is given: an owned input
+    /// survives a cancelled inference, where a borrowed view would leave a
+    /// runtime thread reading a freed buffer.
+    pub(crate) fn into_samples(self) -> Vec<T> {
+        self.samples
     }
 }
 

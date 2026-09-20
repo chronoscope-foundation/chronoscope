@@ -1131,6 +1131,7 @@ dependencies = [
  "indexmap 2.14.0",
  "mistralrs",
  "ort",
+ "proptest",
  "schemars 0.8.22",
  "serde",
  "serde_json",
