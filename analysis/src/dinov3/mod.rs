@@ -1,4 +1,4 @@
-//! DINOv3 through `ort`: pixels in, the CLS embedding and patch grid out.
+//! DINOv3 through `ort`: pixels in, the CLS token and patch grid out.
 //!
 //! Mean/std normalization is baked into the graph by
 //! `nix/scripts/export-dinov3.py`, since there is no `AutoImageProcessor` in
@@ -9,10 +9,13 @@
 //! and owns the rescale, the resize to the model's fixed square resolution, RGB
 //! channel order, and the float32 CHW layout the graph reads.
 
+mod embedding;
 mod manifest;
+mod pool;
 
-use std::path::Path;
+use std::{num::NonZeroUsize, path::Path};
 
+use chronoscope_core::grammar::geometry::Region;
 use image::DynamicImage;
 use ort::{session::Session, value::TensorRef};
 use thiserror::Error;
@@ -21,9 +24,11 @@ use crate::{
     onnx::{self, Accel, SessionError},
     preprocess::{CHANNELS, ChwImage},
 };
+use embedding::normalize;
 use manifest::{Dinov3Manifest, EMBEDDING_DIM};
 
 pub use crate::preprocess::ResizeError;
+pub use embedding::{DegenerateEmbedding, Embedding};
 pub use manifest::{ManifestError, ManifestInvalid};
 
 /// The graph's one input, named by the export.
@@ -33,38 +38,75 @@ const INPUT: &str = "image";
 /// masked pooling reads.
 const OUTPUT: &str = "last_hidden_state";
 
-/// A raw `EMBEDDING_DIM`-d embedding in the model's output space, carried as the
-/// graph produced it.
-///
-/// Normalization is the consumer's concern: cosine similarity normalizes at the
-/// comparison, and region pooling takes a coverage-weighted mean of raw patch
-/// embeddings before L2-normalizing the pooled result. Only the crate mints
-/// these, from tokens `forward` has already held to finite.
-#[derive(Debug, Clone)]
-pub struct Embedding([f32; EMBEDDING_DIM]);
+/// One token as the graph produced it: a raw vector in the model's output
+/// space, finite because `forward` rejects any other.
+type Token = [f32; EMBEDDING_DIM];
 
-impl Embedding {
-    pub(crate) fn new(components: [f32; EMBEDDING_DIM]) -> Self {
-        Self(components)
+/// DINOv3's output for one image, read as unit-length [`Embedding`]s through
+/// [`image`](Self::image) and [`region`](Self::region).
+///
+/// The tokens stay raw because a region's embedding is the normalized mean of
+/// raw patches, the masked-average-pooling recipe DINO region descriptors use;
+/// normalizing each patch first would discard the magnitudes that mean weighs.
+#[derive(Debug, Clone)]
+pub struct Features {
+    /// DINOv3's global summary of the frame, for image-level similarity,
+    /// distinct from any mean of the patches.
+    cls: Token,
+    /// One token per 16x16-pixel patch of the model's input square, row-major:
+    /// `patches[i]` is grid cell `(i / cols, i % cols)`. `forward` holds the
+    /// count to `cols * cols`, which region pooling indexes by.
+    patches: Vec<Token>,
+    /// Patches per side of the square grid.
+    cols: NonZeroUsize,
+}
+
+impl Features {
+    /// The whole-image embedding: the CLS token, normalized.
+    pub fn image(&self) -> Result<Embedding, DegenerateEmbedding> {
+        normalize(&self.cls.map(f64::from), magnitude(&self.cls))
     }
 
-    pub fn as_slice(&self) -> &[f32] {
-        &self.0
+    /// The embedding of the part of the image `region` covers: the mean of the
+    /// patch grid, read as a bilinear field, over the mask, normalized.
+    ///
+    /// `region` must be a mask over the image these features embed. It is read
+    /// in proportional coordinates, so any mask resolution of that frame works:
+    /// `embed` squashes the whole frame into the model's square, so a fraction of
+    /// the mask's width is the same fraction of the patch grid's.
+    ///
+    /// Errors only when the covered patches cancel, leaving no direction.
+    pub fn region(&self, region: &Region) -> Result<Embedding, DegenerateEmbedding> {
+        let weights = pool::patch_weights(region, self.cols);
+        let mut sum = [0.0_f64; EMBEDDING_DIM];
+        let mut mass = 0.0;
+        for (patch, &weight) in self.patches.iter().zip(&weights) {
+            if weight > 0.0 {
+                for (total, &value) in sum.iter_mut().zip(patch) {
+                    *total += weight * f64::from(value);
+                }
+                mass += weight * magnitude(patch);
+            }
+        }
+        normalize(&sum, mass)
+    }
+
+    /// The raw patch grid, row-major as `patches` is, for the reference
+    /// comparison that holds each patch against the checkpoint's own output.
+    /// The pipeline reads patches through [`region`](Self::region).
+    #[doc(hidden)]
+    pub fn raw_patches(&self) -> &[[f32; EMBEDDING_DIM]] {
+        &self.patches
     }
 }
 
-/// DINOv3's output for one image: the CLS embedding and the patch grid, both raw
-/// model-space vectors the pipeline normalizes where it compares or pools them.
-#[derive(Debug, Clone)]
-pub struct Features {
-    /// The whole-image embedding: DINOv3's global summary of the frame, for
-    /// image-level similarity, distinct from any mean of the patches.
-    pub cls: Embedding,
-    /// One feature vector per 16x16-pixel image patch, row-major over the patch
-    /// grid: `patches[i]` is grid cell `(i / cols, i % cols)`, left-to-right
-    /// then top-to-bottom, with `cols = resolution / patch_size`. This is the
-    /// ordering region pooling reads to map a patch back to an image location.
-    pub patches: Vec<Embedding>,
+/// A token's L2 norm, in the f64 the pooled sums accumulate in.
+fn magnitude(token: &Token) -> f64 {
+    token
+        .iter()
+        .map(|&value| f64::from(value) * f64::from(value))
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// Why a forward pass did not produce tokens.
@@ -132,7 +174,7 @@ impl Dinov3 {
     }
 
     /// Preprocesses a decoded image the way the checkpoint's processor does and
-    /// runs the model, returning its CLS embedding and patch grid.
+    /// runs the model, returning its CLS token and patch grid.
     ///
     /// `to_rgb8` fixes the channel count at three, broadcasting a grayscale
     /// frame to three planes the way the processor does when it converts to RGB.
@@ -187,15 +229,18 @@ impl Dinov3 {
                         shape: dimensions.to_vec(),
                     });
                 };
+                // `expected` is the prefix plus the grid side squared, so the
+                // tokens past the prefix are exactly the grid `Features` indexes.
                 let patches = tokens
                     .iter()
                     .skip(self.manifest.prefix_tokens)
-                    .map(|token| Embedding::new(*token))
+                    .copied()
                     .collect();
 
                 Ok(Features {
-                    cls: Embedding::new(*cls),
+                    cls: *cls,
                     patches,
+                    cols: self.manifest.patch_grid_side,
                 })
             }
             _ => Err(ForwardError::OutputShape {

@@ -14,6 +14,7 @@
 
 use std::{
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
 };
 
@@ -51,6 +52,10 @@ pub(crate) struct Dinov3Manifest {
     /// Leading tokens (CLS then registers) before the patch grid; patches begin
     /// at this index.
     pub(crate) prefix_tokens: usize,
+    /// Patches per side of the square patch grid, the resolution over the
+    /// export's patch size, which region pooling needs to place each patch in
+    /// the frame.
+    pub(crate) patch_grid_side: NonZeroUsize,
     /// Per-byte scale, held so `255` times it stays in `[0, 1]`.
     pub(crate) rescale_factor: f32,
 }
@@ -98,14 +103,21 @@ impl Dinov3Manifest {
             }
         };
 
-        // Pooling indexes the grid row-major, so a non-square grid would pool
-        // over the wrong shape and a zero grid would name no patch tokens at all.
-        // Whether a well-formed grid matches `resolution / patch` is left to
-        // `forward`'s token recount, since patch size is not on the wire.
-        let [rows, columns] = model.patch_grid;
-        if rows != columns || rows == 0 {
-            return Err(ManifestInvalid::PatchGridShape { rows, columns });
-        }
+        // Region pooling maps a mask's fractions straight onto the patch grid,
+        // which is exact only when the patches tile the square with nothing left
+        // over; a ViT drops the pixels past the last whole patch. The patch size
+        // is the fact that expresses this, so the grid is derived from it here
+        // rather than restated, and one patch size over a square input makes the
+        // grid square by construction. A positive resolution also makes a patch
+        // wider than the square fail the division, so the surviving grid holds
+        // at least one patch.
+        let patch_grid_side = NonZeroUsize::new(model.patch_size)
+            .filter(|patch| resolution % patch.get() == 0)
+            .and_then(|patch| NonZeroUsize::new(resolution / patch.get()))
+            .ok_or(ManifestInvalid::PatchSize {
+                patch_size: model.patch_size,
+                resolution,
+            })?;
 
         // CLS lives at index 0 by DINOv3 convention, so the prefix cannot be
         // empty. Without this, a prefix-less export would validate and the top-
@@ -145,10 +157,14 @@ impl Dinov3Manifest {
         Ok(Self {
             graph: export.join(model.graph),
             resolution,
+            // `forward` holds the graph's own output to this count, so the
+            // derivation above is confirmed against the model rather than
+            // trusted.
             sequence_length: model
                 .prefix_tokens
-                .saturating_add(rows.saturating_mul(columns)),
+                .saturating_add(patch_grid_side.get().saturating_mul(patch_grid_side.get())),
             prefix_tokens: model.prefix_tokens,
+            patch_grid_side,
             rescale_factor: parse_rescale_factor(model.rescale_factor)?,
         })
     }
@@ -207,8 +223,11 @@ pub enum ManifestInvalid {
     #[error("input shape {shape:?} is not a channel-first [3, N, N] square")]
     InputShape { shape: Vec<i64> },
 
-    #[error("patch grid {rows}x{columns} is not a positive square")]
-    PatchGridShape { rows: usize, columns: usize },
+    #[error("patch size {patch_size} does not tile the {resolution}px input square")]
+    PatchSize {
+        patch_size: usize,
+        resolution: usize,
+    },
 
     #[error("the export declares zero prefix tokens, so there is no CLS token at index 0")]
     PrefixTokens,
@@ -249,6 +268,60 @@ struct Graph {
     antialias: bool,
     rescale_factor: f64,
     prefix_tokens: usize,
-    patch_grid: [usize; 2],
+    patch_size: usize,
     hidden_size: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    /// A manifest with the real ViT-L/16 export's values at `resolution`, over
+    /// `patch_size`-pixel patches.
+    fn manifest(resolution: i64, patch_size: usize) -> Value {
+        json!({
+            "dinov3": {
+                "graph": "dinov3/model.onnx",
+                "inputs": [{ "name": "image", "dtype": "tensor(float)", "shape": [3, resolution, resolution] }],
+                "channel_order": "rgb",
+                "interpolation": "bilinear",
+                "antialias": true,
+                "rescale_factor": 1.0 / 255.0,
+                "prefix_tokens": 5,
+                "patch_size": patch_size,
+                "hidden_size": EMBEDDING_DIM
+            }
+        })
+    }
+
+    fn validate(
+        value: Value,
+    ) -> Result<Result<Dinov3Manifest, ManifestInvalid>, serde_json::Error> {
+        let wire: Wire = serde_json::from_value(value)?;
+        Ok(Dinov3Manifest::validate(Path::new("/export"), wire))
+    }
+
+    #[test]
+    fn the_grid_side_is_the_patch_size_dividing_the_input_square() -> TestResult {
+        // 16px patches tile 448 as a 28x28 grid.
+        let tiling = validate(manifest(448, 16))?.map_err(|error| error.to_string())?;
+        assert_eq!(tiling.patch_grid_side.get(), 28);
+        assert_eq!(tiling.sequence_length, 5 + 28 * 28);
+
+        // 15px patches leave 13 pixels the model would drop, and a zero patch
+        // size names no grid at all.
+        for patch_size in [15, 0] {
+            assert!(matches!(
+                validate(manifest(448, patch_size))?,
+                Err(ManifestInvalid::PatchSize {
+                    patch_size: rejected,
+                    resolution: 448
+                }) if rejected == patch_size
+            ));
+        }
+        Ok(())
+    }
 }

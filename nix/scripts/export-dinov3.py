@@ -185,10 +185,11 @@ if not np.isfinite(drift) or drift > TOLERANCE:
             "interpolation": interpolation,
             "antialias": True,
             "rescale_factor": preprocess["rescale_factor"],
-            # Where the patch grid starts (CLS then registers), its shape, and the
-            # embedding width the crate pools over and is built for.
+            # Where the patch grid starts (CLS then registers), the patch size
+            # the crate divides the input square by to place each patch in the
+            # frame, and the embedding width it pools over and is built for.
             "prefix_tokens": prefix_tokens,
-            "patch_grid": [patch_grid, patch_grid],
+            "patch_size": patch,
             "hidden_size": config["hidden_size"],
         },
         indent=2,

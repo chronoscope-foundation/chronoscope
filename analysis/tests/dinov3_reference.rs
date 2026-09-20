@@ -110,7 +110,16 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             )
         })?;
 
-        let cls = features.cls.as_slice();
+        // Cosine distance ignores length, so the normalized CLS compares against
+        // the reference's raw one directly.
+        let image = features.image().map_err(|source| {
+            format!(
+                "{} at {resolution}px: the CLS has no direction: {}",
+                entry.id,
+                describe(&source)
+            )
+        })?;
+        let cls = image.as_slice();
         assert_eq!(
             cls.len(),
             entry.cls.len(),
@@ -132,17 +141,14 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
         // The patch count and token width come off the model's own output, not
         // the fixture: the reference sidecar must reproduce what this model
         // produces, so it is measured against that.
-        let expected_patches = features.patches.len();
-        let hidden = features
-            .patches
-            .first()
-            .map(|patch| patch.as_slice().len())
-            .ok_or_else(|| {
-                format!(
-                    "{} at {resolution}px: the model produced no patches",
-                    entry.id
-                )
-            })?;
+        let patches = features.raw_patches();
+        let expected_patches = patches.len();
+        let hidden = patches.first().map(|patch| patch.len()).ok_or_else(|| {
+            format!(
+                "{} at {resolution}px: the model produced no patches",
+                entry.id
+            )
+        })?;
 
         let sidecar_path = fixture.join(&entry.patches);
         let sidecar = fs::read(&sidecar_path)
@@ -161,9 +167,7 @@ fn compare(fixture: &Path) -> Result<(), Box<dyn error::Error>> {
             quads.iter().map(|quad| f32::from_le_bytes(*quad)).collect();
 
         let mut max_drift = 0.0_f64;
-        for (reference_patch, produced_patch) in reference_patches
-            .chunks_exact(hidden)
-            .zip(&features.patches)
+        for (reference_patch, produced_patch) in reference_patches.chunks_exact(hidden).zip(patches)
         {
             assert_eq!(
                 produced_patch.as_slice().len(),

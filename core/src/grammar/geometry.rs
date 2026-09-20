@@ -27,6 +27,8 @@
 //! All are anchored to the image's own pixel / proportional frame; a geographic
 //! reading is a property of the image's projection, derived downstream.
 
+use std::ops::Range;
+
 use chronoscope_macros::grammar_type;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -307,42 +309,26 @@ impl Region {
     /// Tight foreground bounding box in `0.0..=1.0` proportional image
     /// coordinates, or `None` when the mask is empty.
     pub fn bounding_rect(&self) -> Option<ProportionalRect> {
-        let width = u64::from(self.width());
-        let (mut min_row, mut min_col, mut max_row, mut max_col) = (u32::MAX, u32::MAX, 0u32, 0u32);
-        let mut any = false;
-        let mut cursor: u64 = 0;
-        for (index, &run) in self.runs.iter().enumerate() {
-            let len = u64::from(run);
-            if index % 2 == 1 && run > 0 {
-                any = true;
-                let (first, last) = (cursor, cursor + len - 1);
-                let (r0, c0) = ((first / width) as u32, (first % width) as u32);
-                let (r1, c1) = ((last / width) as u32, (last % width) as u32);
-                min_row = min_row.min(r0);
-                max_row = max_row.max(r1);
-                // A run that crosses a row boundary wraps through every column,
-                // so its column span is the full width, not `c0..=c1`.
-                if r0 == r1 {
-                    min_col = min_col.min(c0);
-                    max_col = max_col.max(c1);
-                } else {
-                    min_col = 0;
-                    max_col = self.width() - 1;
-                }
-            }
-            cursor += len;
+        let mut runs = self.foreground_row_runs();
+        let (top, first) = runs.next()?;
+        let (mut min_col, mut max_end, mut bottom) = (first.start, first.end, top);
+        // Raster order puts the first run on the top row and the last on the
+        // bottom one, so the rows fall out of the order and only the columns
+        // take a min and max.
+        for (row, columns) in runs {
+            min_col = min_col.min(columns.start);
+            max_end = max_end.max(columns.end);
+            bottom = row;
         }
-        if !any {
-            return None;
-        }
-        // Inclusive pixel span [min, max] to the proportional half-open box
-        // [min, max + 1] / dim. Every operand lies in `[0, 1]`, so the only
-        // failure `ProportionalRect::new` could report is unreachable here.
+        // Half-open pixel spans to the proportional box: columns
+        // `[min_col, max_end)` and rows `[top, bottom + 1)`, each over its
+        // dimension. Every operand lies in `[0, 1]`, so the only failure
+        // `ProportionalRect::new` could report is unreachable here.
         ProportionalRect::new(
             f64::from(min_col) / f64::from(self.width()),
-            f64::from(min_row) / f64::from(self.height()),
-            f64::from(max_col + 1) / f64::from(self.width()),
-            f64::from(max_row + 1) / f64::from(self.height()),
+            f64::from(top) / f64::from(self.height()),
+            f64::from(max_end) / f64::from(self.width()),
+            f64::from(bottom + 1) / f64::from(self.height()),
         )
         .ok()
     }
@@ -350,30 +336,16 @@ impl Region {
     /// The foreground centroid as a [`ProportionalPoint`], the mean of the
     /// foreground pixel positions.
     pub fn centroid(&self) -> ProportionalPoint {
-        let width = u64::from(self.width());
         let (mut sum_col, mut sum_row) = (0u64, 0u64);
-        let mut cursor: u64 = 0;
-        for (index, &run) in self.runs.iter().enumerate() {
-            let len = u64::from(run);
-            // Foreground runs sit at odd indices. Sum each pixel's column and row
-            // over the linear span `[cursor, cursor + len)`, split at row
-            // boundaries so the column arithmetic stays inside one row.
-            if index % 2 == 1 {
-                let (mut i, end) = (cursor, cursor + len);
-                while i < end {
-                    let row = i / width;
-                    let col_start = i % width;
-                    let seg_end = end.min((row + 1) * width);
-                    let seg_len = seg_end - i;
-                    // Columns `col_start .. col_start + seg_len`: a `seg_len`-term
-                    // arithmetic series. The product is of consecutive integers, so
-                    // the halving is exact.
-                    sum_col += seg_len * col_start + seg_len * (seg_len - 1) / 2;
-                    sum_row += row * seg_len;
-                    i = seg_end;
-                }
-            }
-            cursor += len;
+        for (row, columns) in self.foreground_row_runs() {
+            let (start, len) = (
+                u64::from(columns.start),
+                u64::from(columns.end - columns.start),
+            );
+            // Columns `start .. start + len`: a `len`-term arithmetic series. The
+            // product is of consecutive integers, so the halving is exact.
+            sum_col += len * start + len * (len - 1) / 2;
+            sum_row += u64::from(row) * len;
         }
         // Mean pixel over the grid extent. A column is in `[0, width)`, so the
         // ratio is in `[0, 1)`; rows likewise.
@@ -415,6 +387,26 @@ impl Region {
         self.foreground_intervals()
             .into_iter()
             .flat_map(|(start, end)| (start as usize)..(end as usize))
+    }
+
+    /// The foreground as `(row, columns)` runs in raster order, each lying
+    /// within one row: a stored run that wraps past a row's end splits there. A
+    /// consumer that works row by row pays per run here rather than per pixel.
+    pub fn foreground_row_runs(&self) -> impl Iterator<Item = (u32, Range<u32>)> {
+        let width = u64::from(self.width());
+        self.foreground_intervals()
+            .into_iter()
+            .flat_map(move |(start, end)| {
+                // A foreground run is never empty, so `end - 1` is its last
+                // pixel. Every row and column fits in `u32` under the
+                // `MAX_REGION_DIM` cap.
+                (start / width..=(end - 1) / width).map(move |row| {
+                    let row_start = row * width;
+                    let from = start.max(row_start) - row_start;
+                    let to = end.min(row_start + width) - row_start;
+                    (row as u32, from as u32..to as u32)
+                })
+            })
     }
 
     /// Foreground runs as half-open `[start, end)` intervals in linear index
@@ -1077,6 +1069,41 @@ mod tests {
         assert_eq!(
             region.foreground_pixels().collect::<Vec<_>>(),
             vec![1, 2, 4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn region_foreground_row_runs_split_stored_runs_at_row_ends() -> TestResult {
+        // 4x4 grid, foreground at linear 2..11 and 13: one stored run wrapping
+        // from row 0 through a full row 1 into row 2, then a lone pixel.
+        let wrapping = Region::from_pixels(
+            Dimensions::new(4, 4)?,
+            &(2..11).chain([13]).collect::<Vec<_>>(),
+        )?
+        .ok_or("non-empty")?;
+        assert_eq!(
+            wrapping.foreground_row_runs().collect::<Vec<_>>(),
+            vec![(0, 2..4), (1, 0..4), (2, 0..3), (3, 1..2)]
+        );
+
+        // Opening foreground at pixel 0 (a leading zero-length background run),
+        // with two runs sharing row 0.
+        let opening = Region::from_dense(
+            Dimensions::new(3, 2)?,
+            &[true, false, true, true, true, false],
+        )?
+        .ok_or("non-empty")?;
+        assert_eq!(
+            opening.foreground_row_runs().collect::<Vec<_>>(),
+            vec![(0, 0..1), (0, 2..3), (1, 0..2)]
+        );
+
+        // The full frame is one stored run: one full-width run per row.
+        let full = Region::from_dense(Dimensions::new(3, 2)?, &[true; 6])?.ok_or("non-empty")?;
+        assert_eq!(
+            full.foreground_row_runs().collect::<Vec<_>>(),
+            vec![(0, 0..3), (1, 0..3)]
         );
         Ok(())
     }

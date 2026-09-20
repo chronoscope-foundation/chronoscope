@@ -164,12 +164,12 @@ pub fn annotate(image: &RgbImage, regions: &[ScoredRegion], font: &impl Font) ->
         }
         let color = KELLY_COLORS[index % KELLY_COLORS.len()];
 
-        let w = width as usize;
         let angle = index % HATCH_ANGLES;
-        for pixel in region.foreground_pixels() {
-            let (x, y) = ((pixel % w) as u32, (pixel / w) as u32);
-            if hatch_hit(x, y, angle) {
-                out.put_pixel(x, y, color);
+        for (y, columns) in region.foreground_row_runs() {
+            for x in columns {
+                if hatch_hit(x, y, angle) {
+                    out.put_pixel(x, y, color);
+                }
             }
         }
         draw_contour(&mut out, region, color, &mut mask);
@@ -198,14 +198,17 @@ fn draw_contour(canvas: &mut RgbImage, region: &Region, color: Rgb<u8>, mask: &m
             && (y as u32) < height
             && mask[(y as usize) * w + (x as usize)]
     };
-    for pixel in region.foreground_pixels() {
-        let (x, y) = ((pixel % w) as i32, (pixel / w) as i32);
-        if !foreground(x - 1, y)
-            || !foreground(x + 1, y)
-            || !foreground(x, y - 1)
-            || !foreground(x, y + 1)
-        {
-            draw_filled_circle_mut(canvas, (x, y), CONTOUR_RADIUS, color);
+    for (y, columns) in region.foreground_row_runs() {
+        let y = y as i32;
+        for x in columns {
+            let x = x as i32;
+            if !foreground(x - 1, y)
+                || !foreground(x + 1, y)
+                || !foreground(x, y - 1)
+                || !foreground(x, y + 1)
+            {
+                draw_filled_circle_mut(canvas, (x, y), CONTOUR_RADIUS, color);
+            }
         }
     }
     for pixel in region.foreground_pixels() {
@@ -254,21 +257,20 @@ fn draw_marker(
 /// the deepest such pixel is the pole. A one-cell border around the bounding
 /// box is background, so a region pixel touching an edge measures to that edge.
 fn pole_of_inaccessibility(region: &Region) -> ((u32, u32), f64) {
-    let width = region.width() as usize;
     let (mut min_col, mut min_row, mut max_col, mut max_row) = (u32::MAX, u32::MAX, 0u32, 0u32);
-    for pixel in region.foreground_pixels() {
-        let (col, row) = ((pixel % width) as u32, (pixel / width) as u32);
-        min_col = min_col.min(col);
-        max_col = max_col.max(col);
+    for (row, columns) in region.foreground_row_runs() {
+        min_col = min_col.min(columns.start);
+        max_col = max_col.max(columns.end - 1);
         min_row = min_row.min(row);
         max_row = max_row.max(row);
     }
     let (bw, bh) = (max_col - min_col + 1, max_row - min_row + 1);
 
     let mut mask = GrayImage::from_pixel(bw + 2, bh + 2, Luma([255]));
-    for pixel in region.foreground_pixels() {
-        let (col, row) = ((pixel % width) as u32, (pixel / width) as u32);
-        mask.put_pixel(col - min_col + 1, row - min_row + 1, Luma([0]));
+    for (row, columns) in region.foreground_row_runs() {
+        for col in columns {
+            mask.put_pixel(col - min_col + 1, row - min_row + 1, Luma([0]));
+        }
     }
 
     let dist = euclidean_squared_distance_transform(&mask);
@@ -321,18 +323,18 @@ mod tests {
 
         let out = annotate(&image, &regions, &font);
         let color = KELLY_COLORS[0];
-        let w = width as usize;
 
         // The hatch is partial: some region pixels take the mark color (hatch
         // lines, contour, disc), and some keep the true pixel (the gaps between
         // lines), so the object stays visible — the whole point over a solid fill.
         let (mut marked, mut untouched) = (0u32, 0u32);
-        for pixel in region.foreground_pixels() {
-            let (x, y) = ((pixel % w) as u32, (pixel / w) as u32);
-            match *out.get_pixel(x, y) {
-                p if p == color => marked += 1,
-                p if p == base => untouched += 1,
-                _ => {} // disc ring / label pixels are neither the mark nor the base
+        for (y, columns) in region.foreground_row_runs() {
+            for x in columns {
+                match *out.get_pixel(x, y) {
+                    p if p == color => marked += 1,
+                    p if p == base => untouched += 1,
+                    _ => {} // disc ring / label pixels are neither the mark nor the base
+                }
             }
         }
         assert!(marked > 0, "the mark color appears on the region");
