@@ -23,6 +23,10 @@ todo = "deny"
 unimplemented = "deny"
 unused_self = "warn"
 doc_markdown = "deny"
+# Every multi-file module in the workspace is a directory with a `mod.rs`. The
+# lint holds new ones to it, which prose in a plan does not: the convention
+# drifted within minutes of a module being added.
+self_named_module_files = "deny"
 
 [workspace.dependencies]
 # Async runtime
