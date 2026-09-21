@@ -138,6 +138,69 @@ fn put(canvas: &mut RgbImage, x: u32, y: u32, width: u32, height: u32) {
     }
 }
 
+/// The pixels `rect` covers of `image`, as an image of its own.
+///
+/// Corners map to pixel boundaries rather than pixel addresses, so subtracting
+/// two of them counts pixels: a rect reaching the far edge keeps the frame's
+/// last row and column, which an address clamped to the last pixel would drop.
+pub fn crop(image: &DynamicImage, rect: ProportionalRect) -> Result<DynamicImage, DegenerateCrop> {
+    let (width, height) = (image.width(), image.height());
+    let (left, right) = (
+        to_edge(rect.x(), width),
+        to_edge(rect.max_corner().x(), width),
+    );
+    let (top, bottom) = (
+        to_edge(rect.y(), height),
+        to_edge(rect.max_corner().y(), height),
+    );
+
+    // The rect holds its corners in canonical order and `to_edge` preserves it,
+    // so each far edge sits at or past its near one.
+    let (box_width, box_height) = (right - left, bottom - top);
+    if box_width == 0 || box_height == 0 {
+        return Err(DegenerateCrop {
+            left: rect.x(),
+            top: rect.y(),
+            right: rect.max_corner().x(),
+            bottom: rect.max_corner().y(),
+            image_width: width,
+            image_height: height,
+            box_width,
+            box_height,
+        });
+    }
+    Ok(image.crop_imm(left, top, box_width, box_height))
+}
+
+/// Maps a proportional coordinate to a pixel boundary of an `extent`-wide axis:
+/// how many pixels lie before it, which is `extent` at the far edge.
+fn to_edge(fraction: f64, extent: u32) -> u32 {
+    let extent = f64::from(extent);
+    (fraction * extent).round().clamp(0.0, extent) as u32
+}
+
+/// A rect that covers no whole pixel of the image it was read against, which a
+/// rect of positive area does once it is thin beside the parent's pixels.
+///
+/// Refused here, where the rect and the frame are both named, rather than
+/// downstream where a model reports an empty tensor instead.
+#[derive(Debug, Clone, PartialEq, Error)]
+#[error(
+    "the rect ({left:.4}, {top:.4})-({right:.4}, {bottom:.4}) of a \
+     {image_width}x{image_height} image rounds to an empty \
+     {box_width}x{box_height} box"
+)]
+pub struct DegenerateCrop {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub box_width: u32,
+    pub box_height: u32,
+}
+
 /// A panel the model placed off the 0-1000 grid, so its corners could not be
 /// read into the parent frame. The index is its position in the reading-order
 /// panel list, so a batch failure names which panel.
@@ -358,6 +421,33 @@ mod tests {
             upper_left: Point { x: x1, y: y1 },
             lower_right: Point { x: x2, y: y2 },
         }
+    }
+
+    #[test]
+    fn a_rect_crops_the_pixels_between_its_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+        let image = DynamicImage::new_rgb8(100, 50);
+
+        // Columns 10 through 49 and rows 10 through 29: forty by twenty.
+        let panel = crop(&image, ProportionalRect::new(0.1, 0.2, 0.5, 0.6)?)?;
+        assert_eq!((panel.width(), panel.height()), (40, 20));
+
+        // The far edge is the count of pixels, not the last index, so the whole
+        // frame survives a full-frame rect.
+        let whole = crop(&image, ProportionalRect::full())?;
+        assert_eq!((whole.width(), whole.height()), (100, 50));
+        Ok(())
+    }
+
+    #[test]
+    fn a_rect_that_rounds_to_no_pixels_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        // On a two-pixel axis both x boundaries round to zero, so this rect has
+        // area yet covers no pixel.
+        let image = DynamicImage::new_rgb8(2, 2);
+        let error = crop(&image, ProportionalRect::new(0.1, 0.0, 0.2, 1.0)?)
+            .err()
+            .ok_or("a rect covering no pixel is refused")?;
+        assert_eq!((error.box_width, error.box_height), (0, 2));
+        Ok(())
     }
 
     #[test]
