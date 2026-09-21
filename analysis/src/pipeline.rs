@@ -12,14 +12,13 @@
 //! asks Qwen to describe each mark in turn; with none, it asks whether the
 //! segmenter missed a whole structure. A cartographic map or a plan is left for
 //! the map-analysis path. Every call leads with the same raw image, so they share
-//! one image prefill. Each pass is exercised in isolation — cropping the parent
-//! frame and threading the segmenter between the two is a later wiring stage.
+//! one image prefill. Each pass is exercised in isolation; chaining them, with
+//! [`crop`] between pass 1 and the reads and the segmenter before them, is the
+//! orchestrator's job.
 
 use ab_glyph::Font;
 use chronoscope_core::grammar::composites::SubimageRegion;
-use chronoscope_core::grammar::geometry::{
-    ProportionalCoordError, ProportionalRect, Region as Mask,
-};
+use chronoscope_core::grammar::geometry::{ProportionalCoordError, ProportionalRect};
 use chronoscope_core::grammar::text::Text;
 use image::{DynamicImage, Rgb, RgbImage};
 use thiserror::Error;
@@ -277,22 +276,14 @@ Respond with JSON conforming to this type:";
 /// The user-turn trigger after the triage image.
 const TRIAGE_POSTAMBLE: &str = "Report what the detector missed.";
 
-/// One segmented region carrying the model's reading of it. Per-entity coverage
-/// gives every region a reading, so the description is unconditional.
+/// What the model made of a relevant subimage: a reading per region, or, when
+/// the segmenter found none, the recall backstop's verdict.
 #[derive(Debug, Clone)]
-pub struct DescribedRegion {
-    /// The region the segmenter found, as a mask over the subimage.
-    pub region: Mask,
-    /// What the model said the region is.
-    pub description: Text,
-}
-
-/// What the model made of a relevant subimage: its regions read one by one, or —
-/// when the segmenter found none — the recall backstop's verdict.
-#[derive(Debug, Clone)]
-pub enum Content {
-    /// The segmenter's regions, each with the model's reading.
-    Described(Vec<DescribedRegion>),
+pub enum Read {
+    /// One reading per region, positionally: `descriptions[i]` answers the mark
+    /// numbered from `regions[i]`. The caller holds those regions and pairs them
+    /// back up, which is why the order is the contract rather than a convenience.
+    Described(Vec<Text>),
     /// The subimage had no regions; whether the detector missed a real structure.
     Triaged(TriageOutcome),
 }
@@ -320,7 +311,10 @@ pub enum ReadError {
 /// Requires a completed answer, mapping an early stop to a labeled
 /// [`ReadError::Incomplete`]. The one place [`Outcome`] is unwrapped, so it never
 /// leaks past [`gate`] or [`read_content`].
-fn require_complete<T>(outcome: Outcome<T>, call: impl Into<String>) -> Result<T, ReadError> {
+pub(crate) fn require_complete<T>(
+    outcome: Outcome<T>,
+    call: impl Into<String>,
+) -> Result<T, ReadError> {
     match outcome {
         Outcome::Parsed(value) => Ok(value),
         Outcome::Incomplete { finish, raw_prefix } => Err(ReadError::Incomplete {
@@ -348,34 +342,32 @@ pub async fn gate(qwen: &Qwen3, image: &DynamicImage) -> Result<ImageOutcome, Re
 ///
 /// The regions are `scene`'s own, so the overlay's marks and the describe loop's
 /// per-index questions number one set of masks on one grid. The mark number is
-/// internal — the loop index the trigger names — so it never leaves the stage.
+/// internal — the loop index the trigger names — so it never leaves the stage,
+/// and the readings come back in that same order for the caller to pair with the
+/// regions it still holds.
 pub async fn read_content<'b>(
     qwen: &Qwen3,
     scene: &Scene<'b>,
-    regions: Vec<Region<'b>>,
+    regions: &[Region<'b>],
     font: &impl Font,
-) -> Result<Content, ReadError> {
+) -> Result<Read, ReadError> {
     let subimage = scene.image();
     if regions.is_empty() {
         let triage = qwen
             .ask::<TriageOutcome>(triage_prompt(subimage.clone()))
             .await?;
-        return Ok(Content::Triaged(require_complete(triage, "triage")?));
+        return Ok(Read::Triaged(require_complete(triage, "triage")?));
     }
-    let overlay: DynamicImage = setofmark::annotate(scene, &regions, font).into();
-    let mut described = Vec::with_capacity(regions.len());
-    for (index, region) in regions.into_iter().enumerate() {
+    let overlay: DynamicImage = setofmark::annotate(scene, regions, font).into();
+    let mut descriptions = Vec::with_capacity(regions.len());
+    for index in 0..regions.len() {
         let reading = qwen
             .ask::<EntityReading>(entity_prompt(subimage.clone(), overlay.clone(), index))
             .await?;
         let reading = require_complete(reading, format!("entity {index}"))?;
-        described.push(DescribedRegion {
-            // Plain data on its way out of the scene's scope.
-            region: region.mask().clone(),
-            description: reading.description_from_raw_image,
-        });
+        descriptions.push(reading.description_from_raw_image);
     }
-    Ok(Content::Described(described))
+    Ok(Read::Described(descriptions))
 }
 
 /// The gate prompt: the raw subimage alone, judged for relevance, medium, and view.
