@@ -10,6 +10,11 @@
 //!
 //! Ignored by default: it needs a multi-hundred-megabyte export hanging off the
 //! gated weight fetches, which the commit gate cannot realize.
+//!
+//! In the crate rather than `tests/`, unlike its SAM and orchestration
+//! siblings, because it compares against `raw_patches`, `Embedding::cosine` and
+//! `Embedding::from_raw`, which are crate-visible so the public surface carries
+//! no test-only accessors.
 
 use std::{
     env, error, fs,

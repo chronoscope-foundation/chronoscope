@@ -1,4 +1,4 @@
-//! The analysis pipeline: an image in, the located and read entities out.
+//! The passes a pipeline run is composed of, each usable and tested alone.
 //!
 //! Built one model deep at a time. Pass 1 ([`detect_composite`]) asks Qwen
 //! whether the image is a single picture or a composite of several panels, and
@@ -13,13 +13,14 @@
 //! segmenter missed a whole structure. A cartographic map or a plan is left for
 //! the map-analysis path. Every call leads with the same raw image, so they share
 //! one image prefill. Each pass is exercised in isolation; chaining them, with
-//! [`crop`] between pass 1 and the reads and the segmenter before them, is the
-//! orchestrator's job.
+//! [`crop`] between pass 1 and the reads and the segmenter before them, is
+//! [`Pipeline`](super::Pipeline)'s job.
 
 use ab_glyph::Font;
 use chronoscope_core::grammar::composites::SubimageRegion;
 use chronoscope_core::grammar::geometry::{ProportionalCoordError, ProportionalRect};
 use chronoscope_core::grammar::text::Text;
+use chronoscope_core::nonempty::NonEmptyVec;
 use image::{DynamicImage, Rgb, RgbImage};
 use thiserror::Error;
 
@@ -73,23 +74,27 @@ pub async fn detect_composite(
 ///
 /// `CompositeOutcome::panels` collapses a composite of fewer than two panels to
 /// none, so an under-split composite lands on the whole-frame path with a single
-/// picture. The result is always at least one subimage.
-pub fn subimages(outcome: &CompositeOutcome) -> Result<Vec<SubimageRegion>, PanelError> {
+/// picture. The count carries in the type: a caller reading every subimage
+/// reads at least one, and an image with no panels is unspellable.
+pub fn subimages(outcome: &CompositeOutcome) -> Result<NonEmptyVec<SubimageRegion>, PanelError> {
     let panels = outcome.panels();
-    if panels.is_empty() {
-        return Ok(vec![SubimageRegion::Rect {
+    let placed = |index: usize, panel| {
+        let rect = bbox_to_proportional(panel).map_err(|source| PanelError { index, source })?;
+        Ok(SubimageRegion::Rect { rect })
+    };
+
+    // The first panel seeds the list, so "at least one subimage" is how the
+    // value is built rather than something a caller re-checks.
+    let Some((first, rest)) = panels.split_first() else {
+        return Ok(NonEmptyVec::singleton(SubimageRegion::Rect {
             rect: ProportionalRect::full(),
-        }]);
+        }));
+    };
+    let mut subimages = NonEmptyVec::singleton(placed(0, *first)?);
+    for (offset, &panel) in rest.iter().enumerate() {
+        subimages.push(placed(offset + 1, panel)?);
     }
-    panels
-        .iter()
-        .enumerate()
-        .map(|(index, &panel)| {
-            let rect =
-                bbox_to_proportional(panel).map_err(|source| PanelError { index, source })?;
-            Ok(SubimageRegion::Rect { rect })
-        })
-        .collect()
+    Ok(subimages)
 }
 
 /// Draws each subimage's rectangle onto a copy of the image, so a detected
@@ -276,10 +281,10 @@ Respond with JSON conforming to this type:";
 /// The user-turn trigger after the triage image.
 const TRIAGE_POSTAMBLE: &str = "Report what the detector missed.";
 
-/// What the model made of a relevant subimage: a reading per region, or, when
-/// the segmenter found none, the recall backstop's verdict.
+/// What the model made of a relevant subimage's marks: one reading each, or,
+/// when the segmenter found none to mark, the recall backstop's verdict.
 #[derive(Debug, Clone)]
-pub enum Read {
+pub enum Marks {
     /// One reading per region, positionally: `descriptions[i]` answers the mark
     /// numbered from `regions[i]`. The caller holds those regions and pairs them
     /// back up, which is why the order is the contract rather than a convenience.
@@ -350,13 +355,13 @@ pub async fn read_content<'b>(
     scene: &Scene<'b>,
     regions: &[Region<'b>],
     font: &impl Font,
-) -> Result<Read, ReadError> {
+) -> Result<Marks, ReadError> {
     let subimage = scene.image();
     if regions.is_empty() {
         let triage = qwen
             .ask::<TriageOutcome>(triage_prompt(subimage.clone()))
             .await?;
-        return Ok(Read::Triaged(require_complete(triage, "triage")?));
+        return Ok(Marks::Triaged(require_complete(triage, "triage")?));
     }
     let overlay: DynamicImage = setofmark::annotate(scene, regions, font).into();
     let mut descriptions = Vec::with_capacity(regions.len());
@@ -367,7 +372,7 @@ pub async fn read_content<'b>(
         let reading = require_complete(reading, format!("entity {index}"))?;
         descriptions.push(reading.description_from_raw_image);
     }
-    Ok(Read::Described(descriptions))
+    Ok(Marks::Described(descriptions))
 }
 
 /// The gate prompt: the raw subimage alone, judged for relevance, medium, and view.
@@ -445,7 +450,10 @@ mod tests {
     #[test]
     fn a_single_image_is_one_full_frame_subimage() -> Result<(), Box<dyn std::error::Error>> {
         let regions = subimages(&CompositeOutcome::Single)?;
-        assert_eq!(regions, vec![SubimageRegion::rect(0.0, 0.0, 1.0, 1.0)?]);
+        assert_eq!(
+            regions.into_vec(),
+            vec![SubimageRegion::rect(0.0, 0.0, 1.0, 1.0)?]
+        );
         Ok(())
     }
 
@@ -458,7 +466,7 @@ mod tests {
             panels: vec![rect(0.0, 0.0, 1000.0, 500.0)],
         };
         assert_eq!(
-            subimages(&one)?,
+            subimages(&one)?.into_vec(),
             vec![SubimageRegion::rect(0.0, 0.0, 1.0, 1.0)?]
         );
         Ok(())
@@ -476,7 +484,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            subimages(&composite)?,
+            subimages(&composite)?.into_vec(),
             vec![
                 SubimageRegion::rect(0.0, 0.0, 1.0, 0.5)?,
                 SubimageRegion::rect(0.0, 0.5, 1.0, 1.0)?,

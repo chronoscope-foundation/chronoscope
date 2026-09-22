@@ -31,6 +31,11 @@ corpus = [
     "dep:url",
     "dep:tempfile",
 ]
+## The helpers a test loads a model with (the backend choice, the CoreML cache
+## root, a cause-chain printer). In-crate tests see them through `cfg(test)`;
+## this is how the integration tests reach the same ones, the way `core` and
+## `db` expose their own test support.
+test-support = []
 
 [dependencies]
 serde.workspace = true
@@ -125,6 +130,11 @@ schemars.workspace = true
 # The mask-comparison proptests: IoU's laws and its dense-mask oracle, which
 # sample grids and mask content rather than naming cases.
 proptest = "1.4"
+
+# The crate depends on itself so its own integration tests get `test-support`.
+# A dev-dependency's features apply when cargo builds the test targets, and
+# nothing else turns the feature on, so the helpers stay out of a normal build.
+chronoscope-analysis = { path = ".", features = ["test-support"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The Metal GPU backend, on Apple hardware only; other platforms run on CPU.

@@ -829,6 +829,13 @@ model-test:
     # filename lives only in the derivation.
     nix build .#qwen-vlm-uqff --out-link .nix-gc-roots/qwen-vlm-uqff
     export QWEN_MODEL_FIRST_SHARD="$(nix eval --raw .#qwen-vlm-uqff.firstShard)"
+    # The orchestration test drives the models themselves rather than comparing
+    # against a recorded fixture, so it names the exports directly instead of
+    # reading one out of a fixture's closure.
+    export SAM3_EXPORT="$(nix build .#sam3-onnx \
+        --out-link .nix-gc-roots/sam3-onnx --print-out-paths)"
+    export DINOV3_EXPORT="$(nix build .#dinov3-onnx-448 \
+        --out-link .nix-gc-roots/dinov3-onnx-448 --print-out-paths)"
     # CoreML is the backend the pipeline runs, so the comparisons run on it. A
     # stable cache dir lets a rerun reuse the compiled models rather than
     # recompiling each graph; target/ is gitignored. Set only where CoreML exists,

@@ -3,12 +3,12 @@
 //! DINOv3 and SAM 3 run here over the ONNX graphs `nix/analysis.nix` exports;
 //! Qwen 3.6 runs through mistral.rs (`qwen3`), the pipeline's VLM.
 //!
-//! The corpus — the pinned development image set the pipeline is built
-//! against — sits behind the `corpus` feature, since its downloader runs from
-//! Nix.
+//! The corpus is the pinned development image set the pipeline is built
+//! against. Its manifest is the ground truth the orchestration test reads, so
+//! it parses in every build; only the downloader, which the `corpus-fetch` FOD
+//! binary runs from Nix, sits behind the `corpus` feature.
 
 pub mod ask;
-#[cfg(feature = "corpus")]
 pub mod corpus;
 pub mod dinov3;
 mod geometry;
@@ -21,5 +21,5 @@ pub mod qwen3;
 pub mod sam3;
 pub mod scene;
 pub mod setofmark;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

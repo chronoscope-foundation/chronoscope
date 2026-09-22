@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::{env, error};
 
 use chronoscope_analysis::ask::{CompositeOutcome, Outcome};
-use chronoscope_analysis::pipeline::{detect_composite, draw_subimages, subimages};
+use chronoscope_analysis::pipeline::passes::{detect_composite, draw_subimages, subimages};
 use chronoscope_analysis::qwen3::Qwen3;
 use chronoscope_core::grammar::composites::SubimageRegion;
 use chronoscope_core::grammar::geometry::{ProportionalCoordError, ProportionalRect};
@@ -591,7 +591,9 @@ fn composite_layouts_report_their_panels() -> Result<(), Box<dyn error::Error>> 
                 }
             };
 
-            let subs = subimages(&composite).map_err(|e| format!("layout {name}: {e}"))?;
+            let subs = subimages(&composite)
+                .map_err(|e| format!("layout {name}: {e}"))?
+                .into_vec();
             if subs.len() != panels {
                 failures.push(diagnose(name, &canvas, &subs, &truth, &composite));
                 continue;
@@ -634,7 +636,7 @@ fn composite_layouts_report_their_panels() -> Result<(), Box<dyn error::Error>> 
             .map_err(|e| format!("negative control: ask failed: {}", describe(&e)))?
         {
             Outcome::Parsed(composite) => {
-                let subs = subimages(&composite)?;
+                let subs = subimages(&composite)?.into_vec();
                 let full = SubimageRegion::rect(0.0, 0.0, 1.0, 1.0)?;
                 if subs.len() != 1 || subs[0] != full {
                     failures.push(format!(

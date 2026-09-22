@@ -1,6 +1,11 @@
-//! Boilerplate shared by the crate's tests. Only the pieces that are
-//! byte-identical between them live here; each reference comparison keeps its
-//! own fixture discovery, entry type, and numeric metric.
+//! Boilerplate shared by the tests that load a model, in this crate and in its
+//! integration tests. Only the pieces that are byte-identical between them live
+//! here; each reference comparison keeps its own fixture discovery, entry type,
+//! and numeric metric.
+//!
+//! Reached from `tests/` through the `test-support` feature, which only the
+//! crate's own dev-dependency turns on, so none of this compiles into a normal
+//! build.
 
 use std::{
     env, error,
@@ -20,7 +25,7 @@ pub fn frame(width: u32, height: u32) -> Arc<DynamicImage> {
 
 /// One line carrying an error's whole cause chain, since the boxed error a
 /// failing test prints shows only the outermost message otherwise.
-pub(crate) fn describe(error: &dyn error::Error) -> String {
+pub fn describe(error: &dyn error::Error) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {
@@ -36,12 +41,12 @@ pub(crate) fn describe(error: &dyn error::Error) -> String {
 /// `just model-test` sets it, so the comparisons run on CoreML, the backend the
 /// pipeline runs. It is `Option` only so the tests still run on a platform
 /// without CoreML (no cache set, CPU fallback).
-pub(crate) fn coreml_cache_root() -> Option<PathBuf> {
+pub fn coreml_cache_root() -> Option<PathBuf> {
     env::var_os("COREML_CACHE").map(PathBuf::from)
 }
 
 /// The [`Accel`] a cache root selects: CoreML when set, CPU where CoreML is
 /// unavailable.
-pub(crate) fn accel(cache_root: Option<&Path>) -> Accel<'_> {
+pub fn accel(cache_root: Option<&Path>) -> Accel<'_> {
     cache_root.map_or(Accel::Cpu, |root| Accel::CoreML { cache_root: root })
 }

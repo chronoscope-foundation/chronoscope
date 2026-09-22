@@ -1123,6 +1123,7 @@ name = "chronoscope-analysis"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "chronoscope-analysis",
  "chronoscope-core",
  "chronoscope-integrations",
  "fast_image_resize",

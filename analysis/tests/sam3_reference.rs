@@ -17,9 +17,9 @@ use std::{
     sync::Arc,
 };
 
-use super::{Sam3, ScoredRegion};
-use crate::scene::{Region as Branded, with_scene_sync};
-use crate::test_support::{accel, coreml_cache_root, describe};
+use chronoscope_analysis::sam3::{Sam3, ScoredRegion};
+use chronoscope_analysis::scene::{Region as Branded, with_scene_sync};
+use chronoscope_analysis::test_support::{accel, coreml_cache_root, describe};
 use chronoscope_core::grammar::geometry::{Dimensions, ProportionalRect, Region};
 use image::DynamicImage;
 use serde::Deserialize;

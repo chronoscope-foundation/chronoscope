@@ -24,16 +24,10 @@ pub fn corpus_dir() -> Result<std::path::PathBuf, String> {
         })
 }
 
-/// Loads a corpus single by its bare id. The files carry no extension, so the
-/// format is sniffed from the bytes rather than guessed from the path.
+/// Loads a corpus single by its bare id.
+///
+/// The crate owns the read, since the extensionless naming is the corpus's own
+/// convention and an in-crate test reads the same files.
 pub fn load_corpus(dir: &Path, id: &str) -> Result<DynamicImage, Box<dyn error::Error>> {
-    let path = dir.join(id);
-    let reader = image::ImageReader::open(&path)
-        .map_err(|e| format!("could not open corpus image {}: {e}", path.display()))?
-        .with_guessed_format()
-        .map_err(|e| format!("could not sniff the format of {}: {e}", path.display()))?;
-    let image = reader
-        .decode()
-        .map_err(|e| format!("could not decode {}: {e}", path.display()))?;
-    Ok(image)
+    Ok(chronoscope_analysis::corpus::load_image(dir, id)?)
 }

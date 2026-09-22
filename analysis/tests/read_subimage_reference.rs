@@ -13,7 +13,7 @@
 
 use std::error;
 
-use chronoscope_analysis::{ask::ImageOutcome, pipeline::gate, qwen3::Qwen3};
+use chronoscope_analysis::{ask::ImageOutcome, pipeline::passes::gate, qwen3::Qwen3};
 use image::{DynamicImage, Rgb, RgbImage};
 
 mod common;

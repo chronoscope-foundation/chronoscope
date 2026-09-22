@@ -7,14 +7,11 @@ use chronoscope_analysis::qwen3::MODEL_SHARD_ENV;
 
 /// One line carrying an error's whole cause chain, since the boxed error a
 /// failing test prints shows only the outermost message otherwise.
+///
+/// The crate owns the walk, so the in-crate comparison and these binaries print
+/// a failure the same way.
 pub fn describe(error: &dyn error::Error) -> String {
-    let mut message = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        message.push_str(&format!(": {cause}"));
-        source = cause.source();
-    }
-    message
+    chronoscope_analysis::test_support::describe(error)
 }
 
 /// The model's first UQFF shard, from [`MODEL_SHARD_ENV`], or a named actionable

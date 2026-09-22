@@ -170,6 +170,12 @@ impl Qwen3 {
             Constraint::Lark(think_grammar(&schema, think_budget))
         };
         let request = RequestBuilder::new()
+            // Greedy decode, so the same image answers the same way twice: the
+            // reference comparisons and the eval's caching both rest on that.
+            // mistral.rs builds requests this way today, and asserting it here
+            // keeps the property ours rather than inherited. It comes first
+            // because it resets the sampler, max length included.
+            .set_deterministic_sampler()
             .add_image_message(TextMessageRole::User, content, prompt.images)
             .set_constraint(constraint)
             // The length cap covers reasoning and answer together, so add the budget

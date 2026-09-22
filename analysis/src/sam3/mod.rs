@@ -15,8 +15,6 @@
 //! thing that differs between the two.
 
 mod manifest;
-#[cfg(test)]
-mod reference;
 mod tokenizer;
 
 use std::path::Path;
