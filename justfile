@@ -844,4 +844,7 @@ model-test:
         export COREML_CACHE="$PWD/target/coreml-cache"
         mkdir -p "$COREML_CACHE"
     fi
-    cargo test -p chronoscope-analysis -- --ignored
+    # --no-fail-fast so one binary's failure does not hide the other binaries'
+    # verdicts: these tests cost minutes of model loading each, and a run that
+    # reports one failure out of six tells you least where it costs most.
+    cargo test --no-fail-fast -p chronoscope-analysis -- --ignored
