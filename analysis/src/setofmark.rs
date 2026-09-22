@@ -150,7 +150,14 @@ pub fn font_from_env() -> Result<ab_glyph::FontVec, FontError> {
 /// The brand is what lets every region be drawn: each is a mask on this scene's
 /// own grid, so the marks and the describe loop's per-index questions number the
 /// same set.
-pub fn annotate<'b>(scene: &Scene<'b>, regions: &[Region<'b>], font: &impl Font) -> RgbImage {
+///
+/// Regions arrive as an iterator so a caller holding richer records, such as the
+/// detections the postprocess step returns, can project out their masks in place.
+pub fn annotate<'a, 'b: 'a>(
+    scene: &Scene<'b>,
+    regions: impl IntoIterator<Item = &'a Region<'b>>,
+    font: &impl Font,
+) -> RgbImage {
     let mut out = scene.image().to_rgb8();
     let (width, height) = (out.width(), out.height());
     // One foreground mask reused across regions: each region marks and clears
@@ -158,7 +165,7 @@ pub fn annotate<'b>(scene: &Scene<'b>, regions: &[Region<'b>], font: &impl Font)
     // without densifying the whole grid once per region.
     let mut mask = vec![false; width as usize * height as usize];
 
-    for (index, branded) in regions.iter().enumerate() {
+    for (index, branded) in regions.into_iter().enumerate() {
         let region = branded.mask();
         let color = KELLY_COLORS[index % KELLY_COLORS.len()];
 

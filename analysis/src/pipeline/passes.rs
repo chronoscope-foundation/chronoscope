@@ -22,12 +22,14 @@ use chronoscope_core::grammar::geometry::{ProportionalCoordError, ProportionalRe
 use chronoscope_core::grammar::text::Text;
 use chronoscope_core::nonempty::NonEmptyVec;
 use image::{DynamicImage, Rgb, RgbImage};
+use strum::VariantArray as _;
 use thiserror::Error;
 
 use crate::ask::convert::bbox_to_proportional;
 use crate::ask::{CompositeOutcome, EntityReading, ImageOutcome, Outcome, Prompt, TriageOutcome};
+use crate::concept::Concept;
 use crate::qwen3::{AskError, Qwen3};
-use crate::scene::{Region, Scene};
+use crate::scene::{Detection, Scene};
 use crate::setofmark;
 
 /// The fixed framing for pass 1. `Qwen3::ask` appends the rendered schema.
@@ -262,11 +264,16 @@ Respond with JSON conforming to this type:";
 /// and the enclosing building of an interior does not count — the wording carries
 /// that so the backstop stays sound on interior photos.
 /// [`Prompt::user_text`] appends the rendered schema.
-const TRIAGE_PREAMBLE: &str = "\
-An automatic detector for whole built structures — buildings, monuments, and \
-bridges — examined this image and marked nothing. The image is already judged \
-relevant, so the only question is whether the detector missed a structure it \
-should have outlined as a single object.
+///
+/// The classes are read off [`Concept::VARIANTS`], so the backstop is told what
+/// the detector was actually prompted for.
+fn triage_preamble() -> String {
+    format!(
+        "\
+An automatic detector for whole built structures and ways ({}) examined this \
+image and marked nothing. The image is already judged relevant, so the only \
+question is whether the detector missed a structure it should have outlined as \
+a single object.
 
 Report a miss only for a whole discrete structure, not for the architectural \
 parts of one. If this is an interior view, the building you are inside does not \
@@ -276,7 +283,22 @@ separate building visible through a window or opening does.
 If such a structure was missed, describe it. If there is genuinely nothing to \
 mark, report that instead.
 
-Respond with JSON conforming to this type:";
+Respond with JSON conforming to this type:",
+        concept_list()
+    )
+}
+
+/// The vocabulary as a bare comma-separated list, to name what the detector was
+/// asked for. Reading as a parenthetical keeps every noun in the form
+/// [`Concept::prompt`] gives it, so a concept whose plural or article is
+/// irregular needs no agreement rule here.
+fn concept_list() -> String {
+    Concept::VARIANTS
+        .iter()
+        .map(|concept| concept.prompt())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// The user-turn trigger after the triage image.
 const TRIAGE_POSTAMBLE: &str = "Report what the detector missed.";
@@ -345,27 +367,32 @@ pub async fn gate(qwen: &Qwen3, image: &DynamicImage) -> Result<ImageOutcome, Re
 /// or — with no regions — run the recall backstop. Shared so a photograph and a
 /// pictorial map read identically; only their carried viewpoint differs.
 ///
-/// The regions are `scene`'s own, so the overlay's marks and the describe loop's
-/// per-index questions number one set of masks on one grid. The mark number is
-/// internal — the loop index the trigger names — so it never leaves the stage,
-/// and the readings come back in that same order for the caller to pair with the
-/// regions it still holds.
+/// The detections are `scene`'s own, so the overlay's marks and the describe
+/// loop's per-index questions number one set of masks on one grid. The mark
+/// number is internal — the loop index the trigger names — so it never leaves
+/// the stage, and the readings come back in that same order for the caller to
+/// pair with the detections it still holds.
+///
+/// The overlay draws the masks alone. Each region's account is the VLM's to
+/// give here, over the raw image; the concept that found it rides along for the
+/// caller.
 pub async fn read_content<'b>(
     qwen: &Qwen3,
     scene: &Scene<'b>,
-    regions: &[Region<'b>],
+    detections: &[Detection<'b>],
     font: &impl Font,
 ) -> Result<Marks, ReadError> {
     let subimage = scene.image();
-    if regions.is_empty() {
+    if detections.is_empty() {
         let triage = qwen
             .ask::<TriageOutcome>(triage_prompt(subimage.clone()))
             .await?;
         return Ok(Marks::Triaged(require_complete(triage, "triage")?));
     }
+    let regions = detections.iter().map(|detection| &detection.region);
     let overlay: DynamicImage = setofmark::annotate(scene, regions, font).into();
-    let mut descriptions = Vec::with_capacity(regions.len());
-    for index in 0..regions.len() {
+    let mut descriptions = Vec::with_capacity(detections.len());
+    for index in 0..detections.len() {
         let reading = qwen
             .ask::<EntityReading>(entity_prompt(subimage.clone(), overlay.clone(), index))
             .await?;
@@ -401,7 +428,7 @@ fn entity_prompt(subimage: DynamicImage, overlay: DynamicImage, index: usize) ->
 /// The triage prompt: the raw subimage alone, with no regions to mark.
 fn triage_prompt(subimage: DynamicImage) -> Prompt {
     Prompt {
-        preamble: TRIAGE_PREAMBLE.to_owned(),
+        preamble: triage_preamble(),
         images: vec![subimage],
         postamble: TRIAGE_POSTAMBLE.to_owned(),
     }

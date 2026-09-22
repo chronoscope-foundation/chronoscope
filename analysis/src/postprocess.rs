@@ -9,13 +9,16 @@
 //! the VLM assigns type and description later, over the overlay.
 //!
 //! Grouping contained regions into a parent with sub-features (the writeup's
-//! `SUBORDINATE_PROMPTS` layer) is deliberately not done here: it keys on which
-//! concept prompt found each region, and a [`Region`] carries no such label
-//! yet. That is a conscious gap, not another silent drop.
+//! `SUBORDINATE_PROMPTS` layer) is not done here. A [`Detection`] carries the
+//! concept whose prompt found it, so the label that layer keys on is on hand;
+//! the containment pass itself is what is missing. Until it exists,
+//! [`crate::concept::Concept`] holds only classes that do not nest, for the
+//! reason its own docs give: the exclusive-pixel step below would rebuild a
+//! parent around a part that outscored it.
 
 use chronoscope_core::grammar::geometry::{Region as Mask, RegionError};
 
-use crate::scene::{Detection, Region};
+use crate::scene::Detection;
 
 /// Two regions overlapping by more than this are the same detection; the
 /// lower-scored one is dropped.
@@ -27,7 +30,7 @@ const DEDUP_IOU: f64 = 0.7;
 /// double-counted.
 const SURVIVAL: f64 = 0.1;
 
-/// Why [`postprocess_regions`] could not resolve its input.
+/// Why [`postprocess_detections`] could not resolve its input.
 #[derive(Debug, thiserror::Error)]
 pub enum PostprocessError {
     /// Rebuilding a survivor from its exclusively-claimed pixels failed.
@@ -35,22 +38,28 @@ pub enum PostprocessError {
     Region(#[from] RegionError),
 }
 
-/// Reduce raw per-instance detections to the clean, ordered set of regions to
-/// overlay and describe: drop near-duplicates, resolve overlaps by exclusive
-/// area, keep the most confident `max_regions`, and order them left to right by
-/// centroid.
+/// Reduce raw per-instance detections to the clean, ordered set to overlay and
+/// describe: drop near-duplicates, resolve overlaps by exclusive area, keep the
+/// most confident `max_regions`, and order them left to right by centroid.
 ///
-/// The scores are spent here, ranking the contests; what survives is regions,
-/// which is all the overlay and the describe loop read.
+/// The scores do their work here, ranking every contest below; a survivor keeps
+/// its score and its concept so a caller can say which prompt proposed it.
+///
+/// Detections from different prompts are ranked against each other, which takes
+/// their scores as comparable across concepts. Nothing has measured that, and
+/// the same uncalibrated comparison decides which [`crate::concept::Concept`]
+/// the surviving entity carries: where a building prompt and a monument prompt
+/// both find one structure, the larger raw number settles both which mask
+/// survives and what the entity is labelled.
 ///
 /// `max_regions` bounds the overlay's palette and the describe call's length; it
 /// is the caller's to tune, not a fixed limit on how many entities an image may
 /// hold. Every region is a mask over one scene, which is what makes the overlap
 /// comparisons below meaningful.
-pub fn postprocess_regions<'b>(
+pub fn postprocess_detections<'b>(
     detections: Vec<Detection<'b>>,
     max_regions: usize,
-) -> Result<Vec<Region<'b>>, PostprocessError> {
+) -> Result<Vec<Detection<'b>>, PostprocessError> {
     let Some(first) = detections.first() else {
         return Ok(Vec::new());
     };
@@ -63,17 +72,17 @@ pub fn postprocess_regions<'b>(
 
     // Drop a region that overlaps an already-kept, higher-scored one by more than
     // the dedup threshold: the same detection found twice.
-    let mut kept: Vec<Region<'b>> = Vec::new();
+    let mut kept: Vec<Detection<'b>> = Vec::new();
     for candidate in ranked {
         let mut duplicate = false;
         for keeper in &kept {
-            if candidate.region.iou(keeper) > DEDUP_IOU {
+            if candidate.region.iou(&keeper.region) > DEDUP_IOU {
                 duplicate = true;
                 break;
             }
         }
         if !duplicate {
-            kept.push(candidate.region);
+            kept.push(candidate);
         }
     }
 
@@ -87,8 +96,9 @@ pub fn postprocess_regions<'b>(
     // densifies the grid.
     let extent = (grid.width() as usize) * (grid.height() as usize);
     let mut claimed = vec![false; extent];
-    let mut survivors: Vec<Region<'b>> = Vec::new();
-    for region in kept {
+    let mut survivors: Vec<Detection<'b>> = Vec::new();
+    for detection in kept {
+        let region = &detection.region;
         let mut mine: Vec<usize> = Vec::new();
         for pixel in region.mask().foreground_pixels() {
             // Tentative — not claimed yet. A region that fails the survival floor
@@ -110,18 +120,22 @@ pub fn postprocess_regions<'b>(
             for &pixel in &mine {
                 claimed[pixel] = true;
             }
-            survivors.push(survivor);
+            survivors.push(Detection {
+                region: survivor,
+                score: detection.score,
+                concept: detection.concept,
+            });
         }
     }
 
     // Keep the most confident, then present left to right by centroid column.
     survivors.truncate(max_regions);
-    let mut keyed: Vec<(f64, Region<'b>)> = survivors
+    let mut keyed: Vec<(f64, Detection<'b>)> = survivors
         .into_iter()
-        .map(|region| (region.mask().centroid().x(), region))
+        .map(|detection| (detection.region.mask().centroid().x(), detection))
         .collect();
     keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Ok(keyed.into_iter().map(|(_, region)| region).collect())
+    Ok(keyed.into_iter().map(|(_, detection)| detection).collect())
 }
 
 #[cfg(test)]
@@ -130,14 +144,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        scene::{Scene, with_scene_sync},
+        concept::Concept,
+        scene::{Region, Scene, with_scene_sync},
         test_support::frame,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     /// A detection of `scene`: a dense mask on `grid`, with the score the
-    /// contests rank by.
+    /// contests rank by. The concept is whatever a test that cares about it sets
+    /// afterwards; the geometry tests all read as one prompt's proposals.
     fn scored<'b>(
         scene: &Scene<'b>,
         grid: Dimensions,
@@ -146,7 +162,11 @@ mod tests {
     ) -> Result<Detection<'b>, Box<dyn std::error::Error>> {
         let mask = Mask::from_dense(grid, dense)?.ok_or("non-empty")?;
         let region = Region::new(scene, mask).ok_or("on the scene's grid")?;
-        Ok(Detection { region, score })
+        Ok(Detection {
+            region,
+            score,
+            concept: Concept::Building,
+        })
     }
 
     /// A run of `count` foreground pixels starting at `start` on a `len`-pixel
@@ -162,10 +182,26 @@ mod tests {
             // 12/16 and 16/16 overlap at IoU 0.75, over the 0.7 threshold.
             let lower = scored(scene, grid, &run(16, 0, 12), 0.8)?;
             let higher = scored(scene, grid, &run(16, 0, 16), 0.9)?;
-            let out = postprocess_regions(vec![lower, higher], 32)?;
+            let out = postprocess_detections(vec![lower, higher], 32)?;
             assert_eq!(out.len(), 1);
             // The survivor is the 0.9 one, which is the 16-pixel mask.
-            assert_eq!(out[0].mask().area(), 16);
+            assert_eq!(out[0].region.mask().area(), 16);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_survivor_carries_the_concept_whose_prompt_found_it() -> TestResult {
+        let grid = Dimensions::new(4, 4)?;
+        with_scene_sync(frame(4, 4), |scene| {
+            // Two prompts propose the same pyramid. Whichever wins, the caller
+            // has to be able to say which prompt it was.
+            let building = scored(scene, grid, &run(16, 0, 12), 0.5)?;
+            let mut monument = scored(scene, grid, &run(16, 0, 16), 0.9)?;
+            monument.concept = Concept::Monument;
+            let out = postprocess_detections(vec![building, monument], 32)?;
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].concept, Concept::Monument);
             Ok(())
         })
     }
@@ -181,10 +217,10 @@ mod tests {
             // 0.1 survival share.
             let full = scored(scene, grid, &run(16, 0, 16), 0.9)?;
             let small = scored(scene, grid, &run(16, 5, 2), 0.5)?;
-            let out = postprocess_regions(vec![full, small], 32)?;
+            let out = postprocess_detections(vec![full, small], 32)?;
             assert_eq!(out.len(), 1);
             // The full region survives whole: the small one claimed nothing.
-            assert_eq!(out[0].mask().area(), 16);
+            assert_eq!(out[0].region.mask().area(), 16);
             Ok(())
         })
     }
@@ -202,11 +238,12 @@ mod tests {
             let b = scored(scene, grid, &run(25, 10, 11), 0.7)?;
             let c = scored(scene, grid, &run(25, 20, 5), 0.5)?;
 
-            let out = postprocess_regions(vec![a, b, c], 32)?;
+            let out = postprocess_detections(vec![a, b, c], 32)?;
 
             assert_eq!(out.len(), 2, "A and C survive, B drops");
             assert!(
-                out.iter().any(|s| s.mask().to_dense()[20]),
+                out.iter()
+                    .any(|detection| detection.region.mask().to_dense()[20]),
                 "pixel 20 stays with a survivor, not stolen by the dropped B"
             );
             Ok(())
@@ -222,8 +259,11 @@ mod tests {
             let right = scored(scene, grid, &run(6, 5, 1), 0.7)?;
             let left = scored(scene, grid, &run(6, 0, 1), 0.8)?;
             let middle = scored(scene, grid, &run(6, 2, 2), 0.9)?;
-            let out = postprocess_regions(vec![right, left, middle], 32)?;
-            let columns: Vec<f64> = out.iter().map(|s| s.mask().centroid().x()).collect();
+            let out = postprocess_detections(vec![right, left, middle], 32)?;
+            let columns: Vec<f64> = out
+                .iter()
+                .map(|detection| detection.region.mask().centroid().x())
+                .collect();
             assert_eq!(out.len(), 3);
             assert!(columns[0] < columns[1] && columns[1] < columns[2]);
             Ok(())
@@ -237,13 +277,13 @@ mod tests {
             let a = scored(scene, grid, &run(6, 0, 1), 0.5)?;
             let b = scored(scene, grid, &run(6, 2, 1), 0.9)?;
             let c = scored(scene, grid, &run(6, 4, 1), 0.7)?;
-            let out = postprocess_regions(vec![a, b, c], 2)?;
+            let out = postprocess_detections(vec![a, b, c], 2)?;
             assert_eq!(out.len(), 2);
             // The 0.5 region at pixel 0 is dropped; the 0.9 at pixel 2 and the
             // 0.7 at pixel 4 remain, ordered by column.
             let covered: Vec<bool> = out
                 .iter()
-                .flat_map(|region| region.mask().foreground_pixels())
+                .flat_map(|detection| detection.region.mask().foreground_pixels())
                 .fold(vec![false; 6], |mut covered, pixel| {
                     covered[pixel] = true;
                     covered
@@ -256,7 +296,7 @@ mod tests {
     #[test]
     fn empty_input_is_empty_output() -> TestResult {
         with_scene_sync(frame(1, 1), |_scene| {
-            assert!(postprocess_regions(Vec::new(), 32)?.is_empty());
+            assert!(postprocess_detections(Vec::new(), 32)?.is_empty());
             Ok(())
         })
     }
@@ -271,10 +311,10 @@ mod tests {
         with_scene_sync(frame(20, 1), |scene| {
             let higher = scored(scene, grid, &run(20, 0, 10), 0.9)?;
             let lower = scored(scene, grid, &run(20, 5, 10), 0.8)?;
-            let out = postprocess_regions(vec![higher, lower], 32)?;
+            let out = postprocess_detections(vec![higher, lower], 32)?;
             assert_eq!(out.len(), 2);
-            let a = out[0].mask().to_dense();
-            let b = out[1].mask().to_dense();
+            let a = out[0].region.mask().to_dense();
+            let b = out[1].region.mask().to_dense();
             for pixel in 0..20 {
                 assert!(
                     !(a[pixel] && b[pixel]),
@@ -294,15 +334,15 @@ mod tests {
         with_scene_sync(frame(10, 1), |scene| {
             let higher = scored(scene, grid, &run(10, 4, 2), 0.9)?;
             let lower = scored(scene, grid, &run(10, 0, 10), 0.5)?;
-            let out = postprocess_regions(vec![higher, lower], 32)?;
+            let out = postprocess_detections(vec![higher, lower], 32)?;
             assert_eq!(out.len(), 2);
             // The lower region is the surviving one with a hole, so it is the
             // larger of the two by area.
             let holey = out
                 .iter()
-                .max_by_key(|region| region.mask().area())
+                .max_by_key(|detection| detection.region.mask().area())
                 .ok_or("the lower region survives")?;
-            let dense = holey.mask().to_dense();
+            let dense = holey.region.mask().to_dense();
             assert!(!dense[4] && !dense[5], "the claimed middle is excluded");
             assert!(dense[3] && dense[6], "the surrounding pixels remain");
             Ok(())

@@ -23,10 +23,12 @@ use chronoscope_core::grammar::text::Text;
 use chronoscope_core::nonempty::NonEmptyVec;
 use image::DynamicImage;
 use serde::{Deserialize, Serialize};
+use strum::VariantArray as _;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::ask::{DecodeError, ImageOutcome, RelevantMedium, TriageOutcome};
+use crate::concept::Concept;
 use crate::dinov3::{
     DegenerateEmbedding, Dinov3, EmbedError as Dinov3EmbedError, Embedding, ForwardError,
 };
@@ -34,20 +36,10 @@ use crate::pipeline::passes::{
     DegenerateCrop, Marks, PanelError, ReadError, crop, detect_composite, gate, read_content,
     require_complete, subimages,
 };
-use crate::postprocess::{PostprocessError, postprocess_regions};
+use crate::postprocess::{PostprocessError, postprocess_detections};
 use crate::qwen3::{AskError, Qwen3};
 use crate::sam3::{ConceptError, EncodeError, GraphError, Sam3};
 use crate::scene::{DetectError, EmbedError, Features, Scene, detect, embed, with_scene};
-
-/// The concept the segmenter is prompted with.
-///
-/// One concept per call: [`crate::sam3::Sam3::segment_concept`] takes a single
-/// prompt and feeds the language encoder one row of tokens, so asking for
-/// streets or bridges as well means another language encode and grounding
-/// decode each. Those are the cheap half; the image encode they read is
-/// reusable, once [`crate::scene::detect`] holds it on the scene rather than
-/// running it per call.
-const CONCEPT: &str = "building";
 
 /// The most regions one panel is read at.
 ///
@@ -55,6 +47,10 @@ const CONCEPT: &str = "building";
 /// that two marks look alike and the number is all that separates them. The
 /// describe loop also costs one VLM call per mark, so the bound is what keeps a
 /// busy street scene from spending a hundred.
+///
+/// It is one budget over every concept's detections together, spent by raw score
+/// with no per-concept floor, so a panel dense in one concept can take all of it
+/// and truncate another concept away entirely.
 const MAX_REGIONS: usize = 20;
 
 /// The models and the font one image is read with, held together so a batch
@@ -156,17 +152,18 @@ impl Pipeline {
     /// Reads what a content-bearing panel holds: an entity per surviving
     /// region, or the recall backstop when the segmenter found none.
     ///
-    /// The regions are how the entities are found rather than the answer, so
-    /// what leaves here is entities: a mask, a reading and an embedding each.
+    /// The detections are how the entities are found rather than the answer, so
+    /// what leaves here is entities: a mask, a reading, the concept that found
+    /// it, and an embedding each.
     async fn analyze_entities<'b>(
         &self,
         scene: &Scene<'b>,
         features: &Features<'b>,
     ) -> Result<Content, AnalyzeError> {
-        let detections = detect(scene, &self.sam3, CONCEPT).await?;
-        let regions = postprocess_regions(detections, MAX_REGIONS)?;
+        let detections = detect(scene, &self.sam3, Concept::VARIANTS).await?;
+        let detections = postprocess_detections(detections, MAX_REGIONS)?;
 
-        match read_content(&self.qwen, scene, &regions, self.font.as_ref()).await? {
+        match read_content(&self.qwen, scene, &detections, self.font.as_ref()).await? {
             Marks::Triaged(outcome) => Ok(Content::Triaged { outcome }),
             Marks::Described(descriptions) => {
                 // The read stage answers one mark per region it was handed and
@@ -176,20 +173,21 @@ impl Pipeline {
                 // are read before the zip consumes them, so either failure
                 // reports what actually arrived.
                 let pairing = AnalyzeError::Pairing {
-                    regions: regions.len(),
+                    regions: detections.len(),
                     readings: descriptions.len(),
                 };
-                if descriptions.len() != regions.len() {
+                if descriptions.len() != detections.len() {
                     return Err(pairing);
                 }
-                let entities = regions
+                let entities = detections
                     .iter()
                     .zip(descriptions)
-                    .map(|(region, description)| {
+                    .map(|(detection, description)| {
                         Ok(Entity {
-                            region: region.mask().clone(),
+                            region: detection.region.mask().clone(),
                             description,
-                            embedding: features.region(region)?,
+                            concept: detection.concept,
+                            embedding: features.region(&detection.region)?,
                         })
                     })
                     .collect::<Result<Vec<_>, AnalyzeError>>()?;
@@ -301,8 +299,10 @@ pub enum Content {
 /// One entity of a panel: where it is, what it is, and how it embeds.
 ///
 /// No score: the detector's confidences are spent ranking in
-/// [`crate::postprocess::postprocess_regions`], and what
-/// survives that ranking is regions.
+/// [`crate::postprocess::postprocess_detections`], and what survives that
+/// ranking is regions. The concept does travel this far, since it says which
+/// prompt of the vocabulary proposed the region rather than how sure the
+/// detector was.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
     /// The mask, on the pixel grid of the panel it was read from, not of the
@@ -311,6 +311,10 @@ pub struct Entity {
     pub region: Mask,
     /// What the model said it is.
     pub description: Text,
+    /// The concept whose prompt found the region, one class of the segmenter's
+    /// vocabulary: what it was asked for, before the description settled what
+    /// the region actually holds.
+    pub concept: Concept,
     /// DINOv3's reading of the region alone.
     pub embedding: Embedding,
 }
@@ -494,7 +498,8 @@ mod tests {
         let described = Content::Described {
             entities: NonEmptyVec::singleton(Entity {
                 region: mask,
-                description: Text::new("a tower")?,
+                description: Text::new("a monument")?,
+                concept: Concept::Monument,
                 embedding: embedding()?,
             }),
         };

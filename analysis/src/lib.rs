@@ -9,6 +9,7 @@
 //! binary runs from Nix, sits behind the `corpus` feature.
 
 pub mod ask;
+pub mod concept;
 pub mod corpus;
 pub mod dinov3;
 mod geometry;

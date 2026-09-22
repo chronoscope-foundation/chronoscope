@@ -39,6 +39,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use crate::{
+    concept::Concept,
     dinov3::{
         DegenerateEmbedding, Dinov3, EmbedError as Dinov3EmbedError, Embedding,
         Features as RawFeatures,
@@ -164,16 +165,21 @@ impl<'b> Region<'b> {
     }
 }
 
-/// A region and the confidence its producer gave it.
+/// A region, the confidence its producer gave it, and the concept whose prompt
+/// found it.
 ///
-/// The pair, rather than a field on [`Region`], because the score belongs to the
-/// detection that proposed the mask: `postprocess` ranks by it, and everything
-/// downstream of that ranking works in regions alone.
+/// A record of one proposal rather than fields on [`Region`], because both
+/// belong to the detector rather than the mask: a stored or hand-drawn region
+/// has neither. The score is what `postprocess` ranks by; the concept is what
+/// the detector was asked for when this mask came back, which is the difference
+/// between a road and the building beside it.
 pub struct Detection<'b> {
     /// The mask the detector proposed.
     pub region: Region<'b>,
     /// How confident the detector was in it.
     pub score: f32,
+    /// The concept whose prompt found it.
+    pub concept: Concept,
 }
 
 /// DINOv3's reading of one scene, held so a region of that scene can be pooled
@@ -218,28 +224,34 @@ pub async fn embed<'b>(
     })
 }
 
-/// Segments `scene`'s image for `concept` with SAM 3, stamping each region with
-/// the scene's brand.
+/// Segments `scene`'s image for each of `concepts` with SAM 3, stamping every
+/// region with the scene's brand.
 ///
-/// The encode and the concept pass run under one lock: the encoder's features
-/// belong to this scene and nothing else reads them yet, so they live and die
-/// inside the call. Threading them onto the scene is what a second concept
-/// prompt over one image would want.
+/// The image encode is the expensive half and it does not depend on the prompt,
+/// so it runs once and every concept reads it. That is why the vocabulary is a
+/// list here rather than a caller looping: a loop outside would re-encode the
+/// image per concept.
+///
+/// The whole sequence holds one lock, so the encoder's features live and die
+/// inside the call while the prompts take turns over them.
 pub async fn detect<'b>(
     scene: &Scene<'b>,
     model: &Arc<Mutex<Sam3>>,
-    concept: &str,
+    concepts: &[Concept],
 ) -> Result<Vec<Detection<'b>>, DetectError> {
     let mut model = model.lock().await;
     let encoded = model.encode(&scene.image).await?;
-    let scored = model.segment_concept(&encoded, concept).await?;
-    Ok(scored
-        .into_iter()
-        .map(|scored| Detection {
+
+    let mut detections = Vec::new();
+    for &concept in concepts {
+        let scored = model.segment_concept(&encoded, concept.prompt()).await?;
+        detections.extend(scored.into_iter().map(|scored| Detection {
             region: Region::new_unchecked(scene, scored.region),
             score: scored.score,
-        })
-        .collect())
+            concept,
+        }));
+    }
+    Ok(detections)
 }
 
 /// Why a scene could not be embedded.
