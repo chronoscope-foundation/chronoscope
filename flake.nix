@@ -89,8 +89,8 @@
       # so any weights-out-of-line model (the SAM/DINO encoders) fails to load under
       # CoreML. Fixed in >= 1.28; bump the source to the latest release. Only src +
       # version change is needed — unstable's abseil/onnx/protobuf already satisfy 1.29.
-      # An overlay so every consumer resolves the same lib: the `ort` crate's
-      # ORT_DYLIB_PATH, the analysis stack, and the python export/verify scripts.
+      # An overlay so every consumer resolves the same lib: what `ort` links
+      # against, the analysis stack, and the python export/verify scripts.
       onnxruntimeLatest = _final: prev: {
         onnxruntime = prev.onnxruntime.overrideAttrs (_old: {
           version = "1.29.0";
@@ -431,6 +431,14 @@
             # that compiles the workspace needs this. A no-op off macOS, matching
             # nix/rust.nix's crane build.
             MISTRALRS_METAL_PRECOMPILE = "0";
+            # Where `ort` links ONNX Runtime from, matching nix/rust.nix so a
+            # `cargo build` here produces the same binary the hermetic build
+            # does, and what puts the library in reach of every shell that
+            # compiles the workspace rather than the analysis one alone. The
+            # skip is belt and braces; see nix/rust.nix for why it is inert.
+            ORT_LIB_LOCATION = "${pkgs.onnxruntime}/lib";
+            ORT_PREFER_DYNAMIC_LINK = "1";
+            ORT_SKIP_DOWNLOAD = "1";
           }
           // lib.optionalAttrs isLinux {
             # Carries nix/rust.nix's reason into the shells: cargo here links the
@@ -755,7 +763,7 @@
           # shell hook, which would make entering the shell expensive.
           analysis = pkgs.mkShell {
             nativeBuildInputs = [ toolchain ] ++ commonTools ++ backendNativeBuildInputs;
-            buildInputs = backendBuildInputs ++ [ pkgs.onnxruntime ];
+            buildInputs = backendBuildInputs;
             env =
               commonEnv
               // backendEnv
@@ -764,9 +772,6 @@
                 # `corpus-fetch` resolves the URL list from here; without it
                 # `just corpus-hash` cannot find the manifest.
                 CORPUS_MANIFEST = corpus.corpusManifestJson;
-                # `ort` builds with load-dynamic, so it resolves the shared
-                # library at runtime from this rather than downloading one.
-                ORT_DYLIB_PATH = "${pkgs.onnxruntime}/lib/libonnxruntime${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
                 # The Set-of-Mark overlay reads its marker font from here, so
                 # `just test analysis` and the `analyze` binary render numbers
                 # without a font vendored into the repo.

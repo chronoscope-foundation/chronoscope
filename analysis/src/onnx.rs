@@ -1,15 +1,6 @@
 //! Session construction for the ONNX graphs `nix/vision.nix` exports.
-//!
-//! `ort` builds with `load-dynamic`, so ONNX Runtime is loaded dynamically at
-//! first use instead of linked. `ort`'s own response to an unresolvable library
-//! is a panic from deep inside its lazy initializer, which says nothing about
-//! where the path was supposed to come from; the check here happens before any
-//! `ort` call so the failure can name it.
 
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use ort::{
     ep::{CPU, CoreML, coreml::ModelFormat},
@@ -31,10 +22,6 @@ pub(crate) enum Backend<'a> {
     CoreML { cache_dir: &'a Path },
 }
 
-/// Where `load-dynamic` resolves ONNX Runtime from. The `analysis` dev shell
-/// points it at the nixpkgs build.
-const LIBRARY_VAR: &str = "ORT_DYLIB_PATH";
-
 /// Intra-op threads per session. `run_async` hands inference to this pool, so a
 /// session that inferred with one thread has nowhere to run and errors.
 ///
@@ -53,19 +40,6 @@ const INTRA_OP_THREADS: usize = 4;
 /// Why a session could not be built.
 #[derive(Debug, Error)]
 pub enum SessionError {
-    #[error(
-        "{LIBRARY_VAR} is unset, so ONNX Runtime cannot be located. \
-         The `analysis` dev shell provides it: run `just model-test`, \
-         or enter `nix develop .#analysis` first."
-    )]
-    LibraryUnset,
-
-    #[error(
-        "{LIBRARY_VAR} points at `{path}`, which does not exist. \
-         Re-enter the `analysis` dev shell, or run `just model-test`."
-    )]
-    LibraryMissing { path: PathBuf },
-
     #[error("ONNX Runtime rejected the pinned session options")]
     Options(#[source] ort::Error),
 
@@ -94,17 +68,6 @@ pub(crate) fn session(
     backend: Backend,
     dims: &[(&str, i64)],
 ) -> Result<Session, SessionError> {
-    // An empty value carries no path to resolve, so it earns the unset guidance
-    // over a missing-path error. The `DINOV3_FIXTURES` check in the reference
-    // test reads its own empty value the same way.
-    let library = env::var_os(LIBRARY_VAR)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or(SessionError::LibraryUnset)?;
-    if !library.exists() {
-        return Err(SessionError::LibraryMissing { path: library });
-    }
-
     let providers = match backend {
         Backend::Cpu => vec![CPU::default().build()],
         Backend::CoreML { cache_dir } => vec![

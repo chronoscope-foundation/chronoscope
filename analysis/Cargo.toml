@@ -50,9 +50,11 @@ indexmap = { version = "2", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# ONNX Runtime, resolved at runtime from ORT_DYLIB_PATH rather than linked or
-# downloaded, which is what lets nixpkgs own the library. Exact pin because the
-# release-candidate series changes API between candidates.
+# ONNX Runtime, linked at build time against the library nix puts at
+# ORT_LIB_LOCATION. Anything that compiles this crate needs the runtime to run
+# it, so resolving the library later buys nothing and costs a handle that must
+# be present in every environment the binaries and tests run in. Exact pin
+# because the release-candidate series changes API between candidates.
 #
 # `api-23` selects the ONNX Runtime C API version to request. The crate's default
 # is `api-27`, and the runtime refuses to load a library that advertises an older
@@ -66,7 +68,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     "std",
     "tracing",
-    "load-dynamic",
     "api-23",
     "coreml",
 ] }

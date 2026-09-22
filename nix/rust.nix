@@ -60,6 +60,16 @@ let
     # the runtime path needs no Xcode. A no-op off macOS.
     MISTRALRS_METAL_PRECOMPILE = "0";
 
+    # `ort` links ONNX Runtime from here, so the store path lands in the binary
+    # and nothing has to name the library again at run time. This is also what
+    # carries the dependency: the library lives in onnxruntime's default output,
+    # which a `buildInputs` entry would not select. The skip is belt and braces,
+    # since nothing enables `download-binaries` and naming the location
+    # short-circuits the build script before its download path.
+    ORT_LIB_LOCATION = "${pkgs.onnxruntime}/lib";
+    ORT_PREFER_DYNAMIC_LINK = "1";
+    ORT_SKIP_DOWNLOAD = "1";
+
     # Deps vendored with the mistral.rs UQFF-write deadlock fix applied (see the
     # `cargoVendorDir` binding above); providing the vendor dir makes every build
     # use the patched checkout.
